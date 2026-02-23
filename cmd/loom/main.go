@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"gitlab.flexinfer.ai/libs/mcp-go"
+
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
@@ -456,7 +458,7 @@ func newGenerateManifestsCmd() *cobra.Command {
 				registryPath = registry.FindRegistryOrDefault(filepath.Join(cwd, "mcp", "context", "registry.yaml"))
 			}
 
-			reg, err := registry.Load(registryPath)
+			reg, err := registry.LoadWithDefaults(registryPath)
 			if err != nil {
 				return err
 			}
@@ -510,7 +512,7 @@ func newGenerateConfigsCmd() *cobra.Command {
 				registryPath = registry.FindRegistryOrDefault(filepath.Join(cwd, "mcp", "context", "registry.yaml"))
 			}
 
-			reg, err := registry.Load(registryPath)
+			reg, err := registry.LoadWithDefaults(registryPath)
 			if err != nil {
 				return err
 			}
@@ -582,9 +584,10 @@ Platform output formats:
             .claude/rules/<name>.md (rules without frontmatter)
   Kilocode: .kilocode/rules/<name>.md (rules)
             .kilocode/workflows/<name>.yaml (workflows)
-  Gemini:   .gemini/instructions.md (composite from instruction-type skills)
+  Gemini:   .gemini/skills/<name>/SKILL.md + scripts/ + references/ + assets/
+            .gemini/GEMINI.md (composite from instruction-type skills)
 
-Skills with type=instruction are assembled into a composite instructions.md.
+Skills with type=instruction are assembled into a composite instructions.md (or GEMINI.md for Gemini).
 
 Example:
   loom generate skills --target all
@@ -680,8 +683,11 @@ func newSyncCmd() *cobra.Command {
 			loomMode, _ := cmd.Flags().GetBool("loom-mode")
 			loomBinary, _ := cmd.Flags().GetString("loom-binary")
 			resolveSecrets, _ := cmd.Flags().GetBool("resolve-secrets")
-
 			skipSkills, _ := cmd.Flags().GetBool("skip-skills")
+			allProjects, _ := cmd.Flags().GetBool("all-projects")
+			wsRoot, _ := cmd.Flags().GetString("workspace-root")
+			skipWorktrees, _ := cmd.Flags().GetBool("skip-worktrees")
+			dryRun, _ := cmd.Flags().GetBool("dry-run")
 
 			cwd, _ := os.Getwd()
 			mgr, err := sync.NewManager(cwd)
@@ -704,26 +710,86 @@ func newSyncCmd() *cobra.Command {
 						loomBinary = exe
 					}
 				}
-				return mgr.SyncAll(true, regen, repoOnly, hubMode, hubURL, loomMode, loomBinary, rs, loomModeExplicit)
+				if err := mgr.SyncAll(true, regen, repoOnly, hubMode, hubURL, loomMode, loomBinary, rs, loomModeExplicit); err != nil {
+					return err
+				}
+			} else {
+				// For single profile: apply per-profile defaults when flags not explicitly set
+				if p := mgr.Get(profile); p != nil {
+					if !cmd.Flags().Changed("loom-mode") {
+						loomMode = p.DefaultLoomMode
+					}
+					if !cmd.Flags().Changed("resolve-secrets") {
+						resolveSecrets = p.DefaultResolveSecrets
+					}
+				}
+
+				if loomMode && loomBinary == "" {
+					if exe, err := os.Executable(); err == nil && exe != "" {
+						loomBinary = exe
+					}
+				}
+
+				if err := mgr.SyncToHome(profile, true, regen, repoOnly, hubMode, hubURL, loomMode, loomBinary, resolveSecrets); err != nil {
+					return err
+				}
 			}
 
-			// For single profile: apply per-profile defaults when flags not explicitly set
-			if p := mgr.Get(profile); p != nil {
-				if !cmd.Flags().Changed("loom-mode") {
-					loomMode = p.DefaultLoomMode
+			// Propagate hooks to all workspace projects
+			if allProjects {
+				if wsRoot == "" {
+					wsRoot = generator.InferWorkspaceRoot(cwd)
 				}
-				if !cmd.Flags().Changed("resolve-secrets") {
-					resolveSecrets = p.DefaultResolveSecrets
+				if wsRoot == "" {
+					return fmt.Errorf("cannot detect workspace root; use --workspace-root")
+				}
+
+				propagate := func(pName string) error {
+					p := mgr.Get(pName)
+					if p == nil {
+						return nil
+					}
+					hasSettings := false
+					for _, f := range p.ExtraGeneratedFiles {
+						if f == "settings.json" {
+							hasSettings = true
+							break
+						}
+					}
+					if !hasSettings {
+						return nil
+					}
+					fmt.Printf("\nPropagating %s hooks to workspace projects:\n", pName)
+					n, err := mgr.SyncAllProjects(pName, wsRoot, skipWorktrees, dryRun)
+					if err != nil {
+						return fmt.Errorf("propagate %s: %w", pName, err)
+					}
+					if n == 0 {
+						fmt.Println("  All projects already up-to-date.")
+					} else if dryRun {
+						fmt.Printf("  %d project(s) would be updated.\n", n)
+					} else {
+						fmt.Printf("  %d project(s) updated.\n", n)
+					}
+					return nil
+				}
+
+				if profile == "all" {
+					names := mgr.List()
+					sort.Strings(names)
+					for _, name := range names {
+						if err := propagate(name); err != nil {
+							return err
+						}
+					}
+				} else {
+					if err := propagate(profile); err != nil {
+						return err
+					}
 				}
 			}
 
-			if loomMode && loomBinary == "" {
-				if exe, err := os.Executable(); err == nil && exe != "" {
-					loomBinary = exe
-				}
-			}
-
-			return mgr.SyncToHome(profile, true, regen, repoOnly, hubMode, hubURL, loomMode, loomBinary, resolveSecrets)
+			return nil
 		},
 	}
 
@@ -735,6 +801,10 @@ func newSyncCmd() *cobra.Command {
 	syncCmd.Flags().String("loom-binary", "", "Path to loom binary")
 	syncCmd.Flags().Bool("skip-skills", false, "Skip skills generation during --regen")
 	syncCmd.Flags().Bool("resolve-secrets", false, "Resolve secret templates to literal values")
+	syncCmd.Flags().Bool("all-projects", false, "Propagate hooks to all workspace projects")
+	syncCmd.Flags().String("workspace-root", "", "Explicit workspace root (default: auto-detect)")
+	syncCmd.Flags().Bool("skip-worktrees", false, "Skip .worktrees/ during project discovery")
+	syncCmd.Flags().Bool("dry-run", false, "Show what would change without writing")
 
 	// Sync skills subcommand
 	syncSkillsCmd := &cobra.Command{
@@ -1086,6 +1156,11 @@ func newToolsCmd(socketPath string) *cobra.Command {
 		Short: "List and search aggregated tools",
 	}
 
+	var toolsListJSON bool
+	var toolsListServer string
+	var toolsListPage int
+	var toolsListLimit int
+
 	toolsListCmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all available tools from daemon",
@@ -1096,20 +1171,69 @@ func newToolsCmd(socketPath string) *cobra.Command {
 			}
 
 			var tools struct {
-				Tools []struct {
-					Name        string `json:"name"`
-					Description string `json:"description"`
-				} `json:"tools"`
-				CachedAt    string `json:"cachedAt"`
-				ServerCount int    `json:"serverCount"`
+				Tools       []mcp.Tool `json:"tools"`
+				CachedAt    string     `json:"cachedAt"`
+				ServerCount int        `json:"serverCount"`
 			}
 
 			if err := json.Unmarshal(result, &tools); err != nil {
 				return fmt.Errorf("parse tools: %w", err)
 			}
 
-			fmt.Printf("Tools: %d from %d servers\n\n", len(tools.Tools), tools.ServerCount)
-			for _, t := range tools.Tools {
+			if toolsListPage < 1 {
+				return fmt.Errorf("--page must be >= 1")
+			}
+			if toolsListLimit < 0 {
+				return fmt.Errorf("--limit must be >= 0")
+			}
+
+			serverFilter := strings.TrimSpace(toolsListServer)
+			pageSize := len(tools.Tools)
+			if toolsListLimit > 0 {
+				pageSize = clampToolPageSize(toolsListLimit)
+			} else if pageSize == 0 {
+				pageSize = defaultToolPageSize
+			}
+
+			page, err := buildToolInventoryPage(tools.Tools, serverFilter, toolsListPage, pageSize, serverFilter != "")
+			if err != nil {
+				return err
+			}
+
+			if toolsListJSON {
+				out := struct {
+					toolInventoryPage
+					CachedAt    string `json:"cachedAt,omitempty"`
+					ServerCount int    `json:"serverCount"`
+				}{
+					toolInventoryPage: page,
+					CachedAt:          tools.CachedAt,
+					ServerCount:       tools.ServerCount,
+				}
+				b, err := json.MarshalIndent(out, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(b))
+				return nil
+			}
+
+			if serverFilter == "" && toolsListLimit == 0 && toolsListPage == 1 {
+				fmt.Printf("Tools: %d from %d servers\n\n", len(page.Tools), tools.ServerCount)
+			} else {
+				fmt.Printf(
+					"Tools: %d of %d from %d servers (server=%s page=%d/%d pageSize=%d)\n\n",
+					len(page.Tools),
+					page.TotalTools,
+					tools.ServerCount,
+					page.Server,
+					page.Page,
+					page.TotalPages,
+					page.PageSize,
+				)
+			}
+
+			for _, t := range page.Tools {
 				desc := t.Description
 				if len(desc) > 60 {
 					desc = desc[:57] + "..."
@@ -1119,6 +1243,10 @@ func newToolsCmd(socketPath string) *cobra.Command {
 			return nil
 		},
 	}
+	toolsListCmd.Flags().BoolVar(&toolsListJSON, "json", false, "Output machine-readable JSON")
+	toolsListCmd.Flags().StringVar(&toolsListServer, "server", "", "Filter tools by server prefix (server__tool)")
+	toolsListCmd.Flags().IntVar(&toolsListPage, "page", 1, "Page number for paginated output (1-based)")
+	toolsListCmd.Flags().IntVar(&toolsListLimit, "limit", 0, "Page size for paginated output (clamped to 10-500)")
 
 	toolsSearchCmd := &cobra.Command{
 		Use:   "search <query>",

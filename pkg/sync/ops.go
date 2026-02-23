@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -72,11 +73,13 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 	repoPath := m.ResolveRepoPath(p)
 	homePath := m.ResolveHomePath(p)
 	var geminiSnapshot geminiConfigSnapshot
+	var geminiAuthSnapshot geminiAuthSnapshot
 	var claudeSnapshot claudeConfigSnapshot
 	var codexSnapshot codexConfigSnapshot
 	switch p.Name {
 	case "gemini":
 		geminiSnapshot = readGeminiConfigSnapshot(homePath)
+		geminiAuthSnapshot = readGeminiAuthSnapshot(homePath)
 	case "claude":
 		claudeSnapshot = readClaudeConfigSnapshot(homePath)
 	case "codex":
@@ -159,8 +162,8 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 		}
 	}
 
-	// Sync skill files from manifest
-	if p.SkillsManifest != "" {
+	// Sync skill files from manifest (skip when skills are generated directly to home)
+	if p.SkillsManifest != "" && !p.SkillsDirectToHome {
 		manifest, _ := skills.ReadManifest(repoPath)
 		if manifest != nil && len(manifest.Generated) > 0 {
 			for _, relPath := range manifest.Generated {
@@ -215,8 +218,17 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 
 	switch p.Name {
 	case "gemini":
+		// Prune extensions that define mcpServers (redundant with loom proxy).
+		pruned, pruneErr := pruneGeminiMCPExtensions(homePath)
+		if pruneErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: extension pruning failed: %v\n", pruneErr)
+		}
+		geminiSnapshot = filterPrunedExtensions(geminiSnapshot, pruned)
 		if err := ensureGeminiConfigFiles(homePath, geminiSnapshot); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not verify Gemini config files: %v\n", err)
+		}
+		if err := ensureGeminiAuthFiles(homePath, geminiAuthSnapshot); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not preserve Gemini auth files: %v\n", err)
 		}
 	case "claude":
 		if err := ensureClaudeConfigFiles(homePath, claudeSnapshot); err != nil {
@@ -237,6 +249,13 @@ type geminiConfigSnapshot struct {
 	extensionManifests  map[string][]byte
 }
 
+type geminiAuthSnapshot struct {
+	googleAccounts []byte
+	oauthCreds     []byte
+	state          []byte
+	installationID []byte
+}
+
 type claudeConfigSnapshot struct {
 	mcp      []byte
 	settings []byte
@@ -251,6 +270,15 @@ func readGeminiConfigSnapshot(homePath string) geminiConfigSnapshot {
 		trustedFolders:      readGeminiTrustedFoldersSnapshot(homePath),
 		extensionEnablement: readGeminiJSONSnapshot(filepath.Join(homePath, "extensions", "extension-enablement.json")),
 		extensionManifests:  readGeminiExtensionManifestSnapshots(homePath),
+	}
+}
+
+func readGeminiAuthSnapshot(homePath string) geminiAuthSnapshot {
+	return geminiAuthSnapshot{
+		googleAccounts: readGeminiAuthJSONSnapshot(filepath.Join(homePath, "google_accounts.json")),
+		oauthCreds:     readGeminiAuthJSONSnapshot(filepath.Join(homePath, "oauth_creds.json")),
+		state:          readGeminiAuthJSONSnapshot(filepath.Join(homePath, "state.json")),
+		installationID: readNonEmptyTextSnapshot(filepath.Join(homePath, "installation_id")),
 	}
 }
 
@@ -281,6 +309,28 @@ func readGeminiTrustedFoldersSnapshot(homePath string) []byte {
 
 func readGeminiJSONSnapshot(path string) []byte {
 	return readJSONSnapshot(path)
+}
+
+func readGeminiAuthJSONSnapshot(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	if !isValidJSON(data) {
+		return nil
+	}
+	return append([]byte(nil), data...)
+}
+
+func readNonEmptyTextSnapshot(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	return append([]byte(nil), data...)
 }
 
 func readJSONSnapshot(path string) []byte {
@@ -341,6 +391,35 @@ func ensureGeminiConfigFiles(homePath string, snapshot geminiConfigSnapshot) err
 	if err := ensureGeminiExtensionManifests(homePath, snapshot.extensionManifests); err != nil {
 		errs = append(errs, fmt.Sprintf("extensions/*/gemini-extension.json: %v", err))
 	}
+	if err := ensureGeminiExtensionCommands(homePath); err != nil {
+		errs = append(errs, fmt.Sprintf("extensions/*/commands/*.toml: %v", err))
+	}
+
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func ensureGeminiAuthFiles(homePath string, snapshot geminiAuthSnapshot) error {
+	var errs []string
+	ensure := func(relPath string, fallback []byte, validate func([]byte) bool) {
+		if len(fallback) == 0 {
+			return
+		}
+		path := filepath.Join(homePath, relPath)
+		if current, err := os.ReadFile(path); err == nil && validate(current) {
+			return
+		}
+		if err := writeFileAtomic(path, fallback, 0o600); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", relPath, err))
+		}
+	}
+
+	ensure("google_accounts.json", snapshot.googleAccounts, isValidJSON)
+	ensure("oauth_creds.json", snapshot.oauthCreds, isValidJSON)
+	ensure("state.json", snapshot.state, isValidJSON)
+	ensure("installation_id", snapshot.installationID, isValidNonEmptyText)
 
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
@@ -447,8 +526,76 @@ func repairGeminiManifestFile(homePath, relPath string, fallback []byte) error {
 	return writeFileAtomic(path, []byte("{}\n"), 0o600)
 }
 
+func ensureGeminiExtensionCommands(homePath string) error {
+	extensionsDir := filepath.Join(homePath, "extensions")
+	if info, err := os.Stat(extensionsDir); err != nil || !info.IsDir() {
+		return nil
+	}
+
+	var errs []string
+	err := filepath.WalkDir(extensionsDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			errs = append(errs, walkErr.Error())
+			return nil
+		}
+		if d.IsDir() || filepath.Ext(path) != ".toml" {
+			return nil
+		}
+
+		slashPath := filepath.ToSlash(path)
+		if !strings.Contains(slashPath, "/commands/") {
+			return nil
+		}
+
+		current, err := os.ReadFile(path)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", path, err))
+			return nil
+		}
+		if isValidTOML(current) {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(homePath, path)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", path, err))
+			return nil
+		}
+
+		backup := readGeminiBackupTOML(homePath, relPath)
+		if len(backup) == 0 {
+			quarantinePath := path + ".loom-quarantined"
+			_ = os.Remove(quarantinePath)
+			if err := os.Rename(path, quarantinePath); err != nil {
+				errs = append(errs, fmt.Sprintf("%s invalid and no backup available: %v", relPath, err))
+			}
+			return nil
+		}
+
+		mode := os.FileMode(0o644)
+		if info, err := os.Stat(path); err == nil {
+			mode = info.Mode().Perm()
+		}
+		if err := writeFileAtomic(path, backup, mode); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", relPath, err))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
 func readGeminiBackupJSON(homePath, relPath string) []byte {
 	return readProfileBackupFile(homePath, "gemini", relPath, isValidGeminiJSONObject)
+}
+
+func readGeminiBackupTOML(homePath, relPath string) []byte {
+	return readProfileBackupFile(homePath, "gemini", relPath, isValidTOML)
 }
 
 func profileBackupRoots(homePath, profileName string) []string {
@@ -561,6 +708,17 @@ func isValidGeminiJSONObject(data []byte) bool {
 	return json.Unmarshal(data, &obj) == nil
 }
 
+func isValidJSON(data []byte) bool {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return false
+	}
+	return json.Valid(data)
+}
+
+func isValidNonEmptyText(data []byte) bool {
+	return len(bytes.TrimSpace(data)) > 0
+}
+
 func isValidTOML(data []byte) bool {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return false
@@ -629,6 +787,97 @@ func (m *Manager) SyncAll(backup bool, regen bool, repoOnly bool, hubMode bool, 
 	return nil
 }
 
+// SyncAllProjects propagates the canonical hooks from the current repo's
+// settings.json into all other workspace projects that have a matching
+// <profileRepoDir>/settings.json. Only the "hooks" key is replaced; other
+// top-level keys (permissions, mcpServers, etc.) are preserved.
+func (m *Manager) SyncAllProjects(profileName, workspaceRoot string, skipWorktrees, dryRun bool) (int, error) {
+	p, err := m.GetProfile(profileName)
+	if err != nil {
+		return 0, err
+	}
+
+	// Verify this profile has settings.json as an extra generated file
+	hasSettings := false
+	for _, f := range p.ExtraGeneratedFiles {
+		if f == "settings.json" {
+			hasSettings = true
+			break
+		}
+	}
+	if !hasSettings {
+		return 0, fmt.Errorf("profile %s does not generate settings.json", profileName)
+	}
+
+	// Read canonical settings.json from the current repo
+	canonicalPath := filepath.Join(m.ResolveRepoPath(p), "settings.json")
+	canonicalData, err := os.ReadFile(canonicalPath)
+	if err != nil {
+		return 0, fmt.Errorf("read canonical settings: %w", err)
+	}
+
+	canonicalHooks, err := ExtractHooksFromSettings(canonicalData)
+	if err != nil {
+		return 0, fmt.Errorf("extract hooks from canonical settings: %w", err)
+	}
+	if canonicalHooks == nil {
+		return 0, fmt.Errorf("canonical settings.json has no hooks key")
+	}
+
+	// Discover projects
+	projects, err := DiscoverProjects(workspaceRoot, p.RepoDir, skipWorktrees)
+	if err != nil {
+		return 0, fmt.Errorf("discover projects: %w", err)
+	}
+
+	updated := 0
+	for _, projRoot := range projects {
+		// Skip the current repo
+		if filepath.Clean(projRoot) == filepath.Clean(m.RepoRoot) {
+			continue
+		}
+
+		settingsPath := filepath.Join(projRoot, p.RepoDir, "settings.json")
+		existing, _ := os.ReadFile(settingsPath)
+
+		merged, changed, err := MergeHooksIntoSettings(existing, canonicalHooks)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: merge failed for %s: %v\n", settingsPath, err)
+			continue
+		}
+
+		rel, _ := filepath.Rel(workspaceRoot, projRoot)
+		if !changed {
+			fmt.Printf("  %-40s already up-to-date\n", rel)
+			continue
+		}
+
+		if dryRun {
+			action := "would update"
+			if len(existing) == 0 {
+				action = "would create"
+			}
+			fmt.Printf("  %-40s %s\n", rel, action)
+			updated++
+			continue
+		}
+
+		if err := writeFileAtomic(settingsPath, merged, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: write failed for %s: %v\n", settingsPath, err)
+			continue
+		}
+
+		action := "updated"
+		if len(existing) == 0 {
+			action = "created"
+		}
+		fmt.Printf("  %-40s %s\n", rel, action)
+		updated++
+	}
+
+	return updated, nil
+}
+
 // Regenerate generates the configuration for a profile and updates the repo directory.
 func (m *Manager) Regenerate(p *Profile, hubMode bool, hubURL string, loomMode bool, loomBinary string, resolveSecrets bool) error {
 	if p.GeneratorTarget == "" {
@@ -637,11 +886,14 @@ func (m *Manager) Regenerate(p *Profile, hubMode bool, hubURL string, loomMode b
 
 	// Load registry - prefer local override, then home directory
 	regPath := discoverRegistryPath(m.RepoRoot)
-	reg, err := registry.Load(regPath)
+	reg, err := registry.LoadWithDefaults(regPath)
 	if err != nil {
 		return fmt.Errorf("load registry from %s: %w", regPath, err)
 	}
 	fmt.Printf("Using registry: %s\n", regPath)
+	if err := syncAgentsSafetyPolicy(m.RepoRoot, reg); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: AGENTS.md safety policy sync failed: %v\n", err)
+	}
 
 	// Create temp dir
 	tmpDir, err := os.MkdirTemp("", "loom-gen")
@@ -707,14 +959,27 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 		return nil // No skills registry found, skip silently
 	}
 
+	// When skills go directly to home, clean stale repo copies first.
+	if p.SkillsDirectToHome {
+		m.cleanRepoSkills(p)
+	}
+
 	repoPath := m.ResolveRepoPath(p)
 	fmt.Printf("Generating skills for %s from %s...\n", p.Name, skillsRegPath)
+
+	// When SkillsDirectToHome, generate directly into the home directory
+	// so skills exist in only one place (avoiding duplication warnings).
+	outputDir := ""
+	if p.SkillsDirectToHome {
+		outputDir = m.ResolveHomePath(p)
+	}
 
 	gen, err := skills.NewGenerator(skills.GeneratorOptions{
 		RegistryPath:  skillsRegPath,
 		Target:        p.SkillsTarget,
 		RepoRoot:      m.RepoRoot,
 		WorkspaceRoot: m.RepoRoot,
+		OutputDir:     outputDir,
 		// Codex normally generates directly into ~/.codex/skills; for sync we generate
 		// into the repo's .codex/ so status + sync can verify and propagate changes.
 		CodexSkillsDir: func() string {
@@ -732,13 +997,170 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 		return fmt.Errorf("generate skills: %w", err)
 	}
 
-	// Count generated files from manifest
-	manifest, _ := skills.ReadManifest(repoPath)
+	// Read manifest from the directory where skills were generated.
+	manifestDir := repoPath
+	if p.SkillsDirectToHome {
+		manifestDir = m.ResolveHomePath(p)
+	}
+	manifest, _ := skills.ReadManifest(manifestDir)
 	if manifest != nil {
 		fmt.Printf("Generated %d skill files for %s\n", len(manifest.Generated), p.Name)
 	}
 
 	return nil
+}
+
+// cleanRepoSkills removes stale skill files from the repo directory when
+// skills are generated directly to home (SkillsDirectToHome).
+func (m *Manager) cleanRepoSkills(p *Profile) {
+	repoPath := m.ResolveRepoPath(p)
+
+	// Remove the skills directory (e.g. <repo>/.gemini/skills/)
+	skillsDir := filepath.Join(repoPath, "skills")
+	if Exists(skillsDir) {
+		if err := os.RemoveAll(skillsDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove stale repo skills %s: %v\n", skillsDir, err)
+		} else {
+			fmt.Printf("Cleaned stale repo skills: %s\n", skillsDir)
+		}
+	}
+
+	// Remove the manifest file
+	manifestPath := filepath.Join(repoPath, skills.ManifestFilename)
+	if Exists(manifestPath) {
+		if err := os.Remove(manifestPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove stale manifest %s: %v\n", manifestPath, err)
+		}
+	}
+
+	// Remove instructions.md/GEMINI.md if it exists (generated alongside skills)
+	for _, f := range []string{"instructions.md", "GEMINI.md"} {
+		p := filepath.Join(repoPath, f)
+		if Exists(p) {
+			if err := os.Remove(p); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not remove stale %s %s: %v\n", f, p, err)
+			}
+		}
+	}
+}
+
+// pruneGeminiMCPExtensions scans ~/.gemini/extensions/*/gemini-extension.json
+// and removes any extension directory whose manifest defines mcpServers.
+// These are redundant because the loom proxy covers all MCP needs.
+// Returns the list of pruned extension names.
+func pruneGeminiMCPExtensions(homePath string) ([]string, error) {
+	extensionsDir := filepath.Join(homePath, "extensions")
+	if !Exists(extensionsDir) {
+		return nil, nil
+	}
+
+	entries, err := os.ReadDir(extensionsDir)
+	if err != nil {
+		return nil, fmt.Errorf("read extensions dir: %w", err)
+	}
+
+	var pruned []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		manifestPath := filepath.Join(extensionsDir, name, "gemini-extension.json")
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			continue // No manifest, skip
+		}
+
+		var manifest map[string]json.RawMessage
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			continue
+		}
+
+		if _, hasMCP := manifest["mcpServers"]; !hasMCP {
+			continue // No MCP servers, preserve this extension
+		}
+
+		extDir := filepath.Join(extensionsDir, name)
+		if err := os.RemoveAll(extDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not prune extension %s: %v\n", name, err)
+			continue
+		}
+		pruned = append(pruned, name)
+		fmt.Printf("Pruned Gemini MCP extension: %s\n", name)
+	}
+
+	if len(pruned) > 0 {
+		if err := removeFromExtensionEnablement(homePath, pruned); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not update extension-enablement.json: %v\n", err)
+		}
+	}
+
+	return pruned, nil
+}
+
+// removeFromExtensionEnablement removes pruned extension names from
+// ~/.gemini/extensions/extension-enablement.json.
+func removeFromExtensionEnablement(homePath string, names []string) error {
+	path := filepath.Join(homePath, "extensions", "extension-enablement.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return nil // Invalid JSON, leave as-is
+	}
+
+	changed := false
+	for _, name := range names {
+		if _, ok := obj[name]; ok {
+			delete(obj, name)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	updated, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, append(updated, '\n'), 0o600)
+}
+
+// filterPrunedExtensions removes pruned extension manifests from the pre-sync
+// snapshot so ensureGeminiExtensionManifests() doesn't restore them.
+func filterPrunedExtensions(snapshot geminiConfigSnapshot, pruned []string) geminiConfigSnapshot {
+	if len(pruned) == 0 || len(snapshot.extensionManifests) == 0 {
+		return snapshot
+	}
+
+	prunedSet := make(map[string]struct{}, len(pruned))
+	for _, name := range pruned {
+		prunedSet[name] = struct{}{}
+	}
+
+	filtered := make(map[string][]byte, len(snapshot.extensionManifests))
+	for relPath, data := range snapshot.extensionManifests {
+		// relPath is like "extensions/<name>/gemini-extension.json"
+		parts := strings.Split(filepath.ToSlash(relPath), "/")
+		if len(parts) >= 2 {
+			extName := parts[1] // "extensions/<name>/..."
+			if _, isPruned := prunedSet[extName]; isPruned {
+				continue
+			}
+		}
+		filtered[relPath] = data
+	}
+
+	snapshot.extensionManifests = filtered
+	return snapshot
 }
 
 // SyncSkills generates and syncs skill files for a profile.
@@ -754,6 +1176,16 @@ func (m *Manager) SyncSkills(profileName string) error {
 	// Generate skills
 	if err := m.regenerateSkills(p); err != nil {
 		return err
+	}
+
+	// When skills are generated directly to home, no copy step needed.
+	if p.SkillsDirectToHome {
+		homePath := m.ResolveHomePath(p)
+		manifest, _ := skills.ReadManifest(homePath)
+		if manifest != nil {
+			fmt.Printf("Generated %d skill files directly to %s\n", len(manifest.Generated), homePath)
+		}
+		return nil
 	}
 
 	// Sync skill files from repo to home

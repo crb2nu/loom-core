@@ -37,6 +37,9 @@ type FileConfig struct {
 	// RBAC controls role-based access control for tool calls
 	RBAC RBACConfig `yaml:"rbac,omitempty"`
 
+	// Policy controls gateway request/response policy enforcement hooks
+	Policy GatewayPolicyConfig `yaml:"policy,omitempty"`
+
 	// Audit controls structured tool call logging
 	Audit AuditConfig `yaml:"audit,omitempty"`
 
@@ -217,6 +220,9 @@ type HubConfig struct {
 	// PreferHub forces routing to prefer hub over local servers when available.
 	PreferHub bool `yaml:"prefer_hub,omitempty"`
 
+	// DisableOnAuthFailure disables hub fallback if discovery is auth-gated.
+	DisableOnAuthFailure bool `yaml:"disable_on_auth_failure,omitempty"`
+
 	// Profile is the hub profile to use (e.g., "codex", "claude")
 	Profile string `yaml:"profile"`
 
@@ -240,6 +246,11 @@ type HubConfig struct {
 type HealthConfig struct {
 	// CheckIntervalSeconds between health checks (default: 30)
 	CheckIntervalSeconds int `yaml:"check_interval_seconds,omitempty"`
+
+	// DeepProbeIntervalMinutes between full process-spawning probes (default: 5).
+	// Between deep probes, lightweight pool-based probes are used to reduce
+	// CPU/memory churn. Set to 0 to always use deep probes.
+	DeepProbeIntervalMinutes int `yaml:"deep_probe_interval_minutes,omitempty"`
 
 	// HealthyThreshold consecutive successes to mark healthy (default: 2)
 	HealthyThreshold int `yaml:"healthy_threshold,omitempty"`
@@ -282,6 +293,11 @@ func (c *HealthConfig) ToHealthMonitorConfig() HealthMonitorConfig {
 	if c.RestartCooldownMinutes > 0 {
 		cfg.RestartCooldown = time.Duration(c.RestartCooldownMinutes) * time.Minute
 	}
+	if c.DeepProbeIntervalMinutes > 0 {
+		cfg.DeepProbeInterval = time.Duration(c.DeepProbeIntervalMinutes) * time.Minute
+	} else if c.DeepProbeIntervalMinutes < 0 {
+		cfg.DeepProbeInterval = 0 // explicit disable → always deep probe
+	}
 	return cfg
 }
 
@@ -298,6 +314,9 @@ type ProxyConfig struct {
 
 	// HeartbeatIntervalMs is the minimum interval between proxy heartbeats (default: 5000)
 	HeartbeatIntervalMs int `yaml:"heartbeat_interval_ms,omitempty"`
+
+	// IdleExitSeconds is how long an idle proxy waits for MCP messages before exiting (default: 1800)
+	IdleExitSeconds int `yaml:"idle_exit_seconds,omitempty"`
 }
 
 // RoutingConfig controls per-server routing preferences.
@@ -376,10 +395,11 @@ func DefaultFileConfig() FileConfig {
 			SessionTimeoutMinutes: 30,
 			MaxSessions:           1000,
 		},
-		RBAC:  DefaultRBACConfig(),
-		Audit: DefaultAuditConfig(),
-		Cost:  DefaultCostConfig(),
-		Debug: false,
+		RBAC:   DefaultRBACConfig(),
+		Policy: DefaultGatewayPolicyConfig(),
+		Audit:  DefaultAuditConfig(),
+		Cost:   DefaultCostConfig(),
+		Debug:  false,
 	}
 }
 

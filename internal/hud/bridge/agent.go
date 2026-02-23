@@ -3,7 +3,9 @@ package bridge
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,11 +17,12 @@ import (
 // and unmarshals the result into a clean Go struct.
 type AgentBridge struct {
 	client *DaemonClient
+	cache  *Cache // session lookup cache (internal, always in-memory)
 }
 
 // NewAgentBridge creates an AgentBridge backed by the given DaemonClient.
 func NewAgentBridge(client *DaemonClient) *AgentBridge {
-	return &AgentBridge{client: client}
+	return &AgentBridge{client: client, cache: NewCache()}
 }
 
 // --- DTO structs ---
@@ -156,13 +159,17 @@ type ContextEntryInfo struct {
 
 // ContextEntry is the inner entry within a context search result.
 type ContextEntry struct {
-	ID        string `json:"id"`
-	EntryType string `json:"entry_type"`
-	AgentID   string `json:"agent_id"`
-	Namespace string `json:"namespace"`
-	Title     string `json:"title"`
-	Content   string `json:"content,omitempty"`
-	Timestamp string `json:"timestamp"`
+	ID         string `json:"id"`
+	EntryType  string `json:"entry_type"`
+	AgentID    string `json:"agent_id"`
+	Namespace  string `json:"namespace"`
+	Title      string `json:"title"`
+	Content    string `json:"content,omitempty"`
+	FilePath   string `json:"file_path,omitempty"`
+	LineStart  int    `json:"line_start,omitempty"`
+	LineEnd    int    `json:"line_end,omitempty"`
+	TokenCount int    `json:"token_count,omitempty"`
+	Timestamp  string `json:"timestamp"`
 }
 
 // ContextInspectBucket describes aggregate context weight by entry type.
@@ -191,23 +198,38 @@ type ContextInspectTasks struct {
 	Completed  int `json:"completed"`
 }
 
+// ContextInspectSection describes estimated prompt budget by section.
+type ContextInspectSection struct {
+	Section         string `json:"section"`
+	Chars           int    `json:"chars"`
+	EstimatedTokens int    `json:"estimated_tokens"`
+	Source          string `json:"source"`
+}
+
 // ContextInspectResult is a context budget breakdown for a session.
 type ContextInspectResult struct {
-	SessionID       string                   `json:"session_id"`
-	AgentID         string                   `json:"agent_id,omitempty"`
-	Namespace       string                   `json:"namespace,omitempty"`
-	SessionStatus   string                   `json:"session_status,omitempty"`
-	Limit           int                      `json:"limit"`
-	EntryCount      int                      `json:"entry_count"`
-	ContextChars    int                      `json:"context_chars"`
-	EstimatedTokens int                      `json:"estimated_tokens"`
-	Truncated       bool                     `json:"truncated"`
-	ByEntryType     []ContextInspectBucket   `json:"by_entry_type"`
-	TopEntries      []ContextInspectTopEntry `json:"top_entries,omitempty"`
-	Tasks           ContextInspectTasks      `json:"tasks"`
-	Memory          *MemoryStatsResult       `json:"memory,omitempty"`
-	RetrievedAt     string                   `json:"retrieved_at"`
+	SessionID              string                   `json:"session_id"`
+	AgentID                string                   `json:"agent_id,omitempty"`
+	Namespace              string                   `json:"namespace,omitempty"`
+	SessionStatus          string                   `json:"session_status,omitempty"`
+	Limit                  int                      `json:"limit"`
+	EntryCount             int                      `json:"entry_count"`
+	ContextChars           int                      `json:"context_chars"`
+	ContextEstimatedTokens int                      `json:"context_estimated_tokens"`
+	EstimatedTokens        int                      `json:"estimated_tokens"`
+	Truncated              bool                     `json:"truncated"`
+	ByEntryType            []ContextInspectBucket   `json:"by_entry_type"`
+	TopEntries             []ContextInspectTopEntry `json:"top_entries,omitempty"`
+	Sections               []ContextInspectSection  `json:"sections"`
+	Tasks                  ContextInspectTasks      `json:"tasks"`
+	Memory                 *MemoryStatsResult       `json:"memory,omitempty"`
+	RetrievedAt            string                   `json:"retrieved_at"`
 }
+
+const (
+	contextInspectSystemPromptTokensDefault   = 768
+	contextInspectResponseBudgetTokensDefault = 2048
+)
 
 func normalizeEntityInfo(e *EntityInfo) {
 	if e == nil {
@@ -308,6 +330,60 @@ func (a *AgentBridge) callAgentTool(toolName string, args map[string]any, target
 	return nil
 }
 
+// callAgentToolTimeout is like callAgentTool but uses a per-call timeout
+// override on the underlying DaemonClient RPC.
+func (a *AgentBridge) callAgentToolTimeout(toolName string, args map[string]any, target any, timeout time.Duration) error {
+	raw, err := a.client.CallToolWithTimeout("agent_context__"+toolName, args, timeout)
+	if err != nil {
+		return fmt.Errorf("agent tool %s: %w", toolName, err)
+	}
+
+	var envelope mcpCallToolResult
+	if err := json.Unmarshal(raw, &envelope); err == nil {
+		if envelope.IsError {
+			errText := "tool returned error"
+			for _, c := range envelope.Content {
+				if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
+					errText = strings.TrimSpace(c.Text)
+					break
+				}
+			}
+			return fmt.Errorf("agent tool %s: %s", toolName, errText)
+		}
+		if target == nil {
+			return nil
+		}
+		for _, c := range envelope.Content {
+			if c.Type == "text" && c.Text != "" {
+				if err := json.Unmarshal([]byte(c.Text), target); err != nil {
+					jsonBytes, toonErr := mcp.DecodeTOONToJSON(c.Text)
+					if toonErr != nil {
+						return fmt.Errorf("unmarshal %s text (json: %v, toon: %v)", toolName, err, toonErr)
+					}
+					if err := json.Unmarshal(jsonBytes, target); err != nil {
+						return fmt.Errorf("unmarshal %s decoded toon: %w", toolName, err)
+					}
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("unmarshal %s result: no text content in envelope", toolName)
+	}
+
+	if target == nil {
+		return nil
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return fmt.Errorf("unmarshal %s result: %w", toolName, err)
+	}
+	return nil
+}
+
+// invalidateSessionCache removes the cached active-session entry for an agent.
+func (a *AgentBridge) invalidateSessionCache(agentID string) {
+	a.cache.Invalidate("active_session:" + agentID)
+}
+
 // --- Public methods ---
 
 // Sessions returns all agent sessions.
@@ -319,6 +395,33 @@ func (a *AgentBridge) Sessions() ([]SessionInfo, error) {
 		return nil, err
 	}
 	return result.Sessions, nil
+}
+
+// ListSessions calls agent_session_list with arbitrary parameters and returns raw JSON.
+func (a *AgentBridge) ListSessions(params map[string]any) (json.RawMessage, error) {
+	var result json.RawMessage
+	if err := a.callAgentTool("agent_session_list", params, &result); err != nil {
+		return nil, err
+	}
+	raw, _ := json.Marshal(result)
+	return raw, nil
+}
+
+// PruneSessions calls agent_session_prune with arbitrary parameters and returns raw JSON.
+func (a *AgentBridge) PruneSessions(params map[string]any) (json.RawMessage, error) {
+	var result json.RawMessage
+	if err := a.callAgentTool("agent_session_prune", params, &result); err != nil {
+		return nil, err
+	}
+	raw, _ := json.Marshal(result)
+	return raw, nil
+}
+
+// DeleteSession calls agent_session_delete for a single session.
+func (a *AgentBridge) DeleteSession(sessionID string) error {
+	return a.callAgentTool("agent_session_delete", map[string]any{
+		"session_id": sessionID,
+	}, nil)
 }
 
 // Tasks returns tasks for a specific session.
@@ -688,10 +791,10 @@ func (a *AgentBridge) CreateTask(p CreateTaskParams) error {
 
 // UpdateTaskParams holds all fields for task updates.
 type UpdateTaskParams struct {
-	ID         string
-	Status     string
-	Priority   string
-	Resolution string // For completed tasks
+	ID         string `json:"task_id"`
+	Status     string `json:"status"`
+	Priority   string `json:"priority,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
 }
 
 // UpdateTask updates a task's status, priority, and/or resolution.
@@ -981,8 +1084,12 @@ func (a *AgentBridge) ContextInspect(agentID, sessionID string, detail bool, lim
 
 	byType := make(map[string]*ContextInspectBucket)
 	top := make([]ContextInspectTopEntry, 0, len(entries))
-	totalChars := 0
-	totalTokens := 0
+	totalContextChars := 0
+	totalContextTokens := 0
+	contextEntryChars := 0
+	contextEntryTokens := 0
+	fileInjectionChars := 0
+	fileInjectionTokens := 0
 
 	for _, wrapped := range entries {
 		entry := wrapped.Entry
@@ -991,9 +1098,19 @@ func (a *AgentBridge) ContextInspect(agentID, sessionID string, detail bool, lim
 			entryType = "note"
 		}
 		chars := estimateContextChars(entry)
-		tokens := estimateContextTokens(chars)
-		totalChars += chars
-		totalTokens += tokens
+		tokens := entry.TokenCount
+		if tokens <= 0 {
+			tokens = estimateContextTokens(chars)
+		}
+		totalContextChars += chars
+		totalContextTokens += tokens
+		if isFileInjectionEntry(entry, entryType) {
+			fileInjectionChars += chars
+			fileInjectionTokens += tokens
+		} else {
+			contextEntryChars += chars
+			contextEntryTokens += tokens
+		}
 
 		b := byType[entryType]
 		if b == nil {
@@ -1029,14 +1146,56 @@ func (a *AgentBridge) ContextInspect(agentID, sessionID string, detail bool, lim
 
 	if detail {
 		sort.SliceStable(top, func(i, j int) bool {
-			if top[i].Chars == top[j].Chars {
+			if top[i].EstimatedTokens == top[j].EstimatedTokens {
 				return top[i].Timestamp > top[j].Timestamp
 			}
-			return top[i].Chars > top[j].Chars
+			return top[i].EstimatedTokens > top[j].EstimatedTokens
 		})
 		if len(top) > 20 {
 			top = top[:20]
 		}
+	}
+
+	systemPromptTokens, responseBudgetTokens, promptBudgetSource := contextInspectPromptBudget(agentID)
+	systemPromptChars := systemPromptTokens * 4
+	toolSchemaChars, toolSchemaTokens := a.estimateToolSchemaBudget()
+	responseBudgetChars := responseBudgetTokens * 4
+
+	sections := []ContextInspectSection{
+		{
+			Section:         "system_prompt",
+			Chars:           systemPromptChars,
+			EstimatedTokens: systemPromptTokens,
+			Source:          promptBudgetSource,
+		},
+		{
+			Section:         "tools_schema",
+			Chars:           toolSchemaChars,
+			EstimatedTokens: toolSchemaTokens,
+			Source:          "measured",
+		},
+		{
+			Section:         "context_entries",
+			Chars:           contextEntryChars,
+			EstimatedTokens: contextEntryTokens,
+			Source:          "measured",
+		},
+		{
+			Section:         "file_injections",
+			Chars:           fileInjectionChars,
+			EstimatedTokens: fileInjectionTokens,
+			Source:          "measured",
+		},
+		{
+			Section:         "response_budget",
+			Chars:           responseBudgetChars,
+			EstimatedTokens: responseBudgetTokens,
+			Source:          promptBudgetSource,
+		},
+	}
+	promptEstimatedTokens := 0
+	for _, s := range sections {
+		promptEstimatedTokens += s.EstimatedTokens
 	}
 
 	tasksSummary := ContextInspectTasks{}
@@ -1060,17 +1219,19 @@ func (a *AgentBridge) ContextInspect(agentID, sessionID string, detail bool, lim
 	}
 
 	result := &ContextInspectResult{
-		SessionID:       sessionID,
-		Limit:           limit,
-		EntryCount:      len(entries),
-		ContextChars:    totalChars,
-		EstimatedTokens: totalTokens,
-		Truncated:       len(entries) >= limit,
-		ByEntryType:     buckets,
-		TopEntries:      top,
-		Tasks:           tasksSummary,
-		Memory:          memory,
-		RetrievedAt:     time.Now().UTC().Format(time.RFC3339),
+		SessionID:              sessionID,
+		Limit:                  limit,
+		EntryCount:             len(entries),
+		ContextChars:           totalContextChars,
+		ContextEstimatedTokens: totalContextTokens,
+		EstimatedTokens:        promptEstimatedTokens,
+		Truncated:              len(entries) >= limit,
+		ByEntryType:            buckets,
+		TopEntries:             top,
+		Sections:               sections,
+		Tasks:                  tasksSummary,
+		Memory:                 memory,
+		RetrievedAt:            time.Now().UTC().Format(time.RFC3339),
 	}
 	if sessionMeta != nil {
 		result.AgentID = sessionMeta.AgentID
@@ -1087,9 +1248,12 @@ func (a *AgentBridge) ContextInspect(agentID, sessionID string, detail bool, lim
 }
 
 func estimateContextChars(entry ContextEntry) int {
-	chars := len(entry.Title) + len(entry.Content)
+	chars := len(entry.Title) + len(entry.Content) + len(entry.FilePath)
 	// Include minimal metadata overhead so very short entries are still represented.
 	chars += len(entry.EntryType) + len(entry.Timestamp)
+	if entry.LineStart > 0 || entry.LineEnd > 0 {
+		chars += 12
+	}
 	return chars
 }
 
@@ -1099,6 +1263,76 @@ func estimateContextTokens(chars int) int {
 	}
 	// Simple approximation used elsewhere in HUD docs: ~4 chars/token.
 	return (chars + 3) / 4
+}
+
+func contextInspectPromptBudget(agentID string) (systemPromptTokens int, responseBudgetTokens int, source string) {
+	systemPromptTokens = contextInspectSystemPromptTokensDefault
+	responseBudgetTokens = contextInspectResponseBudgetTokensDefault
+	source = "heuristic:default"
+
+	lowerAgentID := strings.ToLower(strings.TrimSpace(agentID))
+	switch {
+	case strings.Contains(lowerAgentID, "claude"):
+		systemPromptTokens = 1024
+		responseBudgetTokens = 4096
+		source = "heuristic:claude"
+	case strings.Contains(lowerAgentID, "gemini"):
+		systemPromptTokens = 900
+		responseBudgetTokens = 3072
+		source = "heuristic:gemini"
+	case strings.Contains(lowerAgentID, "codex"), strings.Contains(lowerAgentID, "openai"):
+		systemPromptTokens = 896
+		responseBudgetTokens = 2048
+		source = "heuristic:codex"
+	}
+
+	if v, ok := parsePositiveIntEnv("LOOM_HUD_CONTEXT_SYSTEM_PROMPT_TOKENS"); ok {
+		systemPromptTokens = v
+		source = "configured:env"
+	}
+	if v, ok := parsePositiveIntEnv("LOOM_HUD_CONTEXT_RESPONSE_BUDGET_TOKENS"); ok {
+		responseBudgetTokens = v
+		source = "configured:env"
+	}
+
+	return systemPromptTokens, responseBudgetTokens, source
+}
+
+func parsePositiveIntEnv(key string) (int, bool) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0, false
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+func isFileInjectionEntry(entry ContextEntry, entryType string) bool {
+	t := strings.ToLower(strings.TrimSpace(entryType))
+	if t == "file_read" || t == "code_context" {
+		return true
+	}
+	return strings.TrimSpace(entry.FilePath) != ""
+}
+
+func (a *AgentBridge) estimateToolSchemaBudget() (chars int, tokens int) {
+	if a == nil || a.client == nil {
+		return 0, 0
+	}
+	toolsResult, err := a.client.Tools()
+	if err != nil || toolsResult == nil {
+		return 0, 0
+	}
+	for _, tool := range toolsResult.Tools {
+		chars += len(tool.Name) + len(tool.Description)
+		if schemaJSON, err := json.Marshal(tool.InputSchema); err == nil {
+			chars += len(schemaJSON)
+		}
+	}
+	return chars, estimateContextTokens(chars)
 }
 
 // --- Reasoning chain methods ---
@@ -1173,8 +1407,53 @@ type HandoffInfo struct {
 	AcceptedAt string `json:"accepted_at,omitempty"`
 }
 
-// HandoffList returns pending handoffs.
-func (a *AgentBridge) HandoffList() ([]HandoffInfo, error) {
+type handoffInboxEntry struct {
+	HandoffID    string `json:"handoff_id"`
+	SourceAgent  string `json:"source_agent"`
+	Status       string `json:"status"`
+	Instructions string `json:"instructions,omitempty"`
+	Summary      string `json:"summary"`
+	CreatedAt    string `json:"created_at"`
+}
+
+func isUnknownToolErr(err error, toolName string) bool {
+	if err == nil || strings.TrimSpace(toolName) == "" {
+		return false
+	}
+	return strings.Contains(err.Error(), "unknown tool: "+toolName)
+}
+
+func (a *AgentBridge) handoffInbox(agentID string, includeViewed bool) ([]HandoffInfo, error) {
+	args := map[string]any{
+		"agent_id": agentID,
+	}
+	if includeViewed {
+		args["include_viewed"] = true
+	}
+
+	var result struct {
+		Handoffs []handoffInboxEntry `json:"handoffs"`
+	}
+	if err := a.callAgentTool("agent_handoff_inbox", args, &result); err != nil {
+		return nil, err
+	}
+
+	out := make([]HandoffInfo, 0, len(result.Handoffs))
+	for _, h := range result.Handoffs {
+		out = append(out, HandoffInfo{
+			ID:        h.HandoffID,
+			FromAgent: h.SourceAgent,
+			ToAgent:   agentID,
+			Status:    h.Status,
+			Summary:   h.Summary,
+			Context:   h.Instructions,
+			CreatedAt: h.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+func (a *AgentBridge) handoffListLegacy() ([]HandoffInfo, error) {
 	var result struct {
 		Handoffs []HandoffInfo `json:"handoffs"`
 	}
@@ -1182,6 +1461,61 @@ func (a *AgentBridge) HandoffList() ([]HandoffInfo, error) {
 		return nil, err
 	}
 	return result.Handoffs, nil
+}
+
+// HandoffList returns pending/viewed handoffs across active/offline agents.
+// It prefers the newer inbox API and falls back to the legacy list tool.
+func (a *AgentBridge) HandoffList() ([]HandoffInfo, error) {
+	agents, err := a.PresenceList(true)
+	if err != nil {
+		legacy, legacyErr := a.handoffListLegacy()
+		if legacyErr == nil {
+			return legacy, nil
+		}
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	combined := make([]HandoffInfo, 0)
+	var inboxErr error
+	var inboxSuccess bool
+
+	for _, agent := range agents {
+		agentID := strings.TrimSpace(agent.AgentID)
+		if agentID == "" {
+			continue
+		}
+		handoffs, err := a.handoffInbox(agentID, true)
+		if err != nil {
+			if isUnknownToolErr(err, "agent_handoff_inbox") {
+				return a.handoffListLegacy()
+			}
+			if inboxErr == nil {
+				inboxErr = err
+			}
+			continue
+		}
+		inboxSuccess = true
+		for _, h := range handoffs {
+			if strings.TrimSpace(h.ID) == "" {
+				continue
+			}
+			if _, ok := seen[h.ID]; ok {
+				continue
+			}
+			seen[h.ID] = struct{}{}
+			combined = append(combined, h)
+		}
+	}
+
+	if inboxSuccess || len(agents) == 0 {
+		return combined, nil
+	}
+
+	if inboxErr != nil {
+		return nil, inboxErr
+	}
+	return combined, nil
 }
 
 // HandoffCreate creates a new handoff.
@@ -1288,8 +1622,11 @@ type SessionStartResult struct {
 // StartSession creates a session, registers presence, and optionally recalls context.
 // It is idempotent: if the agent already has an active session in the same namespace,
 // it returns the existing session ID instead of creating a new one.
+//
+// Presence registration and context recall are fire-and-forget: they run in
+// background goroutines so the caller is not blocked by non-critical MCP calls.
 func (a *AgentBridge) StartSession(p SessionStartParams) (*SessionStartResult, error) {
-	// Check for existing active session in the same namespace.
+	// Check for existing active session in the same namespace (cached, fast path).
 	if existing, err := a.GetActiveSession(p.AgentID); err == nil && existing != nil {
 		if existing.Namespace == p.Namespace && existing.Status == "active" {
 			return &SessionStartResult{
@@ -1299,7 +1636,7 @@ func (a *AgentBridge) StartSession(p SessionStartParams) (*SessionStartResult, e
 		}
 	}
 
-	// Start a new session.
+	// Start a new session (blocking, required, 8s timeout).
 	args := map[string]any{
 		"namespace":   p.Namespace,
 		"description": p.Description,
@@ -1310,11 +1647,19 @@ func (a *AgentBridge) StartSession(p SessionStartParams) (*SessionStartResult, e
 	var sessionResult struct {
 		SessionID string `json:"session_id"`
 	}
-	if err := a.callAgentTool("agent_session_start", args, &sessionResult); err != nil {
+	if err := a.callAgentToolTimeout("agent_session_start", args, &sessionResult, 8*time.Second); err != nil {
 		return nil, fmt.Errorf("start session: %w", err)
 	}
 
-	// Register presence.
+	// Invalidate the session cache so subsequent GetActiveSession picks up
+	// the newly created session.
+	a.invalidateSessionCache(p.AgentID)
+
+	result := &SessionStartResult{
+		SessionID: sessionResult.SessionID,
+	}
+
+	// Fire-and-forget: register presence (non-critical, error already ignored).
 	presenceArgs := map[string]any{
 		"agent_id":   p.AgentID,
 		"session_id": sessionResult.SessionID,
@@ -1325,13 +1670,9 @@ func (a *AgentBridge) StartSession(p SessionStartParams) (*SessionStartResult, e
 	if p.Description != "" {
 		presenceArgs["description"] = p.Description
 	}
-	_ = a.callAgentTool("agent_presence_register", presenceArgs, nil)
+	go func() { _ = a.callAgentTool("agent_presence_register", presenceArgs, nil) }()
 
-	result := &SessionStartResult{
-		SessionID: sessionResult.SessionID,
-	}
-
-	// Optional: recall context.
+	// Fire-and-forget: recall context (best-effort, not returned to caller).
 	if p.AutoRecall {
 		recallArgs := map[string]any{
 			"query":        p.Description,
@@ -1340,12 +1681,7 @@ func (a *AgentBridge) StartSession(p SessionStartParams) (*SessionStartResult, e
 		if p.Namespace != "" {
 			recallArgs["file_context"] = p.Namespace
 		}
-		var recallResult struct {
-			Summary string `json:"summary"`
-		}
-		if err := a.callAgentTool("agent_context_recall_enhanced", recallArgs, &recallResult); err == nil {
-			result.RecalledContext = recallResult.Summary
-		}
+		go func() { _ = a.callAgentTool("agent_context_recall_enhanced", recallArgs, nil) }()
 	}
 
 	return result, nil
@@ -1382,6 +1718,11 @@ func (a *AgentBridge) EndSession(p SessionEndParams) (bool, error) {
 	}
 	if err := a.callAgentTool("agent_session_end", args, nil); err != nil {
 		return false, fmt.Errorf("end session: %w", err)
+	}
+
+	// Invalidate the session cache so subsequent lookups reflect the ended session.
+	if p.AgentID != "" {
+		a.invalidateSessionCache(p.AgentID)
 	}
 
 	// Deregister presence (best-effort).
@@ -1448,18 +1789,38 @@ func (a *AgentBridge) PresenceRegister(agentID, sessionID, agentType, descriptio
 }
 
 // GetActiveSession finds the currently active session for an agent.
-// Returns nil if no active session exists.
+// Results are cached for 30 seconds to avoid repeated full session list
+// fetches from the MCP server. Returns nil if no active session exists.
 func (a *AgentBridge) GetActiveSession(agentID string) (*SessionInfo, error) {
-	sessions, err := a.Sessions()
-	if err != nil {
+	cacheKey := "active_session:" + agentID
+	if cached, ok := a.cache.Get(cacheKey); ok {
+		// Cache hit — may be nil (*SessionInfo) for "no active session".
+		s, _ := cached.(*SessionInfo)
+		return s, nil
+	}
+
+	// Query with agent_id + status filter to avoid hitting the default 20-item
+	// limit when the agent's sessions fall outside the unfiltered window.
+	var listResult struct {
+		Sessions []SessionInfo `json:"sessions"`
+	}
+	args := map[string]any{
+		"agent_id": agentID,
+		"status":   "active",
+		"limit":    1,
+	}
+	if err := a.callAgentTool("agent_session_list", args, &listResult); err != nil {
 		return nil, err
 	}
-	for i := range sessions {
-		if sessions[i].AgentID == agentID && sessions[i].Status == "active" {
-			return &sessions[i], nil
-		}
+
+	var result *SessionInfo
+	if len(listResult.Sessions) > 0 {
+		result = &listResult.Sessions[0]
 	}
-	return nil, nil
+
+	// Cache both hits and misses to avoid redundant fetches.
+	a.cache.Set(cacheKey, result, 30*time.Second)
+	return result, nil
 }
 
 // --- Dispatch + Claim methods ---
@@ -1470,6 +1831,10 @@ type DispatchTaskParams struct {
 	Title         string
 	Context       string
 	Priority      string
+	Tags          []string
+	FilePath      string
+	LineNumber    int
+	BlockedBy     []string
 }
 
 // DispatchTask creates a task and a handoff targeting a specific agent.
@@ -1486,17 +1851,23 @@ func (a *AgentBridge) DispatchTask(p DispatchTaskParams) (map[string]any, error)
 		sessionID = session.ID
 	}
 
+	taskCreated := false
+
 	// Create the task.
 	if sessionID != "" {
 		if err := a.CreateTask(CreateTaskParams{
-			SessionID: sessionID,
-			Title:     p.Title,
-			Context:   p.Context,
-			Priority:  p.Priority,
-			Tags:      []string{"dispatched"},
+			SessionID:  sessionID,
+			Title:      p.Title,
+			Context:    p.Context,
+			Priority:   p.Priority,
+			Tags:       mergeDispatchTags(p.Tags),
+			FilePath:   p.FilePath,
+			LineNumber: p.LineNumber,
+			BlockedBy:  p.BlockedBy,
 		}); err != nil {
 			return nil, fmt.Errorf("create task: %w", err)
 		}
+		taskCreated = true
 	}
 
 	// Create a handoff targeting the agent.
@@ -1511,7 +1882,27 @@ func (a *AgentBridge) DispatchTask(p DispatchTaskParams) (map[string]any, error)
 		"session_id":      sessionID,
 		"title":           p.Title,
 		"priority":        p.Priority,
+		"task_created":    taskCreated,
+		"handoff_created": true,
 	}, nil
+}
+
+func mergeDispatchTags(tags []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(tags)+1)
+
+	for _, tag := range append([]string{"dispatched"}, tags...) {
+		normalized := strings.TrimSpace(tag)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out
 }
 
 // ReleaseFileClaim releases a specific file claim for an agent.
@@ -1525,17 +1916,28 @@ func (a *AgentBridge) ReleaseFileClaim(agentID, filePath string) error {
 
 // HandoffListForAgent returns pending handoffs targeted at a specific agent.
 func (a *AgentBridge) HandoffListForAgent(agentID string) ([]HandoffInfo, error) {
-	all, err := a.HandoffList()
+	if strings.TrimSpace(agentID) == "" {
+		return []HandoffInfo{}, nil
+	}
+
+	handoffs, err := a.handoffInbox(agentID, false)
 	if err != nil {
+		if isUnknownToolErr(err, "agent_handoff_inbox") {
+			all, legacyErr := a.handoffListLegacy()
+			if legacyErr != nil {
+				return nil, legacyErr
+			}
+			result := make([]HandoffInfo, 0, len(all))
+			for _, h := range all {
+				if h.Status == "pending" && (h.ToAgent == agentID || h.ToAgent == "") {
+					result = append(result, h)
+				}
+			}
+			return result, nil
+		}
 		return nil, err
 	}
-	var result []HandoffInfo
-	for _, h := range all {
-		if h.Status == "pending" && (h.ToAgent == agentID || h.ToAgent == "") {
-			result = append(result, h)
-		}
-	}
-	return result, nil
+	return handoffs, nil
 }
 
 // --- Tunnel/cache methods ---

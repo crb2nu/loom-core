@@ -74,7 +74,10 @@ func inferRegistryRoot(registryPath string) string {
 	return filepath.Dir(registryPath)
 }
 
-func inferWorkspaceRoot(candidate string) string {
+// InferWorkspaceRoot walks up from candidate looking for the workspace root
+// (identified by a services/loom-core subdirectory). Returns candidate as
+// fallback if no match is found.
+func InferWorkspaceRoot(candidate string) string {
 	if candidate == "" {
 		return ""
 	}
@@ -118,7 +121,7 @@ func GenerateConfigsWithPath(reg *registry.Registry, registryPath string, output
 	}
 
 	// Resolve repo root from registry path
-	workspaceRoot := inferWorkspaceRoot(registry.GetRepoRoot(registryPath))
+	workspaceRoot := InferWorkspaceRoot(registry.GetRepoRoot(registryPath))
 	registryRoot := inferRegistryRoot(registryPath)
 
 	for _, target := range targets {
@@ -590,69 +593,149 @@ func validateSettingsAgainstUpstream(target, filePath string, content []byte) {
 func claudeHooksConfig(reg *registry.Registry) map[string]any {
 	return map[string]any{
 		"permissions": claudePermissions(reg),
-		"hooks":       claudeHooks(),
+		"hooks":       claudeHooks(reg),
+	}
+}
+
+// hookPlatformConfig defines the platform-specific parameters needed to
+// generate lifecycle hooks (SessionStart, session-end, heartbeat).
+// Claude and Gemini share the same hook structure but differ in event names
+// and tool matchers.
+type hookPlatformConfig struct {
+	AgentID          string // "claude-code" or "gemini-cli"
+	AgentType        string // same as AgentID for now
+	Description      string // "Claude Code session" or "Gemini CLI session"
+	SessionEndEvent  string // "Stop" (Claude) or "SessionEnd" (Gemini)
+	HeartbeatEvent   string // "PostToolUse" (Claude) or "AfterTool" (Gemini)
+	HeartbeatMatcher string // "Bash|Task" (Claude) or "run_shell_command" (Gemini)
+}
+
+// buildPlatformHooks generates the shared SessionStart / session-end / heartbeat
+// hooks for any platform that supports lifecycle hooks. Platform-specific extras
+// (e.g. Claude's PreToolUse guardrails) are appended by the caller.
+func buildPlatformHooks(reg *registry.Registry, cfg hookPlatformConfig) map[string]any {
+	log := `2>>"${TMPDIR:-/tmp}/loom-agent-hooks.log"`
+	bootstrap := hookAgentIDBootstrap(cfg.AgentID)
+	staleCleanup := hookStaleCleanup()
+	policy := agentSafetyPolicyFromRegistry(reg)
+
+	sessionStartHooks := []map[string]any{
+		{
+			"type": "command",
+			"command": fmt.Sprintf(
+				`%s; %s; loom agent session-start --namespace "$(basename $(git rev-parse --show-toplevel 2>/dev/null || echo ${PWD##*/}))/$(git branch --show-current 2>/dev/null || echo main)" --agent-id "$AGENT_ID" --agent-type %s --description %q --auto-recall --quiet %s || true`,
+				bootstrap, staleCleanup, cfg.AgentType, cfg.Description, log),
+		},
+		{
+			"type": "command",
+			"command": fmt.Sprintf(
+				`%s; PID_FILE="${TMPDIR:-/tmp}/loom-keepalive-${AGENT_ID}.pid"; [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null; loom agent keepalive --agent-id "$AGENT_ID" --agent-type %s --quiet %s & printf '%%s' "$!" > "${PID_FILE}.tmp" && mv "${PID_FILE}.tmp" "$PID_FILE"`,
+				bootstrap, cfg.AgentType, log),
+		},
+	}
+	if policy.DirtyWorktreeNudgeOnSessionStart {
+		sessionStartHooks = append(sessionStartHooks, map[string]any{
+			"type":    "command",
+			"command": dirtyWorktreeSessionStartNudgeCommand(policy),
+		})
+	}
+
+	hooks := map[string]any{
+		"SessionStart": []map[string]any{
+			{
+				"hooks": sessionStartHooks,
+			},
+		},
+		cfg.SessionEndEvent: []map[string]any{
+			{
+				"hooks": []map[string]any{
+					{
+						"type": "command",
+						"command": fmt.Sprintf(
+							`%s; PID_FILE="${TMPDIR:-/tmp}/loom-keepalive-${AGENT_ID}.pid"; [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null; rm -f "$PID_FILE"; rm -f "$AGENT_ID_FILE"; loom agent session-end --agent-id "$AGENT_ID" --summarize --quiet %s || true`,
+							bootstrap, log),
+					},
+				},
+			},
+		},
+		cfg.HeartbeatEvent: []map[string]any{
+			{
+				"matcher": cfg.HeartbeatMatcher,
+				"hooks": []map[string]any{
+					{
+						"type": "command",
+						"command": fmt.Sprintf(
+							`%s; loom agent heartbeat --agent-id "$AGENT_ID" --status active --ensure-session --agent-type %s --quiet %s || true`,
+							bootstrap, cfg.AgentType, log),
+					},
+				},
+			},
+		},
+	}
+
+	return hooks
+}
+
+// claudePreToolUseHooks returns the PreToolUse guardrail hooks specific to
+// Claude Code (kubectl edit/set env policy enforcement).
+func claudePreToolUseHooks() []map[string]any {
+	return []map[string]any{
+		{
+			"matcher": "Bash",
+			"hooks": []map[string]any{
+				{
+					"type":    "command",
+					"command": `INPUT=$(cat); CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""'); if echo "$CMD" | grep -qE 'kubectl\s+(edit|set\s+env)'; then echo "GitOps policy: kubectl edit/set env bypasses git history. Edit manifests and use flux reconcile." >&2; exit 2; fi; if echo "$CMD" | grep -qE '^\s*git\s+commit'; then echo '{"systemMessage":"Pre-commit quality reminder: consider running quality_check (or quality_lint / quality_test) before committing to catch issues early."}'; fi; exit 0`,
+				},
+			},
+		},
+	}
+}
+
+// claudePostToolUseExtras returns the Write/Edit formatter hooks specific to
+// Claude Code, appended to the shared heartbeat PostToolUse hooks.
+func claudePostToolUseExtras() []map[string]any {
+	return []map[string]any{
+		{
+			"matcher": "Write|Edit",
+			"hooks": []map[string]any{
+				{
+					"type":    "command",
+					"command": `jq -r '.tool_input.file_path // ""' | { read f; [[ "$f" == *.py ]] && black "$f" 2>/dev/null; exit 0; }`,
+				},
+				{
+					"type":    "command",
+					"command": `jq -r '.tool_input.file_path // ""' | { read f; [[ "$f" == *.go ]] && gofmt -w "$f" 2>/dev/null && goimports -w "$f" 2>/dev/null; exit 0; }`,
+				},
+				{
+					"type":    "command",
+					"command": `jq -r '.tool_input.new_string // .tool_input.content // ""' | { read content; if echo "$content" | grep -qE 'image:.*:latest'; then echo '{"systemMessage":"Noticed :latest tag - consider pinning to a specific version for reproducibility."}'; fi; exit 0; }`,
+				},
+			},
+		},
 	}
 }
 
 // claudeHooks returns the hooks block for Claude Code settings.json.
-func claudeHooks() map[string]any {
-	return map[string]any{
-		"SessionStart": []map[string]any{
-			{
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": `loom agent session-start --namespace "$(basename $(git rev-parse --show-toplevel 2>/dev/null || echo ${PWD##*/}))/$(git branch --show-current 2>/dev/null || echo main)" --agent-id claude-code --agent-type claude-code --description "Claude Code session" --auto-recall --quiet 2>/dev/null || true`,
-					},
-				},
-			},
-		},
-		"Stop": []map[string]any{
-			{
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": "loom agent session-end --agent-id claude-code --summarize --quiet 2>/dev/null || true",
-					},
-				},
-			},
-		},
-		"PreToolUse": []map[string]any{
-			{
-				"matcher": "Bash",
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": `INPUT=$(cat); CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""'); if echo "$CMD" | grep -qE 'kubectl\s+(edit|set\s+env)'; then echo "GitOps policy: kubectl edit/set env bypasses git history. Edit manifests and use flux reconcile." >&2; exit 2; fi; exit 0`,
-					},
-				},
-			},
-		},
-		"PostToolUse": []map[string]any{
-			{
-				"matcher": "Bash|Task",
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": "loom agent heartbeat --agent-id claude-code --status active --ensure-session --agent-type claude-code --quiet 2>/dev/null || true",
-					},
-				},
-			},
-			{
-				"matcher": "Write|Edit",
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": `jq -r '.tool_input.file_path // ""' | { read f; [[ "$f" == *.py ]] && black "$f" 2>/dev/null; exit 0; }`,
-					},
-					{
-						"type":    "command",
-						"command": `jq -r '.tool_input.new_string // .tool_input.content // ""' | { read content; if echo "$content" | grep -qE 'image:.*:latest'; then echo '{"systemMessage":"Noticed :latest tag - consider pinning to a specific version for reproducibility."}'; fi; exit 0; }`,
-					},
-				},
-			},
-		},
-	}
+func claudeHooks(reg *registry.Registry) map[string]any {
+	hooks := buildPlatformHooks(reg, hookPlatformConfig{
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	})
+
+	// Append Claude-specific PreToolUse guardrails.
+	hooks["PreToolUse"] = claudePreToolUseHooks()
+
+	// Append Claude-specific Write/Edit formatters to PostToolUse.
+	postToolUse := hooks["PostToolUse"].([]map[string]any)
+	postToolUse = append(postToolUse, claudePostToolUseExtras()...)
+	hooks["PostToolUse"] = postToolUse
+
+	return hooks
 }
 
 // claudePermissions builds the permissions block for Claude Code settings.json.
@@ -798,6 +881,7 @@ func filterClaudePermissionRules(rules []string) (kept []string, dropped []strin
 // Settings are read from the registry's platform_permissions.codex section.
 func emitCodexPreamble(sb *strings.Builder, reg *registry.Registry, workspaceRoot string) {
 	pp := registryPlatformPerms(reg, "codex")
+	policy := agentSafetyPolicyFromRegistry(reg)
 
 	// Defaults when registry has no codex entry.
 	approvalPolicy := "never"
@@ -857,8 +941,21 @@ func emitCodexPreamble(sb *strings.Builder, reg *registry.Registry, workspaceRoo
 		fmt.Fprintf(sb, "web_search = %q\n\n", webSearchMode)
 	}
 
+	sb.WriteString("# Git safety policy: treat pre-existing dirty worktrees as baseline context.\n")
+	if policy.DirtyWorktreeMode == "continue_scoped_commits" {
+		sb.WriteString("# Continue on current branch/worktree; stage+commit only files changed for the active task.\n")
+		sb.WriteString("# Escalate only when new unexpected changes appear in files you are editing.\n\n")
+	} else {
+		fmt.Fprintf(sb, "# Dirty-worktree mode: %s\n\n", policy.DirtyWorktreeMode)
+	}
+
+	// Codex notify uses a TOML string array with no shell expansion. Use sh -c
+	// to get $$ expansion for a per-process agent ID. The workspace hash from
+	// cksum matches the scheme used by hookAgentIDBootstrap for Claude/Gemini,
+	// avoiding cross-workspace agent ID collisions.
 	sb.WriteString("# Agent lifecycle: heartbeat on turn completion (self-bootstraps session/presence)\n")
-	sb.WriteString("notify = [\"loom\", \"agent\", \"heartbeat\", \"--agent-id\", \"codex\", \"--status\", \"active\", \"--ensure-session\", \"--infer-namespace\", \"--agent-type\", \"codex\", \"--quiet\"]\n\n")
+	sb.WriteString(`notify = ["sh", "-c", "WS_HASH=\"$(printf '%s' \"$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' \"$PWD\")\" | cksum | cut -d' ' -f1)\"; exec loom agent heartbeat --agent-id \"codex-${WS_HASH}-$$\" --status active --ensure-session --infer-namespace --agent-type codex --quiet 2>>\"${TMPDIR:-/tmp}/loom-agent-hooks.log\" || true"]`)
+	sb.WriteString("\n\n")
 }
 
 // registryPlatformPerms returns the PlatformPermission for a given platform,
@@ -868,6 +965,50 @@ func registryPlatformPerms(reg *registry.Registry, platform string) *registry.Pl
 		return nil
 	}
 	return reg.PlatformPermissions[platform]
+}
+
+type agentSafetyPolicy struct {
+	DirtyWorktreeMode                string
+	DirtyWorktreeNudgeOnSessionStart bool
+	DirtyWorktreeNudgeMessage        string
+}
+
+func defaultAgentSafetyPolicy() agentSafetyPolicy {
+	return agentSafetyPolicy{
+		DirtyWorktreeMode:                "continue_scoped_commits",
+		DirtyWorktreeNudgeOnSessionStart: true,
+		DirtyWorktreeNudgeMessage:        "Dirty worktree detected. Treat pre-existing changes as baseline context, continue work, and stage/commit only files for the active task. Escalate only if new unexpected changes appear in files you are editing.",
+	}
+}
+
+func agentSafetyPolicyFromRegistry(reg *registry.Registry) agentSafetyPolicy {
+	policy := defaultAgentSafetyPolicy()
+	pp := registryPlatformPerms(reg, "agents")
+	if pp == nil || pp.Settings == nil {
+		return policy
+	}
+
+	if v, ok := pp.Settings["dirty_worktree_mode"].(string); ok && strings.TrimSpace(v) != "" {
+		policy.DirtyWorktreeMode = strings.TrimSpace(v)
+	}
+	if v, ok := pp.Settings["dirty_worktree_nudge_on_session_start"].(bool); ok {
+		policy.DirtyWorktreeNudgeOnSessionStart = v
+	}
+	if v, ok := pp.Settings["dirty_worktree_nudge_message"].(string); ok && strings.TrimSpace(v) != "" {
+		policy.DirtyWorktreeNudgeMessage = strings.TrimSpace(v)
+	}
+	return policy
+}
+
+func dirtyWorktreeSessionStartNudgeCommand(policy agentSafetyPolicy) string {
+	payload, err := json.Marshal(map[string]string{
+		"systemMessage": policy.DirtyWorktreeNudgeMessage,
+	})
+	if err != nil {
+		payload = []byte(`{"systemMessage":"Dirty worktree detected. Continue on this branch and stage only task-scoped files."}`)
+	}
+
+	return fmt.Sprintf(`if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then printf '%%s\n' %q; fi; fi; exit 0`, string(payload))
 }
 
 // geminiHooksConfig returns a Gemini CLI settings.json with lifecycle hooks
@@ -887,7 +1028,7 @@ func geminiHooksConfig() map[string]any {
 // platform_permissions.gemini section.
 func geminiHooksConfigFromRegistry(reg *registry.Registry) map[string]any {
 	config := map[string]any{
-		"hooks": geminiHooks(),
+		"hooks": geminiHooks(reg),
 	}
 
 	// Merge auto-approve and tool settings from registry.
@@ -914,40 +1055,43 @@ func geminiHooksConfigFromRegistry(reg *registry.Registry) map[string]any {
 }
 
 // geminiHooks returns the hooks block for Gemini CLI settings.json.
-func geminiHooks() map[string]any {
-	return map[string]any{
-		"SessionStart": []map[string]any{
-			{
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": `loom agent session-start --namespace "$(basename $(git rev-parse --show-toplevel 2>/dev/null || echo ${PWD##*/}))/$(git branch --show-current 2>/dev/null || echo main)" --agent-id gemini-cli --agent-type gemini-cli --description "Gemini CLI session" --auto-recall --quiet 2>/dev/null || true`,
-					},
-				},
-			},
-		},
-		"SessionEnd": []map[string]any{
-			{
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": "loom agent session-end --agent-id gemini-cli --summarize --quiet 2>/dev/null || true",
-					},
-				},
-			},
-		},
-		"AfterTool": []map[string]any{
-			{
-				"matcher": "run_shell_command",
-				"hooks": []map[string]any{
-					{
-						"type":    "command",
-						"command": "loom agent heartbeat --agent-id gemini-cli --status active --ensure-session --agent-type gemini-cli --quiet 2>/dev/null || true",
-					},
-				},
-			},
-		},
-	}
+func geminiHooks(reg *registry.Registry) map[string]any {
+	return buildPlatformHooks(reg, hookPlatformConfig{
+		AgentID:          "gemini-cli",
+		AgentType:        "gemini-cli",
+		Description:      "Gemini CLI session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "AfterTool",
+		HeartbeatMatcher: "run_shell_command",
+	})
+}
+
+func hookAgentIDBootstrap(agentID string) string {
+	return fmt.Sprintf(
+		`WS_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$PWD")"; `+
+			`WS_HASH="$(printf '%%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; `+
+			`AGENT_ID_FILE="${TMPDIR:-/tmp}/loom-agent-id-%s-${WS_HASH}"; `+
+			`if [ -s "$AGENT_ID_FILE" ]; then `+
+			`AGENT_ID="$(cat "$AGENT_ID_FILE")"; `+
+			`else `+
+			`AGENT_ID="%s-${WS_HASH}-$PPID"; `+
+			`printf '%%s' "$AGENT_ID" > "$AGENT_ID_FILE"; `+
+			`fi`,
+		agentID, agentID,
+	)
+}
+
+// hookStaleCleanup returns a shell snippet that removes stale PID and agent ID
+// files left behind by a previous session that crashed (Stop hook never fired).
+// It checks whether the PID recorded in the keepalive PID file is still alive;
+// if the process is dead, it removes both files so a fresh session can start.
+func hookStaleCleanup() string {
+	return `PID_FILE="${TMPDIR:-/tmp}/loom-keepalive-${AGENT_ID}.pid"; ` +
+		`if [ -f "$PID_FILE" ]; then ` +
+		`OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"; ` +
+		`if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then ` +
+		`rm -f "$PID_FILE" "$AGENT_ID_FILE"; ` +
+		`fi; fi`
 }
 
 // emitSandboxPolicy writes a .sandbox-policy.json file for the HUD and agents.

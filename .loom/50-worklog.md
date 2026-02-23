@@ -1,5 +1,205 @@
 # Worklog
 
+## 2026-02-19 (session 14)
+
+- What changed:
+  - Captured completion of fallback `codebase_memory` indexing in planning artifacts.
+  - Updated `.loom/00-mcp-inventory.md` and `.loom/00-index.md` with final lexical baseline stats.
+- Why:
+  - Keep planning context accurate after background indexing completed.
+- Sources:
+  - [S1] `codebase_memory__codebase_index_poll(job_id=\"b257c8444ce1b1c4\")`
+  - [S2] `.loom/00-mcp-inventory.md`
+  - [S3] `.loom/00-index.md`
+
+## 2026-02-19 (session 13)
+
+- What changed:
+  - Created M0 draft docs for mobile companion implementation handoff:
+    - `docs/MOBILE_COMPANION_API.md`
+    - `docs/MOBILE_COMPANION_SECURITY.md`
+  - Locked dual-mode connectivity guidance into both docs (LAN + gateway).
+  - Linked both docs from `docs/README.md`.
+  - Marked M0 status as `In progress` in `.loom/30-implementation-plan.md`.
+- Why:
+  - Continue planning after deciding the app must support both LAN and gateway use cases.
+- Sources:
+  - [S1] `docs/MOBILE_COMPANION_API.md`
+  - [S2] `docs/MOBILE_COMPANION_SECURITY.md`
+  - [S3] `docs/README.md`
+  - [S4] `.loom/30-implementation-plan.md`
+
+## 2026-02-19 (session 12)
+
+- What changed:
+  - Updated mobile companion planning artifacts to explicitly support both LAN and gateway connectivity modes.
+  - Updated research/spec/plan docs and added a formal decision entry for dual-mode support.
+- Why:
+  - Product direction refined: connectivity mode should depend on use case, not be single-path.
+- Sources:
+  - [S1] `.loom/10-research.md`
+  - [S2] `.loom/20-product-spec.md`
+  - [S3] `.loom/30-implementation-plan.md`
+  - [S4] `.loom/40-decisions.md`
+
+## 2026-02-19 (session 11)
+
+- What changed:
+  - Started a new planning track for a companion iPhone/iPad app for loom-core.
+  - Refreshed `.loom` planning artifacts for this track:
+    - `.loom/00-workspace-snapshot.md` (regenerated)
+    - `.loom/00-mcp-inventory.md` (runtime/tool/index baseline)
+    - `.loom/10-research.md` (mobile feasibility + gap analysis)
+    - `.loom/20-product-spec.md` (mobile product requirements)
+    - `.loom/30-implementation-plan.md` (phased delivery plan)
+    - `.loom/00-index.md` (repointed to mobile-planning objective)
+  - Validated loom-mode MCP inventory and captured paged tool counts (445 total tools across 5 pages).
+  - Detected embedding-index failure in `codebase_memory` (Morph API 400) and started fallback lexical indexing (`embeddings=false`) to restore planning/search baseline.
+- Why:
+  - User requested to begin structured planning for a mobile companion app focused on monitoring, controlling, and creating agent sessions.
+- Verification / evidence commands:
+  - `python .codex/skills/plan-loom-core/scripts/workspace_snapshot.py --root .`
+  - `./bin/loom tools list --json | jq -r '.tools | length as $n | "total_tools=\($n)"'`
+  - `./bin/loom tools list --json --page 1 --limit 100` ... `--page 5 --limit 100`
+  - `codebase_memory__codebase_stats(repo_id="loom-core")`
+  - `codebase_memory__codebase_index_start(..., embeddings=true)` (failed)
+  - `codebase_memory__codebase_index_start(..., embeddings=false)` (running)
+- Sources:
+  - [S1] `.loom/00-mcp-inventory.md`
+  - [S2] `.loom/10-research.md`
+  - [S3] `.loom/20-product-spec.md`
+  - [S4] `.loom/30-implementation-plan.md`
+  - [S5] `internal/hud/app.go:317`
+  - [S6] `internal/hud/app.go:540`
+  - [S7] `internal/hud/api_agent.go:79`
+  - [S8] `internal/hud/api_agent.go:735`
+  - [S9] `internal/hud/bridge/agent.go:1443`
+
+## 2026-02-17 (session 10)
+- What changed:
+  - Completed a HUD/TUI-focused RALPH slice for Presence diagnostics and conflict visibility.
+  - Added `presenceDiagnosticsStore` to own diagnostics polling, API fetches, policy-form hydration, and runtime policy mutation flow.
+  - Rewired `PresenceDiagnosticsTab.svelte` to bind against the new store so the tab remains a pure view layer.
+  - Added TUI claim-conflict helpers in `internal/tui/panels/presence.go` (`claimConflicts`, `claimConflictCount`) and surfaced:
+    - summary-level conflict count
+    - claims-table conflict banner
+    - per-row conflict marker + selected-row `shared with` hint
+  - Added `internal/tui/panels/presence_test.go` with targeted coverage for conflict detection and rendering.
+  - Added RALPH artifacts:
+    - `.loom/54-ralph-iteration-plan-hud-tui-presence-2026-02-17.md`
+    - `.loom/55-ralph-slice-handoff-hud-tui-presence-2026-02-17.md`
+- Why:
+  - Roadmap refactor focus called out oversized HUD panel/state surfaces; diagnostics orchestration was still embedded in UI.
+  - TUI lacked explicit conflict surfacing despite HUD already exposing conflict cues, creating operator parity gaps.
+- Verification:
+  - `pnpm --dir internal/hud/frontend build` — pass (with same pre-existing Svelte warnings in shared components).
+  - `go test ./internal/tui/panels -count=1` — pass.
+  - `go test ./internal/tui/... -count=1` — pass.
+- Sources:
+  - [S1] `internal/hud/frontend/src/lib/stores/presenceDiagnostics.svelte.ts`
+  - [S2] `internal/hud/frontend/src/lib/components/presence/PresenceDiagnosticsTab.svelte`
+  - [S3] `internal/tui/panels/presence.go`
+  - [S4] `internal/tui/panels/presence_test.go`
+  - [S5] `ROADMAP.md`
+
+## 2026-02-17 (session 9)
+
+- What changed:
+  - Completed Roadmap "Harden daemon tool-call pipeline extraction" Stage 2 slice for side-effect staging and failure coverage.
+  - Refactored `internal/daemon/callpipeline.go` to isolate success-side effects into dedicated helpers (`recordSuccessMetrics`, `markLocalActivity`, `cacheSuccessResponse`, `emitResponseAudit`).
+  - Added failure-path audit/cost emission for route/connect failures and transport send/recv failures.
+  - Added targeted stage-failure tests in `internal/daemon/callpipeline_test.go`:
+    - `TestCallPipelineRouteAndConnect_LocalDialFailureEmitsAuditAndCost`
+    - `TestCallPipelineTransportFailure_EmitsAuditAndCost`
+  - Updated roadmap stage marker in `ROADMAP.md` to note Stage 2 completion.
+  - Added RALPH artifacts:
+    - `.loom/52-ralph-iteration-plan-callpipeline-2026-02-17.md`
+    - `.loom/53-ralph-slice-handoff-callpipeline-2026-02-17.md`
+- Why:
+  - Needed clearer test seams around daemon call side effects and consistent audit/cost behavior for failure stages, not just success/denied/cached paths.
+- Verification:
+  - `go test ./internal/daemon -run 'CallPipeline|TransportFailure|RouteAndConnect'` — pass.
+  - `go test ./internal/daemon` — pass.
+  - `go test ./...` — pass.
+  - `golangci-lint run ./internal/daemon/...` — not run (tool unavailable in shell).
+- Sources:
+  - [S1] `internal/daemon/callpipeline.go`
+  - [S2] `internal/daemon/callpipeline_test.go`
+  - [S3] `ROADMAP.md`
+  - [S4] `.loom/52-ralph-iteration-plan-callpipeline-2026-02-17.md`
+  - [S5] `.loom/53-ralph-slice-handoff-callpipeline-2026-02-17.md`
+
+## 2026-02-17 (session 8)
+
+- What changed:
+  - Reviewed commit activity from the previous two days and identified architecture hotspots by churn frequency and file size.
+  - Added planning brief: `docs/planning/2026-02-17-architecture-refactor-opportunities.md`.
+  - Updated `ROADMAP.md` with a new "Immediate Architecture Refactor Focus (Current)" section to prioritize stabilization work before additional Tier 3 expansion.
+  - Updated `.loom/00-index.md` to align current goals with the refactor/stabilization sequence.
+  - Refreshed `.loom/00-workspace-snapshot.md` using the plan-loom-core workspace snapshot script.
+- Why:
+  - Recent work delivered major features quickly; concentrated churn now indicates maintainability risk in daemon call routing and HUD agent surfaces.
+  - Needed a single, source-backed focus order for what to tackle next.
+- Verification:
+  - Commit/churn analysis commands completed successfully (`git rev-list`, `git log --name-only` aggregations, file-size scans).
+  - Planning docs updated and cross-linked from roadmap + planning index.
+- Sources:
+  - [S1] Command: `git rev-list --count --since='2026-02-15 00:00' HEAD`
+  - [S2] Command: `git log --since='2026-02-15 00:00' --pretty=format: --name-only | ... | sort | uniq -c | sort -nr`
+  - [S3] `internal/daemon/daemon.go`
+  - [S4] `internal/hud/api_agent.go`
+  - [S5] `internal/hud/bridge/agent.go`
+  - [S6] `cmd/loom/cmd_agent.go`
+  - [S7] `internal/hud/frontend/src/lib/components/PresencePanel.svelte`
+  - [S8] `internal/devbox/backend/k8s.go`
+
+## 2026-02-16 (session 7)
+
+- What changed:
+  - Completed backlog issue #4 baseline (full prompt-section context accounting for context inspector).
+  - Extended `ContextInspect` output with sectioned prompt budget model:
+    - `system_prompt`
+    - `tools_schema` (measured from `loom/tools` tool + input-schema payloads)
+    - `context_entries`
+    - `file_injections`
+    - `response_budget`
+  - Added `context_estimated_tokens` (context-only) and changed `estimated_tokens` to section-total prompt estimate.
+  - Added reconciliation logic so section totals equal final prompt estimate.
+  - Extended HUD Diagnostics Context Breakdown to render new prompt section accounting and updated metric card label to prompt estimate.
+  - Rebuilt and reloaded local runtime via `make dev-reload` (twice in this continuation: pre-work and post-work).
+- Why:
+  - Closes the remaining OpenClaw-informed gap for context observability by making prompt composition overhead visible (not just stored-entry weight).
+- Verification:
+  - `go test ./internal/hud/... ./cmd/loom -count=1` — pass.
+  - `pnpm --dir internal/hud/frontend build` — pass (with same pre-existing Svelte warnings in shared components).
+  - `make dev-reload` — pass.
+- Sources:
+  - [S1] `internal/hud/bridge/agent.go`
+  - [S2] `internal/hud/bridge/agent_test.go`
+  - [S3] `internal/hud/bridge/daemon.go`
+  - [S4] `internal/hud/frontend/src/lib/components/PresencePanel.svelte`
+  - [S5] `docs/USER_GUIDE.md`
+
+## 2026-02-16 (session 6)
+
+- What changed:
+  - Extended backlog issue #5 diagnostics baseline with in-HUD runtime policy mutation controls (completes issue #3 UI mutation path).
+  - Added Presence Diagnostics policy editor for:
+    - `cap`, `debounce_ms`, `drop_policy`, `lane_priority`, `updated_by`
+    - admin token entry (sent as `X-Admin-Token`) for protected `POST /api/agent/nudge-queue-policy`
+  - Added client-side validation and error handling for mutation fields.
+  - Kept diagnostics polling from clobbering in-progress edits by hydrating form state only when form is not dirty.
+  - Updated planning/index docs to reflect HUD mutation controls delivery.
+- Why:
+  - Closes the operator control-loop gap by allowing queue policy tuning directly in HUD, without dropping to CLI/curl.
+- Verification:
+  - `pnpm --dir internal/hud/frontend build` — pass.
+  - `go test ./internal/hud/... ./cmd/loom -count=1` — pass.
+- Sources:
+  - [S1] `internal/hud/frontend/src/lib/components/PresencePanel.svelte`
+  - [S2] `internal/hud/api_agent.go`
+  - [S3] `cmd/loom/cmd_agent.go`
+
 ## 2026-02-16 (session 5)
 
 - What changed:

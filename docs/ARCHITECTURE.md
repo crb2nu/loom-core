@@ -6,6 +6,7 @@ For operational commands, see:
 
 - `docs/USER_GUIDE.md`
 - `docs/DEVELOPER_GUIDE.md`
+- `docs/IMPLEMENTATION_STATUS.md` for shipped vs in-progress status
 
 ## High-Level Components
 
@@ -126,6 +127,33 @@ flowchart TB
   Registry --> Daemon
   Sync --> Reload --> Daemon
 ```
+
+## Skill and Instruction Generation
+
+Loom provides a unified mechanism for delivering skills and instructions across multiple AI platforms (Codex, Claude, Kilocode, Gemini).
+
+### Skills Registry
+
+The `skills-registry.yaml` file is the source of truth for all skills. Each skill can have multiple target formats:
+
+- **Command (`command`):** Generates slash commands (e.g., `.claude/commands/`).
+- **Rule (`rule`):** Generates rule files (e.g., `.claude/rules/`).
+- **Skill Bundle (`skill`):** Generates full skill directories with scripts, references, and assets (e.g., `~/.codex/skills/`).
+- **Instruction (`instruction`):** Appends instructions to a composite platform instruction file.
+
+### Instruction Files
+
+For core workflows that should always be active, Loom generates composite instruction files:
+
+- **Claude/Codex/Kilocode:** `instructions.md`
+- **Gemini CLI:** `GEMINI.md` (required by Gemini CLI for hierarchical instructions).
+
+### Platform Sync and Conflict Avoidance
+
+Some platforms have specific requirements for where files reside:
+
+- **Gemini CLI:** Errors if duplicate skill names are found in both the workspace (`.gemini/skills/`) and user home (`~/.gemini/skills/`). Loom mitigates this by generating Gemini skills directly to the home directory and cleaning them from the repository.
+- **Codex:** Prefers skills in `~/.codex/skills/` but Loom generates them into the repo during development so they can be tracked and synced.
 
 ## HUD Architecture
 

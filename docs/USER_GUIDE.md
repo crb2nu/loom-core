@@ -1,18 +1,37 @@
 # Loom Core User Guide
 
-This guide covers daily usage on a developer machine: config sync, daemon operations, HUD visibility, and sandboxed execution.
+This guide is for day-to-day usage on a developer machine: setup, config sync, daemon operations, HUD visibility, and sandbox execution.
 
 For architecture details, see `docs/ARCHITECTURE.md`.
 
-## Concepts
+## What Is Ready Today
 
-- `loom`: CLI for configuration, daemon control, and utility commands.
+For the latest shipped/in-progress snapshot, read `docs/IMPLEMENTATION_STATUS.md`.
+
+Practical current state:
+
+- Stable local workflow: `loom` + `loomd` + `loom proxy`.
+- Multi-platform config sync in `--loom-mode`.
+- HUD visibility for servers, agents, tasks, and sandboxes.
+- Devbox sandbox execution via Docker or Kubernetes backend.
+
+## Core Concepts
+
+- `loom`: CLI for config generation/sync, daemon control, and utility commands.
 - `loomd`: local daemon that aggregates and routes MCP tool calls.
 - `loom proxy`: stdio MCP entrypoint used by AI clients in `--loom-mode`.
 
-## Quickstart
+## 5-Minute First-Time Setup
 
 From `services/loom-core/`:
+
+```bash
+make bootstrap-local
+./bin/loom start
+./bin/loom status
+```
+
+If you prefer manual startup without launchd:
 
 ```bash
 make build
@@ -20,66 +39,39 @@ make build
 ./bin/loomd
 ```
 
-Or run the one-shot first-time bootstrap:
+## Daily Commands
 
 ```bash
-make bootstrap-local
-```
-
-Or run daemon via launchd on macOS:
-
-```bash
-./bin/loom start
-./bin/loom status
-```
-
-## Install Loom Binaries (recommended)
-
-For fast local iteration while preserving agent stability:
-
-```bash
-make install-core
-```
-
-For a full update including all `mcp-*` binaries:
-
-```bash
-make install-all
-```
-
-## Safe Local Upgrade Loop
-
-Use atomic install + controlled restart flow:
-
-```bash
+# Safe upgrade (restarts daemon only when idle)
 make dev-upgrade
+
+# Force upgrade + restart even when active
+make dev-reload
+
+# Health check
+curl http://localhost:9876/health
+
+# Launch HUD
+./bin/loom hud --port 3333
 ```
 
-For initial setup (build + install + sync + check), use:
+## Config Generation and Sync
 
-```bash
-make bootstrap-local
-```
-
-See `docs/DEV_BUILD_LIFECYCLE.md` for rollback and restart policy.
-
-## Generate and Sync MCP Configs
-
-Generate config artifacts into `generated/`:
+Generate configs into `generated/`:
 
 ```bash
 ./bin/loom generate configs --target all --loom-mode
 ```
 
-Sync into client-specific destinations:
+Sync to platform-specific destinations:
 
 ```bash
 ./bin/loom sync all --regen --loom-mode
 ```
 
-`sync --regen` resolves registries from the nearest workspace tree first (including ancestor `platform/gitops/mcp/context/registry.yaml`), then falls back to home defaults.
-
 Common targets: `codex`, `vscode`, `kilocode`, `claude`, `claude_desktop`, `gemini`, `antigravity`.
+
+`sync --regen` resolves registries from the nearest workspace tree first (including ancestor `platform/gitops/mcp/context/registry.yaml`), then falls back to home defaults.
 
 ## Daemon Operations
 
@@ -120,7 +112,8 @@ Optional modes:
 
 ### Sandbox panel
 
-The HUD sandbox panel queries `devbox_summary` from `mcp-devbox` and shows `available=false` when the server is not configured/running.
+HUD calls `devbox_summary` via `/api/sandbox`.
+If `mcp-devbox` is unavailable, HUD shows `available=false`.
 
 ## Devbox Sandbox Workflows
 
@@ -163,11 +156,11 @@ Validate local setup:
 ./bin/loom check
 ```
 
-## Agent Hooks and Lifecycle
+## Agent Hooks and Lifecycle (Advanced)
 
-`loom agent ...` commands are hook-friendly wrappers that prefer HUD API calls (default port `3333`) and fall back to daemon socket tool calls when HUD is unavailable.
+`loom agent ...` commands prefer HUD API calls (default port `3333`) and fall back to daemon socket tool calls when HUD is unavailable.
 
-For hook-only clients that do not emit explicit session start events (for example Codex `notify`), use heartbeat bootstrap mode:
+For hook-only clients that do not emit explicit session-start events (for example Codex `notify`), use heartbeat bootstrap mode:
 
 ```bash
 loom agent heartbeat --agent-id codex --status active --ensure-session --agent-type codex --quiet
@@ -184,15 +177,17 @@ Context budget inspection:
 loom agent context-inspect --agent-id codex --detail --limit 200
 ```
 
-Nudge queue status for an agent:
+Hook reliability diagnostics:
+
+```bash
+loom agent hook-status --agent-id codex --window 5m
+curl "http://127.0.0.1:3333/api/timeline?agent_id=codex&event_type=agent.heartbeat&limit=50"
+```
+
+Nudge queue status and policy:
 
 ```bash
 curl "http://127.0.0.1:3333/api/agent/nudge-queue?agent_id=codex"
-```
-
-Nudge queue runtime policy (read/update):
-
-```bash
 loom agent nudge-queue-policy
 loom agent nudge-queue-policy --cap 96 --drop-policy summarize --debounce-ms 50 --lane-priority control,handoff,advice,default
 ```
@@ -200,11 +195,24 @@ loom agent nudge-queue-policy --cap 96 --drop-policy summarize --debounce-ms 50 
 Optional auth env for policy mutation:
 
 - `LOOM_HUD_ADMIN_TOKEN` (preferred)
-- `HUD_ADMIN_TOKEN` (fallback, also used by `loom hud --admin-token`)
+- `HUD_ADMIN_TOKEN` (fallback)
 
 ## Response Size and Pagination
 
-Many list/search tools support `page` + `per_page` (capped at 100). Several servers also enforce response size limits to prevent tool-call timeouts.
+Many list/search tools support `page` + `per_page` (capped at 100). Several servers also enforce response-size limits.
+
+Loom proxy inventory resources (loom-mode aware planning):
+
+- `loom://tools/index`
+- `loom://tools/page/{page}`
+- `loom://tools/server/{server}/page/{page}`
+
+`loom://tools` is still supported for backward compatibility and may be truncated for large catalogs. Use the paged `loom://tools/*` URIs for deterministic full inventory.
+
+CLI fallback for automation and scripts:
+
+- `loom tools list --json`
+- `loom tools list --json --server <server> --page <n> --limit <n>`
 
 Selected env controls:
 
@@ -213,11 +221,23 @@ Selected env controls:
 - `GRAFANA_MAX_RESPONSE_BYTES`
 - `TAVILY_MAX_RESPONSE_BYTES`
 - `ALERTMANAGER_MAX_RESPONSE_BYTES`
+- `LOOM_PROXY_TOOL_PAGE_SIZE` (default `100`, clamped `10..500`)
+
+## Platform-Specific Quirks
+
+### Gemini CLI
+
+Gemini CLI has several unique behaviors that Loom manages automatically:
+
+- **Instruction Filename:** Unlike Claude Code (`instructions.md`), Gemini CLI expects core instructions in `GEMINI.md`. Loom generates this file into `~/.gemini/GEMINI.md` for instruction-type skills.
+- **Skill Locations:** Gemini CLI searches for skills in both workspace (`.gemini/skills/`) and user (`~/.gemini/skills/`) directories.
+- **Duplicate Skills Error:** A known quirk/bug in Gemini CLI causes it to error if the same skill name is discovered in both the workspace and user directories, even if the content is identical.
+- **Loom Solution:** To avoid duplication errors, the `gemini` profile in Loom sets `SkillsDirectToHome: true`. This ensures skills are only generated into the user directory (`~/.gemini/skills/`) and are automatically cleaned from the repository's `.gemini/skills/` directory during sync operations.
 
 ## Troubleshooting
 
 - Daemon offline: `loom status`, then `loom restart`
-- Binary drift after rebuild: run `make install-core`, then `loom restart`
+- Binary drift after rebuild: `make install-core`, then `loom restart`
 - Stale tool list: `loom reload`
 - Client cannot find servers: `loom sync all --regen --loom-mode`
 - GUI apps miss shell env vars: run `loom check` and move secrets into `loom secrets`

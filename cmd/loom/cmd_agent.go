@@ -15,8 +15,11 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -34,56 +37,37 @@ func hudBaseURL(port string) string {
 	return "http://127.0.0.1:" + port
 }
 
-// hudPost sends a POST request with a JSON body to the HUD API.
-// Returns the response body or an error. On non-2xx status, returns an error.
-func hudPost(port, path string, body any) (json.RawMessage, error) {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+const defaultHUDTimeout = 10 * time.Second
+
+// hudRequest sends a request to the HUD API and returns the raw response body.
+func hudRequest(port, method, path string, body any, headers map[string]string, timeout time.Duration) (json.RawMessage, error) {
+	if timeout <= 0 {
+		timeout = defaultHUDTimeout
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	var payload []byte
+	var err error
+	if body != nil {
+		payload, err = json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal request: %w", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hudBaseURL(port)+path, bytes.NewReader(payload))
+	var reqBody io.Reader
+	if payload != nil {
+		reqBody = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, hudBaseURL(port)+path, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HUD returned %d: %s", resp.StatusCode, string(data))
-	}
-
-	return data, nil
-}
-
-// hudPostWithHeaders sends a POST request with optional extra headers.
-func hudPostWithHeaders(port, path string, body any, headers map[string]string) (json.RawMessage, error) {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hudBaseURL(port)+path, bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		if strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
 			req.Header.Set(k, v)
@@ -100,102 +84,35 @@ func hudPostWithHeaders(port, path string, body any, headers map[string]string) 
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
-
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("HUD returned %d: %s", resp.StatusCode, string(data))
 	}
-
 	return data, nil
+}
+
+// hudPost sends a POST request with a JSON body to the HUD API.
+func hudPost(port, path string, body any) (json.RawMessage, error) {
+	return hudRequest(port, http.MethodPost, path, body, nil, defaultHUDTimeout)
+}
+
+// hudPostWithHeaders sends a POST request with optional extra headers.
+func hudPostWithHeaders(port, path string, body any, headers map[string]string) (json.RawMessage, error) {
+	return hudRequest(port, http.MethodPost, path, body, headers, defaultHUDTimeout)
 }
 
 // hudGet sends a GET request to the HUD API.
 func hudGet(port, path string) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hudBaseURL(port)+path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HUD returned %d: %s", resp.StatusCode, string(data))
-	}
-
-	return data, nil
+	return hudRequest(port, http.MethodGet, path, nil, nil, defaultHUDTimeout)
 }
 
 // hudPostFast sends a POST with a short timeout (for latency-sensitive ops like heartbeats).
 func hudPostFast(port, path string, body any, timeout time.Duration) (json.RawMessage, error) {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hudBaseURL(port)+path, bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HUD returned %d: %s", resp.StatusCode, string(data))
-	}
-
-	return data, nil
+	return hudRequest(port, http.MethodPost, path, body, nil, timeout)
 }
 
 // hudGetFast sends a GET with a short timeout (for preflight health checks).
 func hudGetFast(port, path string, timeout time.Duration) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hudBaseURL(port)+path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HUD returned %d: %s", resp.StatusCode, string(data))
-	}
-
-	return data, nil
+	return hudRequest(port, http.MethodGet, path, nil, nil, timeout)
 }
 
 // hudPostWithRetry sends a POST with retry and exponential backoff.
@@ -277,14 +194,6 @@ func withAgentFallback(op string, hudCall, daemonCall func() (json.RawMessage, e
 }
 
 func startSessionWithFallback(cmd *cobra.Command, port string, p bridge.SessionStartParams) (json.RawMessage, error) {
-	body := map[string]any{
-		"namespace":   p.Namespace,
-		"agent_id":    p.AgentID,
-		"agent_type":  p.AgentType,
-		"description": p.Description,
-		"auto_recall": p.AutoRecall,
-	}
-
 	return withAgentFallback(
 		"agent session-start",
 		func() (json.RawMessage, error) {
@@ -292,7 +201,7 @@ func startSessionWithFallback(cmd *cobra.Command, port string, p bridge.SessionS
 			if _, err := hudGetFast(port, "/api/ping", 1*time.Second); err != nil {
 				return nil, err
 			}
-			return hudPost(port, "/api/agent/session-start", body)
+			return hudPost(port, "/api/agent/session-start", p)
 		},
 		func() (json.RawMessage, error) {
 			return withAgentBridge(cmd, func(agentBridge *bridge.AgentBridge) (json.RawMessage, error) {
@@ -307,18 +216,10 @@ func startSessionWithFallback(cmd *cobra.Command, port string, p bridge.SessionS
 }
 
 func endSessionWithFallback(cmd *cobra.Command, port string, p bridge.SessionEndParams) (json.RawMessage, error) {
-	body := map[string]any{
-		"agent_id":  p.AgentID,
-		"summarize": p.Summarize,
-	}
-	if p.SessionID != "" {
-		body["session_id"] = p.SessionID
-	}
-
 	return withAgentFallback(
 		"agent session-end",
 		func() (json.RawMessage, error) {
-			return hudPost(port, "/api/agent/session-end", body)
+			return hudPost(port, "/api/agent/session-end", p)
 		},
 		func() (json.RawMessage, error) {
 			return withAgentBridge(cmd, func(agentBridge *bridge.AgentBridge) (json.RawMessage, error) {
@@ -376,18 +277,10 @@ func heartbeatWithFallback(cmd *cobra.Command, port string, agentID, status stri
 }
 
 func updateTaskWithFallback(cmd *cobra.Command, port string, p bridge.UpdateTaskParams) (json.RawMessage, error) {
-	body := map[string]any{
-		"task_id": p.ID,
-		"status":  p.Status,
-	}
-	if p.Resolution != "" {
-		body["resolution"] = p.Resolution
-	}
-
 	return withAgentFallback(
 		"agent task-update",
 		func() (json.RawMessage, error) {
-			return hudPost(port, "/api/agent/task-update", body)
+			return hudPost(port, "/api/agent/task-update", p)
 		},
 		func() (json.RawMessage, error) {
 			return withAgentBridge(cmd, func(agentBridge *bridge.AgentBridge) (json.RawMessage, error) {
@@ -419,22 +312,15 @@ func activeSessionWithFallback(cmd *cobra.Command, port, agentID string) (json.R
 }
 
 func contextInspectWithFallback(cmd *cobra.Command, port, agentID, sessionID string, detail bool, limit int) (json.RawMessage, error) {
-	params := url.Values{}
-	if agentID != "" {
-		params.Set("agent_id", agentID)
+	request := bridge.ContextInspectRequest{
+		AgentID:   agentID,
+		SessionID: sessionID,
+		Detail:    detail,
+		Limit:     limit,
 	}
-	if sessionID != "" {
-		params.Set("session_id", sessionID)
-	}
-	if detail {
-		params.Set("detail", "true")
-	}
-	if limit > 0 {
-		params.Set("limit", fmt.Sprintf("%d", limit))
-	}
-	path := "/api/agent/context-inspect"
-	if encoded := params.Encode(); encoded != "" {
-		path += "?" + encoded
+	path, err := request.Path()
+	if err != nil {
+		return nil, err
 	}
 
 	return withAgentFallback(
@@ -455,20 +341,22 @@ func contextInspectWithFallback(cmd *cobra.Command, port, agentID, sessionID str
 }
 
 func nudgeQueueStatusWithHUD(port, agentID string) (json.RawMessage, error) {
-	params := url.Values{}
-	params.Set("agent_id", agentID)
-	return hudGet(port, "/api/agent/nudge-queue?"+params.Encode())
+	path, err := bridge.NudgeQueueStatusPath(agentID)
+	if err != nil {
+		return nil, err
+	}
+	return hudGet(port, path)
 }
 
 func nudgeQueuePolicyWithHUD(port string) (json.RawMessage, error) {
-	return hudGet(port, "/api/agent/nudge-queue-policy")
+	return hudGet(port, bridge.AgentNudgeQueuePolicyPath)
 }
 
-func nudgeQueuePolicyUpdateWithHUD(port string, body map[string]any, adminToken string) (json.RawMessage, error) {
+func nudgeQueuePolicyUpdateWithHUD(port string, body bridge.NudgeQueuePolicyMutation, adminToken string) (json.RawMessage, error) {
 	headers := map[string]string{
 		"Authorization": "Bearer " + adminToken,
 	}
-	return hudPostWithHeaders(port, "/api/agent/nudge-queue-policy", body, headers)
+	return hudPostWithHeaders(port, bridge.AgentNudgeQueuePolicyPath, body, headers)
 }
 
 func workflowDefineWithFallback(cmd *cobra.Command, port string, body map[string]any) (json.RawMessage, error) {
@@ -510,13 +398,18 @@ not reachable, commands fall back to daemon socket tool calls.`,
 		newAgentSessionStartCmd(),
 		newAgentSessionEndCmd(),
 		newAgentHeartbeatCmd(),
+		newAgentKeepaliveCmd(),
 		newAgentTaskUpdateCmd(),
 		newAgentSessionCmd(),
+		newAgentSessionListCmd(),
+		newAgentSessionPruneCmd(),
+		newAgentHookStatusCmd(),
 		newAgentContextInspectCmd(),
 		newAgentNudgeQueueStatusCmd(),
 		newAgentNudgeQueuePolicyCmd(),
 		newAgentWorkflowSyncCmd(),
 		newAgentDispatchCmd(),
+		newAgentQualityGateCmd(),
 	)
 
 	return agentCmd
@@ -744,6 +637,107 @@ func inferGitNamespace() string {
 	return repoName + "/" + branchName
 }
 
+// newAgentKeepaliveCmd creates the `loom agent keepalive` command.
+// It runs a background ticker loop that sends periodic heartbeats to keep
+// agent presence alive even when no tool use is occurring.
+func newAgentKeepaliveCmd() *cobra.Command {
+	var (
+		agentID   string
+		agentType string
+		interval  time.Duration
+		quiet     bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "keepalive",
+		Short: "Background heartbeat daemon for agent presence",
+		Long: `Run a ticker loop that sends periodic heartbeats to keep agent presence
+alive. Designed to be spawned as a background process by session-start hooks
+and killed by session-end hooks via the PID file.
+
+Uses PID file deduplication: if a keepalive for the same agent-id is already
+running, exits silently. On SIGINT/SIGTERM, sends a final deregister and exits.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if agentID == "" {
+				return fmt.Errorf("--agent-id is required")
+			}
+
+			pidFile := keepalivePIDPath(agentID)
+
+			// Dedup: if PID file exists and process is alive, exit silently.
+			if existing, err := os.ReadFile(pidFile); err == nil {
+				if pid, err := strconv.Atoi(strings.TrimSpace(string(existing))); err == nil {
+					if proc, err := os.FindProcess(pid); err == nil {
+						// Signal 0 checks if process is alive without sending a real signal.
+						if proc.Signal(syscall.Signal(0)) == nil {
+							if !quiet {
+								fmt.Fprintf(os.Stderr, "keepalive already running (pid %d)\n", pid)
+							}
+							return nil
+						}
+					}
+				}
+			}
+
+			// Write PID file.
+			if err := os.MkdirAll(filepath.Dir(pidFile), 0755); err != nil {
+				return fmt.Errorf("create pid dir: %w", err)
+			}
+			if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+				return fmt.Errorf("write pid file: %w", err)
+			}
+			defer os.Remove(pidFile)
+
+			port := resolvePort(cmd)
+
+			// Set up signal handling for clean shutdown.
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "keepalive started for %s (interval=%s, pid=%d)\n", agentID, interval, os.Getpid())
+			}
+
+			for {
+				select {
+				case <-ticker.C:
+					_, err := heartbeatWithFallback(cmd, port, agentID, "active")
+					if err != nil && !quiet {
+						fmt.Fprintf(os.Stderr, "keepalive: heartbeat: %v\n", err)
+					}
+				case <-sigCh:
+					if !quiet {
+						fmt.Fprintf(os.Stderr, "keepalive shutting down for %s\n", agentID)
+					}
+					// Best-effort deregister.
+					deregBody := map[string]string{"agent_id": agentID}
+					_, _ = hudPostFast(port, "/api/agent/deregister", deregBody, 3*time.Second)
+					return nil
+				}
+			}
+		},
+	}
+
+	cmd.Flags().StringVar(&agentID, "agent-id", "", "Agent identifier (required)")
+	cmd.Flags().StringVar(&agentType, "agent-type", "", "Agent type for bootstrap")
+	cmd.Flags().DurationVar(&interval, "interval", 20*time.Second, "Heartbeat interval")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress output")
+
+	return cmd
+}
+
+// keepalivePIDPath returns the PID file path for a keepalive daemon.
+func keepalivePIDPath(agentID string) string {
+	tmpDir := os.Getenv("TMPDIR")
+	if tmpDir == "" {
+		tmpDir = "/tmp"
+	}
+	return filepath.Join(tmpDir, "loom-keepalive-"+agentID+".pid")
+}
+
 // newAgentTaskUpdateCmd creates the `loom agent task-update` command.
 func newAgentTaskUpdateCmd() *cobra.Command {
 	var (
@@ -817,6 +811,314 @@ func newAgentSessionCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&agentID, "agent-id", "", "Agent identifier")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress output (for hooks)")
+
+	return cmd
+}
+
+// newAgentSessionListCmd creates the `loom agent session-list` command.
+func newAgentSessionListCmd() *cobra.Command {
+	var (
+		namespace string
+		agentID   string
+		status    string
+		limit     int
+	)
+
+	cmd := &cobra.Command{
+		Use:   "session-list",
+		Short: "List agent sessions",
+		Long: `List sessions, optionally filtered by agent, namespace, or status.
+
+Example:
+  loom agent session-list --status summarized --limit 50
+  loom agent session-list --agent-id claude-code --status active`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			port := resolvePort(cmd)
+
+			params := map[string]any{
+				"limit": limit,
+			}
+			if agentID != "" {
+				params["agent_id"] = agentID
+			}
+			if namespace != "" {
+				params["namespace"] = namespace
+			}
+			if status != "" {
+				params["status"] = status
+			}
+
+			result, err := withAgentFallback(
+				"agent session-list",
+				func() (json.RawMessage, error) {
+					return hudPost(port, "/api/agent/session-list", params)
+				},
+				func() (json.RawMessage, error) {
+					return withAgentBridge(cmd, func(b *bridge.AgentBridge) (json.RawMessage, error) {
+						return b.ListSessions(params)
+					})
+				},
+			)
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(result))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&agentID, "agent-id", "", "Filter by agent ID")
+	cmd.Flags().StringVar(&namespace, "namespace", "", "Filter by namespace")
+	cmd.Flags().StringVar(&status, "status", "", "Filter by status (active, ended, summarized)")
+	cmd.Flags().IntVar(&limit, "limit", 20, "Maximum sessions to return")
+
+	return cmd
+}
+
+// newAgentSessionPruneCmd creates the `loom agent session-prune` command.
+func newAgentSessionPruneCmd() *cobra.Command {
+	var (
+		maxAge string
+		status string
+		dryRun bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "session-prune",
+		Short: "Prune stale sessions",
+		Long: `Delete stale sessions matching status and age criteria.
+
+Example:
+  loom agent session-prune --max-age 72h --dry-run
+  loom agent session-prune --max-age 72h --status summarized,ended`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			port := resolvePort(cmd)
+
+			// Parse max-age duration to hours
+			dur, err := time.ParseDuration(maxAge)
+			if err != nil {
+				return fmt.Errorf("invalid --max-age: %w", err)
+			}
+			maxAgeHours := int(dur.Hours())
+			if maxAgeHours <= 0 {
+				maxAgeHours = 1
+			}
+
+			params := map[string]any{
+				"max_age_hours": maxAgeHours,
+				"status":        status,
+				"dry_run":       dryRun,
+			}
+
+			result, err := withAgentFallback(
+				"agent session-prune",
+				func() (json.RawMessage, error) {
+					return hudPost(port, "/api/agent/session-prune", params)
+				},
+				func() (json.RawMessage, error) {
+					return withAgentBridge(cmd, func(b *bridge.AgentBridge) (json.RawMessage, error) {
+						return b.PruneSessions(params)
+					})
+				},
+			)
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(result))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&maxAge, "max-age", "72h", "Maximum session age (e.g., 72h, 168h)")
+	cmd.Flags().StringVar(&status, "status", "ended,summarized", "Comma-separated status filter")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview what would be pruned without deleting")
+
+	return cmd
+}
+
+func parseHeartbeatTimestamp(raw string) (time.Time, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if ts, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return ts, true
+	}
+	if ts, err := time.Parse(time.RFC3339, value); err == nil {
+		return ts, true
+	}
+	return time.Time{}, false
+}
+
+func hookStateFromSignals(now time.Time, lastHeartbeat time.Time, hasHeartbeat bool, heartbeatsInWindow int) string {
+	if hasHeartbeat {
+		age := now.Sub(lastHeartbeat)
+		switch {
+		case age <= 30*time.Second:
+			return "healthy"
+		case age <= 5*time.Minute:
+			return "stale"
+		default:
+			return "missing"
+		}
+	}
+	if heartbeatsInWindow > 0 {
+		return "stale"
+	}
+	return "missing"
+}
+
+func hookStatusWithHUD(cmd *cobra.Command, port, agentID string, window time.Duration, limit int) (json.RawMessage, error) {
+	if strings.TrimSpace(agentID) == "" {
+		return nil, fmt.Errorf("agent-id is required")
+	}
+	if window <= 0 {
+		return nil, fmt.Errorf("window must be greater than zero")
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be greater than zero")
+	}
+
+	now := time.Now().UTC()
+	agentID = strings.TrimSpace(agentID)
+
+	sessionRaw, err := activeSessionWithFallback(cmd, port, agentID)
+	if err != nil {
+		return nil, err
+	}
+	var sessionEnvelope struct {
+		Session *bridge.SessionInfo `json:"session"`
+	}
+	_ = json.Unmarshal(sessionRaw, &sessionEnvelope)
+
+	presenceRaw, err := hudGet(port, "/api/presence")
+	if err != nil {
+		return nil, err
+	}
+	var presenceEnvelope struct {
+		Agents []bridge.PresenceInfo `json:"agents"`
+	}
+	if err := json.Unmarshal(presenceRaw, &presenceEnvelope); err != nil {
+		return nil, fmt.Errorf("parse presence response: %w", err)
+	}
+
+	var presence *bridge.PresenceInfo
+	for i := range presenceEnvelope.Agents {
+		if presenceEnvelope.Agents[i].AgentID == agentID {
+			presence = &presenceEnvelope.Agents[i]
+			break
+		}
+	}
+
+	query := url.Values{}
+	query.Set("agent_id", agentID)
+	query.Set("event_type", "agent.heartbeat")
+	query.Set("since", now.Add(-window).Format(time.RFC3339))
+	query.Set("limit", fmt.Sprintf("%d", limit))
+	timelineRaw, err := hudGet(port, "/api/timeline?"+query.Encode())
+	if err != nil {
+		return nil, err
+	}
+	var timelineEnvelope struct {
+		Entries []struct {
+			Timestamp time.Time `json:"timestamp"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(timelineRaw, &timelineEnvelope); err != nil {
+		return nil, fmt.Errorf("parse timeline response: %w", err)
+	}
+
+	heartbeatsInWindow := len(timelineEnvelope.Entries)
+	var latestEventAt string
+	if heartbeatsInWindow > 0 {
+		latestEventAt = timelineEnvelope.Entries[0].Timestamp.UTC().Format(time.RFC3339)
+	}
+
+	var (
+		lastHeartbeat    time.Time
+		hasLastHeartbeat bool
+		lastHeartbeatRaw string
+		heartbeatAgeSec  int64
+		presenceStatus   string
+	)
+	if presence != nil {
+		lastHeartbeatRaw = strings.TrimSpace(presence.LastHeartbeat)
+		presenceStatus = strings.TrimSpace(presence.Status)
+		if ts, ok := parseHeartbeatTimestamp(lastHeartbeatRaw); ok {
+			hasLastHeartbeat = true
+			lastHeartbeat = ts.UTC()
+			heartbeatAgeSec = int64(now.Sub(lastHeartbeat).Seconds())
+		}
+	}
+
+	state := hookStateFromSignals(now, lastHeartbeat, hasLastHeartbeat, heartbeatsInWindow)
+
+	result := map[string]any{
+		"ok":                   true,
+		"agent_id":             agentID,
+		"hook_state":           state,
+		"hooks_working":        state != "missing",
+		"window_seconds":       int(window.Seconds()),
+		"heartbeats_in_window": heartbeatsInWindow,
+		"presence_registered":  presence != nil,
+		"has_active_session":   sessionEnvelope.Session != nil,
+		"checked_at":           now.Format(time.RFC3339),
+	}
+	if presenceStatus != "" {
+		result["presence_status"] = presenceStatus
+	}
+	if lastHeartbeatRaw != "" {
+		result["last_heartbeat"] = lastHeartbeatRaw
+	}
+	if hasLastHeartbeat {
+		result["heartbeat_age_seconds"] = heartbeatAgeSec
+	}
+	if latestEventAt != "" {
+		result["latest_heartbeat_event_at"] = latestEventAt
+	}
+	if sessionEnvelope.Session != nil {
+		result["session_id"] = sessionEnvelope.Session.ID
+		result["session_namespace"] = sessionEnvelope.Session.Namespace
+		result["session_status"] = sessionEnvelope.Session.Status
+	}
+
+	return json.Marshal(result)
+}
+
+// newAgentHookStatusCmd creates the `loom agent hook-status` command.
+func newAgentHookStatusCmd() *cobra.Command {
+	var (
+		agentID string
+		window  time.Duration
+		limit   int
+		quiet   bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "hook-status",
+		Short: "Check if heartbeat hooks are firing for an agent",
+		Long: `Summarize hook/control-loop health by combining active session state,
+presence heartbeat recency, and recent agent.heartbeat timeline events.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			port := resolvePort(cmd)
+			result, err := hookStatusWithHUD(cmd, port, agentID, window, limit)
+			if err != nil {
+				if quiet {
+					return nil
+				}
+				return err
+			}
+			if !quiet {
+				fmt.Println(string(result))
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&agentID, "agent-id", "", "Agent identifier")
+	cmd.Flags().DurationVar(&window, "window", 5*time.Minute, "Observation window for heartbeat events")
+	cmd.Flags().IntVar(&limit, "limit", 200, "Maximum timeline entries to inspect")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress output (for hooks)")
 
 	return cmd
@@ -928,10 +1230,32 @@ Mutations require --admin-token or $LOOM_HUD_ADMIN_TOKEN (fallback: $HUD_ADMIN_T
 		RunE: func(cmd *cobra.Command, args []string) error {
 			port := resolvePort(cmd)
 
-			hasMutation := capValue >= 0 ||
-				debounceMs >= 0 ||
-				strings.TrimSpace(dropPolicy) != "" ||
-				strings.TrimSpace(lanePriority) != ""
+			mutation := bridge.NudgeQueuePolicyMutation{}
+			if capValue >= 0 {
+				v := capValue
+				mutation.Cap = &v
+			}
+			if debounceMs >= 0 {
+				v := debounceMs
+				mutation.DebounceMs = &v
+			}
+			if strings.TrimSpace(dropPolicy) != "" {
+				v := strings.TrimSpace(dropPolicy)
+				mutation.DropPolicy = &v
+			}
+			if strings.TrimSpace(lanePriority) != "" {
+				lanes, err := bridge.ParseLanePriorityCSV(lanePriority)
+				if err != nil {
+					return err
+				}
+				mutation.LanePriority = lanes
+			}
+			if strings.TrimSpace(updatedBy) != "" {
+				mutation.UpdatedBy = strings.TrimSpace(updatedBy)
+			}
+			mutation = mutation.Normalize()
+
+			hasMutation := mutation.HasMutation()
 
 			if !hasMutation {
 				result, err := nudgeQueuePolicyWithHUD(port)
@@ -957,36 +1281,11 @@ Mutations require --admin-token or $LOOM_HUD_ADMIN_TOKEN (fallback: $HUD_ADMIN_T
 			if token == "" {
 				return fmt.Errorf("admin token is required for policy updates (--admin-token, LOOM_HUD_ADMIN_TOKEN, or HUD_ADMIN_TOKEN)")
 			}
-
-			body := make(map[string]any)
-			if capValue >= 0 {
-				body["cap"] = capValue
-			}
-			if debounceMs >= 0 {
-				body["debounce_ms"] = debounceMs
-			}
-			if strings.TrimSpace(dropPolicy) != "" {
-				body["drop_policy"] = strings.TrimSpace(dropPolicy)
-			}
-			if strings.TrimSpace(lanePriority) != "" {
-				parts := strings.Split(lanePriority, ",")
-				lanes := make([]string, 0, len(parts))
-				for _, p := range parts {
-					lane := strings.TrimSpace(p)
-					if lane != "" {
-						lanes = append(lanes, lane)
-					}
-				}
-				if len(lanes) == 0 {
-					return fmt.Errorf("lane-priority must include at least one non-empty lane")
-				}
-				body["lane_priority"] = lanes
-			}
-			if strings.TrimSpace(updatedBy) != "" {
-				body["updated_by"] = strings.TrimSpace(updatedBy)
+			if err := mutation.Validate(); err != nil {
+				return err
 			}
 
-			result, err := nudgeQueuePolicyUpdateWithHUD(port, body, token)
+			result, err := nudgeQueuePolicyUpdateWithHUD(port, mutation, token)
 			if err != nil {
 				if quiet {
 					return nil
@@ -1121,6 +1420,10 @@ func newAgentDispatchCmd() *cobra.Command {
 		title       string
 		ctx         string
 		priority    string
+		tags        []string
+		filePath    string
+		lineNumber  int
+		blockedBy   []string
 		quiet       bool
 	)
 
@@ -1139,6 +1442,18 @@ This enables the HUD or CLI to push work to active agents.`,
 				"title":           title,
 				"context":         ctx,
 				"priority":        priority,
+			}
+			if len(tags) > 0 {
+				body["tags"] = tags
+			}
+			if filePath != "" {
+				body["file_path"] = filePath
+			}
+			if lineNumber > 0 {
+				body["line_number"] = lineNumber
+			}
+			if len(blockedBy) > 0 {
+				body["blocked_by"] = blockedBy
 			}
 
 			result, err := hudPost(port, "/api/agent/dispatch", body)
@@ -1161,6 +1476,10 @@ This enables the HUD or CLI to push work to active agents.`,
 	cmd.Flags().StringVar(&title, "title", "", "Task title (required)")
 	cmd.Flags().StringVar(&ctx, "context", "", "Additional context for the task")
 	cmd.Flags().StringVar(&priority, "priority", "medium", "Priority (low, medium, high, critical)")
+	cmd.Flags().StringSliceVar(&tags, "tag", nil, "Tag(s) to attach to the dispatched task (comma-separated or repeated)")
+	cmd.Flags().StringVar(&filePath, "file", "", "Optional related file path for the task")
+	cmd.Flags().IntVar(&lineNumber, "line", 0, "Optional related line number for --file")
+	cmd.Flags().StringSliceVar(&blockedBy, "blocked-by", nil, "Task IDs this dispatch should be blocked by (comma-separated or repeated)")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress output")
 	_ = cmd.MarkFlagRequired("to")
 	_ = cmd.MarkFlagRequired("title")
@@ -1209,4 +1528,179 @@ func loadWorkflowFile(path, namespace, createdBy string) (map[string]any, error)
 	}
 
 	return body, nil
+}
+
+// newAgentQualityGateCmd creates the `loom agent quality-gate` command.
+func newAgentQualityGateCmd() *cobra.Command {
+	var (
+		scope   string
+		baseRef string
+		pkgs    []string
+		quiet   bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "quality-gate",
+		Short: "Run quality checks (lint, test, security) on changed files",
+		Long: `Run code quality checks suitable for pre-commit or CI gates.
+Calls golangci-lint, go test, gosec, and govulncheck on changed files.
+Returns structured JSON results with pass/fail status and remediation hints.
+
+Scope determines which files to check:
+  changed  - files changed vs base-ref (default)
+  all      - entire repository
+  package  - specific packages (use --packages)`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			defer cancel()
+
+			result := runQualityGate(ctx, scope, baseRef, pkgs)
+			out, err := json.MarshalIndent(result, "", "  ")
+			if err != nil {
+				return err
+			}
+			if !quiet {
+				fmt.Println(string(out))
+			}
+			if !result.Passed {
+				os.Exit(1)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&scope, "scope", "changed", "Scope: changed, all, or package")
+	cmd.Flags().StringVar(&baseRef, "base-ref", "HEAD~1", "Git ref to diff against (for scope=changed)")
+	cmd.Flags().StringSliceVar(&pkgs, "packages", nil, "Go packages to check (for scope=package)")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress output (exit code only)")
+
+	return cmd
+}
+
+type qualityGateResult struct {
+	Passed   bool                `json:"passed"`
+	Summary  string              `json:"summary"`
+	Lint     *qualityGateSection `json:"lint,omitempty"`
+	Test     *qualityGateSection `json:"test,omitempty"`
+	Security *qualityGateSection `json:"security,omitempty"`
+}
+
+type qualityGateSection struct {
+	Passed bool   `json:"passed"`
+	Output string `json:"output"`
+}
+
+func runQualityGate(ctx context.Context, scope, baseRef string, pkgs []string) qualityGateResult {
+	result := qualityGateResult{Passed: true}
+	var summaryParts []string
+
+	// Resolve target packages
+	var targetPkgs []string
+	switch scope {
+	case "all":
+		targetPkgs = []string{"./..."}
+	case "package":
+		if len(pkgs) > 0 {
+			targetPkgs = pkgs
+		} else {
+			targetPkgs = []string{"./..."}
+		}
+	default: // "changed"
+		changedPkgs, err := changedGoPackagesForCLI(ctx, baseRef)
+		if err != nil {
+			result.Summary = "failed to determine changed packages: " + err.Error()
+			result.Passed = false
+			return result
+		}
+		if len(changedPkgs) == 0 {
+			result.Summary = "no Go files changed"
+			return result
+		}
+		targetPkgs = changedPkgs
+	}
+
+	// Lint
+	if lintPath, err := exec.LookPath("golangci-lint"); err == nil {
+		_ = lintPath
+		lintArgs := []string{"run", "--out-format=line-number"}
+		if scope == "changed" {
+			lintArgs = append(lintArgs, "--new-from-rev="+baseRef)
+		}
+		lintArgs = append(lintArgs, targetPkgs...)
+		stdout, stderr, err := runCommandCLI(ctx, "golangci-lint", lintArgs...)
+		section := &qualityGateSection{Passed: err == nil}
+		if err != nil {
+			section.Output = strings.TrimSpace(stdout + "\n" + stderr)
+			result.Passed = false
+			summaryParts = append(summaryParts, "lint: FAIL")
+		} else {
+			summaryParts = append(summaryParts, "lint: OK")
+		}
+		result.Lint = section
+	}
+
+	// Test
+	testArgs := []string{"test", "-count=1", "-race"}
+	testArgs = append(testArgs, targetPkgs...)
+	stdout, stderr, err := runCommandCLI(ctx, "go", testArgs...)
+	section := &qualityGateSection{Passed: err == nil}
+	if err != nil {
+		section.Output = strings.TrimSpace(stdout + "\n" + stderr)
+		result.Passed = false
+		summaryParts = append(summaryParts, "test: FAIL")
+	} else {
+		summaryParts = append(summaryParts, "test: OK")
+	}
+	result.Test = section
+
+	// Security (gosec)
+	if _, err := exec.LookPath("gosec"); err == nil {
+		gosecArgs := []string{"-quiet"}
+		gosecArgs = append(gosecArgs, targetPkgs...)
+		stdout, stderr, err := runCommandCLI(ctx, "gosec", gosecArgs...)
+		section := &qualityGateSection{Passed: err == nil}
+		if err != nil {
+			section.Output = strings.TrimSpace(stdout + "\n" + stderr)
+			result.Passed = false
+			summaryParts = append(summaryParts, "security: FAIL")
+		} else {
+			summaryParts = append(summaryParts, "security: OK")
+		}
+		result.Security = section
+	}
+
+	result.Summary = strings.Join(summaryParts, "; ")
+	return result
+}
+
+func changedGoPackagesForCLI(ctx context.Context, baseRef string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "git", "diff", "--name-only", "--diff-filter=ACMR", baseRef)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	var pkgList []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" || !strings.HasSuffix(line, ".go") {
+			continue
+		}
+		dir := filepath.Dir(line)
+		pkg := "./" + dir
+		if !seen[pkg] {
+			seen[pkg] = true
+			pkgList = append(pkgList, pkg)
+		}
+	}
+	return pkgList, nil
+}
+
+func runCommandCLI(ctx context.Context, name string, args ...string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
 }

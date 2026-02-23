@@ -7,7 +7,7 @@
 		docker-push docker-push-loom-core docker-push-custom-server \
 		deploy deploy-status \
 		browserkit-check browserkit-setup \
-		hud hud-dev hud-build hud-install hud-reload hud-frontend hud-clean
+		hud hud-dev hud-build hud-install hud-reload hud-frontend hud-dist-check hud-clean
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -23,7 +23,7 @@ BASELINE_DIR ?= .loom/baselines
 REGISTRY ?= registry.harbor.lan
 LOOM_CORE_IMAGE := $(REGISTRY)/mcp/loom-core
 CUSTOM_SERVER_IMAGE := $(REGISTRY)/mcp/custom-server
-IMAGE_TAG ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
+IMAGE_TAG ?= $(shell git rev-parse --short=8 HEAD 2>/dev/null || echo "dev")
 
 # Workspace root (for local Docker builds that need libs/)
 WORKSPACE_ROOT ?= $(shell realpath ../.. 2>/dev/null || echo "$(HOME)/workspace")
@@ -33,7 +33,7 @@ GITOPS_DIR ?= $(shell realpath ../../platform/gitops 2>/dev/null || echo "$(HOME
 LOOM_HUB_DIR := $(GITOPS_DIR)/k3s/loom-hub
 
 # MCP server binaries
-MCP_SERVERS := mcp-time mcp-git mcp-github mcp-gitlab mcp-memory mcp-sequentialthinking mcp-prometheus mcp-k8s mcp-tavily mcp-server-mgmt mcp-cloudflare mcp-loki mcp-asus-router mcp-git-worktree mcp-grafana mcp-k8s-ops mcp-minio mcp-morph-embeddings mcp-qdrant mcp-ops mcp-zep mcp-morph-fast-apply mcp-youtube mcp-godot mcp-alertmanager mcp-flux mcp-postgres mcp-helm mcp-docker mcp-codebase-memory mcp-agent-context mcp-redis mcp-neo4j mcp-confluence mcp-browserkit mcp-devbox mcp-itchio mcp-release mcp-substack
+MCP_SERVERS := mcp-time mcp-git mcp-github mcp-gitlab mcp-memory mcp-sequentialthinking mcp-prometheus mcp-k8s mcp-tavily mcp-server-mgmt mcp-cloudflare mcp-loki mcp-asus-router mcp-git-worktree mcp-grafana mcp-k8s-ops mcp-minio mcp-morph-embeddings mcp-qdrant mcp-quality mcp-ops mcp-zep mcp-morph-fast-apply mcp-youtube mcp-godot mcp-alertmanager mcp-flux mcp-postgres mcp-helm mcp-docker mcp-codebase-memory mcp-agent-context mcp-redis mcp-neo4j mcp-confluence mcp-browserkit mcp-devbox mcp-itchio mcp-release mcp-substack mcp-linkedin mcp-jobsearch mcp-flexinfer
 .PHONY: $(MCP_SERVERS)
 
 # Default target
@@ -193,6 +193,9 @@ mcp-morph-embeddings:
 mcp-qdrant:
 	go build $(LDFLAGS) -o bin/mcp-qdrant ./cmd/mcp-qdrant
 
+mcp-quality:
+	go build $(LDFLAGS) -o bin/mcp-quality ./cmd/mcp-quality
+
 mcp-ops:
 	go build $(LDFLAGS) -o bin/mcp-ops ./cmd/mcp-ops
 
@@ -252,6 +255,15 @@ mcp-release:
 
 mcp-substack:
 	go build $(LDFLAGS) -o bin/mcp-substack ./cmd/mcp-substack
+
+mcp-linkedin:
+	go build $(LDFLAGS) -o bin/mcp-linkedin ./cmd/mcp-linkedin
+
+mcp-jobsearch:
+	go build $(LDFLAGS) -o bin/mcp-jobsearch ./cmd/mcp-jobsearch
+
+mcp-flexinfer:
+	go build $(LDFLAGS) -o bin/mcp-flexinfer ./cmd/mcp-flexinfer
 
 clean: hud-clean
 	rm -rf bin/
@@ -672,6 +684,18 @@ hud-dev: loom
 	cd $(HUD_FRONTEND) && pnpm dev & \
 	wait
 
+# Verify committed dist/ matches a fresh build.
+# Use locally before committing or in CI (requires pnpm/node).
+hud-dist-check: hud-frontend
+	@echo "Checking HUD dist freshness..."
+	@if git diff --quiet $(HUD_FRONTEND)/dist/ 2>/dev/null; then \
+		echo "✓ HUD dist is up-to-date"; \
+	else \
+		echo "ERROR: HUD dist is stale. Run 'make hud-frontend' and commit the result."; \
+		git diff --stat $(HUD_FRONTEND)/dist/; \
+		exit 1; \
+	fi
+
 # Clean frontend artifacts
 hud-clean:
 	@echo "Cleaning HUD frontend..."
@@ -746,6 +770,8 @@ deploy-update-images:
 		echo "Set GITOPS_DIR to override"; \
 		exit 1; \
 	fi
+	@echo "Updating kustomization.yaml newTag to $(IMAGE_TAG)"
+	@sed -i '' 's|newTag: [a-zA-Z0-9._-]*|newTag: $(IMAGE_TAG)|' "$(LOOM_HUB_DIR)/servers/kustomization.yaml"
 	@echo "Updating deployments to use $(CUSTOM_SERVER_IMAGE):$(IMAGE_TAG)"
 	@for f in $(LOOM_HUB_DIR)/servers/*/deployment.yaml; do \
 		if [ -f "$$f" ]; then \

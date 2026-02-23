@@ -1,10 +1,13 @@
 package sync
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/crb2nu/loom/pkg/skills"
 )
 
 // =============================================================================
@@ -389,6 +392,171 @@ func TestEnsureGeminiExtensionManifests_RepairsInvalidFromBackup(t *testing.T) {
 	}
 	if string(got) != string(backup) {
 		t.Fatalf("expected gemini-extension.json restored from backup\nwant: %q\ngot:  %q", string(backup), string(got))
+	}
+}
+
+func TestEnsureGeminiExtensionCommands_RepairsInvalidFromBackup(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	commandPath := filepath.Join(homeGemini, "extensions", "code-review", "commands", "code-review.toml")
+	if err := os.MkdirAll(filepath.Dir(commandPath), 0755); err != nil {
+		t.Fatalf("mkdir command dir: %v", err)
+	}
+	if err := os.WriteFile(commandPath, []byte(""), 0600); err != nil {
+		t.Fatalf("write invalid command: %v", err)
+	}
+
+	backupPath := filepath.Join(homeGemini, "backups", "gemini_home_20990101_000000", "extensions", "code-review", "commands", "code-review.toml")
+	backup := []byte("name = \"code-review\"\nprompt = \"Run a review\"\n")
+	if err := os.MkdirAll(filepath.Dir(backupPath), 0755); err != nil {
+		t.Fatalf("mkdir backup command dir: %v", err)
+	}
+	if err := os.WriteFile(backupPath, backup, 0600); err != nil {
+		t.Fatalf("write backup command: %v", err)
+	}
+
+	if err := ensureGeminiExtensionCommands(homeGemini); err != nil {
+		t.Fatalf("ensureGeminiExtensionCommands failed: %v", err)
+	}
+
+	got, err := os.ReadFile(commandPath)
+	if err != nil {
+		t.Fatalf("read command: %v", err)
+	}
+	if string(got) != string(backup) {
+		t.Fatalf("expected command restored from backup\nwant: %q\ngot:  %q", string(backup), string(got))
+	}
+}
+
+func TestEnsureGeminiExtensionCommands_QuarantinesInvalidWithoutBackup(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	commandPath := filepath.Join(homeGemini, "extensions", "code-review", "commands", "code-review.toml")
+	if err := os.MkdirAll(filepath.Dir(commandPath), 0755); err != nil {
+		t.Fatalf("mkdir command dir: %v", err)
+	}
+	if err := os.WriteFile(commandPath, []byte(""), 0600); err != nil {
+		t.Fatalf("write invalid command: %v", err)
+	}
+
+	if err := ensureGeminiExtensionCommands(homeGemini); err != nil {
+		t.Fatalf("ensureGeminiExtensionCommands failed: %v", err)
+	}
+
+	if _, err := os.Stat(commandPath); !os.IsNotExist(err) {
+		t.Fatalf("expected invalid command to be quarantined, stat err=%v", err)
+	}
+	quarantinePath := commandPath + ".loom-quarantined"
+	if _, err := os.Stat(quarantinePath); err != nil {
+		t.Fatalf("expected quarantined file at %s: %v", quarantinePath, err)
+	}
+}
+
+func TestEnsureGeminiAuthFiles_RepairsCorruptedAuthData(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	if err := os.MkdirAll(homeGemini, 0755); err != nil {
+		t.Fatalf("mkdir home gemini: %v", err)
+	}
+
+	originalGoogle := []byte("{\"email\":\"user@example.com\"}\n")
+	originalOAuth := []byte("{\"refresh_token\":\"abc\"}\n")
+	originalState := []byte("{\"session\":\"ok\"}\n")
+	originalInstall := []byte("installation-id-123\n")
+
+	if err := os.WriteFile(filepath.Join(homeGemini, "google_accounts.json"), originalGoogle, 0600); err != nil {
+		t.Fatalf("write google_accounts.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeGemini, "oauth_creds.json"), originalOAuth, 0600); err != nil {
+		t.Fatalf("write oauth_creds.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeGemini, "state.json"), originalState, 0600); err != nil {
+		t.Fatalf("write state.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeGemini, "installation_id"), originalInstall, 0600); err != nil {
+		t.Fatalf("write installation_id: %v", err)
+	}
+
+	snapshot := readGeminiAuthSnapshot(homeGemini)
+
+	// Simulate corruption during sync or external write.
+	if err := os.WriteFile(filepath.Join(homeGemini, "google_accounts.json"), []byte(""), 0600); err != nil {
+		t.Fatalf("corrupt google_accounts.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeGemini, "oauth_creds.json"), []byte("not-json"), 0600); err != nil {
+		t.Fatalf("corrupt oauth_creds.json: %v", err)
+	}
+	if err := os.Remove(filepath.Join(homeGemini, "state.json")); err != nil {
+		t.Fatalf("remove state.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeGemini, "installation_id"), []byte(" \n"), 0600); err != nil {
+		t.Fatalf("corrupt installation_id: %v", err)
+	}
+
+	if err := ensureGeminiAuthFiles(homeGemini, snapshot); err != nil {
+		t.Fatalf("ensureGeminiAuthFiles failed: %v", err)
+	}
+
+	assertFileEquals := func(name string, want []byte) {
+		got, err := os.ReadFile(filepath.Join(homeGemini, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("%s mismatch\nwant: %q\ngot:  %q", name, string(want), string(got))
+		}
+	}
+
+	assertFileEquals("google_accounts.json", originalGoogle)
+	assertFileEquals("oauth_creds.json", originalOAuth)
+	assertFileEquals("state.json", originalState)
+	assertFileEquals("installation_id", originalInstall)
+}
+
+func TestEnsureGeminiAuthFiles_DoesNotOverrideValidCurrentData(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	if err := os.MkdirAll(homeGemini, 0755); err != nil {
+		t.Fatalf("mkdir home gemini: %v", err)
+	}
+
+	// Snapshot with old values.
+	if err := os.WriteFile(filepath.Join(homeGemini, "google_accounts.json"), []byte("{\"email\":\"old@example.com\"}\n"), 0600); err != nil {
+		t.Fatalf("write old google_accounts.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeGemini, "installation_id"), []byte("old-install-id\n"), 0600); err != nil {
+		t.Fatalf("write old installation_id: %v", err)
+	}
+	snapshot := readGeminiAuthSnapshot(homeGemini)
+
+	// Simulate user re-auth producing new valid files.
+	newGoogle := []byte("{\"email\":\"new@example.com\"}\n")
+	newInstall := []byte("new-install-id\n")
+	if err := os.WriteFile(filepath.Join(homeGemini, "google_accounts.json"), newGoogle, 0600); err != nil {
+		t.Fatalf("write new google_accounts.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeGemini, "installation_id"), newInstall, 0600); err != nil {
+		t.Fatalf("write new installation_id: %v", err)
+	}
+
+	if err := ensureGeminiAuthFiles(homeGemini, snapshot); err != nil {
+		t.Fatalf("ensureGeminiAuthFiles failed: %v", err)
+	}
+
+	gotGoogle, err := os.ReadFile(filepath.Join(homeGemini, "google_accounts.json"))
+	if err != nil {
+		t.Fatalf("read google_accounts.json: %v", err)
+	}
+	if string(gotGoogle) != string(newGoogle) {
+		t.Fatalf("expected current valid google_accounts.json preserved\nwant: %q\ngot:  %q", string(newGoogle), string(gotGoogle))
+	}
+
+	gotInstall, err := os.ReadFile(filepath.Join(homeGemini, "installation_id"))
+	if err != nil {
+		t.Fatalf("read installation_id: %v", err)
+	}
+	if string(gotInstall) != string(newInstall) {
+		t.Fatalf("expected current valid installation_id preserved\nwant: %q\ngot:  %q", string(newInstall), string(gotInstall))
 	}
 }
 
@@ -1167,6 +1335,301 @@ func TestSyncAll_PerProfileDefaults(t *testing.T) {
 		homeFile := filepath.Join(homeDir, profile, "config.toml")
 		if !Exists(homeFile) {
 			t.Errorf("expected %s to be synced", homeFile)
+		}
+	}
+}
+
+// =============================================================================
+// SkillsDirectToHome Tests
+// =============================================================================
+
+func TestCleanRepoSkills_RemovesStaleFiles(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+
+	p := &Profile{
+		Name:               "gemini",
+		RepoDir:            ".gemini",
+		HomeDir:            ".gemini",
+		SkillsDirectToHome: true,
+	}
+
+	repoGemini := filepath.Join(repoDir, ".gemini")
+
+	// Create stale repo skill files
+	skillsDir := filepath.Join(repoGemini, "skills", "test-skill")
+	os.MkdirAll(skillsDir, 0755)
+	os.WriteFile(filepath.Join(skillsDir, "SKILL.md"), []byte("stale"), 0644)
+
+	// Create stale manifest
+	os.WriteFile(filepath.Join(repoGemini, skills.ManifestFilename), []byte("{}"), 0644)
+
+	// Create stale instructions.md
+	os.WriteFile(filepath.Join(repoGemini, "instructions.md"), []byte("stale"), 0644)
+
+	m.cleanRepoSkills(p)
+
+	if Exists(filepath.Join(repoGemini, "skills")) {
+		t.Error("expected skills directory to be removed")
+	}
+	if Exists(filepath.Join(repoGemini, skills.ManifestFilename)) {
+		t.Error("expected manifest to be removed")
+	}
+	if Exists(filepath.Join(repoGemini, "instructions.md")) {
+		t.Error("expected instructions.md to be removed")
+	}
+}
+
+func TestCleanRepoSkills_NoopWhenNothingExists(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+
+	p := &Profile{
+		Name:               "gemini",
+		RepoDir:            ".gemini",
+		SkillsDirectToHome: true,
+	}
+
+	// Should not panic or error when nothing exists
+	m.cleanRepoSkills(p)
+}
+
+func TestSyncToHome_SkillsDirectToHome_SkipsRepoCopy(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+
+	repoGemini := filepath.Join(repoDir, ".gemini")
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	os.MkdirAll(repoGemini, 0755)
+	os.MkdirAll(homeGemini, 0755)
+
+	// Create generated config files
+	os.WriteFile(filepath.Join(repoGemini, "config.toml"), []byte("[mcp_servers]\n"), 0644)
+	os.WriteFile(filepath.Join(repoGemini, "settings.json"), []byte("{}\n"), 0644)
+	os.WriteFile(filepath.Join(homeGemini, "trustedFolders.json"), []byte("{}\n"), 0600)
+
+	// Create a skill manifest in the REPO (simulating pre-existing state)
+	manifest := skills.Manifest{
+		Platform:  "gemini",
+		Generated: []string{"skills/test/SKILL.md"},
+	}
+	manifestData, _ := json.MarshalIndent(manifest, "", "  ")
+	os.WriteFile(filepath.Join(repoGemini, skills.ManifestFilename), manifestData, 0644)
+
+	// Create the skill file in repo
+	os.MkdirAll(filepath.Join(repoGemini, "skills", "test"), 0755)
+	os.WriteFile(filepath.Join(repoGemini, "skills", "test", "SKILL.md"), []byte("repo skill"), 0644)
+
+	p := m.Get("gemini")
+	// Override to use direct-to-home
+	p.SkillsDirectToHome = true
+
+	err := m.SyncToHome("gemini", false, false, false, false, "", false, "", false)
+	if err != nil {
+		t.Fatalf("SyncToHome failed: %v", err)
+	}
+
+	// The repo skill should NOT have been copied to home (direct-to-home skips the copy)
+	homeSkill := filepath.Join(homeGemini, "skills", "test", "SKILL.md")
+	if Exists(homeSkill) {
+		content, _ := os.ReadFile(homeSkill)
+		if string(content) == "repo skill" {
+			t.Error("repo skill should not have been copied to home when SkillsDirectToHome is true")
+		}
+	}
+}
+
+// =============================================================================
+// Gemini MCP Extension Pruning Tests
+// =============================================================================
+
+func TestPruneGeminiMCPExtensions_RemovesMCPExtensions(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+
+	// Create an extension with mcpServers (should be pruned)
+	mcpExt := filepath.Join(homeGemini, "extensions", "gemini-cli-security")
+	os.MkdirAll(mcpExt, 0755)
+	os.WriteFile(filepath.Join(mcpExt, "gemini-extension.json"), []byte(`{
+		"name": "gemini-cli-security",
+		"mcpServers": {"osvScanner": {"command": "osv-scanner"}}
+	}`), 0644)
+
+	// Create an extension without mcpServers (should be preserved)
+	noMCPExt := filepath.Join(homeGemini, "extensions", "code-review")
+	os.MkdirAll(noMCPExt, 0755)
+	os.WriteFile(filepath.Join(noMCPExt, "gemini-extension.json"), []byte(`{
+		"name": "code-review",
+		"commands": [{"name": "review"}]
+	}`), 0644)
+
+	// Create extension-enablement.json
+	os.WriteFile(filepath.Join(homeGemini, "extensions", "extension-enablement.json"),
+		[]byte(`{"gemini-cli-security": true, "code-review": true}`), 0600)
+
+	pruned, err := pruneGeminiMCPExtensions(homeGemini)
+	if err != nil {
+		t.Fatalf("pruneGeminiMCPExtensions failed: %v", err)
+	}
+
+	if len(pruned) != 1 || pruned[0] != "gemini-cli-security" {
+		t.Fatalf("expected [gemini-cli-security] pruned, got %v", pruned)
+	}
+
+	if Exists(mcpExt) {
+		t.Error("expected gemini-cli-security extension to be removed")
+	}
+	if !Exists(noMCPExt) {
+		t.Error("expected code-review extension to be preserved")
+	}
+
+	// Check enablement was updated
+	enableData, err := os.ReadFile(filepath.Join(homeGemini, "extensions", "extension-enablement.json"))
+	if err != nil {
+		t.Fatalf("read enablement: %v", err)
+	}
+	var enablement map[string]any
+	json.Unmarshal(enableData, &enablement)
+	if _, ok := enablement["gemini-cli-security"]; ok {
+		t.Error("expected gemini-cli-security removed from enablement")
+	}
+	if _, ok := enablement["code-review"]; !ok {
+		t.Error("expected code-review preserved in enablement")
+	}
+}
+
+func TestPruneGeminiMCPExtensions_NoExtensionsDir(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	os.MkdirAll(homeGemini, 0755)
+
+	pruned, err := pruneGeminiMCPExtensions(homeGemini)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pruned) != 0 {
+		t.Fatalf("expected no pruned extensions, got %v", pruned)
+	}
+}
+
+func TestPruneGeminiMCPExtensions_PreservesNonMCPExtensions(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+
+	// Extension with only commands (no mcpServers)
+	ext := filepath.Join(homeGemini, "extensions", "prompt-library")
+	os.MkdirAll(ext, 0755)
+	os.WriteFile(filepath.Join(ext, "gemini-extension.json"), []byte(`{"name": "prompt-library"}`), 0644)
+
+	pruned, err := pruneGeminiMCPExtensions(homeGemini)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pruned) != 0 {
+		t.Fatalf("expected no pruned extensions, got %v", pruned)
+	}
+	if !Exists(ext) {
+		t.Error("expected prompt-library to be preserved")
+	}
+}
+
+func TestRemoveFromExtensionEnablement_RemovesEntries(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	os.MkdirAll(filepath.Join(homeGemini, "extensions"), 0755)
+
+	path := filepath.Join(homeGemini, "extensions", "extension-enablement.json")
+	os.WriteFile(path, []byte(`{"foo": true, "bar": false, "baz": true}`), 0600)
+
+	err := removeFromExtensionEnablement(homeGemini, []string{"foo", "baz"})
+	if err != nil {
+		t.Fatalf("removeFromExtensionEnablement failed: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	var obj map[string]any
+	json.Unmarshal(data, &obj)
+
+	if _, ok := obj["foo"]; ok {
+		t.Error("expected foo removed")
+	}
+	if _, ok := obj["baz"]; ok {
+		t.Error("expected baz removed")
+	}
+	if _, ok := obj["bar"]; !ok {
+		t.Error("expected bar preserved")
+	}
+}
+
+func TestRemoveFromExtensionEnablement_NoFileIsNoop(t *testing.T) {
+	homeDir := t.TempDir()
+	homeGemini := filepath.Join(homeDir, ".gemini")
+	os.MkdirAll(homeGemini, 0755)
+
+	err := removeFromExtensionEnablement(homeGemini, []string{"foo"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFilterPrunedExtensions_RemovesPrunedFromSnapshot(t *testing.T) {
+	snapshot := geminiConfigSnapshot{
+		extensionManifests: map[string][]byte{
+			"extensions/context7/gemini-extension.json":    []byte("{}"),
+			"extensions/code-review/gemini-extension.json": []byte("{}"),
+			"extensions/redis/gemini-extension.json":       []byte("{}"),
+		},
+	}
+
+	filtered := filterPrunedExtensions(snapshot, []string{"context7", "redis"})
+
+	if len(filtered.extensionManifests) != 1 {
+		t.Fatalf("expected 1 manifest remaining, got %d", len(filtered.extensionManifests))
+	}
+	if _, ok := filtered.extensionManifests["extensions/code-review/gemini-extension.json"]; !ok {
+		t.Error("expected code-review to be preserved")
+	}
+}
+
+func TestFilterPrunedExtensions_NoPrunedIsNoop(t *testing.T) {
+	snapshot := geminiConfigSnapshot{
+		extensionManifests: map[string][]byte{
+			"extensions/code-review/gemini-extension.json": []byte("{}"),
+		},
+	}
+
+	filtered := filterPrunedExtensions(snapshot, nil)
+
+	if len(filtered.extensionManifests) != 1 {
+		t.Fatalf("expected snapshot unchanged, got %d manifests", len(filtered.extensionManifests))
+	}
+}
+
+func TestGeminiProfile_HasSkillsDirectToHome(t *testing.T) {
+	m, _ := NewManager(t.TempDir())
+
+	gemini := m.Get("gemini")
+	if gemini == nil {
+		t.Fatal("gemini profile not found")
+	}
+	if !gemini.SkillsDirectToHome {
+		t.Error("gemini profile should have SkillsDirectToHome=true")
+	}
+
+	// Other profiles should NOT have it
+	for _, name := range []string{"claude", "codex", "kilocode"} {
+		p := m.Get(name)
+		if p != nil && p.SkillsDirectToHome {
+			t.Errorf("%s profile should not have SkillsDirectToHome=true", name)
 		}
 	}
 }

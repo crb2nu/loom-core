@@ -79,13 +79,7 @@ func extractStringField(payload any, key string) (string, bool) {
 // handleAgentSessionStart creates a new agent session (idempotent).
 // POST /api/agent/session-start
 func (a *App) handleAgentSessionStart(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Namespace   string `json:"namespace"`
-		AgentID     string `json:"agent_id"`
-		AgentType   string `json:"agent_type"`
-		Description string `json:"description"`
-		AutoRecall  bool   `json:"auto_recall"`
-	}
+	var body bridge.SessionStartParams
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
 		return
@@ -95,13 +89,7 @@ func (a *App) handleAgentSessionStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := a.agent.StartSession(bridge.SessionStartParams{
-		Namespace:   body.Namespace,
-		AgentID:     body.AgentID,
-		AgentType:   body.AgentType,
-		Description: body.Description,
-		AutoRecall:  body.AutoRecall,
-	})
+	result, err := a.agent.StartSession(body)
 	if err != nil {
 		a.writeError(w, http.StatusBadGateway, "failed to start session", err)
 		return
@@ -183,11 +171,7 @@ func (a *App) maybeAutoProvisionSandbox(namespace string) {
 // handleAgentSessionEnd ends an agent session.
 // POST /api/agent/session-end
 func (a *App) handleAgentSessionEnd(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		SessionID string `json:"session_id"`
-		AgentID   string `json:"agent_id"`
-		Summarize bool   `json:"summarize"`
-	}
+	var body bridge.SessionEndParams
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
 		return
@@ -197,11 +181,7 @@ func (a *App) handleAgentSessionEnd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ended, err := a.agent.EndSession(bridge.SessionEndParams{
-		SessionID: body.SessionID,
-		AgentID:   body.AgentID,
-		Summarize: body.Summarize,
-	})
+	ended, err := a.agent.EndSession(body)
 	if err != nil {
 		a.writeError(w, http.StatusBadGateway, "failed to end session", err)
 		return
@@ -236,6 +216,10 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		Status      string `json:"status,omitempty"`
 		AgentType   string `json:"agent_type,omitempty"`
 		Description string `json:"description,omitempty"`
+		Namespace   string `json:"namespace,omitempty"`
+		// EnsureSession auto-bootstraps a session when heartbeat clients lack
+		// dedicated session-start hooks (for example proxy-only integrations).
+		EnsureSession bool `json:"ensure_session,omitempty"`
 
 		ActiveFiles []string `json:"active_files,omitempty"`
 		CurrentTask string   `json:"current_task,omitempty"`
@@ -250,6 +234,12 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if body.AgentID == "" {
 		a.writeError(w, http.StatusBadRequest, "agent_id is required", nil)
 		return
+	}
+	if body.EnsureSession {
+		namespace := strings.TrimSpace(body.Namespace)
+		if err := a.ensureHeartbeatSession(body.AgentID, namespace, body.AgentType, body.Description); err != nil {
+			a.logger.Warn("heartbeat ensure-session failed", "agent_id", body.AgentID, "error", err)
+		}
 	}
 
 	// Coalesce rapid heartbeats: skip the MCP round-trip if we saw an identical
@@ -395,6 +385,61 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, resp)
 }
 
+func (a *App) ensureHeartbeatSession(agentID, namespace, agentType, description string) error {
+	if strings.TrimSpace(agentID) == "" {
+		return nil
+	}
+
+	cacheKey := "hb-session:" + agentID + ":" + namespace
+	if _, ok := a.cache.Get(cacheKey); ok {
+		return nil
+	}
+
+	active, err := a.agent.GetActiveSession(agentID)
+	if err != nil {
+		return err
+	}
+	if active != nil {
+		if namespace == "" || strings.TrimSpace(active.Namespace) == namespace {
+			a.cache.Set(cacheKey, true, 30*time.Second)
+			return nil
+		}
+	}
+
+	if namespace == "" {
+		namespace = "agents/" + agentID
+	}
+	if strings.TrimSpace(agentType) == "" {
+		agentType = agentID
+	}
+	if strings.TrimSpace(description) == "" {
+		description = "Heartbeat bootstrap session"
+	}
+
+	result, err := a.agent.StartSession(bridge.SessionStartParams{
+		Namespace:   namespace,
+		AgentID:     agentID,
+		AgentType:   agentType,
+		Description: description,
+		AutoRecall:  false,
+	})
+	if err != nil {
+		return err
+	}
+
+	a.cache.Set(cacheKey, true, 30*time.Second)
+	if result != nil {
+		a.broadcastAgentEvent("agent.session.bootstrap", map[string]any{
+			"agent_id":   agentID,
+			"agent_type": agentType,
+			"session_id": result.SessionID,
+			"namespace":  namespace,
+		})
+	}
+
+	return nil
+}
+
 func heartbeatFingerprint(status, currentTask, branch string, activeFiles []string) string {
 	afs := append([]string(nil), activeFiles...)
 	sort.Strings(afs)
@@ -427,31 +472,23 @@ func isPresenceNotRegisteredErr(err error) bool {
 // handleAgentTaskUpdate updates a task's status via the lifecycle API.
 // POST /api/agent/task-update
 func (a *App) handleAgentTaskUpdate(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		TaskID     string `json:"task_id"`
-		Status     string `json:"status"`
-		Resolution string `json:"resolution,omitempty"`
-	}
+	var body bridge.UpdateTaskParams
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
 		return
 	}
-	if body.TaskID == "" {
+	if body.ID == "" {
 		a.writeError(w, http.StatusBadRequest, "task_id is required", nil)
 		return
 	}
 
-	if err := a.agent.UpdateTask(bridge.UpdateTaskParams{
-		ID:         body.TaskID,
-		Status:     body.Status,
-		Resolution: body.Resolution,
-	}); err != nil {
+	if err := a.agent.UpdateTask(body); err != nil {
 		a.writeError(w, http.StatusBadGateway, "failed to update task", err)
 		return
 	}
 
 	a.broadcastAgentEvent("agent.task.update", map[string]any{
-		"task_id":    body.TaskID,
+		"task_id":    body.ID,
 		"status":     body.Status,
 		"resolution": body.Resolution,
 	})
@@ -527,6 +564,46 @@ func (a *App) handleAgentSession(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"session": session})
 }
 
+// handleAgentSessionList lists sessions with optional filters.
+// POST /api/agent/session-list
+func (a *App) handleAgentSessionList(w http.ResponseWriter, r *http.Request) {
+	var params map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+
+	result, err := a.agent.ListSessions(params)
+	if err != nil {
+		a.writeError(w, http.StatusBadGateway, "failed to list sessions", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(result)
+}
+
+// handleAgentSessionPrune prunes stale sessions.
+// POST /api/agent/session-prune
+func (a *App) handleAgentSessionPrune(w http.ResponseWriter, r *http.Request) {
+	var params map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+
+	result, err := a.agent.PruneSessions(params)
+	if err != nil {
+		a.writeError(w, http.StatusBadGateway, "failed to prune sessions", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(result)
+}
+
 // handleAgentContextAdd proxies context entries to agent-context and broadcasts
 // SSE events for devbox-titled entries so the sandbox panel shows live activity.
 // POST /api/agent/context/add
@@ -578,30 +655,13 @@ func (a *App) handleAgentContextAdd(w http.ResponseWriter, r *http.Request) {
 // handleAgentContextInspect returns a context budget breakdown for an agent/session.
 // GET /api/agent/context-inspect?agent_id=...&session_id=...&detail=true&limit=200
 func (a *App) handleAgentContextInspect(w http.ResponseWriter, r *http.Request) {
-	agentID := strings.TrimSpace(r.URL.Query().Get("agent_id"))
-	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
-	if agentID == "" && sessionID == "" {
-		a.writeError(w, http.StatusBadRequest, "agent_id or session_id query parameter is required", nil)
+	req, err := bridge.ParseContextInspectRequest(r.URL.Query())
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 
-	detail := false
-	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("detail"))) {
-	case "1", "true", "yes", "y":
-		detail = true
-	}
-
-	limit := 200
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed <= 0 {
-			a.writeError(w, http.StatusBadRequest, "limit must be a positive integer", nil)
-			return
-		}
-		limit = parsed
-	}
-
-	result, err := a.agent.ContextInspect(agentID, sessionID, detail, limit)
+	result, err := a.agent.ContextInspect(req.AgentID, req.SessionID, req.Detail, req.Limit)
 	if err != nil {
 		a.writeError(w, http.StatusBadGateway, "context inspect failed", err)
 		return
@@ -668,18 +728,18 @@ func (a *App) handleAgentNudgeQueue(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "agent_id query parameter is required", nil)
 		return
 	}
-	a.writeJSON(w, http.StatusOK, map[string]any{
-		"ok":     true,
-		"status": a.nudgeQueue.Status(agentID),
+	a.writeJSON(w, http.StatusOK, bridge.NudgeQueueStatusResponse{
+		OK:     true,
+		Status: toNudgeQueueStatusView(a.nudgeQueue.Status(agentID)),
 	})
 }
 
 // handleAgentNudgeQueuePolicy returns current queue policy.
 // GET /api/agent/nudge-queue-policy
 func (a *App) handleAgentNudgeQueuePolicy(w http.ResponseWriter, _ *http.Request) {
-	a.writeJSON(w, http.StatusOK, map[string]any{
-		"ok":     true,
-		"policy": toNudgeQueuePolicyView(a.nudgeQueue.Config()),
+	a.writeJSON(w, http.StatusOK, bridge.NudgeQueuePolicyResponse{
+		OK:     true,
+		Policy: toNudgeQueuePolicyView(a.nudgeQueue.Config()),
 	})
 }
 
@@ -690,15 +750,18 @@ func (a *App) handleAgentNudgeQueuePolicyUpdate(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	var body struct {
-		DebounceMs   *int     `json:"debounce_ms,omitempty"`
-		Cap          *int     `json:"cap,omitempty"`
-		DropPolicy   *string  `json:"drop_policy,omitempty"`
-		LanePriority []string `json:"lane_priority,omitempty"`
-		UpdatedBy    string   `json:"updated_by,omitempty"`
-	}
+	var body bridge.NudgeQueuePolicyMutation
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+	body = body.Normalize()
+	if !body.HasMutation() {
+		a.writeError(w, http.StatusBadRequest, "at least one policy field is required", nil)
+		return
+	}
+	if err := body.Validate(); err != nil {
+		a.writeError(w, http.StatusBadRequest, "invalid nudge queue policy", err)
 		return
 	}
 
@@ -709,10 +772,6 @@ func (a *App) handleAgentNudgeQueuePolicyUpdate(w http.ResponseWriter, r *http.R
 	}
 	if body.LanePriority != nil {
 		update.LanePriority = append([]string(nil), body.LanePriority...)
-	}
-	if update.DebounceMs == nil && update.Cap == nil && update.DropPolicy == nil && update.LanePriority == nil {
-		a.writeError(w, http.StatusBadRequest, "at least one policy field is required", nil)
-		return
 	}
 
 	before := a.nudgeQueue.Config()
@@ -750,25 +809,32 @@ func (a *App) handleAgentNudgeQueuePolicyUpdate(w http.ResponseWriter, r *http.R
 		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
 	})
 
-	a.writeJSON(w, http.StatusOK, map[string]any{
-		"ok":     true,
-		"policy": afterView,
+	a.writeJSON(w, http.StatusOK, bridge.NudgeQueuePolicyResponse{
+		OK:     true,
+		Policy: afterView,
 	})
 }
 
-type nudgeQueuePolicyView struct {
-	DebounceMs   int             `json:"debounce_ms"`
-	Cap          int             `json:"cap"`
-	DropPolicy   NudgeDropPolicy `json:"drop_policy"`
-	LanePriority []string        `json:"lane_priority"`
-}
+type nudgeQueuePolicyView = bridge.NudgeQueuePolicy
 
 func toNudgeQueuePolicyView(cfg NudgeQueueConfig) nudgeQueuePolicyView {
 	return nudgeQueuePolicyView{
 		DebounceMs:   int(cfg.Debounce / time.Millisecond),
 		Cap:          cfg.Cap,
-		DropPolicy:   cfg.DropPolicy,
+		DropPolicy:   string(cfg.DropPolicy),
 		LanePriority: append([]string(nil), cfg.LanePriority...),
+	}
+}
+
+func toNudgeQueueStatusView(status NudgeQueueStatus) bridge.NudgeQueueStatus {
+	return bridge.NudgeQueueStatus{
+		Pending:      status.Pending,
+		Dropped:      status.Dropped,
+		ByLane:       status.ByLane,
+		DebounceMs:   status.DebounceMs,
+		Cap:          status.Cap,
+		DropPolicy:   string(status.DropPolicy),
+		LanePriority: append([]string(nil), status.LanePriority...),
 	}
 }
 

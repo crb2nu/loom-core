@@ -117,7 +117,7 @@ func (g *Generator) generateForTarget(target string) error {
 
 		skillType := skill.GetType(target)
 
-		// Collect instruction-type skills for composite instructions.md
+		// Collect instruction-type skills for composite instructions.md / GEMINI.md
 		if skillType == "instruction" {
 			instructionSkills = append(instructionSkills, skill)
 			continue
@@ -130,18 +130,17 @@ func (g *Generator) generateForTarget(target string) error {
 		case "codex":
 			err = g.generateCodexSkill(skill)
 			if err == nil {
-				files = append(files, filepath.Join("skills", skill.Name, "SKILL.md"))
+				files = append(files, g.codexManifestFiles(skill)...)
 			}
 		case "claude":
 			files, err = g.generateClaudeSkillByType(skill)
 		case "kilocode":
 			files, err = g.generateKilocodeSkill(skill)
 		case "gemini":
-			// Gemini only supports instructions — non-instruction types are skipped
-			if g.Verbose {
-				fmt.Printf("Skipping %s for gemini (type=%s, only instruction supported)\n", skill.Name, skillType)
+			err = g.generateGeminiSkill(skill)
+			if err == nil {
+				files = append(files, g.geminiManifestFiles(skill)...)
 			}
-			continue
 		default:
 			return fmt.Errorf("unknown target: %s", target)
 		}
@@ -154,9 +153,13 @@ func (g *Generator) generateForTarget(target string) error {
 
 	// Generate composite instructions.md for platforms that support it
 	if len(instructionSkills) > 0 {
+		filename := "instructions.md"
+		if target == "gemini" {
+			filename = "GEMINI.md"
+		}
 		files, err := g.generateInstructionsFile(target, instructionSkills)
 		if err != nil {
-			return fmt.Errorf("generate %s instructions.md: %w", target, err)
+			return fmt.Errorf("generate %s %s: %w", target, filename, err)
 		}
 		generatedFiles = append(generatedFiles, files...)
 	}
@@ -194,6 +197,43 @@ func (g *Generator) resolveTargetDir(target string) string {
 		}
 	}
 	return ""
+}
+
+func (g *Generator) codexManifestFiles(skill *Skill) []string {
+	files := []string{filepath.Join("skills", skill.Name, "SKILL.md")}
+	seen := map[string]struct{}{files[0]: {}}
+
+	add := func(path string) {
+		if path == "" {
+			return
+		}
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		files = append(files, path)
+	}
+
+	if skill.Common != nil {
+		for _, script := range skill.Common.Scripts {
+			if script == nil || script.Path == "" {
+				continue
+			}
+			add(filepath.Join("skills", skill.Name, script.Path))
+		}
+		for _, ref := range skill.Common.References {
+			add(filepath.Join("skills", skill.Name, "references", ref))
+		}
+		for _, asset := range skill.Common.Assets {
+			add(filepath.Join("skills", skill.Name, "assets", asset))
+		}
+	}
+
+	return files
+}
+
+func (g *Generator) geminiManifestFiles(skill *Skill) []string {
+	return g.codexManifestFiles(skill)
 }
 
 // =========================================================================
@@ -285,6 +325,110 @@ func (g *Generator) generateCodexSkill(skill *Skill) error {
 	}
 
 	return nil
+}
+
+// =========================================================================
+// Gemini Generator
+// =========================================================================
+
+// generateGeminiSkill generates a Gemini CLI skill bundle in .gemini/skills/<name>/.
+func (g *Generator) generateGeminiSkill(skill *Skill) error {
+	baseDir := g.resolveTargetDir("gemini")
+	if baseDir == "" {
+		baseDir = filepath.Join(g.RepoRoot, ".gemini")
+	}
+
+	skillDir := filepath.Join(baseDir, "skills", skill.Name)
+
+	if g.Verbose {
+		fmt.Printf("Generating Gemini skill: %s -> %s\n", skill.Name, skillDir)
+	}
+
+	if g.DryRun {
+		fmt.Printf("[dry-run] Would create Gemini skill: %s\n", skillDir)
+		return nil
+	}
+
+	for _, subdir := range []string{"scripts", "references", "assets/templates"} {
+		if err := os.MkdirAll(filepath.Join(skillDir, subdir), 0755); err != nil {
+			return fmt.Errorf("create %s: %w", subdir, err)
+		}
+	}
+
+	skillMD := g.generateGeminiSkillMD(skill)
+	skillMDPath := filepath.Join(skillDir, "SKILL.md")
+	if err := os.WriteFile(skillMDPath, []byte(skillMD), 0644); err != nil {
+		return fmt.Errorf("write SKILL.md: %w", err)
+	}
+
+	sourceSkillDir := filepath.Join(g.SourceDir, skill.Name)
+	if skill.Common.Scripts != nil {
+		for _, script := range skill.Common.Scripts {
+			srcPath := filepath.Join(sourceSkillDir, script.Path)
+			dstPath := filepath.Join(skillDir, script.Path)
+			if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
+				fmt.Printf("Warning: could not copy script %s: %v\n", script.Path, err)
+			}
+		}
+	}
+
+	if skill.Common.References != nil {
+		for _, ref := range skill.Common.References {
+			srcPath := filepath.Join(sourceSkillDir, "references", ref)
+			dstPath := filepath.Join(skillDir, "references", ref)
+			if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
+				fmt.Printf("Warning: could not copy reference %s: %v\n", ref, err)
+			}
+		}
+	}
+
+	if skill.Common.Assets != nil {
+		for _, asset := range skill.Common.Assets {
+			srcPath := filepath.Join(sourceSkillDir, "assets", asset)
+			dstPath := filepath.Join(skillDir, "assets", asset)
+			if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+				return err
+			}
+			if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
+				fmt.Printf("Warning: could not copy asset %s: %v\n", asset, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// generateGeminiSkillMD generates the SKILL.md content for a Gemini skill.
+func (g *Generator) generateGeminiSkillMD(skill *Skill) string {
+	var sb strings.Builder
+
+	sb.WriteString("---\n")
+	sb.WriteString(fmt.Sprintf("name: %s\n", skill.Name))
+	desc := strings.TrimSpace(skill.Common.Description)
+	desc = strings.ReplaceAll(desc, "\n", " ")
+	sb.WriteString(fmt.Sprintf("description: \"%s\"\n", escapeYAMLString(desc)))
+	sb.WriteString("---\n\n")
+
+	// Use the final Gemini skills home path to keep references stable after sync.
+	geminiSkillPath := fmt.Sprintf("$HOME/.gemini/skills/%s", skill.Name)
+	instructions := skill.ResolveInstructions("gemini", g.CodexHome, geminiSkillPath)
+	sb.WriteString(instructions)
+
+	hasResources := len(skill.Common.Scripts) > 0 || len(skill.Common.References) > 0 || len(skill.Common.Assets) > 0
+	if hasResources {
+		sb.WriteString("\n## Bundled Resources\n\n")
+		for _, script := range skill.Common.Scripts {
+			sb.WriteString(fmt.Sprintf("- `%s`\n", script.Path))
+		}
+		for _, ref := range skill.Common.References {
+			sb.WriteString(fmt.Sprintf("- `references/%s`\n", ref))
+		}
+		for _, asset := range skill.Common.Assets {
+			sb.WriteString(fmt.Sprintf("- `assets/%s`\n", asset))
+		}
+	}
+
+	return sb.String()
 }
 
 // generateCodexSkillMD generates the SKILL.md content for a Codex skill.
@@ -622,24 +766,27 @@ func (g *Generator) generateKilocodeWorkflow(skill *Skill) ([]string, error) {
 	return []string{filepath.Join("workflows", skill.Name+".yaml")}, nil
 }
 
-// =========================================================================
-// Composite instructions.md Generation
-// =========================================================================
+// Composite instructions.md / GEMINI.md Generation
 
-// generateInstructionsFile assembles instructions.md from all instruction-type skills for a platform.
+// generateInstructionsFile assembles instructions.md (or GEMINI.md for Gemini) from all instruction-type skills for a platform.
 func (g *Generator) generateInstructionsFile(target string, skills []*Skill) ([]string, error) {
 	baseDir := g.resolveTargetDir(target)
 	if baseDir == "" {
 		return nil, nil
 	}
 
+	filename := "instructions.md"
+	if target == "gemini" {
+		filename = "GEMINI.md"
+	}
+
 	if g.Verbose {
-		fmt.Printf("Generating %s instructions.md from %d skills\n", target, len(skills))
+		fmt.Printf("Generating %s %s from %d skills\n", target, filename, len(skills))
 	}
 
 	if g.DryRun {
-		fmt.Printf("[dry-run] Would create %s/instructions.md from %d skills\n", baseDir, len(skills))
-		return []string{"instructions.md"}, nil
+		fmt.Printf("[dry-run] Would create %s/%s from %d skills\n", baseDir, filename, len(skills))
+		return []string{filename}, nil
 	}
 
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
@@ -670,12 +817,12 @@ func (g *Generator) generateInstructionsFile(target string, skills []*Skill) ([]
 		sb.WriteString("\n")
 	}
 
-	outputPath := filepath.Join(baseDir, "instructions.md")
+	outputPath := filepath.Join(baseDir, filename)
 	if err := os.WriteFile(outputPath, []byte(sb.String()), 0644); err != nil {
-		return nil, fmt.Errorf("write instructions.md: %w", err)
+		return nil, fmt.Errorf("write %s: %w", filename, err)
 	}
 
-	return []string{"instructions.md"}, nil
+	return []string{filename}, nil
 }
 
 // =========================================================================

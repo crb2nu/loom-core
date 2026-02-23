@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	loomcache "github.com/crb2nu/loom/internal/cache"
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/hud/coordinator"
 	"github.com/crb2nu/loom/internal/hud/monitor"
@@ -60,6 +61,9 @@ type Config struct {
 	WebhookToken   string // Bearer token for push auth.
 	WebhookResolve string // Override DNS resolution for webhook hostname (e.g., LAN IP to bypass Cloudflare).
 	AdminToken     string // Token required for admin-only HUD mutations.
+	// Mobile operator API auth policy.
+	MobileOperatorToken  string // Bearer token for /api/mobile/v1 routes.
+	MobileOperatorScopes string // Comma-separated scopes granted to mobile token.
 
 	// TUI mode: launch a bubbletea terminal UI instead of the web dashboard.
 	TUI bool
@@ -72,7 +76,7 @@ type App struct {
 	config Config
 	client *bridge.DaemonClient
 	agent  *bridge.AgentBridge
-	cache  *bridge.Cache
+	cache  loomcache.Store
 	logger *slog.Logger
 
 	// Background monitors — poll the bridge and maintain cached snapshots.
@@ -115,14 +119,19 @@ func Run(cfg Config) error {
 
 	agent := bridge.NewAgentBridge(client)
 
+	cacheCfg := loomcache.LoadConfigFromEnv()
+	appCache := loomcache.New(cacheCfg, logger)
+
 	app := &App{
 		config:     cfg,
 		client:     client,
 		agent:      agent,
-		cache:      bridge.NewCache(),
+		cache:      appCache,
 		logger:     logger,
 		nudgeQueue: NewNudgeQueue(),
 	}
+
+	defer appCache.Close()
 
 	// Initialize and start background monitors.
 	app.fleetMonitor = monitor.NewFleetMonitor(client, agent, logger)
@@ -527,6 +536,16 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/sandbox/stop", a.withCORS(a.handleSandboxStop))
 	mux.HandleFunc("GET /api/events", a.withCORS(a.handleSSE))
 
+	// API routes — mobile companion v1.
+	mux.HandleFunc("GET /api/mobile/v1/ping", a.withCORS(a.handleMobilePing))
+	mux.HandleFunc("GET /api/mobile/v1/dashboard", a.withCORS(a.handleMobileDashboard))
+	mux.HandleFunc("GET /api/mobile/v1/sessions", a.withCORS(a.handleMobileSessions))
+	mux.HandleFunc("GET /api/mobile/v1/sessions/{session_id}", a.withCORS(a.handleMobileSessionDetail))
+	mux.HandleFunc("GET /api/mobile/v1/sessions/{session_id}/events", a.withCORS(a.handleMobileSessionEvents))
+	mux.HandleFunc("GET /api/mobile/v1/events/stream", a.withCORS(a.handleMobileEventsStream))
+	mux.HandleFunc("POST /api/mobile/v1/sessions", a.withCORS(a.handleMobileSessionCreate))
+	mux.HandleFunc("POST /api/mobile/v1/sessions/{session_id}/end", a.withCORS(a.handleMobileSessionEnd))
+
 	// API routes — topology graph.
 	mux.HandleFunc("GET /api/topology", a.withCORS(a.handleTopology))
 
@@ -542,6 +561,8 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agent/heartbeat", a.withCORS(a.handleAgentHeartbeat))
 	mux.HandleFunc("POST /api/agent/task-update", a.withCORS(a.handleAgentTaskUpdate))
 	mux.HandleFunc("GET /api/agent/session", a.withCORS(a.handleAgentSession))
+	mux.HandleFunc("POST /api/agent/session-list", a.withCORS(a.handleAgentSessionList))
+	mux.HandleFunc("POST /api/agent/session-prune", a.withCORS(a.handleAgentSessionPrune))
 	mux.HandleFunc("POST /api/agent/context/add", a.withCORS(a.handleAgentContextAdd))
 	mux.HandleFunc("GET /api/agent/context-inspect", a.withCORS(a.handleAgentContextInspect))
 	mux.HandleFunc("POST /api/agent/nudge", a.withCORS(a.handleAgentNudge))
@@ -1160,12 +1181,18 @@ func (a *App) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
 		return
 	}
+	body.Title = strings.TrimSpace(body.Title)
 	if body.Title == "" {
 		a.writeError(w, http.StatusBadRequest, "title is required", nil)
 		return
 	}
-	if body.Priority == "" {
-		body.Priority = "medium"
+	body.Priority = normalizeTaskPriority(body.Priority)
+	body.Tags = normalizeStringList(body.Tags)
+	body.BlockedBy = normalizeStringList(body.BlockedBy)
+	body.Context = strings.TrimSpace(body.Context)
+	body.FilePath = strings.TrimSpace(body.FilePath)
+	if body.LineNumber < 0 {
+		body.LineNumber = 0
 	}
 	if err := a.agent.CreateTask(bridge.CreateTaskParams{
 		SessionID:  body.SessionID,
@@ -1813,16 +1840,23 @@ func (a *App) handleTimeline(w http.ResponseWriter, r *http.Request) {
 			limit = parsed
 		}
 	}
+	agentID := strings.TrimSpace(r.URL.Query().Get("agent_id"))
+	eventType := strings.TrimSpace(r.URL.Query().Get("event_type"))
 
 	var entries []TimelineEntry
 	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
 		if t, err := time.Parse(time.RFC3339, sinceStr); err == nil {
-			entries = a.eventLog.Since(t, limit)
+			entries = a.eventLog.Since(t, 0)
 		} else {
-			entries = a.eventLog.All(limit)
+			entries = a.eventLog.All(0)
 		}
 	} else {
-		entries = a.eventLog.All(limit)
+		entries = a.eventLog.All(0)
+	}
+
+	entries = filterTimelineEntries(entries, agentID, eventType)
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
 	}
 
 	if entries == nil {
@@ -1835,25 +1869,57 @@ func (a *App) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func filterTimelineEntries(entries []TimelineEntry, agentID, eventType string) []TimelineEntry {
+	agentID = strings.TrimSpace(agentID)
+	eventType = strings.TrimSpace(eventType)
+	if agentID == "" && eventType == "" {
+		return entries
+	}
+
+	filtered := make([]TimelineEntry, 0, len(entries))
+	for _, entry := range entries {
+		if agentID != "" && entry.AgentID != agentID {
+			continue
+		}
+		if eventType != "" && entry.EventType != eventType {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
 // handleAgentDispatch dispatches a task to a specific agent from the HUD.
 // POST /api/agent/dispatch
 func (a *App) handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		TargetAgentID string `json:"target_agent_id"`
-		Title         string `json:"title"`
-		Context       string `json:"context"`
-		Priority      string `json:"priority"`
+		TargetAgentID string   `json:"target_agent_id"`
+		Title         string   `json:"title"`
+		Context       string   `json:"context"`
+		Priority      string   `json:"priority"`
+		Tags          []string `json:"tags"`
+		FilePath      string   `json:"file_path"`
+		LineNumber    int      `json:"line_number"`
+		BlockedBy     []string `json:"blocked_by"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		a.writeError(w, http.StatusBadRequest, "invalid request body", err)
 		return
 	}
+	body.TargetAgentID = strings.TrimSpace(body.TargetAgentID)
+	body.Title = strings.TrimSpace(body.Title)
+	body.Context = strings.TrimSpace(body.Context)
+	body.FilePath = strings.TrimSpace(body.FilePath)
+	body.Tags = normalizeStringList(body.Tags)
+	body.BlockedBy = normalizeStringList(body.BlockedBy)
+	body.Priority = normalizeTaskPriority(body.Priority)
+	if body.LineNumber < 0 {
+		body.LineNumber = 0
+	}
+
 	if body.TargetAgentID == "" || body.Title == "" {
 		a.writeError(w, http.StatusBadRequest, "target_agent_id and title are required", nil)
 		return
-	}
-	if body.Priority == "" {
-		body.Priority = "medium"
 	}
 
 	result, err := a.agent.DispatchTask(bridge.DispatchTaskParams{
@@ -1861,6 +1927,10 @@ func (a *App) handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
 		Title:         body.Title,
 		Context:       body.Context,
 		Priority:      body.Priority,
+		Tags:          body.Tags,
+		FilePath:      body.FilePath,
+		LineNumber:    body.LineNumber,
+		BlockedBy:     body.BlockedBy,
 	})
 	if err != nil {
 		a.writeError(w, http.StatusBadGateway, "failed to dispatch task", err)
@@ -1876,6 +1946,32 @@ func (a *App) handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
 	go a.fleetMonitor.Refresh()
 
 	a.writeJSON(w, http.StatusOK, result)
+}
+
+func normalizeTaskPriority(priority string) string {
+	switch strings.ToLower(strings.TrimSpace(priority)) {
+	case "low", "medium", "high", "critical":
+		return strings.ToLower(strings.TrimSpace(priority))
+	default:
+		return "medium"
+	}
+}
+
+func normalizeStringList(values []string) []string {
+	seen := map[string]struct{}{}
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		v := strings.TrimSpace(value)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		normalized = append(normalized, v)
+	}
+	return normalized
 }
 
 // handleClaimRelease force-releases a file claim for an agent.
@@ -1911,7 +2007,11 @@ func (a *App) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		if a.config.Dev {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		}
+		if a.mobileTokenOutsideMobileAPI(r) {
+			a.writeError(w, http.StatusForbidden, "mobile_operator token is restricted to /api/mobile/v1 endpoints", nil)
+			return
 		}
 		next(w, r)
 	}
@@ -1922,7 +2022,7 @@ func (a *App) handlePreflight(w http.ResponseWriter, _ *http.Request) {
 	if a.config.Dev {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

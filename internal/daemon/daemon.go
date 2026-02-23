@@ -15,12 +15,17 @@ import (
 	"runtime"
 	"strings"
 	gosync "sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/crb2nu/loom/internal/pool"
 	"github.com/crb2nu/loom/internal/process"
@@ -67,46 +72,70 @@ type ToolCache struct {
 	ttl       time.Duration
 }
 
+// ResourceCache holds cached aggregated resources from running servers.
+type ResourceCache struct {
+	mu        gosync.RWMutex
+	resources []mcp.Resource
+	updatedAt time.Time
+	ttl       time.Duration
+}
+
 // Daemon is the main Loom daemon.
 type Daemon struct {
-	cfg                Config
-	fileCfg            FileConfig // File-based configuration
-	registry           *registry.Registry
-	repoRoot           string // Repository root for ${repo} expansion
-	procMgr            *process.Manager
-	pool               *pool.Pool
-	hubPool            *pool.Pool
-	router             *router.Router
-	hubClient          *mcp.WebSocketClient
-	callLocks          gosync.Map // serverName -> *gosync.Mutex (serializes stdio request/response)
-	listener           net.Listener
-	logger             *slog.Logger
-	toolCache          *ToolCache
-	manifest           *ManifestManager                // Persistent tool cache
-	profiles           *profiles.Manager               // Tool profile manager
-	metadata           *registry.Metadata              // Tool metadata for enhanced descriptions
-	watcher            *sync.Watcher                   // File watcher for hot reload
-	syncManager        *sync.Manager                   // Sync manager for profile operations
-	metrics            *Metrics                        // Prometheus metrics
-	healthMonitor      *HealthMonitor                  // Server health monitoring
-	tunnelMgr          *TunnelManager                  // SSH tunnel management
-	respCache          *ResponseCache                  // Response cache for read-only tools
-	eventBus           *EventBus                       // Event bus for SSE streaming
-	runningServers     gosync.Map                      // serverName -> true; tracks process starts for event emission
-	httpServer         *http.Server                    // Streamable HTTP listener
-	httpStreamable     *mcp.StreamableHTTPServer       // Streamable HTTP transport handler
-	rbac               *RBACEnforcer                   // RBAC enforcer for tool access control
-	audit              *AuditLogger                    // Structured audit logger
-	cost               *CostTracker                    // Usage tracking and attribution
-	oauth              *OAuthServer                    // OAuth 2.1 authorization server
-	authMiddleware     func(http.Handler) http.Handler // Auth middleware for HTTP (Phase 3)
-	routingPreferences map[string]RoutingPreference    // Per-server routing overrides
-	refreshGroup       singleflight.Group              // Deduplicates concurrent tool cache refreshes
-	wg                 gosync.WaitGroup
-	done               chan struct{}
+	cfg                 Config
+	fileCfg             FileConfig // File-based configuration
+	registry            *registry.Registry
+	repoRoot            string // Repository root for ${repo} expansion
+	procMgr             *process.Manager
+	pool                *pool.Pool
+	hubPool             *pool.Pool
+	router              *router.Router
+	hubClient           *mcp.WebSocketClient
+	callLocks           gosync.Map // serverName -> *gosync.Mutex (serializes stdio request/response)
+	listener            net.Listener
+	logger              *slog.Logger
+	toolCache           *ToolCache
+	resourceCache       *ResourceCache
+	manifest            *ManifestManager                // Persistent tool cache
+	profiles            *profiles.Manager               // Tool profile manager
+	metadata            *registry.Metadata              // Tool metadata for enhanced descriptions
+	watcher             *sync.Watcher                   // File watcher for hot reload
+	syncManager         *sync.Manager                   // Sync manager for profile operations
+	metrics             *Metrics                        // Prometheus metrics
+	healthMonitor       *HealthMonitor                  // Server health monitoring
+	tunnelMgr           *TunnelManager                  // SSH tunnel management
+	respCache           *ResponseCache                  // Response cache for read-only tools
+	eventBus            *EventBus                       // Event bus for SSE streaming
+	runningServers      gosync.Map                      // serverName -> true; tracks process starts for event emission
+	httpServer          *http.Server                    // Streamable HTTP listener
+	httpStreamable      *mcp.StreamableHTTPServer       // Streamable HTTP transport handler
+	rbac                *RBACEnforcer                   // RBAC enforcer for tool access control
+	policy              *GatewayPolicyEnforcer          // Gateway policy enforcer for request hooks
+	audit               *AuditLogger                    // Structured audit logger
+	cost                *CostTracker                    // Usage tracking and attribution
+	oauth               *OAuthServer                    // OAuth 2.1 authorization server
+	authMiddleware      func(http.Handler) http.Handler // Auth middleware for HTTP (Phase 3)
+	routingPreferences  map[string]RoutingPreference    // Per-server routing overrides
+	refreshGroup        singleflight.Group              // Deduplicates concurrent tool cache refreshes
+	hubAuthDisabled     bool                            // Auth-gated hub discovery disabled hub fallback
+	hubAuthBackoffUntil time.Time                       // Backoff window for auth-gated hub discovery
+	wg                  gosync.WaitGroup
+	done                chan struct{}
+	stopOnce            gosync.Once
+	stopErr             error
+
+	// activeRPCs tracks in-flight RPC call count for drain-readiness checks.
+	activeRPCs atomic.Int64
+
+	// daemonEpoch is incremented on each daemon startup for deterministic restart detection.
+	daemonEpoch int64
+	// sessions manages proxy session leases.
+	sessions *SessionManager
 
 	// lockFile prevents multiple loomd instances from unlinking/rebinding the same socket.
 	lockFile *os.File
+
+	tracer trace.Tracer
 }
 
 func (d *Daemon) callLock(serverName string) *gosync.Mutex {
@@ -118,9 +147,20 @@ func (d *Daemon) callLock(serverName string) *gosync.Mutex {
 	return v.(*gosync.Mutex)
 }
 
+func (d *Daemon) daemonTracer() trace.Tracer {
+	if d != nil && d.tracer != nil {
+		return d.tracer
+	}
+	return otel.Tracer("loomd")
+}
+
 func (d *Daemon) acquireLock() error {
 	home, _ := os.UserHomeDir()
-	lockPath := filepath.Join(home, ".config", "loom", "loomd.lock")
+	lockDir := filepath.Join(home, ".config", "loom")
+	if err := os.MkdirAll(lockDir, 0700); err != nil {
+		return fmt.Errorf("create lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, "loomd.lock")
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
@@ -199,12 +239,10 @@ func New(cfg Config) (*Daemon, error) {
 
 	if registryPath != "" {
 		var err error
-		reg, err = registry.Load(registryPath)
+		reg, err = registry.LoadWithDefaults(registryPath)
 		if err != nil {
 			return nil, fmt.Errorf("load registry: %w", err)
 		}
-		// Merge default env aliases for fallback resolution
-		reg.MergeDefaultAliases()
 		logger.Info("loaded registry", "path", registryPath, "servers", len(reg.Servers))
 
 		// If repo_root not set in config, derive from registry path
@@ -214,15 +252,20 @@ func New(cfg Config) (*Daemon, error) {
 		}
 	}
 
-	// Create process manager with variable expansion (using registry for env aliases)
+	// d will be set once the Daemon struct is created (below). Closures below
+	// capture this pointer so runtime expansion and process/event behavior can
+	// follow reloaded daemon state.
+	var d *Daemon
+
+	// Create process manager with variable expansion (using the daemon's current
+	// registry so reloads immediately affect env/template expansion).
 	procMgr := process.NewManager(reg, cfg.Target)
 	procMgr.SetExpandFunc(func(s string) string {
+		if d != nil {
+			return expandVarsWithRegistry(s, d.repoRoot, d.registry)
+		}
 		return expandVarsWithRegistry(s, repoRoot, reg)
 	})
-
-	// d will be set once the Daemon struct is created (below). The closure
-	// captures the pointer so it can emit process.start events on first dial.
-	var d *Daemon
 
 	// Create connection pool for local servers
 	poolMaxIdle, poolMaxOpen, poolIdleTimeout := fileCfg.Resources.GetPoolConfig()
@@ -231,17 +274,42 @@ func New(cfg Config) (*Daemon, error) {
 		MaxOpen:     poolMaxOpen,
 		IdleTimeout: poolIdleTimeout,
 		DialFunc: func(ctx context.Context, serverName string) (mcp.Transport, error) {
+			tracer := otel.Tracer("loomd")
+			if d != nil {
+				tracer = d.daemonTracer()
+			}
+			_, span := tracer.Start(ctx, "daemon.server.connect",
+				trace.WithAttributes(attribute.String("server.name", serverName)),
+			)
+			defer span.End()
+
 			_, wasRunning := d.runningServers.LoadOrStore(serverName, true)
-			transport, err := procMgr.Dial(ctx, serverName)
+			span.SetAttributes(attribute.Bool("server.was_running", wasRunning))
+			// Process lifetime must not be tied to request/handshake timeout contexts.
+			transport, err := procMgr.Dial(context.Background(), serverName)
 			if err != nil {
 				d.runningServers.Delete(serverName)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				return nil, err
 			}
-			if !wasRunning && d.eventBus != nil {
-				d.eventBus.Publish(EventProcessStart, map[string]any{
-					"server": serverName,
-				})
+			if !wasRunning {
+				initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := initializeMCPTransport(initCtx, transport); err != nil {
+					d.runningServers.Delete(serverName)
+					_ = procMgr.Stop(serverName)
+					span.RecordError(err)
+					span.SetStatus(codes.Error, err.Error())
+					return nil, fmt.Errorf("initialize transport: %w", err)
+				}
+				if d.eventBus != nil {
+					d.eventBus.Publish(EventProcessStart, map[string]any{
+						"server": serverName,
+					})
+				}
 			}
+			span.SetAttributes(attribute.Bool("server.started", !wasRunning))
 			return transport, nil
 		},
 	})
@@ -341,17 +409,21 @@ func New(cfg Config) (*Daemon, error) {
 	cacheTTL := fileCfg.Resources.GetManifestTTL()
 
 	d = &Daemon{
-		cfg:       cfg,
-		fileCfg:   fileCfg,
-		registry:  reg,
-		repoRoot:  repoRoot,
-		procMgr:   procMgr,
-		pool:      connPool,
-		hubPool:   hubPool,
-		router:    rtr,
-		hubClient: hubClient,
-		logger:    logger,
+		cfg:         cfg,
+		fileCfg:     fileCfg,
+		daemonEpoch: 1,
+		registry:    reg,
+		repoRoot:    repoRoot,
+		procMgr:     procMgr,
+		pool:        connPool,
+		hubPool:     hubPool,
+		router:      rtr,
+		hubClient:   hubClient,
+		logger:      logger,
 		toolCache: &ToolCache{
+			ttl: cacheTTL,
+		},
+		resourceCache: &ResourceCache{
 			ttl: cacheTTL,
 		},
 		manifest:           manifest,
@@ -362,6 +434,7 @@ func New(cfg Config) (*Daemon, error) {
 		respCache:          NewResponseCache(fileCfg.Cache),
 		routingPreferences: routingPrefs,
 		done:               make(chan struct{}),
+		tracer:             otel.Tracer("loomd"),
 	}
 
 	// Initialize event bus for SSE streaming
@@ -370,7 +443,17 @@ func New(cfg Config) (*Daemon, error) {
 	// Initialize RBAC enforcer (nil when disabled)
 	d.rbac = NewRBACEnforcer(fileCfg.RBAC, logger)
 	if d.rbac != nil {
-		logger.Info("RBAC enabled", "default_policy", fileCfg.RBAC.DefaultPolicy, "roles", len(fileCfg.RBAC.Roles), "bindings", len(fileCfg.RBAC.Bindings))
+		logger.Info("RBAC enabled",
+			"default_policy", fileCfg.RBAC.DefaultPolicy,
+			"roles", len(fileCfg.RBAC.Roles),
+			"bindings", len(fileCfg.RBAC.Bindings),
+			"global_deny", len(fileCfg.RBAC.GlobalDeny),
+			"rate_limits", len(fileCfg.RBAC.RateLimits))
+	}
+	d.policy = NewGatewayPolicyEnforcer(fileCfg.Policy, logger)
+	if d.policy != nil {
+		logger.Info("gateway policy enabled",
+			"request_rules", len(fileCfg.Policy.Request))
 	}
 
 	// Initialize audit logger (nil when disabled)
@@ -406,14 +489,30 @@ func New(cfg Config) (*Daemon, error) {
 }
 
 // Start starts the daemon.
-func (d *Daemon) Start(ctx context.Context) error {
+func (d *Daemon) Start(ctx context.Context) (err error) {
+	ctx, span := d.daemonTracer().Start(ctx, "daemon.start",
+		trace.WithAttributes(
+			attribute.String("loom.socket_path", d.cfg.SocketPath),
+			attribute.Int("loom.warm_server_count", len(d.cfg.WarmOnStart)),
+			attribute.Bool("loom.streamable_http_enabled", d.cfg.HTTPAddr != ""),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	// Bail out early if registry was not provided; running without it will panic.
 	if d.registry == nil {
-		return fmt.Errorf("registry not loaded (pass --registry /path/to/registry.yaml)")
+		err = fmt.Errorf("registry not loaded (pass --registry /path/to/registry.yaml)")
+		return err
 	}
 
 	// Prevent multiple daemons from unlinking/rebinding the same socket path.
-	if err := d.acquireLock(); err != nil {
+	if err = d.acquireLock(); err != nil {
 		return err
 	}
 	started := false
@@ -478,6 +577,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Initialize proxy session manager
+	sessMax := d.fileCfg.HTTP.MaxSessions
+	if sessMax <= 0 {
+		sessMax = 1000
+	}
+	sessTimeout := time.Duration(d.fileCfg.HTTP.SessionTimeoutMinutes) * time.Minute
+	if sessTimeout <= 0 {
+		sessTimeout = 30 * time.Minute
+	}
+	d.sessions = NewSessionManager(sessMax, sessTimeout, d.daemonEpoch, d.logger)
+	d.logger.Info("proxy session manager initialized", "max_sessions", sessMax, "lease_minutes", int(sessTimeout.Minutes()))
+
+	// Start session reaper
+	go d.sessionReaperLoop()
+
 	// Start idle server reaper
 	go d.idleReaperLoop()
 
@@ -527,13 +641,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 
 	// Start Streamable HTTP listener if configured
 	if d.cfg.HTTPAddr != "" {
-		if err := d.startHTTPListener(ctx); err != nil {
-			d.logger.Error("failed to start HTTP listener", "error", err)
+		if httpErr := d.startHTTPListener(ctx); httpErr != nil {
+			d.logger.Error("failed to start HTTP listener", "error", httpErr)
+			span.RecordError(httpErr)
+			span.SetAttributes(attribute.Bool("loom.http_listener_start_failed", true))
 			// Non-fatal: Unix socket still works
 		}
 	}
 
 	started = true
+	span.SetAttributes(attribute.Bool("loom.started", true))
 	return nil
 }
 
@@ -549,7 +666,7 @@ func (d *Daemon) idleReaperLoop() {
 		case <-d.done:
 			return
 		case <-ticker.C:
-			reaped := d.procMgr.ReapIdle(idleTimeout)
+			reaped := d.reapIdleServers(idleTimeout)
 			if len(reaped) > 0 {
 				d.logger.Info("reaped idle servers", "servers", reaped, "count", len(reaped))
 				for _, name := range reaped {
@@ -560,6 +677,72 @@ func (d *Daemon) idleReaperLoop() {
 							"reason": "idle_reaped",
 						})
 					}
+				}
+			}
+		}
+	}
+}
+
+// reapIdleServers reaps idle processes while respecting per-server call locks.
+// This prevents races where the reaper closes a process mid tools/call.
+func (d *Daemon) reapIdleServers(idleTimeout time.Duration) []string {
+	if d.procMgr == nil {
+		return nil
+	}
+
+	idleInfo := d.procMgr.GetIdleInfo()
+	if len(idleInfo) == 0 {
+		return nil
+	}
+
+	reaped := make([]string, 0)
+	for _, info := range idleInfo {
+		if info.IdleDuration <= idleTimeout {
+			continue
+		}
+
+		callMu := d.callLock(info.Name)
+		if !callMu.TryLock() {
+			// Server has an in-flight call; skip this reaper cycle.
+			continue
+		}
+
+		// Re-check idleness while holding the call lock to avoid stale snapshot races.
+		stillIdle := false
+		for _, current := range d.procMgr.GetIdleInfo() {
+			if current.Name == info.Name {
+				stillIdle = current.IdleDuration > idleTimeout
+				break
+			}
+		}
+
+		if stillIdle {
+			if err := d.procMgr.Stop(info.Name); err != nil {
+				d.logger.Warn("failed to reap idle server", "server", info.Name, "error", err)
+			} else {
+				reaped = append(reaped, info.Name)
+			}
+		}
+
+		callMu.Unlock()
+	}
+
+	return reaped
+}
+
+// sessionReaperLoop periodically reaps expired proxy sessions.
+func (d *Daemon) sessionReaperLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.done:
+			return
+		case <-ticker.C:
+			if d.sessions != nil {
+				if reaped := d.sessions.ReapExpired(); reaped > 0 {
+					d.logger.Info("reaped expired proxy sessions", "count", reaped)
 				}
 			}
 		}
@@ -705,76 +888,103 @@ func (d *Daemon) signalLoop(ctx context.Context) {
 }
 
 // Stop stops the daemon.
-func (d *Daemon) Stop() error {
-	close(d.done)
-
-	// Stop health monitor first
-	if d.healthMonitor != nil {
-		d.healthMonitor.Stop()
-	}
-
-	// Stop tunnel manager
-	if d.tunnelMgr != nil {
-		d.tunnelMgr.Stop()
-	}
-
-	// Shutdown HTTP server
-	if d.httpServer != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		d.httpServer.Shutdown(shutdownCtx)
-		cancel()
-	}
-
-	if d.listener != nil {
-		d.listener.Close()
-	}
-	_ = os.Remove(d.cfg.SocketPath)
-
-	d.pool.Close()
-	if d.hubPool != nil {
-		d.hubPool.Close()
-	}
-	if d.hubClient != nil {
-		d.hubClient.Close()
-	}
-	// Emit process.stop events for all running servers before shutdown.
-	if d.eventBus != nil {
-		for _, name := range d.procMgr.List() {
-			d.eventBus.Publish(EventProcessStop, map[string]any{
-				"server": name,
-				"reason": "daemon_shutdown",
-			})
+func (d *Daemon) Stop() (err error) {
+	_, span := d.daemonTracer().Start(context.Background(), "daemon.stop")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 		}
-	}
-	d.procMgr.StopAll()
+		span.End()
+	}()
 
-	// Stop file watcher
-	if d.watcher != nil {
-		if err := d.watcher.Stop(); err != nil {
-			d.logger.Warn("failed to stop watcher", "error", err)
+	d.stopOnce.Do(func() {
+		if d.done != nil {
+			close(d.done)
 		}
-	}
 
-	// Close audit logger
-	if d.audit != nil {
-		if err := d.audit.Close(); err != nil {
-			d.logger.Warn("failed to close audit logger", "error", err)
+		// Drain all proxy sessions
+		if d.sessions != nil {
+			d.sessions.DrainAll()
 		}
-	}
 
-	// Save manifest for next startup
-	if err := d.manifest.Save(); err != nil {
-		d.logger.Warn("failed to save manifest", "error", err)
-	}
+		// Stop health monitor first
+		if d.healthMonitor != nil {
+			d.healthMonitor.Stop()
+		}
 
-	d.wg.Wait()
-	d.logger.Info("daemon stopped")
+		// Stop tunnel manager
+		if d.tunnelMgr != nil {
+			d.tunnelMgr.Stop()
+		}
 
-	if d.lockFile != nil {
-		_ = d.lockFile.Close()
-		d.lockFile = nil
-	}
-	return nil
+		// Shutdown HTTP server
+		if d.httpServer != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = d.httpServer.Shutdown(shutdownCtx)
+			cancel()
+		}
+
+		if d.listener != nil {
+			_ = d.listener.Close()
+		}
+		_ = os.Remove(d.cfg.SocketPath)
+
+		if d.pool != nil {
+			d.pool.Close()
+		}
+		if d.hubPool != nil {
+			d.hubPool.Close()
+		}
+		if d.hubClient != nil {
+			_ = d.hubClient.Close()
+		}
+		// Emit process.stop events for all running servers before shutdown.
+		if d.eventBus != nil && d.procMgr != nil {
+			for _, name := range d.procMgr.List() {
+				d.eventBus.Publish(EventProcessStop, map[string]any{
+					"server": name,
+					"reason": "daemon_shutdown",
+				})
+			}
+		}
+		if d.procMgr != nil {
+			d.procMgr.StopAll()
+		}
+
+		// Stop file watcher
+		if d.watcher != nil {
+			if err := d.watcher.Stop(); err != nil && d.logger != nil {
+				d.logger.Warn("failed to stop watcher", "error", err)
+			}
+		}
+
+		// Close audit logger
+		if d.audit != nil {
+			if err := d.audit.Close(); err != nil && d.logger != nil {
+				d.logger.Warn("failed to close audit logger", "error", err)
+			}
+		}
+
+		// Save manifest for next startup
+		if d.manifest != nil {
+			if err := d.manifest.Save(); err != nil && d.logger != nil {
+				d.logger.Warn("failed to save manifest", "error", err)
+			}
+		}
+
+		d.wg.Wait()
+		if d.logger != nil {
+			d.logger.Info("daemon stopped")
+		}
+
+		if d.lockFile != nil {
+			_ = d.lockFile.Close()
+			d.lockFile = nil
+		}
+	})
+	err = d.stopErr
+	return err
 }
 
 // Wait waits for the daemon to stop.
@@ -890,7 +1100,25 @@ func (d *Daemon) handleConnection(ctx context.Context, conn net.Conn) {
 	defer d.wg.Done()
 	defer conn.Close()
 
-	d.logger.Debug("client connected", "addr", conn.RemoteAddr())
+	remoteAddr := ""
+	if conn.RemoteAddr() != nil {
+		remoteAddr = conn.RemoteAddr().String()
+	}
+
+	ctx, connSpan := d.daemonTracer().Start(ctx, "daemon.connection",
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(
+			attribute.String("network.transport", "unix"),
+			attribute.String("loom.client_addr", remoteAddr),
+		),
+	)
+	messageCount := 0
+	defer func() {
+		connSpan.SetAttributes(attribute.Int("loom.message_count", messageCount))
+		connSpan.End()
+	}()
+
+	d.logger.Debug("client connected", "addr", remoteAddr)
 
 	transport := mcp.NewStdioTransport(conn, conn)
 
@@ -906,57 +1134,98 @@ func (d *Daemon) handleConnection(ctx context.Context, conn net.Conn) {
 		msg, err := transport.Recv(ctx)
 		if err != nil {
 			d.logger.Debug("client disconnected", "error", err)
+			connSpan.AddEvent("client_disconnected", trace.WithAttributes(attribute.String("error", err.Error())))
 			return
 		}
+		messageCount++
 
 		resp, err := d.handleMessage(ctx, msg)
 		if err != nil {
 			d.logger.Error("handle message error", "error", err)
+			connSpan.RecordError(err)
 			resp = mcp.NewErrorResponse(msg.ID, mcp.InternalError, err.Error())
 		}
 
 		if resp != nil {
 			if err := transport.Send(ctx, resp); err != nil {
 				d.logger.Error("send response error", "error", err)
+				connSpan.RecordError(err)
+				connSpan.SetStatus(codes.Error, err.Error())
 				return
 			}
 		}
 	}
 }
 
-func (d *Daemon) handleMessage(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+func (d *Daemon) handleMessage(ctx context.Context, msg *mcp.Message) (resp *mcp.Message, err error) {
+	if msg == nil {
+		err = fmt.Errorf("nil message")
+		return nil, err
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("mcp.method", msg.Method),
+	}
+	if msg.ID != nil {
+		attrs = append(attrs, attribute.String("mcp.request_id", fmt.Sprint(msg.ID)))
+	}
+
+	ctx, span := d.daemonTracer().Start(ctx, "daemon.rpc."+msg.Method,
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(attrs...),
+	)
+	defer func() {
+		span.SetAttributes(attribute.Bool("loom.has_response", resp != nil))
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	switch msg.Method {
 	case "initialize":
-		return d.handleInitialize(ctx, msg)
+		resp, err = d.handleInitialize(ctx, msg)
 	case "notifications/initialized":
-		return nil, nil
+		resp, err = nil, nil
 	case "loom/status":
-		return d.handleStatus(ctx, msg)
+		resp, err = d.handleStatus(ctx, msg)
 	case "loom/servers":
-		return d.handleServers(ctx, msg)
+		resp, err = d.handleServers(ctx, msg)
 	case "loom/health":
-		return d.handleHealth(ctx, msg)
+		resp, err = d.handleHealth(ctx, msg)
 	case "loom/tools":
-		return d.handleTools(ctx, msg)
+		resp, err = d.handleTools(ctx, msg)
+	case "loom/resources":
+		resp, err = d.handleResources(ctx, msg)
 	case "loom/call", "tools/call":
-		return d.handleCall(ctx, msg)
+		resp, err = d.handleCall(ctx, msg)
 	case "loom/reload":
-		return d.handleReload(ctx, msg)
+		resp, err = d.handleReload(ctx, msg)
 	case "loom/config-hash":
-		return d.handleConfigHash(ctx, msg)
+		resp, err = d.handleConfigHash(ctx, msg)
 	case "loom/profile":
-		return d.handleProfile(ctx, msg)
+		resp, err = d.handleProfile(ctx, msg)
 	case "loom/tunnels":
-		return d.handleTunnels(ctx, msg)
+		resp, err = d.handleTunnels(ctx, msg)
 	case "loom/cache/stats":
-		return d.handleCacheStats(ctx, msg)
+		resp, err = d.handleCacheStats(ctx, msg)
 	case "loom/cache/clear":
-		return d.handleCacheClear(ctx, msg)
+		resp, err = d.handleCacheClear(ctx, msg)
 	case "loom/cost-stats":
-		return d.handleCostStats(ctx, msg)
+		resp, err = d.handleCostStats(ctx, msg)
+	case "loom/session/open":
+		resp, err = d.handleSessionOpen(ctx, msg)
+	case "loom/session/heartbeat":
+		resp, err = d.handleSessionHeartbeat(ctx, msg)
+	case "loom/session/status":
+		resp, err = d.handleSessionStatus(ctx, msg)
+	case "loom/session/close":
+		resp, err = d.handleSessionClose(ctx, msg)
 	default:
-		return mcp.NewErrorResponse(msg.ID, mcp.MethodNotFound, fmt.Sprintf("unknown method: %s", msg.Method)), nil
+		resp = mcp.NewErrorResponse(msg.ID, mcp.MethodNotFound, fmt.Sprintf("unknown method: %s", msg.Method))
 	}
+	return resp, err
 }
 
 func (d *Daemon) handleInitialize(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
@@ -973,21 +1242,36 @@ func (d *Daemon) handleInitialize(ctx context.Context, msg *mcp.Message) (*mcp.M
 }
 
 type statusResult struct {
-	Running     bool     `json:"running"`
-	Servers     int      `json:"servers"`
-	ActiveConns int      `json:"activeConns"`
-	IdleConns   int      `json:"idleConns"`
-	Processes   []string `json:"processes"`
+	Running             bool     `json:"running"`
+	Servers             int      `json:"servers"`
+	ActiveConns         int      `json:"activeConns"`
+	IdleConns           int      `json:"idleConns"`
+	Processes           []string `json:"processes"`
+	ActiveRPCs          int64    `json:"activeRPCs"`
+	DrainReady          bool     `json:"drainReady"`
+	DaemonEpoch         int64    `json:"daemonEpoch"`
+	ActiveProxySessions int      `json:"activeProxySessions"`
 }
 
 func (d *Daemon) handleStatus(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
 	stats := d.pool.Stats()
+	rpcs := d.activeRPCs.Load()
+
+	activeSessions := 0
+	if d.sessions != nil {
+		activeSessions = d.sessions.ActiveCount()
+	}
+
 	result := statusResult{
-		Running:     true,
-		Servers:     len(d.registry.Servers),
-		ActiveConns: stats.ActiveConns,
-		IdleConns:   stats.IdleConns,
-		Processes:   d.procMgr.List(),
+		Running:             true,
+		Servers:             len(d.registry.Servers),
+		ActiveConns:         stats.ActiveConns,
+		IdleConns:           stats.IdleConns,
+		Processes:           d.procMgr.List(),
+		ActiveRPCs:          rpcs,
+		DrainReady:          rpcs == 0,
+		DaemonEpoch:         d.daemonEpoch,
+		ActiveProxySessions: activeSessions,
 	}
 	return mcp.NewResponse(msg.ID, result)
 }
@@ -1028,13 +1312,21 @@ func (d *Daemon) handleServers(ctx context.Context, msg *mcp.Message) (*mcp.Mess
 }
 
 type healthResult struct {
-	Servers map[string]serverHealth `json:"servers"`
+	Servers    map[string]serverHealth `json:"servers"`
+	Divergence []healthDivergenceEntry `json:"divergence,omitempty"`
+}
+
+type healthDivergenceEntry struct {
+	Server string `json:"server"`
+	Reason string `json:"reason"`
 }
 
 type serverHealth struct {
-	Local  *healthStatus `json:"local,omitempty"`
-	Hub    *healthStatus `json:"hub,omitempty"`
-	Target string        `json:"target"`
+	Local      *healthStatus     `json:"local,omitempty"`
+	Hub        *healthStatus     `json:"hub,omitempty"`
+	Monitor    *healthStatus     `json:"monitor,omitempty"`
+	Target     string            `json:"target"`
+	Divergence *HealthDivergence `json:"divergence,omitempty"`
 }
 
 type healthStatus struct {
@@ -1047,12 +1339,21 @@ type healthStatus struct {
 func (d *Daemon) handleHealth(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
 	allHealth := d.router.GetAllHealth()
 	servers := make(map[string]serverHealth)
+	var divergences []healthDivergenceEntry
+
+	// Collect monitor statuses for divergence comparison.
+	var monitorStatuses map[string]*ServerHealthStatus
+	if d.healthMonitor != nil {
+		monitorStatuses = d.healthMonitor.GetAllStatuses()
+	}
 
 	for name, h := range allHealth {
 		decision, _ := d.router.Route(ctx, name)
 		target := "unavailable"
+		routerAvailable := false
 		if decision != nil {
 			target = decision.Target.String()
+			routerAvailable = decision.Target != router.TargetUnavailable
 		}
 
 		sh := serverHealth{Target: target}
@@ -1072,10 +1373,34 @@ func (d *Daemon) handleHealth(ctx context.Context, msg *mcp.Message) (*mcp.Messa
 				ErrorMessage: h.Hub.ErrorMessage,
 			}
 		}
+
+		// Include monitor slice if available.
+		monStatus := monitorStatuses[name]
+		if monStatus != nil {
+			sh.Monitor = &healthStatus{
+				Healthy:      monStatus.Healthy,
+				ConsecFails:  monStatus.ConsecutiveFails,
+				AvgLatencyMs: monStatus.AvgLatencyMs,
+				ErrorMessage: monStatus.LastError,
+			}
+		}
+
+		// Check for divergence between monitor and router.
+		if div := computeHealthDivergence(monStatus, routerAvailable); div != nil {
+			sh.Divergence = div
+			divergences = append(divergences, healthDivergenceEntry{
+				Server: name,
+				Reason: div.Reason,
+			})
+		}
+
 		servers[name] = sh
 	}
 
-	return mcp.NewResponse(msg.ID, healthResult{Servers: servers})
+	return mcp.NewResponse(msg.ID, healthResult{
+		Servers:    servers,
+		Divergence: divergences,
+	})
 }
 
 // toolsResult holds the aggregated tools response.
@@ -1083,6 +1408,102 @@ type toolsResult struct {
 	Tools       []mcp.Tool `json:"tools"`
 	CachedAt    time.Time  `json:"cachedAt"`
 	ServerCount int        `json:"serverCount"`
+}
+
+// resourcesResult holds the aggregated resources response.
+type resourcesResult struct {
+	Resources          []mcp.Resource `json:"resources"`
+	CachedAt           time.Time      `json:"cachedAt"`
+	ServerCount        int            `json:"serverCount"`
+	RunningServerCount int            `json:"runningServerCount"`
+}
+
+func daemonBuiltInResources() []mcp.Resource {
+	return []mcp.Resource{
+		{
+			URI:         "loom://servers",
+			Name:        "Loom servers",
+			Description: "List MCP servers managed by the loom daemon",
+			MimeType:    "application/json",
+		},
+		{
+			URI:         "loom://tools",
+			Name:        "Loom tools",
+			Description: "Cached aggregated tools from loom daemon",
+			MimeType:    "application/json",
+		},
+		{
+			URI:         "loom://health",
+			Name:        "Loom health",
+			Description: "Health summary for all servers (local/hub) managed by loom",
+			MimeType:    "application/json",
+		},
+		{
+			URI:         "loom://config",
+			Name:        "Loom config",
+			Description: "Active profile and daemon configuration summary",
+			MimeType:    "application/json",
+		},
+	}
+}
+
+func (d *Daemon) handleResources(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	serverCount := 0
+	if d.registry != nil {
+		serverCount = len(d.registry.Servers)
+	}
+
+	var runningServers []string
+	if d.procMgr != nil {
+		runningServers = d.procMgr.List()
+	}
+	runningSet := make(map[string]struct{}, len(runningServers))
+	for _, serverName := range runningServers {
+		runningSet[serverName] = struct{}{}
+	}
+
+	// Always return cached resources immediately if available (even if stale).
+	d.resourceCache.mu.RLock()
+	hasCache := len(d.resourceCache.resources) > 0
+	cacheStale := time.Since(d.resourceCache.updatedAt) >= d.resourceCache.ttl
+	cachedResources := d.resourceCache.resources
+	cachedAt := d.resourceCache.updatedAt
+	d.resourceCache.mu.RUnlock()
+
+	if hasCache {
+		if cacheStale {
+			go func() {
+				bgCtx := context.Background()
+				_, _ = d.refreshResourcesCacheDeduplicated(bgCtx)
+			}()
+		}
+		return mcp.NewResponse(msg.ID, resourcesResult{
+			Resources:          cachedResources,
+			CachedAt:           cachedAt,
+			ServerCount:        serverCount,
+			RunningServerCount: len(runningSet),
+		})
+	}
+
+	// No cache yet: return built-ins immediately and refresh asynchronously.
+	builtins := daemonBuiltInResources()
+	now := time.Now()
+	d.resourceCache.mu.Lock()
+	d.resourceCache.resources = builtins
+	d.resourceCache.updatedAt = now
+	d.resourceCache.mu.Unlock()
+
+	go func() {
+		bgCtx := context.Background()
+		_, _ = d.refreshResourcesCacheDeduplicated(bgCtx)
+	}()
+
+	return mcp.NewResponse(msg.ID, resourcesResult{
+		Resources:          builtins,
+		CachedAt:           now,
+		ServerCount:        serverCount,
+		RunningServerCount: len(runningSet),
+	})
 }
 
 func (d *Daemon) handleTools(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
@@ -1175,6 +1596,159 @@ func (d *Daemon) getStaticToolsFromRegistry() []mcp.Tool {
 	return tools
 }
 
+// refreshResourcesCacheDeduplicated wraps refreshResourcesCache via singleflight to
+// prevent redundant concurrent refreshes.
+func (d *Daemon) refreshResourcesCacheDeduplicated(ctx context.Context) ([]mcp.Resource, error) {
+	v, err, _ := d.refreshGroup.Do("resources-refresh", func() (any, error) {
+		return d.refreshResourcesCache(ctx)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]mcp.Resource), nil
+}
+
+// refreshResourcesCache fetches resources from currently running servers and updates the cache.
+func (d *Daemon) refreshResourcesCache(ctx context.Context) ([]mcp.Resource, error) {
+	refreshConcurrency := d.fileCfg.Resources.GetRefreshConcurrency()
+	if refreshConcurrency <= 0 {
+		refreshConcurrency = 1
+	}
+
+	base := daemonBuiltInResources()
+	var running []string
+	if d.procMgr != nil {
+		running = d.procMgr.List()
+	}
+	runningSet := make(map[string]struct{}, len(running))
+	for _, serverName := range running {
+		runningSet[serverName] = struct{}{}
+	}
+
+	if len(runningSet) == 0 {
+		d.resourceCache.mu.Lock()
+		d.resourceCache.resources = base
+		d.resourceCache.updatedAt = time.Now()
+		d.resourceCache.mu.Unlock()
+		return base, nil
+	}
+
+	if d.registry == nil {
+		d.resourceCache.mu.Lock()
+		d.resourceCache.resources = base
+		d.resourceCache.updatedAt = time.Now()
+		d.resourceCache.mu.Unlock()
+		return base, nil
+	}
+
+	serverResources := make(map[string][]mcp.Resource, len(runningSet))
+	var (
+		mu  gosync.Mutex
+		wg  gosync.WaitGroup
+		sem = make(chan struct{}, refreshConcurrency)
+	)
+
+	for _, server := range d.registry.Servers {
+		if server == nil {
+			continue
+		}
+		if _, ok := runningSet[server.Name]; !ok {
+			continue
+		}
+
+		wg.Add(1)
+		go func(serverName string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+
+			resources, err := d.fetchServerResources(callCtx, serverName)
+			if err != nil {
+				d.logger.Debug("resources probe failed", "server", serverName, "error", err)
+				return
+			}
+			if len(resources) == 0 {
+				return
+			}
+			mu.Lock()
+			serverResources[serverName] = resources
+			mu.Unlock()
+		}(server.Name)
+	}
+	wg.Wait()
+
+	// Keep output deterministic by walking servers in registry order.
+	allResources := make([]mcp.Resource, 0, len(base)+len(serverResources)*4)
+	allResources = append(allResources, base...)
+	for _, server := range d.registry.Servers {
+		if server == nil {
+			continue
+		}
+		resources, ok := serverResources[server.Name]
+		if !ok {
+			continue
+		}
+		for _, r := range resources {
+			r.URI = server.Name + "__" + r.URI
+			allResources = append(allResources, r)
+		}
+	}
+
+	d.resourceCache.mu.Lock()
+	d.resourceCache.resources = allResources
+	d.resourceCache.updatedAt = time.Now()
+	d.resourceCache.mu.Unlock()
+
+	return allResources, nil
+}
+
+func (d *Daemon) fetchServerResources(ctx context.Context, serverName string) ([]mcp.Resource, error) {
+	if d.pool == nil {
+		return nil, fmt.Errorf("local pool not configured")
+	}
+
+	conn, err := d.pool.Get(ctx, serverName)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	defer d.pool.Put(conn)
+
+	mu := d.callLock(serverName)
+	mu.Lock()
+	defer mu.Unlock()
+
+	req, _ := mcp.NewRequest(1, "resources/list", nil)
+	if err := conn.Transport.Send(ctx, req); err != nil {
+		conn.Healthy = false
+		return nil, fmt.Errorf("send resources/list: %w", err)
+	}
+
+	resp, err := conn.Transport.Recv(ctx)
+	if err != nil {
+		conn.Healthy = false
+		return nil, fmt.Errorf("recv resources/list: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("server error: %s", resp.Error.Message)
+	}
+
+	var result struct {
+		Resources []mcp.Resource `json:"resources"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("parse resources/list: %w", err)
+	}
+
+	return result.Resources, nil
+}
+
 // refreshToolCacheDeduplicated wraps refreshToolCache via singleflight to prevent
 // redundant concurrent refreshes. Multiple callers get the same result.
 func (d *Daemon) refreshToolCacheDeduplicated(ctx context.Context) ([]mcp.Tool, error) {
@@ -1199,31 +1773,50 @@ func (d *Daemon) refreshToolCache(ctx context.Context) ([]mcp.Tool, error) {
 
 	var hubClient *router.HubClient
 	if d.cfg.HubFallback && d.hubClient != nil {
-		// Fetch token from secret store if needed.
-		token := d.expandVars("${secret:MCP_HUB_TOKEN}")
-		if token == "" {
-			token = os.Getenv("MCP_HUB_TOKEN")
-		}
-
-		hubClient = router.NewHubClient(d.cfg.HubURL, token)
-		hostNames, err := hubClient.DiscoverHosts(ctx)
-		if err != nil {
-			d.logger.Warn("failed to discover hub hosts", "error", err)
-			hubClient = nil
+		now := time.Now()
+		if d.hubAuthDisabled {
+			d.logger.Debug("hub fallback disabled after auth-gated discovery failure")
+		} else if !d.hubAuthBackoffUntil.IsZero() && now.Before(d.hubAuthBackoffUntil) {
+			d.logger.Debug("skipping hub discovery during auth backoff", "until", d.hubAuthBackoffUntil)
 		} else {
-			for _, host := range hostNames {
-				// Avoid shadowing local servers if they have the same name.
-				isLocal := false
-				for _, s := range d.registry.Servers {
-					if s.Name == host {
-						isLocal = true
-						break
+			// Fetch token from secret store if needed.
+			token := d.expandVars("${secret:MCP_HUB_TOKEN}")
+			if token == "" {
+				token = os.Getenv("MCP_HUB_TOKEN")
+			}
+
+			hubClient = router.NewHubClient(d.cfg.HubURL, token)
+			hostNames, err := hubClient.DiscoverHosts(ctx)
+			if err != nil {
+				if isHubAuthError(err) {
+					hint := "check MCP_HUB_TOKEN or Cloudflare Access credentials, or set hub.disable_on_auth_failure"
+					if d.fileCfg.Hub.DisableOnAuthFailure {
+						d.hubAuthDisabled = true
+						d.logger.Warn("hub discovery auth required; disabling hub fallback", "error", err, "hint", hint)
+					} else {
+						d.hubAuthBackoffUntil = now.Add(hubAuthBackoff)
+						d.logger.Warn("hub discovery auth required; backing off", "until", d.hubAuthBackoffUntil, "error", err, "hint", hint)
 					}
+				} else {
+					d.logger.Warn("failed to discover hub hosts", "error", err)
 				}
-				if isLocal {
-					continue
+				hubClient = nil
+			} else {
+				d.hubAuthBackoffUntil = time.Time{}
+				for _, host := range hostNames {
+					// Avoid shadowing local servers if they have the same name.
+					isLocal := false
+					for _, s := range d.registry.Servers {
+						if s.Name == host {
+							isLocal = true
+							break
+						}
+					}
+					if isLocal {
+						continue
+					}
+					sources = append(sources, toolSource{name: host, kind: toolSourceHub})
 				}
-				sources = append(sources, toolSource{name: host, kind: toolSourceHub})
 			}
 		}
 	}
@@ -1397,23 +1990,8 @@ func (d *Daemon) fetchServerTools(ctx context.Context, serverName string) ([]mcp
 
 	transport := mcp.NewStdioTransport(stdout, stdin)
 
-	// Initialize
-	initReq, _ := mcp.NewRequest(1, "initialize", mcp.InitializeParams{
-		ProtocolVersion: mcp.ProtocolVersion,
-		Capabilities:    mcp.Capabilities{},
-		ClientInfo:      mcp.ClientInfo{Name: "loom-daemon", Version: "0.1.0"},
-	})
-	if err := transport.Send(ctx, initReq); err != nil {
-		return nil, fmt.Errorf("send init: %w", err)
-	}
-	if _, err := transport.Recv(ctx); err != nil {
-		return nil, fmt.Errorf("recv init: %w", err)
-	}
-
-	// Send initialized notification
-	initNotif := &mcp.Message{JSONRPC: "2.0", Method: "notifications/initialized"}
-	if err := transport.Send(ctx, initNotif); err != nil {
-		return nil, fmt.Errorf("send initialized: %w", err)
+	if err := initializeMCPTransport(ctx, transport); err != nil {
+		return nil, err
 	}
 
 	// Get tools
@@ -1437,6 +2015,70 @@ func (d *Daemon) fetchServerTools(ctx context.Context, serverName string) ([]mcp
 	}
 
 	return toolsList.Tools, nil
+}
+
+// fetchServerToolsViaPool performs a tools/list health probe using the connection
+// pool, reusing an existing idle connection when available. This avoids spawning a
+// fresh process for every health check interval.
+func (d *Daemon) fetchServerToolsViaPool(ctx context.Context, serverName string) ([]mcp.Tool, error) {
+	if d.pool == nil {
+		return nil, fmt.Errorf("local pool not configured")
+	}
+
+	conn, err := d.pool.Get(ctx, serverName)
+	if err != nil {
+		return nil, fmt.Errorf("pool connect: %w", err)
+	}
+	defer d.pool.Put(conn)
+
+	mu := d.callLock(serverName)
+	mu.Lock()
+	defer mu.Unlock()
+
+	req, _ := mcp.NewRequest(1, "tools/list", nil)
+	if err := conn.Transport.Send(ctx, req); err != nil {
+		conn.Healthy = false
+		return nil, fmt.Errorf("send tools/list: %w", err)
+	}
+
+	resp, err := conn.Transport.Recv(ctx)
+	if err != nil {
+		conn.Healthy = false
+		return nil, fmt.Errorf("recv tools/list: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("server error: %s", resp.Error.Message)
+	}
+
+	var toolsList struct {
+		Tools []mcp.Tool `json:"tools"`
+	}
+	if err := json.Unmarshal(resp.Result, &toolsList); err != nil {
+		return nil, fmt.Errorf("unmarshal tools: %w", err)
+	}
+
+	return toolsList.Tools, nil
+}
+
+// initializeMCPTransport performs the MCP initialize handshake on a fresh transport.
+func initializeMCPTransport(ctx context.Context, transport mcp.Transport) error {
+	initReq, _ := mcp.NewRequest(1, "initialize", mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		Capabilities:    mcp.Capabilities{},
+		ClientInfo:      mcp.ClientInfo{Name: "loom-daemon", Version: "0.1.0"},
+	})
+	if err := transport.Send(ctx, initReq); err != nil {
+		return fmt.Errorf("send init: %w", err)
+	}
+	if _, err := transport.Recv(ctx); err != nil {
+		return fmt.Errorf("recv init: %w", err)
+	}
+
+	initNotif := &mcp.Message{JSONRPC: "2.0", Method: "notifications/initialized"}
+	if err := transport.Send(ctx, initNotif); err != nil {
+		return fmt.Errorf("send initialized: %w", err)
+	}
+	return nil
 }
 
 // expandVarsWithRegistry expands variable patterns with registry-based env aliases.
@@ -1477,290 +2119,74 @@ type callParams struct {
 	Arguments json.RawMessage `json:"arguments,omitempty"`  // For smart routing
 	AgentID   string          `json:"agent_id,omitempty"`   // Agent identity for RBAC
 	AgentType string          `json:"agent_type,omitempty"` // Agent type for RBAC
+	SessionID string          `json:"session_id,omitempty"` // Proxy session lease ID
 }
 
 func (d *Daemon) handleCall(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
-	var params callParams
-	if err := json.Unmarshal(msg.Params, &params); err != nil {
-		return mcp.NewErrorResponse(msg.ID, mcp.InvalidParams, err.Error()), nil
+	d.activeRPCs.Add(1)
+	defer d.activeRPCs.Add(-1)
+
+	pipeline := newCallPipeline(d, ctx, msg)
+
+	if resp := pipeline.parseAndResolve(); resp != nil {
+		return resp, nil
 	}
 
-	serverName := params.Server
-	toolName := params.Tool
-	// Support MCP standard tools/call format where tool name is in "name" field
-	if toolName == "" && params.Name != "" {
-		toolName = params.Name
+	// Implicitly touch session lease on every call that carries a session_id.
+	if pipeline.params.SessionID != "" && d.sessions != nil {
+		d.sessions.Touch(pipeline.params.SessionID)
 	}
 
-	// If tool name contains server prefix (server__tool), split it
-	if serverName == "" && strings.Contains(toolName, "__") {
-		parts := strings.SplitN(toolName, "__", 2)
-		if len(parts) == 2 {
-			serverName = parts[0]
-			toolName = parts[1]
-		}
+	if resp := pipeline.authorize(); resp != nil {
+		return resp, nil
 	}
 
-	// Set method for MCP standard tools/call if not specified
-	method := params.Method
-	if method == "" {
-		method = "tools/call"
+	if resp := pipeline.enforceRequestPolicy(); resp != nil {
+		return resp, nil
 	}
 
-	// If server not provided, try to resolve it from tool name and arguments (Smart Routing)
-	if serverName == "" && toolName != "" {
-		var args map[string]any
-		if len(params.Arguments) > 0 {
-			_ = json.Unmarshal(params.Arguments, &args)
-		} else if len(params.Params) > 0 {
-			// Fallback: params might contain arguments if it's a direct tools/call
-			_ = json.Unmarshal(params.Params, &args)
-		}
-
-		resolved, err := d.router.ResolveServer(d.cfg.Target, toolName, args)
-		if err != nil {
-			return mcp.NewErrorResponse(msg.ID, mcp.InternalError, err.Error()), nil
-		}
-		if resolved == "" {
-			return mcp.NewErrorResponse(msg.ID, mcp.InvalidParams, fmt.Sprintf("could not resolve server for tool: %s", toolName)), nil
-		}
-		serverName = resolved
+	if resp := pipeline.tryCachedResponse(); resp != nil {
+		return resp, nil
 	}
 
-	if serverName == "" {
-		return mcp.NewErrorResponse(msg.ID, mcp.InvalidParams, "missing server or tool for call"), nil
+	if resp := pipeline.routeAndConnect(); resp != nil {
+		return resp, nil
+	}
+	defer pipeline.releaseConnection()
+
+	req, resp := pipeline.buildForwardRequest()
+	if resp != nil {
+		return resp, nil
 	}
 
-	// Capture start time for audit logging
-	auditStart := time.Now()
-
-	// RBAC check: enforce tool access control before processing
-	if d.rbac != nil {
-		decision := d.rbac.Check(params.AgentID, params.AgentType, serverName, toolName)
-		d.logAccessDecision(decision)
-		if !decision.Allowed {
-			d.emitAudit(params, serverName, toolName, "", auditStart, "denied", decision.Reason, false)
-			return d.rbacDeniedResponse(msg.ID, decision), nil
-		}
-	}
-
-	// Check response cache for read-only tools
-	var cacheKey string
-	if d.respCache != nil && d.respCache.IsCacheable(serverName, toolName) {
-		// Use params or arguments for cache key
-		cacheParams := params.Params
-		if len(cacheParams) == 0 {
-			cacheParams = params.Arguments
-		}
-		cacheKey = d.respCache.Key(serverName, toolName, cacheParams)
-		if cached, ok := d.respCache.Get(cacheKey); ok {
-			d.metrics.RecordResponseCacheHit(serverName, toolName)
-			d.logger.Debug("response cache hit", "server", serverName, "tool", toolName)
-			d.emitAudit(params, serverName, toolName, "local", auditStart, "success", "", true)
-			// Return cached response with original message ID
-			return mcp.NewResponse(msg.ID, json.RawMessage(cached))
-		}
-		d.metrics.RecordResponseCacheMiss(serverName, toolName)
-	}
-
-	// Route the request based on health
-	decision, err := d.router.Route(ctx, serverName)
-	if err != nil {
-		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, err.Error()), nil
-	}
-
-	// Apply per-server routing preference override
-	if pref, ok := d.routingPreferences[serverName]; ok && pref != RoutingHealthBased {
-		hasHub := d.hubPool != nil
-		newTarget, overridden := applyRoutingPreference(pref, decision.Target, hasHub)
-		if overridden {
-			d.logger.Debug("routing preference override",
-				"server", serverName,
-				"preference", pref,
-				"original", decision.Target,
-				"overridden_to", newTarget)
-			decision.Target = newTarget
-		}
-	}
-
-	d.logger.Debug("routing decision", "server", serverName, "target", decision.Target, "reason", decision.Reason)
-
-	var conn *pool.Conn
-	var target router.Target
-
-	switch decision.Target {
-	case router.TargetLocal:
-		conn, err = d.pool.Get(ctx, serverName)
-		target = router.TargetLocal
-	case router.TargetHub:
-		if d.hubPool == nil {
-			return mcp.NewErrorResponse(msg.ID, mcp.InternalError, "hub fallback not configured"), nil
-		}
-		conn, err = d.hubPool.Get(ctx, serverName)
-		target = router.TargetHub
-	case router.TargetUnavailable:
-		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, fmt.Sprintf("server unavailable: %s", decision.Reason)), nil
-	}
-
-	if err != nil {
-		d.router.RecordFailure(serverName, target, err)
-		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, err.Error()), nil
-	}
-
-	// Use appropriate pool for Put
-	defer func() {
-		if target == router.TargetLocal {
-			d.pool.Put(conn)
-		} else {
-			d.hubPool.Put(conn)
-		}
-	}()
-
-	// Build params for forwarded request
-	var forwardParams json.RawMessage
-	if len(params.Params) > 0 {
-		// Already have full params (e.g., from loom/call)
-		forwardParams = params.Params
-	} else {
-		// Build tools/call params from name and arguments
-		callParams := map[string]any{
-			"name": toolName,
-		}
-		if len(params.Arguments) > 0 {
-			var args map[string]any
-			_ = json.Unmarshal(params.Arguments, &args)
-			callParams["arguments"] = args
-		} else {
-			callParams["arguments"] = map[string]any{}
-		}
-		forwardParams, _ = json.Marshal(callParams)
-	}
-
-	// Forward request to server
-	req, err := mcp.NewRequest(msg.ID, method, forwardParams)
-	if err != nil {
-		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, err.Error()), nil
-	}
-
-	start := time.Now()
-	targetStr := target.String()
-
-	// Record metrics
-	d.metrics.RecordRequestStart(serverName)
-	defer d.metrics.RecordRequestEnd(serverName)
-
-	if target == router.TargetLocal {
-		// Local servers are stdio-based and currently use a shared process/transport per server.
-		// Serialize each request/response pair to avoid concurrent reads/writes on the shared transport.
-		// This prevents crashes and avoids response misdelivery when multiple clients call the same server concurrently.
-		mu := d.callLock(serverName)
-		lockStart := time.Now()
-		mu.Lock()
-		lockWait := time.Since(lockStart)
-		if lockWait > 100*time.Millisecond {
-			d.metrics.CallLockWaitTotal.WithLabelValues(serverName).Inc()
-			d.logger.Debug("call lock contention", "server", serverName, "wait_ms", lockWait.Milliseconds())
-		}
-		defer mu.Unlock()
-	}
-
-	if err := conn.Transport.Send(ctx, req); err != nil {
-		conn.Healthy = false
-		d.router.RecordFailure(serverName, target, err)
-		d.metrics.RecordServerFailure(serverName, targetStr, "send")
-		d.metrics.RecordRequest(serverName, method, "error", targetStr, time.Since(start))
-
-		// For stdio-based local servers, a broken pipe/EOF usually means the
-		// underlying process died. Restart it and clear any stale idle pool
-		// entries so subsequent calls can recover cleanly.
-		if target == router.TargetLocal {
-			d.logger.Warn("local server send failed; restarting",
-				"server", serverName, "error", err)
-			d.pool.ClearServer(serverName)
-			_ = d.procMgr.Stop(serverName)
-			d.runningServers.Delete(serverName)
-			if d.eventBus != nil {
-				d.eventBus.Publish(EventProcessStop, map[string]any{
-					"server": serverName,
-					"reason": "transport_send_error",
-				})
-			}
-		}
-
-		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, err.Error()), nil
-	}
-
-	resp, err := conn.Transport.Recv(ctx)
-	if err != nil {
-		conn.Healthy = false
-		d.router.RecordFailure(serverName, target, err)
-		d.metrics.RecordServerFailure(serverName, targetStr, "recv")
-		d.metrics.RecordRequest(serverName, method, "error", targetStr, time.Since(start))
-
-		if target == router.TargetLocal {
-			d.logger.Warn("local server recv failed; restarting",
-				"server", serverName, "error", err)
-			d.pool.ClearServer(serverName)
-			_ = d.procMgr.Stop(serverName)
-			d.runningServers.Delete(serverName)
-			if d.eventBus != nil {
-				d.eventBus.Publish(EventProcessStop, map[string]any{
-					"server": serverName,
-					"reason": "transport_recv_error",
-				})
-			}
-		}
-
-		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, err.Error()), nil
-	}
-
-	duration := time.Since(start)
-	latencyMs := float64(duration.Milliseconds())
-	d.router.RecordSuccess(serverName, target, latencyMs)
-	d.metrics.RecordServerSuccess(serverName, targetStr)
-	d.metrics.RecordRequest(serverName, method, "success", targetStr, duration)
-
-	// Track activity for idle reaping (local servers only)
-	if target == router.TargetLocal {
-		d.procMgr.MarkActivity(serverName)
-	}
-
-	// Store successful response in cache if cacheable
-	if cacheKey != "" && resp.Error == nil && resp.Result != nil {
-		d.respCache.Set(cacheKey, resp.Result, serverName, toolName)
-		stats := d.respCache.Stats()
-		d.metrics.UpdateResponseCacheStats(stats.Entries, stats.SizeBytes)
-		d.logger.Debug("response cached", "server", serverName, "tool", toolName)
-	}
-
-	// Audit log the completed tool call
-	auditStatus := "success"
-	auditErr := ""
-	if resp.Error != nil {
-		auditStatus = "error"
-		auditErr = resp.Error.Message
-	}
-	d.emitAudit(params, serverName, toolName, targetStr, auditStart, auditStatus, auditErr, false)
-
-	return resp, nil
+	return pipeline.execute(req), nil
 }
 
 // emitAudit writes a structured audit entry and cost record if enabled.
-func (d *Daemon) emitAudit(params callParams, server, tool, target string, start time.Time, status, errMsg string, cached bool) {
+func (d *Daemon) emitAudit(params callParams, server, tool, target string, start time.Time, status, errMsg string, cached bool, policy *GatewayPolicyDecision) {
 	durationMs := time.Since(start).Milliseconds()
+
+	policyRuleID := ""
+	policyReasonCode := ""
+	if policy != nil {
+		policyRuleID = policy.RuleID
+		policyReasonCode = policy.ReasonCode
+	}
 
 	if d.audit != nil {
 		d.audit.Log(AuditEntry{
-			Timestamp:  start.UTC(),
-			AgentID:    params.AgentID,
-			AgentType:  params.AgentType,
-			Server:     server,
-			Tool:       tool,
-			DurationMs: durationMs,
-			Status:     status,
-			Error:      errMsg,
-			Target:     target,
-			Cached:     cached,
+			Timestamp:        start.UTC(),
+			AgentID:          params.AgentID,
+			AgentType:        params.AgentType,
+			Server:           server,
+			Tool:             tool,
+			DurationMs:       durationMs,
+			Status:           status,
+			Error:            errMsg,
+			Target:           target,
+			Cached:           cached,
+			PolicyRuleID:     policyRuleID,
+			PolicyReasonCode: policyReasonCode,
 		})
 	}
 
@@ -1803,13 +2229,6 @@ func (d *Daemon) logAccessDecision(decision AccessDecision) {
 		d.eventBus.Publish(EventAccessDenied, decision)
 	}
 	d.metrics.RBACDenied.Inc()
-}
-
-// rbacDeniedResponse returns an MCP error for a denied tool call.
-func (d *Daemon) rbacDeniedResponse(msgID any, decision AccessDecision) *mcp.Message {
-	reason := fmt.Sprintf("access denied: agent %q with role %q cannot call %s__%s (%s)",
-		decision.AgentID, decision.Role, decision.Server, decision.Tool, decision.Reason)
-	return mcp.NewErrorResponse(msgID, mcp.InvalidRequest, reason)
 }
 
 // handleReload reloads the registry and refreshes the tool cache.
@@ -1894,7 +2313,7 @@ func (d *Daemon) Reload(ctx context.Context) error {
 
 	// Reload registry
 	if d.cfg.RegistryPath != "" {
-		newReg, err := registry.Load(d.cfg.RegistryPath)
+		newReg, err := registry.LoadWithDefaults(d.cfg.RegistryPath)
 		if err != nil {
 			return fmt.Errorf("load registry: %w", err)
 		}
@@ -1925,6 +2344,8 @@ func (d *Daemon) Reload(ctx context.Context) error {
 			}
 		}
 
+		d.procMgr.SetRegistry(newReg)
+		d.router.SetRegistry(newReg)
 		d.registry = newReg
 		d.logger.Info("registry reloaded", "servers", len(newReg.Servers))
 	}

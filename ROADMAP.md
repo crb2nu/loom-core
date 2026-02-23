@@ -1,6 +1,6 @@
 # Project Roadmap
 
-> Last Updated: February 16, 2026
+> Last Updated: February 17, 2026
 
 ## Current Status
 
@@ -116,11 +116,39 @@ These build on shipped work and address immediate quality and reliability.
   - Maintain one canonical docs entrypoint for user/developer/operator tasks.
   - Polish `make bootstrap-local` first-run experience.
 
+## Immediate Architecture Refactor Focus (Current)
+
+Derived from commit-window review (`2026-02-15` to `2026-02-17`) to reduce regression risk before expanding Tier 3 scope.
+
+- [ ] **Harden daemon tool-call pipeline extraction** (in progress via `8c2c50d`) ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/20))
+  - ✅ Stage 1 complete: `handleCall` orchestration now delegates to `internal/daemon/callpipeline.go`.
+  - ✅ Stage 2 complete: isolated side effects (audit/cost/cache/metrics) into dedicated pipeline helpers and added targeted stage-failure tests for route/connect + transport paths.
+  - Next: unify/centralize error-envelope construction for parse/build/route stages and add end-to-end pipeline stage-boundary regression tests.
+  - Target outcome: lower conflict/churn in `internal/daemon/daemon.go` and clearer test seams.
+
+- [ ] **Finish agent contract convergence across HUD/CLI/bridge** (in progress via `8c2c50d`) ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/21))
+  - ✅ Stage 1 complete: shared contracts for context-inspect + nudge policy in `internal/hud/bridge/agent_contracts.go`.
+  - Next: split and dedupe command/bridge surfaces (`cmd/loom/cmd_agent.go`, `internal/hud/bridge/agent.go`, `internal/hud/api_agent.go`) and align error envelopes.
+  - Target outcome: single contract model for context-inspect, nudge queue, and policy mutation surfaces.
+
+- [x] **Split oversized HUD panel/state surfaces** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/22)) ✅ Complete
+  - ✅ 2026-02-17: moved diagnostics polling/fetch/mutation logic into `presenceDiagnosticsStore` and kept `PresenceDiagnosticsTab.svelte` view-only; added TUI claim-conflict visibility in `internal/tui/panels/presence.go` for HUD/TUI parity.
+  - ✅ 2026-02-21: extracted dispatch/nudge/handoff modals from `PresencePanel.svelte` into `DispatchTaskModal`, `NudgeAgentModal`, `CreateHandoffModal` components; moved `fileConflicts` derived logic into `presenceStore` getter.
+  - Target outcome: safer iteration for Fleet orchestration UX work ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/13)).
+
+- [ ] **Refactor devbox K8s backend by concern** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/23))
+  - Separate build pod orchestration from runtime lifecycle logic in `internal/devbox/backend/k8s.go`.
+  - Target outcome: faster iteration and stronger integration-test coverage for Roadmap Issue #2 remaining devbox work.
+
+- [x] **Reduce HUD dist artifact churn in feature commits** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/24)) ✅ Complete
+  - ✅ 2026-02-21: added `.gitattributes` marking dist JS/CSS as `linguist-generated -diff` to collapse in MR diffs; added `make hud-dist-check` target for local/CI freshness verification.
+  - Target outcome: cleaner review diffs and faster root-cause analysis during regressions.
+
 ## Tier 2: Capture Market Gaps (Next)
 
 These address capabilities the market now expects from production MCP infrastructure.
 
-- [ ] **OTel trace export from daemon**
+- [ ] **OTel trace export from daemon** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/12))
   - Broaden `pkg/mcpotel` adoption across all high-traffic MCP servers.
   - Instrument tool call latency, server spawn/restart, proxy connection lifecycle in `loomd`.
   - Add OTLP gRPC export to configurable endpoint (Prometheus, Grafana, Jaeger).
@@ -155,24 +183,25 @@ These address capabilities the market now expects from production MCP infrastruc
 
 These position Loom Core in ways competitors cannot easily replicate.
 
-- [ ] **Fleet orchestration UX**
+- [ ] **Fleet orchestration UX** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/13))
   - Add dispatch panel in HUD for assigning tasks to agents and tracking parallel progress.
   - Surface file claim conflicts in HUD when agents touch overlapping files.
   - Add merge orchestration assistance after parallel agents complete work.
   - Improve cross-agent context transfer via the handoff system.
   - *Rationale: Market is moving to "developer as fleet commander" pattern (Augment Intent, GitHub Agent HQ, Cursor Parallel Agents).*
 
-- [ ] **MCP server catalog and discovery**
+- [ ] **MCP server catalog and discovery** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/14))
   - Add `loom catalog list` for browsable server catalog with capabilities and env requirements.
   - Add `loom catalog enable <server>` for one-command server activation.
   - Add HUD catalog view for browse, enable/disable, and per-server health.
   - *Rationale: 40+ curated Go servers is a unique asset. Docker MCP Toolkit has a catalog; Loom should too.*
 
-- [ ] **Security hardening layer**
+- [ ] **Security hardening layer** ([#25](https://gitlab.flexinfer.ai/services/loom-core/-/issues/25), [#26](https://gitlab.flexinfer.ai/services/loom-core/-/issues/26), [#27](https://gitlab.flexinfer.ai/services/loom-core/-/issues/27), [#29](https://gitlab.flexinfer.ai/services/loom-core/-/issues/29))
   - Add input schema validation at proxy before forwarding to servers.
   - Add output scanning for PII/secrets in tool responses.
   - Add per-agent, per-tool rate limiting.
   - Add deny-list for blocking tool calls based on policy.
+  - Note: prior umbrella issue `#15` is closed; active work is tracked in the concrete slice issues above.
   - *Rationale: MCP security is enterprise-critical. Lasso, MCP Manager, MCP Total are emerging competitors.*
 
 ## Ongoing Engineering Goals
@@ -189,8 +218,10 @@ These position Loom Core in ways competitors cannot easily replicate.
 - `docs/ARCHITECTURE.md`
 - `docs/DEV_BUILD_LIFECYCLE.md`
 - `docs/STREAMABLE_HTTP.md` — Streamable HTTP transport setup and configuration
+- `docs/planning/2026-02-19-enterprise-gateway-rbac-devbox-plan.md` — Scoped enterprise delivery plan for gateway, RBAC, and devbox executor
 - `.loom/12-research-market-trends-2026-02.md` — Market & platform strategic analysis (2026-02-15)
 - `.loom/10-research.md` — HUD UI/UX research brief
 - `.loom/20-product-spec.md` — HUD overhaul product spec
 - `.loom/30-implementation-plan.md` — HUD overhaul implementation plan
 - `docs/planning/2026-02-quality-onboarding-opportunities.md` — Quality and onboarding opportunities
+- `docs/planning/2026-02-17-architecture-refactor-opportunities.md` — Commit-window architecture/refactor focus and sequencing

@@ -1,10 +1,12 @@
 package panels
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestFleetPanelUpdateWindowSize(t *testing.T) {
@@ -166,5 +168,186 @@ func TestFleetPanelViewWithSessions(t *testing.T) {
 	v := p.View()
 	if v == "" {
 		t.Error("expected non-empty view with sessions")
+	}
+}
+
+func TestFleetPanelRebuildFlatRowsSortsByStatusThenRecency(t *testing.T) {
+	now := time.Now().UTC()
+	p := NewFleetPanel()
+	p, _ = p.Update(MsgFleetData{
+		Sessions: []SessionData{
+			{ID: "active-old", Namespace: "ns", Status: "active", StartedAt: now.Add(-2 * time.Hour).Format(time.RFC3339)},
+			{ID: "idle", Namespace: "ns", Status: "idle", StartedAt: now.Add(-30 * time.Minute).Format(time.RFC3339)},
+			{ID: "ended", Namespace: "ns", Status: "ended", StartedAt: now.Add(-10 * time.Minute).Format(time.RFC3339)},
+			{ID: "active-new", Namespace: "ns", Status: "active", StartedAt: now.Add(-1 * time.Hour).Format(time.RFC3339)},
+		},
+	})
+
+	if len(p.flatRows) != 4 {
+		t.Fatalf("flatRows = %d, want 4", len(p.flatRows))
+	}
+
+	got := []string{p.flatRows[0].ID, p.flatRows[1].ID, p.flatRows[2].ID, p.flatRows[3].ID}
+	want := []string{"active-new", "active-old", "idle", "ended"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("flatRows[%d] = %q, want %q (order=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestFleetPanelViewShowsResolvedIdentityAndContext(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "sess-1234567890abcdef"
+	p := NewFleetPanel()
+	p, _ = p.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	p, _ = p.Update(MsgFleetData{
+		Sessions: []SessionData{
+			{
+				ID:          sessionID,
+				AgentID:     "runner-42",
+				Namespace:   "loom-core/main",
+				Status:      "active",
+				Description: "Heartbeat bootstrap session",
+				StartedAt:   now.Add(-15 * time.Minute).Format(time.RFC3339),
+				TokenCount:  1200,
+			},
+		},
+		Agents: []AgentData{
+			{
+				AgentID:       "runner-42",
+				SessionID:     sessionID,
+				Status:        "active",
+				AgentType:     "codex",
+				CurrentTask:   "Investigate session clarity",
+				Branch:        "loom-core/main",
+				LastHeartbeat: now.Add(-2 * time.Minute).Format(time.RFC3339),
+			},
+		},
+	})
+
+	v := ansi.Strip(p.View())
+	if !strings.Contains(v, "Session") || !strings.Contains(v, "State") || !strings.Contains(v, "Last") {
+		t.Fatalf("view missing expected headers:\n%s", v)
+	}
+	if !strings.Contains(v, shortSessionID(sessionID)) {
+		t.Fatalf("view missing short session id %q:\n%s", shortSessionID(sessionID), v)
+	}
+	if !strings.Contains(v, "codex/runner-42") {
+		t.Fatalf("view missing resolved actor label:\n%s", v)
+	}
+	if !strings.Contains(v, "sid:"+sessionID) {
+		t.Fatalf("view missing selected session context:\n%s", v)
+	}
+	if !strings.Contains(v, "task: Investigate session clarity") {
+		t.Fatalf("view missing selected task context:\n%s", v)
+	}
+}
+
+func TestFleetPanelFocusedViewHidesStaleSessionsAndCanToggleAll(t *testing.T) {
+	now := time.Now().UTC()
+	p := NewFleetPanel()
+	p, _ = p.Update(MsgFleetData{
+		Sessions: []SessionData{
+			{
+				ID:        "active-now",
+				AgentID:   "codex-1",
+				Namespace: "ns",
+				Status:    "active",
+				StartedAt: now.Add(-10 * time.Minute).Format(time.RFC3339),
+			},
+			{
+				ID:        "old-ended",
+				AgentID:   "claude-code",
+				Namespace: "ns",
+				Status:    "summarized",
+				StartedAt: now.Add(-48 * time.Hour).Format(time.RFC3339),
+			},
+		},
+	})
+
+	if len(p.flatRows) != 1 {
+		t.Fatalf("focused view flatRows=%d, want 1", len(p.flatRows))
+	}
+	if got := p.flatRows[0].ID; got != "active-now" {
+		t.Fatalf("focused view first row = %q, want active-now", got)
+	}
+
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	if len(p.flatRows) != 2 {
+		t.Fatalf("all view flatRows=%d, want 2", len(p.flatRows))
+	}
+}
+
+func TestFleetPanelSortToggleCyclesAndAppliesTokenSort(t *testing.T) {
+	now := time.Now().UTC()
+	p := NewFleetPanel()
+	p, _ = p.Update(MsgFleetData{
+		Sessions: []SessionData{
+			{ID: "s-low", AgentID: "a1", Namespace: "ns", Status: "active", TokenCount: 10, StartedAt: now.Add(-5 * time.Hour).Format(time.RFC3339)},
+			{ID: "s-high", AgentID: "a2", Namespace: "ns", Status: "active", TokenCount: 900, StartedAt: now.Add(-6 * time.Hour).Format(time.RFC3339)},
+			{ID: "s-mid", AgentID: "a3", Namespace: "ns", Status: "active", TokenCount: 200, StartedAt: now.Add(-4 * time.Hour).Format(time.RFC3339)},
+		},
+		Agents: []AgentData{
+			{AgentID: "a1", SessionID: "s-low", Status: "active", LastHeartbeat: now.Add(-2 * time.Minute).Format(time.RFC3339)},
+			{AgentID: "a2", SessionID: "s-high", Status: "active", LastHeartbeat: now.Add(-15 * time.Minute).Format(time.RFC3339)},
+			{AgentID: "a3", SessionID: "s-mid", Status: "active", LastHeartbeat: now.Add(-7 * time.Minute).Format(time.RFC3339)},
+		},
+	})
+
+	if p.sortMode != fleetSortStatus {
+		t.Fatalf("default sortMode = %q, want %q", p.sortMode, fleetSortStatus)
+	}
+	// status -> recent
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if p.sortMode != fleetSortRecent {
+		t.Fatalf("sortMode after first s = %q, want %q", p.sortMode, fleetSortRecent)
+	}
+	// recent -> tokens
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if p.sortMode != fleetSortTokens {
+		t.Fatalf("sortMode after second s = %q, want %q", p.sortMode, fleetSortTokens)
+	}
+	if len(p.flatRows) < 3 {
+		t.Fatalf("flatRows=%d, want >=3", len(p.flatRows))
+	}
+	if p.flatRows[0].ID != "s-high" || p.flatRows[1].ID != "s-mid" || p.flatRows[2].ID != "s-low" {
+		t.Fatalf("token sort order = [%s %s %s], want [s-high s-mid s-low]", p.flatRows[0].ID, p.flatRows[1].ID, p.flatRows[2].ID)
+	}
+	// tokens -> status (cycle)
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if p.sortMode != fleetSortStatus {
+		t.Fatalf("sortMode after third s = %q, want %q", p.sortMode, fleetSortStatus)
+	}
+}
+
+func TestFleetPanelNamespaceCollapseAndExpandAll(t *testing.T) {
+	now := time.Now().UTC()
+	p := NewFleetPanel()
+	p, _ = p.Update(MsgFleetData{
+		Sessions: []SessionData{
+			{ID: "a-1", Namespace: "alpha", Status: "active", StartedAt: now.Format(time.RFC3339)},
+			{ID: "a-2", Namespace: "alpha", Status: "active", StartedAt: now.Format(time.RFC3339)},
+			{ID: "b-1", Namespace: "beta", Status: "active", StartedAt: now.Format(time.RFC3339)},
+		},
+	})
+	if len(p.flatRows) != 3 {
+		t.Fatalf("flatRows before collapse=%d, want 3", len(p.flatRows))
+	}
+
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if !p.collapsedNS["alpha"] {
+		t.Fatalf("expected alpha namespace to be collapsed")
+	}
+	if len(p.flatRows) != 1 {
+		t.Fatalf("flatRows after collapse=%d, want 1", len(p.flatRows))
+	}
+
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if len(p.collapsedNS) != 0 {
+		t.Fatalf("collapsed namespaces should be reset by x, got %d", len(p.collapsedNS))
+	}
+	if len(p.flatRows) != 3 {
+		t.Fatalf("flatRows after expand-all=%d, want 3", len(p.flatRows))
 	}
 }

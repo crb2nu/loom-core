@@ -12,6 +12,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -26,7 +27,7 @@ const defaultBuilderImage = "quay.io/buildah/stable:v1.38.0"
 // K8sBackend implements Backend using a Kubernetes cluster.
 // Builds are performed in-cluster via Buildah pods — no local Docker daemon required.
 type K8sBackend struct {
-	clientset       *kubernetes.Clientset
+	clientset       kubernetes.Interface
 	restConfig      *rest.Config
 	namespace       string
 	registry        string
@@ -112,6 +113,8 @@ func (k *K8sBackend) Health(ctx context.Context) error {
 	return nil
 }
 
+const buildMaxRetries = 2
+
 func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, error) {
 	registryTag := k.registryTag(opts.Tag)
 
@@ -121,20 +124,48 @@ func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, e
 		return nil, fmt.Errorf("context dir %q is not under workspace root %q", opts.ContextDir, k.workspaceRoot)
 	}
 
+	// Detach from the request context: builds are long-running and must
+	// survive MCP proxy timeouts / client disconnects. Use a generous
+	// build-scoped timeout instead.
+	buildCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
 	buildName := sanitizeBuildName(opts.Tag)
 
 	// Inject Dockerfile via ConfigMap so it's accessible to the Buildah pod
 	// without requiring the local filesystem to be the NFS volume.
 	cmName := "buildah-dockerfile-" + buildName
-	if err := k.createDockerfileConfigMap(ctx, cmName, opts.Dockerfile); err != nil {
+	if err := k.createDockerfileConfigMap(buildCtx, cmName, opts.Dockerfile); err != nil {
 		return nil, fmt.Errorf("create dockerfile configmap: %w", err)
 	}
 	defer func() {
 		_ = k.deleteConfigMap(context.Background(), cmName)
 	}()
 
-	// Create the Buildah build pod
 	podName := "buildah-build-" + buildName
+
+	var lastErr error
+	for attempt := range buildMaxRetries {
+		result, err := k.runBuildPod(buildCtx, podName, registryTag, cmName, contextRel)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+
+		// Don't retry on context cancellation
+		if buildCtx.Err() != nil {
+			break
+		}
+
+		if attempt < buildMaxRetries-1 {
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		}
+	}
+	return nil, lastErr
+}
+
+// runBuildPod creates a Buildah build pod, waits for completion, and returns the result.
+func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmName, contextRel string) (*BuildResult, error) {
 	pod := k.buildBuildahPodSpec(podName, registryTag, cmName, contextRel)
 
 	// Delete any leftover build pod with the same name
@@ -424,6 +455,8 @@ func (k *K8sBackend) buildPodSpec(opts StartOpts, imageTag string) *corev1.Pod {
 		labels["devbox/agent-id"] = opts.AgentID
 	}
 
+	gracePeriod := int64(3)
+
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      opts.Name,
@@ -431,8 +464,9 @@ func (k *K8sBackend) buildPodSpec(opts StartOpts, imageTag string) *corev1.Pod {
 			Labels:    labels,
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:      corev1.RestartPolicyNever,
-			ServiceAccountName: "mcp-devbox",
+			RestartPolicy:                 corev1.RestartPolicyNever,
+			TerminationGracePeriodSeconds: &gracePeriod,
+			ServiceAccountName:            "mcp-devbox",
 			ImagePullSecrets: []corev1.LocalObjectReference{
 				{Name: k.imagePullSecret},
 			},
@@ -479,7 +513,7 @@ func (k *K8sBackend) waitForPodRunning(ctx context.Context, name string, timeout
 		case corev1.PodRunning:
 			return nil
 		case corev1.PodFailed, corev1.PodSucceeded:
-			return fmt.Errorf("pod entered terminal phase: %s", pod.Status.Phase)
+			return fmt.Errorf("pod entered terminal phase: %s", podFailureReason(pod))
 		}
 		// Early exit on image pull errors
 		for _, cs := range pod.Status.ContainerStatuses {
@@ -493,17 +527,42 @@ func (k *K8sBackend) waitForPodRunning(ctx context.Context, name string, timeout
 	return fmt.Errorf("watch closed for pod %s", name)
 }
 
+// podFailureReason extracts a diagnostic string from a failed pod's container statuses.
+func podFailureReason(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if t := cs.State.Terminated; t != nil {
+			parts := []string{fmt.Sprintf("exit_code=%d", t.ExitCode)}
+			if t.Reason != "" {
+				parts = append(parts, "reason="+t.Reason)
+			}
+			if t.Message != "" {
+				parts = append(parts, "message="+t.Message)
+			}
+			return strings.Join(parts, " ")
+		}
+	}
+	if pod.Status.Message != "" {
+		return pod.Status.Message
+	}
+	return string(pod.Status.Phase)
+}
+
 // buildBuildahPodSpec creates a Pod spec for a Buildah in-cluster build.
-// Buildah runs rootless with --storage-driver=vfs --isolation=chroot —
-// no privileged containers or SYS_ADMIN capability required.
+// Buildah runs as root with --storage-driver=vfs --isolation=chroot.
+// Root is required because chroot isolation needs to remount / (MS_REC|MS_SLAVE).
 // The Dockerfile is injected via a ConfigMap (dockerfileCM) so it doesn't
 // need to exist on the NFS workspace volume.
 func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, contextRel string) *corev1.Pod {
 	gracePeriod := int64(0)
-	runAsUser := int64(1000)
-	runAsGroup := int64(1000)
+	runAsUser := int64(0)
+	runAsGroup := int64(0)
 
 	buildAndPush := strings.Join([]string{
+		// Configure registries for short-name resolution (non-interactive builds)
+		"mkdir -p /etc/containers",
+		"&&",
+		`printf 'unqualified-search-registries = ["docker.io"]\nshort-name-mode = "permissive"\n' > /etc/containers/registries.conf`,
+		"&&",
 		"buildah build-using-dockerfile",
 		"--storage-driver=vfs",
 		"--isolation=chroot",
@@ -524,6 +583,10 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, con
 				"app.kubernetes.io/managed-by": "mcp-devbox",
 				"devbox/build":                 "buildah",
 			},
+			Annotations: map[string]string{
+				// Belt-and-suspenders: deprecated annotation for pre-1.30 clusters
+				"container.apparmor.security.beta.kubernetes.io/buildah": "unconfined",
+			},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                 corev1.RestartPolicyNever,
@@ -540,8 +603,10 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, con
 					Env: []corev1.EnvVar{
 						{Name: "BUILDAH_ISOLATION", Value: "chroot"},
 						{Name: "STORAGE_DRIVER", Value: "vfs"},
+						{Name: "CONTAINERS_REGISTRIES_CONF", Value: "/etc/containers/registries.conf"},
 					},
 					SecurityContext: &corev1.SecurityContext{
+						Privileged: boolPtr(true),
 						RunAsUser:  &runAsUser,
 						RunAsGroup: &runAsGroup,
 					},
@@ -558,7 +623,7 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, con
 					VolumeMounts: []corev1.VolumeMount{
 						{Name: "workspace", MountPath: "/workspace"},
 						{Name: "dockerfile", MountPath: "/buildah-dockerfile", ReadOnly: true},
-						{Name: "buildah-storage", MountPath: "/home/build/.local/share/containers/storage"},
+						{Name: "buildah-storage", MountPath: "/var/lib/containers/storage"},
 						{Name: "auth", MountPath: "/run/containers/0/auth.json", SubPath: "config.json", ReadOnly: true},
 					},
 				},
@@ -585,7 +650,9 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, con
 				{
 					Name: "buildah-storage",
 					VolumeSource: corev1.VolumeSource{
-						EmptyDir: &corev1.EmptyDirVolumeSource{},
+						EmptyDir: &corev1.EmptyDirVolumeSource{
+							SizeLimit: resourcePtr(resource.MustParse("10Gi")),
+						},
 					},
 				},
 				{
@@ -628,7 +695,7 @@ func (k *K8sBackend) waitForPodDone(ctx context.Context, name string, timeout ti
 		case corev1.PodSucceeded:
 			return nil
 		case corev1.PodFailed:
-			return fmt.Errorf("build pod failed (phase: %s)", pod.Status.Phase)
+			return fmt.Errorf("build pod failed: %s", podFailureReason(pod))
 		}
 		// Early exit on image pull errors
 		for _, cs := range pod.Status.ContainerStatuses {
@@ -720,11 +787,17 @@ func sanitizeBuildName(tag string) string {
 
 // registryTag prepends the registry to a local image tag.
 func (k *K8sBackend) registryTag(tag string) string {
-	if strings.Contains(tag, "/") && strings.Contains(strings.Split(tag, "/")[0], ".") {
-		return tag // already has a registry prefix
+	if strings.Contains(tag, "/") {
+		prefix := strings.Split(tag, "/")[0]
+		if strings.Contains(prefix, ".") || strings.Contains(prefix, ":") || prefix == "localhost" {
+			return tag // already has a registry prefix
+		}
 	}
 	return k.registry + "/" + tag
 }
+
+func boolPtr(b bool) *bool                               { return &b }
+func resourcePtr(q resource.Quantity) *resource.Quantity { return &q }
 
 // parseExitCode extracts the exit code from a K8s exec error.
 // Returns 1 as default for non-zero exits when code can't be parsed.
@@ -745,7 +818,13 @@ func parseExitCode(err error) int {
 
 // isNotFound returns true if the error is a K8s "not found" error.
 func isNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+	if err == nil {
+		return false
+	}
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
 // workDir returns the working directory, defaulting to "/workspace".

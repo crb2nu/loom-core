@@ -54,6 +54,8 @@ type DaemonClient struct {
 	mu         sync.Mutex
 	reqID      atomic.Int64
 	logger     *slog.Logger
+	// callTimeout bounds each JSON-RPC request.
+	callTimeout time.Duration
 
 	// Circuit breaker for downstream server failures.
 	cbState       circuitState
@@ -72,9 +74,10 @@ func NewDaemonClient(socketPath string, logger *slog.Logger) *DaemonClient {
 		logger = slog.Default()
 	}
 	c := &DaemonClient{
-		socketPath: socketPath,
-		logger:     logger,
-		cbCooldown: cbMinCooldown,
+		socketPath:  socketPath,
+		logger:      logger,
+		cbCooldown:  cbMinCooldown,
+		callTimeout: 30 * time.Second,
 	}
 	c.reqID.Store(0)
 	return c
@@ -187,8 +190,21 @@ func (c *DaemonClient) reconnect() error {
 // auto-reconnection on transport errors and circuit-breaking on downstream
 // server failures. Caller must NOT hold c.mu.
 func (c *DaemonClient) call(method string, params any) (json.RawMessage, error) {
+	return c.callOpt(method, params, 0)
+}
+
+// callOpt is like call but accepts an optional per-call timeout override.
+// A zero or negative timeout uses the client's default callTimeout.
+func (c *DaemonClient) callOpt(method string, params any, timeout time.Duration) (json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Apply per-call timeout override while holding the lock.
+	saved := c.callTimeout
+	if timeout > 0 {
+		c.callTimeout = timeout
+	}
+	defer func() { c.callTimeout = saved }()
 
 	// Circuit breaker: check state before making the call.
 	if c.cbState == circuitOpen {
@@ -319,8 +335,13 @@ func (c *DaemonClient) callLocked(method string, params any) (json.RawMessage, e
 		return nil, fmt.Errorf("not connected")
 	}
 
+	timeout := c.callTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
 	id := c.reqID.Add(1)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	req, err := mcp.NewRequest(id, method, params)
@@ -390,8 +411,9 @@ type ServersResult struct {
 
 // ToolInfo describes an aggregated MCP tool.
 type ToolInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema mcp.InputSchema `json:"inputSchema"`
 }
 
 // ToolsResult holds the response from loom/tools.
@@ -504,4 +526,13 @@ func (c *DaemonClient) CallTool(name string, args map[string]any) (json.RawMessa
 		"arguments": args,
 	}
 	return c.call("tools/call", params)
+}
+
+// CallToolWithTimeout is like CallTool but uses a per-call timeout override.
+func (c *DaemonClient) CallToolWithTimeout(name string, args map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	params := map[string]any{
+		"name":      name,
+		"arguments": args,
+	}
+	return c.callOpt("tools/call", params, timeout)
 }
