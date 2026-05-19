@@ -587,6 +587,54 @@ func TestHandleEvalScores_EmptyOK(t *testing.T) {
 	}
 }
 
+// TestHandleEvalScores_JSONShape pins the JSON field names emitted by
+// /api/mills/eval/scores. The HUD EvalPanel reads SubjectKind /
+// SubjectID / Rubric / JudgedBy / EvaluatedAt to derive the Loop
+// letter and render rows; renaming or dropping any of these in
+// pkg/mills/store.EvalScore would silently blank the panel.
+func TestHandleEvalScores_JSONShape(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+
+	if err := op.store.Eval.RecordScore(context.Background(), &store.EvalScore{
+		SubjectKind: store.EvalSubjectCrossRun,
+		SubjectID:   "2026-05-10..2026-05-17",
+		Rubric:      "loop_c_stale_plans",
+		Score:       0.875,
+		JudgedBy:    "loop_c_cross_run",
+		EvaluatedAt: time.Now().UTC(),
+		Notes:       "shape-contract",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/eval/scores?limit=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var rows []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if len(rows) == 0 {
+		t.Fatalf("expected at least one row, got %s", rec.Body.String())
+	}
+	row := rows[0]
+	for _, want := range []string{"ID", "SubjectKind", "SubjectID", "Rubric", "Score", "JudgedBy", "EvaluatedAt", "Notes"} {
+		if _, ok := row[want]; !ok {
+			t.Errorf("eval JSON missing field %q (HUD EvalPanel depends on it); row=%v", want, row)
+		}
+	}
+	if got, _ := row["SubjectKind"].(string); got != "cross_run" {
+		t.Errorf("SubjectKind = %q, want \"cross_run\"", got)
+	}
+	if got, _ := row["JudgedBy"].(string); got != "loop_c_cross_run" {
+		t.Errorf("JudgedBy = %q, want \"loop_c_cross_run\"", got)
+	}
+}
+
 // ----- Admin-token gate -----
 
 func TestRequireAdmin_NoTokenConfigured_Rejects(t *testing.T) {
