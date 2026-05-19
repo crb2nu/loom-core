@@ -66,22 +66,36 @@
       case 'in_flight':
         return h.queued > 0 ? `${h.queued} queued behind active runs` : 'Pipelines progressing';
       case 'idle':
-        return 'Next scheduled: 0 5 * * * UTC. Trigger manually via `loom mills council run`.';
+        return scheduleDetail();
       default:
         return '';
     }
+  }
+
+  // scheduleDetail reads the cron string out of the policy raw blob if
+  // present (PolicyView intentionally keeps the parsed shape narrow;
+  // schedule_cron lives in .raw). Falls back to a neutral hint when the
+  // raw shape doesn't match — better than rendering "undefined".
+  function scheduleDetail(): string {
+    const raw = policy?.raw as { council?: { schedule_cron?: string } } | undefined;
+    const cron = raw?.council?.schedule_cron;
+    if (cron) return `Next scheduled: ${cron} UTC · or fire one now`;
+    return 'Fire a council run to validate the runner end-to-end.';
   }
 
   function bannerActionLabel(h: SystemHealth): string {
     switch (h.state) {
       case 'broken': return 'View escalations';
       case 'in_flight': return 'Open pipelines';
-      case 'idle': return 'Open council';
+      case 'idle': return councilRunning ? 'Running…' : 'Run council now';
       default: return '';
     }
   }
 
-  function runBannerAction(h: SystemHealth): void {
+  let councilRunning = $state(false);
+  let councilError = $state<string | null>(null);
+
+  async function runBannerAction(h: SystemHealth): Promise<void> {
     switch (h.state) {
       case 'broken':
         gotoBacklogEscalated();
@@ -90,7 +104,16 @@
         goto('pipelines');
         return;
       case 'idle':
-        goto('council');
+        if (councilRunning) return;
+        councilRunning = true;
+        councilError = null;
+        try {
+          await millsStore.runCouncil('hud-overview-idle');
+        } catch (e) {
+          councilError = e instanceof Error ? e.message : String(e);
+        } finally {
+          councilRunning = false;
+        }
         return;
     }
   }
@@ -197,10 +220,14 @@
           type="button"
           class="banner-action"
           onclick={() => runBannerAction(health)}
+          disabled={health.state === 'idle' && councilRunning}
         >
           {bannerActionLabel(health)} →
         </button>
       </div>
+      {#if councilError}
+        <div class="council-error" role="alert">Council run failed: {councilError}</div>
+      {/if}
     {/if}
     <div class="overview-status" role="status">
       <div
@@ -463,6 +490,20 @@
     color: var(--fg-primary);
     border-color: var(--border-focus, var(--accent));
     outline: none;
+  }
+
+  .banner-action[disabled] {
+    cursor: progress;
+    opacity: 0.65;
+  }
+
+  .council-error {
+    margin-top: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid color-mix(in srgb, var(--error) 50%, var(--border));
+    border-radius: var(--radius-sm);
+    color: var(--error);
+    font-size: var(--text-xs);
   }
 
   .system-health-banner.intent-broken .banner-action {

@@ -358,11 +358,29 @@ func run(cfg Config) error {
 	logger.Info("eval Loop C scheduler armed",
 		"weekday", crossRunSched.Weekday.String(), "hour_utc", crossRunSched.Hour)
 
+	// Council scheduler — wakes every minute and fires runner.Run when
+	// the current UTC time matches policy.council.schedule_cron. The
+	// cron field has lived in policy since v1 but had no reader until
+	// this slice (the deferred slice-3.7 wiring), so prior to this
+	// change the operator was perfectly deployed and perfectly idle.
+	// Skipped silently when councilRunner is nil (degraded / fake
+	// agents mode).
+	var councilRunFn mills.CouncilRunFn
+	if councilRunner != nil {
+		councilRunFn = func(ctx context.Context, trigger store.CouncilTrigger, reason string) error {
+			_, err := councilRunner.Run(ctx, runner.RunInput{Trigger: trigger, Reason: reason})
+			return err
+		}
+	}
+	councilSched := mills.NewCouncilScheduler(councilRunFn, pm)
+	councilSched.Logger = logger
+
 	g, gctx := errgroup.WithContext(rootCtx)
 	g.Go(func() error { return runListener(gctx, "http", httpSrv, logger) })
 	g.Go(func() error { return runListener(gctx, "metrics", metricsSrv, logger) })
 	g.Go(func() error { return scheduler.Run(gctx) })
 	g.Go(func() error { return crossRunSched.Run(gctx) })
+	g.Go(func() error { return councilSched.Run(gctx) })
 	if hubClient != nil {
 		g.Go(func() error {
 			runOperatorSessionMaintainer(gctx, hubClient, operatorSession, op, logger, 30*time.Second)

@@ -254,7 +254,7 @@ func Default() *Policy {
 			Pipeline: BudgetLimits{MaxUSDPerRun: 5, MaxUSDPerDay: 75, MaxConcurrentRuns: 4, MaxRunsPerDay: 20},
 		},
 		Council: CouncilPolicy{
-			ScheduleCron:           "0 5 * * *",
+			ScheduleCron:           "0 */6 * * *",
 			ArtifactsBranch:        "council/{date}",
 			ArtifactsMergeStrategy: "fast-merge-loom-only",
 			Triggers:               CouncilTriggers{OnRoadmapChange: true, OnIncident: true, OnMergeDriftHours: 48},

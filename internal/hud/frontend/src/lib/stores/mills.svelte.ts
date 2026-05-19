@@ -593,6 +593,16 @@ class MillsStore {
     await this.fetchPolicyProposals();
   }
 
+  // runCouncil fires an ad-hoc council pass via the operator's
+  // POST /api/mills/council/run endpoint. The HUD proxy attaches the
+  // admin bearer before forwarding so the browser never sees the token.
+  // Returns true on success so callers can drive their own UI feedback.
+  async runCouncil(reason: string = 'hud'): Promise<boolean> {
+    await this.postJSON(`/api/mills/council/run`, { trigger: 'manual', reason });
+    await this.fetchAll();
+    return true;
+  }
+
   startPolling(intervalMs = 15000): void {
     this.stopPolling();
     void this.fetchAll();
