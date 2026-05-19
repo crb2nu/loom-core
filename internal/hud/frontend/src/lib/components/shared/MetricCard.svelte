@@ -11,6 +11,8 @@
    *   trend?: number[],
    *   trendColor?: string,
    *   compact?: boolean,
+   *   proxy?: boolean,
+   *   proxyTitle?: string,
    *   onclick?: () => void,
    * }}
    */
@@ -25,6 +27,8 @@
     trend,
     trendColor = 'var(--info)',
     compact = false,
+    proxy = false,
+    proxyTitle = 'This metric is a proxy — see the Mills plan doc for the canonical definition.',
     onclick,
   } = $props();
 </script>
@@ -40,7 +44,12 @@
   role={onclick ? 'button' : undefined}
 >
   <div class="metric-card-top">
-    <span class="metric-card-label">{label}</span>
+    <span class="metric-card-label">
+      {label}
+      {#if proxy}
+        <span class="metric-card-proxy" title={proxyTitle}>(proxy)</span>
+      {/if}
+    </span>
     {#if badge}
       <span class="metric-card-badge badge-{badgeVariant}">{badge}</span>
     {/if}
@@ -96,6 +105,16 @@
     text-transform: uppercase;
     letter-spacing: var(--tracking-wide);
     color: var(--fg-muted);
+  }
+
+  .metric-card-proxy {
+    margin-left: 4px;
+    font-size: 9px;
+    font-weight: 500;
+    text-transform: lowercase;
+    letter-spacing: 0;
+    color: var(--fg-dim);
+    cursor: help;
   }
 
   .metric-card-badge {
