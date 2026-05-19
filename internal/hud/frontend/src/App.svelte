@@ -10,6 +10,9 @@
   import { embedConfig } from './lib/stores/embedConfig.svelte.ts';
   import { actionStore } from './lib/stores/action.svelte.ts';
   import { millsStore } from './lib/stores/mills.svelte.ts';
+  import { millsSquadsStore } from './lib/stores/mills_squads.svelte.ts';
+  import { millsAuditStore } from './lib/stores/mills_audit.svelte.ts';
+  import { millsCrossRepoStore } from './lib/stores/mills_crossrepo.svelte.ts';
   import { formatTime as fmtTime } from './lib/utils/format.ts';
   import ViewShell from './lib/components/shared/ViewShell.svelte';
   import FleetPanel from './lib/components/FleetPanel.svelte';
@@ -58,6 +61,20 @@
   // unrestricted). Reactive so the nav updates after `embedConfig.load`
   // resolves.
   let visibleViews = $derived(views.filter((v) => embedConfig.isViewAllowed(v.id)));
+
+  // Prime the three Mills sub-stores when the operator enters the Mills
+  // view so the sub-tab nav can render counts without waiting for each
+  // panel to be visited. Each panel still runs its own 15s polling on
+  // mount; this is a one-shot refresh per Mills-view entry, not a
+  // perpetual poll loop.
+  $effect(() => {
+    if (router.view === 'mills') {
+      void millsSquadsStore.refresh();
+      void millsAuditStore.refresh();
+      void millsCrossRepoStore.refresh();
+    }
+  });
+
   onDestroy(() => {
     eventStore.disconnect();
   });
@@ -273,17 +290,22 @@
                   // Surface item counts as small badges next to the
                   // sub-tab label so an operator can see at a glance
                   // where activity lives without opening each panel.
-                  // Only tabs whose stores have a meaningful "items"
-                  // signal get a count; squads / audit / cross-repo
-                  // are intentionally left countless until those
-                  // stores expose first-class counts.
+                  // Cross-repo uses inFlightCount because the runs
+                  // array accumulates terminal-state history; total
+                  // length would show a misleadingly large number on
+                  // a Mills that's been running for a while. Audit
+                  // and squads use total length to match the other
+                  // five tabs.
                   switch (sv.id) {
-                    case 'pipelines': return { ...sv, count: millsStore.pipelineRuns.length };
-                    case 'backlog':   return { ...sv, count: millsStore.backlog.length };
-                    case 'council':   return { ...sv, count: millsStore.councilRuns.length };
-                    case 'eval':      return { ...sv, count: millsStore.evalScores.length };
-                    case 'policy':    return { ...sv, count: millsStore.policyProposals.length };
-                    default:          return sv;
+                    case 'pipelines':  return { ...sv, count: millsStore.pipelineRuns.length };
+                    case 'backlog':    return { ...sv, count: millsStore.backlog.length };
+                    case 'council':    return { ...sv, count: millsStore.councilRuns.length };
+                    case 'eval':       return { ...sv, count: millsStore.evalScores.length };
+                    case 'policy':     return { ...sv, count: millsStore.policyProposals.length };
+                    case 'squads':     return { ...sv, count: millsSquadsStore.state.length };
+                    case 'audit':      return { ...sv, count: millsAuditStore.state.length };
+                    case 'cross-repo': return { ...sv, count: millsCrossRepoStore.inFlightCount };
+                    default:           return sv;
                   }
                 })
               : vd?.subViews}
