@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { millsStore } from '../../stores/mills.svelte.ts';
+  import { millsStore, loopLetterFor, type EvalScore } from '../../stores/mills.svelte.ts';
   import PanelShell from '../shared/PanelShell.svelte';
 
   $effect(() => {
@@ -12,11 +12,11 @@
   let disabled = $derived(millsStore.disabled);
   let error = $derived(millsStore.error);
 
-  // Group by Loop letter so Loop A / B / C trends show separately.
+  // Group by derived Loop letter so Loop A / B / C trends show separately.
   let byLoop = $derived.by(() => {
     const out: Record<string, { count: number; mean: number; latest: number | null }> = {};
     for (const s of scores) {
-      const k = s.Loop ?? '?';
+      const k = loopLetterFor(s);
       if (!out[k]) out[k] = { count: 0, mean: 0, latest: null };
       out[k].count += 1;
       out[k].mean = (out[k].mean * (out[k].count - 1) + s.Score) / out[k].count;
@@ -33,6 +33,13 @@
   }
   function fmtScore(s: number): string {
     return s.toFixed(3);
+  }
+  // subjectLabel renders the row's subject as "<kind>:<id>" so the
+  // SubjectKind discriminator stays visible (a council_run id and a
+  // pipeline_run id can look identical at a glance otherwise).
+  function subjectLabel(s: EvalScore): string {
+    if (!s.SubjectID) return s.SubjectKind || '—';
+    return `${s.SubjectKind}:${s.SubjectID}`;
   }
 </script>
 
@@ -60,6 +67,7 @@
     <thead>
       <tr>
         <th>Loop</th>
+        <th>Rubric</th>
         <th>Subject</th>
         <th>Score</th>
         <th>Notes</th>
@@ -68,12 +76,14 @@
     </thead>
     <tbody>
       {#each scores as s (s.ID)}
+        {@const loop = loopLetterFor(s)}
         <tr>
-          <td><span class="loop loop-{s.Loop}">{s.Loop}</span></td>
-          <td class="mono">{s.Subject}</td>
+          <td><span class="loop loop-{loop}">{loop}</span></td>
+          <td class="mono">{s.Rubric}</td>
+          <td class="mono" title={subjectLabel(s)}>{subjectLabel(s)}</td>
           <td>{fmtScore(s.Score)}</td>
           <td>{s.Notes ?? ''}</td>
-          <td>{fmtTime(s.CreatedAt)}</td>
+          <td>{fmtTime(s.EvaluatedAt)}</td>
         </tr>
       {/each}
     </tbody>

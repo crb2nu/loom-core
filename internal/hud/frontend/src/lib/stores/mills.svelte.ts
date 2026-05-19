@@ -125,13 +125,35 @@ type DebateLoadState =
   | { status: 'loaded'; rounds: CouncilDebateRound[] }
   | { status: 'error'; message: string };
 
+// EvalScore mirrors pkg/mills/store.EvalScore as JSON-encoded by
+// /api/mills/eval/scores. Field names are the Go struct names because
+// the operator uses default encoding/json (no tags). The contract is
+// pinned by TestHandleEvalScores_JSONShape in handlers_test.go — if
+// you change a field here, update both sides at once.
 export interface EvalScore {
-  ID: string;
-  Loop: string;        // "A" | "B" | "C"
-  Subject: string;     // run id, merge sha, etc.
-  Score: number;       // 0..1
+  ID: number;
+  SubjectKind: 'council_run' | 'pipeline_run' | 'cross_run' | string;
+  SubjectID: string;
+  Rubric: string;
+  Score: number;
+  Breakdown?: Record<string, unknown>;
+  JudgedBy: string;
+  EvaluatedAt: string;
   Notes?: string;
-  CreatedAt?: string;
+}
+
+// loopLetterFor derives the "A | B | C | ?" loop tag from the eval
+// score's attribution. The recording sites in pkg/mills/eval pin:
+//   Loop A — council artifact judgments (SubjectKind=council_run)
+//   Loop B — pipeline outcome attribution (SubjectKind=pipeline_run)
+//   Loop C — weekly cross-run consistency (JudgedBy=loop_c_cross_run)
+// Anything else is unknown.
+export function loopLetterFor(s: Pick<EvalScore, 'SubjectKind' | 'JudgedBy'>): string {
+  if (s.JudgedBy && s.JudgedBy.startsWith('loop_c_')) return 'C';
+  if (s.SubjectKind === 'pipeline_run') return 'B';
+  if (s.SubjectKind === 'council_run') return 'A';
+  if (s.SubjectKind === 'cross_run') return 'C';
+  return '?';
 }
 
 export interface PolicyView {
