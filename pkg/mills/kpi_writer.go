@@ -15,6 +15,15 @@ const (
 	kpiWindow1d  = 24 * time.Hour
 	kpiWindow7d  = 7 * 24 * time.Hour
 	kpiWindow30d = 30 * 24 * time.Hour
+
+	// regressionFixLabel marks a backlog item as a fix for a previously-
+	// merged regression. The label is the canonical signal for the
+	// regression_rate KPI; an upstream emitter (operator, integrator,
+	// or human) must tag the backlog with this label for the change to
+	// count as a regression. Until file-overlap detection lands the
+	// metric is still considered a proxy and the HUD card flags it as
+	// such.
+	regressionFixLabel = "regression-fix"
 )
 
 // KPIWriter records rolling snapshots into the canonical kpi_snapshots table.
@@ -130,28 +139,60 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 		metrics["gate_pass_rate"] = float64(gatePass) / float64(gateTotal)
 	}
 	if mergedRuns > 0 {
-		// cost_per_merged_change_usd: today equivalent to per-pipeline
-		// since Mills doesn't yet aggregate multiple pipeline_runs per
-		// backlog item into a single "change". When backlog→change
-		// attribution is added (Phase 8+) this should switch to
-		// grouping by backlog_id; the metric key is the canonical
-		// frontend contract either way.
+		// cost_per_merged_pipeline_usd: total window pipeline cost
+		// (includes escalated work) divided by the count of merged
+		// pipeline_runs. Older of the two cost-per-merge keys; useful
+		// when the operator wants the "raw burn rate" view that
+		// includes work-in-progress money.
 		metrics["cost_per_merged_pipeline_usd"] = pipelineCost / float64(mergedRuns)
-		metrics["cost_per_merged_change_usd"] = pipelineCost / float64(mergedRuns)
+	}
+	// cost_per_merged_change_usd: total cost of pipeline_runs whose
+	// backlog item ended up merged in the window, divided by the count
+	// of distinct merged backlog items ("changes"). This collapses
+	// multi-attempt runs (e.g. an escalated attempt followed by a
+	// successful retry of the same backlog) into one change while
+	// still attributing the failed attempts' cost — that is what an
+	// operator means by "$ per merged change". Excludes the cost of
+	// pipeline_runs whose backlog did not merge in window (those
+	// remain in cost_per_merged_pipeline_usd as the "burn rate" view).
+	changeCost, changeDenom, err := costPerMergedChange(ctx, w.Store, since)
+	if err != nil {
+		return nil, err
+	}
+	if changeDenom > 0 {
+		metrics["cost_per_merged_change_usd"] = changeCost / float64(changeDenom)
 	}
 	// auto_merge_rate: fraction of terminal runs in the window that
 	// reached `done` (vs `escalated`). Mills always uses the
 	// auto-merge path so this measures autonomous-success rate, not
 	// human vs auto merge selection. Denominator is mergedRuns +
 	// escalatedRuns so the metric stays bounded to [0,1] over actual
-	// outcomes and complementary with regression_rate below.
+	// outcomes.
 	if denom := mergedRuns + escalatedRuns; denom > 0 {
 		metrics["auto_merge_rate"] = float64(mergedRuns) / float64(denom)
-		// regression_rate: best-effort proxy = escalation_rate. Mills
-		// doesn't yet track post-merge regressions; until that signal
-		// exists, "rate at which the autonomous pipeline can't carry
-		// through" is the closest single-pass signal we have.
-		metrics["regression_rate"] = float64(escalatedRuns) / float64(denom)
+		// escalation_rate: fraction of terminal runs in the window
+		// that escalated (vs. reached done). Previously emitted under
+		// the name "regression_rate" as a best-effort proxy; now
+		// emitted under its honest name so operators see the
+		// autonomous-pipeline-completion signal under a label that
+		// matches what it measures. regression_rate (below) is now a
+		// separate, label-driven signal.
+		metrics["escalation_rate"] = float64(escalatedRuns) / float64(denom)
+	}
+	// regression_rate: fraction of merged changes in the window that
+	// were themselves regression-fix work (per the
+	// regression-fix label on the backlog item). Emitted when there
+	// are any merged backlog items in the window so the operator can
+	// see "0% regressions" as a distinct, intentional signal — but
+	// the HUD card flags this metric as `(proxy)` until file-overlap
+	// detection lands and removes the dependency on a hand-emitted
+	// label.
+	regressionNum, regressionDenom, err := regressionRateFromLabels(ctx, w.Store, since)
+	if err != nil {
+		return nil, err
+	}
+	if regressionDenom > 0 {
+		metrics["regression_rate"] = float64(regressionNum) / float64(regressionDenom)
 	}
 	// council_roi: merged changes per dollar of council spend. A
 	// value > 1 means each $1 of council deliberation produced > 1
@@ -278,4 +319,60 @@ func avgEvalScoreSince(ctx context.Context, st *store.Store, since time.Time) (a
 
 func kpiTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
+}
+
+// costPerMergedChange returns (sum_cost, distinct_merged_backlog_count)
+// for the window. The sum is over pipeline_runs whose backlog ended
+// up merged in the window — escalated/retried attempts of the same
+// backlog count toward the same "change", but pipeline_runs whose
+// backlog did NOT merge are excluded entirely.
+//
+// Caller divides; we return both values so the caller can omit the
+// metric when denominator is zero.
+func costPerMergedChange(ctx context.Context, st *store.Store, since time.Time) (float64, int, error) {
+	row := st.DB().QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(cost_usd), 0),
+			COUNT(DISTINCT backlog_id)
+		FROM pipeline_runs
+		WHERE backlog_id IN (
+			SELECT DISTINCT backlog_id
+			FROM pipeline_runs
+			WHERE state = ? AND started_at >= ?
+		)
+		AND started_at >= ?
+	`, string(store.PipelineDone), kpiTime(since), kpiTime(since))
+	var cost float64
+	var denom int
+	if err := row.Scan(&cost, &denom); err != nil {
+		return 0, 0, fmt.Errorf("kpi cost-per-change: %w", err)
+	}
+	return cost, denom, nil
+}
+
+// regressionRateFromLabels returns (regressions, merged_backlog_items)
+// for the window. A "regression" is a distinct merged backlog item
+// whose Labels JSON contains the canonical regressionFixLabel string.
+// The match is a substring check on the JSON-encoded labels column —
+// safe for the standard json.Marshal output of a []string, where each
+// label is wrapped in quotes (so the match cannot collide with a
+// label that contains regressionFixLabel as a suffix or prefix
+// unless someone deliberately names a label like that).
+//
+// Caller divides; we return both values so the caller can omit the
+// metric when denominator is zero.
+func regressionRateFromLabels(ctx context.Context, st *store.Store, since time.Time) (int, int, error) {
+	row := st.DB().QueryRowContext(ctx, `
+		SELECT
+			COUNT(DISTINCT CASE WHEN bi.labels_json LIKE ? THEN pr.backlog_id END),
+			COUNT(DISTINCT pr.backlog_id)
+		FROM pipeline_runs pr
+		JOIN backlog_items bi ON pr.backlog_id = bi.id
+		WHERE pr.state = ? AND pr.started_at >= ?
+	`, "%\""+regressionFixLabel+"\"%", string(store.PipelineDone), kpiTime(since))
+	var num, denom int
+	if err := row.Scan(&num, &denom); err != nil {
+		return 0, 0, fmt.Errorf("kpi regression-rate: %w", err)
+	}
+	return num, denom, nil
 }

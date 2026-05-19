@@ -160,12 +160,26 @@ func TestKPIWriter_FrontendKeys_PopulatedWhenDataAvailable(t *testing.T) {
 	// reflecting "$ spent per successful merge" including the cost of
 	// failed work.
 	assertMetric(t, snap.Metrics, "cost_per_merged_pipeline_usd", 2.75)
-	// cost_per_merged_change_usd: today aliases per-pipeline
-	assertMetric(t, snap.Metrics, "cost_per_merged_change_usd", 2.75)
+	// cost_per_merged_change_usd: backlog-grouped attribution. Distinct
+	// merged backlogs = {BACK-PIPE-FAST, BACK-PIPE-SLOW} → 2.
+	// PIPE-ESC's backlog (BACK-PIPE-ESC) is NOT in the merged set, so
+	// its $0.50 is excluded. Numerator = $2 + $3 = $5; denom = 2;
+	// cost_per_merged_change = $2.50. Diverges from per-pipeline
+	// ($2.75) because escalated-only backlogs no longer pollute the
+	// per-change view.
+	assertMetric(t, snap.Metrics, "cost_per_merged_change_usd", 2.5)
 	// auto_merge_rate = 2 done / (2 done + 1 escalated) = 0.6666...
 	assertMetricCloseTo(t, snap.Metrics, "auto_merge_rate", 2.0/3.0, 1e-9)
-	// regression_rate = 1 escalated / 3 terminal = 0.3333...
-	assertMetricCloseTo(t, snap.Metrics, "regression_rate", 1.0/3.0, 1e-9)
+	// escalation_rate = 1 escalated / (2 done + 1 escalated) = 0.3333...
+	// Renamed from the old `regression_rate` proxy so the autonomous-
+	// pipeline-completion signal is preserved under its honest name.
+	assertMetricCloseTo(t, snap.Metrics, "escalation_rate", 1.0/3.0, 1e-9)
+	// regression_rate: label-driven. No backlog in this fixture has
+	// the regression-fix label so num = 0; denom = 2 merged backlogs.
+	// Metric is emitted as 0% (an intentional "0 regressions" signal)
+	// — the UI flags it as `(proxy)` until file-overlap detection
+	// lands.
+	assertMetric(t, snap.Metrics, "regression_rate", 0.0)
 	// council_roi = 2 merged / $1 council cost = 2.0
 	assertMetric(t, snap.Metrics, "council_roi", 2.0)
 	// slice_to_merge_p50_seconds: median of [60, 180] = 120
@@ -197,6 +211,7 @@ func TestKPIWriter_FrontendKeys_OmittedWhenInsufficientData(t *testing.T) {
 		"cost_per_merged_change_usd",
 		"cost_per_merged_pipeline_usd",
 		"auto_merge_rate",
+		"escalation_rate",
 		"regression_rate",
 		"council_roi",
 		"slice_to_merge_p50_seconds",
@@ -205,6 +220,177 @@ func TestKPIWriter_FrontendKeys_OmittedWhenInsufficientData(t *testing.T) {
 			t.Errorf("%s present with no data; want omitted to render '—'", key)
 		}
 	}
+}
+
+// TestKPIWriter_CostPerMergedChange_BacklogGroupedAttribution pins
+// the multi-attempt case where backlog-grouped attribution diverges
+// from the per-pipeline value. One backlog has an escalated attempt
+// followed by a successful merge; both attempts' cost must be
+// attributed to the single merged change, while the per-pipeline
+// metric divides by the count of merged pipeline_runs (which is just
+// the successful one). This is the load-bearing semantic difference
+// between cost_per_merged_change_usd and cost_per_merged_pipeline_usd.
+func TestKPIWriter_CostPerMergedChange_BacklogGroupedAttribution(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := env.now
+
+	// One backlog item with two attempts: first escalated ($4),
+	// retry merged ($2). Plus a second, single-attempt merged
+	// backlog ($1).
+	if err := env.store.Backlog.Put(ctx, &store.BacklogItem{
+		ID: "BACK-RETRY", Title: "retried", State: store.BacklogMerged,
+		Priority: store.P2, CreatedBy: "test",
+	}); err != nil {
+		t.Fatalf("seed backlog retry: %v", err)
+	}
+	if err := env.store.Backlog.Put(ctx, &store.BacklogItem{
+		ID: "BACK-SOLO", Title: "solo", State: store.BacklogMerged,
+		Priority: store.P2, CreatedBy: "test",
+	}); err != nil {
+		t.Fatalf("seed backlog solo: %v", err)
+	}
+	mustPut := func(id, backlog string, attempts int, st store.PipelineState, cost float64) {
+		t.Helper()
+		started := now.Add(-time.Hour)
+		end := started.Add(60 * time.Second)
+		if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: backlog, Template: "mills-default",
+			Attempts: attempts,
+			State:    st, StartedAt: started, EndedAt: &end, CostUSD: cost,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	mustPut("PIPE-RETRY-1", "BACK-RETRY", 0, store.PipelineEscalated, 4.0)
+	mustPut("PIPE-RETRY-2", "BACK-RETRY", 1, store.PipelineDone, 2.0)
+	mustPut("PIPE-SOLO", "BACK-SOLO", 0, store.PipelineDone, 1.0)
+
+	writer := NewKPIWriter(env.store, env.policy)
+	writer.Clock = func() time.Time { return now }
+	writer.Windows = []time.Duration{kpiWindow1d}
+	if err := writer.Record(ctx); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	snap, err := env.store.KPI.Latest(ctx, int(kpiWindow1d.Seconds()))
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+
+	// cost_per_merged_pipeline_usd = total window cost / merged runs
+	//   = ($4 + $2 + $1) / 2 = $3.50
+	// (BACK-RETRY's escalated $4 IS in window cost, both done runs
+	//  count toward mergedRuns denominator)
+	assertMetric(t, snap.Metrics, "cost_per_merged_pipeline_usd", 3.5)
+	// cost_per_merged_change_usd: distinct merged backlogs = 2
+	// (BACK-RETRY, BACK-SOLO). Pipeline runs whose backlog is in
+	// that set: all 3 runs (both BACK-RETRY attempts + BACK-SOLO).
+	// Numerator = $4 + $2 + $1 = $7. Denominator = 2.
+	//   = $3.50 in this fixture (matches per-pipeline because both
+	//   backlogs happen to be in the merged set and PIPE-ESC of the
+	//   other test isn't here)
+	// The key insight: if a third backlog had an escalated-only run,
+	// per-pipeline would pollute its denominator with that cost while
+	// per-change would correctly exclude it. See
+	// TestKPIWriter_CostPerMergedChange_ExcludesNonMergedBacklog
+	// below.
+	assertMetric(t, snap.Metrics, "cost_per_merged_change_usd", 3.5)
+}
+
+// TestKPIWriter_CostPerMergedChange_ExcludesNonMergedBacklog pins
+// the case where the two cost metrics diverge: an escalated-only
+// backlog (no merged attempt) inflates the per-pipeline burn rate
+// but should NOT contribute to per-change attribution.
+func TestKPIWriter_CostPerMergedChange_ExcludesNonMergedBacklog(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := env.now
+
+	put := func(id, backlog string, st store.PipelineState, cost float64) {
+		t.Helper()
+		if err := env.store.Backlog.Put(ctx, &store.BacklogItem{
+			ID: backlog, Title: backlog,
+			State:    store.BacklogMerged,
+			Priority: store.P2, CreatedBy: "test",
+		}); err != nil {
+			t.Fatalf("seed %s: %v", backlog, err)
+		}
+		started := now.Add(-time.Hour)
+		end := started.Add(60 * time.Second)
+		if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: backlog, Template: "mills-default",
+			State: st, StartedAt: started, EndedAt: &end, CostUSD: cost,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	put("PIPE-OK", "BACK-OK", store.PipelineDone, 1.0)
+	put("PIPE-STUCK", "BACK-STUCK", store.PipelineEscalated, 9.0)
+
+	writer := NewKPIWriter(env.store, env.policy)
+	writer.Clock = func() time.Time { return now }
+	writer.Windows = []time.Duration{kpiWindow1d}
+	if err := writer.Record(ctx); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	snap, err := env.store.KPI.Latest(ctx, int(kpiWindow1d.Seconds()))
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+
+	// cost_per_merged_pipeline = $10 total / 1 merged = $10.
+	assertMetric(t, snap.Metrics, "cost_per_merged_pipeline_usd", 10.0)
+	// cost_per_merged_change = $1 (only BACK-OK's run, since
+	// BACK-STUCK never merged) / 1 distinct merged backlog = $1.
+	// 10x cheaper than per-pipeline because stuck work isn't
+	// attributed to merged changes.
+	assertMetric(t, snap.Metrics, "cost_per_merged_change_usd", 1.0)
+}
+
+// TestKPIWriter_RegressionRate_LabelDriven pins the new label-based
+// regression rate: count distinct merged backlogs with the
+// regression-fix label, divide by total merged backlogs in window.
+func TestKPIWriter_RegressionRate_LabelDriven(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := env.now
+
+	put := func(id, backlog string, labels []string, cost float64) {
+		t.Helper()
+		if err := env.store.Backlog.Put(ctx, &store.BacklogItem{
+			ID: backlog, Title: backlog, Labels: labels,
+			State:    store.BacklogMerged,
+			Priority: store.P2, CreatedBy: "test",
+		}); err != nil {
+			t.Fatalf("seed %s: %v", backlog, err)
+		}
+		started := now.Add(-time.Hour)
+		end := started.Add(60 * time.Second)
+		if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: backlog, Template: "mills-default",
+			State: store.PipelineDone, StartedAt: started, EndedAt: &end,
+			CostUSD: cost,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	put("PIPE-FIX", "BACK-FIX", []string{"regression-fix"}, 1.0)
+	put("PIPE-FEAT-A", "BACK-FEAT-A", []string{"feature"}, 1.0)
+	put("PIPE-FEAT-B", "BACK-FEAT-B", nil, 1.0)
+
+	writer := NewKPIWriter(env.store, env.policy)
+	writer.Clock = func() time.Time { return now }
+	writer.Windows = []time.Duration{kpiWindow1d}
+	if err := writer.Record(ctx); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	snap, err := env.store.KPI.Latest(ctx, int(kpiWindow1d.Seconds()))
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+
+	// 1 of 3 merged backlogs carry the regression-fix label.
+	assertMetricCloseTo(t, snap.Metrics, "regression_rate", 1.0/3.0, 1e-9)
 }
 
 // TestKPIWriter_P50_OddCountReturnsExactMiddle pins the odd-n

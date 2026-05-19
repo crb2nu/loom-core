@@ -83,6 +83,7 @@
       trendColor: string;
       badge?: string;
       badgeVariant?: BadgeVariant;
+      proxy?: boolean;
     }> = [
       {
         label: 'Cost / merged',
@@ -114,6 +115,13 @@
         value: fmtPct(m.regression_rate),
         trend: millsStore.metricSeries('regression_rate'),
         trendColor: trendColor(millsStore.metricSeries('regression_rate'), 'lower-better'),
+        // Backend now derives this from the canonical regression-fix
+        // label on merged backlog items. The signal is honest only to
+        // the degree the label is being emitted; until file-overlap
+        // detection lands the metric stays flagged as a proxy so the
+        // operator interprets short-term moves (especially 0%)
+        // accordingly.
+        proxy: true,
         ...(badge(m.regression_rate, { target: 0.02, direction: 'lower-better', softMargin: 0.5 }) ?? {}),
       },
     ];
@@ -140,6 +148,7 @@
           trendColor={card.trendColor}
           badge={card.badge}
           badgeVariant={card.badgeVariant ?? 'muted'}
+          proxy={card.proxy ?? false}
           compact
           onclick={gotoMills}
         />
