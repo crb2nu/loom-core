@@ -395,6 +395,8 @@ gitlab.flexinfer.ai/libs/fi-mcp-kit v0.2.1-0.20260412164817-1a41094d2496 h1:piew
 gitlab.flexinfer.ai/libs/fi-mcp-kit v0.2.1-0.20260412164817-1a41094d2496/go.mod h1:7ffh/+hY0tkkUdAjeodVk5DlcwQNCrhNhLsS8nRKpo0=
 gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260317181133-7ff2221818cd h1:vkRd3JmpnmVn2JDhIRU0NSl59DYpfBdI82wO77DO0NU=
 gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260317181133-7ff2221818cd/go.mod h1:dtS8wFBeXIocUiBiQU4w6wXC1wUFvVhdMALl0WaMBXo=
+gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260520023524-aa57e61f11bd h1:D+SnQg2d2HZJp9zi1His3nvkUPPPUP4IMbNlcSsER+0=
+gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260520023524-aa57e61f11bd/go.mod h1:dtS8wFBeXIocUiBiQU4w6wXC1wUFvVhdMALl0WaMBXo=
 go.mongodb.org/mongo-driver v1.17.8 h1:BDP3+U3Y8K0vTrpqDJIRaXNhb/bKyoVeg6tIJsW5EhM=
 go.mongodb.org/mongo-driver v1.17.8/go.mod h1:LlOhpH5NUEfhxcAwG0UEkMqwYcc4JU18gtCdGudk/tQ=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
@@ -441,6 +443,8 @@ golang.org/x/crypto v0.50.0 h1:zO47/JPrL6vsNkINmLoo/PH1gcxpls50DNogFvB5ZGI=
 golang.org/x/crypto v0.50.0/go.mod h1:3muZ7vA7PBCE6xgPX7nkzzjiUq87kRItoJQM1Yo8S+Q=
 golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa h1:t2QcU6V556bFjYgu4L6C+6VrCPyJZ+eyRsABUPs1mz4=
 golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa/go.mod h1:BHOTPb3L19zxehTsLoJXVaTktb06DFgmdW6Wb9s8jqk=
+golang.org/x/image v0.25.0 h1:Y6uW6rH1y5y/LK1J8BPWZtr6yZ7hrsy6hFrXjgsc2fQ=
+golang.org/x/image v0.25.0/go.mod h1:tCAmOEGthTtkalusGp1g3xa2gke8J6c2N565dTyl9Rs=
 golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
 golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
 golang.org/x/mod v0.6.0-dev.0.20220419223038-86c51ed26bb4/go.mod h1:jJ57K6gSWd91VN4djpZkiMVwK6gcyfeH4XE8wZrZaV4=

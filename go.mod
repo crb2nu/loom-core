@@ -23,6 +23,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/kkdai/youtube/v2 v2.10.5
+	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/lib/pq v1.10.9
 	github.com/minio/minio-go/v7 v7.0.97
 	github.com/neo4j/neo4j-go-driver/v5 v5.28.4
@@ -34,9 +35,10 @@ require (
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	github.com/spf13/cobra v1.9.1
 	github.com/stretchr/testify v1.11.1
+	github.com/xuri/excelize/v2 v2.10.1
 	gitlab.flexinfer.ai/libs/fi-accel/go/fiaccel v0.0.0-20260318222621-ce3294e404e0
 	gitlab.flexinfer.ai/libs/fi-mcp-kit v0.2.1-0.20260412164817-1a41094d2496
-	gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260317181133-7ff2221818cd
+	gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260520023524-aa57e61f11bd
 	go.mongodb.org/mongo-driver v1.17.8
 	go.opentelemetry.io/otel v1.40.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.40.0
@@ -137,7 +139,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.11 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
-	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
@@ -183,7 +184,6 @@ require (
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/xuri/efp v0.0.1 // indirect
-	github.com/xuri/excelize/v2 v2.10.1 // indirect
 	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
