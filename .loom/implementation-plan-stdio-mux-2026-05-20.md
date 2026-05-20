@@ -4,10 +4,14 @@
 - **Companion**: [brainstorm-stdio-mux-2026-05-20.md](brainstorm-stdio-mux-2026-05-20.md),
   [product-spec-stdio-mux-2026-05-20.md](product-spec-stdio-mux-2026-05-20.md)
 - **Status**: S1 kill-test **PASSED 2026-05-20** (MR !458, merge commit
-  `10b92e9d`). S2 **PASSED 2026-05-20** (branch `feat/stdio-mux-s2`;
-  production package + race-clean tests, evidence below). S3 unblocked. Two
-  findings from S1 carried into S2.5 (optional). See "S1 kill-test outcome"
-  and "S2 production package outcome" below.
+  `10b92e9d`). S2 **PASSED 2026-05-20** (MR !459, merge `305c0553`;
+  production package + race-clean tests). S3 **PASSED 2026-05-20**
+  (branch `feat/stdio-mux-s3`; wired into local-stdio dial path behind
+  `LOOM_MUX_STDIO=1` feature flag, callLock skipped for local when on,
+  parallelism regression tests green, evidence below). S2.5 (optional)
+  still gated on operator decision after S3 soak. See "S1 kill-test
+  outcome", "S2 production package outcome", and "S3 wire-up outcome"
+  below.
 - **Cycle**: 2026-05-20 → ~2026-05-27 (5 working days est.)
 
 ## Execution order
@@ -20,7 +24,7 @@ S2   pkg/transport/muxstdio package (unit + race)       (1 day)
 S2.5 (optional, additive) Enable handler-side parallel  (0.25 day)
      dispatch via SetConcurrencyLimit on each server
 S3   Wire mux into pool for local stdio + drop callLock (1 day)
-     → ship; soak 24h on operator machine
+     → ship; soak 24h on operator machine                  [PASSED 2026-05-20]
 S4   (optional) Upstream the shape into libs/mcp-go     (1.5 days, separate repo)
      → only if S2/S3 shape proves stable
 ```
@@ -257,6 +261,61 @@ package merged, kill-test variant with a parallel-friendly handler shows
 ~Nx speedup.
 
 **MR title**: `feat(mcp): enable handler-side parallel dispatch (LOOM_MCP_CONCURRENCY)`
+
+---
+
+## S3 wire-up outcome (2026-05-20)
+
+- All targeted tests green: `go test ./internal/daemon/ ./internal/pool/
+  ./pkg/transport/muxstdio/ -race` passes; new parallelism tests confirm
+  10 concurrent local-stdio callers × 100 ms latency complete in ~100 ms
+  (vs. ~1 s serialized) and 50 callers × 50 ms in ~50 ms.
+- `go vet ./...` clean. `golangci-lint run ./internal/... ./pkg/transport/...`
+  reports `0 issues`.
+- Default-off: env flag `LOOM_MUX_STDIO=1` (or `true`) enables the
+  wrapper. With the flag unset (current production posture) the dial
+  path and callLock behavior are byte-identical to pre-S3 main.
+- Design deviations from the plan's original sketch:
+  - **muxCache lives in `internal/daemon/`, not in kitprocess.Manager**
+    — the Manager is delegated to fi-mcp-kit (libs/fi-mcp-kit/pkg/process)
+    and modifying its API would require a separate upstream MR. Keeping
+    the cache in loom-core keeps S3 self-contained.
+  - **`perConnTransport` wrapper added** — `muxstdio.Transport.Recv` is
+    id-aware (`Recv(ctx, id)`), but `mcp.Transport` and the pipeline
+    are not. Each pool.Conn holds its own `perConnTransport` that
+    remembers the most recent `Send(msg)` id and replays it to
+    `mux.Recv`. The wrapper's `Close` is a no-op so kitpool's
+    unhealthy-Put / idle-overflow close path (verified to call
+    `Transport.Close()` at libs/fi-mcp-kit/pkg/pool/pool.go:195,205)
+    does not tear down the shared demuxer for other in-flight callers.
+    Mux lifecycle is owned by `muxCache.Evict` (called from
+    `d.stopServerProc`) and `muxCache.CloseAll` (from shutdown).
+  - **Centralized stop helper `d.stopServerProc(name)`** — every site
+    that previously called `procMgr.Stop(name)` now goes through this
+    helper so the mux is evicted (and pending Recv waiters drained
+    with `ErrClosed`) before the process is torn down. 8 call sites
+    updated (daemon_lifecycle, callpipeline_errors, callpipeline_routing,
+    daemon_loops, daemon_dispatch_ops, daemon_new, reload_runtime,
+    health). `d.stopAllServerProcs()` mirrors this for the shutdown
+    `StopAll` path.
+- Pre-existing test flake unrelated to S3: `TestHandleEventsPublish_*`
+  fail with `status 403 forbidden` when run under `-count=3` (env-var
+  leak from another test setting `LOOM_HUD_ADMIN_TOKEN`). Reproduces
+  on main without the S3 changes; tracked as out-of-scope.
+
+### S3 next step — soak
+
+Per R3 in the risk register: deploy with `LOOM_MUX_STDIO=1` on the
+operator daemon for ≥24 h with heartbeat-heavy callers active
+(`agent_context_*`, presence, stream monitors). Watch
+`~/.config/loom/logs/daemon.err` for any `acquire call lock for ... after
+15s` lines (should be **zero**) and for any `muxstdio: dropped response`
+warnings (should also be zero on a healthy server).
+
+If the soak window is clean, flip the default in a follow-up MR so
+`LOOM_MUX_STDIO` defaults on. If a regression appears, set
+`LOOM_MUX_STDIO=0` (or unset) and the daemon reverts to the lock-based
+path with no other changes needed.
 
 ---
 

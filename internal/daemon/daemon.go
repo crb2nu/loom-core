@@ -149,6 +149,14 @@ type Daemon struct {
 	// nil when MaxConcurrentCalls is 0 (unlimited).
 	callSem chan struct{}
 
+	// muxStdio enables the per-id muxing wrapper around local stdio transports.
+	// When true, every pool.Conn for a serverName shares one muxstdio.Transport
+	// (cached in muxCache) and the per-server callLock is skipped for TargetLocal
+	// because the wire-level demuxer makes concurrent Send+Recv on a shared
+	// stdio pipe safe. Toggled by LOOM_MUX_STDIO=1; default off pending soak.
+	muxStdio bool
+	muxCache *muxCache
+
 	// activeRPCs tracks in-flight RPC call count for drain-readiness checks.
 	activeRPCs atomic.Int64
 

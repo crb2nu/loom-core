@@ -124,7 +124,7 @@ func (d *Daemon) Reload(ctx context.Context) error {
 		for name := range oldServers {
 			if !newServers[name] {
 				d.logger.Info("stopping removed server", "server", name)
-				d.procMgr.Stop(name)
+				_ = d.stopServerProc(name)
 				d.runningServers.Delete(name)
 				d.manifest.RemoveServer(name)
 				if d.eventBus != nil {

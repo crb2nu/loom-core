@@ -324,9 +324,7 @@ func (d *Daemon) Stop() (err error) {
 				})
 			}
 		}
-		if d.procMgr != nil {
-			d.procMgr.StopAll()
-		}
+		d.stopAllServerProcs()
 
 		// Stop file watcher
 		if d.watcher != nil {

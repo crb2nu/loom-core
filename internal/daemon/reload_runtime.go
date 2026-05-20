@@ -29,7 +29,7 @@ func (d *Daemon) invalidateServersForReload(oldReg, newReg *registry.Registry) [
 		if d.pool != nil {
 			d.pool.ClearServer(name)
 		}
-		if err := d.procMgr.Stop(name); err != nil && d.logger != nil {
+		if err := d.stopServerProc(name); err != nil && d.logger != nil {
 			d.logger.Warn("failed to stop server during reload", "server", name, "error", err)
 		}
 		d.runningServers.Delete(name)

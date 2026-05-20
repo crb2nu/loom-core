@@ -68,7 +68,7 @@ func (d *Daemon) reapIdleServers(idleTimeout time.Duration) []string {
 		}
 
 		if stillIdle {
-			if err := d.procMgr.Stop(info.Name); err != nil {
+			if err := d.stopServerProc(info.Name); err != nil {
 				d.logger.Warn("failed to reap idle server", "server", info.Name, "error", err)
 			} else {
 				reaped = append(reaped, info.Name)

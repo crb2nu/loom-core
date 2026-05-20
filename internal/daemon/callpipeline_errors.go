@@ -40,7 +40,7 @@ func (p *callPipeline) transportFailure(stage string, err error, start time.Time
 		)
 
 		p.daemon.pool.ClearServer(p.serverName)
-		_ = p.daemon.procMgr.Stop(p.serverName)
+		_ = p.daemon.stopServerProc(p.serverName)
 		p.daemon.runningServers.Delete(p.serverName)
 		if p.daemon.eventBus != nil {
 			reason := "transport_recv_error"
