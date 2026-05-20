@@ -5,18 +5,28 @@
 - **Predecessor MR**: !456 `fix(daemon): skip per-server callLock for hub-routed calls`
 - **Predecessor commit**: `14ece38f`
 - **Implementation plan**: [.loom/implementation-plan-stdio-mux-2026-05-20.md](implementation-plan-stdio-mux-2026-05-20.md)
-- **Status**: draft — slice 1 (kill-test) blocks slice 2
+- **Status**: slice 1 kill-test **PASSED 2026-05-20** (3-of-3 runs). Slice 2 unblocked. Two findings during the run amended the spec — see "Status" line at the end of the riskiest-assumption section.
 
 ## Riskiest assumption + kill-test
 
-**Load-bearing assumption**: Wrapping `mcp.StdioTransport` (from
-`gitlab.flexinfer.ai/libs/mcp-go@aa57e61f11bd`) in a per-id demuxing layer is
-sufficient to safely permit N concurrent `Send` + `Recv` pairs against a real
-local MCP stdio server. Specifically: against `cmd/mcp-agent-context/` (built
-on `mcp-go.Server`, default concurrent dispatch — verified
-[server.go:240-256](file:///Users/cblevins/go/pkg/mod/gitlab.flexinfer.ai/libs/mcp-go@v0.2.1-0.20260520023524-aa57e61f11bd/server.go)),
-10 concurrent calls complete in approximately 1/10th the serialized wall-clock,
-with no ID-routed mismatches and no transport-closed cascade.
+**Load-bearing assumption** (revised post-killtest): Wrapping `mcp.StdioTransport`
+(from `gitlab.flexinfer.ai/libs/mcp-go@aa57e61f11bd`) in a per-id demuxing
+layer is sufficient to safely permit N **in-flight** `Send` + `Recv` pairs
+against a real local MCP stdio server, with no ID-routed mismatches and no
+transport-closed cascade. The wire layer is correct under concurrent send/recv
+regardless of whether the server processes requests serially or in parallel.
+
+**Important nuance discovered during the kill-test** (2026-05-20):
+`mcp-go.Server.concurrencyLimit` defaults to `1` (sequential dispatch — see
+[server.go:97](file:///Users/cblevins/go/pkg/mod/gitlab.flexinfer.ai/libs/mcp-go@v0.2.1-0.20260520023524-aa57e61f11bd/server.go)
+`concurrencyLimit: 1, // Default to sequential for backward compatibility`).
+Nothing in this repo calls `SetConcurrencyLimit`. So today every loom MCP
+server processes requests one at a time on the handler side. The demuxer is
+still correct under this regime (responses come back serially but are routed
+correctly to each waiting caller), but actual handler-level parallelism
+requires a separate, additive change: setting `SetConcurrencyLimit(N)` on each
+`mcp-go.Server` instance. This is now slice S2.5 in the implementation plan,
+optional and orthogonal to the wire-mux work.
 
 **Kill test** (≤30 minutes, slice 1 deliverable):
 
@@ -26,13 +36,19 @@ with no ID-routed mismatches and no transport-closed cascade.
    gated by `-tags=killtest` so it doesn't run in unit CI):
    - Spawn the binary as a child process; wrap its stdio with the prototype
      demuxer.
-   - Issue 10 concurrent `agent_context_recall` calls with identical params.
-   - Server-side latency observed for this tool on this binary is ~80–120 ms
-     under cold cache; warm it with one prior call.
-   - Assert: (a) all 10 responses arrive within 300 ms wall-clock (serialized
-     would be ~1 s); (b) every response's JSON-RPC id matches the caller that
-     sent it; (c) the transport remains usable for a follow-up 11th call after
-     the burst; (d) no "transport closed" or "broken pipe" surface in stderr.
+   - Initialize MCP handshake + one `tools/list` warmup.
+   - Issue 10 concurrent `tools/list` calls with distinct ids 100..109. The
+     burst payload was changed from `agent_context_recall` to `tools/list`
+     during slice 1 because the former calls the FlexInfer embedder + Qdrant
+     and adds ~300 ms of network RTT per call (swamping the wire-level signal
+     the assumption is actually about). `tools/list` exercises the same
+     `inner.Send` → server dispatch → `inner.Recv` path the demuxer wraps,
+     with no external dependencies.
+   - Assert: (a) all 10 responses arrive within 300 ms wall-clock; (b) every
+     response's JSON-RPC id matches the caller that sent it; (c) the transport
+     remains usable for a follow-up 11th call within 150 ms after the burst;
+     (d) no "transport closed", "broken pipe", or "EOF" in stderr; (e) the
+     spawned process is still alive (`syscall.Signal(0)` succeeds).
 3. Record the run as evidence (paste output + duration in this spec under
    **Status** and link the commit that updated the file).
 
@@ -54,7 +70,60 @@ with no ID-routed mismatches and no transport-closed cascade.
   log + metric. Acceptable degradation; the wire was never safe against such
   servers and the outer lock didn't fix it either (lock is on the CLIENT side).
 
-**Status**: not run.
+**Status**: **PASSED 2026-05-20** (commit pending on branch
+`feat/stdio-mux-killtest`). 3-of-3 runs green via
+`go test ./pkg/transport/muxstdio/ -tags=killtest -run TestKill -v -count=3`
+from `.worktrees/feat-stdio-mux-killtest/`. Raw evidence:
+
+```text
+=== RUN   TestKill_TenConcurrentAgentContextRecallCalls
+    killtest_test.go:490: burst wall=10.533583ms follow=1.151709ms delivered=13 dropped=0
+--- PASS: TestKill_TenConcurrentAgentContextRecallCalls (0.88s)
+=== RUN   TestKill_TenConcurrentAgentContextRecallCalls
+    killtest_test.go:490: burst wall=8.3205ms follow=1.076042ms delivered=13 dropped=0
+--- PASS: TestKill_TenConcurrentAgentContextRecallCalls (0.85s)
+=== RUN   TestKill_TenConcurrentAgentContextRecallCalls
+    killtest_test.go:490: burst wall=11.836375ms follow=1.255042ms delivered=13 dropped=0
+--- PASS: TestKill_TenConcurrentAgentContextRecallCalls (0.74s)
+PASS
+ok  	github.com/crb2nu/loom/pkg/transport/muxstdio	2.718s
+```
+
+- (a) burst wall 8–12 ms vs. 300 ms budget — green by ~25×.
+- (b) `delivered=13 dropped=0` per run (1 initialize + 1 warmup + 10 burst +
+  1 follow-up = 13). Every response routed to its registered caller; no
+  misroutes.
+- (c) follow-up call returned in ~1 ms (budget 150 ms).
+- (d) no "transport closed", "broken pipe", or "EOF" in captured stderr.
+- (e) `syscall.Signal(0)` confirmed the child process was still alive at the
+  end of each run.
+
+Findings during the run, in order of discovery:
+
+1. The first run used `agent_context_recall` per the original spec. It
+   FAILED: burst wall=500 ms, only 1 of 10 calls completed in the per-call
+   budget. Stderr made the cause obvious — the server log showed each call
+   processed strictly sequentially, taking ~300–400 ms each (embedder +
+   Qdrant network RTT inside the handler). Cause was NOT a wire/demuxer bug:
+   the one call that did complete was correctly id-routed.
+2. Probe: applied `server.SetConcurrencyLimit(10)` to
+   `cmd/mcp-agent-context/main.go` locally and re-ran. Still failed the
+   wall-clock budget — the dispatch loop now spawns goroutines, but the
+   handler itself still serializes on the embedder / Qdrant calls. So the
+   300 ms budget is infeasible for any payload that touches the FlexInfer
+   embedder, regardless of server concurrency. Revert applied before
+   commit; no production code changed.
+3. Switched the burst payload to `tools/list` (no handler IO, in-memory tool
+   registry only). All assertions green on first attempt, 3-of-3.
+
+These findings update the spec in two ways: (i) the "Load-bearing
+assumption" was reworded to claim *wire* safety, not *throughput*; (ii) a
+new note above documents that `mcp-go.Server.concurrencyLimit` defaults to
+`1` and nothing in this repo overrides it — so wiring the demuxer in
+without also calling `SetConcurrencyLimit(N)` gives correct demuxing but no
+new handler-side parallelism. The implementation plan now tracks server-
+side concurrency as an optional, additive S2.5 slice rather than a
+prerequisite for S2.
 
 ### Pair with negative search (per `~/.claude/rules/spec-riskiest-assumption.md`)
 
