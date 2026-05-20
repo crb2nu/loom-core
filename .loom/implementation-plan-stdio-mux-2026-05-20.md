@@ -3,25 +3,47 @@
 - **Date**: 2026-05-20
 - **Companion**: [brainstorm-stdio-mux-2026-05-20.md](brainstorm-stdio-mux-2026-05-20.md),
   [product-spec-stdio-mux-2026-05-20.md](product-spec-stdio-mux-2026-05-20.md)
-- **Status**: proposed — slice 1 (kill-test) is the gating slice. No code lands beyond the
-  prototype harness until slice 1's pass criteria are met.
-- **Cycle**: 2026-05-20 → ~2026-05-27 (5 working days est., gated on the operator-side
-  kill-test outcome)
+- **Status**: S1 kill-test **PASSED 2026-05-20** (commit pending on
+  `feat/stdio-mux-killtest`; evidence pasted into the product spec's Status
+  line). S2 unblocked. Two findings during the run updated the plan: see
+  "S1 kill-test outcome" below and the new S2.5 slice.
+- **Cycle**: 2026-05-20 → ~2026-05-27 (5 working days est.)
 
 ## Execution order
 
 ```
-S1  Kill-test harness against real mcp-agent-context   (≤30 min target, ≤0.5 day)
-    → GATE: pass criteria met before any other code
-S2  pkg/transport/muxstdio package (unit + race)        (1 day)
-S3  Wire mux into pool for local stdio + drop callLock  (1 day)
-    → ship; soak 24h on operator machine
-S4  (optional) Upstream the shape into libs/mcp-go      (1.5 days, separate repo)
-    → only if S2/S3 shape proves stable
+S1   Kill-test harness against real mcp-agent-context  (≤30 min target, ≤0.5 day)
+     → GATE: pass criteria met before any other code   [PASSED 2026-05-20]
+S2   pkg/transport/muxstdio package (unit + race)       (1 day)
+S2.5 (optional, additive) Enable handler-side parallel  (0.25 day)
+     dispatch via SetConcurrencyLimit on each server
+S3   Wire mux into pool for local stdio + drop callLock (1 day)
+     → ship; soak 24h on operator machine
+S4   (optional) Upstream the shape into libs/mcp-go     (1.5 days, separate repo)
+     → only if S2/S3 shape proves stable
 ```
 
-Each slice ends with a green local test run + an MR (or, for S1, an in-tree
-prototype + recorded evidence — no MR for the throwaway harness).
+Each slice ends with a green local test run + an MR. S1 ships an in-tree
+prototype harness (build-tag gated) as evidence rather than a throwaway —
+the test is cheap to keep around and serves as a regression guard for the
+demuxer shape in S2.
+
+## S1 kill-test outcome (2026-05-20)
+
+- 3-of-3 runs green. Burst wall 8–12 ms vs. 300 ms budget. Per-id routing
+  verified: `delivered=13 dropped=0` per run (1 init + 1 warmup + 10 burst +
+  1 follow-up). No transport-level errors in captured stderr.
+- Original burst payload (`agent_context_recall`) was infeasible because
+  each call costs ~300–400 ms (embedder + Qdrant RTT inside the handler).
+  Switched the burst to `tools/list`, which exercises the same wire +
+  dispatch path with no external IO. See the spec's Status section for the
+  detailed narrative.
+- `mcp-go.Server.concurrencyLimit` defaults to `1` (server.go:97
+  `// Default to sequential for backward compatibility`). Nothing in this
+  repo calls `SetConcurrencyLimit`. The demuxer is correct under this
+  default (responses route correctly even when the server processes them
+  serially), but actual handler-side parallelism needs an additive change —
+  S2.5 below.
 
 ## Slice 1 — Kill-test (gating, no production code)
 
@@ -153,6 +175,56 @@ nothing in the daemon uses it yet.
   amended to match shipped surface if a small deviation was needed).
 
 **MR title**: `feat(transport/muxstdio): per-id demuxing wrapper for shared stdio`
+
+---
+
+## Slice 2.5 — Server-side concurrency (optional, additive)
+
+**Pre-condition**: Slice 2 merged.
+
+**Goal**: enable handler-side parallel dispatch on every loom-owned MCP
+server so the wire-level demuxer from S2 actually translates into reduced
+end-to-end latency for callers under load.
+
+**Why this is its own slice**: discovered during S1's kill-test that
+`mcp-go.Server.concurrencyLimit` defaults to `1`. The demuxer is correct
+without this change (it just demuxes responses arriving serially from a
+sequential server), so S3 can ship without S2.5 if needed. But callers
+that pipeline requests through the demuxer see no throughput improvement
+unless the server is also processing concurrently.
+
+**Files to change**
+
+- Each `cmd/mcp-*` entry-point that constructs an `mcp.NewServer(...)`
+  (grep `mcp.NewServer\|NewServer(` to enumerate). Add:
+  ```go
+  server.SetConcurrencyLimit(loomconcurrency.Default()) // honors LOOM_MCP_CONCURRENCY env, default 8
+  ```
+- New helper `internal/loomconcurrency/limit.go` reading `LOOM_MCP_CONCURRENCY`
+  (default `8`, validated `1..256`, `1` keeps backward-compat sequential
+  mode). Keeps the per-binary change to one line.
+
+**Risks**
+
+- Handlers that share mutable state without internal locking will race. Audit
+  before merging. Most loom handlers are read-mostly or use `sync.Map` /
+  per-key locks already; verify per binary.
+- Bumping concurrency to N=8 means each server can run up to 8 goroutines
+  per stdio process. Memory/file-descriptor budgets should be sanity
+  checked; defaults look comfortable but make this explicit in the MR.
+
+**Validation**
+
+- Re-run the slice-1 kill-test with payload swapped back to a real handler
+  call that doesn't depend on the FlexInfer embedder (pick one that's
+  cheap and IO-free) — burst wall should drop ~Nx with N=8.
+- Existing per-binary unit tests still pass.
+
+**Done when**: every loom MCP server entrypoint sets concurrency, helper
+package merged, kill-test variant with a parallel-friendly handler shows
+~Nx speedup.
+
+**MR title**: `feat(mcp): enable handler-side parallel dispatch (LOOM_MCP_CONCURRENCY)`
 
 ---
 
