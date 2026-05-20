@@ -153,7 +153,8 @@ type Daemon struct {
 	// When true, every pool.Conn for a serverName shares one muxstdio.Transport
 	// (cached in muxCache) and the per-server callLock is skipped for TargetLocal
 	// because the wire-level demuxer makes concurrent Send+Recv on a shared
-	// stdio pipe safe. Toggled by LOOM_MUX_STDIO=1; default off pending soak.
+	// stdio pipe safe. Default on; set LOOM_MUX_STDIO=0 to opt out and fall back
+	// to the pre-S3 callLock path.
 	muxStdio bool
 	muxCache *muxCache
 
