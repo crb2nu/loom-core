@@ -71,9 +71,7 @@ func (p *callPipeline) retryLocalAfterLocalSendFailure(err error, req *mcp.Messa
 		"server", p.serverName, "tool", p.toolName, "error", err)
 
 	p.daemon.pool.ClearServer(p.serverName)
-	if p.daemon.procMgr != nil {
-		_ = p.daemon.procMgr.Stop(p.serverName)
-	}
+	_ = p.daemon.stopServerProc(p.serverName)
 	p.daemon.runningServers.Delete(p.serverName)
 	if p.daemon.eventBus != nil {
 		p.daemon.eventBus.Publish(EventProcessStop, map[string]any{
@@ -132,9 +130,7 @@ func (p *callPipeline) resetLocalServer(reason string) {
 	if p.daemon.pool != nil {
 		p.daemon.pool.ClearServer(p.serverName)
 	}
-	if p.daemon.procMgr != nil {
-		_ = p.daemon.procMgr.Stop(p.serverName)
-	}
+	_ = p.daemon.stopServerProc(p.serverName)
 	p.daemon.runningServers.Delete(p.serverName)
 	if p.daemon.eventBus != nil {
 		p.daemon.eventBus.Publish(EventProcessStop, map[string]any{
@@ -165,32 +161,44 @@ func (p *callPipeline) connectTarget(target router.Target, reason string) error 
 	// mu/readMu — so two callers on two Conns are independent and the lock
 	// only adds queueing under heartbeat storms.
 	//
-	// Skip the lock entirely for TargetHub. For TargetLocal, acquire briefly
-	// here just to mark process activity (under lock so reapIdleServers'
-	// TryLock signal is meaningful), then drop it before pool.Get and
-	// re-acquire below for the send/recv phase.
+	// When LOOM_MUX_STDIO is enabled the local-stdio dial path wraps every
+	// shared *StdioTransport in pkg/transport/muxstdio, which routes
+	// responses by JSON-RPC id. Two concurrent Send+Recv pairs on the same
+	// pipe cannot misroute, so the callLock becomes pure queueing overhead.
+	// Skip it in that mode and rely on the demuxer instead.
+	//
+	// Skip the lock entirely for TargetHub. For TargetLocal without the mux,
+	// acquire briefly here just to mark process activity (under lock so
+	// reapIdleServers' TryLock signal is meaningful), then drop it before
+	// pool.Get and re-acquire below for the send/recv phase.
 	var err error
 	if target == router.TargetLocal {
-		var lockWait time.Duration
-		p.callMu, lockWait, err = p.daemon.acquireCallLock(p.ctx, p.serverName)
-		if err != nil {
-			p.daemon.router.RecordFailure(p.serverName, p.target, err)
-			p.daemon.metrics.RecordServerFailure(p.serverName, p.targetStr, "call_lock")
-			return err
-		}
-		p.lockHeld = true
-		if lockWait > 100*time.Millisecond {
-			p.daemon.metrics.CallLockWaitTotal.WithLabelValues(p.serverName).Inc()
-			p.daemon.logger.Debug("call lock contention", "server", p.serverName, "wait_ms", lockWait.Milliseconds())
-		}
+		if p.daemon.muxStdio {
+			if p.daemon.procMgr != nil {
+				p.daemon.procMgr.MarkActivity(p.serverName)
+			}
+		} else {
+			var lockWait time.Duration
+			p.callMu, lockWait, err = p.daemon.acquireCallLock(p.ctx, p.serverName)
+			if err != nil {
+				p.daemon.router.RecordFailure(p.serverName, p.target, err)
+				p.daemon.metrics.RecordServerFailure(p.serverName, p.targetStr, "call_lock")
+				return err
+			}
+			p.lockHeld = true
+			if lockWait > 100*time.Millisecond {
+				p.daemon.metrics.CallLockWaitTotal.WithLabelValues(p.serverName).Inc()
+				p.daemon.logger.Debug("call lock contention", "server", p.serverName, "wait_ms", lockWait.Milliseconds())
+			}
 
-		if p.daemon.procMgr != nil {
-			p.daemon.procMgr.MarkActivity(p.serverName)
-		}
+			if p.daemon.procMgr != nil {
+				p.daemon.procMgr.MarkActivity(p.serverName)
+			}
 
-		// Release before the potentially-blocking pool.Get().
-		p.callMu.Unlock()
-		p.lockHeld = false
+			// Release before the potentially-blocking pool.Get().
+			p.callMu.Unlock()
+			p.lockHeld = false
+		}
 	}
 
 	switch target {
@@ -226,30 +234,29 @@ func (p *callPipeline) connectTarget(target router.Target, reason string) error 
 		return err
 	}
 
-	// Re-acquire the lock for the RPC send phase — TargetLocal only.
+	// Re-acquire the lock for the RPC send phase — TargetLocal only, and
+	// only when the per-id stdio mux is OFF.
 	//
-	// Why this is required for stdio: kitprocess.Manager.Dial returns the
-	// SAME *Process — and therefore the same *StdioTransport (one
-	// stdin/stdout pipe, one readLoop pushing to one msgCh) — for every
+	// Why this is required for stdio without the mux: kitprocess.Manager.Dial
+	// returns the SAME *Process — and therefore the same *StdioTransport
+	// (one stdin/stdout pipe, one readLoop pushing to one msgCh) — for every
 	// pool entry sharing a serverName. Pool maxOpen=25 means 25 logical
-	// handles to ONE stdio pipe, not 25 processes. Concurrent Send+Recv
-	// pairs on the shared transport interleave: goroutine A can Recv()
-	// goroutine B's response. The pipeline catches the ID mismatch and
-	// treats it as transport corruption, triggering procMgr.Stop and a
-	// cascade of "transport closed" errors for every other in-flight call.
+	// handles to ONE stdio pipe, not 25 processes. Concurrent Send+Recv pairs
+	// on the shared transport interleave: goroutine A can Recv() goroutine
+	// B's response. The pipeline catches the ID mismatch and treats it as
+	// transport corruption, triggering procMgr.Stop and a cascade of
+	// "transport closed" errors for every other in-flight call.
 	//
 	// Why it is NOT required for hub: post-mcp-go!3 (commit aa57e61),
 	// WebSocketClient.Dial builds a fresh *WebSocketTransport with its own
 	// underlying websocket.Conn for every pool dial. Each pool Conn is
-	// therefore an independent transport, so concurrent Send+Recv on
-	// different Conns cannot interleave.
+	// therefore an independent transport.
 	//
-	// A 2026-05-12 attempt to remove this lock entirely (commit a6bb44e2)
-	// was reverted because its unit test gave each fake Conn a fresh
-	// Transport in the DialFunc — modelling hub correctly but stdio
-	// incorrectly. The fix here keeps the lock for stdio (correct) and
-	// drops it for hub (now safe with per-call fresh websocket transports).
-	if target == router.TargetLocal {
+	// Why it is NOT required when LOOM_MUX_STDIO is on: the stdio dial path
+	// wraps the shared transport in pkg/transport/muxstdio, which routes
+	// each response back to the goroutine that owns the request id. Two
+	// concurrent Send+Recv pairs cannot misroute.
+	if target == router.TargetLocal && !p.daemon.muxStdio {
 		p.callMu, _, err = p.daemon.acquireCallLock(p.ctx, p.serverName)
 		if err != nil {
 			// Connection acquired but can't get lock — return it to the pool.

@@ -368,7 +368,7 @@ func (h *HealthMonitor) handleRestart(serverName string, status *ServerHealthSta
 	)
 
 	// Perform restart via process manager
-	if err := h.daemon.procMgr.Stop(serverName); err != nil {
+	if err := h.daemon.stopServerProc(serverName); err != nil {
 		h.logger.Warn("failed to stop server during restart", "server", serverName, "error", err)
 		span.RecordError(err)
 		span.AddEvent("daemon.server.restart.stop_failed",

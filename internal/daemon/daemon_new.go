@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
@@ -131,6 +132,19 @@ func New(cfg Config) (*Daemon, error) {
 	// follow reloaded daemon state.
 	var d *Daemon
 
+	// LOOM_MUX_STDIO=1 opts the local-stdio pool into the per-id muxing
+	// wrapper (pkg/transport/muxstdio). When enabled, the per-server callLock
+	// is also skipped for TargetLocal — see callpipeline_routing.go and
+	// .loom/implementation-plan-stdio-mux-2026-05-20.md slice 3. Default off
+	// pending the soak window described in the plan's risk register (R3).
+	muxStdioEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("LOOM_MUX_STDIO")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("LOOM_MUX_STDIO")), "true")
+	var stdioMuxCache *muxCache
+	if muxStdioEnabled {
+		stdioMuxCache = newMuxCache(logger)
+		logger.Info("local stdio per-id muxing enabled (LOOM_MUX_STDIO)")
+	}
+
 	// Create process manager with variable expansion (using the daemon's current
 	// registry so reloads immediately affect env/template expansion).
 	procMgr := process.NewManager(reg, cfg.Target)
@@ -173,7 +187,7 @@ func New(cfg Config) (*Daemon, error) {
 				defer cancel()
 				if err := initializeMCPTransport(initCtx, transport); err != nil {
 					d.runningServers.Delete(serverName)
-					_ = procMgr.Stop(serverName)
+					_ = d.stopServerProc(serverName)
 					span.RecordError(err)
 					span.SetStatus(codes.Error, err.Error())
 					return nil, fmt.Errorf("initialize transport: %w", err)
@@ -185,6 +199,17 @@ func New(cfg Config) (*Daemon, error) {
 				}
 			}
 			span.SetAttributes(attribute.Bool("server.started", !wasRunning))
+
+			// If LOOM_MUX_STDIO is enabled, every pool.Conn for serverName
+			// shares one cached *muxstdio.Transport (initialized on first
+			// dial, after the MCP handshake completed on the raw stdio
+			// transport). Each Conn gets its own perConnTransport wrapper
+			// so kitpool's idle-overflow / unhealthy-Put close path does
+			// not tear down the demuxer for in-flight callers.
+			if d != nil && d.muxStdio && d.muxCache != nil {
+				mux := d.muxCache.GetOrCreate(serverName, transport)
+				return newPerConnTransport(mux), nil
+			}
 			return transport, nil
 		},
 	})
@@ -316,6 +341,8 @@ func New(cfg Config) (*Daemon, error) {
 		tracer:             runtimeTracer,
 		otelShutdown:       otelShutdown,
 		otelRuntimeState:   otelRuntimeState,
+		muxStdio:           muxStdioEnabled,
+		muxCache:           stdioMuxCache,
 	}
 
 	// Initialize daemon-wide call concurrency semaphore
