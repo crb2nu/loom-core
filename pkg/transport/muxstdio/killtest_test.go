@@ -19,12 +19,10 @@ package muxstdio
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -53,35 +51,9 @@ func requireBin(t *testing.T) {
 	}
 }
 
-// idKey normalizes a JSON-RPC id (any) to a canonical string for map lookup.
-// JSON unmarshal of `ID any` yields float64 for numbers, so a request sent
-// with int64(42) comes back as float64(42) — both must hash to "42".
-func idKey(id any) string {
-	if id == nil {
-		return ""
-	}
-	switch v := id.(type) {
-	case string:
-		return "s:" + v
-	case float64:
-		// Whole-number floats hash to the same key as their int form.
-		if v == float64(int64(v)) {
-			return "n:" + strconv.FormatInt(int64(v), 10)
-		}
-		return "n:" + strconv.FormatFloat(v, 'f', -1, 64)
-	case int:
-		return "n:" + strconv.Itoa(v)
-	case int64:
-		return "n:" + strconv.FormatInt(v, 10)
-	case json.Number:
-		if i, err := v.Int64(); err == nil {
-			return "n:" + strconv.FormatInt(i, 10)
-		}
-		return "n:" + v.String()
-	default:
-		return fmt.Sprintf("o:%v", v)
-	}
-}
+// idKey is the canonical id normalization helper from transport.go (production
+// code). The kill-test reuses it so the prototype below exercises the same
+// JSON-number-vs-int routing semantics that production callers see.
 
 // demux is the prototype id-routing wrapper for the kill test. Production
 // code lives in slice 2 and is intentionally not derived from this struct.

@@ -5,7 +5,11 @@
 - **Predecessor MR**: !456 `fix(daemon): skip per-server callLock for hub-routed calls`
 - **Predecessor commit**: `14ece38f`
 - **Implementation plan**: [.loom/implementation-plan-stdio-mux-2026-05-20.md](implementation-plan-stdio-mux-2026-05-20.md)
-- **Status**: slice 1 kill-test **PASSED 2026-05-20** (3-of-3 runs). Slice 2 unblocked. Two findings during the run amended the spec — see "Status" line at the end of the riskiest-assumption section.
+- **Status**: slice 1 kill-test **PASSED 2026-05-20** (MR !458, merge commit
+  `10b92e9d`). Slice 2 **PASSED 2026-05-20** (`feat/stdio-mux-s2`): production
+  `pkg/transport/muxstdio` package shipped with 11 unit tests + 2 race tests;
+  `go test -race -count=10` green; `golangci-lint run` reports 0 issues.
+  Slice 3 unblocked.
 
 ## Riskiest assumption + kill-test
 
@@ -213,10 +217,22 @@ type Transport struct {
 
 func New(inner mcp.Transport, opts ...Option) *Transport
 func (t *Transport) Send(ctx context.Context, msg *mcp.Message) error // pre-registers id then forwards
-func (t *Transport) Recv(ctx context.Context, id string) (*mcp.Message, error) // demuxed
+func (t *Transport) Recv(ctx context.Context, id any) (*mcp.Message, error) // demuxed
+func (t *Transport) Call(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) // Send + Recv on msg.ID
 func (t *Transport) NotificationCh() <-chan *mcp.Message
 func (t *Transport) Close() error
+
+// Sentinel errors:
+//   ErrClosed       — transport is closed (or was during call)
+//   ErrNoID         — Send/Recv was given a message with a nil JSON-RPC id
+//   ErrDuplicateID  — Send for an id that already has a pending registration
 ```
+
+Note: S2 shipped `Recv(ctx, id any)` (not `id string` as originally
+sketched) because `mcp.Message.ID` is `any` upstream and forcing callers to
+normalize externally would duplicate the `idKey` canonicalization. `Call`
+was added as a convenience because the kill-test prototype proved it useful
+and it removes Send/Recv boilerplate from S3 call sites.
 
 Key behaviors:
 

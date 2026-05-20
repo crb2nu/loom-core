@@ -3,10 +3,11 @@
 - **Date**: 2026-05-20
 - **Companion**: [brainstorm-stdio-mux-2026-05-20.md](brainstorm-stdio-mux-2026-05-20.md),
   [product-spec-stdio-mux-2026-05-20.md](product-spec-stdio-mux-2026-05-20.md)
-- **Status**: S1 kill-test **PASSED 2026-05-20** (commit pending on
-  `feat/stdio-mux-killtest`; evidence pasted into the product spec's Status
-  line). S2 unblocked. Two findings during the run updated the plan: see
-  "S1 kill-test outcome" below and the new S2.5 slice.
+- **Status**: S1 kill-test **PASSED 2026-05-20** (MR !458, merge commit
+  `10b92e9d`). S2 **PASSED 2026-05-20** (branch `feat/stdio-mux-s2`;
+  production package + race-clean tests, evidence below). S3 unblocked. Two
+  findings from S1 carried into S2.5 (optional). See "S1 kill-test outcome"
+  and "S2 production package outcome" below.
 - **Cycle**: 2026-05-20 → ~2026-05-27 (5 working days est.)
 
 ## Execution order
@@ -15,6 +16,7 @@
 S1   Kill-test harness against real mcp-agent-context  (≤30 min target, ≤0.5 day)
      → GATE: pass criteria met before any other code   [PASSED 2026-05-20]
 S2   pkg/transport/muxstdio package (unit + race)       (1 day)
+     → package compiles, -race -count=10 green          [PASSED 2026-05-20]
 S2.5 (optional, additive) Enable handler-side parallel  (0.25 day)
      dispatch via SetConcurrencyLimit on each server
 S3   Wire mux into pool for local stdio + drop callLock (1 day)
@@ -109,6 +111,36 @@ not patched.
 the test output as a fenced block + the commit SHA that captured it).
 
 ---
+
+## S2 production package outcome (2026-05-20)
+
+- All unit + race tests green: `go test ./pkg/transport/muxstdio/ -race -count=10`
+  passed in ~1.6s. `go vet` clean under both default and `-tags=killtest`.
+  `golangci-lint run` reports `0 issues`.
+- 11 unit tests in `transport_test.go` (Send/Recv routing, ctx cancel cleanup,
+  after-close error, slow-drainer non-blocking, notification fan-out drop,
+  Close idempotency, Close delivers ErrClosed to pending waiters, nil/duplicate
+  id rejection, Call round-trip).
+- 2 race tests in `transport_race_test.go`: high-fanout 64 goroutines × 100
+  Send+Recv pairs (6,400 calls, all id-routed correctly, 0 drops); concurrent
+  Send-while-Close.
+- API surface deviations from the spec's sketch (spec amended in this MR):
+  - `Recv(ctx, id any)` not `Recv(ctx, id string)` — `mcp.Message.ID` is
+    `any` upstream, and forcing callers to normalize externally would
+    duplicate the `idKey` canonicalization.
+  - Added `Call(ctx, *Message) (*Message, error)` convenience method —
+    proven useful in the S1 prototype and reduces S3 call-site churn.
+  - Added sentinel errors: `ErrClosed`, `ErrNoID`, `ErrDuplicateID`. Spec
+    didn't list them; the test plan implies them ("after-close returns
+    closed error").
+  - Reader goroutine now uses a cancellable context (`readerCancel` in
+    `Close`) so the wrapper works against any `mcp.Transport`, not only
+    those that honor Close-during-Recv. PipeTransport in particular does
+    not — discovered during test development.
+- The kill-test prototype in `killtest_test.go` was updated to reuse the
+  package-level `idKey` helper instead of defining its own duplicate
+  (compile-conflict under `-tags=killtest`). Unifying the helper also makes
+  the kill-test a genuine regression guard for the canonical id-keying.
 
 ## Slice 2 — Production `pkg/transport/muxstdio` package
 
