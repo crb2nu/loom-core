@@ -2337,22 +2337,32 @@ func TestCallPipelineExecute_ResponseIDMismatch(t *testing.T) {
 	}
 }
 
-func TestHandleCall_HubConcurrencyNoIDMismatchWithLock(t *testing.T) {
-	// Two concurrent callers share a single transport (mirrors
-	// kitprocess.Manager.Dial returning the same *Process for both
-	// pool.Conns). Without per-server serialization the interleaving
-	// transport's broken Recv would deliver the wrong response ID, which
-	// the pipeline catches as transport corruption and treats with a
-	// full process teardown. With the per-server callLock the two calls
-	// serialize, each Send→Recv pair completes atomically, and both
-	// callers see the correct response. This is the property the
-	// daemon's per-server callLock exists to guarantee for shared
-	// stdio transports.
+func TestHandleCall_LocalConcurrencyNoIDMismatchWithLock(t *testing.T) {
+	// Two concurrent callers share a single transport — the production
+	// reality for stdio servers, where kitprocess.Manager.Dial returns the
+	// same *Process (and so the same *StdioTransport) for every pool entry
+	// sharing a serverName. Without per-server serialization the
+	// interleaving transport's broken Recv would deliver the wrong response
+	// ID; the pipeline catches that mismatch as transport corruption and
+	// triggers a full process teardown. With the per-server callLock the
+	// two calls serialize, each Send→Recv pair completes atomically, and
+	// both callers see the correct response. This is the property the
+	// daemon's per-server callLock continues to guarantee for TargetLocal.
 	d := newCallPipelineTestDaemon()
-	d.router = router.New(router.Config{HubEnabled: true})
+	d.router = router.New(router.Config{
+		HubEnabled: true,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{
+					Name:       "local_concurrency_test",
+					Categories: []string{"local-only"},
+				},
+			},
+		},
+	})
 
 	shared := &interleavingHubTransport{}
-	d.hubPool = pool.New(pool.Config{
+	d.pool = pool.New(pool.Config{
 		MaxIdle:     2,
 		MaxOpen:     2,
 		IdleTimeout: time.Minute,
@@ -2360,11 +2370,11 @@ func TestHandleCall_HubConcurrencyNoIDMismatchWithLock(t *testing.T) {
 			return shared, nil
 		},
 	})
-	defer func() { _ = d.hubPool.Close() }()
+	defer func() { _ = d.pool.Close() }()
 
 	makeMsg := func(id string) *mcp.Message {
 		msg := newCallMessage(t, map[string]any{
-			"server": "hub_concurrency_test",
+			"server": "local_concurrency_test",
 			"tool":   "query",
 		})
 		msg.ID = id
@@ -2405,20 +2415,97 @@ func TestHandleCall_HubConcurrencyNoIDMismatchWithLock(t *testing.T) {
 	}
 }
 
-// TestHandleCall_ConcurrentCallsCompleteWithoutLockTimeout exercises the
-// hot path that originally produced the "acquire call lock for
-// agent_context after 15s: context deadline exceeded" cascade in
-// loom-agent-hooks.log: many concurrent callers serializing through the
-// per-server callLock. The lock must serialize them (it does — shared
-// stdio transport demands it) but should NOT pile up to the 15s
-// acquire timeout for fast in-flight calls.
+// TestHandleCall_HubConcurrentCallsRunInParallel verifies that hub-routed
+// calls to the same server name complete in parallel — the per-server
+// callLock applies to TargetLocal only. Each hub pool dial returns a fresh
+// transport, mirroring the post-mcp-go!3 (commit aa57e61) WebSocketClient
+// behaviour where every Dial builds a new *WebSocketTransport with its own
+// websocket.Conn. Concurrent callers therefore each hold an exclusive
+// transport via the pool and must not serialize on the per-server lock.
 //
-// This is a regression test for the cascade behaviour, not for
-// parallelism: with a shared transport, concurrent callers physically
-// cannot run their Send→Recv pairs in parallel without ID interleaving.
-// What we verify is that the per-server lock has reasonable fairness
-// and no caller exhausts the lock-acquire budget under bounded
-// in-flight latency.
+// Regression: the cascade reported in daemon.err on 2026-05-19 was caused
+// by the lock being acquired around send/recv for hub-routed calls — a
+// slow upstream recv held the per-server lock for up to the 30s tool RPC
+// timeout, queueing every heartbeat/refresh caller until they exhausted
+// the 15s LOOM_DAEMON_CALL_LOCK_TIMEOUT budget. With the lock skipped for
+// hub, this cascade cannot recur as long as each pool Conn has its own
+// transport.
+func TestHandleCall_HubConcurrentCallsRunInParallel(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{HubEnabled: true})
+
+	const perCallLatency = 100 * time.Millisecond
+	const callers = 10
+
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     callers,
+		MaxOpen:     callers,
+		IdleTimeout: time.Minute,
+		// Fresh transport per dial mirrors post-mcp-go!3 WebSocketClient.Dial.
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			return &slowEchoTransport{sendDelay: perCallLatency}, nil
+		},
+	})
+	defer func() { _ = d.hubPool.Close() }()
+
+	makeMsg := func(id string) *mcp.Message {
+		msg := newCallMessage(t, map[string]any{
+			"server": "hub_parallel_test",
+			"tool":   "echo",
+		})
+		msg.ID = id
+		return msg
+	}
+
+	type result struct {
+		resp *mcp.Message
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			resp, err := d.handleCall(context.Background(), makeMsg(fmt.Sprintf("req-%d", idx)))
+			results <- result{resp: resp, err: err}
+		}(i)
+	}
+
+	beginAt := time.Now()
+	close(start)
+	wg.Wait()
+	elapsed := time.Since(beginAt)
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("unexpected call error: %v", res.err)
+		}
+		if res.resp == nil || res.resp.Error != nil {
+			t.Fatalf("expected success, got %+v", res.resp)
+		}
+	}
+
+	// If hub were still serialized on the per-server lock, wall-clock would
+	// be ~callers*perCallLatency = 1000ms. Allow generous slack (3×) for CI
+	// scheduling jitter but still catch serialization (would be ~10×).
+	parallelBudget := perCallLatency * 3
+	if elapsed > parallelBudget {
+		t.Fatalf("hub calls appear serialized: %d concurrent callers took %v, want < %v",
+			callers, elapsed, parallelBudget)
+	}
+}
+
+// TestHandleCall_ConcurrentCallsCompleteWithoutLockTimeout is the original
+// regression for the "acquire call lock for agent_context after 15s:
+// context deadline exceeded" cascade reported in loom-agent-hooks.log.
+// Post-fix the hub path no longer takes the per-server lock at all, so
+// this test now serves as defense-in-depth: many concurrent hub callers
+// must complete without any lock-acquire failure even when individual
+// calls take non-trivial time.
 func TestHandleCall_ConcurrentCallsCompleteWithoutLockTimeout(t *testing.T) {
 	d := newCallPipelineTestDaemon()
 	d.router = router.New(router.Config{HubEnabled: true})

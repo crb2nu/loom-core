@@ -156,35 +156,42 @@ func (p *callPipeline) connectTarget(target router.Target, reason string) error 
 		return fmt.Errorf("unsupported routing target: %s", target)
 	}
 
-	// Acquire the call lock briefly for bookkeeping (mark activity), then
-	// release it BEFORE pool.Get() which may block waiting for a connection.
-	// The pool is internally thread-safe; holding the call lock during pool
-	// acquisition caused cascade timeouts for concurrent callers (heartbeats,
-	// task-sync) that share the same per-server lock.
-	var (
-		err      error
-		lockWait time.Duration
-	)
-	p.callMu, lockWait, err = p.daemon.acquireCallLock(p.ctx, p.serverName)
-	if err != nil {
-		p.daemon.router.RecordFailure(p.serverName, p.target, err)
-		p.daemon.metrics.RecordServerFailure(p.serverName, p.targetStr, "call_lock")
-		return err
-	}
-	p.lockHeld = true
-	if lockWait > 100*time.Millisecond {
-		p.daemon.metrics.CallLockWaitTotal.WithLabelValues(p.serverName).Inc()
-		p.daemon.logger.Debug("call lock contention", "server", p.serverName, "wait_ms", lockWait.Milliseconds())
-	}
+	// The per-server callLock serializes Send+Recv against shared transports.
+	// Stdio servers genuinely share one transport per serverName
+	// (kitprocess.Manager.Dial returns the same *Process — one stdin/stdout
+	// pipe — for every pool entry; readLoop has one msgCh). Hub-routed
+	// servers, post-mcp-go!3 (libs/mcp-go!3, websocket.Dial fresh-transport-
+	// per-call), give each pool Conn its own websocket.Conn with per-instance
+	// mu/readMu — so two callers on two Conns are independent and the lock
+	// only adds queueing under heartbeat storms.
+	//
+	// Skip the lock entirely for TargetHub. For TargetLocal, acquire briefly
+	// here just to mark process activity (under lock so reapIdleServers'
+	// TryLock signal is meaningful), then drop it before pool.Get and
+	// re-acquire below for the send/recv phase.
+	var err error
+	if target == router.TargetLocal {
+		var lockWait time.Duration
+		p.callMu, lockWait, err = p.daemon.acquireCallLock(p.ctx, p.serverName)
+		if err != nil {
+			p.daemon.router.RecordFailure(p.serverName, p.target, err)
+			p.daemon.metrics.RecordServerFailure(p.serverName, p.targetStr, "call_lock")
+			return err
+		}
+		p.lockHeld = true
+		if lockWait > 100*time.Millisecond {
+			p.daemon.metrics.CallLockWaitTotal.WithLabelValues(p.serverName).Inc()
+			p.daemon.logger.Debug("call lock contention", "server", p.serverName, "wait_ms", lockWait.Milliseconds())
+		}
 
-	// Mark activity under the lock (quick operation).
-	if target == router.TargetLocal && p.daemon.procMgr != nil {
-		p.daemon.procMgr.MarkActivity(p.serverName)
-	}
+		if p.daemon.procMgr != nil {
+			p.daemon.procMgr.MarkActivity(p.serverName)
+		}
 
-	// Release the lock before the potentially-blocking pool.Get().
-	p.callMu.Unlock()
-	p.lockHeld = false
+		// Release before the potentially-blocking pool.Get().
+		p.callMu.Unlock()
+		p.lockHeld = false
+	}
 
 	switch target {
 	case router.TargetLocal:
@@ -219,51 +226,45 @@ func (p *callPipeline) connectTarget(target router.Target, reason string) error 
 		return err
 	}
 
-	// Re-acquire the lock for the RPC send phase.
+	// Re-acquire the lock for the RPC send phase — TargetLocal only.
 	//
-	// Why this serialization is required (even though pool.Get gives an
-	// "exclusive" Conn): for local stdio servers, kitprocess.Manager.Dial
-	// returns the SAME *Process — and therefore the same *StdioTransport
-	// — every time it's called for a given serverName. Pool maxOpen=25
-	// means 25 logical handles to ONE stdio pipe, not 25 processes. The
-	// readLoop dispatches every incoming message to a single msgCh, so
-	// concurrent Send+Recv pairs on the shared transport interleave:
-	// goroutine A can Recv() goroutine B's response. The pipeline catches
-	// the ID mismatch and treats it as transport corruption, triggering
-	// procMgr.Stop and a cascade of "transport closed" errors for every
-	// other in-flight call.
+	// Why this is required for stdio: kitprocess.Manager.Dial returns the
+	// SAME *Process — and therefore the same *StdioTransport (one
+	// stdin/stdout pipe, one readLoop pushing to one msgCh) — for every
+	// pool entry sharing a serverName. Pool maxOpen=25 means 25 logical
+	// handles to ONE stdio pipe, not 25 processes. Concurrent Send+Recv
+	// pairs on the shared transport interleave: goroutine A can Recv()
+	// goroutine B's response. The pipeline catches the ID mismatch and
+	// treats it as transport corruption, triggering procMgr.Stop and a
+	// cascade of "transport closed" errors for every other in-flight call.
 	//
-	// A 2026-05-12 attempt to remove this lock (commit a6bb44e2) was
-	// based on the incorrect assumption that each pool Conn had its own
-	// Transport. The unit test for that change accidentally validated the
-	// removal because its mock DialFunc returned a fresh Transport per
-	// call — production never does. Reverted 2026-05-12 (this commit).
+	// Why it is NOT required for hub: post-mcp-go!3 (commit aa57e61),
+	// WebSocketClient.Dial builds a fresh *WebSocketTransport with its own
+	// underlying websocket.Conn for every pool dial. Each pool Conn is
+	// therefore an independent transport, so concurrent Send+Recv on
+	// different Conns cannot interleave.
 	//
-	// The first acquire (lines above pool.Get) is intentionally NOT
-	// re-introduced as a held-through-pool-Get lock — that was the real
-	// cascade source in commit ee76d223. We hold the lock ONLY for the
-	// send/recv phase; the pool wait is unlocked.
-	p.callMu, _, err = p.daemon.acquireCallLock(p.ctx, p.serverName)
-	if err != nil {
-		// Connection acquired but can't get lock — return connection to pool.
-		if p.conn != nil {
-			switch target {
-			case router.TargetLocal:
+	// A 2026-05-12 attempt to remove this lock entirely (commit a6bb44e2)
+	// was reverted because its unit test gave each fake Conn a fresh
+	// Transport in the DialFunc — modelling hub correctly but stdio
+	// incorrectly. The fix here keeps the lock for stdio (correct) and
+	// drops it for hub (now safe with per-call fresh websocket transports).
+	if target == router.TargetLocal {
+		p.callMu, _, err = p.daemon.acquireCallLock(p.ctx, p.serverName)
+		if err != nil {
+			// Connection acquired but can't get lock — return it to the pool.
+			if p.conn != nil {
 				if p.daemon.pool != nil {
 					p.daemon.pool.Put(p.conn)
 				}
-			case router.TargetHub:
-				if p.daemon.hubPool != nil {
-					p.daemon.hubPool.Put(p.conn)
-				}
+				p.conn = nil
 			}
-			p.conn = nil
+			p.daemon.router.RecordFailure(p.serverName, p.target, err)
+			p.daemon.metrics.RecordServerFailure(p.serverName, p.targetStr, "call_lock")
+			return err
 		}
-		p.daemon.router.RecordFailure(p.serverName, p.target, err)
-		p.daemon.metrics.RecordServerFailure(p.serverName, p.targetStr, "call_lock")
-		return err
+		p.lockHeld = true
 	}
-	p.lockHeld = true
 
 	return nil
 }

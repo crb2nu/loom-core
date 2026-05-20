@@ -393,8 +393,6 @@ gitlab.flexinfer.ai/libs/fi-accel/go/fiaccel v0.0.0-20260318222621-ce3294e404e0 
 gitlab.flexinfer.ai/libs/fi-accel/go/fiaccel v0.0.0-20260318222621-ce3294e404e0/go.mod h1:VJQRTLn0pxXI2MHqkjxtle3g0ec+5C1BEs6BUnZdvOY=
 gitlab.flexinfer.ai/libs/fi-mcp-kit v0.2.1-0.20260412164817-1a41094d2496 h1:piewbaDHDVdTEhPR7jyx678qzTPsLE3SiwlKI0rPbjA=
 gitlab.flexinfer.ai/libs/fi-mcp-kit v0.2.1-0.20260412164817-1a41094d2496/go.mod h1:7ffh/+hY0tkkUdAjeodVk5DlcwQNCrhNhLsS8nRKpo0=
-gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260317181133-7ff2221818cd h1:vkRd3JmpnmVn2JDhIRU0NSl59DYpfBdI82wO77DO0NU=
-gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260317181133-7ff2221818cd/go.mod h1:dtS8wFBeXIocUiBiQU4w6wXC1wUFvVhdMALl0WaMBXo=
 gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260520023524-aa57e61f11bd h1:D+SnQg2d2HZJp9zi1His3nvkUPPPUP4IMbNlcSsER+0=
 gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260520023524-aa57e61f11bd/go.mod h1:dtS8wFBeXIocUiBiQU4w6wXC1wUFvVhdMALl0WaMBXo=
 go.mongodb.org/mongo-driver v1.17.8 h1:BDP3+U3Y8K0vTrpqDJIRaXNhb/bKyoVeg6tIJsW5EhM=
