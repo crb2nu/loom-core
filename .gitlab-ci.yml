@@ -124,7 +124,9 @@ cache:
 
 # Base template for Go jobs
 .go-template: &go-template
-  image: registry.harbor.lan/dockerhub-cache/library/golang:${GO_VERSION}
+  # Bypass the Harbor Docker Hub pull-through cache: missing upstream tags surface
+  # as 404s in runner prepare before CI scripts can execute.
+  image: docker.io/library/golang:${GO_VERSION}
   retry:
     max: 2
     when:
