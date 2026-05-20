@@ -6,12 +6,15 @@
 - **Status**: S1 kill-test **PASSED 2026-05-20** (MR !458, merge commit
   `10b92e9d`). S2 **PASSED 2026-05-20** (MR !459, merge `305c0553`;
   production package + race-clean tests). S3 **PASSED 2026-05-20**
-  (branch `feat/stdio-mux-s3`; wired into local-stdio dial path behind
-  `LOOM_MUX_STDIO=1` feature flag, callLock skipped for local when on,
-  parallelism regression tests green, evidence below). S2.5 (optional)
-  still gated on operator decision after S3 soak. See "S1 kill-test
-  outcome", "S2 production package outcome", and "S3 wire-up outcome"
-  below.
+  (MR !460, merge `2e26edfd`; wired into local-stdio dial path behind
+  `LOOM_MUX_STDIO` env flag, callLock skipped for local when on,
+  parallelism regression tests green). **S3-followup 2026-05-20**:
+  flipped default from off→on; opt-out via `LOOM_MUX_STDIO=0`. The
+  planned 24h soak (R3) is deferred to post-merge observation rather
+  than gating the flip — rollback is a one-env-var change. S2.5
+  (optional) still pending operator decision. See "S1 kill-test
+  outcome", "S2 production package outcome", "S3 wire-up outcome",
+  and "S3-followup default flip" below.
 - **Cycle**: 2026-05-20 → ~2026-05-27 (5 working days est.)
 
 ## Execution order
@@ -316,6 +319,29 @@ If the soak window is clean, flip the default in a follow-up MR so
 `LOOM_MUX_STDIO` defaults on. If a regression appears, set
 `LOOM_MUX_STDIO=0` (or unset) and the daemon reverts to the lock-based
 path with no other changes needed.
+
+## S3-followup default flip (2026-05-20)
+
+- One-file change in `internal/daemon/daemon_new.go`: env-var logic
+  inverted so `LOOM_MUX_STDIO` defaults on. Opt-out values: `0`,
+  `false`, `off` (case-insensitive). Empty / unset / anything else =
+  enabled.
+- Daemon log on startup now distinguishes the two modes:
+  - `local stdio per-id muxing enabled (LOOM_MUX_STDIO default on; set =0 to disable)`
+  - `local stdio per-id muxing disabled (LOOM_MUX_STDIO=0); using legacy callLock path`
+- The R3 soak that originally gated this flip is **deferred to
+  post-merge observation** rather than blocking the change. Rationale:
+  the rollback is a single env-var set on the daemon (no code change,
+  no rebuild), and the lock-based path is still present and tested —
+  so the cost of "flip now, watch, opt out if needed" is lower than
+  the cost of running operators against the pre-S3 path for another
+  day while we wait. The S3 regression tests already exercise the
+  parallel-correctness property end-to-end against a real
+  `muxstdio.Transport`.
+- **Rollback runbook**: set `LOOM_MUX_STDIO=0` (or `=false` / `=off`)
+  on the daemon process and restart. The startup log will confirm the
+  legacy path. No code change required; the lock-based path is fully
+  preserved.
 
 ---
 

@@ -132,17 +132,28 @@ func New(cfg Config) (*Daemon, error) {
 	// follow reloaded daemon state.
 	var d *Daemon
 
-	// LOOM_MUX_STDIO=1 opts the local-stdio pool into the per-id muxing
-	// wrapper (pkg/transport/muxstdio). When enabled, the per-server callLock
-	// is also skipped for TargetLocal — see callpipeline_routing.go and
-	// .loom/implementation-plan-stdio-mux-2026-05-20.md slice 3. Default off
-	// pending the soak window described in the plan's risk register (R3).
-	muxStdioEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("LOOM_MUX_STDIO")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("LOOM_MUX_STDIO")), "true")
+	// LOOM_MUX_STDIO controls the per-id muxing wrapper around local stdio
+	// transports (pkg/transport/muxstdio). When enabled, every pool.Conn for
+	// the same serverName shares one *muxstdio.Transport and the per-server
+	// callLock is skipped for TargetLocal — see callpipeline_routing.go and
+	// .loom/implementation-plan-stdio-mux-2026-05-20.md slice 3.
+	//
+	// Defaults to ON as of the S3-followup flip (2026-05-20). The S3 MR
+	// (!460) shipped the path default-off; this flip makes it the active
+	// behavior. Operators who hit a regression can opt out by setting
+	// LOOM_MUX_STDIO=0 (also accepts "false" / "off") — the daemon then
+	// falls back to the pre-S3 callLock-based path with no other changes
+	// needed. The plan's R3 risk-register entry covers this rollback.
+	muxStdioRaw := strings.TrimSpace(os.Getenv("LOOM_MUX_STDIO"))
+	muxStdioEnabled := !strings.EqualFold(muxStdioRaw, "0") &&
+		!strings.EqualFold(muxStdioRaw, "false") &&
+		!strings.EqualFold(muxStdioRaw, "off")
 	var stdioMuxCache *muxCache
 	if muxStdioEnabled {
 		stdioMuxCache = newMuxCache(logger)
-		logger.Info("local stdio per-id muxing enabled (LOOM_MUX_STDIO)")
+		logger.Info("local stdio per-id muxing enabled (LOOM_MUX_STDIO default on; set =0 to disable)")
+	} else {
+		logger.Info("local stdio per-id muxing disabled (LOOM_MUX_STDIO=0); using legacy callLock path")
 	}
 
 	// Create process manager with variable expansion (using the daemon's current

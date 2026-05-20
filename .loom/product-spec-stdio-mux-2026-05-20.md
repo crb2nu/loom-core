@@ -9,12 +9,14 @@
   `10b92e9d`). Slice 2 **PASSED 2026-05-20** (MR !459, merge `305c0553`):
   production `pkg/transport/muxstdio` package shipped with 11 unit tests + 2
   race tests; `go test -race -count=10` green; `golangci-lint run` reports 0
-  issues. Slice 3 **PASSED 2026-05-20** (`feat/stdio-mux-s3`): wired into
-  the local-stdio dial path behind `LOOM_MUX_STDIO=1` feature flag,
+  issues. Slice 3 **PASSED 2026-05-20** (MR !460, merge `2e26edfd`): wired
+  into the local-stdio dial path behind `LOOM_MUX_STDIO` env flag,
   per-server callLock skipped for `TargetLocal` when on, parallelism
   regression tests confirm 10 callers × 100 ms latency complete in ~100 ms.
-  Awaiting 24h operator soak before flipping the default; see implementation
-  plan "S3 wire-up outcome".
+  **S3-followup 2026-05-20**: default flipped off→on; opt-out via
+  `LOOM_MUX_STDIO=0`. R3 soak deferred to post-merge observation (rollback
+  is a single env-var change). See implementation plan "S3 wire-up outcome"
+  and "S3-followup default flip".
 
 ## Riskiest assumption + kill-test
 
