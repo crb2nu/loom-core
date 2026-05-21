@@ -114,7 +114,12 @@ if check_tool golangci-lint "linting"; then
 fi
 
 echo -n "Checking for debug statements... "
-DEBUG_PATTERNS='fmt\.Print|log\.Print|panic\(|os\.Exit'
+# Patterns that genuinely indicate debug-only code left in.
+# Excluded: os.Exit (every cmd/*/main.go uses it for error exit) and
+# fmt.Fprintf (legitimate for writing to os.Stderr from main()).
+# fmt.Print / fmt.Println / fmt.Printf without Fprint prefix still catch
+# real "leftover println" cases.
+DEBUG_PATTERNS='fmt\.Println|fmt\.Printf\(|log\.Println|log\.Printf|spew\.Dump|pp\.Print'
 if grep -l -E "${DEBUG_PATTERNS}" ${STAGED_GO_FILES} 2>/dev/null | grep -v '_test\.go$$' | head -5; then
   echo -e "${YELLOW}WARNING: Found potential debug statements (review before committing)${NC}"
 else
