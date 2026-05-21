@@ -35,6 +35,13 @@ func (f *fakeReloadHUDApp) lastToken() string {
 }
 
 func TestReloadEnvFile_PushesAdminTokenIntoHUD(t *testing.T) {
+	// reloadEnvFile calls os.Setenv("HUD_ADMIN_TOKEN", ...) — pin the
+	// variable via t.Setenv so it is restored to its pre-test value at
+	// the end of this test. Without this, the leaked token causes
+	// TestHandleEventsPublish_* (in api_events_test.go) to fail with
+	// 403 forbidden under -count>=2.
+	t.Setenv("HUD_ADMIN_TOKEN", "")
+
 	dir := t.TempDir()
 	envPath := filepath.Join(dir, "hud.env")
 	if err := os.WriteFile(envPath, []byte("HUD_ADMIN_TOKEN=hot-loaded-token\n"), 0o600); err != nil {
@@ -77,14 +84,17 @@ func TestReloadEnvFile_MissingFileIsNoop(t *testing.T) {
 }
 
 func TestReloadEnvFile_OnlyAllowlistedKeysApplied(t *testing.T) {
+	// Pin both env vars via t.Setenv so the test's os.Setenv side
+	// effects do not leak across to TestHandleEventsPublish_* (see
+	// PushesAdminTokenIntoHUD for the failure mode).
+	t.Setenv("HUD_ADMIN_TOKEN", "")
+	t.Setenv("ROGUE_INJECT", "")
+
 	dir := t.TempDir()
 	envPath := filepath.Join(dir, "hud.env")
 	body := "HUD_ADMIN_TOKEN=tok-allowed\nROGUE_INJECT=should-not-leak\n"
 	if err := os.WriteFile(envPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
-	}
-	if err := os.Unsetenv("ROGUE_INJECT"); err != nil {
-		t.Fatalf("unsetenv: %v", err)
 	}
 
 	d := &Daemon{
