@@ -1,20 +1,29 @@
 package merge
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/crb2nu/loom/internal/hud/coordination"
 )
 
 // gitRemoteURLEnv is the env var consulted by the merge domain to build
-// per-candidate deep links into the upstream forge. When unset, deep-link
-// fields are omitted from the JSON payload and the HUD renders nothing.
+// per-candidate deep links into the upstream forge. When set, it overrides
+// auto-detection. When unset and auto-detection fails, deep-link fields
+// are omitted from the JSON payload and the HUD renders nothing.
 const gitRemoteURLEnv = "LOOM_HUD_GIT_REMOTE_URL"
+
+// gitRemoteDetector is overridable so tests can swap in a deterministic
+// implementation. Production code uses detectGitRemoteURL, which shells out
+// to `git remote get-url origin` in the daemon's current working directory.
+var gitRemoteDetector = detectGitRemoteURL
 
 // MergeCandidate represents an agent branch eligible for merge consideration.
 type MergeCandidate struct {
@@ -66,7 +75,7 @@ type MergeConflictsResponse struct {
 // handleMergeQueue returns the ordered merge queue derived from the coordination snapshot.
 func (d *MergeDomain) handleMergeQueue(w http.ResponseWriter, r *http.Request) {
 	snap := d.deps.CoordinationSnapshot()
-	remoteURL := os.Getenv(gitRemoteURLEnv)
+	remoteURL := resolveRemoteURL()
 
 	var ready, blocked []MergeCandidate
 	for _, agent := range snap.Agents {
@@ -202,6 +211,71 @@ func buildConflictPairs(snap coordination.Snapshot) []MergeConflictPair {
 		conflicts = []MergeConflictPair{}
 	}
 	return conflicts
+}
+
+// resolveRemoteURL returns the upstream forge URL used for merge-queue deep
+// links, in priority order: the LOOM_HUD_GIT_REMOTE_URL env var (operator
+// opt-in, e.g., for daemons running in k8s where the working tree is not a
+// git checkout), then auto-detection via `git remote get-url origin` from
+// the daemon's current working directory. The returned URL is always passed
+// through sanitizeRemoteURL so embedded credentials (e.g., the oauth2:token
+// userinfo that GitLab adds for some clones) cannot leak into the HUD's
+// browser-readable JSON payload.
+func resolveRemoteURL() string {
+	if env := strings.TrimSpace(os.Getenv(gitRemoteURLEnv)); env != "" {
+		return sanitizeRemoteURL(env)
+	}
+	return sanitizeRemoteURL(gitRemoteDetector())
+}
+
+// sanitizeRemoteURL removes any userinfo segment (user:password@host) from
+// the URL and refuses any scheme other than http/https, since deep links are
+// rendered as <a href> in the HUD frontend and must be browser-clickable.
+// Returns "" for any input that can't be safely emitted; callers treat ""
+// as "no deep link" and the omitempty JSON tags suppress the field.
+func sanitizeRemoteURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// Reject scp-style SSH URLs like `git@host:owner/repo.git` — they cannot
+	// be opened from a browser anyway, and url.Parse misinterprets them.
+	if strings.HasPrefix(raw, "git@") && !strings.Contains(raw, "://") {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return ""
+	}
+	if u.Host == "" {
+		return ""
+	}
+	// Strip any embedded credentials before emitting to the frontend.
+	u.User = nil
+	return u.String()
+}
+
+// detectGitRemoteURL invokes `git remote get-url origin` in the daemon's
+// current working directory with a short timeout. Any failure (git missing,
+// not a repo, no origin, timeout) yields "" so the link surface stays
+// graceful. The 2s timeout protects against hung git invocations without
+// noticeably delaying a HUD poll.
+func detectGitRemoteURL() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "remote", "get-url", "origin")
+	cmd.Env = append(os.Environ(),
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // candidateURLs builds GitLab-style deep links for a merge candidate. It

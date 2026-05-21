@@ -258,6 +258,11 @@ func TestHandleMergeQueue_PopulatesDeepLinksWhenEnvSet(t *testing.T) {
 
 func TestHandleMergeQueue_OmitsDeepLinksWhenEnvUnset(t *testing.T) {
 	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "")
+	// Override the detector so the test passes regardless of whether the
+	// working tree happens to be a git checkout (e.g., CI may run in /).
+	prev := gitRemoteDetector
+	gitRemoteDetector = func() string { return "" }
+	t.Cleanup(func() { gitRemoteDetector = prev })
 
 	snap := coordination.Snapshot{
 		Agents: []coordination.AgentSummary{
@@ -303,4 +308,115 @@ func TestHandleMergeConflicts_BidirectionalPairsAreSeparate(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Equal(t, 2, resp.Count)
 	assert.Len(t, resp.Conflicts, 2)
+}
+
+func TestSanitizeRemoteURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"plain_https", "https://gitlab.example.com/team/repo.git", "https://gitlab.example.com/team/repo.git"},
+		{"plain_http", "http://gitlab.example.com/team/repo", "http://gitlab.example.com/team/repo"},
+		{"strips_oauth_token", "https://oauth2:glpat-secret-token@gitlab.example.com/team/repo.git", "https://gitlab.example.com/team/repo.git"},
+		{"strips_user_pass", "https://user:hunter2@gitlab.example.com/team/repo", "https://gitlab.example.com/team/repo"},
+		{"strips_user_only", "https://user@gitlab.example.com/team/repo", "https://gitlab.example.com/team/repo"},
+		{"rejects_ssh_form", "git@gitlab.example.com:team/repo.git", ""},
+		{"rejects_ssh_scheme", "ssh://git@gitlab.example.com/team/repo.git", ""},
+		{"rejects_file_scheme", "file:///srv/repos/repo.git", ""},
+		{"rejects_no_scheme", "gitlab.example.com/team/repo", ""},
+		{"trims_whitespace", "  https://example.com/r  ", "https://example.com/r"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, sanitizeRemoteURL(tc.in))
+		})
+	}
+}
+
+func TestResolveRemoteURL_EnvWinsOverDetect(t *testing.T) {
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "https://gitlab.example.com/team/from-env")
+	prev := gitRemoteDetector
+	gitRemoteDetector = func() string { return "https://gitlab.example.com/team/from-detect" }
+	t.Cleanup(func() { gitRemoteDetector = prev })
+
+	assert.Equal(t, "https://gitlab.example.com/team/from-env", resolveRemoteURL())
+}
+
+func TestResolveRemoteURL_FallsBackToDetect(t *testing.T) {
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "")
+	prev := gitRemoteDetector
+	gitRemoteDetector = func() string { return "https://gitlab.example.com/team/detected" }
+	t.Cleanup(func() { gitRemoteDetector = prev })
+
+	assert.Equal(t, "https://gitlab.example.com/team/detected", resolveRemoteURL())
+}
+
+func TestResolveRemoteURL_BothEmpty(t *testing.T) {
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "")
+	prev := gitRemoteDetector
+	gitRemoteDetector = func() string { return "" }
+	t.Cleanup(func() { gitRemoteDetector = prev })
+
+	assert.Equal(t, "", resolveRemoteURL())
+}
+
+func TestResolveRemoteURL_StripsCredentialsFromDetectedURL(t *testing.T) {
+	// Critical: the workspace's actual `origin` remote contains an embedded
+	// oauth2:token userinfo. Auto-detection must scrub it before the URL
+	// reaches the HUD's browser-readable JSON payload.
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "")
+	prev := gitRemoteDetector
+	gitRemoteDetector = func() string {
+		return "https://oauth2:glpat-LEAKED-TOKEN@gitlab.example.com/team/repo.git"
+	}
+	t.Cleanup(func() { gitRemoteDetector = prev })
+
+	got := resolveRemoteURL()
+	assert.Equal(t, "https://gitlab.example.com/team/repo.git", got)
+	assert.NotContains(t, got, "glpat", "must not leak access token through the URL")
+	assert.NotContains(t, got, "oauth2", "must not leak userinfo through the URL")
+}
+
+func TestResolveRemoteURL_StripsCredentialsFromEnvURL(t *testing.T) {
+	// Same protection applies when an operator naively pastes their authed
+	// clone URL into the env var.
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "https://user:hunter2@gitlab.example.com/team/repo.git")
+	prev := gitRemoteDetector
+	gitRemoteDetector = func() string { return "should-not-be-called" }
+	t.Cleanup(func() { gitRemoteDetector = prev })
+
+	assert.Equal(t, "https://gitlab.example.com/team/repo.git", resolveRemoteURL())
+}
+
+func TestHandleMergeQueue_AutoDetectsRemoteWhenEnvUnset(t *testing.T) {
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "")
+	prev := gitRemoteDetector
+	gitRemoteDetector = func() string {
+		return "https://oauth2:secret@gitlab.example.com/team/auto.git"
+	}
+	t.Cleanup(func() { gitRemoteDetector = prev })
+
+	snap := coordination.Snapshot{
+		Agents: []coordination.AgentSummary{
+			{AgentID: "a", Branch: "feat/auto", Status: "active", MergeReady: true},
+		},
+	}
+	d := New(&mockDeps{snap: snap})
+
+	req := httptest.NewRequest("GET", "/api/merge-queue", nil)
+	rec := httptest.NewRecorder()
+	d.handleMergeQueue(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp MergeQueueResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp.Ready, 1)
+	// candidateURLs strips the `.git` suffix from the base, so the tree URL
+	// hangs off the project URL form.
+	assert.Equal(t, "https://gitlab.example.com/team/auto/-/tree/feat%2Fauto", resp.Ready[0].BranchURL)
+	body := rec.Body.String()
+	assert.NotContains(t, body, "secret", "credentials must not leak via deep-link URLs")
+	assert.NotContains(t, body, "oauth2", "userinfo must be stripped before the response leaves the daemon")
 }
