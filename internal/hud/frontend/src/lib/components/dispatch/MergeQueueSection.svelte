@@ -129,6 +129,7 @@
                   Conflicts{sortIndicator(readySortKey, readySortDir, 'conflicts')}
                 </button>
               </th>
+              <th class="th-actions">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -143,6 +144,21 @@
                     <span class="conflict-badge">{candidate.conflict_files}</span>
                   {:else}
                     —
+                  {/if}
+                </td>
+                <td class="cell-actions">
+                  {#if candidate.branch_url}
+                    <a class="action-link" href={candidate.branch_url} target="_blank" rel="noopener noreferrer" title={`View ${candidate.branch} on the forge`}>
+                      Branch ↗
+                    </a>
+                  {/if}
+                  {#if candidate.merge_request_new_url}
+                    <a class="action-link action-link-primary" href={candidate.merge_request_new_url} target="_blank" rel="noopener noreferrer" title={`Open a new merge request for ${candidate.branch}`}>
+                      New MR ↗
+                    </a>
+                  {/if}
+                  {#if !candidate.branch_url && !candidate.merge_request_new_url}
+                    <span class="cell-empty">—</span>
                   {/if}
                 </td>
               </tr>
@@ -178,6 +194,7 @@
                   Blocked Tasks{sortIndicator(blockedSortKey, blockedSortDir, 'blocked_tasks')}
                 </button>
               </th>
+              <th class="th-actions">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -195,6 +212,15 @@
                   {/if}
                 </td>
                 <td class="cell-num">{candidate.blocked_tasks}</td>
+                <td class="cell-actions">
+                  {#if candidate.branch_url}
+                    <a class="action-link" href={candidate.branch_url} target="_blank" rel="noopener noreferrer" title={`View ${candidate.branch} on the forge`}>
+                      Branch ↗
+                    </a>
+                  {:else}
+                    <span class="cell-empty">—</span>
+                  {/if}
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -325,6 +351,53 @@
     border-radius: var(--radius-sm);
     background: rgba(var(--error-rgb, 255, 85, 85), 0.15);
     color: var(--error);
+  }
+
+  .th-actions {
+    padding: var(--space-1) var(--space-2);
+    text-align: right;
+  }
+
+  .cell-actions {
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .cell-empty {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .action-link {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    margin-left: 4px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--fg-secondary);
+    text-decoration: none;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  }
+
+  .action-link:hover {
+    background: var(--bg-tertiary);
+    color: var(--fg-primary);
+    border-color: var(--fg-muted);
+  }
+
+  .action-link-primary {
+    color: var(--accent);
+    border-color: rgba(var(--accent-rgb, 100, 160, 255), 0.4);
+  }
+
+  .action-link-primary:hover {
+    background: rgba(var(--accent-rgb, 100, 160, 255), 0.15);
+    color: var(--accent);
+    border-color: var(--accent);
   }
 
   .blocker-badge {

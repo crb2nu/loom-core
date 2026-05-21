@@ -8,6 +8,12 @@ export interface MergeCandidate {
   conflict_files: number;
   blocked_tasks: number;
   task_count: number;
+  /** Deep link to the branch view on the upstream forge. Present when the
+   * daemon's `LOOM_HUD_GIT_REMOTE_URL` env is set. */
+  branch_url?: string;
+  /** Deep link to a pre-filled "new merge request" page on the upstream
+   * forge. Present when the daemon's `LOOM_HUD_GIT_REMOTE_URL` env is set. */
+  merge_request_new_url?: string;
 }
 
 export interface MergeQueueSummary {

@@ -174,6 +174,109 @@ func TestHandleMergeConflicts_MultipleFilesAggregated(t *testing.T) {
 		"conflict_pairs metric counts distinct agent pairs, not individual files")
 }
 
+func TestCandidateURLs(t *testing.T) {
+	cases := []struct {
+		name       string
+		remote     string
+		branch     string
+		wantBranch string
+		wantMR     string
+	}{
+		{
+			name:       "unset_remote_returns_empty",
+			remote:     "",
+			branch:     "feat/x",
+			wantBranch: "",
+			wantMR:     "",
+		},
+		{
+			name:       "empty_branch_returns_empty",
+			remote:     "https://gitlab.example.com/team/repo",
+			branch:     "",
+			wantBranch: "",
+			wantMR:     "",
+		},
+		{
+			name:       "trailing_slash_tolerated",
+			remote:     "https://gitlab.example.com/team/repo/",
+			branch:     "feat/x",
+			wantBranch: "https://gitlab.example.com/team/repo/-/tree/feat%2Fx",
+			wantMR:     "https://gitlab.example.com/team/repo/-/merge_requests/new?merge_request[source_branch]=feat%2Fx",
+		},
+		{
+			name:       "git_suffix_stripped",
+			remote:     "https://gitlab.example.com/team/repo.git",
+			branch:     "fix/y",
+			wantBranch: "https://gitlab.example.com/team/repo/-/tree/fix%2Fy",
+			wantMR:     "https://gitlab.example.com/team/repo/-/merge_requests/new?merge_request[source_branch]=fix%2Fy",
+		},
+		{
+			name:       "branch_with_special_chars_escaped",
+			remote:     "https://gitlab.example.com/team/repo",
+			branch:     "feat/a b&c",
+			wantBranch: "https://gitlab.example.com/team/repo/-/tree/feat%2Fa%20b&c",
+			wantMR:     "https://gitlab.example.com/team/repo/-/merge_requests/new?merge_request[source_branch]=feat%2Fa+b%26c",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotBranch, gotMR := candidateURLs(tc.remote, tc.branch)
+			assert.Equal(t, tc.wantBranch, gotBranch, "branch URL")
+			assert.Equal(t, tc.wantMR, gotMR, "merge request URL")
+		})
+	}
+}
+
+func TestHandleMergeQueue_PopulatesDeepLinksWhenEnvSet(t *testing.T) {
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "https://gitlab.example.com/team/repo")
+
+	snap := coordination.Snapshot{
+		Agents: []coordination.AgentSummary{
+			{AgentID: "a", Branch: "feat/one", Status: "active", MergeReady: true},
+			{AgentID: "b", Branch: "feat/two", Status: "active", MergeReady: false, MergeBlockers: []string{"blocked_tasks"}},
+		},
+	}
+	d := New(&mockDeps{snap: snap})
+
+	req := httptest.NewRequest("GET", "/api/merge-queue", nil)
+	rec := httptest.NewRecorder()
+	d.handleMergeQueue(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp MergeQueueResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp.Ready, 1)
+	require.Len(t, resp.Blocked, 1)
+	assert.Equal(t, "https://gitlab.example.com/team/repo/-/tree/feat%2Fone", resp.Ready[0].BranchURL)
+	assert.Equal(t, "https://gitlab.example.com/team/repo/-/merge_requests/new?merge_request[source_branch]=feat%2Fone", resp.Ready[0].MergeRequestNewURL)
+	// Blocked candidates also get URLs so the HUD can still link to the branch
+	// before it becomes merge-ready.
+	assert.Equal(t, "https://gitlab.example.com/team/repo/-/tree/feat%2Ftwo", resp.Blocked[0].BranchURL)
+	assert.Equal(t, "https://gitlab.example.com/team/repo/-/merge_requests/new?merge_request[source_branch]=feat%2Ftwo", resp.Blocked[0].MergeRequestNewURL)
+}
+
+func TestHandleMergeQueue_OmitsDeepLinksWhenEnvUnset(t *testing.T) {
+	t.Setenv("LOOM_HUD_GIT_REMOTE_URL", "")
+
+	snap := coordination.Snapshot{
+		Agents: []coordination.AgentSummary{
+			{AgentID: "a", Branch: "feat/one", Status: "active", MergeReady: true},
+		},
+	}
+	d := New(&mockDeps{snap: snap})
+
+	req := httptest.NewRequest("GET", "/api/merge-queue", nil)
+	rec := httptest.NewRecorder()
+	d.handleMergeQueue(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Body must not include the deep-link keys at all (omitempty contract).
+	body := rec.Body.String()
+	assert.NotContains(t, body, "branch_url")
+	assert.NotContains(t, body, "merge_request_new_url")
+}
+
 func TestHandleMergeConflicts_BidirectionalPairsAreSeparate(t *testing.T) {
 	// a→b and b→a are directional relations: surfacing them as a single pair
 	// would require normalization upstream. Preserve current behavior: each
