@@ -123,3 +123,81 @@ func TestHandleMergeConflicts_FileConflicts(t *testing.T) {
 
 	assert.Equal(t, "shared_branch", resp.Conflicts[1].ConflictType)
 }
+
+func TestHandleMergeConflicts_MultipleFilesAggregated(t *testing.T) {
+	// Three file_conflict relations between the same (agent-a, agent-b) pair
+	// should collapse into a single MergeConflictPair whose Files slice lists
+	// every conflicting path in sorted order, and the summary should report
+	// one conflict pair, not three.
+	snap := coordination.Snapshot{
+		Agents: []coordination.AgentSummary{
+			{AgentID: "agent-a", Branch: "feat/a", MergeReady: true},
+			{AgentID: "agent-b", Branch: "feat/b", MergeReady: true},
+		},
+		Relations: []coordination.RelationEdge{
+			{Kind: "file_conflict", Source: "agent-a", Target: "agent-b", Detail: "pkg/zeta.go"},
+			{Kind: "file_conflict", Source: "agent-a", Target: "agent-b", Detail: "pkg/alpha.go"},
+			{Kind: "file_conflict", Source: "agent-a", Target: "agent-b", Detail: "pkg/mid.go"},
+		},
+	}
+	d := New(&mockDeps{snap: snap})
+
+	conflictsReq := httptest.NewRequest("GET", "/api/merge-queue/conflicts", nil)
+	conflictsRec := httptest.NewRecorder()
+	d.handleMergeConflicts(conflictsRec, conflictsReq)
+	require.Equal(t, http.StatusOK, conflictsRec.Code)
+
+	var conflictsResp MergeConflictsResponse
+	require.NoError(t, json.Unmarshal(conflictsRec.Body.Bytes(), &conflictsResp))
+	require.Equal(t, 1, conflictsResp.Count, "three file_conflicts between one pair must collapse to one pair")
+	require.Len(t, conflictsResp.Conflicts, 1)
+
+	pair := conflictsResp.Conflicts[0]
+	assert.Equal(t, "file_conflict", pair.ConflictType)
+	assert.Equal(t, "agent-a", pair.LeftAgent)
+	assert.Equal(t, "agent-b", pair.RightAgent)
+	assert.Equal(t, "feat/a", pair.LeftBranch)
+	assert.Equal(t, "feat/b", pair.RightBranch)
+	assert.Equal(t, []string{"pkg/alpha.go", "pkg/mid.go", "pkg/zeta.go"}, pair.Files,
+		"aggregated files must be sorted for stable output")
+
+	// The merge-queue summary should report a single conflict pair, matching the
+	// rendered "1 conflict pair" label in the HUD.
+	queueReq := httptest.NewRequest("GET", "/api/merge-queue", nil)
+	queueRec := httptest.NewRecorder()
+	d.handleMergeQueue(queueRec, queueReq)
+	require.Equal(t, http.StatusOK, queueRec.Code)
+
+	var queueResp MergeQueueResponse
+	require.NoError(t, json.Unmarshal(queueRec.Body.Bytes(), &queueResp))
+	assert.Equal(t, 1, queueResp.Summary.ConflictPairs,
+		"conflict_pairs metric counts distinct agent pairs, not individual files")
+}
+
+func TestHandleMergeConflicts_BidirectionalPairsAreSeparate(t *testing.T) {
+	// a→b and b→a are directional relations: surfacing them as a single pair
+	// would require normalization upstream. Preserve current behavior: each
+	// direction yields its own MergeConflictPair so the HUD can show the
+	// asymmetry. This test pins the contract so future refactors are deliberate.
+	snap := coordination.Snapshot{
+		Agents: []coordination.AgentSummary{
+			{AgentID: "agent-a", Branch: "feat/a"},
+			{AgentID: "agent-b", Branch: "feat/b"},
+		},
+		Relations: []coordination.RelationEdge{
+			{Kind: "file_conflict", Source: "agent-a", Target: "agent-b", Detail: "x.go"},
+			{Kind: "file_conflict", Source: "agent-b", Target: "agent-a", Detail: "y.go"},
+		},
+	}
+	d := New(&mockDeps{snap: snap})
+
+	req := httptest.NewRequest("GET", "/api/merge-queue/conflicts", nil)
+	rec := httptest.NewRecorder()
+	d.handleMergeConflicts(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp MergeConflictsResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, 2, resp.Count)
+	assert.Len(t, resp.Conflicts, 2)
+}

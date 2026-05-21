@@ -127,7 +127,9 @@ func (d *MergeDomain) handleMergeConflicts(w http.ResponseWriter, r *http.Reques
 }
 
 // buildConflictPairs extracts file_conflict and shared_branch relations
-// that would create merge conflicts, enriched with branch info.
+// that would create merge conflicts, enriched with branch info. Multiple
+// file_conflict relations between the same (source, target) are aggregated
+// into a single pair whose Files slice lists every conflicting path.
 func buildConflictPairs(snap coordination.Snapshot) []MergeConflictPair {
 	agentBranch := make(map[string]string, len(snap.Agents))
 	for _, agent := range snap.Agents {
@@ -137,17 +139,20 @@ func buildConflictPairs(snap coordination.Snapshot) []MergeConflictPair {
 	}
 
 	var conflicts []MergeConflictPair
-	seen := make(map[string]struct{})
+	indexByKey := make(map[string]int)
 
 	for _, rel := range snap.Relations {
 		if rel.Kind != "file_conflict" && rel.Kind != "shared_branch" {
 			continue
 		}
 		key := rel.Source + "|" + rel.Target + "|" + rel.Kind
-		if _, ok := seen[key]; ok {
+		if idx, ok := indexByKey[key]; ok {
+			// Aggregate additional files into the existing pair.
+			if rel.Kind == "file_conflict" && rel.Detail != "" {
+				conflicts[idx].Files = append(conflicts[idx].Files, rel.Detail)
+			}
 			continue
 		}
-		seen[key] = struct{}{}
 
 		pair := MergeConflictPair{
 			LeftAgent:    rel.Source,
@@ -157,10 +162,18 @@ func buildConflictPairs(snap coordination.Snapshot) []MergeConflictPair {
 			ConflictType: rel.Kind,
 			Detail:       rel.Detail,
 		}
-		if rel.Kind == "file_conflict" {
+		if rel.Kind == "file_conflict" && rel.Detail != "" {
 			pair.Files = []string{rel.Detail}
 		}
 		conflicts = append(conflicts, pair)
+		indexByKey[key] = len(conflicts) - 1
+	}
+
+	// Sort files inside each pair so output is stable regardless of relation order.
+	for i := range conflicts {
+		if len(conflicts[i].Files) > 1 {
+			sort.Strings(conflicts[i].Files)
+		}
 	}
 
 	sort.Slice(conflicts, func(i, j int) bool {
@@ -176,13 +189,18 @@ func buildConflictPairs(snap coordination.Snapshot) []MergeConflictPair {
 	return conflicts
 }
 
-// countConflictPairs counts the number of unique conflict pairs in the snapshot.
+// countConflictPairs counts the number of unique (source, target) agent pairs
+// that have at least one file_conflict relation. The "conflict_pairs" summary
+// metric is rendered as "N conflict pair(s)" in the HUD merge queue view, so
+// this counts agent pairs, not individual conflicting files.
 func countConflictPairs(snap coordination.Snapshot) int {
-	count := 0
+	seen := make(map[string]struct{})
 	for _, rel := range snap.Relations {
-		if rel.Kind == "file_conflict" {
-			count++
+		if rel.Kind != "file_conflict" {
+			continue
 		}
+		key := rel.Source + "|" + rel.Target
+		seen[key] = struct{}{}
 	}
-	return count
+	return len(seen)
 }
