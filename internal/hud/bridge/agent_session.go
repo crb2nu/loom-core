@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	presencepkg "github.com/crb2nu/loom/internal/visibility/contracts/presence"
 	"github.com/crb2nu/loom/pkg/projectmeta"
 )
 
@@ -589,13 +590,13 @@ func (a *AgentBridge) DeleteSession(sessionID string) error {
 }
 
 // PresenceList returns all active agents in the presence registry.
-func (a *AgentBridge) PresenceList(includeOffline bool) ([]PresenceInfo, error) {
+func (a *AgentBridge) PresenceList(includeOffline bool) ([]presencepkg.PresenceInfo, error) {
 	args := map[string]any{}
 	if includeOffline {
 		args["include_offline"] = true
 	}
 	var result struct {
-		Agents []PresenceInfo `json:"agents"`
+		Agents []presencepkg.PresenceInfo `json:"agents"`
 	}
 	if err := a.callAgentTool("agent_presence_list", args, &result); err != nil {
 		return nil, err

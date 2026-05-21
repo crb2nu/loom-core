@@ -58,15 +58,16 @@ Each slice is independently shippable, has its own `claude/...` branch + worktre
   - Pure rename + import swap; printer functions unchanged.
 - Acceptance: `loom status` text + JSON byte-identical to pre-change (capture before/after via `go test -run TestStatusJSONFormat`).
 
-### Slice S4 — UNIFY-1d: migrate HUD handlers to contracts package
-- Branch: `refactor/unify-1d-hud-uses-contracts`
-- Files:
-  - update: `internal/hud/app_routes_observability.go`, `internal/hud/app_routes_fleet.go`, `internal/hud/api_*.go`.
-  - update: `internal/hud/monitor/{cost,health,fleet}.go` if struct embedding moves.
-- Implementation:
-  - Swap struct returns to contracts types; keep wire format identical.
-  - Mobile v1 handlers wrap with `contracts.mobile.v1.MapDashboard()` etc. so frozen JSON bytes don't shift.
-- Acceptance: `make ci-contracts` green (mobile bytes identical); `go test ./internal/hud/...` green.
+### Slice S4 — UNIFY-1d: migrate HUD handlers to contracts package ✅ SHIPPED (2026-05-21)
+- Branch: `refactor/unify-1d-hud-uses-contracts` (initial) + `refactor/unify-1d-cost-presence-aliases` (closeout)
+- Shipped in two passes:
+  - `d97cf28b` (2026-05-06): migrated 23 SA1019 call sites from `bridge.{ServerHealth,HealthEntry,HealthDivergence,HealthDivergenceEntry,HealthResult,StatusResult}` to `internal/visibility/contracts/{health,status}`; unblocked main.
+  - **UNIFY-1d closeout** (2026-05-21, this MR): removed the residual `bridge.{PresenceInfo,CostStatsResult,CostAgentUsage,CostServerUsage,CostTotals}` aliases now that zero callers reference them; rewrote `DaemonClient.CostStats()` and `AgentBridge.PresenceList()` signatures to use `costpkg.*` / `presencepkg.*` directly.
+- Verified:
+  - `make ci-contracts` green — all 27 mobile golden files byte-identical (no JSON wire drift).
+  - `go test ./internal/hud/... ./internal/visibility/... ./internal/contracts/... ./cmd/loom/...` all pass.
+  - `golangci-lint run ./internal/hud/... ./internal/visibility/... ./cmd/loom/...` 0 issues.
+- Note: actual file scope diverged from this plan. The original plan listed `app_routes_observability.go`, `app_routes_fleet.go`, `api_*.go`. The real call sites were inside `internal/hud/monitor/{health,fleet}.go` and the bridge package itself; HUD handlers already consumed the underlying contract types via type aliases.
 
 ### Slice S5 — UNIFY-2a: embedded HUD library API + docs
 - Branch: `feat/unify-2a-embed-library-api`

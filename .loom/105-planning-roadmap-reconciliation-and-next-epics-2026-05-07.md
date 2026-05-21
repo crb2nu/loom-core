@@ -55,7 +55,7 @@ the next 2–3 epics to plan in detail. Planning baseline for the next 1–2 wee
 | Epic | Status | Remaining |
 |---|---|---|
 | **Spectator (event bus + live sessions)** | Phases 0/1/2.1/2.2/2.2b/2.2c/2.3/3/4/5 ✅ | **Phase 6** — multi-platform CLI `loom spectate` + hardening |
-| **EPIC 2 — Unify Visibility (#66)** | 13 of 14 slices ✅ | **Slice S4 (UNIFY-1d)** — migrate HUD handlers to contracts package (only deprecated-alias cleanup landed; full handler migration pending) |
+| **EPIC 2 — Unify Visibility (#66)** | 14 of 14 slices ✅ | **DONE** (Slice S4 closeout shipped 2026-05-21; see [104-impl-plan](104-implementation-plan-unify-visibility-2026-05-06.md) Slice S4 status) |
 | **Harbor 401 incident followups** | #2/#3/#4 ✅, #1 CI prereq ✅ | **#1 final** — loom-core `ImageRepository`/`ImagePolicy`/`ImageUpdateAutomation` CRDs (one design choice; ~30 min) |
 | **Mills v2 (formerly hive-v2)** | Phases 1–8 ✅ | None on critical path; v2.1 audit-blocking + default-on cross-repo deferred |
 
@@ -100,15 +100,13 @@ These are < 1 day each and close out epics already 80–95% shipped. Land these
 **before** kicking off new epics so the cognitive overhead per session stays
 low.
 
-### S4 — UNIFY-1d: migrate HUD handlers to contracts package
+### S4 — UNIFY-1d: migrate HUD handlers to contracts package ✅ SHIPPED (2026-05-21)
 - Source: `.loom/104-implementation-plan-unify-visibility-2026-05-06.md` slice S4.
-- What's done: bridge.* deprecated aliases migrated (commit `d97cf28b`); CI is
-  green on staticcheck.
-- What remains: walk `internal/hud/handlers/*.go` and convert direct
-  `bridge.{ServerHealth,StatusResult,CostStatsResult,...}` references to the
-  `internal/visibility/contracts/{health,status,cost,presence}` packages.
-  Estimated 1 short session.
-- Gate: `golangci-lint run ./...` clean; HUD smoke loads identical payloads.
+- Shipped in two passes:
+  - `d97cf28b` (2026-05-06): migrated 23 SA1019 staticcheck violations on `bridge.{ServerHealth,HealthEntry,HealthDivergence,HealthDivergenceEntry,HealthResult,StatusResult}` to `internal/visibility/contracts/{health,status}` callers; removed those alias declarations once consumers were clean.
+  - **UNIFY-1d closeout** (2026-05-21, this RALPH iteration): removed the residual `bridge.{PresenceInfo,CostStatsResult,CostAgentUsage,CostServerUsage,CostTotals}` aliases — zero remaining callers; rewrote `DaemonClient.CostStats()` → `*costpkg.CostStatsResult` and `AgentBridge.PresenceList()` → `[]presencepkg.PresenceInfo`.
+- Verified: `make ci-contracts` green (27 mobile golden files byte-identical), `golangci-lint run ./internal/hud/... ./internal/visibility/... ./cmd/loom/...` 0 issues, all HUD/contracts/cmd test packages pass.
+- Note: real call sites lived in `internal/hud/monitor/{health,fleet}.go` + bridge package internals, not the `internal/hud/handlers/*.go` directory listed in this plan (which never existed). The plan's `bridge.{ServerHealth,StatusResult,CostStatsResult,...}` enumeration was correct; the file path was wrong.
 
 ### Spectator Phase 6 — CLI spectate + hardening
 - Source: `.loom/99-implementation-plan-agent-telemetry-spectator-2026-05-04.md`

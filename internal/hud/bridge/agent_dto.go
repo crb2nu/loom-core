@@ -8,8 +8,6 @@ package bridge
 
 import (
 	"encoding/json"
-
-	presencepkg "github.com/crb2nu/loom/internal/visibility/contracts/presence"
 )
 
 // --- Session DTOs ---
@@ -363,19 +361,6 @@ type ContextInspectResult struct {
 }
 
 // --- Presence / Coordination DTOs ---
-
-// PresenceInfo describes an agent in the presence registry.
-//
-// IsOrphan / OrphanAgeSeconds are derived by fleetview.Join from the
-// presence+session pair; they are never persisted or trusted across
-// snapshots. An orphan is a heartbeating presence that has no matching
-// active session — the typical signature of a vendor CLI that registered
-// presence (or got auto-registered on heartbeat) but never successfully
-// called agent_session_start.
-//
-// Deprecated: use internal/visibility/contracts/presence.PresenceInfo.
-// Retained as an alias for backward compatibility during EPIC 2 (#66).
-type PresenceInfo = presencepkg.PresenceInfo
 
 // PresenceHeartbeatResult is the response from agent_presence_heartbeat.
 type PresenceHeartbeatResult struct {

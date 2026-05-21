@@ -392,18 +392,12 @@ func (c *DaemonClient) callLocked(method string, params any) (json.RawMessage, e
 
 // --- Typed RPC result structs ---
 
-// EPIC 2 close-out (UNIFY-1d): Status/Health type aliases that lived here
-// as "Retained for backward compat during EPIC 2 (#66)" were removed once
-// every consumer (cmd/, internal/, pkg/, services/loom, apps/) was
-// confirmed clean of bridge.{StatusResult,HealthEntry,HealthDivergence,
-// HealthDivergenceEntry,HealthResult,ServerHealth} references. Use
-// internal/visibility/contracts/{status,health} directly.
-//
-// Cost and Presence aliases remain because bridge.DaemonClient.CostStats()
-// and bridge.AgentBridge.PresenceList() still return them as method
-// signatures. A follow-up slice can change those signatures to costpkg.*
-// / presencepkg.* directly (the alias means no caller needs updating —
-// the types are identical).
+// EPIC 2 close-out (UNIFY-1d): all bridge.* type aliases for visibility
+// contracts have been removed. Consumers (cmd/, internal/, pkg/) use the
+// canonical types in internal/visibility/contracts/{status,health,cost,
+// presence} directly. bridge.DaemonClient.CostStats() returns
+// *costpkg.CostStatsResult and bridge.AgentBridge.PresenceList() returns
+// []presencepkg.PresenceInfo.
 
 // ServerInfo describes a registered MCP server.
 type ServerInfo struct {
@@ -530,33 +524,13 @@ func (c *DaemonClient) CacheStats() (*CacheStatsResult, error) {
 	return &result, nil
 }
 
-// CostStatsResult holds the response from loom/cost-stats.
-//
-// Deprecated: use internal/visibility/contracts/cost.CostStatsResult.
-type CostStatsResult = costpkg.CostStatsResult
-
-// CostAgentUsage summarizes per-agent cost data.
-//
-// Deprecated: use internal/visibility/contracts/cost.CostAgentUsage.
-type CostAgentUsage = costpkg.CostAgentUsage
-
-// CostServerUsage summarizes per-server cost data.
-//
-// Deprecated: use internal/visibility/contracts/cost.CostServerUsage.
-type CostServerUsage = costpkg.CostServerUsage
-
-// CostTotals summarizes aggregate cost data.
-//
-// Deprecated: use internal/visibility/contracts/cost.CostTotals.
-type CostTotals = costpkg.CostTotals
-
 // CostStats returns cost/usage tracking statistics.
-func (c *DaemonClient) CostStats() (*CostStatsResult, error) {
+func (c *DaemonClient) CostStats() (*costpkg.CostStatsResult, error) {
 	raw, err := c.Call("loom/cost-stats", nil)
 	if err != nil {
 		return nil, err
 	}
-	var result CostStatsResult
+	var result costpkg.CostStatsResult
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("unmarshal cost-stats: %w", err)
 	}
