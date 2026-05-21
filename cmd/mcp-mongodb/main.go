@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -83,6 +84,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-mongodb", "version", version, "uri", mongoURI)
 
 	server := mcp.NewServer("mcp-mongodb", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("MongoDB database tools. Configure with MONGODB_URI and optionally MONGODB_DATABASE for default database.")
 
 	// Database operations

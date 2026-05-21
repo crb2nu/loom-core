@@ -17,6 +17,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -315,6 +316,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-godot", "version", version, "host", host, "port", port)
 
 	server := mcp.NewServer("mcp-godot", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Godot debugging server. Requires Godot plugin running on localhost:6550.")
 
 	registerTools(server, wrap)

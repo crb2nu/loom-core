@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
@@ -58,6 +59,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-notion", "version", version)
 
 	server := mcp.NewServer("mcp-notion", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Notion pages and databases tools. Configure with NOTION_API_KEY (integration token).")
 
 	// Search

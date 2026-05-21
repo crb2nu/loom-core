@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -69,6 +70,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-redis", "version", version)
 
 	server := mcp.NewServer("mcp-redis", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Redis MCP server. Inspect cache data, monitor connections, and analyze performance.")
 
 	// redis_info

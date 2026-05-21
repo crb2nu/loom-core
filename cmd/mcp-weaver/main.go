@@ -10,6 +10,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/flexinfer"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -83,6 +84,7 @@ func run(ctx context.Context) error {
 	)
 
 	server := mcp.NewServer("mcp-weaver", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions(`Orchestra MCP Server (standalone)
 
 This server provides multi-tool orchestrated queries using local AI models

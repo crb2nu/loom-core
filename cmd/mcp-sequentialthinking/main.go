@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -97,6 +98,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-sequentialthinking", "version", version, "path", persistPath)
 
 	server := mcp.NewServer("mcp-sequentialthinking", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Sequential thinking server for structured reasoning. Use start_thinking to begin, add_thought to continue, and complete_chain to finish.")
 
 	// start_thinking - Start a new thought chain

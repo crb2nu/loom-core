@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -144,6 +145,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-flux", "version", version, "namespace", namespace)
 
 	server := mcp.NewServer("mcp-flux", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Flux CD GitOps MCP server. Manage sources, kustomizations, and helm releases. Uses the flux CLI when available, otherwise falls back to Kubernetes API for core operations.")
 
 	// get_sources

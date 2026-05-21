@@ -14,6 +14,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -57,6 +58,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-alertmanager", "version", version, "url", amURL)
 
 	server := mcp.NewServer("mcp-alertmanager", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Alertmanager MCP server. Manage alerts and silences.")
 	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
 		return mcpotel.TracedToolHandler(tracer, name, h)

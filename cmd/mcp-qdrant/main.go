@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -50,6 +51,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-qdrant", "version", version, "url", qdrantURL)
 
 	server := mcp.NewServer("mcp-qdrant", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Qdrant vector database operations")
 
 	registerTools(server, wrap)

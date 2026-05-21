@@ -17,6 +17,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -56,6 +57,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-docker", "version", version)
 
 	server := mcp.NewServer("mcp-docker", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Docker CLI operations. Tools: docker_version, docker_info, docker_ps, docker_images, docker_inspect, docker_logs, docker_exec")
 
 	registerTools(server, tracer)

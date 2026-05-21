@@ -12,6 +12,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
@@ -59,6 +60,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-minio", "version", version, "endpoint", endpoint)
 
 	server := mcp.NewServer("mcp-minio", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("MinIO/S3 file management")
 
 	registerTools(server, wrap)

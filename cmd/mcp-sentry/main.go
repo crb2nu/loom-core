@@ -14,6 +14,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -65,6 +66,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-sentry", "version", version, "url", sentryURL)
 
 	server := mcp.NewServer("mcp-sentry", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Sentry error tracking tools. Configure with SENTRY_AUTH_TOKEN and SENTRY_ORG. Optionally set SENTRY_URL for self-hosted instances.")
 
 	// Organizations and Projects

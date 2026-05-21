@@ -13,6 +13,7 @@ import (
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -180,6 +181,7 @@ func run(ctx context.Context) error {
 	)
 
 	server := mcp.NewServer("mcp-linkedin", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("LinkedIn personal account management. Supports profile reads and messaging operations. Configure via LINKEDIN_ACCESS_TOKEN or LINKEDIN_SESSION_COOKIE.")
 
 	server.AddTool(mcp.Tool{

@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -83,6 +84,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-aws", "version", version, "region", awsRegion)
 
 	server := mcp.NewServer("mcp-aws", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("AWS services tools. Uses standard AWS credential chain (env vars, shared credentials, IAM role). Set AWS_REGION to change region.")
 
 	// Identity

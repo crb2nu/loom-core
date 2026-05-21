@@ -15,8 +15,13 @@
   regression tests confirm 10 callers × 100 ms latency complete in ~100 ms.
   **S3-followup 2026-05-20**: default flipped off→on; opt-out via
   `LOOM_MUX_STDIO=0`. R3 soak deferred to post-merge observation (rollback
-  is a single env-var change). See implementation plan "S3 wire-up outcome"
-  and "S3-followup default flip".
+  is a single env-var change). **S2.5 PASSED 2026-05-20**: handler-side
+  parallel dispatch enabled across every loom-owned MCP binary via
+  `internal/loomconcurrency` (default `LOOM_MCP_CONCURRENCY=8`, opt out
+  with `=1` for the legacy sequential mode). The wire is now parallel
+  AND the servers are now parallel. See implementation plan "S3 wire-up
+  outcome", "S3-followup default flip", and "S2.5 handler concurrency
+  outcome".
 
 ## Riskiest assumption + kill-test
 

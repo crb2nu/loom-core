@@ -30,6 +30,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -71,6 +72,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-browserkit", "version", version)
 
 	server := mcp.NewServer("mcp-browserkit", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions(strings.TrimSpace(`
 BrowserKit screenshot server (local-only).
 

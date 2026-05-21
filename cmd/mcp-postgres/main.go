@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -94,6 +95,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-postgres", "version", version)
 
 	server := mcp.NewServer("mcp-postgres", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("PostgreSQL MCP server. Inspect schemas and run read-only queries.")
 
 	// pg_list_databases

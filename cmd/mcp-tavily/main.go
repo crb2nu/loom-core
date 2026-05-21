@@ -13,6 +13,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -79,6 +80,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-tavily", "version", version)
 
 	server := mcp.NewServer("mcp-tavily", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Fast Go-native Tavily AI search MCP server. Web search, news search, and content extraction.")
 
 	// search

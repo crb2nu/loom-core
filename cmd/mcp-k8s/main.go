@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -64,6 +65,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-k8s", "version", version, "kubeconfig", kubeconfig)
 
 	server := mcp.NewServer("mcp-k8s", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Fast Go-native Kubernetes MCP server. Supports pods, deployments, services, logs, and more.")
 
 	// list_pods
