@@ -4,7 +4,15 @@
   import { formatTraceDuration, traceBreakdown, traceStatusVariant } from '../utils/traces.ts';
   import EmptyState from './shared/EmptyState.svelte';
   import Badge from '../widgets/Badge.svelte';
+  import VirtualList from '../widgets/VirtualList.svelte';
   import { formatTime } from '../utils/format.ts';
+
+  // Audit-driven trace lists are unbounded; virtualize the render path so a
+  // backlog of thousands of entries doesn't pin the renderer. Fixed height
+  // covers the common two-line trace; long error messages clip with an
+  // ellipsis inside the row (the full error is preserved in the title
+  // tooltip and remains available in the audit stream).
+  const TRACE_ROW_HEIGHT = 104;
 
   const tracePollingOwner = Symbol('TracesPanel');
 
@@ -126,41 +134,43 @@
     {/if}
   {:else}
     <div class="trace-list">
-      {#each filtered as entry, i (`${entry.timestamp}-${entry.server}-${entry.tool}-${i}`)}
-        <div class="trace-row">
-          <div class="trace-row-top">
-            <div class="trace-id">
-              <span class="trace-time">{formatTime(entry.timestamp)}</span>
-              <span class="trace-server">{entry.server}</span>
-              <span class="trace-tool">{entry.tool}</span>
+      <VirtualList items={filtered} itemHeight={TRACE_ROW_HEIGHT}>
+        {#snippet children({ item: entry })}
+          <div class="trace-row">
+            <div class="trace-row-top">
+              <div class="trace-id">
+                <span class="trace-time">{formatTime(entry.timestamp)}</span>
+                <span class="trace-server">{entry.server}</span>
+                <span class="trace-tool">{entry.tool}</span>
+              </div>
+              <div class="trace-badges">
+                <span class="trace-duration">{formatTraceDuration(entry.duration_ms)}</span>
+                <Badge text={entry.status} variant={traceStatusVariant(entry.status)} />
+                {#if entry.cached}
+                  <Badge text="cached" variant="info" />
+                {/if}
+                {#if entry.target}
+                  <Badge text={entry.target} variant="accent" />
+                {/if}
+              </div>
             </div>
-            <div class="trace-badges">
-              <span class="trace-duration">{formatTraceDuration(entry.duration_ms)}</span>
-              <Badge text={entry.status} variant={traceStatusVariant(entry.status)} />
-              {#if entry.cached}
-                <Badge text="cached" variant="info" />
+            <div class="trace-row-meta">
+              {#if entry.agent_id}
+                <span class="meta-chip">{entry.agent_id}</span>
               {/if}
-              {#if entry.target}
-                <Badge text={entry.target} variant="accent" />
+              {#if entry.pipeline_stage}
+                <span class="meta-chip">{entry.pipeline_stage}</span>
+              {/if}
+              {#if traceBreakdown(entry)}
+                <span class="meta-chip breakdown">{traceBreakdown(entry)}</span>
               {/if}
             </div>
-          </div>
-          <div class="trace-row-meta">
-            {#if entry.agent_id}
-              <span class="meta-chip">{entry.agent_id}</span>
-            {/if}
-            {#if entry.pipeline_stage}
-              <span class="meta-chip">{entry.pipeline_stage}</span>
-            {/if}
-            {#if traceBreakdown(entry)}
-              <span class="meta-chip breakdown">{traceBreakdown(entry)}</span>
+            {#if entry.error}
+              <div class="trace-error" title={entry.error}>{entry.error}</div>
             {/if}
           </div>
-          {#if entry.error}
-            <div class="trace-error">{entry.error}</div>
-          {/if}
-        </div>
-      {/each}
+        {/snippet}
+      </VirtualList>
     </div>
   {/if}
 
@@ -249,15 +259,21 @@
     background: color-mix(in srgb, var(--info) 10%, var(--bg-tertiary));
   }
 
+  /* VirtualList owns the scroll viewport; .trace-list just provides a
+     bounded flex slot inside .traces-panel so VirtualList can compute its
+     own client height. The inter-row gap is baked into TRACE_ROW_HEIGHT
+     (96px row + 8px gap) since absolute-positioned children can't use
+     flex gap. */
   .trace-list {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    overflow: auto;
+    flex: 1;
     min-height: 0;
+    overflow: hidden;
   }
 
   .trace-row {
+    box-sizing: border-box;
+    height: 96px;
+    overflow: hidden;
     padding: 12px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -319,6 +335,11 @@
     margin-top: 8px;
     color: var(--error);
     font-size: var(--text-sm);
+    /* Single-line clamp so a long error doesn't blow past the fixed row
+       height; full text is kept in the title attribute and the audit log. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .trace-footer {
