@@ -57,11 +57,9 @@ cat > "$PLIST" <<EOF
     <string>com.loom.mount-nfs</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/sbin/mount_nfs</string>
-        <string>-o</string>
-        <string>rw,resvport,noowners,nolockd,hard,intr,tcp,noatime,acregmin=3,acdirmin=0,acdirmax=5,mapall=1000:1000</string>
-        <string>${NFS_SERVER}:${NFS_PATH}</string>
-        <string>${MOUNT_POINT}</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>/sbin/mount | /usr/bin/grep -q ' ${MOUNT_POINT} ' || /sbin/mount_nfs -o rw,resvport,noowners,nolockd,hard,intr,tcp,noatime,acregmin=3,acdirmin=0,acdirmax=5,mapall=1000:1000 ${NFS_SERVER}:${NFS_PATH} ${MOUNT_POINT}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
