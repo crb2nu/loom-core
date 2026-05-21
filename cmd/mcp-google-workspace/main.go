@@ -16,6 +16,7 @@ import (
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/people/v1"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -73,6 +74,7 @@ func run(ctx context.Context) error {
 	}
 
 	server := mcp.NewServer("mcp-google-workspace", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Google Workspace MCP. Uses Loom-managed Google OAuth secrets (client ID, client secret, refresh token) configured via `loom auth google login`.")
 	registerTools(server, srv, tracer)
 

@@ -13,6 +13,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -81,6 +82,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-helm", "version", version, "namespace", namespace)
 
 	server := mcp.NewServer("mcp-helm", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Helm MCP server. Manage Helm releases and charts.")
 
 	// helm_list

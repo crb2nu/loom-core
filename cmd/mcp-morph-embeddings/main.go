@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -55,6 +56,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-morph-embeddings", "version", version)
 
 	server := mcp.NewServer("mcp-morph-embeddings", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Morph embeddings and Qdrant vector search")
 
 	registerTools(server, wrap)

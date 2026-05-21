@@ -15,6 +15,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
@@ -52,6 +53,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-zep", "version", version)
 
 	server := mcp.NewServer("mcp-zep", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Zep Cloud memory server. Tools: zep_health, zep_add_messages, zep_get_messages")
 
 	// zep_health - Check connectivity

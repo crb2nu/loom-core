@@ -16,6 +16,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
@@ -66,6 +67,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-slack", "version", version)
 
 	server := mcp.NewServer("mcp-slack", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Slack MCP server. Search messages, list channels, post messages. Requires SLACK_BOT_TOKEN with appropriate scopes.")
 	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
 		return mcpotel.TracedToolHandler(tracer, name, h)

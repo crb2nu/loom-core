@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -104,6 +105,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-flexinfer", "version", version, "namespace", namespace)
 
 	server := mcp.NewServer("mcp-flexinfer", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("FlexInfer AI inference operator MCP server. Manage Model CRs, LoRA adapters, model catalogs, GPU status, and proxy health. Uses Kubernetes API with unstructured client for CRD operations.")
 
 	// --- Read-only tools (always_allow) ---

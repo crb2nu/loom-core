@@ -13,6 +13,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -56,6 +57,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-github-actions", "version", version)
 
 	server := mcp.NewServer("mcp-github-actions", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("GitHub Actions MCP server. Manage workflows, runs, and jobs. Requires GITHUB_TOKEN or GITHUB_PERSONAL_ACCESS_TOKEN.")
 	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
 		return mcpotel.TracedToolHandler(tracer, name, h)

@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -51,6 +52,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-release", "version", version)
 
 	server := mcp.NewServer("mcp-release", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Multi-channel release orchestration. Tools: release_validate, release_changelog, release_status")
 
 	server.AddTool(mcp.Tool{

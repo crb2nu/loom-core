@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -59,6 +60,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-grafana", "version", version, "url", grafanaURL)
 
 	server := mcp.NewServer("mcp-grafana", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Grafana dashboard search and retrieval")
 	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
 		return mcpotel.TracedToolHandler(tracer, name, h)

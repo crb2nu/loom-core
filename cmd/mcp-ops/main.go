@@ -14,6 +14,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -64,6 +65,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-ops", "version", version)
 
 	server := mcp.NewServer("mcp-ops", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Operations MCP server for k3s and Harvester operations")
 
 	registerTools(server, wrap)

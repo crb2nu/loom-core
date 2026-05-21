@@ -10,6 +10,7 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
 )
@@ -57,6 +58,15 @@ func NewServer(ctx context.Context, name, version string, opts ...Option) (*Serv
 	if cfg.instructions != "" {
 		srv.SetInstructions(cfg.instructions)
 	}
+
+	// Opt every scaffold-built server into bounded parallel handler
+	// dispatch. mcp-go.Server defaults to concurrencyLimit=1 (sequential)
+	// for backward compatibility — without this call the per-id stdio mux
+	// in pkg/transport/muxstdio carries packets in parallel but the server
+	// still processes them one at a time, so callers see no end-to-end
+	// throughput improvement. LOOM_MCP_CONCURRENCY=1 keeps the legacy
+	// sequential mode if a binary needs it.
+	loomconcurrency.Apply(srv)
 
 	return &Server{
 		Server: srv,

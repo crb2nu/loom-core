@@ -14,6 +14,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -66,6 +67,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-elasticsearch", "version", version, "url", esURL)
 
 	server := mcp.NewServer("mcp-elasticsearch", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Elasticsearch search and cluster management tools. Configure with ELASTICSEARCH_URL, ELASTICSEARCH_USERNAME/PASSWORD or ELASTICSEARCH_API_KEY.")
 
 	// Search

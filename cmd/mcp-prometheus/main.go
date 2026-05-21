@@ -13,6 +13,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -60,6 +61,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-prometheus", "version", version, "url", promURL)
 
 	server := mcp.NewServer("mcp-prometheus", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Fast Go-native Prometheus MCP server. Query metrics, alerts, and targets.")
 
 	// query

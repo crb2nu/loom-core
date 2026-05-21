@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -56,6 +57,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-jira", "version", version, "url", srv.jiraURL)
 
 	server := mcp.NewServer("mcp-jira", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Interact with Jira (get issues, search, transition, comment). Requires JIRA_URL, JIRA_USERNAME, and JIRA_API_TOKEN.")
 
 	registerTools(server, srv, tracer)

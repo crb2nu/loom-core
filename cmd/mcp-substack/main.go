@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -87,6 +88,7 @@ func run(ctx context.Context) error {
 		"subdomain", subdomain, "user_id", s.userID)
 
 	server := mcp.NewServer("mcp-substack", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Substack publication management. Create drafts, publish posts, and read archives for your newsletter.")
 
 	server.AddTool(mcp.Tool{

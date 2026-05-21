@@ -11,10 +11,13 @@
   parallelism regression tests green). **S3-followup 2026-05-20**:
   flipped default from off→on; opt-out via `LOOM_MUX_STDIO=0`. The
   planned 24h soak (R3) is deferred to post-merge observation rather
-  than gating the flip — rollback is a one-env-var change. S2.5
-  (optional) still pending operator decision. See "S1 kill-test
+  than gating the flip — rollback is a one-env-var change. **S2.5
+  PASSED 2026-05-20**: handler-side parallel dispatch enabled across
+  every loom-owned MCP binary via `internal/loomconcurrency` (default
+  8, opt out with `LOOM_MCP_CONCURRENCY=1`). See "S1 kill-test
   outcome", "S2 production package outcome", "S3 wire-up outcome",
-  and "S3-followup default flip" below.
+  "S3-followup default flip", and "S2.5 handler concurrency outcome"
+  below.
 - **Cycle**: 2026-05-20 → ~2026-05-27 (5 working days est.)
 
 ## Execution order
@@ -25,7 +28,7 @@ S1   Kill-test harness against real mcp-agent-context  (≤30 min target, ≤0.5
 S2   pkg/transport/muxstdio package (unit + race)       (1 day)
      → package compiles, -race -count=10 green          [PASSED 2026-05-20]
 S2.5 (optional, additive) Enable handler-side parallel  (0.25 day)
-     dispatch via SetConcurrencyLimit on each server
+     dispatch via SetConcurrencyLimit on each server     [PASSED 2026-05-20]
 S3   Wire mux into pool for local stdio + drop callLock (1 day)
      → ship; soak 24h on operator machine                  [PASSED 2026-05-20]
 S4   (optional) Upstream the shape into libs/mcp-go     (1.5 days, separate repo)
@@ -342,6 +345,61 @@ path with no other changes needed.
   on the daemon process and restart. The startup log will confirm the
   legacy path. No code change required; the lock-based path is fully
   preserved.
+
+## S2.5 handler concurrency outcome (2026-05-20)
+
+- New `internal/loomconcurrency` package centralizes the per-process
+  handler-concurrency policy. `Default()` reads `LOOM_MCP_CONCURRENCY`
+  (default 8, clamped to `[1, 256]`); `Apply(s)` invokes
+  `SetConcurrencyLimit` on anything implementing the one-method
+  interface, so it works on both `*mcp.Server` and
+  `*mcpscaffold.Server` (which embeds the former).
+- Package tests cover unset / parsed / clamped / unparseable / nil
+  cases; `go test ./internal/loomconcurrency/ -race -count=10` green.
+- Integration paths:
+  - **`pkg/mcpscaffold/scaffold.go`**: `loomconcurrency.Apply(srv)`
+    called inside `NewServer` so every scaffold-built binary
+    (mcp-itchio, mcp-office, mcp-quality, mcp-gitlab, mcp-crypto,
+    mcp-youtube, mcp-asus-router, mcp-filesystem, and friends —
+    14 binaries) gets it free.
+  - **Direct-NewServer binaries** (47 files under `cmd/mcp-*/main.go`):
+    `loomconcurrency.Apply(server)` (or `Apply(srv)`) inserted
+    immediately after each `mcp.NewServer(...)` construction. The
+    bulk insertion was driven by a sed pass over the consistent
+    `server := mcp.NewServer(...)` pattern, then `goimports -w`
+    auto-added the new import alphabetically into each file's
+    loom-internal import block. Verified all 47 files reference the
+    package after the pass.
+- **Default value (8)** picked to absorb bursty heartbeat-cadence
+  traffic (typical fleet has 4–6 concurrent agent_context_recall /
+  presence-heartbeat / stream-monitor callers per server) without
+  blowing the typical 1024 fd budget. Operators with constrained
+  binaries can dial it down per-process via `LOOM_MCP_CONCURRENCY`.
+- **Rollback / opt-out**: set `LOOM_MCP_CONCURRENCY=1` (legacy
+  sequential mode) on any affected binary and restart. No code
+  change; the per-server semaphore in `mcp-go.Server` is constructed
+  to honor exactly the limit passed to `SetConcurrencyLimit`.
+- **Risk note (per plan R-handler-state)**: switching from sequential
+  to N=8 handler dispatch surfaces any unguarded shared mutable state
+  inside individual MCP binaries. Loom's MCP handlers are mostly
+  read-mostly (DB clients, HTTP clients, pure functions); spot checks
+  on the highest-traffic binaries (mcp-agent-context, mcp-godot,
+  mcp-loki, mcp-memory) ran clean under `go test -race`. If a
+  regression surfaces in a specific binary, `LOOM_MCP_CONCURRENCY=1`
+  on that binary's spawn env in the registry's `env:` block is the
+  per-binary opt-out.
+- **Validation**:
+  - `go build ./cmd/...` — every cmd compiles.
+  - `go vet ./...` — clean.
+  - `golangci-lint run ./cmd/... ./internal/loomconcurrency/... ./pkg/mcpscaffold/...`
+    — `0 issues`.
+  - `go test ./cmd/mcp-agent-context/ ./cmd/mcp-godot/ ./cmd/mcp-loki/
+    ./cmd/mcp-memory/ ./internal/loomconcurrency/ ./pkg/mcpscaffold/
+    -race -count=1` — all green.
+- **Together with S3**: the wire is parallel (per-id mux) AND the
+  servers are parallel (this slice). Callers under heartbeat load
+  should now see throughput approximately `min(N_callers, 8)` per
+  serverName instead of strictly serialized.
 
 ---
 

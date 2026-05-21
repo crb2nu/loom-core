@@ -13,6 +13,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -68,6 +69,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-vault", "version", version, "addr", vaultAddr)
 
 	server := mcp.NewServer("mcp-vault", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("HashiCorp Vault secrets management tools. Configure with VAULT_ADDR and VAULT_TOKEN. Optionally set VAULT_NAMESPACE for enterprise namespaces.")
 
 	// Health/Status

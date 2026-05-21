@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
@@ -58,6 +59,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-linear", "version", version)
 
 	server := mcp.NewServer("mcp-linear", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Linear issue tracking tools. Configure with LINEAR_API_KEY.")
 
 	// Issues

@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -90,6 +91,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-memory", "version", version, "path", persistPath)
 
 	server := mcp.NewServer("mcp-memory", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Knowledge graph memory for persistent context. Store entities, relations, and observations.")
 
 	// create_entities

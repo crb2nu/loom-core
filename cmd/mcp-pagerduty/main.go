@@ -13,6 +13,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -61,6 +62,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-pagerduty", "version", version)
 
 	server := mcp.NewServer("mcp-pagerduty", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("PagerDuty incident management tools. Configure with PAGERDUTY_API_KEY.")
 
 	// Incidents

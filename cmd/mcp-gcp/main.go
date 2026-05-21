@@ -17,6 +17,7 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 	"google.golang.org/api/iterator"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
@@ -94,6 +95,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-gcp", "version", version, "project", gcpProject, "region", gcpRegion)
 
 	server := mcp.NewServer("mcp-gcp", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Google Cloud Platform tools. Uses Application Default Credentials or GOOGLE_APPLICATION_CREDENTIALS. Set GCP_PROJECT for project-scoped operations.")
 
 	// Cloud Storage

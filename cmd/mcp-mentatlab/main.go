@@ -13,6 +13,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
@@ -60,6 +61,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-mentatlab", "version", version, "base_url", srv.baseURL)
 
 	server := mcp.NewServer("mcp-mentatlab", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("MentatLab orchestrator MCP server. Tools cover run lifecycle (create, start, list, get, cancel, clone), agent management (list, get, register), flow management (list, get, create), gate operations (approve, reject), and health diagnostics.")
 
 	registerRunTools(server, srv, tracer)

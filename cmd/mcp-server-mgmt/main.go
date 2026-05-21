@@ -12,6 +12,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -73,6 +74,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-server-mgmt", "version", version)
 
 	server := mcp.NewServer("server-mgmt", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("SSH-based Linux server management")
 
 	// Register tools
