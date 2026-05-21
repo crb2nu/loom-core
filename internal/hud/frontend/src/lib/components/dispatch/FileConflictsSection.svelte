@@ -17,6 +17,10 @@
       presenceActionsStore.onReleaseClaim(agentId, file);
     }
   }
+
+  function releaseFile(agentId, file) {
+    presenceActionsStore.onReleaseClaim(agentId, file);
+  }
 </script>
 
 <section class="dispatch-section">
@@ -45,7 +49,29 @@
             {#if conflict.files?.length}
               <div class="conflict-files">
                 {#each conflict.files as file}
-                  <div class="conflict-file">{file}</div>
+                  <div class="conflict-file">
+                    <span class="conflict-file-path">{file}</span>
+                    <span class="conflict-file-actions">
+                      <button
+                        type="button"
+                        class="file-release-btn file-release-left"
+                        title={`Release ${file} from ${conflict.left_agent}`}
+                        aria-label={`Release ${file} from ${conflict.left_agent}`}
+                        onclick={() => releaseFile(conflict.left_agent, file)}
+                      >
+                        {'←'} L
+                      </button>
+                      <button
+                        type="button"
+                        class="file-release-btn file-release-right"
+                        title={`Release ${file} from ${conflict.right_agent}`}
+                        aria-label={`Release ${file} from ${conflict.right_agent}`}
+                        onclick={() => releaseFile(conflict.right_agent, file)}
+                      >
+                        R {'→'}
+                      </button>
+                    </span>
+                  </div>
                 {/each}
               </div>
             {/if}
@@ -66,6 +92,12 @@
                 Nudge {conflict.right_agent}
               </button>
               {#if conflict.files?.length}
+                <button
+                  class="btn btn-sm btn-release"
+                  onclick={() => releaseConflict(conflict.left_agent, conflict.files)}
+                >
+                  Release left
+                </button>
                 <button
                   class="btn btn-sm btn-release"
                   onclick={() => releaseConflict(conflict.right_agent, conflict.files)}
@@ -151,10 +183,56 @@
   }
 
   .conflict-file {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
     font-family: var(--font-mono);
     font-size: var(--text-xs);
     color: var(--fg-secondary);
     padding-left: var(--space-2);
+  }
+
+  .conflict-file-path {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .conflict-file-actions {
+    display: inline-flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .file-release-btn {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    border: 1px solid transparent;
+    background: transparent;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .file-release-btn.file-release-left {
+    color: var(--accent);
+    border-color: rgba(var(--accent-rgb, 100, 160, 255), 0.4);
+  }
+
+  .file-release-btn.file-release-left:hover {
+    background: rgba(var(--accent-rgb, 100, 160, 255), 0.15);
+  }
+
+  .file-release-btn.file-release-right {
+    color: var(--warning);
+    border-color: rgba(var(--warning-rgb, 255, 170, 51), 0.4);
+  }
+
+  .file-release-btn.file-release-right:hover {
+    background: rgba(var(--warning-rgb, 255, 170, 51), 0.15);
   }
 
   .conflict-detail {
