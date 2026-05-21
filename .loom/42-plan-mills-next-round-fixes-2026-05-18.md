@@ -5,6 +5,27 @@ to operator-facing leverage: data trust on the Overview, HUD parity with the
 CLI for the few day-2 actions that still force a terminal drop, and closing
 the deferred polish from the most recent KPI/Sub-tab feature.
 
+## Status (2026-05-21)
+
+| Slice | Status | Evidence |
+| --- | --- | --- |
+| 0 — Kill-test (operator walkthrough) | not run | requires live operator session |
+| 1 — HUD action parity for day-2 ops | not started | kill-test-gated |
+| 2 — KPI honesty | **shipped 2026-05-19** | `dbccd413` (MR merged via `a748d138`) |
+| 3 — Sub-tab counts coverage | **shipped 2026-05-19** | `f99a48ef` (MR merged via `e6110f95`) |
+| 4 — Spawn/escalator stabilization debt | **shipped 2026-05-19** | `985f2f5d` (MR merged via `55a0bcf0`); STATES.md at `pkg/mills/pipeline/STATES.md` |
+| 5 — Idle-state one-click | **shipped 2026-05-19** | `53419638` (MR merged via `b9c6ca66`) |
+
+Slice 4 deviation from the original plan: STATES.md landed in
+`pkg/mills/pipeline/`, not `pkg/mills/runner/` — the pipeline package
+owns the spawn lifecycle state machine; `pkg/mills/runner/` is the
+council runner. The doc covers both state machines + the cross-component
+seam and includes the 4a regression-test audit inline.
+
+The kill-test for Slice 1 is the only remaining gate. Slice 4 finished
+ahead of Slice 1 because Slices 2/3/4/5 are mutually independent and 4
+did not require the operator walkthrough.
+
 ## Riskiest assumption + kill-test
 
 **Load-bearing assumption**: The "drop to CLI / curl" friction on the Mills
@@ -136,6 +157,11 @@ Actions:
 
 ### Slice 2 — KPI honesty (data trust)
 
+**Status**: shipped 2026-05-19 via `dbccd413` (`a748d138` merge).
+Backlog-grouped `cost_per_merged_change_usd` + label-driven
+`regression_rate` landed; KPI cards no longer carry a `(proxy)` chip
+for these two.
+
 **Scope**: Stop two KPIs from lying. Both are flagged in the
 23e40ad2 commit body as proxies.
 
@@ -180,6 +206,10 @@ Actions:
 
 ### Slice 3 — Sub-tab counts coverage (close deferred polish)
 
+**Status**: shipped 2026-05-19 via `f99a48ef` (`e6110f95` merge).
+`squads`, `audit`, and `cross-repo` sub-tabs now render count pills
+when nonzero.
+
 **Scope**: Wire counts on the three sub-tabs intentionally left
 countless in 23e40ad2: `squads`, `audit`, `cross-repo`.
 
@@ -203,8 +233,32 @@ countless in 23e40ad2: `squads`, `audit`, `cross-repo`.
 
 ### Slice 4 — Spawn/escalator stabilization debt
 
-**Scope**: Reduce the `fix(mills): ...` cadence by turning recent fixes
-into regression tests and consolidating the spawn lifecycle paths.
+**Status**: shipped 2026-05-19 via `985f2f5d` (`55a0bcf0` merge).
+Audit finding: all 6 named fix commits already shipped with regression
+tests that pin the post-fix invariants. No backfill was needed.
+State-machine reference landed at `pkg/mills/pipeline/STATES.md` (the
+pipeline package owns the spawn lifecycle wiring; the `runner/` path
+named in the plan is the council runner). The doc covers both state
+machines, the cross-component seam where the "ResumeSpawnID
+propagation" bugs cluster, 8 known sharp edges, and 3 follow-up slice
+candidates (none blocking).
+
+Regression-test audit table (canonical version inline in STATES.md):
+
+| Commit | Symptom fixed | Regression test |
+| --- | --- | --- |
+| `a3070890` | Empty `stage_results.log_tail` on plan_slice error rows | `TestRunner_PersistsSpawnFailureContextWhenWorkerReturnsEmptyError`, `TestRunner_PersistsSpawnFailureContextOnPendingPath`, `TestBuildFailureLogTail_Precedence` (`pkg/mills/pipeline/runner_test.go`) |
+| `a433ce06` | Cached WebSocket transport went stale after close 1006 / broken pipe | `TestCallTool_RetriesOnceAfterTransportClose1006`, `TestCallTool_RetriesOnceAfterBrokenPipeOnSend`, `TestCallTool_DoesNotRetryJSONRPCErrors`, `TestCallTool_StopsAfterOneRetry`, `TestIsTransportError` (`pkg/mills/clients/mcphub_test.go`) |
+| `6cb0dcd1` | `ResumeSpawnID` dropped at the fallback-dispatcher boundary | `TestFallbackDispatcher_PropagatesResumeSpawnID` (`cmd/loom-mills-operator/dispatcher_test.go`) |
+| `a08c8f7d` | Accepted spawn marked failed on poll interruption | `TestRunner_KeepsAcceptedSpawnPendingOnInterruptedPoll`, `TestMapTelemetryToResponse_PreservesTerminalStatusWithoutTelemetry` |
+| `f2dec2cf` | Double-dispatch on a stage with a pending spawn | `TestRunner_StartSuppressesDuplicateActiveRun`, `TestHandlePipelineEscalate_MarksRunAndBacklog` |
+| `f55f8cfe` | Spawn ID not recorded before first poll → mid-spawn escalation | `TestRun_RecordsAcceptedSpawnBeforePolling`, `TestResumePollsExistingSpawnWithoutPost`, `TestRunner_ResumesPendingStageSpawnAttempt` |
+
+---
+
+**Original scope** (preserved for context): Reduce the `fix(mills): ...`
+cadence by turning recent fixes into regression tests and
+consolidating the spawn lifecycle paths.
 
 Concrete subset (from `git log --oneline -- pkg/mills/ cmd/loom-mills-operator/`):
   - `a3070890 fix(mills): persist spawn failure context to stage_results.log_tail`
@@ -239,6 +293,11 @@ slice does:
 - `STATES.md` exists with the diagram + a "known sharp edges" list.
 
 ### Slice 5 — Idle-state one-click
+
+**Status**: shipped 2026-05-19 via `53419638` (`b9c6ca66` merge).
+Operator banner action now calls `/api/mills/council/run` directly
+instead of just navigating to the Council panel. Slice 5 piggybacked
+on the same MR that wired the deferred council scheduler.
 
 **Scope**: From the system-health banner's "idle" state
 (`OverviewPanel.svelte:54`, "Council has never run"), the action button
