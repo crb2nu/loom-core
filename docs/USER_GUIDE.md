@@ -277,6 +277,7 @@ Optional environment overrides:
 
 - `LOOM_HUD_PORT`: HUD API port
 - `LOOM_SOCKET`: daemon socket path (fallback path)
+- `LOOM_HUD_GIT_REMOTE_URL`: upstream forge project URL (e.g. `https://gitlab.flexinfer.ai/services/loom-core`) used to build merge-queue deep links (`Branch ↗` and `New MR ↗`) in the HUD Dispatch → Merge queue panel. When unset, the daemon auto-detects the URL by running `git remote get-url origin` from its working directory (2s timeout, fails gracefully when the daemon is not inside a git checkout). Embedded credentials (`user:password@host` and `oauth2:token@host`) are stripped before the URL reaches the frontend, and only `http(s)` schemes are emitted. Set this explicitly when the daemon runs outside a git checkout (e.g. in Kubernetes). Forge URL pattern is GitLab-style; GitHub support is a follow-up.
 
 Context budget inspection:
 
