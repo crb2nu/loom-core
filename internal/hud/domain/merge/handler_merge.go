@@ -1,23 +1,34 @@
 package merge
 
 import (
+	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"sort"
+	"strings"
 
 	"github.com/crb2nu/loom/internal/hud/coordination"
 )
 
+// gitRemoteURLEnv is the env var consulted by the merge domain to build
+// per-candidate deep links into the upstream forge. When unset, deep-link
+// fields are omitted from the JSON payload and the HUD renders nothing.
+const gitRemoteURLEnv = "LOOM_HUD_GIT_REMOTE_URL"
+
 // MergeCandidate represents an agent branch eligible for merge consideration.
 type MergeCandidate struct {
-	AgentID       string   `json:"agent_id"`
-	Branch        string   `json:"branch"`
-	Namespace     string   `json:"namespace,omitempty"`
-	Status        string   `json:"status"`
-	MergeReady    bool     `json:"merge_ready"`
-	MergeBlockers []string `json:"merge_blockers,omitempty"`
-	ConflictFiles int      `json:"conflict_files"`
-	BlockedTasks  int      `json:"blocked_tasks"`
-	TaskCount     int      `json:"task_count"`
+	AgentID            string   `json:"agent_id"`
+	Branch             string   `json:"branch"`
+	Namespace          string   `json:"namespace,omitempty"`
+	Status             string   `json:"status"`
+	MergeReady         bool     `json:"merge_ready"`
+	MergeBlockers      []string `json:"merge_blockers,omitempty"`
+	ConflictFiles      int      `json:"conflict_files"`
+	BlockedTasks       int      `json:"blocked_tasks"`
+	TaskCount          int      `json:"task_count"`
+	BranchURL          string   `json:"branch_url,omitempty"`
+	MergeRequestNewURL string   `json:"merge_request_new_url,omitempty"`
 }
 
 // MergeQueueResponse is the payload for GET /api/merge-queue.
@@ -55,22 +66,26 @@ type MergeConflictsResponse struct {
 // handleMergeQueue returns the ordered merge queue derived from the coordination snapshot.
 func (d *MergeDomain) handleMergeQueue(w http.ResponseWriter, r *http.Request) {
 	snap := d.deps.CoordinationSnapshot()
+	remoteURL := os.Getenv(gitRemoteURLEnv)
 
 	var ready, blocked []MergeCandidate
 	for _, agent := range snap.Agents {
 		if agent.Branch == "" || agent.Branch == "main" || agent.Branch == "master" {
 			continue
 		}
+		branchURL, mrURL := candidateURLs(remoteURL, agent.Branch)
 		candidate := MergeCandidate{
-			AgentID:       agent.AgentID,
-			Branch:        agent.Branch,
-			Namespace:     agent.Namespace,
-			Status:        agent.Status,
-			MergeReady:    agent.MergeReady,
-			MergeBlockers: agent.MergeBlockers,
-			ConflictFiles: agent.ConflictFiles,
-			BlockedTasks:  agent.BlockedTasks,
-			TaskCount:     agent.TaskCount,
+			AgentID:            agent.AgentID,
+			Branch:             agent.Branch,
+			Namespace:          agent.Namespace,
+			Status:             agent.Status,
+			MergeReady:         agent.MergeReady,
+			MergeBlockers:      agent.MergeBlockers,
+			ConflictFiles:      agent.ConflictFiles,
+			BlockedTasks:       agent.BlockedTasks,
+			TaskCount:          agent.TaskCount,
+			BranchURL:          branchURL,
+			MergeRequestNewURL: mrURL,
 		}
 		if candidate.MergeReady {
 			ready = append(ready, candidate)
@@ -187,6 +202,28 @@ func buildConflictPairs(snap coordination.Snapshot) []MergeConflictPair {
 		conflicts = []MergeConflictPair{}
 	}
 	return conflicts
+}
+
+// candidateURLs builds GitLab-style deep links for a merge candidate. It
+// returns ("", "") when either the remote base or the branch is empty so
+// the JSON payload omits the fields (via omitempty) and the HUD can render
+// nothing. The remote base tolerates trailing slashes and a `.git` suffix
+// so the env var can hold either the clone URL or the project URL.
+//
+// GitLab patterns (the workspace's primary forge):
+//   - branch: {base}/-/tree/{branch}
+//   - new MR: {base}/-/merge_requests/new?merge_request[source_branch]={branch}
+func candidateURLs(remoteURL, branch string) (string, string) {
+	if remoteURL == "" || branch == "" {
+		return "", ""
+	}
+	base := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(remoteURL), "/"), ".git")
+	if base == "" {
+		return "", ""
+	}
+	branchURL := fmt.Sprintf("%s/-/tree/%s", base, url.PathEscape(branch))
+	mrURL := fmt.Sprintf("%s/-/merge_requests/new?merge_request[source_branch]=%s", base, url.QueryEscape(branch))
+	return branchURL, mrURL
 }
 
 // countConflictPairs counts the number of unique (source, target) agent pairs
