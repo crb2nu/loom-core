@@ -4,6 +4,8 @@
   import Badge from '../widgets/Badge.svelte';
   import EmptyState from './shared/EmptyState.svelte';
   import VirtualList from '../widgets/VirtualList.svelte';
+  import { createStreamScroll } from '../widgets/useStreamScroll.svelte.ts';
+  import UnseenAboveChip from '../widgets/UnseenAboveChip.svelte';
 
   // Timeline rows accumulate per-event from the audit stream; virtualize the
   // render path so a long backlog doesn't pin the renderer. Fixed height
@@ -31,6 +33,16 @@
       (e.agent_id ?? '').toLowerCase().includes(q) ||
       (e.agent_type ?? '').toLowerCase().includes(q)
     );
+  });
+
+  // Shared scroll behavior — snap-to-top on prepend when at top, anchor
+  // scrollTop when scrolled down, unseen-count for the "↑ N new events"
+  // chip. No pause concept on the timeline; the composable defaults
+  // paused to false.
+  const scroll = createStreamScroll({
+    rowHeight: TIMELINE_ROW_HEIGHT,
+    source: () => entries.length,
+    visible: () => filtered.length,
   });
 
   function eventVariant(type) {
@@ -67,7 +79,10 @@
     <EmptyState icon={'\u23F0'} heading="No timeline events" compact />
   {:else}
     <div class="timeline-list">
-      <VirtualList items={filtered} itemHeight={TIMELINE_ROW_HEIGHT}>
+      {#if scroll.unseenCount > 0 && !scroll.isAtTop}
+        <UnseenAboveChip count={scroll.unseenCount} onClick={scroll.jumpToNewest} singular="event" plural="events" />
+      {/if}
+      <VirtualList items={filtered} itemHeight={TIMELINE_ROW_HEIGHT} bind:containerEl={scroll.containerEl}>
         {#snippet children({ item: entry })}
           <div class="timeline-entry">
             <div class="timeline-time">{formatTime(entry.timestamp)}</div>
@@ -170,11 +185,13 @@
   /* VirtualList owns the scroll viewport; .timeline-list provides a bounded
      flex slot so VirtualList can compute its own client height. The 4px
      inter-row gap is baked into TIMELINE_ROW_HEIGHT since absolute-positioned
-     children can't use flex gap. */
+     children can't use flex gap. position: relative anchors the
+     UnseenAboveChip overlay. */
   .timeline-list {
     flex: 1;
     min-height: 0;
     overflow: hidden;
+    position: relative;
   }
 
   .timeline-entry {

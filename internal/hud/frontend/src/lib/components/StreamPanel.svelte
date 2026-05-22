@@ -5,6 +5,8 @@
   import SparkLine from '../widgets/SparkLine.svelte';
   import EmptyState from './shared/EmptyState.svelte';
   import VirtualList from '../widgets/VirtualList.svelte';
+  import { createStreamScroll } from '../widgets/useStreamScroll.svelte.ts';
+  import UnseenAboveChip from '../widgets/UnseenAboveChip.svelte';
 
   // Stream rows are bounded at 500 entries server-side but still poll every
   // 2s and accumulate over the session; virtualize the render path so the
@@ -23,40 +25,6 @@
 
   let typeFilter = $state('all');
   let agentFilter = $state('all');
-  let streamEl = $state(null);
-
-  // Scroll-aware auto-pause: snap-to-top should only fire when the user is
-  // already near the top. If they've scrolled down to read history, the
-  // 2s poll cadence would otherwise yank them back to the newest entry on
-  // every prepend (the previous behavior, escapable only via the explicit
-  // pause toggle). Tolerance is half a row so brief overshoot still counts
-  // as "at top".
-  const STREAM_SCROLL_TOP_TOLERANCE_PX = STREAM_ROW_HEIGHT / 2;
-  let isAtTop = $state(true);
-
-  $effect(() => {
-    if (!streamEl) return;
-    const handler = () => {
-      isAtTop = streamEl.scrollTop < STREAM_SCROLL_TOP_TOLERANCE_PX;
-    };
-    streamEl.addEventListener('scroll', handler, { passive: true });
-    return () => streamEl.removeEventListener('scroll', handler);
-  });
-
-  // Unseen-prepend indicator: when the user is scrolled down and new
-  // entries arrive, !478 anchors the visible rows in place — which is
-  // correct but leaves the user with no signal that newer entries have
-  // accumulated above. Track that count here so the panel can offer a
-  // single-click "scroll to top" affordance, and reset it whenever they
-  // return to the top.
-  let unseenCount = $state(0);
-  $effect(() => {
-    if (isAtTop) unseenCount = 0;
-  });
-
-  function jumpToNewest() {
-    if (streamEl) streamEl.scrollTop = 0;
-  }
 
   const entryTypes = ['all', 'decision', 'finding', 'error', 'task', 'file_read', 'note'];
 
@@ -80,34 +48,15 @@
     return result;
   });
 
-  // React to new entries arriving from the poll. Gate on entries.length
-  // (not filtered.length) so changes to typeFilter/agentFilter don't get
-  // misread as a prepend. When entries actually grow:
-  //   - if the user is near the top and not paused, snap to top so the
-  //     newest entry stays visible (the previous behavior);
-  //   - if the user has scrolled down to read history, anchor their
-  //     visible items by compensating scrollTop by the number of newly
-  //     visible prepended rows. Without this, prepends shift the items
-  //     under the user's viewport and they re-read content they were
-  //     already past.
-  let prevEntriesLen = 0;
-  let prevFilteredLen = 0;
-  $effect(() => {
-    const entriesLen = entries.length;
-    const filteredLen = filtered.length;
-    const entriesDelta = entriesLen - prevEntriesLen;
-    const filteredDelta = filteredLen - prevFilteredLen;
-    prevEntriesLen = entriesLen;
-    prevFilteredLen = filteredLen;
-
-    if (entriesDelta <= 0 || paused || !streamEl) return;
-
-    if (isAtTop) {
-      streamEl.scrollTop = 0;
-    } else if (filteredDelta > 0) {
-      streamEl.scrollTop += filteredDelta * STREAM_ROW_HEIGHT;
-      unseenCount += filteredDelta;
-    }
+  // Scroll behavior: snap-to-top on real prepend (when at top + not
+  // paused), anchor scrollTop on prepend when scrolled down, accumulate
+  // unseen count for the "↑ N new entries" chip. See createStreamScroll
+  // for the full pattern — TimelinePanel and TracesPanel share it.
+  const scroll = createStreamScroll({
+    rowHeight: STREAM_ROW_HEIGHT,
+    source: () => entries.length,
+    visible: () => filtered.length,
+    paused: () => paused,
   });
 
   function setTypeFilter(type) {
@@ -223,16 +172,14 @@
       </div>
     {/if}
 
-    {#if unseenCount > 0 && !isAtTop}
-      <button type="button" class="unseen-indicator" onclick={jumpToNewest}>
-        ↑ {unseenCount} new {unseenCount === 1 ? 'entry' : 'entries'}
-      </button>
+    {#if scroll.unseenCount > 0 && !scroll.isAtTop}
+      <UnseenAboveChip count={scroll.unseenCount} onClick={scroll.jumpToNewest} />
     {/if}
 
     {#if filtered.length === 0}
       <EmptyState icon={'\u25C9'} heading="No activity yet" description="Context entries will appear here in real-time" />
     {:else}
-      <VirtualList items={filtered} itemHeight={STREAM_ROW_HEIGHT} bind:containerEl={streamEl}>
+      <VirtualList items={filtered} itemHeight={STREAM_ROW_HEIGHT} bind:containerEl={scroll.containerEl}>
         {#snippet children({ item: entry, index })}
           <div
             class="stream-row"
@@ -374,38 +321,6 @@
     letter-spacing: 3px;
     color: var(--warning);
     animation: glowPulse 2s ease-in-out infinite;
-  }
-
-  /* Floating "N new entries above" chip that appears when the user is
-     scrolled down and prepends have accumulated since they left the top.
-     Positioned absolute so it doesn't reflow the VirtualList beneath. */
-  .unseen-indicator {
-    position: absolute;
-    top: var(--space-2);
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 20;
-    padding: 4px var(--space-3);
-    background: color-mix(in srgb, var(--info) 22%, var(--bg-secondary));
-    border: 1px solid var(--info);
-    border-radius: var(--radius-full);
-    color: var(--fg-primary);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    cursor: pointer;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
-    transition: background var(--transition-fast), transform var(--transition-fast);
-  }
-
-  .unseen-indicator:hover {
-    background: color-mix(in srgb, var(--info) 40%, var(--bg-secondary));
-    transform: translateX(-50%) translateY(-1px);
-  }
-
-  .unseen-indicator:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 2px;
   }
 
   .stream-row {
