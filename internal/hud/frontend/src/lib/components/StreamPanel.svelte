@@ -65,14 +65,32 @@
     return result;
   });
 
-  // Auto-scroll when not paused, the user hasn't scrolled away from the
-  // top, and new entries arrive. If the user has scrolled down to read
-  // history, leave their scroll position alone — they re-engage the
-  // snap-to-top by scrolling back to the top.
+  // React to new entries arriving from the poll. Gate on entries.length
+  // (not filtered.length) so changes to typeFilter/agentFilter don't get
+  // misread as a prepend. When entries actually grow:
+  //   - if the user is near the top and not paused, snap to top so the
+  //     newest entry stays visible (the previous behavior);
+  //   - if the user has scrolled down to read history, anchor their
+  //     visible items by compensating scrollTop by the number of newly
+  //     visible prepended rows. Without this, prepends shift the items
+  //     under the user's viewport and they re-read content they were
+  //     already past.
+  let prevEntriesLen = 0;
+  let prevFilteredLen = 0;
   $effect(() => {
-    const count = filtered.length;
-    if (!paused && isAtTop && streamEl) {
+    const entriesLen = entries.length;
+    const filteredLen = filtered.length;
+    const entriesDelta = entriesLen - prevEntriesLen;
+    const filteredDelta = filteredLen - prevFilteredLen;
+    prevEntriesLen = entriesLen;
+    prevFilteredLen = filteredLen;
+
+    if (entriesDelta <= 0 || paused || !streamEl) return;
+
+    if (isAtTop) {
       streamEl.scrollTop = 0;
+    } else if (filteredDelta > 0) {
+      streamEl.scrollTop += filteredDelta * STREAM_ROW_HEIGHT;
     }
   });
 
