@@ -1,5 +1,6 @@
 <script>
   import { catalogStore } from '../stores/catalog.svelte.ts';
+  import { relativeTime } from '../utils/format.ts';
   import PanelShell from './shared/PanelShell.svelte';
   import FilterBar from './shared/FilterBar.svelte';
   import MetricCard from './shared/MetricCard.svelte';
@@ -7,6 +8,20 @@
   $effect(() => {
     catalogStore.startPolling(30000);
     return () => { catalogStore.stopPolling(); };
+  });
+
+  // Tick once per second so the "last synced" relative timestamp updates
+  // smoothly between the 30s polls; without this it would only refresh
+  // when the next poll mutates lastUpdated, leaving "0s ago" visible
+  // for nearly the entire interval.
+  let now = $state(Date.now());
+  $effect(() => {
+    const id = setInterval(() => { now = Date.now(); }, 1000);
+    return () => clearInterval(id);
+  });
+  let lastSyncedLabel = $derived.by(() => {
+    void now;
+    return catalogStore.lastUpdated ? relativeTime(catalogStore.lastUpdated) : null;
   });
 
   let servers = $derived(catalogStore.filteredServers);
@@ -329,9 +344,19 @@
     </div>
   {/if}
 
-  {#if catalogStore.registryPath}
+  {#if catalogStore.registryPath || lastSyncedLabel}
     <div class="catalog-footer">
-      <span class="text-muted text-mono text-xs">Registry: {catalogStore.registryPath}</span>
+      {#if catalogStore.registryPath}
+        <span class="text-muted text-mono text-xs">Registry: {catalogStore.registryPath}</span>
+      {/if}
+      {#if lastSyncedLabel}
+        <span
+          class="text-muted text-mono text-xs catalog-last-synced"
+          title={catalogStore.lastUpdated?.toLocaleString()}
+        >
+          Last synced: {lastSyncedLabel}
+        </span>
+      {/if}
     </div>
   {/if}
 </PanelShell>
@@ -843,9 +868,18 @@
   }
 
   .catalog-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    flex-wrap: wrap;
     padding: var(--space-2) var(--space-3) 0;
     border-top: 1px solid var(--border);
     margin-top: var(--space-2);
+  }
+
+  .catalog-last-synced {
+    cursor: help;
   }
 
   @media (max-width: 640px) {
