@@ -3,6 +3,15 @@
   import { formatTime, agentColor, eventIcon, statusVariant } from '../utils/format.ts';
   import Badge from '../widgets/Badge.svelte';
   import EmptyState from './shared/EmptyState.svelte';
+  import VirtualList from '../widgets/VirtualList.svelte';
+
+  // Timeline rows accumulate per-event from the audit stream; virtualize the
+  // render path so a long backlog doesn't pin the renderer. Fixed height
+  // covers the common header-row + one detail-chip line (60px row + 4px gap
+  // baked in since absolute children can't use flex gap). Rare events with
+  // many chips clip via overflow inside the row; the underlying data is
+  // unaffected and still searchable through the filter input.
+  const TIMELINE_ROW_HEIGHT = 64;
 
   $effect(() => {
     timelineStore.startPolling(30000);
@@ -54,50 +63,54 @@
     />
   </div>
 
-  <div class="timeline-list">
-    {#each filtered as entry, i (entry.timestamp + '-' + i)}
-      <div class="timeline-entry">
-        <div class="timeline-time">{formatTime(entry.timestamp)}</div>
-        <div class="timeline-icon" style:color={agentColor(entry.agent_type)}>
-          {eventIcon(entry.event_type)}
-        </div>
-        <div class="timeline-body">
-          <div class="timeline-header-row">
-            <Badge text={shortEventType(entry.event_type)} variant={eventVariant(entry.event_type)} />
-            {#if entry.agent_id}
-              <span class="agent-badge" style:color={agentColor(entry.agent_type)}>
-                {entry.agent_id}
-              </span>
-            {/if}
-          </div>
-          {#if entry.data}
-            <div class="timeline-detail">
-              {#if entry.data.namespace}
-                <span class="detail-chip">{entry.data.namespace}</span>
-              {/if}
-              {#if entry.data.session_id}
-                <span class="detail-chip text-muted">{String(entry.data.session_id).slice(0, 12)}...</span>
-              {/if}
-              {#if entry.data.title}
-                <span class="detail-chip">{entry.data.title}</span>
-              {/if}
-              {#if entry.data.status}
-                <span class="detail-chip">{entry.data.status}</span>
-              {/if}
-              {#if entry.data.reason}
-                <span class="detail-chip text-muted">{entry.data.reason}</span>
-              {/if}
-              {#if entry.data.branch}
-                <span class="detail-chip text-mono">{entry.data.branch}</span>
+  {#if filtered.length === 0}
+    <EmptyState icon={'\u23F0'} heading="No timeline events" compact />
+  {:else}
+    <div class="timeline-list">
+      <VirtualList items={filtered} itemHeight={TIMELINE_ROW_HEIGHT}>
+        {#snippet children({ item: entry })}
+          <div class="timeline-entry">
+            <div class="timeline-time">{formatTime(entry.timestamp)}</div>
+            <div class="timeline-icon" style:color={agentColor(entry.agent_type)}>
+              {eventIcon(entry.event_type)}
+            </div>
+            <div class="timeline-body">
+              <div class="timeline-header-row">
+                <Badge text={shortEventType(entry.event_type)} variant={eventVariant(entry.event_type)} />
+                {#if entry.agent_id}
+                  <span class="agent-badge" style:color={agentColor(entry.agent_type)}>
+                    {entry.agent_id}
+                  </span>
+                {/if}
+              </div>
+              {#if entry.data}
+                <div class="timeline-detail">
+                  {#if entry.data.namespace}
+                    <span class="detail-chip">{entry.data.namespace}</span>
+                  {/if}
+                  {#if entry.data.session_id}
+                    <span class="detail-chip text-muted">{String(entry.data.session_id).slice(0, 12)}...</span>
+                  {/if}
+                  {#if entry.data.title}
+                    <span class="detail-chip">{entry.data.title}</span>
+                  {/if}
+                  {#if entry.data.status}
+                    <span class="detail-chip">{entry.data.status}</span>
+                  {/if}
+                  {#if entry.data.reason}
+                    <span class="detail-chip text-muted">{entry.data.reason}</span>
+                  {/if}
+                  {#if entry.data.branch}
+                    <span class="detail-chip text-mono">{entry.data.branch}</span>
+                  {/if}
+                </div>
               {/if}
             </div>
-          {/if}
-        </div>
-      </div>
-    {:else}
-      <EmptyState icon={'\u23F0'} heading="No timeline events" compact />
-    {/each}
-  </div>
+          </div>
+        {/snippet}
+      </VirtualList>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -154,15 +167,20 @@
     font-size: var(--text-sm);
   }
 
+  /* VirtualList owns the scroll viewport; .timeline-list provides a bounded
+     flex slot so VirtualList can compute its own client height. The 4px
+     inter-row gap is baked into TIMELINE_ROW_HEIGHT since absolute-positioned
+     children can't use flex gap. */
   .timeline-list {
     flex: 1;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .timeline-entry {
+    box-sizing: border-box;
+    height: 60px;
+    overflow: hidden;
     display: flex;
     align-items: flex-start;
     gap: var(--space-2);
