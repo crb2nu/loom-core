@@ -8164,6 +8164,142 @@ skills:
         type: command
         output_format: markdown
 
+  - name: icc-workbench-ops
+    categories: [icc, workbench, workflow]
+    common:
+      description: |
+        Drive the broader ICC entity surface (projects, artifacts, action items, decisions, risks, milestones, deliverables, dependencies, code refs, session links) via the mcp-icc MCP server. Read tools (project list/brief/kanban/calendar/gantt/status/changes/blocked, entity lists, search, needs-attention) are always enabled. Write tools (create/update/transition/delete plus quick_capture) are gated behind ICC_MCP_WRITE_ENABLED=1.
+      instructions: |
+        # ICC Workbench Ops
+
+        Use the `icc` MCP server for the broad ICC entity surface — anything
+        beyond Slack/email/meeting note-capture (which lives in
+        `icc-capture-ops`).
+
+        ## When to use
+
+        - You want to read project state without loading the SPA: brief,
+          kanban, calendar, gantt, status, change history, blocked rollup.
+        - You want to list / detail any of the core entities: artifacts,
+          action items, decisions, risks, milestones, deliverables,
+          dependencies, workstreams, code refs, session links.
+        - You want to search artifacts (lexical or hybrid), or pull the
+          workspace-wide needs-attention rollup.
+        - You want to create / update / transition / delete an entity.
+          (Writes only work when `ICC_MCP_WRITE_ENABLED=1` is set on the
+          server process — see the registry entry.)
+        - You want one-call code-snapshot capture: `icc_quick_capture`
+          pairs with the artifact form's `code_path` + `session_id`
+          fields (Slice 5) so MCP callers can produce an artifact with
+          provenance in a single tool call.
+
+        ## Read tools (always enabled)
+
+        - `icc__icc_project_list`, `icc_project_brief`, `icc_project_kanban`,
+          `icc_project_calendar`, `icc_project_gantt`, `icc_project_status`,
+          `icc_project_changes`, `icc_project_blocked`.
+        - Entity lists: `icc_action_item_list`, `icc_decision_list`,
+          `icc_risk_list`, `icc_milestone_list`, `icc_deliverable_list`,
+          `icc_dependency_list`, `icc_workstream_list`, `icc_code_ref_list`,
+          `icc_session_link_list`.
+        - Detail: `icc_artifact_get`, `icc_artifact_links_list`.
+        - Cross-cutting: `icc_search`, `icc_needs_attention`.
+
+        ## Write tools (gated behind ICC_MCP_WRITE_ENABLED=1)
+
+        - Creates: `icc_project_create`, `icc_artifact_create`,
+          `icc_action_item_create`, `icc_decision_create`, `icc_risk_create`,
+          `icc_milestone_create`, `icc_deliverable_create`,
+          `icc_dependency_create`, `icc_code_ref_create`,
+          `icc_session_link_create`.
+        - Updates: `icc_project_update`, `icc_artifact_update`,
+          `icc_action_item_update`, `icc_risk_update`, `icc_code_ref_update`,
+          `icc_session_link_update`.
+        - Transitions: `icc_action_item_transition`, `icc_risk_transition`,
+          `icc_milestone_transition`, `icc_deliverable_transition`,
+          `icc_extraction_transition`.
+        - Deletes: `icc_artifact_delete`, `icc_deliverable_delete`,
+          `icc_dependency_delete`, `icc_code_ref_delete`,
+          `icc_session_link_delete`.
+        - Artifact lifecycle: `icc_artifact_reclassify`,
+          `icc_artifact_link_add`, `icc_artifact_link_remove`,
+          `icc_artifact_demote`.
+
+        ## Convenience
+
+        - `icc__icc_quick_capture` — create an artifact with
+          `code_path` + `session_id` populated. Equivalent to
+          `icc_artifact_create` + the form's M55 fields. Use this
+          when capturing a snapshot of "what the agent was doing
+          when it noticed something worth filing".
+
+        ## Loop
+
+        1. If you need writes, confirm `ICC_MCP_WRITE_ENABLED=1` is set
+           on the MCP-server process (the tool will return
+           `writes_disabled` otherwise — no network call is made).
+        2. Read first: `icc_project_brief` or `icc_project_kanban` to
+           orient. `icc_search` for free-text lookups.
+        3. Drive the change: prefer the dedicated `_transition` tools
+           for status moves (they emit audit rows the SPA picks up).
+        4. Verify with the matching read tool — the backend emits
+           `state_version` so the SPA refreshes; for MCP callers, the
+           read just confirms.
+
+        ## Behavior notes
+
+        - All write tools accept a free-form `payload` map that is
+          forwarded verbatim to the backend; the backend does the
+          shape-shaped validation. Update/transition/delete tools
+          additionally require a top-level `id` arg; it's folded into
+          the payload under "id" if the payload doesn't already
+          carry one.
+        - Tools that template an id into the URL path (e.g.
+          `icc_artifact_demote` → `/api/artifacts/<id>/demote`) take
+          the id as a separate required arg.
+        - The trusted-context handshake (`X-Requested-With` +
+          `Origin`) is applied automatically. No token plumbing needed
+          in this slice; HMAC is a future hardening step.
+      always_allow:
+        - icc_action_item_list
+        - icc_artifact_get
+        - icc_artifact_links_list
+        - icc_code_ref_list
+        - icc_decision_list
+        - icc_deliverable_list
+        - icc_dependency_list
+        - icc_milestone_list
+        - icc_needs_attention
+        - icc_project_blocked
+        - icc_project_brief
+        - icc_project_calendar
+        - icc_project_changes
+        - icc_project_gantt
+        - icc_project_kanban
+        - icc_project_list
+        - icc_project_status
+        - icc_risk_list
+        - icc_search
+        - icc_session_link_list
+        - icc_workstream_list
+    targets:
+      codex:
+        enabled: true
+        type: skill
+      claude:
+        enabled: true
+        type: command
+        output_format: markdown
+      kilocode:
+        enabled: true
+        type: rule
+      gemini:
+        enabled: false
+      antigravity:
+        enabled: true
+        type: command
+        output_format: markdown
+
   - name: spec-riskiest-assumption
     categories: [planning, methodology, process]
     common:

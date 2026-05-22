@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/crb2nu/loom/internal/iccclient"
 )
 
 // --- shared helpers for network-backed tools ----------------------------
@@ -22,11 +23,7 @@ func newTestICCServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server,
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	icc := &iccClient{
-		baseURL:    srv.URL,
-		httpClient: srv.Client(),
-		logger:     slog.Default(),
-	}
+	icc := iccclient.NewForTest(srv.URL, srv.Client())
 	return srv, icc
 }
 
@@ -206,7 +203,7 @@ func TestWriteCapture_ICC400_PropagatesErrorMessage(t *testing.T) {
 }
 
 func TestWriteCapture_MissingBaseURL_ICCNotConfigured(t *testing.T) {
-	icc := &iccClient{baseURL: "", httpClient: &http.Client{}, logger: slog.Default()}
+	icc := iccclient.NewForTest("", &http.Client{})
 	handler := makeWriteCaptureHandler(icc)
 	result, err := handler(context.Background(), map[string]any{
 		"project_id":     "prj_abc",
@@ -690,7 +687,7 @@ func TestArchiveRaw_WhitespaceReason_ClientRefusal(t *testing.T) {
 }
 
 func TestArchiveRaw_MissingBaseURL_ICCNotConfigured(t *testing.T) {
-	icc := &iccClient{baseURL: "", httpClient: &http.Client{}, logger: slog.Default()}
+	icc := iccclient.NewForTest("", &http.Client{})
 	handler := makeArchiveRawHandler(icc)
 	result, err := handler(context.Background(), map[string]any{
 		"code_ref_id": "cref_1",
