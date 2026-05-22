@@ -4,6 +4,14 @@
   import Badge from '../widgets/Badge.svelte';
   import SparkLine from '../widgets/SparkLine.svelte';
   import EmptyState from './shared/EmptyState.svelte';
+  import VirtualList from '../widgets/VirtualList.svelte';
+
+  // Stream rows are bounded at 500 entries server-side but still poll every
+  // 2s and accumulate over the session; virtualize the render path so the
+  // long-tail of older entries doesn't sit in the DOM. Single-line rows fit
+  // a fixed height cleanly; 40px is enough for the padded line on desktop
+  // and stays close to the prior mobile touch-target minimum (44px).
+  const STREAM_ROW_HEIGHT = 40;
 
   $effect(() => {
     streamStore.startPolling(2000);
@@ -153,7 +161,7 @@
   {/if}
 
   <!-- Stream area -->
-  <div class="stream-container" bind:this={streamEl}>
+  <div class="stream-container">
     {#if paused}
       <div class="paused-overlay">
         <span class="paused-text">PAUSED</span>
@@ -163,21 +171,23 @@
     {#if filtered.length === 0}
       <EmptyState icon={'\u25C9'} heading="No activity yet" description="Context entries will appear here in real-time" />
     {:else}
-      {#each filtered as entry, i (entry.id ?? `${entry.timestamp}-${i}`)}
-        <div
-          class="stream-row"
-          class:alt-row={i % 2 === 1}
-          style="border-left: 3px solid {typeBorderColor(entry.entry_type)}"
-        >
-          <span class="stream-time text-mono">{formatTime(entry.timestamp)}</span>
-          <Badge text={entry.entry_type ?? 'note'} variant={entryVariant(entry.entry_type)} />
-          <span class="stream-agent">
-            <Badge text={entry.agent ?? '---'} variant="info" />
-          </span>
-          <span class="stream-ns text-mono text-muted">{entry.namespace ?? ''}</span>
-          <span class="stream-title truncate">{entry.title ?? entry.content?.slice(0, 80) ?? '---'}</span>
-        </div>
-      {/each}
+      <VirtualList items={filtered} itemHeight={STREAM_ROW_HEIGHT} bind:containerEl={streamEl}>
+        {#snippet children({ item: entry, index })}
+          <div
+            class="stream-row"
+            class:alt-row={index % 2 === 1}
+            style="border-left: 3px solid {typeBorderColor(entry.entry_type)}"
+          >
+            <span class="stream-time text-mono">{formatTime(entry.timestamp)}</span>
+            <Badge text={entry.entry_type ?? 'note'} variant={entryVariant(entry.entry_type)} />
+            <span class="stream-agent">
+              <Badge text={entry.agent ?? '---'} variant="info" />
+            </span>
+            <span class="stream-ns text-mono text-muted">{entry.namespace ?? ''}</span>
+            <span class="stream-title truncate">{entry.title ?? entry.content?.slice(0, 80) ?? '---'}</span>
+          </div>
+        {/snippet}
+      </VirtualList>
     {/if}
   </div>
 </div>
@@ -268,15 +278,20 @@
     font-size: 10px;
   }
 
-  /* Stream container */
+  /* Stream container — bounded flex column. VirtualList owns the scroll
+     viewport; .stream-container just provides a fixed slot underneath the
+     paused overlay so VirtualList can compute its own client height. */
   .stream-container {
     flex: 1;
-    overflow-y: auto;
+    min-height: 0;
+    overflow: hidden;
     position: relative;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     margin-top: var(--space-2);
+    display: flex;
+    flex-direction: column;
   }
 
   .paused-overlay {
@@ -301,6 +316,9 @@
   }
 
   .stream-row {
+    box-sizing: border-box;
+    height: 40px;
+    overflow: hidden;
     display: flex;
     align-items: center;
     gap: var(--space-2);
@@ -358,8 +376,7 @@
     .stream-ns {
       display: none;
     }
-    .stream-row {
-      min-height: 44px;
-    }
+    /* .stream-row uses an explicit 40px height for VirtualList; no mobile
+       min-height override — virtualization requires a single row height. */
   }
 </style>

@@ -6,6 +6,10 @@
    *  - items: T[]           — full data array
    *  - itemHeight: number   — fixed height per row (px)
    *  - buffer: number       — extra rows to render above/below viewport
+   *  - containerEl: bindable handle to the scroll viewport so parents can
+   *                 imperatively read/write scrollTop (e.g. snap-to-top on
+   *                 new entries). Defaults to null; only meaningful when the
+   *                 parent binds it.
    *
    * Slots:
    *  - default: receives { item, index } for each visible item
@@ -14,12 +18,18 @@
    *   items: any[],
    *   itemHeight?: number,
    *   buffer?: number,
+   *   containerEl?: HTMLElement | null,
    *   children: import('svelte').Snippet<[{ item: any, index: number }]>
    * }}
    */
-  let { items = [], itemHeight = 32, buffer = 10, children } = $props();
+  let {
+    items = [],
+    itemHeight = 32,
+    buffer = 10,
+    children,
+    containerEl = $bindable(null),
+  } = $props();
 
-  let containerEl = $state(null);
   let scrollTop = $state(0);
   let containerHeight = $state(400);
 
