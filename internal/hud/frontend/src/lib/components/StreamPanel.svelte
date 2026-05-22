@@ -25,6 +25,24 @@
   let agentFilter = $state('all');
   let streamEl = $state(null);
 
+  // Scroll-aware auto-pause: snap-to-top should only fire when the user is
+  // already near the top. If they've scrolled down to read history, the
+  // 2s poll cadence would otherwise yank them back to the newest entry on
+  // every prepend (the previous behavior, escapable only via the explicit
+  // pause toggle). Tolerance is half a row so brief overshoot still counts
+  // as "at top".
+  const STREAM_SCROLL_TOP_TOLERANCE_PX = STREAM_ROW_HEIGHT / 2;
+  let isAtTop = $state(true);
+
+  $effect(() => {
+    if (!streamEl) return;
+    const handler = () => {
+      isAtTop = streamEl.scrollTop < STREAM_SCROLL_TOP_TOLERANCE_PX;
+    };
+    streamEl.addEventListener('scroll', handler, { passive: true });
+    return () => streamEl.removeEventListener('scroll', handler);
+  });
+
   const entryTypes = ['all', 'decision', 'finding', 'error', 'task', 'file_read', 'note'];
 
   let agents = $derived.by(() => {
@@ -47,10 +65,13 @@
     return result;
   });
 
-  // Auto-scroll when not paused and new entries arrive
+  // Auto-scroll when not paused, the user hasn't scrolled away from the
+  // top, and new entries arrive. If the user has scrolled down to read
+  // history, leave their scroll position alone — they re-engage the
+  // snap-to-top by scrolling back to the top.
   $effect(() => {
     const count = filtered.length;
-    if (!paused && streamEl) {
+    if (!paused && isAtTop && streamEl) {
       streamEl.scrollTop = 0;
     }
   });
