@@ -9,6 +9,12 @@ import (
 
 type catalogAPIEntry struct {
 	registry.CatalogEntry
+
+	// HUD-only health fields sourced from the health monitor and surfaced
+	// alongside the shared CLI/HUD CatalogEntry so the catalog panel can
+	// distinguish "disabled and stopped" from "enabled but failed to start
+	// or crashed." The CLI does not consume these.
+	ErrorMessage string `json:"error_message,omitempty"`
 }
 
 func (a *App) handleCatalogList(w http.ResponseWriter, r *http.Request) {
@@ -26,18 +32,28 @@ func (a *App) handleCatalogList(w http.ResponseWriter, r *http.Request) {
 	categoryFilter := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("category")))
 	query := strings.TrimSpace(r.URL.Query().Get("query"))
 
-	// Build the running set from health monitor if available.
+	// Build the running set + per-server error messages from the health
+	// monitor. ErrorMessage carries through whatever the local/hub probe
+	// reported on the last refresh and is the only field the catalog panel
+	// can use to explain a stalled server without a separate API call.
 	runningSet := make(map[string]bool)
+	errorByName := make(map[string]string)
 	if a.healthMonitor != nil {
 		for _, srv := range a.healthMonitor.Servers() {
 			runningSet[srv.Name] = srv.Running
+			if srv.ErrorMessage != "" {
+				errorByName[srv.Name] = srv.ErrorMessage
+			}
 		}
 	}
 
 	entries := registry.BuildCatalogEntries(reg, cs, "", categoryFilter, query, runningSet)
 	apiEntries := make([]catalogAPIEntry, len(entries))
 	for i, entry := range entries {
-		apiEntries[i] = catalogAPIEntry{CatalogEntry: entry}
+		apiEntries[i] = catalogAPIEntry{
+			CatalogEntry: entry,
+			ErrorMessage: errorByName[entry.Name],
+		}
 	}
 
 	a.writeJSON(w, http.StatusOK, map[string]any{

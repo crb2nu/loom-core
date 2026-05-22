@@ -11,6 +11,10 @@ export interface CatalogServer {
   tool_count: number;
   env_hints: string[];
   config_hints: string[];
+  // Populated by the HUD when the health monitor has a recent probe failure
+  // for this server. Empty/undefined when the server is healthy or no probe
+  // has run yet. Drives the "unhealthy" runtime pill tooltip.
+  error_message?: string;
 }
 
 export interface CatalogResponse {
@@ -98,7 +102,7 @@ class CatalogStore {
 
       const keyFn = (s: CatalogServer) => s.name;
       const hashFn = (s: CatalogServer) =>
-        `${s.enabled}|${s.running}|${s.command}|${s.tool_count}|${s.description}|${(s.categories ?? []).join(',')}|${(s.env_hints ?? []).join(',')}|${(s.config_hints ?? []).join(',')}`;
+        `${s.enabled}|${s.running}|${s.command}|${s.tool_count}|${s.description}|${(s.categories ?? []).join(',')}|${(s.env_hints ?? []).join(',')}|${(s.config_hints ?? []).join(',')}|${s.error_message ?? ''}`;
       if (!arraysEqualByKey(this.servers, incoming, keyFn, hashFn)) {
         this.servers = incoming;
       }
