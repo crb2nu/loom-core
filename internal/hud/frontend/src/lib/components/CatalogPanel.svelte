@@ -108,6 +108,28 @@
   function hintSummary(values) {
     return (values ?? []).join(' · ') || 'None';
   }
+
+  // Tri-state pill for the runtime column. The previous binary
+  // running/stopped split hid the most important case: a server the user
+  // explicitly enabled but the runtime never started (or it crashed). Those
+  // entries used to render the same grey "stopped" badge as intentionally
+  // disabled servers, with no way to tell them apart at a glance.
+  function runtimePill(srv) {
+    if (srv.running) {
+      return { variant: 'running', label: 'running', tooltip: '' };
+    }
+    if (srv.enabled) {
+      const reason = (srv.error_message || '').trim();
+      return {
+        variant: 'unhealthy',
+        label: 'not running',
+        tooltip: reason
+          ? `Enabled but not running: ${reason}`
+          : 'Enabled but not running — last health probe did not report a reason',
+      };
+    }
+    return { variant: 'stopped', label: 'stopped', tooltip: '' };
+  }
 </script>
 
 <PanelShell
@@ -206,6 +228,7 @@
         </thead>
         <tbody>
           {#each sorted as srv (srv.name)}
+            {@const pill = runtimePill(srv)}
             <tr class:disabled-row={!srv.enabled}>
               <td class="cell-state">
                 <span class="status-dot" class:on={srv.enabled} class:off={!srv.enabled}></span>
@@ -229,11 +252,10 @@
                 <span class="tool-count">{srv.tool_count ?? 0}</span>
               </td>
               <td>
-                {#if srv.running}
-                  <span class="runtime-tag runtime-running">running</span>
-                {:else}
-                  <span class="runtime-tag runtime-stopped">stopped</span>
-                {/if}
+                <span class="runtime-tag runtime-{pill.variant}" title={pill.tooltip || null}>
+                  {#if pill.variant === 'unhealthy'}<span class="runtime-icon" aria-hidden="true">⚠</span>{/if}
+                  {pill.label}
+                </span>
               </td>
               <td>
                 <button
@@ -294,15 +316,15 @@
   {:else}
     <div class="catalog-cards">
       {#each sorted as srv (srv.name)}
+        {@const pill = runtimePill(srv)}
         <div class="server-card" class:server-card-disabled={!srv.enabled}>
           <div class="server-card-head">
             <span class="status-dot" class:on={srv.enabled} class:off={!srv.enabled}></span>
             <span class="server-card-name">{srv.name}</span>
-            {#if srv.running}
-              <span class="runtime-tag runtime-running">running</span>
-            {:else}
-              <span class="runtime-tag runtime-stopped">stopped</span>
-            {/if}
+            <span class="runtime-tag runtime-{pill.variant}" title={pill.tooltip || null}>
+              {#if pill.variant === 'unhealthy'}<span class="runtime-icon" aria-hidden="true">⚠</span>{/if}
+              {pill.label}
+            </span>
           </div>
           <div class="server-card-desc">{srv.description || 'No description'}</div>
           <div class="server-card-meta">
@@ -621,6 +643,9 @@
   }
 
   .runtime-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
     font-size: var(--text-xs);
     font-family: var(--font-mono);
     padding: 1px 6px;
@@ -635,6 +660,18 @@
   .runtime-stopped {
     color: var(--fg-muted);
     background: var(--bg-tertiary);
+  }
+
+  .runtime-unhealthy {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+    cursor: help;
+  }
+
+  .runtime-icon {
+    font-weight: 700;
+    line-height: 1;
   }
 
   /* ---- Detail Row ---- */
