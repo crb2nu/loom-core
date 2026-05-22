@@ -43,6 +43,21 @@
     return () => streamEl.removeEventListener('scroll', handler);
   });
 
+  // Unseen-prepend indicator: when the user is scrolled down and new
+  // entries arrive, !478 anchors the visible rows in place — which is
+  // correct but leaves the user with no signal that newer entries have
+  // accumulated above. Track that count here so the panel can offer a
+  // single-click "scroll to top" affordance, and reset it whenever they
+  // return to the top.
+  let unseenCount = $state(0);
+  $effect(() => {
+    if (isAtTop) unseenCount = 0;
+  });
+
+  function jumpToNewest() {
+    if (streamEl) streamEl.scrollTop = 0;
+  }
+
   const entryTypes = ['all', 'decision', 'finding', 'error', 'task', 'file_read', 'note'];
 
   let agents = $derived.by(() => {
@@ -91,6 +106,7 @@
       streamEl.scrollTop = 0;
     } else if (filteredDelta > 0) {
       streamEl.scrollTop += filteredDelta * STREAM_ROW_HEIGHT;
+      unseenCount += filteredDelta;
     }
   });
 
@@ -205,6 +221,12 @@
       <div class="paused-overlay">
         <span class="paused-text">PAUSED</span>
       </div>
+    {/if}
+
+    {#if unseenCount > 0 && !isAtTop}
+      <button type="button" class="unseen-indicator" onclick={jumpToNewest}>
+        ↑ {unseenCount} new {unseenCount === 1 ? 'entry' : 'entries'}
+      </button>
     {/if}
 
     {#if filtered.length === 0}
@@ -352,6 +374,38 @@
     letter-spacing: 3px;
     color: var(--warning);
     animation: glowPulse 2s ease-in-out infinite;
+  }
+
+  /* Floating "N new entries above" chip that appears when the user is
+     scrolled down and prepends have accumulated since they left the top.
+     Positioned absolute so it doesn't reflow the VirtualList beneath. */
+  .unseen-indicator {
+    position: absolute;
+    top: var(--space-2);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    padding: 4px var(--space-3);
+    background: color-mix(in srgb, var(--info) 22%, var(--bg-secondary));
+    border: 1px solid var(--info);
+    border-radius: var(--radius-full);
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    transition: background var(--transition-fast), transform var(--transition-fast);
+  }
+
+  .unseen-indicator:hover {
+    background: color-mix(in srgb, var(--info) 40%, var(--bg-secondary));
+    transform: translateX(-50%) translateY(-1px);
+  }
+
+  .unseen-indicator:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
   }
 
   .stream-row {
