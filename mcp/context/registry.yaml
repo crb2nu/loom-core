@@ -1282,6 +1282,49 @@ servers:
         command: "${repo}/services/loom-core/bin/mcp-icc-capture"
         args: []
 
+  - name: icc
+    categories: [icc, workbench, local-only]
+    common:
+      description: Broad ICC entity surface — projects, artifacts, action items, decisions, risks, milestones, deliverables, dependencies, code refs, session links. Reads always enabled; writes gated behind ICC_MCP_WRITE_ENABLED=1.
+      hint: Use for any ICC entity CRUD beyond note-capture (mcp-icc-capture covers Slack/email/meeting pastes). Read tools include project_list/brief/kanban/calendar/gantt/status/changes/blocked, list/detail for each entity, search, and needs-attention. Write tools cover create/update/transition/delete for the canonical entities plus icc_quick_capture for the artifact-from-code-context flow.
+      command: "${repo}/services/loom-core/bin/mcp-icc"
+      args: []
+      timeout: 60
+      always_allow:
+        - icc_action_item_list
+        - icc_artifact_get
+        - icc_artifact_links_list
+        - icc_code_ref_list
+        - icc_decision_list
+        - icc_deliverable_list
+        - icc_dependency_list
+        - icc_milestone_list
+        - icc_needs_attention
+        - icc_project_blocked
+        - icc_project_brief
+        - icc_project_calendar
+        - icc_project_changes
+        - icc_project_gantt
+        - icc_project_kanban
+        - icc_project_list
+        - icc_project_status
+        - icc_risk_list
+        - icc_search
+        - icc_session_link_list
+        - icc_workstream_list
+      env:
+        ICC_BASE_URL: "${env:ICC_BASE_URL:-http://localhost:8765}"
+        ICC_MCP_WRITE_ENABLED: "${env:ICC_MCP_WRITE_ENABLED:-}"
+        LOG_LEVEL: info
+    targets:
+      vscode:
+        type: stdio
+        command: "${repo}/services/loom-core/bin/mcp-icc"
+        args: []
+        env:
+          ICC_BASE_URL: "${env:ICC_BASE_URL:-http://localhost:8765}"
+          ICC_MCP_WRITE_ENABLED: "${env:ICC_MCP_WRITE_ENABLED:-}"
+
   - name: alertmanager
     categories: [monitoring, alerting]
     common:
