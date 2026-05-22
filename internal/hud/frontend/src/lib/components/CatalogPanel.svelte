@@ -107,6 +107,19 @@
 >
   {#snippet header()}
     <div class="catalog-header">
+      {#if catalogStore.error}
+        <!-- Fetch errors are otherwise swallowed: when /api/catalog fails
+             on cold start, the panel shows "No servers registered" with no
+             indication of the underlying cause; when it fails on refresh,
+             the cached server list keeps displaying with no signal the
+             data has gone stale. Surface the store-tracked error as a
+             non-dismissable banner; it auto-clears on the next successful
+             fetch (the store resets error to null at fetch start). -->
+        <div class="error-banner" role="alert" aria-live="polite">
+          <span class="error-banner-icon" aria-hidden="true">⚠</span>
+          <span class="error-banner-text">Catalog refresh failed: {catalogStore.error}</span>
+        </div>
+      {/if}
       <div class="catalog-metrics">
         <MetricCard label="Total" value={catalogStore.servers.length} compact />
         <MetricCard label="Enabled" value={catalogStore.enabledCount} color="var(--success)" compact />
@@ -326,6 +339,30 @@
 <style>
   .catalog-header {
     padding: var(--space-2) var(--space-3) var(--space-1);
+  }
+
+  .error-banner {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-start;
+    padding: 8px var(--space-3);
+    margin-bottom: var(--space-2);
+    background: color-mix(in srgb, var(--error) 18%, var(--bg-secondary));
+    border: 1px solid var(--error);
+    border-radius: var(--radius-md);
+    color: var(--fg-primary);
+    font-size: var(--text-sm);
+  }
+
+  .error-banner-icon {
+    color: var(--error);
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .error-banner-text {
+    flex: 1;
+    word-break: break-word;
   }
 
   .catalog-metrics {
