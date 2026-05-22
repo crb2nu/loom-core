@@ -5,6 +5,8 @@
   import EmptyState from './shared/EmptyState.svelte';
   import Badge from '../widgets/Badge.svelte';
   import VirtualList from '../widgets/VirtualList.svelte';
+  import { createStreamScroll } from '../widgets/useStreamScroll.svelte.ts';
+  import UnseenAboveChip from '../widgets/UnseenAboveChip.svelte';
   import { formatTime } from '../utils/format.ts';
 
   // Audit-driven trace lists are unbounded; virtualize the render path so a
@@ -66,6 +68,15 @@
     { value: 'success', label: 'Success' },
   ];
 
+  // Shared scroll behavior — snap-to-top on prepend when at top, anchor
+  // scrollTop when scrolled down, unseen-count for the "↑ N new traces"
+  // chip. Traces have no pause concept; the composable defaults paused
+  // to false.
+  const scroll = createStreamScroll({
+    rowHeight: TRACE_ROW_HEIGHT,
+    source: () => entries.length,
+    visible: () => filtered.length,
+  });
 </script>
 
 <div class="panel traces-panel">
@@ -134,7 +145,10 @@
     {/if}
   {:else}
     <div class="trace-list">
-      <VirtualList items={filtered} itemHeight={TRACE_ROW_HEIGHT}>
+      {#if scroll.unseenCount > 0 && !scroll.isAtTop}
+        <UnseenAboveChip count={scroll.unseenCount} onClick={scroll.jumpToNewest} singular="trace" plural="traces" />
+      {/if}
+      <VirtualList items={filtered} itemHeight={TRACE_ROW_HEIGHT} bind:containerEl={scroll.containerEl}>
         {#snippet children({ item: entry })}
           <div class="trace-row">
             <div class="trace-row-top">
@@ -263,11 +277,12 @@
      bounded flex slot inside .traces-panel so VirtualList can compute its
      own client height. The inter-row gap is baked into TRACE_ROW_HEIGHT
      (96px row + 8px gap) since absolute-positioned children can't use
-     flex gap. */
+     flex gap. position: relative anchors the UnseenAboveChip overlay. */
   .trace-list {
     flex: 1;
     min-height: 0;
     overflow: hidden;
+    position: relative;
   }
 
   .trace-row {
