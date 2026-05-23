@@ -43,6 +43,11 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	mux.HandleFunc("GET /api/mills/kpis", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/council/runs", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/council/runs/{id}", mw(d.handleProxyGet))
+	// Per-round debate transcript for a council run. Without this proxy
+	// the SPA fallback served HTML to /runs/{id}/debate, which the HUD
+	// frontend then tried to JSON.parse and surfaced as
+	// "Unrecognized token '<'" on the Council tab.
+	mux.HandleFunc("GET /api/mills/council/runs/{id}/debate", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/pipeline/runs", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/pipeline/runs/{id}", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/backlog", mw(d.handleProxyGet))
