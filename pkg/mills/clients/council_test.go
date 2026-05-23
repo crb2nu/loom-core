@@ -59,6 +59,47 @@ func TestFlexInferCouncilEditorSplitsArtifacts(t *testing.T) {
 	}
 }
 
+// Regression: a model that returns an empty (or whitespace-only) string
+// must surface as EditorOutput.Empty=true so the runner can demote the
+// council run's outcome to error instead of silently writing a placeholder
+// and marking the run success.
+func TestFlexInferCouncilEditorMarksEmptyResponse(t *testing.T) {
+	cli := newStubClient(t, `{
+		"model":"gemma4-26b-a4b-gptq",
+		"choices":[{"message":{"role":"assistant","content":"   \n  "}}],
+		"usage":{"prompt_tokens":40,"completion_tokens":0,"total_tokens":40}
+	}`, 200)
+	editor := &FlexInferCouncilEditor{Client: cli, Model: "gemma4-26b-a4b-gptq"}
+
+	out, err := editor.Edit(context.Background(), &council.Brief{Markdown: "Brief"}, nil)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !out.Empty {
+		t.Fatalf("Empty = false, want true for whitespace-only response")
+	}
+	if !strings.Contains(out.Sidecar.Notes, "no content") {
+		t.Fatalf("Sidecar.Notes = %q, want explanation of empty response", out.Sidecar.Notes)
+	}
+}
+
+func TestFlexInferCouncilEditorNonEmptyResponseNotMarkedEmpty(t *testing.T) {
+	cli := newStubClient(t, `{
+		"model":"gemma4-26b-a4b-gptq",
+		"choices":[{"message":{"role":"assistant","content":"## Research\nFindings."}}],
+		"usage":{"prompt_tokens":40,"completion_tokens":10,"total_tokens":50}
+	}`, 200)
+	editor := &FlexInferCouncilEditor{Client: cli, Model: "gemma4-26b-a4b-gptq"}
+
+	out, err := editor.Edit(context.Background(), &council.Brief{Markdown: "Brief"}, nil)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if out.Empty {
+		t.Fatalf("Empty = true, want false for non-empty response")
+	}
+}
+
 func TestFlexInferEvalJudgeParsesContradictionVerdict(t *testing.T) {
 	cli := newStubClient(t, `{
 		"model":"qwen3-8b",

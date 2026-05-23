@@ -282,6 +282,51 @@ func TestRun_PartialSkipsBacklog(t *testing.T) {
 	}
 }
 
+// TestRun_EmptyEditorMarksOutcomeError pins the regression where an
+// editor that returned no usable content used to produce a council_run
+// row with outcome=success and a "No model output returned." placeholder
+// document. After the empty-flag wiring the runner demotes the run to
+// outcome=error and annotates the notes so operators see the failure on
+// the Council tab.
+func TestRun_EmptyEditorMarksOutcomeError(t *testing.T) {
+	env := newRunnerEnv(t, sampleProposals(1))
+	// Decorate the existing editor so it stamps Empty=true on the
+	// output. Everything else stays normal so the writer still produces
+	// a council_run row — we just want to verify the outcome demotion.
+	env.runner.Editor = &emptyMarkingEditor{base: env.runner.Editor}
+	res, err := env.runner.Run(context.Background(), RunInput{
+		Trigger: store.CouncilTriggerCron,
+		Reason:  "scheduled",
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got, err := env.store.Council.Get(context.Background(), res.RunID)
+	if err != nil {
+		t.Fatalf("Council.Get: %v", err)
+	}
+	if got.Outcome != store.CouncilOutcomeError {
+		t.Errorf("Outcome = %v, want error", got.Outcome)
+	}
+	if !strings.Contains(got.Notes, "empty response") {
+		t.Errorf("Notes = %q, want it to mention empty response", got.Notes)
+	}
+}
+
+// emptyMarkingEditor decorates a base Editor to set Empty=true on every
+// returned output, simulating a model that took the API call but produced
+// no usable text.
+type emptyMarkingEditor struct{ base council.Editor }
+
+func (e *emptyMarkingEditor) Edit(ctx context.Context, brief *council.Brief, reviews []council.ReviewerOutput) (*council.EditorOutput, error) {
+	out, err := e.base.Edit(ctx, brief, reviews)
+	if err != nil {
+		return nil, err
+	}
+	out.Empty = true
+	return out, nil
+}
+
 // ----- dryrun path -----
 
 func TestRun_DryrunWritesScratchDir(t *testing.T) {

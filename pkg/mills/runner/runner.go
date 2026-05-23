@@ -265,6 +265,19 @@ func (r *Runner) Run(ctx context.Context, in RunInput) (*RunResult, error) {
 	if verdict.Partial {
 		wr.Run.Outcome = store.CouncilOutcomePartial
 	}
+	// An editor that returned no usable content is a failed run even
+	// when the artifact write succeeded with a "No model output returned."
+	// placeholder. Demote loudly so operators see the failure on the
+	// Council tab instead of a misleading green 'success'. This wins
+	// over Partial — empty is a strictly worse signal.
+	if out != nil && out.Empty {
+		wr.Run.Outcome = store.CouncilOutcomeError
+		if wr.Run.Notes == "" {
+			wr.Run.Notes = "editor returned empty response"
+		} else {
+			wr.Run.Notes = wr.Run.Notes + " (editor returned empty response)"
+		}
+	}
 	if !in.Dryrun {
 		if err := r.Store.Council.Put(ctx, wr.Run); err != nil {
 			return res, fmt.Errorf("persist council run: %w", err)

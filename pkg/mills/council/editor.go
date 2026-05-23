@@ -58,6 +58,17 @@ type EditorOutput struct {
 	Backend string
 	Model   string
 	CostUSD float64
+
+	// Empty is set by the editor when the underlying model returned no
+	// usable content (empty string, whitespace-only, or a malformed
+	// response we couldn't recover anything from). Callers (the council
+	// runner) treat this as a run-level failure even though the HTTP
+	// call to the backend may have succeeded with a 200 — a council
+	// whose editor produced nothing is not a successful council. Without
+	// this signal the runner would persist a row marked success with a
+	// placeholder "No model output returned." document, which lied to
+	// operators about run health.
+	Empty bool
 }
 
 // ArtifactDoc is one markdown document the editor produced. The writer
