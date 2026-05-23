@@ -37,14 +37,17 @@
   import DataTable from '../shared/DataTable.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
 
+  // Agent column intentionally has no explicit width: with table-layout: fixed
+  // (from DataTable's stable-layout) the unsized column absorbs leftover space
+  // and prevents the table sum from exceeding the panel width on narrow viewports.
   const columns = [
-    { key: 'agent', label: 'Agent', sortable: true, width: '200px' },
-    { key: 'status', label: 'Status', sortable: true, width: '70px' },
-    { key: 'evidence', label: 'Evidence', sortable: true, width: '110px' },
-    { key: 'namespace', label: 'Namespace', sortable: true, width: '180px' },
-    { key: 'activity', label: 'Activity', sortable: false, width: '220px' },
-    { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '90px' },
-    { key: 'actions', label: 'Actions', sortable: false, width: '190px' },
+    { key: 'agent', label: 'Agent', sortable: true },
+    { key: 'status', label: 'Status', sortable: true, width: '60px' },
+    { key: 'evidence', label: 'Evidence', sortable: true, width: '90px' },
+    { key: 'namespace', label: 'Namespace', sortable: true, width: '160px' },
+    { key: 'activity', label: 'Activity', sortable: false, width: '200px' },
+    { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '80px' },
+    { key: 'actions', label: 'Actions', sortable: false, width: '170px' },
   ];
 
   function unifiedAgentStatus(agent) {
@@ -242,10 +245,17 @@
     text-overflow: ellipsis;
   }
 
-  .agent-cell {
+  /* Agent cell intentionally wraps and aligns to the top so its stacked
+     children (id, meta-row, hierarchy-pills) read naturally. The selector
+     is qualified with .data-table.stable-layout to beat the default
+     stable-layout rule which forces nowrap + middle-align on every td. */
+  :global(.data-table.stable-layout) tbody td.agent-cell {
     position: relative;
     white-space: normal;
     word-break: break-word;
+    vertical-align: top;
+    padding-top: var(--space-2);
+    padding-bottom: var(--space-2);
   }
 
   .namespace-cell {
