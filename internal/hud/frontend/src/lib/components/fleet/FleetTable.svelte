@@ -139,8 +139,12 @@
           <StatusDot status={unifiedAgentStatus(agent)} />
         </td>
         <td class="evidence-cell" class:ungrouped-divider={showUngroupedDivider}>
-          <span class="evidence-pill" class:evidence-pill-active={agent.has_presence}>presence</span>
-          <span class="evidence-pill" class:evidence-pill-active={agent.has_session}>session</span>
+          {#if agent.has_presence}
+            <span class="evidence-pill evidence-pill-active">presence</span>
+          {/if}
+          {#if agent.has_session}
+            <span class="evidence-pill evidence-pill-active">session</span>
+          {/if}
           {#if agent.has_spawn}
             <span class="evidence-pill evidence-pill-active">spawn</span>
           {/if}
@@ -149,6 +153,9 @@
               class="evidence-pill evidence-pill-orphan"
               title={`Heartbeating without an active session for ${Math.round(agent.orphan_age_seconds / 60)}m. Auto-reaped at 10m.`}
             >orphan</span>
+          {/if}
+          {#if !agent.has_presence && !agent.has_session && !agent.has_spawn && !agent.is_orphan}
+            <span class="evidence-empty" title="No presence, session, or spawn evidence">—</span>
           {/if}
         </td>
         <td class="text-mono text-muted namespace-cell" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.namespace ?? agent.project ?? '---')}>
@@ -364,6 +371,12 @@
     border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
     background: color-mix(in srgb, var(--warning) 12%, transparent);
     color: var(--warning);
+  }
+
+  .evidence-empty {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-dim);
   }
 
   .actions-cell {
