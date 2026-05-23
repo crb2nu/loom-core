@@ -120,6 +120,10 @@ func (a *aimodelsDepsAdapter) AIModelsResolver() *aimodels.Resolver {
 	return a.app.AIModelsResolver()
 }
 
+func (a *aimodelsDepsAdapter) FlexInferProxyURL() string {
+	return a.app.config.FlexInferURL
+}
+
 // --- Shared Deps methods (used by multiple domains) ---
 
 func (a *App) Agent() *bridge.AgentBridge { return a.agent }

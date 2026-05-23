@@ -11,6 +11,7 @@ import (
 
 type fakeDeps struct {
 	resolver *aimodels.Resolver
+	proxyURL string
 }
 
 func (f *fakeDeps) WriteJSON(w http.ResponseWriter, status int, v any) {
@@ -24,6 +25,7 @@ func (f *fakeDeps) WriteError(w http.ResponseWriter, status int, msg string, _ e
 }
 
 func (f *fakeDeps) AIModelsResolver() *aimodels.Resolver { return f.resolver }
+func (f *fakeDeps) FlexInferProxyURL() string            { return f.proxyURL }
 
 func TestHandleRoles_DefaultResolver(t *testing.T) {
 	t.Parallel()

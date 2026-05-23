@@ -1,10 +1,15 @@
 <script lang="ts">
   import { millsAuditStore, type AuditFinding } from '../../stores/mills_audit.svelte.ts';
+  import { flexinferModelsStore, type ModelStatus } from '../../stores/flexinfer_models.svelte.ts';
   import PanelShell from '../shared/PanelShell.svelte';
 
   $effect(() => {
     millsAuditStore.startPolling(15000);
-    return () => { millsAuditStore.stopPolling(); };
+    flexinferModelsStore.startPolling();
+    return () => {
+      millsAuditStore.stopPolling();
+      flexinferModelsStore.stopPolling();
+    };
   });
 
   let entries = $derived(millsAuditStore.state);
@@ -73,6 +78,14 @@
       case 'council_artifact': return 'council';
       case 'pipeline_merge': return 'pipeline';
       default: return kind || 'unknown';
+    }
+  }
+
+  function poolStatusTitle(status: ModelStatus, model: string): string {
+    switch (status) {
+      case 'ready':   return `${model}: Ready in flexinfer-system — accepting requests.`;
+      case 'idle':    return `${model}: Idle / scaled-to-zero — requests will trigger a cold start (or fail if probe is offline).`;
+      case 'unknown': return `${model}: not present in the flexinfer-system /v1/models registry, OR the registry hasn't loaded yet. If it's the former, the dispatcher will 404 on every call to this model.`;
     }
   }
 
@@ -218,9 +231,18 @@
               <h3 class="detail-heading">Auditor pool</h3>
               <ul class="pool-list">
                 {#each detail.AuditorPool as m, i (i)}
+                  {@const status = m.backend === 'flexinfer' ? flexinferModelsStore.statusFor(m.model ?? '') : 'unknown'}
                   <li class="pool-item">
                     <span class="pool-backend">{m.backend ?? '—'}</span>
                     <span class="pool-model">{m.model ?? '—'}</span>
+                    {#if m.backend === 'flexinfer'}
+                      <span
+                        class="pool-status pool-status-{status}"
+                        title={poolStatusTitle(status, m.model ?? '')}
+                      >{status}</span>
+                    {:else}
+                      <span class="pool-status pool-status-unknown" title="Status checks are only available for flexinfer-backed models today.">—</span>
+                    {/if}
                     <span class="pool-role role-{m.role ?? 'unknown'}">{m.role ?? 'unknown'}</span>
                   </li>
                 {/each}
@@ -519,7 +541,8 @@
   }
   .pool-item {
     display: grid;
-    grid-template-columns: 5rem 1fr 5rem;
+    grid-template-columns: 5rem 1fr 4.5rem 5rem;
+    align-items: center;
     gap: 0.5rem;
     font-size: 0.78rem;
   }
@@ -531,6 +554,32 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .pool-status {
+    text-align: center;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-family: ui-monospace, monospace;
+    cursor: help;
+    white-space: nowrap;
+  }
+  .pool-status-ready {
+    background: rgba(78, 201, 176, 0.18);
+    color: var(--success, #4ec9b0);
+    border: 1px solid rgba(78, 201, 176, 0.4);
+  }
+  .pool-status-idle {
+    background: rgba(215, 160, 58, 0.18);
+    color: var(--warning, #d7a03a);
+    border: 1px solid rgba(215, 160, 58, 0.4);
+  }
+  .pool-status-unknown {
+    background: rgba(224, 108, 117, 0.15);
+    color: var(--danger, #e06c75);
+    border: 1px solid rgba(224, 108, 117, 0.35);
   }
   .pool-role {
     text-align: right;

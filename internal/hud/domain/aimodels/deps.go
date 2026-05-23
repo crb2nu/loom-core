@@ -16,4 +16,10 @@ type Deps interface {
 	// the daemon constructed at startup. May return nil before
 	// initialization; handlers must guard.
 	AIModelsResolver() *aimodels.Resolver
+
+	// FlexInferProxyURL returns the base URL of the FlexInfer
+	// OpenAI-compatible proxy (without /v1 suffix) the daemon was
+	// configured with. Empty string disables the flexinfer/models
+	// endpoint; the handler returns an empty list rather than 500.
+	FlexInferProxyURL() string
 }
