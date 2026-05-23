@@ -28,4 +28,9 @@ func (d *AIModelsDomain) Name() string { return "aimodels" }
 // RegisterRoutes mounts the read-only role inspection endpoints.
 func (d *AIModelsDomain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) http.HandlerFunc) {
 	mux.HandleFunc("GET /api/aimodels/roles", mw(d.handleRoles))
+	// Surface the live FlexInfer model registry so panels (Mills Audit,
+	// Council debate participants) can tag each model with its current
+	// Ready/Idle/Unknown state instead of treating every model name
+	// as opaque.
+	mux.HandleFunc("GET /api/aimodels/flexinfer/models", mw(d.handleFlexInferModels))
 }
