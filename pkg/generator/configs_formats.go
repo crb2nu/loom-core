@@ -337,6 +337,8 @@ func generateHooksConfig(reg *registry.Registry, outputDir, target string, profi
 		config = claudeHooksConfig(reg, profile, loomBinary)
 	case target == "gemini":
 		config = geminiHooksConfigFromRegistry(reg, profile, loomBinary)
+	case target == "antigravity":
+		config = antigravityHooksConfig(reg, profile, loomBinary)
 	default:
 		// Generic JSON hooks stub for platforms with hooks.enabled but no
 		// platform-specific wrapper (future platforms).

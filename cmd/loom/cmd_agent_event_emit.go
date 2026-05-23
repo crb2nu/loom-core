@@ -33,10 +33,11 @@ const (
 // stdin is already a canonical {type, payload} envelope and bypasses
 // platform-specific normalization.
 const (
-	platformClaudeCode = "claude-code"
-	platformGemini     = "gemini-cli"
-	platformCodex      = "codex"
-	platformGeneric    = "generic"
+	platformClaudeCode  = "claude-code"
+	platformGemini      = "gemini-cli"
+	platformCodex       = "codex"
+	platformAntigravity = "antigravity"
+	platformGeneric     = "generic"
 )
 
 // Canonical event type strings. Mirror internal/daemon.EventType constants
@@ -71,10 +72,12 @@ func hookToEvent(hook, platform, agentID string, raw map[string]any) (emittedEve
 		return nativeHookToEvent(hook, agentID, raw)
 	case platformCodex:
 		return codexHookToEvent(hook, agentID, raw)
+	case platformAntigravity:
+		return antigravityHookToEvent(hook, agentID, raw)
 	case platformGeneric:
 		return genericHookToEvent(hook, agentID, raw)
 	default:
-		return emittedEvent{}, fmt.Errorf("unsupported platform %q (supported: %s, %s, %s, %s)", platform, platformClaudeCode, platformGemini, platformCodex, platformGeneric)
+		return emittedEvent{}, fmt.Errorf("unsupported platform %q (supported: %s, %s, %s, %s, %s)", platform, platformClaudeCode, platformGemini, platformCodex, platformAntigravity, platformGeneric)
 	}
 }
 
@@ -218,6 +221,134 @@ func codexHookToEvent(hook, agentID string, raw map[string]any) (emittedEvent, e
 	return emittedEvent{Type: eventToolCallEnd, Payload: payload}, nil
 }
 
+// antigravityHookToEvent maps Google Antigravity hook payloads to canonical
+// events. Antigravity uses conversationId instead of session_id and nests tool
+// metadata under toolCall {name,args}.
+func antigravityHookToEvent(hook, agentID string, raw map[string]any) (emittedEvent, error) {
+	sessionID := stringField(raw, "conversationId")
+	if sessionID == "" {
+		sessionID = stringField(raw, "session_id")
+	}
+	if agentID == "" {
+		agentID = stringField(raw, "agent_id")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	switch hook {
+	case hookSessionStart:
+		return emittedEvent{
+			Type: eventSessionStart,
+			Payload: map[string]any{
+				"session_id": sessionID,
+				"agent_id":   agentID,
+				"started_at": now,
+			},
+		}, nil
+
+	case hookSessionEnd:
+		payload := map[string]any{
+			"session_id": sessionID,
+			"agent_id":   agentID,
+			"ended_at":   now,
+		}
+		if reason := stringField(raw, "terminationReason"); reason != "" {
+			payload["termination_reason"] = reason
+		}
+		if errMsg := stringField(raw, "error"); errMsg != "" {
+			payload["error"] = errMsg
+		}
+		if v, ok := boolField(raw, "fullyIdle"); ok {
+			payload["fully_idle"] = v
+		}
+		return emittedEvent{Type: eventSessionEnd, Payload: payload}, nil
+
+	case hookPreToolUse:
+		toolName, args := antigravityToolCall(raw)
+		if toolName == "" {
+			return emittedEvent{}, errors.New("pre-tool-use: toolCall.name is required")
+		}
+		return emittedEvent{
+			Type: eventToolCallStart,
+			Payload: map[string]any{
+				"call_id":       antigravityCallID(raw, sessionID),
+				"session_id":    sessionID,
+				"agent_id":      agentID,
+				"tool_name":     toolName,
+				"args_redacted": redact.Redact(toolName, args, redact.TierPublic),
+				"args_tier":     string(redact.TierPublic),
+				"started_at":    now,
+			},
+		}, nil
+
+	case hookPostToolUse:
+		toolName, _ := antigravityToolCall(raw)
+		if toolName == "" {
+			toolName = "antigravity.step"
+		}
+		payload := map[string]any{
+			"call_id":    antigravityCallID(raw, sessionID),
+			"session_id": sessionID,
+			"agent_id":   agentID,
+			"tool_name":  toolName,
+			"ended_at":   now,
+		}
+		if step := intField(raw, "stepIdx"); step != 0 {
+			payload["step_idx"] = step
+		}
+		if errMsg := stringField(raw, "error"); errMsg != "" {
+			payload["error"] = errMsg
+		}
+		if v, ok := raw["result"]; ok && v != nil {
+			if s := redact.Summary(toolName, v, redact.TierPublic); s != "" {
+				payload["result_summary"] = s
+			}
+		}
+		return emittedEvent{Type: eventToolCallEnd, Payload: payload}, nil
+
+	default:
+		return emittedEvent{}, fmt.Errorf("unknown hook %q (expected: %s, %s, %s, %s)",
+			hook, hookSessionStart, hookSessionEnd, hookPreToolUse, hookPostToolUse)
+	}
+}
+
+func antigravityToolCall(raw map[string]any) (string, map[string]any) {
+	toolCall := mapField(raw, "toolCall")
+	if toolCall == nil {
+		toolCall = mapField(raw, "tool_call")
+	}
+	toolName := stringField(toolCall, "name")
+	if toolName == "" {
+		toolName = stringField(raw, "tool_name")
+	}
+	args := mapField(toolCall, "args")
+	if args == nil {
+		args = mapField(raw, "tool_input")
+	}
+	if args == nil {
+		args = map[string]any{}
+	}
+	return toolName, args
+}
+
+func antigravityCallID(raw map[string]any, sessionID string) string {
+	for _, key := range []string{"call_id", "callId", "requestId"} {
+		if v := stringField(raw, key); v != "" {
+			return v
+		}
+	}
+	if toolCall := mapField(raw, "toolCall"); toolCall != nil {
+		for _, key := range []string{"id", "callId"} {
+			if v := stringField(toolCall, key); v != "" {
+				return v
+			}
+		}
+	}
+	if step := intField(raw, "stepIdx"); sessionID != "" || step != 0 {
+		return fmt.Sprintf("antigravity-%s-%d", sessionID, step)
+	}
+	return generateEventEmitCallID()
+}
+
 // genericHookToEvent passes through a pre-normalized {type, payload}
 // envelope. Used by automation that already knows the canonical schema (e.g.
 // custom orchestrators) so we don't need a per-tool platform.
@@ -277,13 +408,37 @@ func generateEventEmitCallID() string {
 }
 
 func stringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
 	if v, ok := m[key].(string); ok {
 		return v
 	}
 	return ""
 }
 
+func mapField(m map[string]any, key string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	if v, ok := m[key].(map[string]any); ok {
+		return v
+	}
+	return nil
+}
+
+func boolField(m map[string]any, key string) (bool, bool) {
+	if m == nil {
+		return false, false
+	}
+	v, ok := m[key].(bool)
+	return v, ok
+}
+
 func intField(m map[string]any, key string) int64 {
+	if m == nil {
+		return 0
+	}
 	switch v := m[key].(type) {
 	case float64:
 		return int64(v)
@@ -391,7 +546,7 @@ http://127.0.0.1:9876 (the loomd metrics/events port).`,
 	}
 
 	cmd.Flags().StringVar(&hook, "hook", "", "Hook name: session-start, session-end, pre-tool-use, post-tool-use")
-	cmd.Flags().StringVar(&platform, "platform", platformClaudeCode, "Source platform: claude-code, gemini-cli, codex, generic")
+	cmd.Flags().StringVar(&platform, "platform", platformClaudeCode, "Source platform: claude-code, gemini-cli, codex, antigravity, generic")
 	cmd.Flags().StringVar(&agentID, "agent-id", "", "Agent identifier (overrides payload agent_id)")
 	cmd.Flags().StringVar(&daemonURL, "daemon-url", "", "Daemon HTTP URL (default: $LOOM_DAEMON_HTTP_URL or http://127.0.0.1:9876)")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress output and errors (recommended for hook context)")

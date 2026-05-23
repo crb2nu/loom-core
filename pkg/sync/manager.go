@@ -26,6 +26,10 @@ type Profile struct {
 	// (e.g. "settings.json" for lifecycle hooks). These are synced alongside
 	// GeneratedFile but are optional — missing extras are silently skipped.
 	ExtraGeneratedFiles []string
+	// HomeExtraGeneratedFiles overrides the home relative path for extra
+	// generated files. Keys are repo-relative extra paths, values are paths
+	// relative to HomeDir.
+	HomeExtraGeneratedFiles map[string]string
 	// GeneratedDirectToHome writes generated config files directly into the home
 	// profile directory and treats the repo mirror as stale cache to be cleaned.
 	GeneratedDirectToHome bool
@@ -181,23 +185,28 @@ func (m *Manager) registerProfiles() {
 
 	m.Profiles["antigravity"] = &Profile{
 		Name:    "antigravity",
-		RepoDir: ".antigravity",
-		HomeDir: ".gemini/antigravity",
+		RepoDir: ".agents",
+		HomeDir: ".gemini",
 		Excludes: []string{
 			"auth.json", "sessions", "backups", "extensions",
 			"antigravity", "argv.json", "logs", "CachedData",
 		},
-		SecretFiles:         []string{"auth.json"},
-		GeneratorTarget:     "antigravity", // Uses mcp.json format (VSCode fork)
-		GeneratedFile:       "mcp.json",
-		HomeGeneratedFile:   "mcp_config.json",
-		ExtraGeneratedFiles: []string{"settings.json"}, // Stub for sync architecture consistency
-		SyncGeneratedOnly:   true,
-		SkillsTarget:        "gemini",
-		SkillsManifest:      ".loom-skills-manifest.json",
-		SkillsHomePath:      "$HOME/.gemini/antigravity/skills",
-		SkillsDirectToHome:  true,
-		DefaultLoomMode:     true,
+		SecretFiles:       []string{"auth.json"},
+		GeneratorTarget:   "antigravity",
+		GeneratedFile:     "mcp_config.json",
+		HomeGeneratedFile: "antigravity/mcp_config.json",
+		ExtraGeneratedFiles: []string{
+			"hooks.json",
+		},
+		HomeExtraGeneratedFiles: map[string]string{
+			"hooks.json": "config/hooks.json",
+		},
+		SyncGeneratedOnly:  true,
+		SkillsTarget:       "gemini",
+		SkillsManifest:     ".loom-skills-manifest.json",
+		SkillsHomePath:     "$HOME/.gemini/antigravity/skills",
+		SkillsDirectToHome: true,
+		DefaultLoomMode:    true,
 	}
 
 	m.Profiles["vscode"] = &Profile{

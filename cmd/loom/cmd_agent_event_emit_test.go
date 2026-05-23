@@ -343,6 +343,79 @@ func TestHookToEvent_CodexOmitsZeroFieldsForAbsentMetadata(t *testing.T) {
 	}
 }
 
+func TestHookToEvent_AntigravitySessionStart(t *testing.T) {
+	raw := mustParse(t, `{"conversationId":"ag-1","workspacePaths":["/workspace/project"]}`)
+
+	ev, err := hookToEvent("session-start", "antigravity", "antigravity-1", raw)
+	if err != nil {
+		t.Fatalf("hookToEvent: %v", err)
+	}
+	if ev.Type != eventSessionStart {
+		t.Errorf("Type = %q, want %q", ev.Type, eventSessionStart)
+	}
+	if ev.Payload["session_id"] != "ag-1" {
+		t.Errorf("session_id = %v, want ag-1", ev.Payload["session_id"])
+	}
+	if ev.Payload["agent_id"] != "antigravity-1" {
+		t.Errorf("agent_id = %v, want antigravity-1", ev.Payload["agent_id"])
+	}
+}
+
+func TestHookToEvent_AntigravityPreToolUseRedactsArgs(t *testing.T) {
+	raw := mustParse(t, `{
+		"conversationId": "ag-2",
+		"toolCall": {
+			"id": "call-ag-1",
+			"name": "run_command",
+			"args": {"CommandLine": "aws s3 ls --secret AKIAIOSFODNN7EXAMPLE"}
+		}
+	}`)
+
+	ev, err := hookToEvent("pre-tool-use", "antigravity", "antigravity-2", raw)
+	if err != nil {
+		t.Fatalf("hookToEvent: %v", err)
+	}
+	if ev.Type != eventToolCallStart {
+		t.Errorf("Type = %q, want %q", ev.Type, eventToolCallStart)
+	}
+	if ev.Payload["tool_name"] != "run_command" {
+		t.Errorf("tool_name = %v, want run_command", ev.Payload["tool_name"])
+	}
+	if ev.Payload["call_id"] != "call-ag-1" {
+		t.Errorf("call_id = %v, want call-ag-1", ev.Payload["call_id"])
+	}
+	argsBytes, _ := json.Marshal(ev.Payload["args_redacted"])
+	if strings.Contains(string(argsBytes), "AKIAIOSFODNN7EXAMPLE") {
+		t.Errorf("AWS key leaked through Antigravity redaction: %s", argsBytes)
+	}
+}
+
+func TestHookToEvent_AntigravityStopIncludesTerminationMetadata(t *testing.T) {
+	raw := mustParse(t, `{
+		"conversationId": "ag-3",
+		"terminationReason": "user_cancelled",
+		"fullyIdle": true,
+		"error": "cancelled"
+	}`)
+
+	ev, err := hookToEvent("session-end", "antigravity", "antigravity-3", raw)
+	if err != nil {
+		t.Fatalf("hookToEvent: %v", err)
+	}
+	if ev.Type != eventSessionEnd {
+		t.Errorf("Type = %q, want %q", ev.Type, eventSessionEnd)
+	}
+	if ev.Payload["termination_reason"] != "user_cancelled" {
+		t.Errorf("termination_reason = %v", ev.Payload["termination_reason"])
+	}
+	if ev.Payload["fully_idle"] != true {
+		t.Errorf("fully_idle = %v, want true", ev.Payload["fully_idle"])
+	}
+	if ev.Payload["error"] != "cancelled" {
+		t.Errorf("error = %v, want cancelled", ev.Payload["error"])
+	}
+}
+
 func TestIsAllowedEmittedType(t *testing.T) {
 	allowed := []string{
 		eventSessionStart, eventSessionEnd, eventAgentStatusChange,

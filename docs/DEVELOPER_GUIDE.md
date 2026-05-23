@@ -84,7 +84,7 @@ For Flux-backed releases, run `make deploy-check` before `make deploy`. The depl
 
 `sync --regen` prefers workspace-local registries discovered from repo ancestors before home-level defaults.
 
-Antigravity sync now maintains both `mcp.json` and `settings.json` (hooks stub), so keep both generated artifacts in sync when updating hook-generation behavior.
+Antigravity 2.0 sync now maintains `.agents/mcp_config.json` + `.agents/hooks.json` in workspaces and `~/.gemini/antigravity/mcp_config.json` + `~/.gemini/config/hooks.json` at home. Native Antigravity hooks use a distinct `hooks.json` contract, so they are emitted by `configs_antigravity.go` rather than the shared Claude/Gemini hook generator.
 
 For inventory-oriented tooling/tests in loom-mode, prefer paged proxy resources:
 

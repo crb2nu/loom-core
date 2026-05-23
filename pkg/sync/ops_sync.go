@@ -150,7 +150,7 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 			if !Exists(extraSrc) {
 				continue
 			}
-			extraDst := filepath.Join(homePath, extra)
+			extraDst := filepath.Join(homePath, mapRepoGeneratedToHome(p, extra))
 
 			if extra == "settings.json" {
 				// Smart merge: hooks should only live at the user/home level.

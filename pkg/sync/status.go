@@ -393,11 +393,12 @@ func homeGeneratedFiles(profile *Profile) []string {
 		if rel == "" {
 			continue
 		}
-		if _, ok := seen[rel]; ok {
+		homeRel := mapRepoGeneratedToHome(profile, rel)
+		if _, ok := seen[homeRel]; ok {
 			continue
 		}
-		seen[rel] = struct{}{}
-		files = append(files, rel)
+		seen[homeRel] = struct{}{}
+		files = append(files, homeRel)
 	}
 	return files
 }

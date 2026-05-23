@@ -1246,6 +1246,42 @@ func TestSyncToHome_GeneratedOnly_HomeGeneratedFileOverride(t *testing.T) {
 	}
 }
 
+func TestSyncToHome_GeneratedOnly_HomeExtraGeneratedFileOverride(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	repoProfDir := filepath.Join(repoDir, "test-profile")
+	os.MkdirAll(repoProfDir, 0755)
+	os.WriteFile(filepath.Join(repoProfDir, "mcp_config.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(repoProfDir, "hooks.json"), []byte(`{"loom":{}}`), 0644)
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:                "test",
+		RepoDir:             "test-profile",
+		HomeDir:             filepath.Join(homeDir, "dest"),
+		GeneratedFile:       "mcp_config.json",
+		ExtraGeneratedFiles: []string{"hooks.json"},
+		HomeExtraGeneratedFiles: map[string]string{
+			"hooks.json": "config/hooks.json",
+		},
+		SyncGeneratedOnly: true,
+	}
+
+	err := m.SyncToHome("test", false, false, false, false, "", false, "", false)
+	if err != nil {
+		t.Fatalf("SyncToHome failed: %v", err)
+	}
+
+	if !Exists(filepath.Join(homeDir, "dest", "config", "hooks.json")) {
+		t.Fatal("expected hooks.json to be synced to home override path config/hooks.json")
+	}
+	if Exists(filepath.Join(homeDir, "dest", "hooks.json")) {
+		t.Fatal("did not expect hooks.json at the home profile root when HomeExtraGeneratedFiles is set")
+	}
+}
+
 func TestBackup_GeneratedOnly(t *testing.T) {
 	repoDir := t.TempDir()
 	homeDir := t.TempDir()

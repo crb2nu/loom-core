@@ -153,9 +153,9 @@ func (p *PlatformProfile) ToVendorCapabilities() *VendorCapabilities {
 	}
 	for _, evt := range p.Hooks.Events {
 		switch evt {
-		case "sessionStart":
+		case "sessionStart", "preInvocation":
 			vc.SessionStartHook = true
-		case "sessionEnd":
+		case "sessionEnd", "stop":
 			vc.SessionEndHook = true
 		case "postToolUse", "toolExecuteAfter":
 			vc.PostToolUseHook = true
