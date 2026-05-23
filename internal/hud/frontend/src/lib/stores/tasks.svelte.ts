@@ -1,8 +1,15 @@
 // Tasks store - task management
 // v2: SSE-first with 60s fallback poll. Applies task list from hud.fleet snapshots.
+import { actionStore } from './action.svelte.ts';
 import { eventStore } from './events.svelte.ts';
 import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 import { arraysEqualById } from '../utils/diff.ts';
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message || 'Unknown error';
+  if (typeof e === 'string') return e;
+  try { return JSON.stringify(e); } catch { return 'Unknown error'; }
+}
 
 export interface Task {
   id: string;
@@ -155,6 +162,7 @@ class TaskStore {
   }
 
   async updateStatus(taskId: string, status: string): Promise<void> {
+    const auditId = actionStore.start(`Update task status → ${status}`, 'TasksPanel:status');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
@@ -163,12 +171,15 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Update task: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
     }
   }
 
   async setPriority(taskId: string, priority: string): Promise<void> {
+    const auditId = actionStore.start(`Set task priority → ${priority}`, 'TasksPanel:priority');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
@@ -177,7 +188,9 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Set priority: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
     }
   }
@@ -192,6 +205,7 @@ class TaskStore {
     lineNumber?: number;
     blockedBy?: string[];
   }): Promise<boolean> {
+    const auditId = actionStore.start('Create task', 'TasksPanel:create');
     try {
       const body: Record<string, unknown> = {
         title: params.title,
@@ -210,14 +224,17 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Create task: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
       return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
       return false;
     }
   }
 
   async resolve(taskId: string, resolution: string): Promise<void> {
+    const auditId = actionStore.start('Resolve task', 'TasksPanel:resolve');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
@@ -226,7 +243,9 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Resolve task: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
     }
   }
