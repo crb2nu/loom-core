@@ -75,6 +75,24 @@
       default: return kind || 'unknown';
     }
   }
+
+  // A finding with score==0 AND cost==0 is suspect: a real adverse
+  // finding still costs the auditor model an inference call. Zero on
+  // both axes almost always means the dispatch failed (404, parse
+  // error, timeout) before the model could score anything. Surfacing
+  // this state explicitly stops operators from reading "0.0% survival,
+  // 6 critical" as a real code-quality signal when it's actually
+  // backend health.
+  function isLikelyNoRun(entry: { SurvivalScore?: number; CostUSD?: number }): boolean {
+    const score = entry.SurvivalScore ?? 0;
+    const cost = entry.CostUSD ?? 0;
+    return score === 0 && cost === 0;
+  }
+  // True when every visible entry looks like it never actually ran —
+  // i.e., this isn't a code-quality problem, it's a backend outage.
+  let allLikelyNoRun = $derived(
+    entries.length > 0 && entries.every((e) => isLikelyNoRun(e))
+  );
 </script>
 
 <PanelShell
@@ -91,6 +109,19 @@
     ? 'Set LOOM_MILLS_OPERATOR_URL on the HUD to connect.'
     : (error ?? 'Findings appear when council artifacts commit and pipeline merges land.')}
 >
+  {#if allLikelyNoRun}
+    <div class="all-no-run-banner" role="alert">
+      <strong>Every audit returned 0 with no cost.</strong>
+      <span>
+        This usually means the auditor pool models aren't producing
+        output (404, parse error, or timeout) — not that every audit
+        target is critically broken. Expand a row and check the
+        <em>Auditor pool</em> section, then verify those models are
+        Ready in flexinfer.
+      </span>
+    </div>
+  {/if}
+
   <header class="audit-summary">
     <div class="summary-card">
       <span class="summary-label">avg survival</span>
@@ -144,7 +175,12 @@
           <span class="audit-score {survivalClass(entry.SurvivalScore)}">
             {fmtScore(entry.SurvivalScore)}
           </span>
-          <span class="audit-sev sev-pill-{entry.Severity}">{entry.Severity}</span>
+          <span class="audit-sev-wrap">
+            <span class="audit-sev sev-pill-{entry.Severity}">{entry.Severity}</span>
+            {#if isLikelyNoRun(entry)}
+              <span class="audit-badge badge-no-run" title="Score is 0 and no cost was recorded — the auditor model probably never produced a usable response">no-run</span>
+            {/if}
+          </span>
           <span class="audit-cost">{fmtCost(entry.CostUSD)}</span>
           <span class="audit-time">{fmtTime(entry.CreatedAt)}</span>
         </button>
@@ -167,6 +203,13 @@
                   </li>
                 {/each}
               </ul>
+            {:else if isLikelyNoRun(entry)}
+              <p class="detail-empty detail-empty-warn">
+                <strong>No findings recorded.</strong>
+                Combined with the zero cost above, this strongly suggests
+                the auditor pool never produced a parseable response.
+                Check the Auditor pool below.
+              </p>
             {:else}
               <p class="detail-empty">No structured findings — score speaks for itself.</p>
             {/if}
@@ -196,6 +239,23 @@
 </PanelShell>
 
 <style>
+  .all-no-run-banner {
+    margin: 0.25rem 0.25rem 0.75rem;
+    padding: 0.7rem 0.9rem;
+    background: rgba(224, 108, 117, 0.10);
+    border: 1px solid rgba(224, 108, 117, 0.4);
+    border-left: 3px solid var(--danger, #e06c75);
+    border-radius: 6px;
+    color: var(--text-default, #eef);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .all-no-run-banner strong { color: var(--danger, #e06c75); }
+  .all-no-run-banner em { color: var(--text-default, #eef); font-style: normal; font-weight: 500; }
+
   .audit-summary {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
@@ -346,6 +406,27 @@
   .sev-pill-info { background: rgba(78, 201, 176, 0.18); color: var(--success, #4ec9b0); }
   .sev-pill-warn { background: rgba(215, 160, 58, 0.20); color: var(--warning, #d7a03a); }
   .sev-pill-critical { background: rgba(224, 108, 117, 0.22); color: var(--danger, #e06c75); }
+  .audit-sev-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+  .audit-badge {
+    text-align: center;
+    border-radius: 4px;
+    padding: 0.1rem 0.45rem;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-family: ui-monospace, monospace;
+    white-space: nowrap;
+  }
+  .badge-no-run {
+    background: rgba(215, 160, 58, 0.18);
+    color: var(--warning, #d7a03a);
+    border: 1px solid rgba(215, 160, 58, 0.4);
+  }
   .audit-cost {
     color: var(--text-muted, #97a3b6);
     font-variant-numeric: tabular-nums;
@@ -380,6 +461,16 @@
     font-style: italic;
     font-size: 0.85rem;
   }
+  .detail-empty-warn {
+    padding: 0.5rem 0.7rem;
+    background: rgba(215, 160, 58, 0.10);
+    border-left: 3px solid var(--warning, #d7a03a);
+    border-radius: 3px;
+    color: var(--text-default, #eef);
+    font-style: normal;
+    line-height: 1.45;
+  }
+  .detail-empty-warn strong { color: var(--warning, #d7a03a); }
   .detail-meta {
     margin: 0;
     color: var(--text-muted, #97a3b6);
