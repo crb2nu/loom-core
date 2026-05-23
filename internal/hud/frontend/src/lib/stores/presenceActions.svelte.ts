@@ -1,3 +1,4 @@
+import { actionStore } from './action.svelte.ts';
 import { fleetStore } from './fleet.svelte.ts';
 import { toastStore } from './toasts.svelte.ts';
 import {
@@ -11,6 +12,12 @@ import {
   type HandoffRecord,
   type TemplateRecord,
 } from '../clients/presenceActions.ts';
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message || 'Unknown error';
+  if (typeof e === 'string') return e;
+  try { return JSON.stringify(e); } catch { return 'Unknown error'; }
+}
 
 class PresenceActionsStore {
   handoffs = $state<HandoffRecord[]>([]);
@@ -76,6 +83,7 @@ class PresenceActionsStore {
     if (!this.newHandoffTo.trim() || !this.newHandoffSummary.trim()) return;
 
     this.creatingHandoff = true;
+    const auditId = actionStore.start('Create handoff', 'PresencePanel:handoff/create');
     try {
       const payload: Parameters<typeof createHandoff>[0] = {
         target_agent_id: this.newHandoffTo.trim(),
@@ -91,6 +99,7 @@ class PresenceActionsStore {
         payload.token_budget = this.newHandoffTokenBudget;
       }
       await createHandoff(payload);
+      actionStore.succeed(auditId);
       toastStore.success('Handoff created');
       this.showHandoffModal = false;
       this.newHandoffTo = '';
@@ -100,7 +109,8 @@ class PresenceActionsStore {
       this.newHandoffEntryIds = [];
       this.newHandoffTokenBudget = 0;
       await this.refreshHandoffs();
-    } catch {
+    } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       toastStore.error('Failed to create handoff');
     } finally {
       this.creatingHandoff = false;
@@ -112,11 +122,14 @@ class PresenceActionsStore {
       toastStore.error('Cannot accept handoff without a target agent');
       return;
     }
+    const auditId = actionStore.start('Accept handoff', 'PresencePanel:handoff/accept');
     try {
       await acceptHandoff(id, { target_agent_id: targetAgentID.trim() });
+      actionStore.succeed(auditId);
       toastStore.success('Handoff accepted');
       await this.refreshHandoffs();
-    } catch {
+    } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       toastStore.error('Failed to accept handoff');
     }
   }
@@ -141,6 +154,10 @@ class PresenceActionsStore {
     if (!this.dispatchTargetAgent || !this.dispatchTitle.trim()) return;
 
     this.dispatchSubmitting = true;
+    const auditId = actionStore.start(
+      `Dispatch task to ${this.dispatchTargetAgent}`,
+      'PresencePanel:dispatch/submit',
+    );
     try {
       await dispatchTask({
         target_agent_id: this.dispatchTargetAgent,
@@ -148,12 +165,14 @@ class PresenceActionsStore {
         context: this.dispatchContext.trim() || undefined,
         priority: this.dispatchPriority,
       });
+      actionStore.succeed(auditId);
       toastStore.success(`Task dispatched to ${this.dispatchTargetAgent}`);
       this.showDispatchModal = false;
       this.dispatchTitle = '';
       this.dispatchContext = '';
       this.dispatchPriority = 'medium';
-    } catch {
+    } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       toastStore.error('Failed to dispatch task');
     } finally {
       this.dispatchSubmitting = false;
@@ -175,6 +194,10 @@ class PresenceActionsStore {
     if (!this.nudgeTargetAgent || !this.nudgeContent.trim()) return;
 
     this.nudgeSubmitting = true;
+    const auditId = actionStore.start(
+      `Nudge ${this.nudgeTargetAgent}`,
+      'PresencePanel:nudge/submit',
+    );
     try {
       await sendNudge({
         target_agent_id: this.nudgeTargetAgent,
@@ -182,9 +205,11 @@ class PresenceActionsStore {
         content: this.nudgeContent.trim(),
         from_agent: 'hud',
       });
+      actionStore.succeed(auditId);
       toastStore.success(`Nudge sent to ${this.nudgeTargetAgent}`);
       this.showNudgeModal = false;
-    } catch {
+    } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       toastStore.error('Failed to send nudge');
     } finally {
       this.nudgeSubmitting = false;
@@ -192,11 +217,17 @@ class PresenceActionsStore {
   }
 
   async onReleaseClaim(agentId: string, filePath: string): Promise<void> {
+    const auditId = actionStore.start(
+      `Release claim: ${filePath} (${agentId})`,
+      'FileConflicts:release',
+    );
     try {
       await releaseClaim(agentId, filePath);
+      actionStore.succeed(auditId);
       toastStore.success('Claim released');
       await fleetStore.fetch();
-    } catch {
+    } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       toastStore.error('Failed to release claim');
     }
   }
