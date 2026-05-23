@@ -31,6 +31,14 @@
   let longItems = $derived(memStats.long_term_memory?.items ?? 0);
   let totalMemItems = $derived(workingItems + shortItems + longItems);
   let graphTotal = $derived(graphStats.total_entities ?? 0);
+
+  // Load gates: distinguish "store hasn't fetched yet" (show —) from
+  // "fetched and the answer is zero" (show 0). Without these the
+  // operator can't tell broken from empty.
+  let sessionsLoaded = $derived(fleetStore.lastUpdated !== null);
+  let memoryLoaded = $derived(memoryStore.lastUpdated !== null);
+  let graphLoaded = $derived(graphStore.lastUpdated !== null);
+  let infraLoaded = $state(false);
   let graphTopTypes = $derived.by(() => {
     const types = graphStats?.entity_types ?? {};
     return Object.entries(types).sort((a, b) => b[1] - a[1]).slice(0, 3);
@@ -63,6 +71,7 @@
       ]);
       tunnelCount = tunnels.length;
       cacheHitRate = cache?.hit_rate ?? 0;
+      infraLoaded = true;
     }
     loadInfra();
     const timer = setInterval(loadInfra, 30000);
@@ -101,7 +110,7 @@
   <div class="stat-card" style="--accent-color: var(--accent)">
     {#key totalTokens}
       <div class="metric-value data-updated" class:metric-empty={totalTokens === 0}>
-        {totalTokens === 0 ? '—' : formatNumber(totalTokens)}
+        {#if !sessionsLoaded}{'—'}{:else}{formatNumber(totalTokens)}{/if}
       </div>
     {/key}
     <div class="metric-label">Tokens</div>
@@ -113,7 +122,7 @@
   <div class="stat-card" style="--accent-color: var(--tier-short)">
     {#key totalMemItems}
       <div class="metric-value data-updated" class:metric-empty={totalMemItems === 0}>
-        {totalMemItems === 0 ? '—' : formatNumber(totalMemItems)}
+        {#if !memoryLoaded}{'—'}{:else}{formatNumber(totalMemItems)}{/if}
       </div>
     {/key}
     <div class="metric-label">Memory Items</div>
@@ -121,7 +130,7 @@
   <div class="stat-card" style="--accent-color: var(--tier-long)">
     {#key graphTotal}
       <div class="metric-value data-updated" class:metric-empty={graphTotal === 0}>
-        {graphTotal === 0 ? '—' : formatNumber(graphTotal)}
+        {#if !graphLoaded}{'—'}{:else}{formatNumber(graphTotal)}{/if}
       </div>
     {/key}
     <div class="metric-label">Graph Entities</div>
@@ -131,16 +140,16 @@
   </div>
   <div class="stat-card" style="--accent-color: var(--fg-muted)">
     {#key tunnelCount + cacheHitRate}
-      <div class="metric-value data-updated" class:metric-empty={tunnelCount === 0 && cacheHitRate === 0}>
-        {#if tunnelCount > 0 || cacheHitRate > 0}
-          {tunnelCount} <span class="metric-unit">tunnels</span> · {(cacheHitRate * 100).toFixed(0)}%
-        {:else}
+      <div class="metric-value data-updated" class:metric-empty={infraLoaded && tunnelCount === 0 && cacheHitRate === 0}>
+        {#if !infraLoaded}
           {'—'}
+        {:else}
+          {tunnelCount} <span class="metric-unit">tunnels</span> · {(cacheHitRate * 100).toFixed(0)}%
         {/if}
       </div>
     {/key}
     <div class="metric-label">Infrastructure</div>
-    {#if tunnelCount === 0 && cacheHitRate === 0}
+    {#if infraLoaded && tunnelCount === 0 && cacheHitRate === 0}
       <div class="metric-sub">no tunnels · no cache stats</div>
     {/if}
   </div>
