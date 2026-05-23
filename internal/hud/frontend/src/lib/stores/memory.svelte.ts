@@ -1,7 +1,14 @@
 // Memory store - tiered memory management
 // v2: SSE-first for stats with 30s fallback. Items still fetched on demand.
+import { actionStore } from './action.svelte.ts';
 import { eventStore } from './events.svelte.ts';
 import { arraysEqualById } from '../utils/diff.ts';
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message || 'Unknown error';
+  if (typeof e === 'string') return e;
+  try { return JSON.stringify(e); } catch { return 'Unknown error'; }
+}
 
 export interface TierStats {
   items: number;
@@ -162,30 +169,37 @@ class MemoryStore {
   }
 
   async promote(itemId: string): Promise<void> {
+    const auditId = actionStore.start('Promote memory item', 'MemoryPanel:promote');
     try {
       const res = await globalThis.fetch(`/api/memory/${itemId}/promote`, {
         method: 'POST',
       });
       if (!res.ok) throw new Error(`Promote: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
     }
   }
 
   async demote(itemId: string): Promise<void> {
+    const auditId = actionStore.start('Demote memory item', 'MemoryPanel:demote');
     try {
       const res = await globalThis.fetch(`/api/memory/${itemId}/demote`, {
         method: 'POST',
       });
       if (!res.ok) throw new Error(`Demote: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
     }
   }
 
   async addItem(title: string, content: string, tier: string, importance: string, category?: string): Promise<boolean> {
+    const auditId = actionStore.start(`Add memory item → ${tier}`, 'MemoryPanel:add');
     try {
       const body: Record<string, unknown> = { title, content, tier, importance };
       if (category) body.category = category;
@@ -196,22 +210,27 @@ class MemoryStore {
       });
       if (!res.ok) throw new Error(`Add memory: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
       return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
       return false;
     }
   }
 
   async deleteItem(id: string): Promise<boolean> {
+    const auditId = actionStore.start('Delete memory item', 'MemoryPanel:delete');
     try {
       const res = await globalThis.fetch(`/api/memory/${id}`, {
         method: 'DELETE',
       });
       if (!res.ok) throw new Error(`Delete memory: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
       return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
       return false;
     }
