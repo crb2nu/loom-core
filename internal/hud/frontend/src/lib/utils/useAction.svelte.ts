@@ -86,7 +86,7 @@ export function useAction<T = unknown>(config: ActionConfig<T>): ActionHandle<T>
     pending = true;
     error = null;
 
-    const id = actionStore.start(config.label, config.source, !config.nonRetryable);
+    const id = actionStore.start(config.label, config.source, !config.nonRetryable, invoke);
     currentId = id;
 
     if (config.optimistic) {
