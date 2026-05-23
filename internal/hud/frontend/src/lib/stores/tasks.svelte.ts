@@ -161,7 +161,7 @@ class TaskStore {
     this.error = null;
   }
 
-  async updateStatus(taskId: string, status: string): Promise<void> {
+  async updateStatus(taskId: string, status: string): Promise<boolean> {
     const auditId = actionStore.start(`Update task status → ${status}`, 'TasksPanel:status');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
@@ -172,13 +172,15 @@ class TaskStore {
       if (!res.ok) throw new Error(`Update task: ${res.status}`);
       await this.fetch();
       actionStore.succeed(auditId);
+      return true;
     } catch (e) {
       actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
+      return false;
     }
   }
 
-  async setPriority(taskId: string, priority: string): Promise<void> {
+  async setPriority(taskId: string, priority: string): Promise<boolean> {
     const auditId = actionStore.start(`Set task priority → ${priority}`, 'TasksPanel:priority');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
@@ -189,9 +191,11 @@ class TaskStore {
       if (!res.ok) throw new Error(`Set priority: ${res.status}`);
       await this.fetch();
       actionStore.succeed(auditId);
+      return true;
     } catch (e) {
       actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
+      return false;
     }
   }
 
@@ -233,7 +237,7 @@ class TaskStore {
     }
   }
 
-  async resolve(taskId: string, resolution: string): Promise<void> {
+  async resolve(taskId: string, resolution: string): Promise<boolean> {
     const auditId = actionStore.start('Resolve task', 'TasksPanel:resolve');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
@@ -244,9 +248,11 @@ class TaskStore {
       if (!res.ok) throw new Error(`Resolve task: ${res.status}`);
       await this.fetch();
       actionStore.succeed(auditId);
+      return true;
     } catch (e) {
       actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
+      return false;
     }
   }
 
