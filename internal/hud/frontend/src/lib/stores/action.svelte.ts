@@ -39,6 +39,14 @@ class ActionStore {
 
   private nextId = Date.now();
 
+  get pendingCount(): number {
+    return this.entries.filter((e) => e.status === 'pending').length;
+  }
+
+  get errorCount(): number {
+    return this.entries.filter((e) => e.status === 'error').length;
+  }
+
   /** Allocate an id + record the action start. Returns the id for follow-up. */
   start(label: string, source: string, retryable = true): string {
     const id = `${this.nextId++}`;

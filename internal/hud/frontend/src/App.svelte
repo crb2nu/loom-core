@@ -264,6 +264,20 @@
 
     <div class="nav-actions">
       <button
+        class="btn btn-ghost audit-trigger"
+        data-state={actionStore.errorCount > 0 ? 'error' : (actionStore.pendingCount > 0 ? 'pending' : 'idle')}
+        onclick={() => actionStore.openDrawer()}
+        title="Recent Actions"
+        aria-label="Open recent actions drawer"
+      >
+        {'\u29c9'}
+        {#if actionStore.errorCount > 0}
+          <span class="audit-badge error" aria-label="{actionStore.errorCount} failed actions">{actionStore.errorCount}</span>
+        {:else if actionStore.pendingCount > 0}
+          <span class="audit-badge pending" aria-label="{actionStore.pendingCount} pending actions">{actionStore.pendingCount}</span>
+        {/if}
+      </button>
+      <button
         class="btn btn-ghost"
         onclick={() => { showCommandPalette = true; }}
         title="Command Palette (Cmd+K)"
@@ -746,6 +760,47 @@
     color: var(--fg-primary);
     border-color: var(--border-focus);
     background: rgba(255, 255, 255, 0.04);
+  }
+
+  .audit-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-right: 6px;
+  }
+
+  .audit-trigger[data-state='error'] {
+    color: var(--error);
+    border-color: var(--error-dim);
+  }
+
+  .audit-trigger[data-state='pending'] {
+    color: var(--info);
+    border-color: var(--info-dim);
+  }
+
+  .audit-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    font-family: var(--font-mono);
+  }
+
+  .audit-badge.error {
+    background: var(--error-dim);
+    color: var(--error);
+  }
+
+  .audit-badge.pending {
+    background: var(--info-dim);
+    color: var(--info);
   }
 
   /* ═══ Panel Area ════════════════════════════════════════════ */
