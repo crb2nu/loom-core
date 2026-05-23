@@ -4,7 +4,7 @@
 
 See `.loom/118-research-antigravity-2-2026-05-23.md`.
 
-Key conclusion: Antigravity 2.0 should use `.agents/mcp_config.json` for workspace MCP config, `~/.gemini/antigravity/mcp_config.json` for home MCP sync, and Antigravity-native `hooks.json` for lifecycle/policy support. Loom tools should be auto-allowed through the `ask_permission` hook with `permissionOverrides=["mcp(loom/)"]`.
+Key conclusion: Antigravity 2.0 should use `.agents/mcp_config.json` for workspace MCP config, `~/.gemini/antigravity/mcp_config.json` for home MCP sync, and Antigravity-native `hooks.json` for lifecycle/policy support. Loom tools should be auto-allowed through the `ask_permission` hook with `permissionOverrides=["mcp(loom/*)"]`.
 
 # Research Brief: Loom Companion iPhone/iPad App
 

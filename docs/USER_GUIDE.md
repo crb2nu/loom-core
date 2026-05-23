@@ -84,7 +84,7 @@ Common targets: `codex`, `vscode`, `kilocode`, `claude`, `claude_desktop`, `gemi
 Claude Desktop uses the `claude_desktop` target and writes `~/Library/Application Support/Claude/claude_desktop_config.json`.
 Its generated `loom` MCP entry includes `--agent-hint claude-desktop`, the shared `llm-core` tool profile, and `LOOM_PROXY_IDLE_EXIT_SECONDS=0` so Claude Desktop can keep the MCP proxy process open without seeing a stale idle-exit disconnect.
 
-Antigravity 2.0 sync writes `.agents/mcp_config.json` and `.agents/hooks.json` in workspaces, plus `~/.gemini/antigravity/mcp_config.json` and `~/.gemini/config/hooks.json` at home. The generated hooks keep Loom session tracking active and auto-allow the `mcp(loom/)` tool namespace through Antigravity's native permission hook.
+Antigravity 2.0 sync writes `.agents/mcp_config.json` and `.agents/hooks.json` in workspaces, plus `~/.gemini/antigravity/mcp_config.json` and `~/.gemini/config/hooks.json` at home. The generated hooks keep Loom session tracking active and auto-allow the `mcp(loom/*)` tool namespace through Antigravity's native permission hook.
 
 ## Daemon Operations
 
