@@ -466,10 +466,10 @@ func TestCheckPolicyHealth_HooklessPlatform(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	health := &PlatformHealth{
-		Platform: "antigravity",
+		Platform: "zed",
 		Policy:   "n/a",
 	}
-	checkPolicyHealth(health, "antigravity", tmpDir)
+	checkPolicyHealth(health, "zed", tmpDir)
 
 	if health.Policy != "n/a" {
 		t.Errorf("policy = %s, want n/a for hookless platform", health.Policy)
@@ -566,7 +566,7 @@ func TestDeriveStatus_PolicyOkDoesNotAffectStatus(t *testing.T) {
 
 func TestDeriveStatus_PolicyNADoesNotAffectStatus(t *testing.T) {
 	h := &PlatformHealth{
-		Platform: "antigravity",
+		Platform: "zed",
 		Hooks:    "n/a",
 		Perms:    "n/a",
 		Schema:   "n/a",

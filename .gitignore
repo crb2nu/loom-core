@@ -52,6 +52,8 @@ CHANGELOG.json
 .gemini/config.toml
 .kilocode/config.toml
 .kilocode/
+.agents/hooks.json
+.agents/mcp_config.json
 .vscode-mcp/
 .vscode/mcp.json
 .antigravity/

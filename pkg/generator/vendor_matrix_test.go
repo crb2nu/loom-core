@@ -15,7 +15,7 @@ func TestGetVendorCapabilities(t *testing.T) {
 		{"codex", false, "Codex CLI"},
 		{"opencode", false, "OpenCode"},
 		{"kilocode", false, "Kilo Code"},
-		{"antigravity", false, "Antigravity"},
+		{"antigravity", false, "Antigravity 2.0"},
 		{"vscode", false, "VS Code"},
 		{"zed", false, "Zed"},
 		{"nonexistent", true, ""},
@@ -59,7 +59,7 @@ func TestAllVendors(t *testing.T) {
 
 func TestCheckVendorFeatures_NoHooksWarning(t *testing.T) {
 	// Platforms without any hook support should generate a warning.
-	noHookPlatforms := []string{"kilocode", "antigravity", "vscode", "zed"}
+	noHookPlatforms := []string{"kilocode", "vscode", "zed"}
 	for _, p := range noHookPlatforms {
 		warnings := CheckVendorFeatures(p)
 		if len(warnings) == 0 {
@@ -77,7 +77,7 @@ func TestCheckVendorFeatures_NoHooksWarning(t *testing.T) {
 	}
 
 	// Platforms with hooks should NOT generate the warning.
-	hookPlatforms := []string{"claude", "gemini", "codex"}
+	hookPlatforms := []string{"claude", "gemini", "codex", "antigravity"}
 	for _, p := range hookPlatforms {
 		warnings := CheckVendorFeatures(p)
 		for _, w := range warnings {

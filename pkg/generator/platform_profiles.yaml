@@ -234,21 +234,30 @@ platforms:
       supports_description: true
 
   antigravity:
-    display_name: "Antigravity"
+    display_name: "Antigravity 2.0"
     config_format: "json"
-    config_file: "mcp.json"
+    config_file: "mcp_config.json"
     config_root: "mcpServers"
     hooks:
-      enabled: false
+      enabled: true
+      file: "hooks.json"
+      events: ["preInvocation", "preToolUse", "postToolUse", "stop"]
       policy_refs: ["gitops_flux"]
-      enforcement: "proxy"
+      enforcement: "native"
+      agent_id: "antigravity"
+      agent_type: "antigravity"
+      description: "Antigravity session"
+      session_end_event: "Stop"
+      heartbeat_event: "PostToolUse"
+      heartbeat_matcher: "run_command|manage_task|invoke_subagent"
+      extras: ["telemetry_eventEmit"]
     loom_proxy:
       agent_hint: "antigravity"
       tool_profile: "antigravity-core"
       max_tools: 100
     capabilities:
       mcp_servers: true
-      permissions: false
+      permissions: true
       sandbox: false
       web_search: false
       custom_models: false

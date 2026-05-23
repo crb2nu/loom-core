@@ -319,7 +319,7 @@ func TestProfile_SecretFilesAreSet(t *testing.T) {
 	}
 }
 
-func TestAntigravityProfile_HomePathAndFilenameOverride(t *testing.T) {
+func TestAntigravityProfile_UsesAntigravity2Paths(t *testing.T) {
 	m, err := NewManager("/tmp/test-repo")
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
@@ -329,14 +329,23 @@ func TestAntigravityProfile_HomePathAndFilenameOverride(t *testing.T) {
 	if p == nil {
 		t.Fatal("antigravity profile not found")
 	}
-	if p.HomeDir != ".gemini/antigravity" {
-		t.Fatalf("HomeDir = %q, want %q", p.HomeDir, ".gemini/antigravity")
+	if p.HomeDir != ".gemini" {
+		t.Fatalf("HomeDir = %q, want %q", p.HomeDir, ".gemini")
 	}
-	if p.GeneratedFile != "mcp.json" {
-		t.Fatalf("GeneratedFile = %q, want %q", p.GeneratedFile, "mcp.json")
+	if p.RepoDir != ".agents" {
+		t.Fatalf("RepoDir = %q, want %q", p.RepoDir, ".agents")
 	}
-	if p.HomeGeneratedFile != "mcp_config.json" {
-		t.Fatalf("HomeGeneratedFile = %q, want %q", p.HomeGeneratedFile, "mcp_config.json")
+	if p.GeneratedFile != "mcp_config.json" {
+		t.Fatalf("GeneratedFile = %q, want %q", p.GeneratedFile, "mcp_config.json")
+	}
+	if p.HomeGeneratedFile != "antigravity/mcp_config.json" {
+		t.Fatalf("HomeGeneratedFile = %q, want %q", p.HomeGeneratedFile, "antigravity/mcp_config.json")
+	}
+	if len(p.ExtraGeneratedFiles) != 1 || p.ExtraGeneratedFiles[0] != "hooks.json" {
+		t.Fatalf("ExtraGeneratedFiles = %#v, want [hooks.json]", p.ExtraGeneratedFiles)
+	}
+	if p.HomeExtraGeneratedFiles["hooks.json"] != "config/hooks.json" {
+		t.Fatalf("HomeExtraGeneratedFiles[hooks.json] = %q, want %q", p.HomeExtraGeneratedFiles["hooks.json"], "config/hooks.json")
 	}
 	if p.SkillsTarget != "gemini" {
 		t.Fatalf("SkillsTarget = %q, want %q", p.SkillsTarget, "gemini")

@@ -1983,8 +1983,8 @@ func TestAllPlatforms_HaveEnforcement(t *testing.T) {
 }
 
 func TestNativeEnforcementPlatforms(t *testing.T) {
-	// Claude and Gemini should have native enforcement.
-	for _, name := range []string{"claude", "gemini"} {
+	// Claude, Gemini, and Antigravity should have native hook enforcement.
+	for _, name := range []string{"claude", "gemini", "antigravity"} {
 		profile, err := GetPlatformProfile(name)
 		if err != nil {
 			t.Fatalf("GetPlatformProfile(%q): %v", name, err)
@@ -1997,7 +1997,7 @@ func TestNativeEnforcementPlatforms(t *testing.T) {
 
 func TestProxyEnforcementPlatforms(t *testing.T) {
 	// These platforms rely on the loom proxy for enforcement.
-	proxyPlatforms := []string{"codex", "vscode", "antigravity", "kilocode", "zed", "claude_desktop"}
+	proxyPlatforms := []string{"codex", "vscode", "kilocode", "zed", "claude_desktop"}
 	for _, name := range proxyPlatforms {
 		profile, err := GetPlatformProfile(name)
 		if err != nil {

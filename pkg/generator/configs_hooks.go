@@ -458,7 +458,7 @@ func hookAgentIDBootstrap(agentID string) string {
 		`HOOK_INPUT="${INPUT:-}"; `+
 			`HOOK_SESSION_ID=""; `+
 			`if [ -n "$HOOK_INPUT" ]; then `+
-			`HOOK_SESSION_ID="$(printf '%%s' "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)"; `+
+			`HOOK_SESSION_ID="$(printf '%%s' "$HOOK_INPUT" | jq -r '.session_id // .conversationId // empty' 2>/dev/null || true)"; `+
 			`fi; `+
 			`SESSION_SCOPE=""; `+
 			`if [ -n "$HOOK_SESSION_ID" ]; then `+

@@ -44,8 +44,12 @@ On 2026-04-18, every Codex call was prompting for approval because commit `848be
 - `always_allow = [...]` IS a valid key for Kilocode (distinct from Codex).
 
 ### Antigravity (Google)
-- **About:** Google's VS Code fork.
-- **Config file:** `.antigravity/mcp.json` (JSON). Shape largely inherits VS Code.
+- **Docs:** https://antigravity.google/docs/mcp and https://antigravity.google/docs/hooks
+- **About:** Google Antigravity 2.0 is the standalone agent-first desktop app; legacy IDE behavior should not be used as the generator authority.
+- **MCP config files:** workspace `.agents/mcp_config.json`; home `~/.gemini/antigravity/mcp_config.json`.
+- **MCP shape:** JSON with top-level `mcpServers`. Local servers use `command`/`args`/`env`; remote Streamable HTTP servers use `serverUrl` rather than `url`/`httpUrl`.
+- **Hooks:** Antigravity 2.0 uses `hooks.json` under a customization directory such as `.agents/` or `~/.gemini/config/`. Loom emits an Antigravity-specific `hooks.json` wrapper (`{"loom": {"PreInvocation": ...}}`) because Claude/Gemini `settings.json` hook emission has the wrong top-level schema and stdout contract.
+- **Permissions:** Loom MCP tools are auto-allowed through a native `PreToolUse` hook for `ask_permission`. The hook returns `decision=allow` plus `permissionOverrides=["mcp(loom/)"]` when Antigravity asks about `mcp(loom/...)`.
 
 ### Zed
 - **Docs:** https://zed.dev/docs/assistant/mcp
@@ -98,16 +102,17 @@ Verified May 2026 against the URLs above plus:
 - Codex hooks: <https://developers.openai.com/codex/hooks>
 - OpenCode plugin: <https://opencode.ai/docs/plugins>
 - Kilocode plugin: <https://github.com/Kilo-Org/kilocode/blob/main/packages/plugin/src/index.ts>
+- Antigravity hooks: <https://antigravity.google/docs/hooks>
 
-| Canonical | Claude Code | Codex | Gemini CLI | OpenCode | Kilocode | VSCode / Antigravity / Zed |
-|-----------|-------------|-------|------------|----------|----------|----------------------------|
-| session-start | `SessionStart` | `notify` (turn-end keepalive) + `[[hooks.SessionStart]]` (hooks.json, GA 2026-05-07) | `SessionStart` | TS `sessionCreated` | — (feature request, [#5827](https://github.com/Kilo-Org/kilocode/issues/5827)) | — (no native hook surface) |
-| session-end | `SessionEnd` *(per-session — was incorrectly `Stop`, fixed 2026-05-12)* | `notify` + keepalive-wrap deregister-on-exit (no `SessionEnd` event exists) | `SessionEnd` | TS `sessionDeleted` | — | — |
-| heartbeat | `PostToolUse` matcher `Bash\|Task` | `[[hooks.PostToolUse]]` (hooks.json) + `notify` (rate-limited stamp file) | `AfterTool` matcher `run_shell_command` | TS `toolExecuteAfter` | — | — |
+| Canonical | Claude Code | Codex | Gemini CLI | OpenCode | Antigravity | Kilocode / VSCode / Zed |
+|-----------|-------------|-------|------------|----------|-------------|-------------------------|
+| session-start | `SessionStart` | `notify` (turn-end keepalive) + `[[hooks.SessionStart]]` (hooks.json, GA 2026-05-07) | `SessionStart` | TS `sessionCreated` | `PreInvocation` | — |
+| session-end | `SessionEnd` *(per-session — was incorrectly `Stop`, fixed 2026-05-12)* | `notify` + keepalive-wrap deregister-on-exit (no `SessionEnd` event exists) | `SessionEnd` | TS `sessionDeleted` | `Stop` only when `fullyIdle=true` | — |
+| heartbeat | `PostToolUse` matcher `Bash\|Task` | `[[hooks.PostToolUse]]` (hooks.json) + `notify` (rate-limited stamp file) | `AfterTool` matcher `run_shell_command` | TS `toolExecuteAfter` | `PostToolUse` matcher `run_command\|manage_task\|invoke_subagent` | — |
 | task-sync | `PostToolUse` matcher `TaskCreate\|TaskUpdate\|TodoWrite` | — (no per-tool granularity) | — | — | — | — |
-| pre-tool-use telemetry | `PreToolUse` | — (use `[[hooks.PreToolUse]]` once we emit it) | `BeforeTool` | — | — | — |
-| post-tool-use telemetry | `PostToolUse` (extras) | `notify` (telemetry_eventEmit extra) | `AfterTool` (extras) | TS `toolExecuteAfter` | — | — |
-| GitOps policy guardrail | `PreToolUse` matcher `Bash` (block kubectl mutations) | — (proxy-enforced) | `BeforeTool` matcher `run_shell_command` | (plugin) | (proxy-enforced) | (proxy-enforced) |
+| pre-tool-use telemetry | `PreToolUse` | — (use `[[hooks.PreToolUse]]` once we emit it) | `BeforeTool` | — | `PreToolUse` | — |
+| post-tool-use telemetry | `PostToolUse` (extras) | `notify` (telemetry_eventEmit extra) | `AfterTool` (extras) | TS `toolExecuteAfter` | `PostToolUse` | — |
+| GitOps policy guardrail | `PreToolUse` matcher `Bash` (block kubectl mutations) | — (proxy-enforced) | `BeforeTool` matcher `run_shell_command` | (plugin) | `PreToolUse` matcher `run_command` | (proxy-enforced) |
 
 Notes on naming asymmetry (read before adding an event name):
 - Claude uses `PreToolUse` / `PostToolUse`. Gemini uses `BeforeTool` / `AfterTool`. **Do not unify them.**

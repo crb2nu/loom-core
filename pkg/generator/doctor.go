@@ -90,6 +90,8 @@ func DoctorCheck(reg *registry.Registry, platform, configDir string) *PlatformHe
 		checkCodexHealth(health, configDir)
 	case "opencode":
 		checkOpenCodeHealth(health, configDir)
+	case "antigravity":
+		checkAntigravityHealth(health, reg, configDir)
 	default:
 		checkBasicHealth(health, platform, configDir)
 	}
@@ -424,6 +426,42 @@ func checkOpenCodeHealth(health *PlatformHealth, configDir string) {
 	}
 }
 
+func checkAntigravityHealth(health *PlatformHealth, reg *registry.Registry, configDir string) {
+	if _, ok := firstExistingFile(configDir, "mcp_config.json", filepath.Join("antigravity", "mcp_config.json")); !ok {
+		health.Status = "not_configured"
+		health.Details = append(health.Details, "mcp_config.json not found")
+	}
+
+	hooksPath, ok := firstExistingFile(configDir, "hooks.json", filepath.Join("config", "hooks.json"))
+	if !ok {
+		health.Hooks = "missing"
+		health.Details = append(health.Details, "hooks.json not found")
+		return
+	}
+	data, err := os.ReadFile(hooksPath)
+	if err != nil {
+		health.Hooks = "missing"
+		health.Details = append(health.Details, "cannot read hooks.json")
+		return
+	}
+	var onDisk map[string]any
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		health.Hooks = "missing"
+		health.Schema = "errors"
+		health.Details = append(health.Details, "hooks.json is not valid JSON")
+		return
+	}
+
+	antigravityProfile, _ := GetPlatformProfile("antigravity")
+	expected := antigravityHooksConfig(reg, antigravityProfile, "")
+	if jsonFingerprint(onDisk) != jsonFingerprint(expected) {
+		health.Hooks = "stale"
+		health.Details = append(health.Details, "hooks.json differs from expected (regenerate with: loom sync antigravity --regen)")
+	} else {
+		health.Hooks = "ok"
+	}
+}
+
 // checkBasicHealth checks platforms that only have MCP config (no hooks).
 func checkBasicHealth(health *PlatformHealth, platform, configDir string) {
 	// These platforms have no native hook support.
@@ -431,6 +469,8 @@ func checkBasicHealth(health *PlatformHealth, platform, configDir string) {
 	switch platform {
 	case "kilocode":
 		configFile = "config.toml"
+	case "antigravity":
+		configFile = "mcp_config.json"
 	default:
 		configFile = "mcp.json"
 	}
@@ -440,6 +480,16 @@ func checkBasicHealth(health *PlatformHealth, platform, configDir string) {
 		health.Status = "not_configured"
 		health.Details = append(health.Details, configFile+" not found")
 	}
+}
+
+func firstExistingFile(base string, rels ...string) (string, bool) {
+	for _, rel := range rels {
+		path := filepath.Join(base, rel)
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 // resolveConfigDir returns the config directory for a platform.
@@ -496,8 +546,10 @@ func platformExpectedFiles(platform string) []string {
 		return []string{"config.toml"}
 	case "opencode":
 		return []string{"opencode.json", filepath.Join("plugins", "loom-hooks.ts")}
-	case "vscode", "antigravity", "zed":
+	case "vscode", "zed":
 		return []string{"mcp.json"}
+	case "antigravity":
+		return []string{"mcp_config.json", "hooks.json", filepath.Join("antigravity", "mcp_config.json"), filepath.Join("config", "hooks.json")}
 	default:
 		return nil
 	}
@@ -515,7 +567,7 @@ func platformDirNames(platform string) (workspace, home string) {
 	case "kilocode":
 		return ".kilocode", ".kilocode"
 	case "antigravity":
-		return ".antigravity", ".antigravity"
+		return ".agents", ".gemini"
 	case "opencode":
 		return ".opencode", filepath.Join(".config", "opencode")
 	case "vscode":
@@ -576,7 +628,7 @@ func deriveStatus(h *PlatformHealth) string {
 	if h.Hooks == "missing" && h.Hooks != "n/a" {
 		// Missing hooks on a platform that should have them.
 		switch h.Platform {
-		case "claude", "gemini", "codex", "opencode":
+		case "claude", "gemini", "codex", "opencode", "antigravity":
 			return "stale"
 		}
 	}

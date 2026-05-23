@@ -140,7 +140,7 @@ MCP is now the de facto standard for AI-tool integration (8M+ downloads, 5,800+ 
 
 - ✅ **Sync/worktree workflow polish**
   - Added session-start nudge recommending worktree allocation on `main`/`master`.
-  - Added Antigravity `settings.json` hooks stub generation and sync parity.
+  - Migrated Antigravity sync to the 2.0 `.agents/mcp_config.json` workspace path and home `~/.gemini/antigravity/mcp_config.json`, with native `.agents/hooks.json` / `~/.gemini/config/hooks.json` support and Loom MCP autoallow.
 
 - ✅ **Developer lifecycle**
   - Added atomic install scripts and `make dev-upgrade` / `make dev-reload` workflow.

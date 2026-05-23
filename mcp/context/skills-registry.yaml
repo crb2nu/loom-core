@@ -64,7 +64,7 @@
 # Sync: loom sync <profile> --regen --hub-mode --all-projects --skip-worktrees
 
 version: 1
-updated: 2026-05-18
+updated: 2026-05-23
 skills:
   - name: flux-gitops-operator
     categories: [kubernetes, gitops, operations]
@@ -899,7 +899,7 @@ skills:
         | Platform | Config Format | Repo Path | Home Path |
         |----------|---------------|-----------|-----------|
         | VS Code | JSON | `.vscode/mcp.json` | `~/Library/.../Code/User/mcp.json` |
-        | Antigravity | JSON | `.antigravity/mcp.json` | `~/.antigravity/mcp.json` |
+        | Antigravity 2.0 | JSON | `.agents/mcp_config.json` + `.agents/hooks.json` | `~/.gemini/antigravity/mcp_config.json` + `~/.gemini/config/hooks.json` |
         | Gemini | JSON | `.gemini/settings.json` | `~/.gemini/settings.json` |
         | Claude | JSON | `.claude/mcp.json` | `~/.claude/mcp.json` |
         | Codex | TOML | `.codex/config.toml` | `~/.codex/config.toml` |
@@ -938,7 +938,7 @@ skills:
         ### Sync Single Platform
         ```bash
         loom sync vscode --regen --hub-mode --all-projects --skip-worktrees       # VS Code
-        loom sync antigravity --regen --hub-mode --all-projects --skip-worktrees  # Antigravity/Windsurf
+        loom sync antigravity --regen --hub-mode --all-projects --skip-worktrees  # Antigravity 2.0
         loom sync gemini --regen --hub-mode --all-projects --skip-worktrees       # Gemini CLI
         loom sync claude --regen --hub-mode --all-projects --skip-worktrees       # Claude Code
         loom sync codex --regen --hub-mode --all-projects --skip-worktrees        # Codex CLI

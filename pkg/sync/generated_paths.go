@@ -18,5 +18,10 @@ func mapRepoGeneratedToHome(p *Profile, repoRel string) string {
 	if p != nil && p.HomeGeneratedFile != "" && repoRel == p.GeneratedFile {
 		return p.HomeGeneratedFile
 	}
+	if p != nil && p.HomeExtraGeneratedFiles != nil {
+		if rel := p.HomeExtraGeneratedFiles[repoRel]; rel != "" {
+			return rel
+		}
+	}
 	return repoRel
 }

@@ -92,6 +92,40 @@ func TestGetPlatformProfile_Codex(t *testing.T) {
 	}
 }
 
+func TestGetPlatformProfile_Antigravity2(t *testing.T) {
+	t.Parallel()
+
+	p, err := GetPlatformProfile("antigravity")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile: %v", err)
+	}
+
+	if p.DisplayName != "Antigravity 2.0" {
+		t.Errorf("display_name = %q, want Antigravity 2.0", p.DisplayName)
+	}
+	if p.ConfigFile != "mcp_config.json" {
+		t.Errorf("config_file = %q, want mcp_config.json", p.ConfigFile)
+	}
+	if p.ConfigRoot != "mcpServers" {
+		t.Errorf("config_root = %q, want mcpServers", p.ConfigRoot)
+	}
+	if !p.Hooks.Enabled {
+		t.Error("hooks.enabled = false, want true")
+	}
+	if p.Hooks.File != "hooks.json" {
+		t.Errorf("hooks.file = %q, want hooks.json", p.Hooks.File)
+	}
+	if p.Hooks.Enforcement != "native" {
+		t.Errorf("hooks.enforcement = %q, want native", p.Hooks.Enforcement)
+	}
+	if p.Hooks.AgentID != "antigravity" {
+		t.Errorf("hooks.agent_id = %q, want antigravity", p.Hooks.AgentID)
+	}
+	if !p.Capabilities.Permissions {
+		t.Error("capabilities.permissions = false, want true")
+	}
+}
+
 func TestGetPlatformProfile_ClaudeDesktopProxy(t *testing.T) {
 	t.Parallel()
 
