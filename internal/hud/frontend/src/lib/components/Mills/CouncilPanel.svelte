@@ -32,8 +32,36 @@
     return d.toLocaleString();
   }
   function fmtCost(c?: number): string {
+    // Distinguish unknown (—) from genuinely zero ($0.0000). A run that
+    // finishes free is valid (cached, skipped, dry-run); null means we
+    // never got a cost back from the operator. Conflating the two hides
+    // real signal.
     if (c == null) return '—';
-    return `$${c.toFixed(3)}`;
+    return `$${c.toFixed(4)}`;
+  }
+  function durationMs(started?: string, ended?: string): number | null {
+    if (!started || !ended) return null;
+    const a = new Date(started).getTime();
+    const b = new Date(ended).getTime();
+    if (isNaN(a) || isNaN(b)) return null;
+    return Math.max(0, b - a);
+  }
+  function fmtDuration(started?: string, ended?: string): string {
+    const ms = durationMs(started, ended);
+    if (ms == null) return '—';
+    if (ms < 100) return `${ms}ms`;
+    if (ms < 1000) return `${(ms / 1000).toFixed(2)}s`;
+    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+    const mins = Math.floor(ms / 60_000);
+    const secs = Math.floor((ms % 60_000) / 1000);
+    return `${mins}m ${secs}s`;
+  }
+  // Anything that "completes" in under a second almost always means
+  // the run crashed before doing any work. Tag the row so the operator
+  // can spot it without expanding to read the debate transcript.
+  function isSuspiciouslyInstant(r: { StartedAt?: string; EndedAt?: string; Outcome?: string }): boolean {
+    const ms = durationMs(r.StartedAt, r.EndedAt);
+    return ms != null && ms < 1000;
   }
   function roleLabel(role: string): string {
     switch (role) {
@@ -75,6 +103,7 @@
         <th>Trigger</th>
         <th>Outcome</th>
         <th>Cost</th>
+        <th>Duration</th>
         <th>Started</th>
         <th>Ended</th>
       </tr>
@@ -83,27 +112,38 @@
       {#each runs as r (r.ID)}
         {@const isOpen = !!expanded[r.ID]}
         {@const debate = millsStore.debateByRun[r.ID]}
-        <tr class="row-summary" on:click={() => toggle(r.ID)}>
+        {@const instant = isSuspiciouslyInstant(r)}
+        {@const debateBroken = debate && debate.status === 'error'}
+        <tr class="row-summary" class:row-suspicious={instant || debateBroken} on:click={() => toggle(r.ID)}>
           <td class="expander">
             <span class="caret" class:open={isOpen} aria-hidden="true">▸</span>
           </td>
           <td class="mono">{r.ID}</td>
           <td>{r.Trigger}</td>
-          <td><span class="outcome outcome-{r.Outcome}">{r.Outcome}</span></td>
+          <td>
+            <span class="outcome outcome-{r.Outcome}">{r.Outcome}</span>
+            {#if instant}
+              <span class="badge badge-warn" title="Started and ended within 1 second — usually means the run crashed before doing any work">instant</span>
+            {/if}
+            {#if debateBroken}
+              <span class="badge badge-err" title="Debate transcript failed to load — expand for details">debate ✕</span>
+            {/if}
+          </td>
           <td>{fmtCost(r.CostUSD)}</td>
+          <td class="mono dur" class:dur-instant={instant}>{fmtDuration(r.StartedAt, r.EndedAt)}</td>
           <td>{fmtTime(r.StartedAt)}</td>
           <td>{fmtTime(r.EndedAt)}</td>
         </tr>
         {#if isOpen}
           <tr class="row-debate">
             <td></td>
-            <td colspan="6">
+            <td colspan="7">
               {#if !debate || debate.status === 'idle' || debate.status === 'loading'}
                 <div class="debate-status">Loading debate transcript…</div>
               {:else if debate.status === 'error'}
                 <div class="debate-status error">
-                  Failed to load debate: {debate.message}
-                  <button type="button" on:click|stopPropagation={() => millsStore.loadDebate(r.ID)}>retry</button>
+                  <strong>Failed to load debate:</strong> {debate.message}
+                  <button type="button" class="retry-btn" on:click|stopPropagation={() => millsStore.loadDebate(r.ID)}>↻ retry</button>
                 </div>
               {:else if debate.rounds.length === 0}
                 <div class="debate-status muted">No debate ran for this council run (single-pass).</div>
@@ -166,17 +206,61 @@
 
   .row-summary { cursor: pointer; }
   .row-summary:hover { background: rgba(255, 255, 255, 0.03); }
+  .row-suspicious td:first-child + td + td + td {
+    /* No-op: targeting handled via the badge in the outcome cell. Kept
+       as a hook for future row-level tinting if we want it. */
+  }
+  .badge {
+    margin-left: 0.4rem;
+    padding: 0.05rem 0.35rem;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    font-family: ui-monospace, monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    vertical-align: middle;
+  }
+  .badge-warn {
+    background: rgba(220, 200, 60, 0.18);
+    color: rgb(240, 220, 120);
+    border: 1px solid rgba(220, 200, 60, 0.35);
+  }
+  .badge-err {
+    background: rgba(220, 80, 80, 0.18);
+    color: rgb(240, 130, 130);
+    border: 1px solid rgba(220, 80, 80, 0.4);
+  }
+  .dur { color: var(--text-muted, #889); }
+  .dur-instant { color: rgb(240, 200, 100); font-weight: 600; }
   .expander { width: 1.2rem; padding-right: 0; }
   .caret { display: inline-block; transition: transform 120ms ease; color: var(--text-muted, #889); }
   .caret.open { transform: rotate(90deg); }
   .row-debate td { background: rgba(255, 255, 255, 0.015); border-bottom: 1px solid var(--border-subtle, #233); }
   .debate-status { padding: 0.5rem 0.25rem; color: var(--text-muted, #889); font-size: 0.85rem; }
-  .debate-status.error { color: rgb(240, 130, 130); }
-  .debate-status.muted { color: var(--text-muted, #889); }
-  .debate-status button {
-    margin-left: 0.5rem; background: transparent; border: 1px solid var(--border-subtle, #233);
-    color: inherit; cursor: pointer; padding: 0.1rem 0.5rem; border-radius: 3px; font-size: 0.75rem;
+  .debate-status.error {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: rgba(220, 80, 80, 0.1);
+    border-left: 3px solid rgb(220, 80, 80);
+    border-radius: 3px;
+    color: rgb(240, 200, 200);
   }
+  .debate-status.error strong { color: rgb(240, 130, 130); }
+  .debate-status.muted { color: var(--text-muted, #889); }
+  .retry-btn {
+    margin-left: auto;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(240, 130, 130, 0.4);
+    color: rgb(240, 200, 200);
+    cursor: pointer;
+    padding: 0.2rem 0.6rem;
+    border-radius: 3px;
+    font-size: 0.78rem;
+    font-family: ui-monospace, monospace;
+  }
+  .retry-btn:hover { background: rgba(240, 130, 130, 0.15); }
   .debate-summary { padding: 0.4rem 0.25rem 0.25rem; font-size: 0.85rem; display: flex; gap: 0.5rem; align-items: center; }
   .debate-summary .muted { color: var(--text-muted, #889); }
   .debate-list {
