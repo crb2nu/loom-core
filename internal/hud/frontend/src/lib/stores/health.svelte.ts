@@ -275,8 +275,14 @@ class HealthStore {
     const hashFn = (s: MergedServer) => `${s.status}|${s.latency}|${s.tool_count}|${s.error_message}|${s.consec_fails}`;
     if (!arraysEqualByKey(this.servers, merged, keyFn, hashFn)) {
       this.servers = merged;
-      this.lastUpdated = new Date();
     }
+    // lastUpdated must advance on EVERY snapshot, not only when data
+    // changes — otherwise a steady-state SSE feed (same statuses, same
+    // latencies push after push) makes the staleness watchdog think we
+    // haven't heard from the server after staleAfter ms, and the
+    // "Stale data — no recent updates from servers" banner fires
+    // even though SSE is healthy.
+    this.lastUpdated = new Date();
     this.error = null;
   }
 
