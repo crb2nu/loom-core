@@ -63,6 +63,15 @@
             <div class="audit-entry-head">
               <span class="audit-status" data-status={entry.status}>{statusLabel(entry.status)}</span>
               <span class="audit-label">{entry.label}</span>
+              {#if entry.status === 'error' && entry.retryable && actionStore.hasRetry(entry.id)}
+                <button
+                  type="button"
+                  class="audit-entry-retry"
+                  onclick={() => actionStore.retry(entry.id)}
+                  aria-label="Retry {entry.label}"
+                  title="Retry"
+                >↻</button>
+              {/if}
               <button
                 type="button"
                 class="audit-entry-dismiss"
@@ -262,6 +271,25 @@
   .audit-entry-dismiss:hover {
     color: var(--fg-primary);
     background: var(--bg-tertiary);
+  }
+
+  .audit-entry-retry {
+    flex-shrink: 0;
+    font-size: 12px;
+    line-height: 1;
+    color: var(--info);
+    background: var(--info-dim);
+    border: 1px solid transparent;
+    padding: 2px 6px;
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    font-family: var(--font-mono);
+    transition: color var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .audit-entry-retry:hover {
+    color: var(--fg-primary);
+    border-color: var(--info);
   }
 
   .audit-entry-meta {
