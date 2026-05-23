@@ -29,8 +29,9 @@
   async function submit() {
     if (!taskId) return;
     resolving = true;
-    await taskStore.resolve(taskId, resolutionText.trim());
-    toastStore.success('Task resolved');
+    const ok = await taskStore.resolve(taskId, resolutionText.trim());
+    if (ok) toastStore.success('Task resolved');
+    else toastStore.error('Failed to resolve task');
     onClose();
   }
 </script>

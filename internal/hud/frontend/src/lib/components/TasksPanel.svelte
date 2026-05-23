@@ -117,15 +117,17 @@
     collapsedGroups = next;
   }
 
-  function cyclePriority(task: any) {
+  async function cyclePriority(task: any) {
     const idx = PRIORITY_CYCLE.indexOf(task.priority ?? 'medium');
     const next = PRIORITY_CYCLE[(idx + 1) % PRIORITY_CYCLE.length];
-    taskStore.setPriority(task.id, next);
-    toastStore.info(`Priority → ${next}`);
+    const ok = await taskStore.setPriority(task.id, next);
+    if (ok) toastStore.info(`Priority → ${next}`);
+    else toastStore.error(`Failed to set priority → ${next}`);
   }
   async function changeStatus(task: any, newStatus: string) {
-    await taskStore.updateStatus(task.id, newStatus);
-    toastStore.info(`Status → ${newStatus.replaceAll('_', ' ')}`);
+    const ok = await taskStore.updateStatus(task.id, newStatus);
+    if (ok) toastStore.info(`Status → ${newStatus.replaceAll('_', ' ')}`);
+    else toastStore.error(`Failed to set status → ${newStatus.replaceAll('_', ' ')}`);
   }
   function openResolve(task: any) {
     resolveTaskId = task.id;
@@ -136,19 +138,37 @@
     selectedTask = selectedTask?.id === task.id ? null : task;
   }
 
+  function reportBulk(verb: string, total: number, failures: number) {
+    const ok = total - failures;
+    if (failures === 0) toastStore.success(`${total} tasks ${verb}`);
+    else if (ok === 0) toastStore.error(`Failed to ${verb} ${total} tasks`);
+    else toastStore.warning(`${verb}: ${ok} of ${total} succeeded (${failures} failed)`);
+  }
   async function bulkComplete() {
-    for (const id of selectedTaskIds) await taskStore.updateStatus(id, 'completed');
-    toastStore.success(`${selectedTaskIds.size} tasks completed`);
+    const ids = [...selectedTaskIds];
+    let failures = 0;
+    for (const id of ids) {
+      if (!(await taskStore.updateStatus(id, 'completed'))) failures++;
+    }
+    reportBulk('completed', ids.length, failures);
     selectedTaskIds = new Set();
   }
   async function bulkCancel() {
-    for (const id of selectedTaskIds) await taskStore.updateStatus(id, 'cancelled');
-    toastStore.success(`${selectedTaskIds.size} tasks cancelled`);
+    const ids = [...selectedTaskIds];
+    let failures = 0;
+    for (const id of ids) {
+      if (!(await taskStore.updateStatus(id, 'cancelled'))) failures++;
+    }
+    reportBulk('cancelled', ids.length, failures);
     selectedTaskIds = new Set();
   }
   async function bulkHighPriority() {
-    for (const id of selectedTaskIds) await taskStore.setPriority(id, 'high');
-    toastStore.success(`${selectedTaskIds.size} tasks set to high priority`);
+    const ids = [...selectedTaskIds];
+    let failures = 0;
+    for (const id of ids) {
+      if (!(await taskStore.setPriority(id, 'high'))) failures++;
+    }
+    reportBulk('set to high priority', ids.length, failures);
     selectedTaskIds = new Set();
   }
   let bulkActions = $derived([
