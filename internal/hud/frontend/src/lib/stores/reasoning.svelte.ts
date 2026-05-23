@@ -1,4 +1,11 @@
 // Reasoning store - reasoning chain tracking and visualization
+import { actionStore } from './action.svelte.ts';
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message || 'Unknown error';
+  if (typeof e === 'string') return e;
+  try { return JSON.stringify(e); } catch { return 'Unknown error'; }
+}
 
 export interface ReasoningChain {
   id: string;
@@ -66,6 +73,7 @@ class ReasoningStore {
   }
 
   async createChain(title: string, description: string): Promise<boolean> {
+    const auditId = actionStore.start(`Create reasoning chain → ${title}`, 'ReasoningPanel:create');
     try {
       const res = await globalThis.fetch('/api/reasoning/chains', {
         method: 'POST',
@@ -74,8 +82,10 @@ class ReasoningStore {
       });
       if (!res.ok) throw new Error(`Create chain: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
       return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
       return false;
     }
