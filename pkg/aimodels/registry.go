@@ -75,6 +75,14 @@ type RoleSpec struct {
 // exist on the cluster's FlexInfer proxy.
 //
 // Update history:
+//   - 2026-05-23: qwen3-8b is no longer deployed in flexinfer-system
+//     (verified via /v1/models). Migrated every qwen3-8b primary to
+//     gemma4-26b-a4b-gptq, which is Ready and exposes the "fast-text",
+//     "gpt-4", "gpt-3.5-turbo", and "qwen3-default" aliases in its
+//     service_labels — so the old fallback names continue resolving
+//     (via FlexInfer alias routing) without explicit fallback edits.
+//     The two GPU variants of gemma4-26b are listed as cross-fallbacks
+//     so primary-GPU contention falls through to the partner GPU.
 //   - 2026-05-08: initial table aligning to deployed FlexInfer models
 //     (qwen3-8b-fast-7900xtx with planned alias "qwen3-8b", and
 //     qwen3-1p7b-tools-radeonvii brought up Ready as router).
@@ -82,27 +90,27 @@ func defaultRoles() map[Role]RoleSpec {
 	return map[Role]RoleSpec{
 		RoleWeaverRouter: {
 			Primary:   "qwen3-1p7b-tools-radeonvii",
-			Fallbacks: []string{"qwen3-8b", "fast-text"},
+			Fallbacks: []string{"gemma4-26b-a4b-gptq", "fast-text"},
 		},
 		RoleWeaverSubagent: {
-			Primary:   "qwen3-8b",
-			Fallbacks: []string{"qwen3-8b-fast-7900xtx", "fast-text"},
+			Primary:   "gemma4-26b-a4b-gptq",
+			Fallbacks: []string{"gemma4-26b-a4b-gptq-5930k", "fast-text"},
 		},
 		RoleMillsJudge: {
-			Primary:   "qwen3-8b",
-			Fallbacks: []string{"fast-text", "gpt-3.5-turbo"},
+			Primary:   "gemma4-26b-a4b-gptq",
+			Fallbacks: []string{"gemma4-26b-a4b-gptq-5930k", "fast-text"},
 		},
 		RoleMillsResearch: {
-			Primary:   "qwen3-8b",
-			Fallbacks: []string{"fast-text"},
+			Primary:   "gemma4-26b-a4b-gptq",
+			Fallbacks: []string{"gemma4-26b-a4b-gptq-5930k", "fast-text"},
 		},
 		RoleCoordinatorDefault: {
-			Primary:   "qwen3-8b",
-			Fallbacks: []string{"fast-text"},
+			Primary:   "gemma4-26b-a4b-gptq",
+			Fallbacks: []string{"gemma4-26b-a4b-gptq-5930k", "fast-text"},
 		},
 		RoleAutofix: {
-			Primary:   "qwen3-8b",
-			Fallbacks: []string{"fast-text"},
+			Primary:   "gemma4-26b-a4b-gptq",
+			Fallbacks: []string{"gemma4-26b-a4b-gptq-5930k", "fast-text"},
 		},
 	}
 }

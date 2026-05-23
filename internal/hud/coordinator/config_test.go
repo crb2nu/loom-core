@@ -88,8 +88,8 @@ func TestValidate_MultipleErrors(t *testing.T) {
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
-	if cfg.DefaultModel != "qwen3-8b" {
-		t.Fatalf("expected default model qwen3-8b, got %s", cfg.DefaultModel)
+	if cfg.DefaultModel != "gemma4-26b-a4b-gptq" {
+		t.Fatalf("expected default model gemma4-26b-a4b-gptq, got %s", cfg.DefaultModel)
 	}
 	if cfg.PollInterval != 30*time.Second {
 		t.Fatalf("expected 30s poll interval, got %s", cfg.PollInterval)

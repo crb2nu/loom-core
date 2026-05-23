@@ -111,7 +111,7 @@ func NewAutoFixEngine(
 		logger = slog.Default()
 	}
 	if model == "" {
-		model = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleAutofix, "qwen3-8b")
+		model = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleAutofix, "gemma4-26b-a4b-gptq")
 	}
 	return &AutoFixEngine{
 		llm:        llm,

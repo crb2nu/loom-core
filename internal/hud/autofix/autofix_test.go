@@ -264,8 +264,8 @@ func TestProposeAutoFix(t *testing.T) {
 
 func TestNewAutoFixEngine_Defaults(t *testing.T) {
 	engine := NewAutoFixEngine(nil, nil, nil, nil, "", nil)
-	if engine.model != "qwen3-8b" {
-		t.Errorf("expected default model 'qwen3-8b', got %q", engine.model)
+	if engine.model != "gemma4-26b-a4b-gptq" {
+		t.Errorf("expected default model 'gemma4-26b-a4b-gptq', got %q", engine.model)
 	}
 	if engine.logger == nil {
 		t.Error("expected non-nil logger")

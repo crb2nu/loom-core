@@ -103,8 +103,8 @@ func TestCoordinator_Status(t *testing.T) {
 	if !status.Healthy {
 		t.Error("expected healthy")
 	}
-	if status.Model != "qwen3-8b" {
-		t.Errorf("expected model qwen3-8b, got %s", status.Model)
+	if status.Model != "gemma4-26b-a4b-gptq" {
+		t.Errorf("expected model gemma4-26b-a4b-gptq, got %s", status.Model)
 	}
 	if status.CircuitState != "closed" {
 		t.Errorf("expected circuit closed, got %s", status.CircuitState)

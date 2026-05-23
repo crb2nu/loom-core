@@ -47,7 +47,7 @@ const (
 // WEAVER_SUBAGENT_MODEL env vars or ~/.config/loom/aimodel-roles.yaml.
 var (
 	DefaultRouterModel   = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleWeaverRouter, "qwen3-1p7b-tools-radeonvii")
-	DefaultSubagentModel = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleWeaverSubagent, "qwen3-8b")
+	DefaultSubagentModel = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleWeaverSubagent, "gemma4-26b-a4b-gptq")
 )
 
 // ModelBehavior holds model-specific adjustments applied before LLM calls.

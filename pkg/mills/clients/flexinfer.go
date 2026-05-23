@@ -69,7 +69,10 @@ func NewFlexInferClient(cfg FlexInferConfig) (*FlexInferClient, error) {
 		return nil, errors.New("flexinfer: ProxyURL required")
 	}
 	if cfg.JudgeModel == "" {
-		cfg.JudgeModel = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleMillsJudge, "qwen3-8b")
+		// Last-resort default if the registry itself is empty. Matches the
+		// gemma4-26b-a4b-gptq primary in pkg/aimodels/registry.go so the
+		// fallback never references an undeployed model.
+		cfg.JudgeModel = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleMillsJudge, "gemma4-26b-a4b-gptq")
 	}
 	if cfg.WeaverModel == "" {
 		cfg.WeaverModel = aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleMillsResearch, cfg.JudgeModel)
