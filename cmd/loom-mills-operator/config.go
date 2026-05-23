@@ -60,7 +60,8 @@ type Config struct {
 	// proxy.
 	FlexInferToken string
 	// FlexInferJudgeModel is the model id rubric judges target. Empty
-	// uses the client's "qwen3-8b-instruct" default.
+	// uses the client's default (gemma4-26b-a4b-gptq via the aimodels
+	// registry; see pkg/mills/clients/flexinfer.go).
 	FlexInferJudgeModel string
 	// FlexInferWeaverModel is the model id WeaverWorker targets. Empty
 	// falls through to JudgeModel.

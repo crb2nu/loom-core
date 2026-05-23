@@ -28,15 +28,16 @@ func TestDefaultResolver_RolesLookup(t *testing.T) {
 
 func TestDefaultResolver_KnownPrimaries(t *testing.T) {
 	t.Parallel()
-	// Lock in the canonical defaults from MR-001 so we notice if
-	// someone silently changes them.
+	// Lock in the canonical defaults so we notice if someone silently
+	// changes them. Last bumped 2026-05-23 when qwen3-8b stopped being
+	// deployed in flexinfer-system; see defaultRoles update history.
 	cases := map[Role]string{
 		RoleWeaverRouter:       "qwen3-1p7b-tools-radeonvii",
-		RoleWeaverSubagent:     "qwen3-8b",
-		RoleMillsJudge:         "qwen3-8b",
-		RoleMillsResearch:      "qwen3-8b",
-		RoleCoordinatorDefault: "qwen3-8b",
-		RoleAutofix:            "qwen3-8b",
+		RoleWeaverSubagent:     "gemma4-26b-a4b-gptq",
+		RoleMillsJudge:         "gemma4-26b-a4b-gptq",
+		RoleMillsResearch:      "gemma4-26b-a4b-gptq",
+		RoleCoordinatorDefault: "gemma4-26b-a4b-gptq",
+		RoleAutofix:            "gemma4-26b-a4b-gptq",
 	}
 	r := DefaultResolver()
 	for role, want := range cases {
@@ -116,8 +117,8 @@ roles:
 		t.Errorf("override fallback chain = %v, want [my-custom-router a b c]", chain)
 	}
 	// Untouched roles keep defaults.
-	if got := r.Resolve(RoleAutofix); got != "qwen3-8b" {
-		t.Errorf("Resolve autofix = %q, want qwen3-8b (unchanged)", got)
+	if got := r.Resolve(RoleAutofix); got != "gemma4-26b-a4b-gptq" {
+		t.Errorf("Resolve autofix = %q, want gemma4-26b-a4b-gptq (unchanged)", got)
 	}
 	// Override that omits fallbacks keeps the role's existing fallbacks.
 	judge := r.ResolveWithFallbacks(RoleMillsJudge)
@@ -225,7 +226,7 @@ func TestResolutionMetrics_IncrementsOnResolve(t *testing.T) {
 		t.Errorf("router counter = %v, want 2", got)
 	}
 	got = testutil.ToFloat64(m.ResolutionTotal.WithLabelValues(
-		string(RoleAutofix), "qwen3-8b", "false"))
+		string(RoleAutofix), "gemma4-26b-a4b-gptq", "false"))
 	if got != 1 {
 		t.Errorf("autofix counter = %v, want 1", got)
 	}

@@ -24,7 +24,7 @@ type Config struct {
 	FlexInferKey string // Optional API key for FlexInfer.
 
 	// Model selection.
-	DefaultModel  string // Default model for all tasks (e.g., "qwen3-8b").
+	DefaultModel  string // Default model for all tasks (e.g., "gemma4-26b-a4b-gptq").
 	FallbackModel string // Fallback if default is unavailable.
 	PlannerModel  string // Override for planning (may need larger model).
 
@@ -67,7 +67,7 @@ type Config struct {
 // is canonical on this cluster.
 func DefaultConfig() Config {
 	return Config{
-		DefaultModel:  aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleCoordinatorDefault, "qwen3-8b"),
+		DefaultModel:  aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleCoordinatorDefault, "gemma4-26b-a4b-gptq"),
 		FallbackModel: "",
 		PlannerModel:  "",
 

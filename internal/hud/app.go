@@ -48,7 +48,7 @@ type Config struct {
 	// Coordinator (FlexInfer LLM integration). Empty URL = disabled.
 	FlexInferURL     string // FlexInfer proxy URL (e.g., "http://flexinfer-proxy:8080").
 	FlexInferKey     string // Optional API key for FlexInfer.
-	CoordinatorModel string // Default model for coordinator tasks (e.g., "qwen3-8b").
+	CoordinatorModel string // Default model for coordinator tasks (e.g., "gemma4-26b-a4b-gptq").
 
 	// Webhook push: forward presence+session snapshots to a remote endpoint.
 	WebhookURL     string // Push URL (e.g., "https://deck.flexinfer.ai/api/agents/hud/push").
