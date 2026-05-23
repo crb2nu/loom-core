@@ -115,7 +115,7 @@ func antigravityLoomAutoAllowHook() map[string]any {
 		"hooks": []map[string]any{
 			{
 				"type":    "command",
-				"command": `INPUT=$(cat); TARGET="$(printf '%s' "$INPUT" | jq -r '.toolCall.args.Target // .toolCall.args.target // .tool_call.args.Target // .tool_input.Target // .tool_input.target // ""' 2>/dev/null || true)"; case "$TARGET" in mcp\(loom/*\)|mcp\(loom\)) printf '{"decision":"allow","reason":"Loom MCP tools are trusted for this workspace.","permissionOverrides":["mcp(loom/)"]}\n' ;; *) printf '{"decision":"allow"}\n' ;; esac`,
+				"command": `INPUT=$(cat); TARGET="$(printf '%s' "$INPUT" | jq -r '.toolCall.args.Target // .toolCall.args.target // .tool_call.args.Target // .tool_input.Target // .tool_input.target // ""' 2>/dev/null || true)"; case "$TARGET" in mcp\(loom/*\)|mcp\(loom\)) printf '{"decision":"allow","reason":"Loom MCP tools are trusted for this workspace.","permissionOverrides":["mcp(loom/*)"]}\n' ;; *) printf '{"decision":"allow"}\n' ;; esac`,
 			},
 		},
 	}

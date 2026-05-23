@@ -49,7 +49,7 @@ On 2026-04-18, every Codex call was prompting for approval because commit `848be
 - **MCP config files:** workspace `.agents/mcp_config.json`; home `~/.gemini/antigravity/mcp_config.json`.
 - **MCP shape:** JSON with top-level `mcpServers`. Local servers use `command`/`args`/`env`; remote Streamable HTTP servers use `serverUrl` rather than `url`/`httpUrl`.
 - **Hooks:** Antigravity 2.0 uses `hooks.json` under a customization directory such as `.agents/` or `~/.gemini/config/`. Loom emits an Antigravity-specific `hooks.json` wrapper (`{"loom": {"PreInvocation": ...}}`) because Claude/Gemini `settings.json` hook emission has the wrong top-level schema and stdout contract.
-- **Permissions:** Loom MCP tools are auto-allowed through a native `PreToolUse` hook for `ask_permission`. The hook returns `decision=allow` plus `permissionOverrides=["mcp(loom/)"]` when Antigravity asks about `mcp(loom/...)`.
+- **Permissions:** Loom MCP tools are auto-allowed through a native `PreToolUse` hook for `ask_permission`. The hook returns `decision=allow` plus `permissionOverrides=["mcp(loom/*)"]` when Antigravity asks about `mcp(loom/...)`.
 
 ### Zed
 - **Docs:** https://zed.dev/docs/assistant/mcp

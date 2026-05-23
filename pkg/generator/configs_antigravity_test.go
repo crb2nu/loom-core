@@ -29,11 +29,11 @@ func TestAntigravityHooksConfigShapeAndAutoAllow(t *testing.T) {
 	}
 
 	preToolUse := mustHookBlocks(t, loom, "PreToolUse")
-	autoAllow := findHookCommand(preToolUse, "mcp(loom/)")
+	autoAllow := findHookCommand(preToolUse, "mcp(loom/*)")
 	if autoAllow == "" {
-		t.Fatalf("expected ask_permission hook to autoallow mcp(loom/) namespace: %#v", preToolUse)
+		t.Fatalf("expected ask_permission hook to autoallow mcp(loom/*) namespace: %#v", preToolUse)
 	}
-	if !strings.Contains(autoAllow, `"permissionOverrides":["mcp(loom/)"]`) {
+	if !strings.Contains(autoAllow, `"permissionOverrides":["mcp(loom/*)"]`) {
 		t.Fatalf("autoallow hook missing permissionOverrides for loom namespace: %s", autoAllow)
 	}
 	if !strings.Contains(autoAllow, `mcp\(loom/*\)`) {
