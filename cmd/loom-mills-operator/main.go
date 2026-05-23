@@ -1104,19 +1104,23 @@ func buildAuditSubsystem(
 	dispatcher.Logger = logger
 
 	// Pool defaults align with FlexInfer models actually deployed on the
-	// canonical cluster. Prior values (`llama-4-70b-instruct`,
-	// `qwen-3-32b`) were absent from /v1/models and 404'd on first audit
-	// dispatch. See services/loom-core/.loom/111-product-spec-weaver-
-	// qwen3-integration-2026-05-08.md (MW-004); the gitops policy
-	// ConfigMap is updated in lockstep at platform/gitops/k3s/mills/
-	// configmap-policy.yaml. Escalation entries retain the `flexinfer`
-	// backend tag because audit.PoolMember has no driver field today;
-	// the policy.AuditPool YAML mirror keeps the per-driver split for
-	// the eventual spawn-backend wiring (v2.1).
+	// canonical cluster. History (most recent first):
+	//   - 2026-05-23: qwen3-8b / qwen3-14b-abliterated dropped from
+	//     flexinfer-system; every audit run 404'd with HTML, surfacing
+	//     as "Unrecognized token '<'" on the Council tab. Migrated to
+	//     gemma4-26b-a4b-gptq (two GPU variants for parallelism);
+	//     gitops configmap-policy.yaml is updated in lockstep (gitops
+	//     MR !170 above).
+	//   - 2026-05-09 (MW-004): llama-4-70b-instruct / qwen-3-32b
+	//     dropped → qwen3-8b / qwen3-14b-abliterated.
+	// Escalation entries retain the `flexinfer` backend tag because
+	// audit.PoolMember has no driver field today; the policy.AuditPool
+	// YAML mirror keeps the per-driver split for the eventual
+	// spawn-backend wiring (v2.1).
 	policy := &audit.PoolPolicy{
 		Bulk: []audit.PoolMember{
-			{Backend: "flexinfer", Model: "qwen3-8b"},
-			{Backend: "flexinfer", Model: "qwen3-14b-abliterated"},
+			{Backend: "flexinfer", Model: "gemma4-26b-a4b-gptq"},
+			{Backend: "flexinfer", Model: "gemma4-26b-a4b-gptq-5930k"},
 		},
 		Escalation: []audit.PoolMember{
 			{Backend: "flexinfer", Model: "claude-opus-4-7"},
