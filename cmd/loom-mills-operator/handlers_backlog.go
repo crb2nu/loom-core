@@ -203,11 +203,20 @@ func backlogForceRequested(r *http.Request) bool {
 }
 
 // findRecentCanary scans the backlog for a non-merged mills-canary item
-// whose CreatedAt is within `window`. Returns the oldest match (i.e. the
-// item still wedging the queue) or nil if none. `selfID` excludes the
-// item that is being upserted right now, which matters because Put is
-// an upsert — re-posting a canary by ID must not be treated as a
-// duplicate of itself.
+// that should block a new canary enqueue. Returns the oldest match (i.e.
+// the item still wedging the queue) or nil if none. `selfID` excludes
+// the item being upserted right now, which matters because Put is an
+// upsert — re-posting a canary by ID must not be treated as a duplicate
+// of itself.
+//
+// Escalated canaries are special-cased: they bypass the `window` and
+// always block, because escalation means "human must act before the
+// next canary makes sense." Without this carve-out, a stuck escalation
+// from >window ago lets a new canary slip through every cycle, which
+// is exactly how the backlog accumulated 30+ identical
+// MILLS-CANARY-* / escalated rows visible in the HUD Backlog tab.
+// Other in-flight states (queued, running, paused) continue to use
+// the time window — those represent transient progress, not a wedge.
 func findRecentCanary(ctx context.Context, st *store.Store, window time.Duration, selfID string) (*store.BacklogItem, error) {
 	if st == nil {
 		return nil, nil
@@ -228,7 +237,9 @@ func findRecentCanary(ctx context.Context, st *store.Store, window time.Duration
 		if it.State == store.BacklogMerged {
 			continue
 		}
-		if it.CreatedAt.Before(cutoff) {
+		// Escalated canaries block forever — see comment above. Other
+		// non-merged states use the configured window.
+		if it.State != store.BacklogEscalated && it.CreatedAt.Before(cutoff) {
 			continue
 		}
 		if oldest == nil || it.CreatedAt.Before(oldest.CreatedAt) {
