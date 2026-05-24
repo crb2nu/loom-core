@@ -228,19 +228,45 @@ func (a *SpawnTelemetryAccumulator) AddTokens(input, output, cacheCreate, cacheR
 }
 
 // StartToolCall records the start of a tool call for duration tracking.
+//
+// When a publisher is attached (NewSpawnTelemetryAccumulatorWithPublisher /
+// SetPublisher) it also emits a tool.call.start event so spectator UIs see
+// the call land in real time. The simple path carries no args — callers
+// that have args should use StartToolCallWithArgsServer for redaction. The
+// matching CompleteToolCall reads toolMeta to echo the tool name on the
+// end event without a re-supply.
 func (a *SpawnTelemetryAccumulator) StartToolCall(id, name, serverName string) {
+	now := time.Now()
+
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.toolStart[id] = now
+	a.toolMeta[id] = toolCallMeta{toolName: name, startedAt: now}
 
-	a.toolStart[id] = time.Now()
+	if len(a.data.ToolCalls) < maxToolCalls {
+		a.data.ToolCalls = append(a.data.ToolCalls, ToolCallEntry{
+			Name:       name,
+			ServerName: serverName,
+			Timestamp:  now.UTC().Format(time.RFC3339),
+		})
+	}
+	publisher := a.publisher
+	sessionID := a.sessionID
+	agentID := a.agentID
+	a.mu.Unlock()
 
-	if len(a.data.ToolCalls) >= maxToolCalls {
+	if publisher == nil {
 		return
 	}
-	a.data.ToolCalls = append(a.data.ToolCalls, ToolCallEntry{
-		Name:       name,
-		ServerName: serverName,
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+
+	publisher.Publish(EventTypeToolCallStart, ToolCallStartEvent{
+		CallID:       id,
+		SessionID:    sessionID,
+		AgentID:      agentID,
+		ToolName:     name,
+		ServerName:   serverName,
+		ArgsRedacted: map[string]any{},
+		ArgsTier:     string(redact.TierPublic),
+		StartedAt:    now,
 	})
 }
 
@@ -289,15 +315,21 @@ func (a *SpawnTelemetryAccumulator) EnsureToolCall(id, name, serverName string) 
 
 // CompleteToolCall updates a previously started tool call with its result.
 // If the tool call was started, the duration is computed from the start time.
+//
+// When a publisher is attached it also emits a tool.call.end event so a UI
+// that rendered the matching start event can flip the row from in-flight to
+// completed. The simple path carries no result payload — callers with
+// results to summarize should use CompleteToolCallWithResult instead.
 func (a *SpawnTelemetryAccumulator) CompleteToolCall(id string, durationMs int, exitCode *int, errMsg string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	now := time.Now()
 
+	a.mu.Lock()
 	// Compute duration from tracked start time if available
 	if start, ok := a.toolStart[id]; ok {
 		durationMs = int(time.Since(start).Milliseconds())
 		delete(a.toolStart, id)
 	}
+	meta, hadMeta := a.toolMeta[id]
 	delete(a.toolMeta, id)
 
 	// Find and update the matching tool call entry (walk backwards for recent matches)
@@ -307,9 +339,37 @@ func (a *SpawnTelemetryAccumulator) CompleteToolCall(id string, durationMs int, 
 			tc.DurationMs = durationMs
 			tc.ExitCode = exitCode
 			tc.Error = errMsg
-			return
+			break
 		}
 	}
+
+	publisher := a.publisher
+	sessionID := a.sessionID
+	agentID := a.agentID
+	a.mu.Unlock()
+
+	if publisher == nil {
+		return
+	}
+
+	ec := 0
+	if exitCode != nil {
+		ec = *exitCode
+	}
+	toolName := ""
+	if hadMeta {
+		toolName = meta.toolName
+	}
+	publisher.Publish(EventTypeToolCallEnd, ToolCallEndEvent{
+		CallID:     id,
+		SessionID:  sessionID,
+		AgentID:    agentID,
+		ToolName:   toolName,
+		DurationMs: int64(durationMs),
+		ExitCode:   ec,
+		Error:      errMsg,
+		EndedAt:    now,
+	})
 }
 
 // StartToolCallWithArgs records the start of a tool call AND emits a

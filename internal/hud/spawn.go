@@ -421,6 +421,34 @@ func (o *SpawnOrchestrator) broadcastTelemetryEvent(eventType string, agentID st
 	})
 }
 
+// spawnTelemetryPublisher adapts an *SSEHub to the bridge.TelemetryPublisher
+// interface so SpawnTelemetryAccumulator can emit tool.call.start/end events
+// into the same SSE stream consumed by /api/events. Marshal failures are
+// swallowed: telemetry is best-effort and must never panic the spawn loop.
+type spawnTelemetryPublisher struct {
+	hub *SSEHub
+}
+
+func newSpawnTelemetryPublisher(hub *SSEHub) *spawnTelemetryPublisher {
+	return &spawnTelemetryPublisher{hub: hub}
+}
+
+func (p *spawnTelemetryPublisher) Publish(eventType string, payload any) {
+	if p == nil || p.hub == nil {
+		return
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	p.hub.Broadcast(bridge.SSEEvent{
+		ID:        fmt.Sprintf("%s-%d", eventType, time.Now().UnixMilli()),
+		Type:      eventType,
+		Timestamp: time.Now(),
+		Data:      body,
+	})
+}
+
 // runSpawn executes the full spawn lifecycle in a background goroutine.
 func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	ctx, span := o.tracer.Start(context.Background(), "agent.spawn",
@@ -549,13 +577,21 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	cfgSpan.End()
 
 	// Step 4: Register agent session (before exec so the agent has session context).
+	// Capture sessionID so per-tool-call events emitted by the accumulator below
+	// can stamp the correct session and land in the Live Sessions panel row for
+	// this spawn. StartSession is idempotent — repeat spawns under the same
+	// namespace reuse the same session.
 	_, sessSpan := o.tracer.Start(ctx, "agent.spawn.session_register")
-	o.agentBridge.StartSession(bridge.SessionStartParams{
+	sessRes, sessErr := o.agentBridge.StartSession(bridge.SessionStartParams{
 		Namespace:   req.Namespace,
 		AgentID:     state.AgentID,
 		AgentType:   req.AgentType,
 		Description: req.TaskDescription,
 	})
+	var spawnSessionID string
+	if sessErr == nil && sessRes != nil {
+		spawnSessionID = sessRes.SessionID
+	}
 	sessSpan.End()
 
 	// Mark running and broadcast event.
@@ -623,7 +659,15 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	}
 
 	// Create telemetry accumulator and JSONL parser for real-time parsing.
-	acc := bridge.NewSpawnTelemetryAccumulator()
+	// Wire it to the SSE hub via spawnTelemetryPublisher so per-tool-call
+	// events (tool.call.start/end) reach /api/events. Without the publisher
+	// the accumulator silently dropped them and the Live Sessions panel
+	// only ever showed empty session rows for in-cluster spawn agents.
+	acc := bridge.NewSpawnTelemetryAccumulatorWithPublisher(
+		newSpawnTelemetryPublisher(o.sseHub),
+		spawnSessionID,
+		state.AgentID,
+	)
 	o.telemetry.Store(spawnID, acc)
 
 	broadcaster := SpawnEventBroadcaster(func(eventType string, agentID string, data any) {
