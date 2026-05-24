@@ -625,8 +625,12 @@ class FleetStore {
     if (this.pollingOwners.size === 0) return;
 
     const intervalMs = Math.min(...this.pollingOwners.values());
+    // Watchdog: poll on SSE-down OR on stale. See healthStore for the
+    // full rationale — the short version is that an SSE-connected-but-
+    // quiet cluster (no agent activity) used to leave this store stale
+    // indefinitely, false-firing the "Stale data" banner.
     this.pollTimer = setInterval(() => {
-      if (!eventStore.connected) this.fetch();
+      if (!eventStore.connected || this.isStale) this.fetch();
     }, intervalMs);
   }
 
