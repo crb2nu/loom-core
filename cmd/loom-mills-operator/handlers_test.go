@@ -219,10 +219,15 @@ func TestHandleBacklog_CreateDedupeAllowsMergedAndOldCanaries(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed merged: %v", err)
 	}
-	// In-flight canary older than the dedupe window — also not a blocker.
+	// In-flight queued canary older than the dedupe window — not a
+	// blocker (queued represents transient progress, the dedupe window
+	// gives up on it as wedge-worthy after 24h and lets a new one in).
+	// NOTE: the previous version of this seed used BacklogEscalated,
+	// which is now blocked-forever; see TestHandleBacklog_
+	// CreateDedupeBlocksEscalatedRegardlessOfAge for that case.
 	if err := op.store.Backlog.Put(ctx, &store.BacklogItem{
 		ID: "MILLS-CANARY-STALE", Title: "stale", Labels: []string{"mills-canary"},
-		State: store.BacklogEscalated, Priority: store.P3, CreatedBy: "test",
+		State: store.BacklogQueued, Priority: store.P3, CreatedBy: "test",
 		CreatedAt: now.Add(-48 * time.Hour),
 	}); err != nil {
 		t.Fatalf("seed stale: %v", err)
@@ -245,6 +250,43 @@ func TestHandleBacklog_CreateDedupeAllowsMergedAndOldCanaries(t *testing.T) {
 	}
 	if _, err := op.store.Backlog.Get(ctx, "MILLS-CANARY-FRESH"); err != nil {
 		t.Errorf("fresh canary should persist: %v", err)
+	}
+}
+
+// TestHandleBacklog_CreateDedupeBlocksEscalatedRegardlessOfAge pins
+// the post-MR semantic: an escalated canary blocks new canary enqueues
+// forever, not just within the 24h window. Escalation means "human
+// must act before the next canary makes sense" — without this carve-
+// out, a stuck escalation from >24h ago lets a new canary slip
+// through every cycle, accumulating into the 30+ MILLS-CANARY-* /
+// escalated rows visible in the HUD Backlog tab on 2026-05-24.
+func TestHandleBacklog_CreateDedupeBlocksEscalatedRegardlessOfAge(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Escalated canary far outside the dedupe window — must STILL block.
+	if err := op.store.Backlog.Put(ctx, &store.BacklogItem{
+		ID: "MILLS-CANARY-WEDGED", Title: "wedged", Labels: []string{"mills-canary"},
+		State: store.BacklogEscalated, Priority: store.P3, CreatedBy: "test",
+		CreatedAt: time.Now().UTC().Add(-10 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed wedged: %v", err)
+	}
+
+	body := `{"ID":"MILLS-CANARY-NEW-AGAIN","Title":"new","Labels":["mills-canary"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/mills/backlog", strings.NewReader(body))
+	op.handleBacklogCreate(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for escalated canary regardless of age, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["existing_id"] != "MILLS-CANARY-WEDGED" {
+		t.Errorf("existing_id = %q, want MILLS-CANARY-WEDGED", resp["existing_id"])
 	}
 }
 
