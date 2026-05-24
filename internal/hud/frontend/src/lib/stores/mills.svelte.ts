@@ -156,10 +156,33 @@ export function loopLetterFor(s: Pick<EvalScore, 'SubjectKind' | 'JudgedBy'>): s
   return '?';
 }
 
+// CouncilAgent mirrors pkg/mills/policy.go:CouncilAgent. Used by the
+// council ensemble inspection in CouncilPanel so operators can see
+// the editor/reviewer pool the next run will use, with live model
+// availability badges from flexinfer_models.svelte.ts.
+export interface CouncilAgent {
+  name?: string;
+  model?: string;
+  backend?: string;
+}
+
+export interface CouncilEnsemble {
+  editor?: CouncilAgent;
+  reviewers?: CouncilAgent[];
+  judge?: CouncilAgent;
+}
+
 export interface PolicyView {
   enabled: boolean;
   version: number;
   raw?: unknown;
+  // Optional decoded shape — the operator returns the full Policy
+  // struct on /api/mills/policy, but only enabled+version are needed
+  // by most panels. CouncilPanel extracts the ensemble lazily so
+  // unrelated surfaces don't carry the payload weight.
+  council?: {
+    ensemble?: CouncilEnsemble;
+  };
 }
 
 export interface MillsCapabilityRow {
