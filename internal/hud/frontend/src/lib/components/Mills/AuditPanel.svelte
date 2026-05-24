@@ -373,7 +373,13 @@
   }
   .audit-row-btn {
     display: grid;
-    grid-template-columns: 1.2rem minmax(0, 1.6fr) 4rem 4rem 5rem 1fr;
+    /* Severity column widened from 4rem → 9rem so it can fit the
+       severity pill AND the optional 'no-run' badge side-by-side
+       without spilling into the Cost column. The previous 4rem was
+       big enough for just the pill (CRITICAL is the widest at ~7ch)
+       but the no-run badge added in MR !502 pushed the wrap beyond
+       the cell, mashing into '$0.0000' as 'NO-$Q0000'. */
+    grid-template-columns: 1.2rem minmax(0, 1.6fr) 4rem 9rem 5rem 1fr;
     align-items: center;
     gap: 0.6rem;
     width: 100%;
