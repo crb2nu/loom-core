@@ -83,9 +83,14 @@ type RoleSpec struct {
 //     (via FlexInfer alias routing) without explicit fallback edits.
 //     The two GPU variants of gemma4-26b are listed as cross-fallbacks
 //     so primary-GPU contention falls through to the partner GPU.
-//   - 2026-05-08: initial table aligning to deployed FlexInfer models
-//     (qwen3-8b-fast-7900xtx with planned alias "qwen3-8b", and
-//     qwen3-1p7b-tools-radeonvii brought up Ready as router).
+//   - 2026-05-08: initial table aligning to deployed FlexInfer models.
+//     The original target was qwen3-8b-fast-7900xtx (with a planned
+//     "qwen3-8b" alias) plus qwen3-1p7b-tools-radeonvii as the router.
+//     qwen3-8b-fast-7900xtx never landed Ready on this cluster — by
+//     2026-05-23 verification, only the router and the gemma4-26b
+//     variants were ever served. The router-class model is still in
+//     production; the larger qwen3-8b assumption was the source of
+//     the audit-pool outage tracked in the 2026-05-23 entry above.
 func defaultRoles() map[Role]RoleSpec {
 	return map[Role]RoleSpec{
 		RoleWeaverRouter: {
