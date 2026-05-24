@@ -390,10 +390,13 @@ class SpawnStore {
     this.fetch();
     this.subscribeSSE();
     if (this.pollTimer) return;
-    // 60s watchdog poll (Slice B3) — SSE agent.spawn.* events are the
-    // primary data source; this only fires when SSE is disconnected.
+    // Watchdog: poll on SSE-down OR on stale. See healthStore for the
+    // full rationale — short version: an SSE-connected-but-quiet
+    // cluster (no spawn activity) used to leave this store stale
+    // indefinitely, false-firing the "Stale data" banner. Same fix
+    // as MR !511; spawn was missed in that pass.
     this.pollTimer = setInterval(() => {
-      if (!eventStore.connected) this.fetch();
+      if (!eventStore.connected || this.isStale) this.fetch();
     }, intervalMs);
   }
 
