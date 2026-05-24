@@ -121,6 +121,7 @@ type EmbeddedHUDConfig struct {
 	PipelineProjects                  string  `yaml:"pipeline_projects,omitempty"`
 	BindAddress                       string  `yaml:"bind_address,omitempty"`
 	FlexInferURL                      string  `yaml:"flexinfer_url,omitempty"`
+	FlexInferProxyURL                 string  `yaml:"flexinfer_proxy_url,omitempty"`
 	FlexInferKey                      string  `yaml:"flexinfer_key,omitempty"`
 	CoordinatorModel                  string  `yaml:"coordinator_model,omitempty"`
 

@@ -121,6 +121,16 @@ func (a *aimodelsDepsAdapter) AIModelsResolver() *aimodels.Resolver {
 }
 
 func (a *aimodelsDepsAdapter) FlexInferProxyURL() string {
+	// Prefer the dedicated proxy URL (flexinfer-proxy on the
+	// flexinfer-system service) so /v1/models returns the real
+	// model registry with metadata.ready. Fall back to the legacy
+	// FlexInferURL only as a last resort — that field actually
+	// points at the LiteLLM gateway in the canonical cluster, which
+	// requires auth and returns a different shape, so falling back
+	// to it produces 401s and empty model lists.
+	if u := a.app.config.FlexInferProxyURL; u != "" {
+		return u
+	}
 	return a.app.config.FlexInferURL
 }
 

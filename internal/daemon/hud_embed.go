@@ -50,6 +50,7 @@ func (d *Daemon) startEmbeddedHUD(ctx context.Context, mux *http.ServeMux) error
 		PipelineProjects:                  firstNonEmpty(cfg.PipelineProjects, os.Getenv("HUD_PIPELINE_PROJECTS")),
 		BindAddress:                       firstNonEmpty(cfg.BindAddress, os.Getenv("HUD_BIND_ADDRESS")),
 		FlexInferURL:                      firstNonEmpty(cfg.FlexInferURL, os.Getenv("FLEXINFER_URL")),
+		FlexInferProxyURL:                 firstNonEmpty(cfg.FlexInferProxyURL, os.Getenv("FLEXINFER_PROXY_URL")),
 		FlexInferKey:                      firstNonEmpty(cfg.FlexInferKey, os.Getenv("FLEXINFER_API_KEY")),
 		CoordinatorModel:                  firstNonEmpty(cfg.CoordinatorModel, os.Getenv("COORDINATOR_MODEL")),
 		MillsOperatorURL:                  os.Getenv("LOOM_MILLS_OPERATOR_URL"),
