@@ -261,7 +261,13 @@ class TaskStore {
     this.fetch();
     // 60s watchdog poll (SSE is the primary data source; this only fires
     // when SSE is disconnected — see Slice B3 of the HUD UX overhaul).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    // Watchdog: poll on SSE-down OR on stale. See healthStore for the
+    // full rationale — the short version is that an SSE-connected-but-
+    // quiet cluster (no agent activity) used to leave this store stale
+    // indefinitely, false-firing the "Stale data" banner.
+    this.pollTimer = setInterval(() => {
+      if (!eventStore.connected || this.isStale) this.fetch();
+    }, intervalMs);
 
     // Subscribe to SSE events: apply task list directly from hud.fleet snapshots.
     // The FleetMonitor fetches all tasks on its 15s cadence and broadcasts them.

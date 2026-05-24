@@ -291,7 +291,15 @@ class HealthStore {
     this.fetch();
     // 60s watchdog poll (SSE is the primary data source; this only fires
     // when SSE is disconnected — see Slice B3 of the HUD UX overhaul).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    // Watchdog: poll when SSE is disconnected OR when the store has
+    // gone stale despite a healthy SSE. The latter handles the "SSE
+    // connected but quiet" case — e.g. no fleet activity to push for
+    // staleAfter ms — which previously left the staleness banner
+    // false-firing forever. A successful fetch bumps lastUpdated and
+    // clears the banner; a failure surfaces an honest error.
+    this.pollTimer = setInterval(() => {
+      if (!eventStore.connected || this.isStale) this.fetch();
+    }, intervalMs);
 
     // Subscribe to SSE events: apply data directly from hud.health snapshots.
     this.eventUnsubs.push(
