@@ -1,10 +1,15 @@
 <script lang="ts">
-  import { millsStore } from '../../stores/mills.svelte.ts';
+  import { millsStore, type CouncilAgent } from '../../stores/mills.svelte.ts';
+  import { flexinferModelsStore, type ModelStatus } from '../../stores/flexinfer_models.svelte.ts';
   import PanelShell from '../shared/PanelShell.svelte';
 
   $effect(() => {
     millsStore.startPolling(15000);
-    return () => { millsStore.stopPolling(); };
+    flexinferModelsStore.startPolling();
+    return () => {
+      millsStore.stopPolling();
+      flexinferModelsStore.stopPolling();
+    };
   });
 
   let runs = $derived(millsStore.councilRuns);
@@ -62,6 +67,23 @@
   function isSuspiciouslyInstant(r: { StartedAt?: string; EndedAt?: string; Outcome?: string }): boolean {
     const ms = durationMs(r.StartedAt, r.EndedAt);
     return ms != null && ms < 1000;
+  }
+
+  // The /api/mills/policy endpoint returns the full Policy struct; we
+  // extract just the council ensemble lazily so unrelated panels don't
+  // pay the deserialization cost. Returns null when the operator hasn't
+  // wired the council section yet.
+  let ensemble = $derived.by(() => {
+    const raw = policy?.raw as { council?: { ensemble?: { editor?: CouncilAgent; reviewers?: CouncilAgent[]; judge?: CouncilAgent } } } | undefined;
+    return raw?.council?.ensemble ?? null;
+  });
+
+  function modelStatusTitle(status: ModelStatus, model: string): string {
+    switch (status) {
+      case 'ready':   return `${model}: Ready in flexinfer-system — accepting requests.`;
+      case 'idle':    return `${model}: Idle / scaled-to-zero — first request will cold-start (or fail if the probe is offline).`;
+      case 'unknown': return `${model}: not present in the flexinfer-system /v1/models registry, OR the registry hasn't loaded yet. If it's the former, every dispatch to this agent will 404.`;
+    }
   }
   function roleLabel(role: string): string {
     switch (role) {
@@ -138,6 +160,41 @@
           <tr class="row-debate">
             <td></td>
             <td colspan="7">
+              {#if ensemble}
+                {@const editorBackend = ensemble.editor?.backend ?? ''}
+                {@const editorModel = ensemble.editor?.model ?? '—'}
+                {@const editorStatus = editorBackend === 'flexinfer' ? flexinferModelsStore.statusFor(editorModel) : 'unknown'}
+                <div class="ensemble-block">
+                  <div class="ensemble-heading">Ensemble (policy v{policy?.version ?? '?'})</div>
+                  <ul class="ensemble-list">
+                    <li class="ensemble-row">
+                      <span class="ens-role">editor</span>
+                      <span class="ens-backend">{editorBackend || '—'}</span>
+                      <span class="ens-model">{editorModel}</span>
+                      {#if editorBackend === 'flexinfer'}
+                        <span class="ens-status ens-status-{editorStatus}" title={modelStatusTitle(editorStatus, editorModel)}>{editorStatus}</span>
+                      {:else}
+                        <span class="ens-status ens-status-unknown" title="Status checks only available for flexinfer-backed agents today.">—</span>
+                      {/if}
+                    </li>
+                    {#each ensemble.reviewers ?? [] as rev (rev.name ?? rev.model)}
+                      {@const revBackend = rev.backend ?? ''}
+                      {@const revModel = rev.model ?? '—'}
+                      {@const revStatus = revBackend === 'flexinfer' ? flexinferModelsStore.statusFor(revModel) : 'unknown'}
+                      <li class="ensemble-row">
+                        <span class="ens-role">reviewer · {rev.name ?? '(unnamed)'}</span>
+                        <span class="ens-backend">{revBackend || '—'}</span>
+                        <span class="ens-model">{revModel}</span>
+                        {#if revBackend === 'flexinfer'}
+                          <span class="ens-status ens-status-{revStatus}" title={modelStatusTitle(revStatus, revModel)}>{revStatus}</span>
+                        {:else}
+                          <span class="ens-status ens-status-unknown" title="Status checks only available for flexinfer-backed agents today.">—</span>
+                        {/if}
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+              {/if}
               {#if !debate || debate.status === 'idle' || debate.status === 'loading'}
                 <div class="debate-status">Loading debate transcript…</div>
               {:else if debate.status === 'error'}
@@ -261,6 +318,46 @@
     font-family: ui-monospace, monospace;
   }
   .retry-btn:hover { background: rgba(240, 130, 130, 0.15); }
+  .ensemble-block {
+    margin: 0.4rem 0.25rem 0.5rem;
+    padding: 0.5rem 0.7rem;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-subtle, #233);
+    border-radius: 4px;
+  }
+  .ensemble-heading {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted, #889);
+    margin-bottom: 0.4rem;
+  }
+  .ensemble-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+  .ensemble-row {
+    display: grid;
+    grid-template-columns: 11rem 5rem 1fr 4.5rem;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+  }
+  .ens-role { color: var(--text-muted, #889); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .ens-backend { color: var(--text-muted, #889); }
+  .ens-model { font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ens-status {
+    text-align: center;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-family: ui-monospace, monospace;
+    cursor: help;
+    white-space: nowrap;
+  }
+  .ens-status-ready   { background: rgba(78, 201, 176, 0.18);  color: rgb(120, 220, 160); border: 1px solid rgba(78, 201, 176, 0.4); }
+  .ens-status-idle    { background: rgba(215, 160, 58, 0.18);  color: rgb(240, 220, 120); border: 1px solid rgba(215, 160, 58, 0.4); }
+  .ens-status-unknown { background: rgba(224, 108, 117, 0.15); color: rgb(240, 130, 130); border: 1px solid rgba(224, 108, 117, 0.35); }
+
   .debate-summary { padding: 0.4rem 0.25rem 0.25rem; font-size: 0.85rem; display: flex; gap: 0.5rem; align-items: center; }
   .debate-summary .muted { color: var(--text-muted, #889); }
   .debate-list {
