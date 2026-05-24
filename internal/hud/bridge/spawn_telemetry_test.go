@@ -791,6 +791,63 @@ func TestSpawnAccumulator_PerToolCallEvents_DoNotBreakLegacyDelta(t *testing.T) 
 	}
 }
 
+// TestSpawnAccumulator_StartCompleteToolCall_Simple_EmitsEvents pins the
+// behavior introduced when wiring the spawn parser publisher: the simple
+// StartToolCall / CompleteToolCall pair (used by the Claude/Codex/Gemini
+// JSONL parsers) must also emit tool.call.start/end events so the Live
+// Sessions panel sees activity for in-cluster spawn agents. Before this,
+// only the WithArgs/WithResult variants published, and the parsers never
+// called those — so every spawn-agent session row in the HUD showed "No
+// captured activity for this session yet" indefinitely.
+func TestSpawnAccumulator_StartCompleteToolCall_Simple_EmitsEvents(t *testing.T) {
+	pub := &fakeTelemetryPublisher{}
+	acc := NewSpawnTelemetryAccumulatorWithPublisher(pub, "session-abc", "agent-codex")
+
+	const callID = "item-42"
+	acc.StartToolCall(callID, "Read", "")
+
+	starts := pub.byType(EventTypeToolCallStart)
+	if len(starts) != 1 {
+		t.Fatalf("expected 1 tool.call.start, got %d", len(starts))
+	}
+	startEv, ok := starts[0].Payload.(ToolCallStartEvent)
+	if !ok {
+		t.Fatalf("start payload type: got %T, want ToolCallStartEvent", starts[0].Payload)
+	}
+	if startEv.CallID != callID {
+		t.Errorf("start CallID: got %q, want %q", startEv.CallID, callID)
+	}
+	if startEv.SessionID != "session-abc" || startEv.AgentID != "agent-codex" {
+		t.Errorf("start identity: got session=%q agent=%q", startEv.SessionID, startEv.AgentID)
+	}
+	if startEv.ToolName != "Read" {
+		t.Errorf("start ToolName: got %q, want %q", startEv.ToolName, "Read")
+	}
+
+	ec := 0
+	acc.CompleteToolCall(callID, 0, &ec, "")
+
+	ends := pub.byType(EventTypeToolCallEnd)
+	if len(ends) != 1 {
+		t.Fatalf("expected 1 tool.call.end, got %d", len(ends))
+	}
+	endEv, ok := ends[0].Payload.(ToolCallEndEvent)
+	if !ok {
+		t.Fatalf("end payload type: got %T, want ToolCallEndEvent", ends[0].Payload)
+	}
+	if endEv.CallID != callID {
+		t.Errorf("end CallID: got %q, want %q", endEv.CallID, callID)
+	}
+	if endEv.ToolName != "Read" {
+		// CompleteToolCall reads tool name from toolMeta populated by
+		// StartToolCall; if this regresses, the simple path stopped stashing.
+		t.Errorf("end ToolName: got %q, want %q (toolMeta stash regressed?)", endEv.ToolName, "Read")
+	}
+	if endEv.DurationMs < 0 {
+		t.Errorf("end DurationMs: got %d, want >= 0", endEv.DurationMs)
+	}
+}
+
 // TestSpawnAccumulator_SetPublisher_NilSafe verifies the SetPublisher sink
 // can be cleared and replaced after construction without breaking emission.
 func TestSpawnAccumulator_SetPublisher_NilSafe(t *testing.T) {
