@@ -33,6 +33,7 @@ func newHudCmd(socketPath string) *cobra.Command {
 	var overlayOpacity float64
 	var overlayCornerRadius float64
 	var flexinferURL string
+	var flexinferProxyURL string
 	var flexinferKey string
 	var coordinatorModel string
 	var webhookURL string
@@ -158,6 +159,7 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 			}
 			applyEnvString("metrics-addr", "DAEMON_METRICS_ADDR", &metricsAddr)
 			applyEnvString("flexinfer-url", "FLEXINFER_URL", &flexinferURL)
+			applyEnvString("flexinfer-proxy-url", "FLEXINFER_PROXY_URL", &flexinferProxyURL)
 			applyEnvString("flexinfer-key", "FLEXINFER_API_KEY", &flexinferKey)
 			applyEnvString("coordinator-model", "COORDINATOR_MODEL", &coordinatorModel)
 			applyEnvString("webhook-url", "HUD_WEBHOOK_URL", &webhookURL)
@@ -241,6 +243,7 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 				OverlayOpacity:                    overlayOpacity,
 				OverlayCornerRadius:               overlayCornerRadius,
 				FlexInferURL:                      flexinferURL,
+				FlexInferProxyURL:                 flexinferProxyURL,
 				FlexInferKey:                      flexinferKey,
 				CoordinatorModel:                  coordinatorModel,
 				WebhookURL:                        webhookURL,
@@ -298,7 +301,8 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 	// Coordinator (FlexInfer LLM integration).
 	// Defaults from env vars so the coordinator auto-enables when the
 	// environment is configured (e.g., in .zshrc or launchd plist).
-	cmd.Flags().StringVar(&flexinferURL, "flexinfer-url", os.Getenv("FLEXINFER_URL"), "FlexInfer proxy URL (enables coordinator) [$FLEXINFER_URL]")
+	cmd.Flags().StringVar(&flexinferURL, "flexinfer-url", os.Getenv("FLEXINFER_URL"), "LiteLLM gateway URL used by the coordinator [$FLEXINFER_URL]")
+	cmd.Flags().StringVar(&flexinferProxyURL, "flexinfer-proxy-url", os.Getenv("FLEXINFER_PROXY_URL"), "FlexInfer proxy URL used by the aimodels endpoint for live /v1/models registry [$FLEXINFER_PROXY_URL]")
 	cmd.Flags().StringVar(&flexinferKey, "flexinfer-key", os.Getenv("FLEXINFER_API_KEY"), "FlexInfer API key [$FLEXINFER_API_KEY]")
 	cmd.Flags().StringVar(&coordinatorModel, "coordinator-model", os.Getenv("COORDINATOR_MODEL"), "Default model for coordinator (e.g., fast-chat) [$COORDINATOR_MODEL]")
 

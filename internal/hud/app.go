@@ -46,9 +46,18 @@ type Config struct {
 	OverlayCornerRadius float64 // Corner radius in points (default 12).
 
 	// Coordinator (FlexInfer LLM integration). Empty URL = disabled.
-	FlexInferURL     string // FlexInfer proxy URL (e.g., "http://flexinfer-proxy:8080").
-	FlexInferKey     string // Optional API key for FlexInfer.
-	CoordinatorModel string // Default model for coordinator tasks (e.g., "gemma4-26b-a4b-gptq").
+	// NOTE: FlexInferURL is misnamed for historical reasons — it actually
+	// points at the LiteLLM gateway used by the coordinator/spawn paths,
+	// not at the FlexInfer proxy that owns /v1/models. The aimodels
+	// domain's flexinfer-models endpoint needs the proxy directly to
+	// surface model availability badges; use FlexInferProxyURL for that
+	// path. Renaming the historical field would touch many call sites
+	// and break SOPS-encrypted secrets; the dual fields keep both
+	// behaviors honest.
+	FlexInferURL      string // LiteLLM gateway URL (litellm.ai.svc.cluster.local). Used by coordinator.
+	FlexInferProxyURL string // FlexInfer proxy URL (flexinfer-proxy.flexinfer-system.svc.cluster.local). Used by aimodels/flexinfer-models endpoint.
+	FlexInferKey      string // Optional API key for FlexInfer.
+	CoordinatorModel  string // Default model for coordinator tasks (e.g., "gemma4-26b-a4b-gptq").
 
 	// Webhook push: forward presence+session snapshots to a remote endpoint.
 	WebhookURL     string // Push URL (e.g., "https://deck.flexinfer.ai/api/agents/hud/push").
