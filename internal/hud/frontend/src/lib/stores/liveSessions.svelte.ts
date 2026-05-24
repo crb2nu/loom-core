@@ -84,6 +84,12 @@ class LiveSessionsStore {
     this.unsubs.push(eventStore.on('tool.call.start', (e) => this.onToolCallStart(e)));
     this.unsubs.push(eventStore.on('tool.call.end', (e) => this.onToolCallEnd(e)));
 
+    // hud.fleet carries the canonical session list. Without this subscription
+    // the panel would only ever learn about sessions that emit session.start
+    // *after* mount — already-running sessions never appear (the one-shot
+    // seed below races against fleet load and silently misses late arrivals).
+    this.unsubs.push(eventStore.on('hud.fleet', (e) => this.onFleetSnapshot(e)));
+
     if (!this.reapTimer) {
       this.reapTimer = setInterval(() => this.reapEnded(), 5_000);
     }
@@ -145,38 +151,52 @@ class LiveSessionsStore {
       const res = await globalThis.fetch('/api/fleet');
       if (!res.ok) return;
       const data = (await res.json()) as { sessions?: Array<Record<string, unknown>> };
-      const sessions = data.sessions ?? [];
-      let added = 0;
-      const backfills: Array<Promise<void>> = [];
-      for (const s of sessions) {
-        const sid = stringField(s, 'id');
-        const status = stringField(s, 'status');
-        const ended = stringField(s, 'ended_at');
-        if (!sid || status !== 'active' || ended) continue;
-        // Skip sessions an SSE event already populated — those have richer
-        // state (recent_calls, agent_status). Don't clobber.
-        if (this.sessions.has(sid)) continue;
-        const aid = stringField(s, 'agent_id');
-        const startedMs = Date.parse(stringField(s, 'started_at')) || Date.now();
-        const session: LiveSession = {
-          session_id: sid,
-          agent_id: aid,
-          agent_status: 'unknown',
-          recent_calls: [],
-          first_seen: startedMs,
-          last_activity: startedMs,
-        };
-        this.sessions.set(sid, session);
-        backfills.push(this.backfillSessionActivity(session));
-        added++;
-      }
-      if (added > 0) this.touch();
-      if (backfills.length > 0) {
-        await Promise.allSettled(backfills);
-      }
+      await this.mergeActiveSessions(data.sessions ?? []);
     } catch {
       // Best-effort: SSE will populate as turns happen.
     }
+  }
+
+  /**
+   * mergeActiveSessions inserts any status=active sessions not already
+   * tracked into the live-sessions map. Idempotent: existing sessions are
+   * left alone (SSE-sourced entries have richer state we don't want to
+   * clobber). Called from both the one-shot mount seed and the hud.fleet
+   * SSE handler so sessions that appear in fleet after mount still show up.
+   */
+  async mergeActiveSessions(sessions: Array<Record<string, unknown>>): Promise<void> {
+    let added = 0;
+    const backfills: Array<Promise<void>> = [];
+    for (const s of sessions) {
+      const sid = stringField(s, 'id');
+      const status = stringField(s, 'status');
+      const ended = stringField(s, 'ended_at');
+      if (!sid || status !== 'active' || ended) continue;
+      if (this.sessions.has(sid)) continue;
+      const aid = stringField(s, 'agent_id');
+      const startedMs = Date.parse(stringField(s, 'started_at')) || Date.now();
+      const session: LiveSession = {
+        session_id: sid,
+        agent_id: aid,
+        agent_status: 'unknown',
+        recent_calls: [],
+        first_seen: startedMs,
+        last_activity: startedMs,
+      };
+      this.sessions.set(sid, session);
+      backfills.push(this.backfillSessionActivity(session));
+      added++;
+    }
+    if (added > 0) this.touch();
+    if (backfills.length > 0) {
+      await Promise.allSettled(backfills);
+    }
+  }
+
+  private onFleetSnapshot(e: SSEEvent): void {
+    const sessions = (e.data as { sessions?: unknown })?.sessions;
+    if (!Array.isArray(sessions)) return;
+    void this.mergeActiveSessions(sessions as Array<Record<string, unknown>>);
   }
 
   private touch() {
