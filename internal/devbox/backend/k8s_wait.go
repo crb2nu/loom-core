@@ -135,7 +135,12 @@ func (k *K8sBackend) getPodLogs(ctx context.Context, podName string) (string, er
 	return buf.String(), nil
 }
 
-// deletePod deletes a pod with zero grace period (immediate).
+// deletePod deletes a pod with zero grace period (immediate). The
+// Delete API returns as soon as the request is accepted — the pod
+// may still be in "Terminating" state for some seconds afterward,
+// which is why a subsequent Create with the same name can fail with
+// 409 AlreadyExists. Use evictPod when the caller intends to recreate
+// under the same name.
 func (k *K8sBackend) deletePod(ctx context.Context, name string) error {
 	gracePeriod := int64(0)
 	err := k.clientset.CoreV1().Pods(k.namespace).Delete(ctx, name, metav1.DeleteOptions{
@@ -145,6 +150,46 @@ func (k *K8sBackend) deletePod(ctx context.Context, name string) error {
 		return fmt.Errorf("delete pod: %w", err)
 	}
 	return nil
+}
+
+// waitForPodGone polls until the named pod is no longer present, or
+// returns an error on timeout / ctx cancellation. Caller uses this
+// before recreating under the same name to avoid the 409 AlreadyExists
+// race that produced ~20% of buildah build failures in the 2026-05-24
+// kill-test (.loom/local/handoffs/mills-autonomy-killtest-2026-05-24.md).
+//
+// Watch isn't ideal for "pod is gone" because the watcher closes when
+// the pod is deleted, so we poll Get for NotFound. Polling cadence is
+// 200ms — fast enough that a typical 1-2s termination window resolves
+// in <10 polls.
+func (k *K8sBackend) waitForPodGone(ctx context.Context, name string, timeout time.Duration) error {
+	deadline, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		_, err := k.clientset.CoreV1().Pods(k.namespace).Get(deadline, name, metav1.GetOptions{})
+		if isNotFound(err) {
+			return nil
+		}
+		select {
+		case <-deadline.Done():
+			return fmt.Errorf("wait pod gone: %s still present after %s", name, timeout)
+		case <-tick.C:
+			// continue
+		}
+	}
+}
+
+// evictPod deletes the pod and waits for it to actually disappear from
+// the cluster. Cheap when the pod isn't there (Delete returns NotFound,
+// waitForPodGone returns immediately on the first poll). Used before a
+// recreate under the same name to dodge the "pod already exists" 409.
+func (k *K8sBackend) evictPod(ctx context.Context, name string, timeout time.Duration) error {
+	if err := k.deletePod(ctx, name); err != nil {
+		return err
+	}
+	return k.waitForPodGone(ctx, name, timeout)
 }
 
 // parseExitCode extracts the exit code from a K8s exec error.
