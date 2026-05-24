@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -23,7 +24,15 @@ var buildDepFiles = []string{
 	"Gemfile", "Gemfile.lock",
 }
 
-const buildMaxRetries = 2
+const (
+	buildMaxRetries = 2
+	// podEvictTimeout caps how long evictPod waits for a terminating
+	// pod to disappear before recreating. 30s comfortably covers the
+	// typical 1-5s termination window seen in production. Tuned to be
+	// well under the outer buildMaxRetries backoff so a stubborn pod
+	// gets a second eviction attempt without blowing the build budget.
+	podEvictTimeout = 30 * time.Second
+)
 
 func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, error) {
 	release, err := k.acquireBuildSlot(ctx)
@@ -97,11 +106,31 @@ func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, e
 func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmName, buildContext string, preferExisting bool) (*BuildResult, error) {
 	pod := k.buildBuildahPodSpec(podName, registryTag, cmName, buildContext, preferExisting)
 
-	// Delete any leftover build pod with the same name
-	_ = k.deletePod(ctx, podName)
+	// Evict any leftover build pod with the same name AND wait for the
+	// terminating pod to actually disappear. The previous code called
+	// deletePod (fire-and-forget) and immediately tried to Create — a
+	// terminating pod still occupies the name and the Create returned
+	// 409 AlreadyExists. Per the 2026-05-24 kill-test that pattern
+	// accounted for ~20% of buildah build failures.
+	// Don't fail outright on eviction timeout — the Create call below
+	// will surface a 409 with the actual error context if the pod is
+	// genuinely still there, and the next retry loop handles that.
+	_ = k.evictPod(ctx, podName, podEvictTimeout)
 
 	if _, err := k.clientset.CoreV1().Pods(k.namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-		return nil, fmt.Errorf("create buildah pod: %w", err)
+		// Belt-and-suspenders: if the eviction wait was too short
+		// and Create still hit AlreadyExists, evict harder and try
+		// once more before giving up. Combined with the outer
+		// buildMaxRetries this gives the cluster up to ~1 minute to
+		// finish a stubborn termination.
+		if apierrors.IsAlreadyExists(err) {
+			_ = k.evictPod(ctx, podName, podEvictTimeout)
+			if _, retryErr := k.clientset.CoreV1().Pods(k.namespace).Create(ctx, pod, metav1.CreateOptions{}); retryErr != nil {
+				return nil, fmt.Errorf("create buildah pod (after evict retry): %w", retryErr)
+			}
+		} else {
+			return nil, fmt.Errorf("create buildah pod: %w", err)
+		}
 	}
 	defer func() {
 		_ = k.deletePod(context.Background(), podName)

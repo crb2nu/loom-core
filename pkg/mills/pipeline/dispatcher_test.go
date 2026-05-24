@@ -310,6 +310,51 @@ func TestGitLabWorker_CreateMR_RecordsIID(t *testing.T) {
 	}
 }
 
+// Slice 2a: when AutoMergeFor returns true, the CreateMRRequest carries
+// AutoMerge=true through to the GitLab client.
+func TestGitLabWorker_CreateMR_PassesAutoMergeFromCallback(t *testing.T) {
+	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	w := &GitLabWorker{
+		Client:       gl,
+		AutoMergeFor: func(jc JobContext) bool { return true },
+	}
+	if _, err := w.Run(context.Background(), sampleJobContext("mr")); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !gl.createCalls[0].AutoMerge {
+		t.Errorf("CreateMRRequest.AutoMerge = false, want true (callback returned true)")
+	}
+}
+
+// And the negative: callback returns false → no auto-merge.
+func TestGitLabWorker_CreateMR_AutoMergeOffByDefault(t *testing.T) {
+	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	w := &GitLabWorker{Client: gl} // no AutoMergeFor wired
+	if _, err := w.Run(context.Background(), sampleJobContext("mr")); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if gl.createCalls[0].AutoMerge {
+		t.Errorf("CreateMRRequest.AutoMerge = true with no callback + no item.Policy.AutoMerge")
+	}
+}
+
+// Item.Policy.AutoMerge alone (no callback) still flips the flag —
+// importer/council can opt an item in even when the operator hasn't
+// wired the policy.LabelOverrideFor callback.
+func TestGitLabWorker_CreateMR_AutoMergeFromItemPolicy(t *testing.T) {
+	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	w := &GitLabWorker{Client: gl}
+	jc := sampleJobContext("mr", func(jc *JobContext) {
+		jc.Item.Policy.AutoMerge = true
+	})
+	if _, err := w.Run(context.Background(), jc); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !gl.createCalls[0].AutoMerge {
+		t.Errorf("AutoMerge = false; item.Policy.AutoMerge should have flipped it")
+	}
+}
+
 func TestGitLabWorker_CreateMR_FanOutParentUsesIntegrationBranch(t *testing.T) {
 	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
 	w := &GitLabWorker{Client: gl}

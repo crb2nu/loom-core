@@ -275,6 +275,48 @@ watch -n 30 'curl -sf $LOOM_MILLS_OPERATOR_URL/metrics | grep loom_mills_regress
 
 If `loom_mills_regression_count_total` increases above zero in the first 24h, pause and investigate before any further flips. The kill switch (`enabled: false`) is the safest and lowest-blast-radius rollback.
 
+## GitLab issue importer (Slice 1a of .loom/43)
+
+The operator can pull open issues labelled `mills-eligible` from its
+configured GitLab project (`GITLAB_PROJECT` env) and create one
+BacklogItem per fresh issue. Disabled by default; opt in via policy.
+
+```yaml
+intake:
+  gitlab:
+    enabled: true
+    eligible_label: "mills-eligible"   # required label on the issue
+    poll_interval_seconds: 300         # 5 min
+    default_priority: "P2"             # fallback if no priority:Px label
+```
+
+**Label semantics on the issue side:**
+- `mills-eligible` (required) — the importer's selector. Add this on
+  any issue you want Mills to pick up.
+- `priority:P0` / `priority:P1` / `priority:P2` / `priority:P3`
+  (optional) — sets the BacklogItem priority. Highest priority wins
+  when multiple are present. Default is `default_priority`.
+
+**Dedup**: BacklogItem ID is `gl-<project_id>-<issue_iid>`, so the
+importer is safe to re-run. Once an item exists, the importer does NOT
+update it — reconciler/council state transitions (queued → running →
+merged/escalated) are preserved across ticks.
+
+**Verify**:
+```bash
+# After enabling, watch for the import line in operator logs:
+kubectl -n loom-mills logs deploy/loom-mills-operator -f | \
+  grep "gitlab importer"
+# Check the backlog API for the new item:
+loom mills backlog list | grep gl-
+```
+
+**Don't enable until pipelines are reaching `merge` stage.** Per the
+2026-05-24 kill-test (`.loom/local/handoffs/mills-autonomy-killtest-...`)
+100% of pipeline_runs were escalating at `tests` or `plan_slice`.
+Adding more intake before Slices 2c + 2e land would just deepen the
+escalation pile.
+
 ## v2 rollout staging (preview)
 
 When `.loom/94-implementation-plan-mills-v2-hierarchical-swarm-2026-05-02.md` Phase 8 lands, each v2 feature flips behind its own policy flag with a 1-week soak between flips. Order:

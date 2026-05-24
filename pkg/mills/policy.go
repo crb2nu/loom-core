@@ -47,6 +47,51 @@ type Policy struct {
 	Debate         DebatePolicy       `yaml:"debate,omitempty"`
 	Recursion      RecursionPolicy    `yaml:"recursion,omitempty"`
 	AdaptivePolicy AdaptivePolicy     `yaml:"adaptive_policy,omitempty"`
+	Intake         IntakePolicy       `yaml:"intake,omitempty"`
+	Notify         NotifyPolicy       `yaml:"notify,omitempty"`
+}
+
+// NotifyPolicy controls external notification hooks (Slice 3a).
+// Currently the only sink is a generic JSON webhook (Slack-compatible).
+// Disabled by default — set webhook_url to opt in.
+type NotifyPolicy struct {
+	WebhookURL        string `yaml:"webhook_url,omitempty"`
+	WebhookTimeoutSec int    `yaml:"webhook_timeout_seconds,omitempty"` // default 10
+	MRBaseURL         string `yaml:"mr_base_url,omitempty"`             // optional MR link prefix
+	OnlyAutonomous    bool   `yaml:"only_autonomous,omitempty"`         // future: gate on no-human-touch
+}
+
+// IntakePolicy controls external backlog sources. v1 ships only the
+// GitLab issue importer; future intake sources (Loki errors, roadmap
+// pulls, canary autopilot) live as additional sub-fields here.
+type IntakePolicy struct {
+	GitLab   GitLabIntake   `yaml:"gitlab,omitempty"`
+	CanaryGC CanaryGCPolicy `yaml:"canary_gc,omitempty"`
+}
+
+// CanaryGCPolicy controls the stale-escalated-canary sweeper (Slice
+// "Stale-canary GC" in plan 43). Without GC, escalated canaries block
+// new mills-canary enqueues forever per commit 2fcc705a — leaving the
+// operator starved once a handful of canaries hit the bad-cluster
+// epoch. Default disabled until the operator confirms supply-side
+// fixes are healthy enough that we want fresh canaries flowing again.
+type CanaryGCPolicy struct {
+	Enabled         bool `yaml:"enabled,omitempty"`
+	StaleAfterHours int  `yaml:"stale_after_hours,omitempty"` // default 48
+	IntervalMinutes int  `yaml:"interval_minutes,omitempty"`  // default 60
+	DryRun          bool `yaml:"dry_run,omitempty"`
+}
+
+// GitLabIntake configures the GitLab issue importer (Slice 1a). The
+// importer polls the configured GitLab project on PollIntervalSeconds
+// and creates a backlog item for each open issue carrying the
+// EligibleLabel that the operator hasn't already imported. Disabled by
+// default — opt in via configmap policy.intake.gitlab.enabled: true.
+type GitLabIntake struct {
+	Enabled             bool   `yaml:"enabled,omitempty"`
+	EligibleLabel       string `yaml:"eligible_label,omitempty"`        // default "mills-eligible"
+	PollIntervalSeconds int    `yaml:"poll_interval_seconds,omitempty"` // default 300 (5min)
+	DefaultPriority     string `yaml:"default_priority,omitempty"`      // default "P2"
 }
 
 // Budgets holds per-tier spend limits.
@@ -111,9 +156,23 @@ type LabelOverride struct {
 }
 
 // RetryPolicy controls how the pipeline retries failed stages.
+//
+// MaxAttempts caps "real" failures (Code + Infra error classes per
+// pkg/mills/pipeline/error_class.go). TransientRetryCap caps the
+// *extra* free retries the runner spends on Transient + TransientQuota
+// failures (k8s pod GC, MCP transport drop, flexinfer timeout, etc.).
+// Hard cap on total attempts is MaxAttempts + TransientRetryCap so a
+// permanent transient can't loop forever.
 type RetryPolicy struct {
-	MaxAttempts     int `yaml:"max_attempts"`
-	CooldownSeconds int `yaml:"cooldown_seconds"`
+	MaxAttempts       int `yaml:"max_attempts"`
+	CooldownSeconds   int `yaml:"cooldown_seconds"`
+	TransientRetryCap int `yaml:"transient_retry_cap,omitempty"` // default 5
+	// EscalationAutoRetryCap (Slice 3d) lets a transient-cap escalation
+	// auto-spawn a fresh pipeline_run on the same backlog item, up to
+	// this many extra runs. 0 disables (legacy behavior — escalate
+	// straight to human). Default 2 — covers a flaky cluster afternoon
+	// without burning more than 3 attempts of a real-code-bug budget.
+	EscalationAutoRetryCap int `yaml:"escalation_auto_retry_cap,omitempty"`
 }
 
 // HumanHandoffPolicy controls escalation behavior.

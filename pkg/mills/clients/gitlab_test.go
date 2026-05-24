@@ -162,6 +162,50 @@ func TestCreateMR_PostsAndPropagatesIID(t *testing.T) {
 	}
 }
 
+func TestCreateMR_AutoMergeSetsMergeWhenPipelineSucceeds(t *testing.T) {
+	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"POST /api/v4/projects/services%2Floom-core/merge_requests": func(_ *http.Request) (int, any) {
+			return 201, mrResponse{IID: 100, WebURL: "https://gitlab/-/merge_requests/100"}
+		},
+	})
+	if _, err := cli.CreateMR(context.Background(), pipeline.CreateMRRequest{
+		BacklogID: "BL-Y", SourceBranch: "feat/y", TargetBranch: "main",
+		Title: "feat: y", AutoMerge: true,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(rt.requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(rt.requests))
+	}
+	var body createMRBody
+	if err := json.Unmarshal([]byte(rt.requests[0].Body), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.MergeWhenPipelineSucceeds {
+		t.Errorf("merge_when_pipeline_succeeds = false, want true (AutoMerge was true)")
+	}
+}
+
+func TestCreateMR_AutoMergeFalseOmitsFlag(t *testing.T) {
+	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"POST /api/v4/projects/services%2Floom-core/merge_requests": func(_ *http.Request) (int, any) {
+			return 201, mrResponse{IID: 101, WebURL: "https://gitlab/-/merge_requests/101"}
+		},
+	})
+	if _, err := cli.CreateMR(context.Background(), pipeline.CreateMRRequest{
+		BacklogID: "BL-Z", SourceBranch: "feat/z", TargetBranch: "main",
+		Title: "feat: z", AutoMerge: false,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// `omitempty` on the JSON field means the key should be absent when
+	// AutoMerge=false — verifies we don't accidentally enable auto-merge
+	// for an item the policy disallowed.
+	if strings.Contains(rt.requests[0].Body, "merge_when_pipeline_succeeds") {
+		t.Errorf("body unexpectedly contained merge_when_pipeline_succeeds: %s", rt.requests[0].Body)
+	}
+}
+
 func TestCreateMR_ServerError(t *testing.T) {
 	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
 		"POST /api/v4/projects": func(_ *http.Request) (int, any) {
@@ -373,6 +417,84 @@ func TestProjectPath_SlugPathEncoded(t *testing.T) {
 	}
 	if got := c.projectPath(); got != "services%2Floom-core" {
 		t.Errorf("projectPath = %q", got)
+	}
+}
+
+// ----- ListIssues -----
+
+func TestListIssues_BuildsQueryAndDecodes(t *testing.T) {
+	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/issues": func(req *http.Request) (int, any) {
+			// Round-trip the query so the assertions below see what
+			// the client sent.
+			q := req.URL.Query()
+			if got := q.Get("labels"); got != "mills-eligible" {
+				return 400, map[string]string{"message": "wrong labels: " + got}
+			}
+			if got := q.Get("state"); got != "opened" {
+				return 400, map[string]string{"message": "wrong state: " + got}
+			}
+			if got := q.Get("per_page"); got != "100" {
+				return 400, map[string]string{"message": "wrong per_page: " + got}
+			}
+			return 200, []IssueListItem{
+				{IID: 12, ProjectID: 47, Title: "fix flake", State: "opened",
+					Labels:      []string{"mills-eligible", "priority:P1"},
+					Description: "repro"},
+			}
+		},
+	})
+	got, err := cli.ListIssues(context.Background(), ListIssuesOpts{
+		Labels:  []string{"mills-eligible"},
+		State:   "opened",
+		PerPage: 100,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 issue, got %d", len(got))
+	}
+	if got[0].IID != 12 || got[0].ProjectID != 47 {
+		t.Errorf("unexpected issue: %+v", got[0])
+	}
+	if len(rt.requests) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(rt.requests))
+	}
+	if rt.requests[0].Token != "tok-123" {
+		t.Errorf("token = %q", rt.requests[0].Token)
+	}
+}
+
+func TestListIssues_EmptyOptsOmitsQuery(t *testing.T) {
+	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/issues": func(req *http.Request) (int, any) {
+			if req.URL.RawQuery != "" {
+				return 400, map[string]string{"message": "expected no query, got " + req.URL.RawQuery}
+			}
+			return 200, []IssueListItem{}
+		},
+	})
+	if _, err := cli.ListIssues(context.Background(), ListIssuesOpts{}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rt.requests) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(rt.requests))
+	}
+}
+
+func TestListIssues_PropagatesServerError(t *testing.T) {
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects": func(_ *http.Request) (int, any) {
+			return 500, map[string]string{"message": "boom"}
+		},
+	})
+	_, err := cli.ListIssues(context.Background(), ListIssuesOpts{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("want status in error, got %v", err)
 	}
 }
 

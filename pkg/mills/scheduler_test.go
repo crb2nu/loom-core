@@ -2,6 +2,7 @@ package mills
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -136,4 +137,100 @@ func TestScheduler_TickRecordsKPISnapshot(t *testing.T) {
 	if _, err := env.store.KPI.Latest(context.Background(), int(kpiWindow1d.Seconds())); err != nil {
 		t.Fatalf("expected scheduler to record KPI snapshot: %v", err)
 	}
+}
+
+// ----- Slice 3b: tick-on-merge via KickNow -----
+
+// TestScheduler_KickNow_TriggersImmediateTick pins the tick-on-merge
+// behaviour: after the merge hook calls KickNow, the scheduler runs a
+// Tick within ~1s instead of waiting up to 60s for the next scheduled
+// tick. Without this, even with auto-merge wired, the operator sits
+// idle for up to a minute between merges.
+// kpiTickCounter is a KPIRecorder stub used as the observable for
+// "did a Tick actually fire?" — the scheduler calls Record exactly
+// once per successful tickOnce.
+type kpiTickCounter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c *kpiTickCounter) Record(_ context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+	return nil
+}
+
+func (c *kpiTickCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+func TestScheduler_KickNow_TriggersImmediateTick(t *testing.T) {
+	env := newRecEnv(t, nil)
+	counter := &kpiTickCounter{}
+	// Long interval so the test only passes if KickNow actually fires.
+	sch := NewScheduler(env.rec)
+	sch.Interval = 10 * time.Minute
+	sch.IdleAfter = -1 // disable idle throttle so cadence stays fast
+	sch.Logger = nil
+	sch.KPIRecorder = counter
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- sch.Run(ctx) }()
+
+	// Wait for the initial boot tick so the kick lands on the
+	// steady-state select loop, not the boot-tick path.
+	deadline := time.Now().Add(1 * time.Second)
+	for counter.count() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if counter.count() < 1 {
+		sch.Stop()
+		<-runErrCh
+		t.Fatal("initial tick never fired within 1s")
+	}
+	initial := counter.count()
+
+	// Kick → expect counter to grow within ~1s without waiting for
+	// the 10-minute scheduled tick.
+	sch.KickNow()
+	kickDeadline := time.Now().Add(1 * time.Second)
+	for counter.count() <= initial && time.Now().Before(kickDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if counter.count() <= initial {
+		sch.Stop()
+		<-runErrCh
+		t.Fatalf("tick count did not grow after KickNow: %d (initial %d)",
+			counter.count(), initial)
+	}
+
+	sch.Stop()
+	<-runErrCh
+}
+
+// TestScheduler_KickNow_BeforeRunIsSafe pins that KickNow doesn't
+// panic / leak goroutines when called before Run sets up kickCh.
+func TestScheduler_KickNow_BeforeRunIsSafe(t *testing.T) {
+	sch := NewScheduler(nil)
+	sch.KickNow()
+	sch.KickNow() // double for good measure
+}
+
+// TestScheduler_KickNow_NilReceiverNoPanic guards the wiring path
+// where a hook closure captures a nil *Scheduler. Should silently
+// no-op.
+func TestScheduler_KickNow_NilReceiverNoPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("KickNow panic on nil receiver: %v", r)
+		}
+	}()
+	var sch *Scheduler
+	sch.KickNow()
 }

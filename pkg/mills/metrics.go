@@ -81,6 +81,17 @@ var (
 		Help: "Pipeline stage attempts, by stage and outcome (success/error/gate_fail).",
 	}, []string{"stage", "outcome"})
 
+	// PipelineStageErrorClassTotal partitions stage errors by the
+	// retry-classifier output (transient / transient_quota / infra /
+	// code). Together with the kill-test bucket analysis at
+	// .loom/local/handoffs/mills-autonomy-killtest-2026-05-24.md this
+	// lets the operator see whether transient flake or real-code-bug
+	// is consuming the attempt budget without grepping log_tail.
+	PipelineStageErrorClassTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_pipeline_stage_error_class_total",
+		Help: "Pipeline stage errors, by stage and error_class (transient/transient_quota/infra/code).",
+	}, []string{"stage", "error_class"})
+
 	// PipelineStageDurationSeconds histograms per-stage wall-clock time.
 	// Stage names go in a label so a dashboard can render heatmaps per
 	// stage without rolling up.

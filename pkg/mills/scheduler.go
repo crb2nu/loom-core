@@ -68,6 +68,12 @@ type Scheduler struct {
 
 	// running guards against double-Run.
 	running bool
+
+	// kickCh receives a one-buffered signal from KickNow() to drive a
+	// tick immediately instead of waiting for the next scheduled
+	// interval. Used by the on-merge hook (Slice 3b) to dispatch the
+	// next backlog item within ~1s of a merge instead of up to 60s.
+	kickCh chan struct{}
 }
 
 const (
@@ -107,6 +113,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	s.running = true
 	s.stopCh = make(chan struct{})
+	// kickCh is 1-buffered so KickNow() never blocks the caller, and
+	// repeated kicks during a single tick coalesce into one extra tick
+	// instead of stacking up.
+	s.kickCh = make(chan struct{}, 1)
 	s.stopMu.Unlock()
 
 	interval := s.Interval
@@ -154,6 +164,22 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			return s.shutdown()
 		case <-s.stopCh:
 			return s.shutdown()
+		case <-s.kickCh:
+			// Slice 3b: tick-on-merge. A merge just landed and the
+			// reconciler should pick up the next backlog item now,
+			// not in up-to-60s. Run the tick, reset the ticker so
+			// the regular cadence resumes from the kick, and snap
+			// back to fast cadence (active state).
+			res, err := s.tickOnce(ctx)
+			if err != nil && s.Logger != nil {
+				s.Logger.Warn("scheduler: kick tick failed", "error", err)
+			}
+			next, nextIdleSince := s.nextInterval(res, idleSince, interval, idleInterval, idleAfter)
+			idleSince = nextIdleSince
+			if next != curInterval {
+				curInterval = next
+			}
+			t.Reset(curInterval)
 		case <-t.C:
 			res, err := s.tickOnce(ctx)
 			if err != nil && s.Logger != nil {
@@ -172,6 +198,26 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				curInterval = next
 			}
 		}
+	}
+}
+
+// KickNow schedules an immediate tick. Safe to call from any goroutine,
+// safe to call before Run starts (no-op until Run sets up kickCh).
+// Repeated kicks during a single tick coalesce into one extra tick.
+func (s *Scheduler) KickNow() {
+	if s == nil {
+		return
+	}
+	s.stopMu.Lock()
+	ch := s.kickCh
+	s.stopMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+		// Already a kick pending; coalesce.
 	}
 }
 

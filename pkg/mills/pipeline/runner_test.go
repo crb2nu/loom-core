@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/gates"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
@@ -934,4 +937,332 @@ func TestBuildFailureLogTail_Precedence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ----- Slice 2c: transient-vs-code retry classification -----
+
+// classedFailDispatcher returns a specific error string on the next N
+// calls to a stage, then succeeds. Lets tests drive the runner through
+// the new error_class classifier with real kill-test fixtures.
+type classedFailDispatcher struct {
+	mu    sync.Mutex
+	stage string
+	errs  []string // pop from front; empty slice = success thereafter
+	calls int
+}
+
+func (d *classedFailDispatcher) Dispatch(_ context.Context, _ *store.PipelineRun, _ *store.BacklogItem, stage Stage, _ map[string]StageOutput) (StageOutput, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if stage.ID != d.stage {
+		// Other stages just succeed.
+		return StageOutput{CostUSD: 0.01}, nil
+	}
+	d.calls++
+	if len(d.errs) == 0 {
+		return StageOutput{CostUSD: 0.01}, nil
+	}
+	msg := d.errs[0]
+	d.errs = d.errs[1:]
+	return StageOutput{}, errors.New(msg)
+}
+
+// TestRunner_TransientErrorsDoNotConsumeBudget pins the headline
+// Slice 2c behavior: a stage that fails with transient errors (k8s pod
+// GC, websocket close, broken pipe) is retried for free up to the cap
+// and still reaches `done` even though the raw fail count exceeded
+// MaxAttempts. Without this slice, 4 transient flakes would have hit
+// MaxAttempts=3 and escalated.
+func TestRunner_TransientErrorsDoNotConsumeBudget(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &classedFailDispatcher{
+		stage: "implement",
+		errs: []string{
+			"pod not found during reconciliation",                             // transient (k8s GC)
+			"websocket: close 1006 (abnormal closure): unexpected EOF",        // transient (mcp)
+			"write tcp 10.42.4.85:45000->10.43.248.41:80: write: broken pipe", // transient (mcp)
+			"flexinfer chat: context deadline exceeded",                       // transient (flexinfer)
+		},
+	}
+	if err := New(st, newPassingGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State == store.PipelineEscalated {
+		t.Errorf("state = escalated; transient retries should not consume MaxAttempts budget")
+	}
+	if disp.calls < 5 {
+		t.Errorf("implement called %d times; want at least 5 (4 transient retries + 1 success)", disp.calls)
+	}
+}
+
+// TestRunner_CodeErrorsExhaustBudgetEvenWithTransientHistory pins the
+// other half: a stage that mixes transient and real-code failures
+// escalates after MaxAttempts *code* failures, regardless of how many
+// transient retries it burned. Without proper class accounting a
+// stage could mask a real bug by interleaving transient flakes.
+func TestRunner_CodeErrorsExhaustBudgetEvenWithTransientHistory(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &classedFailDispatcher{
+		stage: "implement",
+		// Two transients followed by three real code failures.
+		// Default MaxAttempts=3 → escalate after the 3rd code fail.
+		errs: []string{
+			"websocket: close 1006",
+			"pod not found during reconciliation",
+			"go test FAIL: TestFoo not equal",
+			"go test FAIL: TestFoo not equal",
+			"go test FAIL: TestFoo not equal",
+		},
+	}
+	if err := New(st, newPassingGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != store.PipelineEscalated {
+		t.Errorf("state = %s; want escalated (3 code fails should exhaust budget)", got.State)
+	}
+	if disp.calls != 5 {
+		t.Errorf("implement called %d times; want 5 (2 transient + 3 code)", disp.calls)
+	}
+}
+
+// TestRunner_TransientHardCapPreventsRunaway pins the hard cap on
+// total attempts (MaxAttempts + TransientRetryCap, default 3+5=8): a
+// permanently-flaking transient escalates instead of looping forever.
+func TestRunner_TransientHardCapPreventsRunaway(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	// 20 transient errors >> hard cap. Runner should stop at the cap.
+	flakes := make([]string, 20)
+	for i := range flakes {
+		flakes[i] = "websocket: close 1006 (abnormal closure)"
+	}
+	disp := &classedFailDispatcher{stage: "implement", errs: flakes}
+	if err := New(st, newPassingGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != store.PipelineEscalated {
+		t.Errorf("state = %s; want escalated (hard cap should kick in)", got.State)
+	}
+	// Default cap is 3+5=8. Allow ±1 for the boundary (the escalate
+	// check is `>= cap`).
+	if disp.calls < 7 || disp.calls > 9 {
+		t.Errorf("implement called %d times; want ~8 (MaxAttempts=3 + TransientRetryCap=5)", disp.calls)
+	}
+}
+
+// TestRunner_InfraErrorsCountAgainstBudget pins that buildah / sandbox
+// infrastructure failures (ClassInfra) count against MaxAttempts so a
+// truly broken sandbox doesn't get free retries forever. Slice 2e will
+// reduce the rate, but until then ClassInfra must consume the budget.
+func TestRunner_InfraErrorsCountAgainstBudget(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &classedFailDispatcher{
+		stage: "implement",
+		errs: []string{
+			"image build failed: create buildah pod: pods \"buildah-build-spawn-runtime-codex-x\" already exists",
+			"image build failed: buildah build failed: build pod failed: exit_code=243 reason=Error",
+			"ensure sandbox: generate dockerfile: no language detected",
+		},
+	}
+	if err := New(st, newPassingGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != store.PipelineEscalated {
+		t.Errorf("state = %s; want escalated (3 infra failures should exhaust budget)", got.State)
+	}
+	if disp.calls != 3 {
+		t.Errorf("implement called %d times; want 3 (MaxAttempts, no free retries for Infra)", disp.calls)
+	}
+}
+
+// ----- Slice 3d: bounded escalation auto-retry -----
+
+// TestRunner_TransientCapEscalation_AutoRetries pins the headline
+// behaviour: a pipeline that escalates because of the transient hard
+// cap gets re-queued (backlog stays Queued, run goes Escalated) up to
+// EscalationAutoRetryCap times.
+func TestRunner_TransientCapEscalation_AutoRetries(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	// Use a policy mutator? newRunnerEnv doesn't accept one. Instead
+	// rely on the default policy + a runner Policy override. The
+	// recurring transient → escalate path needs MaxAttempts=3 +
+	// EscalationAutoRetryCap > 0.
+	disp := &classedFailDispatcher{stage: "implement"}
+	// 100 transient errors >> hard cap → escalate by total-attempts.
+	for i := 0; i < 100; i++ {
+		disp.errs = append(disp.errs, "websocket: close 1006 (abnormal closure)")
+	}
+
+	r := New(st, newPassingGates(t), disp, nil)
+	// Inject a Policy that opts into auto-retry.
+	r.Policy = newPolicyMgrWithRetryCap(t, 2)
+
+	var autoRetries int32
+	r.OnAutoRetry = func(_ context.Context, _ *store.PipelineRun, _ *store.BacklogItem) error {
+		atomic.AddInt32(&autoRetries, 1)
+		return nil
+	}
+
+	if err := r.Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	// First run should be escalated (transient cap), but backlog
+	// item should be queued (auto-retried, not human-escalated).
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("getrun: %v", err)
+	}
+	if got.State != store.PipelineEscalated {
+		t.Errorf("run state = %s, want escalated", got.State)
+	}
+	gotItem, err := st.Backlog.Get(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("getbacklog: %v", err)
+	}
+	if gotItem.State != store.BacklogQueued {
+		t.Errorf("backlog state = %s, want queued (auto-retry should not escalate the item)", gotItem.State)
+	}
+	if got := atomic.LoadInt32(&autoRetries); got != 1 {
+		t.Errorf("OnAutoRetry fired %d times, want 1", got)
+	}
+}
+
+// TestRunner_TransientCapEscalation_StopsAtCap pins the second half:
+// after EscalationAutoRetryCap auto-retries already exist, the next
+// transient escalation actually escalates the backlog item.
+func TestRunner_TransientCapEscalation_StopsAtCap(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+
+	// Seed two prior escalated runs so the cap (2) is exhausted. The
+	// pipeline_runs UNIQUE constraint is (backlog_id, attempts), and
+	// newRunnerEnv already seeded a row with attempts=1; use 100/101
+	// here to dodge that without bumping the live run's attempts.
+	ctx := context.Background()
+	for i, attempts := range []int{100, 101} {
+		prior := &store.PipelineRun{
+			ID:        fmt.Sprintf("PIPE-%s-prior-%d", item.ID, i),
+			BacklogID: item.ID,
+			Template:  "mills-default-pipeline",
+			State:     store.PipelineEscalated,
+			Attempts:  attempts,
+			StartedAt: run.StartedAt.Add(-time.Duration(i+1) * time.Hour),
+		}
+		if err := st.Pipeline.PutRun(ctx, prior); err != nil {
+			t.Fatalf("seed prior %d (attempts=%d): %v", i, attempts, err)
+		}
+	}
+
+	disp := &classedFailDispatcher{stage: "implement"}
+	for i := 0; i < 100; i++ {
+		disp.errs = append(disp.errs, "websocket: close 1006")
+	}
+	r := New(st, newPassingGates(t), disp, nil)
+	r.Policy = newPolicyMgrWithRetryCap(t, 2)
+
+	if err := r.Drive(ctx, run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	gotItem, err := st.Backlog.Get(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("getbacklog: %v", err)
+	}
+	if gotItem.State != store.BacklogEscalated {
+		t.Errorf("backlog state = %s, want escalated (cap of 2 exhausted)", gotItem.State)
+	}
+}
+
+// TestRunner_CodeClassEscalation_DoesNotAutoRetry: even with cap > 0,
+// a real code-class failure (test fail, build fail, etc.) escalates
+// to human — auto-retry is only for transient-cap escalations.
+func TestRunner_CodeClassEscalation_DoesNotAutoRetry(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &classedFailDispatcher{stage: "implement", errs: []string{
+		"go test FAIL: TestFoo not equal",
+		"go test FAIL: TestFoo not equal",
+		"go test FAIL: TestFoo not equal",
+	}}
+	r := New(st, newPassingGates(t), disp, nil)
+	r.Policy = newPolicyMgrWithRetryCap(t, 5) // generous cap, irrelevant for code-class
+
+	var autoRetries int32
+	r.OnAutoRetry = func(_ context.Context, _ *store.PipelineRun, _ *store.BacklogItem) error {
+		atomic.AddInt32(&autoRetries, 1)
+		return nil
+	}
+
+	if err := r.Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	gotItem, _ := st.Backlog.Get(context.Background(), item.ID)
+	if gotItem.State != store.BacklogEscalated {
+		t.Errorf("backlog state = %s, want escalated (code-class should not auto-retry)", gotItem.State)
+	}
+	if got := atomic.LoadInt32(&autoRetries); got != 0 {
+		t.Errorf("OnAutoRetry fired %d times for code-class, want 0", got)
+	}
+}
+
+func TestIsTransientEscalationReason(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"stage implement errored after 8 total attempts (cap 8) [class=transient]: websocket close", true},
+		{"stage implement errored after 6 total attempts (cap 6) [class=transient_quota]: 429", true},
+		{"stage implement errored after 3 attempts [class=code]: go test FAIL", false},
+		{"stage tests errored after 3 attempts [class=infra]: buildah pod conflict", false},
+		{"gate diff_size failed; implement exceeded 3 attempts", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isTransientEscalationReason(tc.in); got != tc.want {
+			t.Errorf("isTransientEscalationReason(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// newPolicyMgrWithRetryCap builds a real PolicyManager whose policy
+// has EscalationAutoRetryCap set. We use a tmpdir + YAML file because
+// PolicyManager is fsnotify-driven and there's no public constructor
+// that takes a *Policy directly. The Validate() golden version field
+// requires version >= 1; we use 1 to keep the fixture minimal.
+func newPolicyMgrWithRetryCap(t *testing.T, cap int) *mills.PolicyManager {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	body := fmt.Sprintf(`version: 1
+enabled: true
+budgets:
+  council:  { max_usd_per_run: 1, max_usd_per_day: 1 }
+  pipeline: { max_usd_per_run: 1, max_usd_per_day: 1 }
+pipeline:
+  retry:
+    max_attempts: 3
+    cooldown_seconds: 0
+    escalation_auto_retry_cap: %d
+`, cap)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	pm, err := mills.NewPolicyManager(context.Background(), path, mills.PolicyManagerOptions{SkipWatch: true})
+	if err != nil {
+		t.Fatalf("policy mgr: %v", err)
+	}
+	t.Cleanup(func() { _ = pm.Close() })
+	return pm
 }

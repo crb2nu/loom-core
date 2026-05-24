@@ -140,6 +140,12 @@ type createMRBody struct {
 	Description        string `json:"description,omitempty"`
 	RemoveSourceBranch bool   `json:"remove_source_branch"`
 	Squash             bool   `json:"squash"`
+	// MWPS, when true, asks GitLab to auto-merge the MR once its head
+	// pipeline succeeds. Belt-and-suspenders against operator downtime —
+	// Mills still polls + calls Merge separately, but GitLab will close
+	// the MR even if the operator restarts. Per-item gated upstream by
+	// GitLabWorker.computeAutoMerge.
+	MergeWhenPipelineSucceeds bool `json:"merge_when_pipeline_succeeds,omitempty"`
 }
 
 type mrResponse struct {
@@ -159,12 +165,13 @@ type mrHeadPipe struct {
 // CreateMR implements pipeline.GitLabClient.
 func (c *GitLabClient) CreateMR(ctx context.Context, req pipeline.CreateMRRequest) (pipeline.CreateMRResponse, error) {
 	body := createMRBody{
-		SourceBranch:       req.SourceBranch,
-		TargetBranch:       req.TargetBranch,
-		Title:              req.Title,
-		Description:        req.Description,
-		RemoveSourceBranch: true,
-		Squash:             false,
+		SourceBranch:              req.SourceBranch,
+		TargetBranch:              req.TargetBranch,
+		Title:                     req.Title,
+		Description:               req.Description,
+		RemoveSourceBranch:        true,
+		Squash:                    false,
+		MergeWhenPipelineSucceeds: req.AutoMerge,
 	}
 	var got mrResponse
 	path := fmt.Sprintf("/projects/%s/merge_requests", c.projectPath())
@@ -314,4 +321,52 @@ func (c *GitLabClient) CreateIssue(ctx context.Context, req pipeline.IssueReques
 		return pipeline.IssueResponse{}, err
 	}
 	return pipeline.IssueResponse{IID: got.IID, URL: got.WebURL}, nil
+}
+
+// ListIssuesOpts filters a ListIssues call. Empty fields are omitted; an
+// empty Labels slice does NOT filter (matches all).
+type ListIssuesOpts struct {
+	Labels  []string // ANDed (GitLab requires comma-separated)
+	State   string   // "opened" | "closed" | "" (all)
+	PerPage int      // 1..100; defaults to 20 at the GitLab side
+}
+
+// IssueListItem is the subset of GitLab's issue response the importer needs.
+// Fields not consumed downstream are omitted from the struct (JSON decoder
+// ignores unknown keys); add fields explicitly as future intake needs grow.
+type IssueListItem struct {
+	IID         int64    `json:"iid"`
+	ProjectID   int64    `json:"project_id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Labels      []string `json:"labels"`
+	State       string   `json:"state"`
+	WebURL      string   `json:"web_url"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
+}
+
+// ListIssues returns issues for the configured project, filtered by opts.
+// Scope is intentionally single-project (matches GitLabConfig.Project);
+// multi-project intake is a future-Slice concern.
+func (c *GitLabClient) ListIssues(ctx context.Context, opts ListIssuesOpts) ([]IssueListItem, error) {
+	q := url.Values{}
+	if len(opts.Labels) > 0 {
+		q.Set("labels", strings.Join(opts.Labels, ","))
+	}
+	if opts.State != "" {
+		q.Set("state", opts.State)
+	}
+	if opts.PerPage > 0 {
+		q.Set("per_page", strconv.Itoa(opts.PerPage))
+	}
+	path := fmt.Sprintf("/projects/%s/issues", c.projectPath())
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var got []IssueListItem
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &got); err != nil {
+		return nil, err
+	}
+	return got, nil
 }

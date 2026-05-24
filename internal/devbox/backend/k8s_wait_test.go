@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
@@ -218,5 +219,58 @@ func TestWaitForPodDoneReturnsWhenPodDeleted(t *testing.T) {
 	err := <-errCh
 	if err == nil || !strings.Contains(err.Error(), "deleted before completion") {
 		t.Fatalf("waitForPodDone error = %v, want deleted pod error", err)
+	}
+}
+
+// ----- Slice 2e: pod-already-exists eviction race -----
+
+// TestWaitForPodGone_NotFoundResolvesImmediately pins the fast path:
+// if the pod doesn't exist when waitForPodGone is called, return
+// immediately on the first Get (which returns NotFound).
+func TestWaitForPodGone_NotFoundResolvesImmediately(t *testing.T) {
+	k := testK8sBackend()
+	k.clientset = k8sfake.NewSimpleClientset()
+	if err := k.waitForPodGone(context.Background(), "buildah-build-x", 2*time.Second); err != nil {
+		t.Fatalf("waitForPodGone(absent): %v", err)
+	}
+}
+
+// TestWaitForPodGone_TimesOutWhenPodPersists pins the slow path: a pod
+// that won't go away surfaces a timeout error, so the caller can fail
+// the build (or fall through to the 409 belt-and-suspenders path).
+func TestWaitForPodGone_TimesOutWhenPodPersists(t *testing.T) {
+	k := testK8sBackend()
+	k.clientset = k8sfake.NewSimpleClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "buildah-build-stuck", Namespace: k.namespace},
+		},
+	)
+	err := k.waitForPodGone(context.Background(), "buildah-build-stuck", 400*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "still present") {
+		t.Errorf("error = %q, want 'still present' substring", err)
+	}
+}
+
+// TestEvictPod_DeletesAndWaits exercises the combined Delete +
+// waitForPodGone path used by runBuildPod before each Create. With the
+// fake clientset, Delete removes the pod synchronously and the next
+// Get is NotFound — i.e. the happy "pod terminates promptly" case.
+func TestEvictPod_DeletesAndWaits(t *testing.T) {
+	k := testK8sBackend()
+	k.clientset = k8sfake.NewSimpleClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "buildah-build-x", Namespace: k.namespace},
+		},
+	)
+	if err := k.evictPod(context.Background(), "buildah-build-x", 2*time.Second); err != nil {
+		t.Fatalf("evictPod: %v", err)
+	}
+	// Verify it's actually gone via direct Get.
+	_, err := k.clientset.CoreV1().Pods(k.namespace).Get(context.Background(), "buildah-build-x", metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("pod still present after evictPod: %v", err)
 	}
 }
