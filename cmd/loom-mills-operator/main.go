@@ -32,6 +32,8 @@ import (
 	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/mills/eval"
 	"github.com/crb2nu/loom/pkg/mills/gates"
+	"github.com/crb2nu/loom/pkg/mills/intake"
+	"github.com/crb2nu/loom/pkg/mills/notify"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 	"github.com/crb2nu/loom/pkg/mills/runner"
 	"github.com/crb2nu/loom/pkg/mills/squads"
@@ -199,7 +201,7 @@ func run(cfg Config) error {
 	// Worker dispatcher: real clients where configured, NoOpDispatcher
 	// for stages whose backing service isn't wired yet. The operator
 	// logs each gap so it's obvious which surfaces are stub vs production.
-	dispatcher, realStages := buildDispatcher(cfg, flexClient, hubClient, st, logger)
+	dispatcher, realStages := buildDispatcher(cfg, flexClient, hubClient, st, logger, autoMergeFor(pm))
 	capabilities.DispatcherRealStages = realStages
 	capabilities.BranchContractReady = true
 	capabilities.BranchContractSource = "pkg/mills/pipeline/branch_contract.go"
@@ -219,6 +221,26 @@ func run(cfg Config) error {
 	squadRecorder.Logger = logger
 	mergedHooks := []pipelineMergedHook{attributor.OnMerged, squadRecorder.OnMerged}
 
+	// Webhook notifier (Slice 3a of plan 43). When policy.notify.webhook_url
+	// is set, a Slack/Discord-compatible JSON POST fires on every merge.
+	// Disabled by default; hot-reloads via PolicyManager fsnotify.
+	if notifyHook := buildNotifyHook(pm, st, logger); notifyHook != nil && notifyHook.Enabled() {
+		mergedHooks = append(mergedHooks, notifyHook.OnMerged)
+		logger.Info("notify webhook hook enabled")
+	}
+
+	// Tick-on-merge (Slice 3b of plan 43). After a merge lands the
+	// scheduler picks up the next backlog item within ~1s instead of
+	// waiting up to 60s for the regularly-scheduled tick. The wire-up
+	// happens here as a closure because the *mills.Scheduler is
+	// created later in this function; the closure captures the local
+	// var by reference and the var is assigned after NewScheduler.
+	var schedulerRef *mills.Scheduler
+	mergedHooks = append(mergedHooks, func(_ context.Context, _ *store.PipelineRun, _ *store.BacklogItem) error {
+		schedulerRef.KickNow()
+		return nil
+	})
+
 	// Audit subsystem (Phase 3). Activates only when FlexInfer is
 	// configured AND the operator can reach the canonical store +
 	// council runner. Without it the audit endpoints serve canonical
@@ -233,6 +255,15 @@ func run(cfg Config) error {
 		logger.Info("audit triggers disabled (FLEXINFER_PROXY_URL or council runner missing)")
 	}
 	pipelineRunner.OnMerged = chainPipelineMerged(mergedHooks...)
+	// Slice 3d: when maybeAutoRetry converts a transient-cap
+	// escalation into a re-queue, kick the scheduler so the new run
+	// starts within ~1s instead of waiting for the next tick.
+	pipelineRunner.OnAutoRetry = func(_ context.Context, _ *store.PipelineRun, _ *store.BacklogItem) error {
+		if schedulerRef != nil {
+			schedulerRef.KickNow()
+		}
+		return nil
+	}
 	op.withAudit(auditDispatcher, auditWorker, auditTriggers, auditPolicy)
 
 	// Escalator: GitLab for issues, MCP hub for handoff. Either may be
@@ -347,6 +378,8 @@ func run(cfg Config) error {
 	scheduler := mills.NewScheduler(reconciler)
 	scheduler.Logger = logger
 	scheduler.KPIRecorder = kpiWriter
+	// Bind the tick-on-merge closure now that the scheduler exists.
+	schedulerRef = scheduler
 
 	// Eval Loop C — weekly cross-run consistency check (default Sunday
 	// 06:00 UTC). Runs alongside the reconciler scheduler in the same
@@ -381,6 +414,21 @@ func run(cfg Config) error {
 	g.Go(func() error { return scheduler.Run(gctx) })
 	g.Go(func() error { return crossRunSched.Run(gctx) })
 	g.Go(func() error { return councilSched.Run(gctx) })
+
+	// GitLab issue importer (Slice 1a of plan 43). Opt-in via
+	// policy.intake.gitlab.enabled: true. No-op without a configured
+	// GitLab client.
+	if gitlabImporter := buildGitLabImporter(pm, gitlabClient, st, logger); gitlabImporter != nil {
+		g.Go(func() error { return gitlabImporter.Run(gctx) })
+	}
+
+	// Stale-canary GC (plan 43 follow-up to Slice 3d). Sweeps escalated
+	// canary backlog items older than StaleAfterHours so they stop
+	// blocking new mills-canary enqueues. Opt-in via
+	// policy.intake.canary_gc.enabled.
+	if canaryGC := buildCanaryGC(pm, st, logger); canaryGC != nil {
+		g.Go(func() error { return canaryGC.Run(gctx) })
+	}
 	if hubClient != nil {
 		g.Go(func() error {
 			runOperatorSessionMaintainer(gctx, hubClient, operatorSession, op, logger, 30*time.Second)
@@ -584,6 +632,108 @@ func buildGitLabClient(cfg Config, logger *slog.Logger) *clients.GitLabClient {
 	return c
 }
 
+// buildNotifyHook returns a configured webhook hook when policy
+// has notify.webhook_url set. Returns nil otherwise (the hook chain
+// silently skips a nil hook). PolicyManager fsnotify makes the URL
+// hot-reloadable; the hook reads cfg by value at construction time so
+// a URL change requires an operator restart for now — flagged in plan
+// 43 as a follow-up if it bites.
+func buildNotifyHook(pm *mills.PolicyManager, st *store.Store, logger *slog.Logger) *notify.WebhookHook {
+	pol := pm.Current()
+	if pol == nil {
+		return nil
+	}
+	if strings.TrimSpace(pol.Notify.WebhookURL) == "" {
+		return nil
+	}
+	cfg := notify.Config{
+		URL:       pol.Notify.WebhookURL,
+		MRBaseURL: pol.Notify.MRBaseURL,
+	}
+	if pol.Notify.WebhookTimeoutSec > 0 {
+		cfg.Timeout = time.Duration(pol.Notify.WebhookTimeoutSec) * time.Second
+	}
+	return notify.New(cfg, st.Pipeline, nil, logger)
+}
+
+// autoMergeFor returns the callback the GitLabWorker uses to decide
+// whether to set merge_when_pipeline_succeeds on a new MR. Precedence:
+// item.Policy.AutoMerge (explicit per-item opt-in, set by importer or
+// council) OR policy.LabelOverrideFor(item.Labels).AutoMerge (per-label
+// override from the policy YAML). Live policy is read on every call so
+// the hot-reloadable YAML takes effect without an operator restart.
+func autoMergeFor(pm *mills.PolicyManager) func(pipeline.JobContext) bool {
+	return func(jc pipeline.JobContext) bool {
+		if jc.Item == nil {
+			return false
+		}
+		if jc.Item.Policy.AutoMerge {
+			return true
+		}
+		pol := pm.Current()
+		if pol == nil {
+			return false
+		}
+		if ov, ok := pol.LabelOverrideFor(jc.Item.Labels); ok && ov.AutoMerge {
+			return true
+		}
+		return false
+	}
+}
+
+// buildCanaryGC returns a configured stale-canary GC when policy
+// has intake.canary_gc.enabled = true. Returns nil otherwise.
+func buildCanaryGC(pm *mills.PolicyManager, st *store.Store, logger *slog.Logger) *intake.CanaryGC {
+	pol := pm.Current()
+	if pol == nil || !pol.Intake.CanaryGC.Enabled {
+		return nil
+	}
+	cfg := intake.CanaryGCConfig{DryRun: pol.Intake.CanaryGC.DryRun}
+	if h := pol.Intake.CanaryGC.StaleAfterHours; h > 0 {
+		cfg.StaleAfter = time.Duration(h) * time.Hour
+	}
+	if m := pol.Intake.CanaryGC.IntervalMinutes; m > 0 {
+		cfg.Interval = time.Duration(m) * time.Minute
+	}
+	logger.Info("canary GC enabled",
+		"stale_after_hours", pol.Intake.CanaryGC.StaleAfterHours,
+		"interval_minutes", pol.Intake.CanaryGC.IntervalMinutes,
+		"dry_run", cfg.DryRun,
+	)
+	return intake.NewCanaryGC(st.Backlog, cfg, logger)
+}
+
+// buildGitLabImporter returns a configured importer when both a GitLab
+// client exists AND policy.intake.gitlab.enabled is true. Returns nil
+// (no error) when either is missing so the operator boots without it.
+// Logs at info on enable + warn on the disabled-but-could-be-on case so
+// the gating decision is visible in the pod logs.
+func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, st *store.Store, logger *slog.Logger) *intake.GitLabImporter {
+	pol := pm.Current()
+	if !pol.Intake.GitLab.Enabled {
+		return nil
+	}
+	if gitlab == nil {
+		logger.Warn("gitlab intake enabled in policy but GitLab client unconfigured; importer disabled")
+		return nil
+	}
+	cfg := intake.GitLabImporterConfig{
+		EligibleLabel: pol.Intake.GitLab.EligibleLabel,
+	}
+	if secs := pol.Intake.GitLab.PollIntervalSeconds; secs > 0 {
+		cfg.PollInterval = time.Duration(secs) * time.Second
+	}
+	if p := pol.Intake.GitLab.DefaultPriority; p != "" {
+		cfg.DefaultPriority = store.Priority(p)
+	}
+	logger.Info("gitlab importer enabled",
+		"eligible_label", cfg.EligibleLabel,
+		"poll_interval_seconds", pol.Intake.GitLab.PollIntervalSeconds,
+		"default_priority", pol.Intake.GitLab.DefaultPriority,
+	)
+	return intake.NewGitLabImporter(gitlab, st.Backlog, cfg, logger)
+}
+
 // buildDispatcher wires the per-stage worker dispatcher. Real clients
 // are used where configured; stages whose backing service isn't bridged
 // fall back to the NoOp output so the runner still drives the DAG to
@@ -599,7 +749,7 @@ func buildGitLabClient(cfg Config, logger *slog.Logger) *clients.GitLabClient {
 //   - GitLabWorker (mr/ci_watch/merge/cleanup): GitLab REST API
 //   - DevboxWorker (tests): mcp-devbox via MCP hub
 //   - SpawnWorker (plan_slice/implement/pr_self_review): HUD mobile API
-func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger) (pipeline.WorkerDispatcher, map[string]bool) {
+func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger, autoMerge func(pipeline.JobContext) bool) (pipeline.WorkerDispatcher, map[string]bool) {
 	noop := &pipeline.NoOpDispatcher{}
 	gitlab := buildGitLabClient(cfg, logger)
 	spawn := buildHUDSpawnClient(cfg, logger)
@@ -623,7 +773,7 @@ func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCP
 		logger.Warn("research stage stub: NoOpDispatcher (FLEXINFER_PROXY_URL unset)")
 	}
 	if gitlab != nil {
-		gw := &pipeline.GitLabWorker{Client: gitlab}
+		gw := &pipeline.GitLabWorker{Client: gitlab, AutoMergeFor: autoMerge}
 		routes["mr"] = gw
 		routes["ci_watch"] = gw
 		routes["merge"] = gw

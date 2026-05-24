@@ -209,7 +209,13 @@ type Runner struct {
 	// produces exactly one pipeline_outcome eval row. Errors are logged
 	// but do not undo the state transition.
 	OnMerged func(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem) error
-	active   sync.Map
+	// OnAutoRetry (Slice 3d) is invoked after a transient-cap
+	// escalation is converted into an auto-retry (run escalated, item
+	// kept queued). The operator wires this to scheduler.KickNow so
+	// the new pipeline_run dispatches within ~1s instead of waiting
+	// for the next scheduled reconciler tick.
+	OnAutoRetry func(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem) error
+	active      sync.Map
 	// CrossRepoIntegrator, when set, switches the runner into the
 	// cross-repo path for any backlog item that has an open
 	// cross_repo_run row. Unset means single-repo behaviour for every
@@ -310,6 +316,15 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 	if maxAttempts <= 0 {
 		maxAttempts = 3
 	}
+	// transientRetryCap is the *extra* free retries allowed for
+	// Transient + TransientQuota error classes on top of MaxAttempts.
+	// Hard cap on total attempts is maxAttempts + transientRetryCap so
+	// a permanent transient (e.g. flexinfer down for hours) escalates
+	// instead of looping forever.
+	transientRetryCap := policy.Pipeline.Retry.TransientRetryCap
+	if transientRetryCap <= 0 {
+		transientRetryCap = 5
+	}
 
 	// attempts tracks per-stage attempt count for the live Drive call.
 	// On resume we seed it from the persisted stage_results so retry
@@ -318,6 +333,14 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 	if err != nil {
 		return fmt.Errorf("pipeline: seed attempts: %w", err)
 	}
+	// effectiveAttempts counts only "real" failures (Code + Infra) toward
+	// the MaxAttempts budget. Free transient retries bump `attempts`
+	// (for stage_results.attempt monotonicity) but not this counter.
+	// Reset across resumes by design: simpler than persisting error
+	// class per attempt, and operator restarts are rare enough that
+	// re-burning a free retry budget after a restart is acceptable
+	// (Slice 2c trade-off, documented in error_class.go).
+	effectiveAttempts := map[string]int{}
 
 	for i := startIdx; i < len(r.Stages); i++ {
 		stage := r.Stages[i]
@@ -367,9 +390,42 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				r.logger().Info("pipeline drive stopped; stage attempt already has an accepted spawn", "run", run.ID, "stage", stage.ID, "attempt", attempt)
 				return nil
 			}
-			if attempts[stage.ID] >= maxAttempts {
-				return r.escalateWithItem(ctx, run, item, fmt.Sprintf("stage %s errored after %d attempts: %v", stage.ID, attempts[stage.ID], err))
+
+			// Slice 2c: classify the failure so transient flakes
+			// (k8s pod GC, MCP transport drop, flexinfer timeout)
+			// don't burn the MaxAttempts budget meant for real-code
+			// failures. Kill-test (2026-05-24) showed ~62% of
+			// failing stage_results were transient.
+			cls := Classify(err)
+			mills.PipelineStageErrorClassTotal.WithLabelValues(stage.ID, string(cls)).Inc()
+			if !IsFreeRetry(cls) {
+				effectiveAttempts[stage.ID]++
 			}
+
+			// Hard cap on total attempts (free + budgeted) so a
+			// permanent transient can't loop forever.
+			if attempts[stage.ID] >= maxAttempts+transientRetryCap {
+				return r.escalateWithItem(ctx, run, item, fmt.Sprintf("stage %s errored after %d total attempts (cap %d) [class=%s]: %v", stage.ID, attempts[stage.ID], maxAttempts+transientRetryCap, cls, err))
+			}
+			// Budget cap on real (Code + Infra) failures.
+			if effectiveAttempts[stage.ID] >= maxAttempts {
+				return r.escalateWithItem(ctx, run, item, fmt.Sprintf("stage %s errored after %d attempts [class=%s]: %v", stage.ID, effectiveAttempts[stage.ID], cls, err))
+			}
+
+			// Backoff for quota errors so we don't immediately
+			// re-hit the rate limit on the next dispatch.
+			if cls == ClassTransientQuota {
+				backoff := quotaBackoff(attempts[stage.ID])
+				r.logger().Info("pipeline retry backoff", "run", run.ID, "stage", stage.ID, "class", cls, "backoff", backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			} else {
+				r.logger().Info("pipeline retry", "run", run.ID, "stage", stage.ID, "class", cls, "attempt", attempts[stage.ID], "effective_attempts", effectiveAttempts[stage.ID])
+			}
+
 			// Retry the same stage by stepping back one (loop will ++).
 			i--
 			continue
@@ -773,7 +829,17 @@ func (r *Runner) markDone(ctx context.Context, run *store.PipelineRun, item *sto
 // and invokes the optional EscalationHandler for issue+handoff
 // publication. Handler failures are logged but don't undo the state
 // transition.
+//
+// Slice 3d: when the reason indicates a transient-class hard-cap hit
+// AND the backlog item has been auto-retried fewer than
+// policy.Pipeline.Retry.EscalationAutoRetryCap times, divert to
+// maybeAutoRetry which marks this run escalated but keeps the backlog
+// queued so the reconciler spins up a fresh pipeline_run on the next
+// tick (kicked immediately via OnAutoRetry).
 func (r *Runner) escalateWithItem(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, reason string) error {
+	if r.maybeAutoRetry(ctx, run, item, reason) {
+		return nil
+	}
 	t := r.now()
 	run.State = store.PipelineEscalated
 	run.EndedAt = &t
@@ -798,6 +864,104 @@ func (r *Runner) escalateWithItem(ctx context.Context, run *store.PipelineRun, i
 		}
 	}
 	return nil
+}
+
+// maybeAutoRetry implements Slice 3d's bounded escalation auto-retry.
+// Returns true (handled) when the escalation has been diverted into a
+// re-queue. Caller must NOT proceed with the normal escalation path
+// when this returns true. Returns false when the escalation is a
+// real failure (code / infra / non-transient) that needs human eyes.
+func (r *Runner) maybeAutoRetry(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, reason string) bool {
+	if item == nil {
+		return false
+	}
+	if !isTransientEscalationReason(reason) {
+		return false
+	}
+	policy := r.policy()
+	cap := policy.Pipeline.Retry.EscalationAutoRetryCap
+	if cap <= 0 {
+		return false
+	}
+	// Count prior escalated pipeline_runs for this backlog. The
+	// current run hasn't been persisted as escalated yet, so prior
+	// count + 1 is what we'd be at if this one escalated.
+	priorEscalated, err := r.countEscalatedRuns(ctx, item.ID)
+	if err != nil {
+		r.logger().Warn("auto-retry: count escalated failed; falling through to escalation",
+			"backlog", item.ID, "err", err)
+		return false
+	}
+	if priorEscalated >= cap {
+		r.logger().Info("auto-retry cap exhausted; escalating",
+			"backlog", item.ID, "prior_escalated", priorEscalated, "cap", cap)
+		return false
+	}
+
+	// Convert: mark this run escalated, but leave the backlog item
+	// queued so the reconciler creates a fresh pipeline_run next tick.
+	t := r.now()
+	run.State = store.PipelineEscalated
+	run.EndedAt = &t
+	if err := r.Store.Pipeline.PutRun(ctx, run); err != nil {
+		r.logger().Warn("auto-retry: persist run escalated failed; falling through to escalation",
+			"run", run.ID, "err", err)
+		return false
+	}
+	// Item stays in store.BacklogQueued. No-op write to keep
+	// updated_at fresh.
+	item.State = store.BacklogQueued
+	if err := r.Store.Backlog.Put(ctx, item); err != nil {
+		r.logger().Warn("auto-retry: persist backlog queued failed; will rely on next tick anyway",
+			"backlog", item.ID, "err", err)
+	}
+	mills.PipelineRunsTotal.WithLabelValues(string(store.PipelineEscalated)).Inc()
+	mills.PipelineCostUSDTotal.WithLabelValues(string(store.PipelineEscalated)).Add(run.CostUSD)
+	mills.EscalationsTotal.WithLabelValues("auto_retried").Inc()
+	r.event(ctx, "pipeline.run.auto_retried", "ok", map[string]any{
+		"run":             run.ID,
+		"backlog":         item.ID,
+		"reason":          reason,
+		"prior_escalated": priorEscalated,
+		"cap":             cap,
+	})
+	r.logger().Info("pipeline auto-retried transient escalation",
+		"run", run.ID, "backlog", item.ID,
+		"prior_escalated", priorEscalated, "cap", cap, "reason", reason)
+	if r.OnAutoRetry != nil {
+		if err := r.OnAutoRetry(ctx, run, item); err != nil {
+			r.logger().Warn("pipeline OnAutoRetry hook failed",
+				"run", run.ID, "err", err)
+		}
+	}
+	return true
+}
+
+// countEscalatedRuns counts pipeline_runs in PipelineEscalated state
+// for the given backlog id. Used by maybeAutoRetry to enforce the
+// EscalationAutoRetryCap. Returns 0 + nil when ListByBacklog is empty.
+func (r *Runner) countEscalatedRuns(ctx context.Context, backlogID string) (int, error) {
+	runs, err := r.Store.Pipeline.ListByBacklog(ctx, backlogID)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, pr := range runs {
+		if pr.State == store.PipelineEscalated {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// isTransientEscalationReason matches the reason strings emitted by
+// the Slice 2c retry loop when the *transient* hard cap is hit. We do
+// NOT auto-retry when the reason names ClassCode or ClassInfra — those
+// are real failures that retry can't fix.
+func isTransientEscalationReason(reason string) bool {
+	lower := strings.ToLower(reason)
+	return strings.Contains(lower, "[class=transient]") ||
+		strings.Contains(lower, "[class=transient_quota]")
 }
 
 // mergeArtifacts flattens a StageOutput into the JSON map persisted into

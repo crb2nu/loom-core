@@ -457,12 +457,21 @@ type GitLabClient interface {
 }
 
 // CreateMRRequest is the bundle a `mr` stage ships.
+//
+// AutoMerge maps to GitLab's merge_when_pipeline_succeeds flag. When
+// true, GitLab merges the MR autonomously once the head pipeline
+// succeeds — even if the Mills operator has crashed/restarted in the
+// meantime. Mills still polls the pipeline + calls Merge separately as
+// a fast-path, so AutoMerge is belt-and-suspenders against operator
+// downtime rather than a replacement for the existing merge flow.
+// Per-item gating: see GitLabWorker.AutoMergeFor.
 type CreateMRRequest struct {
 	BacklogID    string
 	SourceBranch string
 	TargetBranch string
 	Title        string
 	Description  string
+	AutoMerge    bool
 	Env          map[string]string
 }
 
@@ -528,6 +537,11 @@ type GitLabWorker struct {
 	// falls back to BranchContractFor; TargetBranch falls back to "main".
 	SourceBranch func(jc JobContext) string
 	TargetBranch func(jc JobContext) string
+	// AutoMergeFor returns whether GitLab's merge_when_pipeline_succeeds
+	// should be set on this item's MR. Operator main wires this to
+	// merge item.Policy.AutoMerge with policy.LabelOverrideFor. Nil
+	// means the worker falls back to jc.Item.Policy.AutoMerge alone.
+	AutoMergeFor func(jc JobContext) bool
 }
 
 // Run satisfies Worker.
@@ -560,6 +574,7 @@ func (w *GitLabWorker) runMR(ctx context.Context, jc JobContext) (StageOutput, e
 		TargetBranch: callOr(w.TargetBranch, jc, "main"),
 		Title:        callOr(w.MRTitle, jc, jc.Item.Title),
 		Description:  callOr(w.MRDescription, jc, ""),
+		AutoMerge:    w.computeAutoMerge(jc),
 		Env:          jc.Env,
 	}
 	resp, err := w.Client.CreateMR(ctx, req)
@@ -642,6 +657,24 @@ func (w *GitLabWorker) runCleanup(ctx context.Context, jc JobContext) (StageOutp
 		CostUSD: resp.CostUSD,
 		LogTail: resp.LogTail,
 	}, nil
+}
+
+// computeAutoMerge resolves whether the MR being created should set
+// GitLab's merge_when_pipeline_succeeds. Precedence:
+//  1. If AutoMergeFor callback is wired, it wins (operator main routes
+//     policy.LabelOverrideFor + item.Policy.AutoMerge through here).
+//  2. Else fall back to the item's own ItemPolicy.AutoMerge.
+//
+// Disabled by default so an operator without explicit opt-in keeps
+// the existing Mills-driven Merge flow without surprise behavior.
+func (w *GitLabWorker) computeAutoMerge(jc JobContext) bool {
+	if w.AutoMergeFor != nil {
+		return w.AutoMergeFor(jc)
+	}
+	if jc.Item == nil {
+		return false
+	}
+	return jc.Item.Policy.AutoMerge
 }
 
 func (w *GitLabWorker) sourceBranch(jc JobContext) string {
