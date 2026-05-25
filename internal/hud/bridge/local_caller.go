@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
@@ -16,8 +17,18 @@ type Dispatch func(ctx context.Context, msg *mcp.Message) (*mcp.Message, error)
 // LocalCaller implements Caller by dispatching JSON-RPC requests directly
 // to the daemon's handleMessage function in-process. No socket, no transport,
 // no circuit breaker — the HUD and daemon share the same process.
+//
+// reqID is a monotonic JSON-RPC id counter. Previously every Call() stamped
+// id=1, which collided in the daemon's shared muxstdio transport whenever
+// two embedded-HUD monitors fanned out to the same upstream MCP server
+// concurrently. The collision triggered `muxstdio: duplicate in-flight id:
+// n:1`, closed the transport, and cascaded /api/agent/heartbeat into 5xx →
+// Cloudflare 502. Unique ids per call eliminate the race at the source;
+// the daemon's reverse-id mapping still translates back to the inbound id
+// before responding to the original caller.
 type LocalCaller struct {
 	dispatch Dispatch
+	reqID    atomic.Int64
 }
 
 // NewLocalCaller creates a LocalCaller that dispatches to the given function.
@@ -39,7 +50,7 @@ func (c *LocalCaller) CallWithTimeout(method string, params any, timeout time.Du
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	req, err := mcp.NewRequest(int64(1), method, params)
+	req, err := mcp.NewRequest(c.reqID.Add(1), method, params)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
