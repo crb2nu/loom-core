@@ -211,6 +211,20 @@ func (p *CodexJSONLParser) handleItemStarted(line []byte) {
 	changed := false
 	switch item.Type {
 	case "command_execution":
+		// Log every shell command codex starts. Without this, headless
+		// debugging of "implement spawn produced no diff" had to rely on
+		// post-mortem git state since the spawn pod is reaped immediately
+		// on completion. The command text is truncated to keep log lines
+		// reasonable while still showing the actual git push / git commit
+		// invocations we care about.
+		cmd := item.Command
+		if len(cmd) > 200 {
+			cmd = cmd[:200] + "...(truncated)"
+		}
+		p.logger.Info("codex item.started: command_execution",
+			"item_id", item.ID,
+			"command", cmd,
+		)
 		p.sink.StartToolCall(item.ID, "Bash", "")
 		changed = true
 	case "mcp_tool_call":
@@ -218,8 +232,15 @@ func (p *CodexJSONLParser) handleItemStarted(line []byte) {
 		if name == "" {
 			name = "unknown"
 		}
+		p.logger.Info("codex item.started: mcp_tool_call",
+			"item_id", item.ID, "tool", name, "server", item.Server)
 		p.sink.StartToolCall(item.ID, name, item.Server)
 		changed = true
+	default:
+		// Surface unhandled item types so the parser doesn't silently drop
+		// events that might explain "codex finished but did nothing".
+		p.logger.Info("codex item.started: other",
+			"item_id", item.ID, "type", item.Type)
 	}
 	if changed {
 		p.emitTelemetryDelta()
@@ -288,6 +309,28 @@ func (p *CodexJSONLParser) handleCommandExecution(item codexItem) {
 		}
 		p.sink.AddError("tool_failure", errMsg)
 	}
+	// Always log the result of a shell command. Without this, a failing
+	// `git push` (auth, branch protected, etc.) inside the spawn pod is
+	// invisible because the pod is reaped on completion. Truncate stderr
+	// so a 5MB compile error doesn't bloat the HUD log.
+	exit := -1
+	if item.ExitCode != nil {
+		exit = *item.ExitCode
+	}
+	stderrTail := errMsg
+	if len(stderrTail) > 400 {
+		stderrTail = stderrTail[:400] + "...(truncated)"
+	}
+	cmd := item.Command
+	if len(cmd) > 200 {
+		cmd = cmd[:200] + "...(truncated)"
+	}
+	p.logger.Info("codex command_execution complete",
+		"item_id", item.ID,
+		"command", cmd,
+		"exit_code", exit,
+		"stderr_tail", stderrTail,
+	)
 	p.sink.CompleteToolCall(item.ID, 0, item.ExitCode, errMsg)
 
 	if p.broadcast != nil {
@@ -303,6 +346,12 @@ func (p *CodexJSONLParser) handleCommandExecution(item codexItem) {
 func (p *CodexJSONLParser) handleFileChange(item codexItem) {
 	for _, ch := range item.Changes {
 		p.sink.AddFileChange(ch.Path, ch.Kind, 0, 0)
+		// One line per actual file modification. Combined with the
+		// command_execution log this makes "codex modified the file but
+		// failed to commit/push" distinguishable from "codex never
+		// touched the file".
+		p.logger.Info("codex file_change",
+			"item_id", item.ID, "path", ch.Path, "kind", ch.Kind)
 	}
 	if p.broadcast != nil {
 		p.broadcast("agent.spawn.file_change", p.agentID, map[string]any{
@@ -367,6 +416,7 @@ func (p *CodexJSONLParser) handleMCPToolCall(item codexItem) {
 // ---------- turn.failed ----------
 
 func (p *CodexJSONLParser) handleTurnFailed() {
+	p.logger.Warn("codex turn.failed")
 	p.sink.AddError("execution", "turn failed")
 	p.emitTelemetryDelta()
 }
@@ -381,6 +431,10 @@ func (p *CodexJSONLParser) handleError(line []byte) {
 		p.logger.Debug("failed to parse error event", "error", err)
 		return
 	}
+	// Codex emits `{"type":"error",…}` for hard failures the agentic loop
+	// gave up on. Log at error so operators can grep `level=ERROR` and
+	// see exactly why a spawn completed without producing work.
+	p.logger.Error("codex error event", "message", ev.Message)
 	p.sink.AddError("fatal", ev.Message)
 	p.emitTelemetryDelta()
 }
