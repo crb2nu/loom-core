@@ -1497,7 +1497,16 @@ servers:
         - weaver__codebase_overview
       env:
         WEAVER_ENABLED: "1"
-        FLEXINFER_URL: "${env:FLEXINFER_URL:-http://litellm.ai.svc.cluster.local:8000}"
+        # In-cluster default. Local users override via env FLEXINFER_URL,
+        # typically https://litellm.flexinfer.ai. K8s deployment injects this
+        # from loom-secrets so the registry default is the local fallback.
+        FLEXINFER_URL: "${env:FLEXINFER_URL:-https://litellm.flexinfer.ai}"
+        # mcp-weaver makes HTTP calls to MCP_HUB_URL/loom/tools and /tools/call
+        # to enumerate and invoke other MCP tools. The K8s deployment sets this
+        # to http://gateway:8080 in-cluster; locally we point at the daemon's
+        # own embedded HUD HTTP listener (default :3333) so the same binary
+        # works under loomd procMgr without extra configuration.
+        MCP_HUB_URL: "${env:MCP_HUB_URL:-http://localhost:3333}"
 
   - name: docker
     categories: [containers, devops]
