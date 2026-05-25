@@ -449,6 +449,15 @@ func (m *FleetMonitor) refresh(force bool) error {
 		}
 	}
 
+	// Track sub-fetch success for Sessions and PresenceList. When either
+	// errors (typically a transient MCP lock-timeout), the join + stale-
+	// session reaper below would either zero out the visible counts or
+	// dispatch false-positive agent_session_end calls. Carrying over those
+	// fields from the previous snapshot keeps the HUD live and avoids
+	// destructive side effects on transient failure.
+	sessionsOK := false
+	presenceOK := false
+
 	// Fetch agent sessions. Session counts and totals are recomputed after
 	// the fleetview.Join below so the stale-session filter can drop zombie
 	// sessions (no fresh heartbeat) from the snapshot in a single pass.
@@ -456,6 +465,7 @@ func (m *FleetMonitor) refresh(force bool) error {
 		m.Logger.Warn("fleet: failed to fetch sessions", "error", err)
 	} else {
 		snap.Sessions = sessions
+		sessionsOK = true
 	}
 
 	// Fetch all tasks.
@@ -516,126 +526,152 @@ func (m *FleetMonitor) refresh(force bool) error {
 		m.Logger.Warn("fleet: failed to fetch presence", "error", err)
 	} else {
 		rawAgents = agents
+		presenceOK = true
 	}
 
-	// Stale-session filter: identify sessions whose backing agent has
-	// not heartbeated past fleetStaleSessionReapAfter, drop them from
-	// the snapshot, and dispatch a background reaper to call
-	// agent_session_end on each. Heartbeat lookup precedence:
-	//   1. raw presence keyed by session_id (most precise),
-	//   2. raw presence keyed by agent_id,
-	//   3. session.StartedAt as a fallback when no presence row exists
-	//      OR the presence row never reported a heartbeat — in either
-	//      case the session has been alive for its entire life without
-	//      any liveness signal, so its own age is the correct
-	//      staleness clock.
-	//
-	// Presence rows with an empty LastHeartbeat are skipped here. Before
-	// this guard, fleetview.AgeSeconds clamped empty/unparseable values
-	// to 0, which seeded the maps with age=0 and made every such session
-	// look freshly heartbeated forever — visible as spawn-* rows stuck
-	// in "active" with HEARTBEAT="---" long after the spawn pod died.
-	heartbeatBySession := make(map[string]int, len(rawAgents))
-	heartbeatByAgent := make(map[string]int, len(rawAgents))
-	for _, p := range rawAgents {
-		if strings.TrimSpace(p.LastHeartbeat) == "" {
-			continue
-		}
-		age := fleetview.AgeSeconds(p.LastHeartbeat, snap.UpdatedAt)
-		if p.SessionID != "" {
-			heartbeatBySession[p.SessionID] = age
-		}
-		if p.AgentID != "" {
-			// Prefer the freshest heartbeat we can find for this
-			// agent when multiple presence rows exist (shouldn't
-			// happen in practice, but the MCP server doesn't enforce
-			// uniqueness for our purposes).
-			if existing, ok := heartbeatByAgent[p.AgentID]; !ok || age < existing {
-				heartbeatByAgent[p.AgentID] = age
+	if sessionsOK && presenceOK {
+		// Stale-session filter: identify sessions whose backing agent has
+		// not heartbeated past fleetStaleSessionReapAfter, drop them from
+		// the snapshot, and dispatch a background reaper to call
+		// agent_session_end on each. Heartbeat lookup precedence:
+		//   1. raw presence keyed by session_id (most precise),
+		//   2. raw presence keyed by agent_id,
+		//   3. session.StartedAt as a fallback when no presence row exists
+		//      OR the presence row never reported a heartbeat — in either
+		//      case the session has been alive for its entire life without
+		//      any liveness signal, so its own age is the correct
+		//      staleness clock.
+		//
+		// Presence rows with an empty LastHeartbeat are skipped here. Before
+		// this guard, fleetview.AgeSeconds clamped empty/unparseable values
+		// to 0, which seeded the maps with age=0 and made every such session
+		// look freshly heartbeated forever — visible as spawn-* rows stuck
+		// in "active" with HEARTBEAT="---" long after the spawn pod died.
+		heartbeatBySession := make(map[string]int, len(rawAgents))
+		heartbeatByAgent := make(map[string]int, len(rawAgents))
+		for _, p := range rawAgents {
+			if strings.TrimSpace(p.LastHeartbeat) == "" {
+				continue
+			}
+			age := fleetview.AgeSeconds(p.LastHeartbeat, snap.UpdatedAt)
+			if p.SessionID != "" {
+				heartbeatBySession[p.SessionID] = age
+			}
+			if p.AgentID != "" {
+				// Prefer the freshest heartbeat we can find for this
+				// agent when multiple presence rows exist (shouldn't
+				// happen in practice, but the MCP server doesn't enforce
+				// uniqueness for our purposes).
+				if existing, ok := heartbeatByAgent[p.AgentID]; !ok || age < existing {
+					heartbeatByAgent[p.AgentID] = age
+				}
 			}
 		}
-	}
-	reapThresholdSeconds := int(fleetStaleSessionReapAfter.Seconds())
-	liveSessions := snap.Sessions[:0]
-	var staleSessions []staleSessionRef
-	for _, s := range snap.Sessions {
-		isActive := s.Status == "active"
-		age, ok := heartbeatBySession[s.ID]
-		if !ok {
-			age, ok = heartbeatByAgent[s.AgentID]
+		reapThresholdSeconds := int(fleetStaleSessionReapAfter.Seconds())
+		liveSessions := snap.Sessions[:0]
+		var staleSessions []staleSessionRef
+		for _, s := range snap.Sessions {
+			isActive := s.Status == "active"
+			age, ok := heartbeatBySession[s.ID]
+			if !ok {
+				age, ok = heartbeatByAgent[s.AgentID]
+			}
+			if !ok {
+				age = fleetview.AgeSeconds(s.StartedAt, snap.UpdatedAt)
+			}
+			if isActive && age >= reapThresholdSeconds {
+				snap.StaleSessions++
+				staleSessions = append(staleSessions, staleSessionRef{
+					SessionID:           s.ID,
+					AgentID:             s.AgentID,
+					HeartbeatAgeSeconds: age,
+				})
+				continue
+			}
+			liveSessions = append(liveSessions, s)
+			if isActive {
+				snap.ActiveSessions++
+			}
+			snap.TotalTokens += s.TotalTokens
 		}
-		if !ok {
-			age = fleetview.AgeSeconds(s.StartedAt, snap.UpdatedAt)
+		snap.Sessions = liveSessions
+		snap.TotalSessions = len(snap.Sessions)
+		if len(staleSessions) > 0 {
+			go m.reapStaleSessions(staleSessions)
 		}
-		if isActive && age >= reapThresholdSeconds {
-			snap.StaleSessions++
-			staleSessions = append(staleSessions, staleSessionRef{
-				SessionID:           s.ID,
-				AgentID:             s.AgentID,
-				HeartbeatAgeSeconds: age,
-			})
-			continue
-		}
-		liveSessions = append(liveSessions, s)
-		if isActive {
-			snap.ActiveSessions++
-		}
-		snap.TotalTokens += s.TotalTokens
-	}
-	snap.Sessions = liveSessions
-	snap.TotalSessions = len(snap.Sessions)
-	if len(staleSessions) > 0 {
-		go m.reapStaleSessions(staleSessions)
-	}
 
-	// Join raw presence against the filtered session list. Sessions
-	// reaped above don't produce synthetic session-only agent rows here,
-	// and presence rows that previously matched a now-stale session
-	// revert to presence-only (and may be picked up by the orphan
-	// reaper on a later refresh if they keep heartbeating without
-	// re-establishing a session).
-	snap.Agents = fleetview.Join(rawAgents, snap.Sessions, snap.UpdatedAt)
+		// Join raw presence against the filtered session list. Sessions
+		// reaped above don't produce synthetic session-only agent rows here,
+		// and presence rows that previously matched a now-stale session
+		// revert to presence-only (and may be picked up by the orphan
+		// reaper on a later refresh if they keep heartbeating without
+		// re-establishing a session).
+		snap.Agents = fleetview.Join(rawAgents, snap.Sessions, snap.UpdatedAt)
 
-	// Live-presence filter: downgrade any active/idle row whose
-	// heartbeat is older than fleetLivePresenceStaleAfter to "offline"
-	// before counting, and likewise downgrade orphan-flagged rows.
-	// The Fleet API ("live agents") and the frontend's live-agent
-	// classification both key off Status, so this is what makes the
-	// counter agree with what the user calls "actually working right
-	// now." Synthetic session-only rows (HasPresence=false) are
-	// exempt: they have no heartbeat clock by construction, and the
-	// stale-session reaper above already covers the "session alive,
-	// no agent" case.
-	livePresenceStaleSeconds := int(fleetLivePresenceStaleAfter.Seconds())
-	var reapCandidates []string
-	for i := range snap.Agents {
-		a := &snap.Agents[i]
-		if a.HasPresence {
-			tooStale := a.HeartbeatAgeSeconds >= livePresenceStaleSeconds
-			if (tooStale || a.IsOrphan) && (a.Status == "active" || a.Status == "idle") {
-				a.Status = "offline"
+		// Live-presence filter: downgrade any active/idle row whose
+		// heartbeat is older than fleetLivePresenceStaleAfter to "offline"
+		// before counting, and likewise downgrade orphan-flagged rows.
+		// The Fleet API ("live agents") and the frontend's live-agent
+		// classification both key off Status, so this is what makes the
+		// counter agree with what the user calls "actually working right
+		// now." Synthetic session-only rows (HasPresence=false) are
+		// exempt: they have no heartbeat clock by construction, and the
+		// stale-session reaper above already covers the "session alive,
+		// no agent" case.
+		livePresenceStaleSeconds := int(fleetLivePresenceStaleAfter.Seconds())
+		var reapCandidates []string
+		for i := range snap.Agents {
+			a := &snap.Agents[i]
+			if a.HasPresence {
+				tooStale := a.HeartbeatAgeSeconds >= livePresenceStaleSeconds
+				if (tooStale || a.IsOrphan) && (a.Status == "active" || a.Status == "idle") {
+					a.Status = "offline"
+				}
+			}
+			switch a.Status {
+			case "active":
+				snap.ActiveAgents++
+			case "idle":
+				snap.IdleAgents++
+			case "offline":
+				snap.OfflineAgents++
+			}
+			if a.IsOrphan {
+				snap.OrphanAgents++
+				if a.OrphanAgeSeconds >= int(fleetOrphanReapAfter.Seconds()) {
+					reapCandidates = append(reapCandidates, a.AgentID)
+				}
 			}
 		}
-		switch a.Status {
-		case "active":
-			snap.ActiveAgents++
-		case "idle":
-			snap.IdleAgents++
-		case "offline":
-			snap.OfflineAgents++
+		// Auto-deregister orphans past the reap threshold. Fire-and-forget so
+		// the fleet refresh path stays non-blocking; failures are retried on
+		// the next refresh. See fleetOrphanReapAfter rationale.
+		if len(reapCandidates) > 0 {
+			go m.reapOrphans(reapCandidates)
 		}
-		if a.IsOrphan {
-			snap.OrphanAgents++
-			if a.OrphanAgeSeconds >= int(fleetOrphanReapAfter.Seconds()) {
-				reapCandidates = append(reapCandidates, a.AgentID)
-			}
-		}
-	}
-	// Auto-deregister orphans past the reap threshold. Fire-and-forget so
-	// the fleet refresh path stays non-blocking; failures are retried on
-	// the next refresh. See fleetOrphanReapAfter rationale.
-	if len(reapCandidates) > 0 {
-		go m.reapOrphans(reapCandidates)
+	} else {
+		// Partial sub-fetch failure: skip the stale-session filter and
+		// the presence/session join because they would otherwise either
+		// zero the visible counters or dispatch false-positive
+		// agent_session_end reaps when one side of the coupled view is
+		// missing. Carry over Sessions/Agents and their derived counts
+		// from the previous snapshot so the HUD shows live data
+		// instead of blank rows on transient MCP timeouts.
+		snap.Sessions = prev.Sessions
+		snap.ActiveSessions = prev.ActiveSessions
+		snap.TotalSessions = prev.TotalSessions
+		snap.TotalTokens = prev.TotalTokens
+		snap.StaleSessions = prev.StaleSessions
+		snap.Agents = prev.Agents
+		snap.ActiveAgents = prev.ActiveAgents
+		snap.IdleAgents = prev.IdleAgents
+		snap.OfflineAgents = prev.OfflineAgents
+		snap.OrphanAgents = prev.OrphanAgents
+		m.Logger.Info("fleet: partial sub-fetch failure; carried over sessions/agents from previous snapshot",
+			"sessions_ok", sessionsOK,
+			"presence_ok", presenceOK,
+			"prev_sessions", len(prev.Sessions),
+			"prev_agents", len(prev.Agents))
 	}
 
 	// Fetch file claims.
