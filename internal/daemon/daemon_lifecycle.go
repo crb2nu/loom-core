@@ -312,6 +312,9 @@ func (d *Daemon) Stop() (err error) {
 		if d.hubPool != nil {
 			d.hubPool.Close()
 		}
+		if d.hubMuxCache != nil {
+			d.hubMuxCache.CloseAll()
+		}
 		if d.hubClient != nil {
 			_ = d.hubClient.Close()
 		}

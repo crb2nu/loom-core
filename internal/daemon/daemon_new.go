@@ -228,6 +228,7 @@ func New(cfg Config) (*Daemon, error) {
 	// Create hub client if hub fallback is enabled
 	var hubClient *mcp.WebSocketClient
 	var hubPool *pool.Pool
+	var hubMuxCache *muxCache
 	if cfg.HubFallback && cfg.HubURL != "" {
 		hubClient = mcp.NewWebSocketClient(mcp.WebSocketConfig{
 			URL:                  cfg.HubURL,
@@ -237,12 +238,30 @@ func New(cfg Config) (*Daemon, error) {
 			ConnectTimeout:       10 * time.Second,
 		})
 		hubMaxIdle, hubMaxOpen, hubIdleTimeout, hubWaitTimeout := fileCfg.Resources.GetHubPoolConfig()
+		hubMuxCache = newMuxCache(logger)
 		hubPool = pool.New(pool.Config{
 			MaxIdle:     hubMaxIdle,
 			MaxOpen:     hubMaxOpen,
 			IdleTimeout: hubIdleTimeout,
 			WaitTimeout: hubWaitTimeout,
-			DialFunc:    hubClient.Dial,
+			DialFunc: func(ctx context.Context, serverName string) (mcp.Transport, error) {
+				// hubClient.Dial → GetConnection returns the SAME cached
+				// *WebSocketTransport for every call with this serverName.
+				// Multiple pool.Conn entries for one server therefore all
+				// read off the same WebSocket; concurrent Send/Recv would
+				// race for responses on the shared wire, surfacing as
+				// `response ID mismatch: sent X, got Y` in the pipeline's
+				// post-execute guard. Wrap the shared transport in one
+				// muxstdio.Transport per server (cached) and hand each
+				// pool.Conn its own perConnTransport shim so id-keyed
+				// Recv routes responses to the right caller.
+				transport, err := hubClient.Dial(ctx, serverName)
+				if err != nil {
+					return nil, err
+				}
+				mux := hubMuxCache.GetOrCreate(serverName, transport)
+				return newPerConnTransport(mux), nil
+			},
 		})
 		logger.Info("hub fallback enabled", "url", cfg.HubURL)
 	}
@@ -354,6 +373,7 @@ func New(cfg Config) (*Daemon, error) {
 		otelRuntimeState:   otelRuntimeState,
 		muxStdio:           muxStdioEnabled,
 		muxCache:           stdioMuxCache,
+		hubMuxCache:        hubMuxCache,
 	}
 
 	// Initialize daemon-wide call concurrency semaphore
