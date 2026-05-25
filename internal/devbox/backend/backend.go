@@ -105,6 +105,17 @@ type StartOpts struct {
 	// ExtraLabels are merged into the pod/container labels after defaults.
 	// Caller-provided keys win over defaults if there is a collision.
 	ExtraLabels map[string]string
+
+	// Branch, when set in git-clone sync mode, is checked out by the
+	// git-clone init container after clone. If the branch exists on
+	// origin it is checked out directly; otherwise it is created from
+	// BaseBranch. Has no effect in tar-pipe or PVC modes.
+	Branch string
+
+	// BaseBranch is the parent branch used to create Branch when Branch
+	// does not yet exist on origin. Defaults to "main" when empty.
+	// Only consulted in git-clone sync mode.
+	BaseBranch string
 }
 
 // Mount describes a bind mount.

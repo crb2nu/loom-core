@@ -646,7 +646,7 @@ func TestGitEnabled(t *testing.T) {
 func TestGitCloneInitContainer(t *testing.T) {
 	k := testK8sBackendGitClone()
 
-	ic := k.gitCloneInitContainer("/workspace/services/loom-core")
+	ic := k.gitCloneInitContainer("/workspace/services/loom-core", gitCloneOpts{})
 	if ic.Name != "git-clone" {
 		t.Fatalf("expected initContainer name 'git-clone', got %q", ic.Name)
 	}
@@ -654,9 +654,9 @@ func TestGitCloneInitContainer(t *testing.T) {
 		t.Fatalf("expected %s image, got %q", defaultGitCloneImage, ic.Image)
 	}
 
-	// Should have GIT_TOKEN env from secret ref
+	// Should have GIT_TOKEN env from secret ref (no SPAWN_BRANCH when opts empty).
 	if len(ic.Env) != 1 || ic.Env[0].Name != "GIT_TOKEN" {
-		t.Fatalf("expected GIT_TOKEN env, got: %#v", ic.Env)
+		t.Fatalf("expected only GIT_TOKEN env, got: %#v", ic.Env)
 	}
 	if ic.Env[0].ValueFrom == nil || ic.Env[0].ValueFrom.SecretKeyRef == nil {
 		t.Fatal("expected GIT_TOKEN from secretKeyRef")
@@ -674,9 +674,65 @@ func TestGitCloneInitContainer(t *testing.T) {
 		t.Fatalf("expected clone dest /workspace/services/loom-core, got: %s", script)
 	}
 
+	// --depth 1 was load-bearing for the no-diff bug: shallow clones
+	// have no merge base for Mills' rubric-input `git diff`. Pin that
+	// the flag stays out.
+	if strings.Contains(script, "--depth") {
+		t.Fatalf("expected full clone (no --depth flag), got: %s", script)
+	}
+
 	// Should mount workspace volume
 	if len(ic.VolumeMounts) != 1 || ic.VolumeMounts[0].MountPath != "/workspace" {
 		t.Fatalf("expected /workspace volume mount, got: %#v", ic.VolumeMounts)
+	}
+}
+
+func TestGitCloneInitContainer_BranchCheckout(t *testing.T) {
+	k := testK8sBackendGitClone()
+
+	ic := k.gitCloneInitContainer("/workspace/services/loom-core", gitCloneOpts{
+		branch:     "mills-canary-fix-test",
+		baseBranch: "main",
+	})
+
+	// SPAWN_BRANCH + SPAWN_BASE_BRANCH must reach the init container as
+	// plain-value env vars so the script's checkout block can resolve.
+	var sawBranch, sawBase bool
+	for _, e := range ic.Env {
+		switch e.Name {
+		case "SPAWN_BRANCH":
+			sawBranch = true
+			if e.Value != "mills-canary-fix-test" {
+				t.Fatalf("SPAWN_BRANCH value=%q, want mills-canary-fix-test", e.Value)
+			}
+		case "SPAWN_BASE_BRANCH":
+			sawBase = true
+			if e.Value != "main" {
+				t.Fatalf("SPAWN_BASE_BRANCH value=%q, want main", e.Value)
+			}
+		}
+	}
+	if !sawBranch {
+		t.Fatalf("expected SPAWN_BRANCH env var, got: %#v", ic.Env)
+	}
+	if !sawBase {
+		t.Fatalf("expected SPAWN_BASE_BRANCH env var, got: %#v", ic.Env)
+	}
+
+	// Script must (a) cd into the clone dest before checkout, (b) check
+	// out existing remote branches, and (c) fall back to creating from
+	// origin/${BASE}. Each of these was missing pre-fix.
+	script := ic.Command[2]
+	for _, needle := range []string{
+		`cd "/workspace/services/loom-core"`,
+		`if [ -n "${SPAWN_BRANCH:-}" ]`,
+		`git ls-remote --exit-code --heads origin "${SPAWN_BRANCH}"`,
+		`git checkout "${SPAWN_BRANCH}"`,
+		`git checkout -b "${SPAWN_BRANCH}" "origin/${BASE}"`,
+	} {
+		if !strings.Contains(script, needle) {
+			t.Fatalf("clone script missing %q, full script:\n%s", needle, script)
+		}
 	}
 }
 

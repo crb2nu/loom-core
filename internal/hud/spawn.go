@@ -549,6 +549,13 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		Network:           true,
 		AgentID:           state.AgentID,
 		ManagedByOverride: spawn.ManagedByValue,
+		// Branch + BaseBranch land in the git-clone init container as
+		// SPAWN_BRANCH / SPAWN_BASE_BRANCH so the pod ends up on the
+		// requested branch. Without this the pod sits on the default
+		// branch and any agent edits silently go to the wrong ref —
+		// the failure mode .loom/119 diagnoses.
+		Branch:     req.Branch,
+		BaseBranch: req.BaseBranch,
 		ExtraLabels: map[string]string{
 			spawn.SpawnIDLabel: spawnID,
 			spawn.AgentIDLabel: state.AgentID,
