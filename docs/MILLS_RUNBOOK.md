@@ -324,6 +324,24 @@ calling GitLab `CreateMR`. Without this, GitLab accepts the MR row
 but it points at a branch with no `head_sha`, and `ci_watch` hangs
 forever waiting for a pipeline that can't exist.
 
+There are TWO push paths (belt-and-suspenders):
+
+1. **Spawn-side push (primary)**: the `implement` stage prompt
+   explicitly instructs the agent to `git push -u origin HEAD` as
+   its final step. The spawn pod has git credentials configured.
+   This is the path that actually fires today because the single-
+   repo SpawnWorker does NOT use Mills' WorktreeAllocator — so
+   the operator doesn't know the worktree path and can't push
+   from outside the pod.
+
+2. **Operator-side push (fallback, currently inert)**: when
+   `jc.Run.WorktreePath` is set, `GitLabWorker.runMR` runs the
+   `clients.GitBranchPusher` before `CreateMR`. This path is
+   exercised in the cross-repo integrator flow where Mills does
+   allocate worktrees explicitly. A future slice should propagate
+   the spawn-side WorkingDir back through SpawnResponse so the
+   fallback also kicks in for single-repo runs.
+
 - Implementation: `pkg/mills/clients/branch_pusher.go`
   (`clients.GitBranchPusher`) shells `git push --force-with-lease -u
   origin HEAD:<branch>` from the run's `WorktreePath`.

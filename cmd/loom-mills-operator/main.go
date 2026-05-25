@@ -862,7 +862,7 @@ func stagePromptFor(stage string) func(jc pipeline.JobContext) string {
 	templates := map[string]string{
 		"plan_slice":     "Plan implementation slices for backlog item %s (%q). Output a numbered list of independent slices with files touched and test strategy per slice.",
 		"research":       "Research backlog item %s (%q). Summarize relevant code paths, prior decisions, test constraints, and rollout risks for the implementation worker.",
-		"implement":      "Implement backlog item %s (%q). Write code + tests in the allocated worktree. Commit with conventional commit format.",
+		"implement":      "Implement backlog item %s (%q). Write code + tests in the allocated worktree. Commit with conventional commit format. As your FINAL step, push the branch with `git push -u origin HEAD` so the downstream `mr` stage can open a real merge request against your commits — without the push, GitLab sees an empty branch and the pipeline hangs.",
 		"pr_self_review": "Review your own diff for backlog item %s (%q) before opening a merge request. Score on the pr_self_review_v1 rubric and fix anything below 0.8.",
 	}
 	tmpl := templates[stage]
