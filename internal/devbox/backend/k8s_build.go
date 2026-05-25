@@ -217,7 +217,7 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, bui
 	buildAndPush := strings.Join(buildSteps, " ")
 
 	workspaceSizeLimit := resource.MustParse("5Gi")
-	workspace := k.workspacePlan(buildContext, &workspaceSizeLimit)
+	workspace := k.workspacePlan(buildContext, gitCloneOpts{}, &workspaceSizeLimit)
 	volumeMounts := append([]corev1.VolumeMount{}, workspace.volumeMounts...)
 	volumeMounts = append(volumeMounts,
 		corev1.VolumeMount{Name: "dockerfile", MountPath: "/buildah-dockerfile", ReadOnly: true},

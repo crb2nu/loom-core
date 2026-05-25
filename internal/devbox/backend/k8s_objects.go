@@ -47,7 +47,10 @@ func (k *K8sBackend) buildPodSpec(opts StartOpts, imageTag string) *corev1.Pod {
 		resources.Limits[corev1.ResourceCPU] = resource.MustParse(fmt.Sprintf("%dm", int(opts.CPUs*1000)))
 	}
 
-	workspace := k.workspacePlan(opts.WorkDir, nil)
+	workspace := k.workspacePlan(opts.WorkDir, gitCloneOpts{
+		branch:     opts.Branch,
+		baseBranch: opts.BaseBranch,
+	}, nil)
 	volumes := []corev1.Volume{workspace.volume}
 	volumeMounts := append([]corev1.VolumeMount{}, workspace.volumeMounts...)
 	initContainers := append([]corev1.Container{}, workspace.initContainers...)
@@ -221,7 +224,17 @@ func (k *K8sBackend) gitEnabled() bool {
 // the workspace emptyDir. The workDir determines which subdirectory receives
 // the clone (e.g., /workspace/services/loom-core → repo "loom-core" cloned
 // into /workspace/services/loom-core/).
-func (k *K8sBackend) gitCloneInitContainer(workDirPath string) corev1.Container {
+//
+// When opts.branch is non-empty, the script checks out that branch after
+// clone (creating it from opts.baseBranch when origin doesn't have it
+// yet). Without this step the pod sits on the default branch and edits
+// land on the wrong ref — which silently breaks Mills' diff capture.
+//
+// We intentionally drop --depth 1 here: a shallow clone has no merge
+// base for `git diff <base>...HEAD` (Mills' rubric-input capture relies
+// on it), and shallow clones make `git push` of a non-default branch
+// need extra unshallow steps. Full history is cheap for these repos.
+func (k *K8sBackend) gitCloneInitContainer(workDirPath string, opts gitCloneOpts) corev1.Container {
 	// Derive project name and clone destination from workDir.
 	// workDir is typically "/workspace/services/<project>" or "/workspace/<project>".
 	cloneDest := workDirPath
@@ -234,8 +247,8 @@ func (k *K8sBackend) gitCloneInitContainer(workDirPath string) corev1.Container 
 	projectName := parts[len(parts)-1]
 	repoURL := strings.TrimSuffix(k.gitBaseURL, "/") + "/" + projectName + ".git"
 
-	// Clone script: shallow clone for speed. Preserve the original URL
-	// scheme (http vs https) so internal HTTP-only registries work.
+	// Preserve the original URL scheme (http vs https) so internal
+	// HTTP-only registries work.
 	scheme := "https"
 	if strings.HasPrefix(repoURL, "http://") {
 		scheme = "http"
@@ -244,31 +257,50 @@ func (k *K8sBackend) gitCloneInitContainer(workDirPath string) corev1.Container 
 	cloneScript := fmt.Sprintf(
 		`set -e
 mkdir -p "$(dirname %q)"
-git clone --depth 1 "%s://token:${GIT_TOKEN}@%s" %q
-echo "git-clone: cloned %s into %s"`,
+git clone "%s://token:${GIT_TOKEN}@%s" %q
+cd %q
+if [ -n "${SPAWN_BRANCH:-}" ]; then
+  BASE="${SPAWN_BASE_BRANCH:-main}"
+  if git ls-remote --exit-code --heads origin "${SPAWN_BRANCH}" >/dev/null 2>&1; then
+    git checkout "${SPAWN_BRANCH}"
+  elif git ls-remote --exit-code --heads origin "${BASE}" >/dev/null 2>&1; then
+    git checkout -b "${SPAWN_BRANCH}" "origin/${BASE}"
+  else
+    git checkout -b "${SPAWN_BRANCH}"
+  fi
+fi
+echo "git-clone: ready %s on $(git rev-parse --abbrev-ref HEAD)"`,
 		cloneDest,
 		scheme,
 		hostAndPath,
 		cloneDest,
-		projectName,
 		cloneDest,
+		projectName,
 	)
+
+	env := []corev1.EnvVar{
+		{
+			Name: "GIT_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: k.gitSecret},
+					Key:                  "token",
+				},
+			},
+		},
+	}
+	if opts.branch != "" {
+		env = append(env, corev1.EnvVar{Name: "SPAWN_BRANCH", Value: opts.branch})
+	}
+	if opts.baseBranch != "" {
+		env = append(env, corev1.EnvVar{Name: "SPAWN_BASE_BRANCH", Value: opts.baseBranch})
+	}
 
 	return corev1.Container{
 		Name:    "git-clone",
 		Image:   k.gitCloneImage,
 		Command: []string{"sh", "-c", cloneScript},
-		Env: []corev1.EnvVar{
-			{
-				Name: "GIT_TOKEN",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: k.gitSecret},
-						Key:                  "token",
-					},
-				},
-			},
-		},
+		Env:     env,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "workspace", MountPath: "/workspace"},
 		},

@@ -11,9 +11,18 @@ type workspacePodPlan struct {
 	initContainers []corev1.Container
 }
 
+// gitCloneOpts carries optional checkout info for the git-clone init
+// container. Zero values keep the legacy behavior (clone default
+// branch, no checkout step) so build pods that don't care about a
+// specific branch can pass workspacePlanOpts{}.
+type gitCloneOpts struct {
+	branch     string
+	baseBranch string
+}
+
 // workspacePodPlan returns the workspace volume and any initContainers needed
 // to materialize source content for runtime or build pods.
-func (k *K8sBackend) workspacePlan(cloneTarget string, emptyDirSizeLimit *resource.Quantity) workspacePodPlan {
+func (k *K8sBackend) workspacePlan(cloneTarget string, opts gitCloneOpts, emptyDirSizeLimit *resource.Quantity) workspacePodPlan {
 	plan := workspacePodPlan{
 		volumeMounts: []corev1.VolumeMount{
 			{Name: "workspace", MountPath: "/workspace"},
@@ -27,7 +36,7 @@ func (k *K8sBackend) workspacePlan(cloneTarget string, emptyDirSizeLimit *resour
 	case k.gitEnabled():
 		// Git-clone mode also uses emptyDir, but hydrates it before start.
 		plan.volume = emptyDirWorkspaceVolume(emptyDirSizeLimit)
-		plan.initContainers = []corev1.Container{k.gitCloneInitContainer(cloneTarget)}
+		plan.initContainers = []corev1.Container{k.gitCloneInitContainer(cloneTarget, opts)}
 	default:
 		plan.volume = pvcWorkspaceVolume(k.workspacePVC)
 	}

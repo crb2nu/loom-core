@@ -220,7 +220,7 @@ func (c *HUDSpawnClient) Run(ctx context.Context, req pipeline.SpawnRequest) (pi
 		}
 	}
 
-	return c.pollSpawn(ctx, spawnID, req.WorkingDir, req.BaseBranch)
+	return c.pollSpawn(ctx, spawnID, req.WorkingDir, req.BaseBranch, req.Branch)
 }
 
 // Resume implements pipeline.SpawnResumeClient by polling an already
@@ -239,10 +239,10 @@ func (c *HUDSpawnClient) Resume(ctx context.Context, spawnID string) (pipeline.S
 	if spawnID == "" {
 		return pipeline.SpawnResponse{}, errors.New("hud spawn: resume spawn id required")
 	}
-	return c.pollSpawn(ctx, spawnID, "", "")
+	return c.pollSpawn(ctx, spawnID, "", "", "")
 }
 
-func (c *HUDSpawnClient) pollSpawn(ctx context.Context, spawnID, workingDir, baseBranch string) (pipeline.SpawnResponse, error) {
+func (c *HUDSpawnClient) pollSpawn(ctx context.Context, spawnID, workingDir, baseBranch, branch string) (pipeline.SpawnResponse, error) {
 	// Poll until terminal.
 	pollCtx, cancel := context.WithTimeout(ctx, c.cfg.PollDeadline)
 	defer cancel()
@@ -262,7 +262,7 @@ func (c *HUDSpawnClient) pollSpawn(ctx context.Context, spawnID, workingDir, bas
 		}
 		if isTerminalSpawnStatus(state.Status) {
 			resp := mapTelemetryToResponse(state)
-			c.attachGitContext(ctx, &resp, workingDir, baseBranch)
+			c.attachGitContext(ctx, &resp, workingDir, baseBranch, branch)
 			if state.Status != "completed" {
 				return resp, fmt.Errorf("hud spawn %s status=%s: %s", spawnID, state.Status, state.Error)
 			}
@@ -455,56 +455,67 @@ func mapTelemetryToResponse(state *hudSpawnState) pipeline.SpawnResponse {
 }
 
 // attachGitContext fills resp.DiffPatch + resp.CommitMessages by
-// shelling `git diff` and `git log` in the spawn's worktree. The
-// operator + spawn pods share an NFS-backed worktree, so the operator
-// process can read the working tree HEAD after the spawn pod
-// terminates.
+// shelling `git diff` and `git log` in the operator-local worktree.
+//
+// The spawn pod runs in a separate, pod-local clone (see
+// internal/devbox/backend/k8s_workspace.go). The pod pushes its commits
+// to origin/<branch>; the operator never sees the pod's filesystem. So
+// before we diff, we `git fetch origin <branch>` into the operator's
+// worktree to bring the pod's commits into a ref we can read, then
+// compare baseBranch...origin/<branch>. Pre-fix the diff was taken
+// against the operator's untouched HEAD and always came back empty —
+// the root cause documented in .loom/119.
 //
 // Failure modes are best-effort: any git error sets the fields to zero
 // values (empty diff, nil commits) so downstream gates see "nothing to
-// grade" rather than getting an infrastructure error here. The M2.5
+// grade" rather than an infrastructure error here. The M2.5
 // unparseable-retry path is the safety net for the legitimate
 // nothing-changed case (the canary's no-op edit).
-//
-// The function never returns nil for DiffPatch when there's a worktree
-// to inspect: it returns []byte{} (empty slice) on success-with-no-diff
-// so downstream code can distinguish "ran git, got nothing" from
-// "didn't run git at all".
-func (c *HUDSpawnClient) attachGitContext(ctx context.Context, resp *pipeline.SpawnResponse, workingDir, baseBranch string) {
+func (c *HUDSpawnClient) attachGitContext(ctx context.Context, resp *pipeline.SpawnResponse, workingDir, baseBranch, branch string) {
 	if c == nil || resp == nil {
 		return
 	}
-	if workingDir == "" || baseBranch == "" {
-		// No worktree path or base ref → operator never told us where to
-		// look. Leave Diff/Commits at zero values; gate fallback path
-		// will retry via M2.5's unparseable-handler.
+	if workingDir == "" || baseBranch == "" || branch == "" {
+		// No worktree path, base ref, or branch → operator never told
+		// us where to look. Leave Diff/Commits at zero values; gate
+		// fallback path will retry via M2.5's unparseable-handler.
 		return
 	}
 	if c.cfg.GitRunner == nil {
 		return
 	}
 
-	diff := captureGitDiff(ctx, c.cfg.GitRunner, workingDir, baseBranch, c.cfg.MaxDiffBytes)
-	commits := captureGitCommitMessages(ctx, c.cfg.GitRunner, workingDir, baseBranch, c.cfg.MaxCommitMessagesBytes)
+	// Pull the pod's pushed commits into a ref the operator can read.
+	// Best-effort: a failed fetch (e.g. nothing pushed) leaves the
+	// downstream diff empty, which is the correct signal.
+	_, _, _, _ = c.cfg.GitRunner.Run(ctx, workingDir, "git", "fetch", "origin", branch)
+
+	headRef := "origin/" + branch
+	diff := captureGitDiff(ctx, c.cfg.GitRunner, workingDir, baseBranch, headRef, c.cfg.MaxDiffBytes)
+	commits := captureGitCommitMessages(ctx, c.cfg.GitRunner, workingDir, baseBranch, headRef, c.cfg.MaxCommitMessagesBytes)
 
 	resp.DiffPatch = diff
 	resp.CommitMessages = commits
 }
 
-// captureGitDiff runs `git diff <baseBranch>...HEAD` in workingDir and
-// returns the unified diff capped at maxBytes. The triple-dot form
-// produces the symmetric-difference diff between base and HEAD — i.e.
+// captureGitDiff runs `git diff <baseBranch>...<headRef>` in workingDir
+// and returns the unified diff capped at maxBytes. The triple-dot form
+// produces the symmetric-difference diff between base and head — i.e.
 // "what changed on this branch since fork from base", which is the
 // view the rubric judge needs to score code review questions.
+//
+// headRef is typically "origin/<branch>" after attachGitContext fetches
+// the pod's commits — the operator worktree's local HEAD is never
+// touched by the spawn pod, so the local ref is always empty.
 //
 // On any git error (worktree missing, base ref unknown, etc.) we
 // return an empty slice — never nil — so callers can distinguish
 // "ran git, no changes" from "git capture was skipped entirely".
-func captureGitDiff(ctx context.Context, runner CommandRunner, workingDir, baseBranch string, maxBytes int) []byte {
-	if runner == nil || workingDir == "" || baseBranch == "" {
+func captureGitDiff(ctx context.Context, runner CommandRunner, workingDir, baseBranch, headRef string, maxBytes int) []byte {
+	if runner == nil || workingDir == "" || baseBranch == "" || headRef == "" {
 		return nil
 	}
-	stdout, _, code, err := runner.Run(ctx, workingDir, "git", "diff", baseBranch+"...HEAD")
+	stdout, _, code, err := runner.Run(ctx, workingDir, "git", "diff", baseBranch+"..."+headRef)
 	if err != nil || code != 0 {
 		// best-effort: return empty slice (not nil) so the response
 		// shape is consistent.
@@ -514,14 +525,15 @@ func captureGitDiff(ctx context.Context, runner CommandRunner, workingDir, baseB
 }
 
 // captureGitCommitMessages returns the per-commit message bodies on
-// the current branch since fork from baseBranch. Uses a NUL delimiter
-// so multi-paragraph commit messages don't get mangled by newline
-// splitting.
-func captureGitCommitMessages(ctx context.Context, runner CommandRunner, workingDir, baseBranch string, maxBytes int) []string {
-	if runner == nil || workingDir == "" || baseBranch == "" {
+// headRef since fork from baseBranch. Uses a NUL delimiter so
+// multi-paragraph commit messages don't get mangled by newline
+// splitting. headRef is "origin/<branch>" for HUD-spawn flows where
+// the pod's commits live on origin.
+func captureGitCommitMessages(ctx context.Context, runner CommandRunner, workingDir, baseBranch, headRef string, maxBytes int) []string {
+	if runner == nil || workingDir == "" || baseBranch == "" || headRef == "" {
 		return nil
 	}
-	stdout, _, code, err := runner.Run(ctx, workingDir, "git", "log", "--pretty=format:%B%x00", baseBranch+"..HEAD")
+	stdout, _, code, err := runner.Run(ctx, workingDir, "git", "log", "--pretty=format:%B%x00", baseBranch+".."+headRef)
 	if err != nil || code != 0 {
 		return nil
 	}

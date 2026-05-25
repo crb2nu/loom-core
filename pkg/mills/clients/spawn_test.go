@@ -585,10 +585,12 @@ func TestRun_PopulatesDiffPatchAndCommitMessages(t *testing.T) {
 		"@@\n-old line\n+new line\n"
 	logOut := "feat(canary): bump heartbeat\x00fix(spawn): retry logic\x00"
 
+	// Branch from sampleSpawnReq → "mills/BL-X/plan_slice"; the head ref
+	// the operator now diffs against is origin/<branch>.
 	gr := &spawnTelGitRunner{
 		stdouts: map[string]string{
-			"diff main...HEAD":                      diffOut,
-			"log --pretty=format:%B%x00 main..HEAD": logOut,
+			"diff main...origin/mills/BL-X/plan_slice":                      diffOut,
+			"log --pretty=format:%B%x00 main..origin/mills/BL-X/plan_slice": logOut,
 		},
 	}
 	ft := &hudFakeTransport{
@@ -631,18 +633,38 @@ func TestRun_PopulatesDiffPatchAndCommitMessages(t *testing.T) {
 	if gr.dirSeen != "/work/spawn/heartbeat" {
 		t.Errorf("git ran in dir %q, want /work/spawn/heartbeat", gr.dirSeen)
 	}
-	// Both git diff + git log must be invoked exactly once.
+	// fetch must run before diff so origin/<branch> exists locally.
 	calls := gr.callArgs()
-	wantArgs := map[string]bool{
-		"git diff main...HEAD":                      true,
-		"git log --pretty=format:%B%x00 main..HEAD": true,
-	}
-	for _, c := range calls {
+	fetchIdx, diffIdx := -1, -1
+	for i, c := range calls {
 		key := strings.Join(c, " ")
-		delete(wantArgs, key)
+		switch key {
+		case "git fetch origin mills/BL-X/plan_slice":
+			fetchIdx = i
+		case "git diff main...origin/mills/BL-X/plan_slice":
+			diffIdx = i
+		}
 	}
-	if len(wantArgs) > 0 {
-		t.Errorf("missing git calls: %v; saw %v", wantArgs, calls)
+	if fetchIdx < 0 {
+		t.Errorf("missing git fetch call; saw %v", calls)
+	}
+	if diffIdx < 0 {
+		t.Errorf("missing git diff call; saw %v", calls)
+	}
+	if fetchIdx >= 0 && diffIdx >= 0 && fetchIdx >= diffIdx {
+		t.Errorf("fetch must run before diff; fetchIdx=%d diffIdx=%d", fetchIdx, diffIdx)
+	}
+	// And the log call must use the same origin ref.
+	wantLog := "git log --pretty=format:%B%x00 main..origin/mills/BL-X/plan_slice"
+	var sawLog bool
+	for _, c := range calls {
+		if strings.Join(c, " ") == wantLog {
+			sawLog = true
+			break
+		}
+	}
+	if !sawLog {
+		t.Errorf("missing log call %q; saw %v", wantLog, calls)
 	}
 }
 
@@ -655,8 +677,8 @@ func TestRun_DiffPatchTruncatedAtCap(t *testing.T) {
 	bigDiff := strings.Repeat("x", 64*1024)
 	gr := &spawnTelGitRunner{
 		stdouts: map[string]string{
-			"diff main...HEAD":                      bigDiff,
-			"log --pretty=format:%B%x00 main..HEAD": "",
+			"diff main...origin/mills/BL-X/plan_slice":                      bigDiff,
+			"log --pretty=format:%B%x00 main..origin/mills/BL-X/plan_slice": "",
 		},
 	}
 	ft := &hudFakeTransport{
@@ -693,8 +715,8 @@ func TestRun_CommitMessagesTruncatedAtCap(t *testing.T) {
 	logOut := "feat: tiny\x00" + big + "\x00"
 	gr := &spawnTelGitRunner{
 		stdouts: map[string]string{
-			"diff main...HEAD":                      "",
-			"log --pretty=format:%B%x00 main..HEAD": logOut,
+			"diff main...origin/mills/BL-X/plan_slice":                      "",
+			"log --pretty=format:%B%x00 main..origin/mills/BL-X/plan_slice": logOut,
 		},
 	}
 	ft := &hudFakeTransport{
@@ -735,8 +757,8 @@ func TestRun_CommitMessagesTruncatedAtCap(t *testing.T) {
 func TestRun_EmptyWorktreeYieldsEmptyDiff(t *testing.T) {
 	gr := &spawnTelGitRunner{
 		stdouts: map[string]string{
-			"diff main...HEAD":                      "",
-			"log --pretty=format:%B%x00 main..HEAD": "",
+			"diff main...origin/mills/BL-X/plan_slice":                      "",
+			"log --pretty=format:%B%x00 main..origin/mills/BL-X/plan_slice": "",
 		},
 	}
 	ft := &hudFakeTransport{
@@ -774,15 +796,15 @@ func TestRun_EmptyWorktreeYieldsEmptyDiff(t *testing.T) {
 func TestRun_GitFailureFallsBackToEmptyCapture(t *testing.T) {
 	gr := &spawnTelGitRunner{
 		stdouts: map[string]string{
-			"diff main...HEAD":                      "irrelevant",
-			"log --pretty=format:%B%x00 main..HEAD": "ignored",
+			"diff main...origin/mills/BL-X/plan_slice":                      "irrelevant",
+			"log --pretty=format:%B%x00 main..origin/mills/BL-X/plan_slice": "ignored",
 		},
 		exits: map[string]int{
-			"diff main...HEAD":                      128,
-			"log --pretty=format:%B%x00 main..HEAD": 128,
+			"diff main...origin/mills/BL-X/plan_slice":                      128,
+			"log --pretty=format:%B%x00 main..origin/mills/BL-X/plan_slice": 128,
 		},
 		stderrs: map[string]string{
-			"diff main...HEAD": "fatal: bad revision 'main...HEAD'",
+			"diff main...origin/mills/BL-X/plan_slice": "fatal: bad revision 'main...origin/mills/BL-X/plan_slice'",
 		},
 	}
 	ft := &hudFakeTransport{
