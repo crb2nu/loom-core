@@ -4775,3 +4775,120 @@ func TestNewPipelineError(t *testing.T) {
 		t.Errorf("Details = %v, want nil", ped.Details)
 	}
 }
+
+// TestTransportFailure_LocalRecvTimeoutKeepsSubprocessAlive is the
+// regression for the cluster's /api/agent/heartbeat → 502 cascade we
+// surfaced after fixing the LocalCaller duplicate-id race. Once unique
+// ids stopped the send-side collision, a NEW failure mode became
+// visible: a single >3s call to agent_context would time out on recv,
+// and transportFailure would tear down the entire subprocess via
+// stopServerProc + runningServers.Delete. Every other concurrent
+// caller on the shared muxstdio.Transport then drained with
+// `transport closed`, which the heartbeat handler turned into 5xx →
+// Cloudflare 502. The subprocess was alive the whole time — just slow.
+//
+// transportFailure must now short-circuit the nuke path when the
+// failure is a recv-side context.DeadlineExceeded: mark the conn
+// unhealthy (so the pool discards it on next Get), but do not stop
+// the subprocess and do not delete its runningServers entry.
+func TestTransportFailure_LocalRecvTimeoutKeepsSubprocessAlive(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	// Seed the running-server marker that the nuke path would delete.
+	const serverName = "agent_context"
+	d.runningServers.Store(serverName, true)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "timeout-test",
+	})
+	p.serverName = serverName
+	p.toolName = "agent_session_list"
+	p.target = router.TargetLocal
+	p.targetStr = "local"
+
+	timeoutErr := fmt.Errorf(
+		"tools/call timeout during recv after 3s (recoverable: daemon will reconnect upstream transport and retry on the next request): %w",
+		context.DeadlineExceeded,
+	)
+	resp := p.transportFailure("recv", timeoutErr, time.Now())
+
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected JSON-RPC error response, got %+v", resp)
+	}
+	if _, ok := d.runningServers.Load(serverName); !ok {
+		t.Fatalf("subprocess marker was deleted; transportFailure must not stop the process on a per-call timeout")
+	}
+}
+
+// TestTransportFailure_LocalRecvTransportErrorStillKillsSubprocess
+// pins the OTHER half of the discriminator: a genuine transport fault
+// (EOF, broken pipe, muxstdio: transport closed) still tears down the
+// subprocess so a stale-pipe state can't poison subsequent calls.
+func TestTransportFailure_LocalRecvTransportErrorStillKillsSubprocess(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	const serverName = "agent_context"
+	d.runningServers.Store(serverName, true)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "transport-err-test",
+	})
+	p.serverName = serverName
+	p.toolName = "agent_session_list"
+	p.target = router.TargetLocal
+	p.targetStr = "local"
+
+	// Non-timeout error — simulates muxstdio's `transport closed`,
+	// EOF, broken pipe, etc.
+	resp := p.transportFailure("recv", io.ErrUnexpectedEOF, time.Now())
+
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected JSON-RPC error response, got %+v", resp)
+	}
+	if _, ok := d.runningServers.Load(serverName); ok {
+		t.Fatalf("subprocess marker should have been deleted on a transport-fault error")
+	}
+}
+
+// TestTransportFailure_LocalSendTimeoutStillKillsSubprocess pins the
+// stage discriminator: even a send-side timeout still tears down the
+// subprocess. A timeout on send means we couldn't write into the
+// stdio pipe at all (extremely unusual), implying the process or
+// pipe is in a stuck state — the conservative response is to
+// respawn.
+func TestTransportFailure_LocalSendTimeoutStillKillsSubprocess(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	const serverName = "agent_context"
+	d.runningServers.Store(serverName, true)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "send-timeout-test",
+	})
+	p.serverName = serverName
+	p.toolName = "agent_session_list"
+	p.target = router.TargetLocal
+	p.targetStr = "local"
+
+	timeoutErr := fmt.Errorf(
+		"tools/call timeout during send after 3s: %w",
+		context.DeadlineExceeded,
+	)
+	resp := p.transportFailure("send", timeoutErr, time.Now())
+
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected JSON-RPC error response, got %+v", resp)
+	}
+	if _, ok := d.runningServers.Load(serverName); ok {
+		t.Fatalf("subprocess marker should have been deleted on a send-stage failure")
+	}
+}
