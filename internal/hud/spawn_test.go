@@ -100,7 +100,12 @@ func TestBuildAgentCommand(t *testing.T) {
 			agentID:   "spawn-codex-abc123",
 			wantContains: []string{
 				"codex exec",
-				"--sandbox workspace-write",
+				// danger-full-access lets headless codex push git commits;
+				// workspace-write blocks network access for shell commands
+				// (see comment on buildAgentCommand). Pin the explicit flag
+				// so future refactors can't quietly regress to the silent-
+				// no-push failure mode.
+				"--sandbox danger-full-access",
 				"--skip-git-repo-check",
 				"--json",
 				"trap",
@@ -111,6 +116,10 @@ func TestBuildAgentCommand(t *testing.T) {
 				// --full-auto was removed in codex 0.110+; verify we
 				// don't regress to the deprecated flag.
 				"--full-auto",
+				// workspace-write was the previous setting; pin the regression
+				// so a future "tighten security" PR can't quietly bring it
+				// back without first wiring an alternate push path.
+				"--sandbox workspace-write",
 			},
 		},
 		{
