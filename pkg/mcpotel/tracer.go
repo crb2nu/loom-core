@@ -18,11 +18,11 @@ import (
 	"os"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
@@ -88,11 +88,15 @@ func InitTracerWithOptions(ctx context.Context, serviceName string, logger *slog
 		return noop.NewTracerProvider(), noopShutdown, fmt.Errorf("create OTLP exporter: %w", err)
 	}
 
+	// Leave the per-service resource's schema URL empty so resource.Merge
+	// inherits whatever schema resource.Default() carries. Pinning a
+	// specific semconv version here breaks whenever an upstream dep
+	// upgrades the SDK and shifts Default's schema (see ErrSchemaURLConflict).
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceNameKey.String(serviceName),
+			"",
+			attribute.String("service.name", serviceName),
 		),
 	)
 	if err != nil {
