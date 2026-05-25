@@ -303,6 +303,35 @@ Implications for embedders:
   to the local Vite dev server. Use this only during HUD UI development;
   production embedders leave `Dev = false`.
 
+## Presence Federation (LOOM_HUD_MIRROR_URL)
+
+When `LOOM_HUD_MIRROR_URL` is set, `StartMonitors` launches a background
+mirror that periodically forwards this daemon's active presence to a
+remote HUD via its `/api/agent/heartbeat` endpoint with
+`ensure_session: true`. The remote HUD bootstraps presence rows for
+unknown agent_ids and surfaces them in its own fleet snapshot — useful
+when operator hooks point at a local Mac daemon but the fleet view
+lives on a cluster HUD (e.g. `https://hud.flexinfer.ai`).
+
+| Env var | Default | Purpose |
+|--|--|--|
+| `LOOM_HUD_MIRROR_URL` | _empty_ (disabled) | Base URL of the remote HUD to mirror to. |
+| `LOOM_HUD_MIRROR_INTERVAL` | `15s` | Cycle period. |
+| `LOOM_HUD_MIRROR_TIMEOUT` | `3s` | Per-POST timeout. |
+| `LOOM_HUD_MIRROR_TOKEN` | _empty_ | Optional `Authorization: Bearer ...` value. |
+| `LOOM_HUD_MIRROR_CF_ACCESS_CLIENT_ID` | _empty_ | Cloudflare Access service-token client id. |
+| `LOOM_HUD_MIRROR_CF_ACCESS_CLIENT_SECRET` | _empty_ | Cloudflare Access service-token secret. |
+
+The mirror only forwards rows with non-empty `agent_id` and a status
+other than `offline`/`expired`. Mirror errors are coalesced to one warn
+log per failure streak, and the mirror loop is stopped by
+`StopMonitors()`.
+
+See [`internal/hud/mirror/mirror.go`](../internal/hud/mirror/mirror.go)
+for the service and
+[`internal/hud/mirror/mirror_test.go`](../internal/hud/mirror/mirror_test.go)
+for the contract tests.
+
 ## Limitations
 
 - **Pre-1.0 surface.** `NewApp`, `StartMonitors`, `RegisterRoutes`,

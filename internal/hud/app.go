@@ -23,6 +23,7 @@ import (
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/hud/coordinator"
 	"github.com/crb2nu/loom/internal/hud/domain"
+	"github.com/crb2nu/loom/internal/hud/mirror"
 	"github.com/crb2nu/loom/internal/hud/monitor"
 	"github.com/crb2nu/loom/internal/hud/shuttle"
 )
@@ -171,6 +172,10 @@ type App struct {
 	contextHealthMonitor *monitor.ContextHealthMonitor
 	codebaseMonitor      *monitor.CodebaseMonitor
 	shuttleMonitor       *shuttle.ShuttleMonitor
+
+	// hudMirror federates this daemon's active presence to a remote HUD
+	// when LOOM_HUD_MIRROR_URL is set. Nil when mirroring is disabled.
+	hudMirror *mirror.Service
 
 	// Shuttle engine — auto-dispatch, load balancing, conflict prevention.
 	shuttleEngine *shuttle.Engine
