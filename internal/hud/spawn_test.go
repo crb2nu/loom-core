@@ -100,12 +100,13 @@ func TestBuildAgentCommand(t *testing.T) {
 			agentID:   "spawn-codex-abc123",
 			wantContains: []string{
 				"codex exec",
-				// danger-full-access lets headless codex push git commits;
-				// workspace-write blocks network access for shell commands
-				// (see comment on buildAgentCommand). Pin the explicit flag
-				// so future refactors can't quietly regress to the silent-
-				// no-push failure mode.
-				"--sandbox danger-full-access",
+				// --dangerously-bypass-approvals-and-sandbox is codex's
+				// equivalent of claude --dangerously-skip-permissions.
+				// Without it, headless codex pauses for approval on every
+				// shell command (git add/commit/push, go test, …) and the
+				// implement stage produces empty MRs. Pin the flag so the
+				// silent-no-push failure mode can't return.
+				"--dangerously-bypass-approvals-and-sandbox",
 				"--skip-git-repo-check",
 				"--json",
 				"trap",
@@ -116,10 +117,13 @@ func TestBuildAgentCommand(t *testing.T) {
 				// --full-auto was removed in codex 0.110+; verify we
 				// don't regress to the deprecated flag.
 				"--full-auto",
-				// workspace-write was the previous setting; pin the regression
-				// so a future "tighten security" PR can't quietly bring it
-				// back without first wiring an alternate push path.
+				// --sandbox workspace-write blocks network for shell
+				// commands (git push silently fails).
 				"--sandbox workspace-write",
+				// --sandbox danger-full-access opens the sandbox but
+				// still leaves the approval-prompt hang in headless
+				// pods. Bypass-approvals-and-sandbox covers both.
+				"--sandbox danger-full-access",
 			},
 		},
 		{
