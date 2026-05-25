@@ -3,6 +3,8 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,6 +122,58 @@ func TestLocalCaller_Close(t *testing.T) {
 
 func TestLocalCaller_SatisfiesCaller(t *testing.T) {
 	var _ Caller = (*LocalCaller)(nil)
+}
+
+// TestLocalCaller_UniqueRequestIDs is the regression for the cluster
+// `/api/agent/heartbeat → 502` cascade: previously every Call() stamped
+// id=1, which the daemon's shared muxstdio transport rejected with
+// `duplicate in-flight id: n:1` whenever two embedded-HUD monitors
+// fanned out to the same upstream MCP server concurrently. Once the
+// transport closed, every queued caller drained as 5xx and Cloudflare
+// converted that into a 502 at the edge. Confirm each Call gets a
+// monotonically increasing id.
+func TestLocalCaller_UniqueRequestIDs(t *testing.T) {
+	const callers = 32
+	const perCaller = 8
+
+	var (
+		mu  sync.Mutex
+		ids = make(map[string]bool, callers*perCaller)
+	)
+	dispatch := func(_ context.Context, msg *mcp.Message) (*mcp.Message, error) {
+		mu.Lock()
+		key := fmt.Sprint(msg.ID)
+		if ids[key] {
+			mu.Unlock()
+			return nil, fmt.Errorf("duplicate id observed: %v", msg.ID)
+		}
+		ids[key] = true
+		mu.Unlock()
+		return &mcp.Message{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}, nil
+	}
+
+	caller := NewLocalCaller(dispatch)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	errs := make(chan error, callers*perCaller)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perCaller; j++ {
+				if _, err := caller.Call("ping", nil); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("call returned error: %v", err)
+	}
+	if len(ids) != callers*perCaller {
+		t.Fatalf("observed %d distinct ids, want %d", len(ids), callers*perCaller)
+	}
 }
 
 func TestDaemonClient_SatisfiesCaller(t *testing.T) {
