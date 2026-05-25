@@ -158,6 +158,20 @@ type Daemon struct {
 	muxStdio bool
 	muxCache *muxCache
 
+	// hubMuxCache demuxes responses on the shared hub WebSocket transport.
+	// mcp.WebSocketClient.GetConnection() returns the SAME *WebSocketTransport
+	// for every Dial of a given serverName (single conn per server, cached on
+	// the client), so concurrent pool.Conn entries for one hub-routed server
+	// all read off the same WebSocket. Without per-id demuxing, caller A's
+	// Recv can drain caller B's response — surfaced as `response ID mismatch:
+	// sent X, got Y (possible transport corruption)` in the pipeline's
+	// post-execute guard (`internal/daemon/callpipeline_stages.go:433`).
+	//
+	// Always-on (unlike muxStdio's LOOM_MUX_STDIO opt-in) because the sharing
+	// is structural to the underlying WebSocketClient, not an opt-in. Set to
+	// nil when hub fallback is disabled (no hubPool to wrap).
+	hubMuxCache *muxCache
+
 	// activeRPCs tracks in-flight RPC call count for drain-readiness checks.
 	activeRPCs atomic.Int64
 
