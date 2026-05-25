@@ -317,6 +317,28 @@ loom mills backlog list | grep gl-
 Adding more intake before Slices 2c + 2e land would just deepen the
 escalation pile.
 
+## Source-branch push before MR
+
+The `mr` stage publishes the spawn agent's commits to origin before
+calling GitLab `CreateMR`. Without this, GitLab accepts the MR row
+but it points at a branch with no `head_sha`, and `ci_watch` hangs
+forever waiting for a pipeline that can't exist.
+
+- Implementation: `pkg/mills/clients/branch_pusher.go`
+  (`clients.GitBranchPusher`) shells `git push --force-with-lease -u
+  origin HEAD:<branch>` from the run's `WorktreePath`.
+- Interface: `pipeline.BranchPusher` (4-line contract). The operator
+  wires the production pusher onto `GitLabWorker.BranchPusher` at
+  startup; tests inject fakes.
+- Idempotency: `--force-with-lease` lets retries safely overwrite a
+  stale prior push without clobbering unrelated upstream work. A
+  no-op push (HEAD already at origin) exits 0.
+
+Failure mode (push errors before MR is created): the `mr` stage
+returns an error and the runner retries per the Slice 2c
+classification — a transport / quota error gets free retries; a
+real `git push` rejection counts against MaxAttempts.
+
 ## v2 rollout staging (preview)
 
 When `.loom/94-implementation-plan-mills-v2-hierarchical-swarm-2026-05-02.md` Phase 8 lands, each v2 feature flips behind its own policy flag with a 1-week soak between flips. Order:
