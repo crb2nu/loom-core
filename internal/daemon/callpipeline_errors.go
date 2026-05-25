@@ -25,6 +25,33 @@ func (p *callPipeline) transportFailure(stage string, err error, start time.Time
 	p.daemon.metrics.RecordRequest(p.serverName, p.method, "error", p.targetStr, time.Since(start))
 	p.emitErrorAudit(p.targetStr, err.Error())
 
+	// Per-call timeouts (context.DeadlineExceeded) from a still-alive
+	// upstream subprocess must not tear down the subprocess. Doing so
+	// drops every concurrent caller's pending Recv with `transport
+	// closed`, which on the cluster's embedded HUD cascades into
+	// /api/agent/heartbeat returning 5xx → Cloudflare 502.
+	//
+	// The conn was marked unhealthy above so the pool will discard it
+	// on next Get(); the shared muxstdio.Transport survives and other
+	// pending callers continue to receive their responses. The next
+	// caller that needs a conn dials a fresh one over the same alive
+	// subprocess.
+	//
+	// Only applies when the failure is a recv-side timeout (a send-side
+	// failure or a real EOF/broken-pipe still means the subprocess
+	// channel is dead and must be respawned).
+	if p.target == router.TargetLocal && stage != "send" && isRPCTimeout(err) {
+		p.daemon.logger.Warn("local server recv timed out; subprocess kept alive",
+			"server", p.serverName, "tool", p.toolName, "error", err)
+		p.recordTransportSpanEvent("daemon.server.recv_timeout_no_restart",
+			attribute.String("server.name", p.serverName),
+			attribute.String("failure.stage", stage),
+			attribute.String("failure.error", err.Error()),
+			attribute.String("target", p.targetStr),
+		)
+		return p.internalError(err)
+	}
+
 	if p.target == router.TargetLocal {
 		switch stage {
 		case "send":
