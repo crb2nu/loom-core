@@ -936,12 +936,20 @@ func buildAgentCommand(agentType, task, agentID string) string {
 		// stderr is suppressed via 2>/dev/null and the HUD-side completeSpawn /
 		// failSpawn will still call EndSession as a fallback.
 		//
-		// --full-auto was deprecated in @openai/codex 0.110+; the supported form
-		// is --sandbox workspace-write. --skip-git-repo-check lets codex run in
-		// the spawn pod's /workspace clone where there is no .git on first
-		// boot (devbox backend clones into the working dir, not /).
+		// --full-auto was deprecated in @openai/codex 0.110+. The next-best
+		// option for a headless agent that must commit AND push is
+		// --sandbox danger-full-access (the codex equivalent of claude-code's
+		// --dangerously-skip-permissions): `workspace-write` blocks network
+		// access for shell commands, so `git push` silently fails inside the
+		// spawn pod and Mills' implement stage produced empty MRs even after
+		// the branch-checkout + workspace-chown fixes (ab6f8446, 5742ae07).
+		// The whole spawn pod is already isolated by K8s; the "danger" name
+		// refers to codex's per-command policy, not the surrounding sandbox.
+		// --skip-git-repo-check lets codex run in the spawn pod's /workspace
+		// clone where the .git dir might be at the working dir rather than a
+		// parent.
 		return fmt.Sprintf(
-			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --sandbox workspace-write --skip-git-repo-check --json %q`,
+			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --sandbox danger-full-access --skip-git-repo-check --json %q`,
 			agentID, task,
 		)
 	case "gemini":
