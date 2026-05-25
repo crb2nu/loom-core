@@ -681,6 +681,18 @@ func TestGitCloneInitContainer(t *testing.T) {
 		t.Fatalf("expected full clone (no --depth flag), got: %s", script)
 	}
 
+	// umask 002 + recursive chown to 1000:1000 are load-bearing for
+	// agent writes: the init container runs as root, the runtime as
+	// uid 1000. Without these, the cloned workspace is root:0 mode
+	// 0644 and the agent cannot modify, commit, or push — the same
+	// "no diff" pathology as the missing branch checkout.
+	if !strings.Contains(script, "umask 002") {
+		t.Fatalf("expected `umask 002` in clone script, got: %s", script)
+	}
+	if !strings.Contains(script, "chown -R 1000:1000") {
+		t.Fatalf("expected `chown -R 1000:1000` after checkout, got: %s", script)
+	}
+
 	// Should mount workspace volume
 	if len(ic.VolumeMounts) != 1 || ic.VolumeMounts[0].MountPath != "/workspace" {
 		t.Fatalf("expected /workspace volume mount, got: %#v", ic.VolumeMounts)

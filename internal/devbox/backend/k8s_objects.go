@@ -254,8 +254,19 @@ func (k *K8sBackend) gitCloneInitContainer(workDirPath string, opts gitCloneOpts
 		scheme = "http"
 	}
 	hostAndPath := strings.TrimPrefix(strings.TrimPrefix(repoURL, "https://"), "http://")
+	// The runtime container runs as uid 1000 (the `agent` user in
+	// spawn-runtime-codex / spawn-runtime-claude). Without an explicit
+	// chown, the workspace ends up owned by root:0 with mode 0644 — the
+	// agent can read but not write, so it cannot modify files, commit, or
+	// push. fsGroup chowns the emptyDir mount point to gid 1000 but does
+	// not propagate to files written into the volume by a later init
+	// container running as root. The umask + recursive chown make every
+	// freshly-cloned path agent-writable. Without this, the spawn fix
+	// from ab6f8446 (init container checks out req.Branch) reaches the
+	// right branch but produces no diff because the agent can't write.
 	cloneScript := fmt.Sprintf(
 		`set -e
+umask 002
 mkdir -p "$(dirname %q)"
 git clone "%s://token:${GIT_TOKEN}@%s" %q
 cd %q
@@ -269,10 +280,12 @@ if [ -n "${SPAWN_BRANCH:-}" ]; then
     git checkout -b "${SPAWN_BRANCH}"
   fi
 fi
+chown -R 1000:1000 %q
 echo "git-clone: ready %s on $(git rev-parse --abbrev-ref HEAD)"`,
 		cloneDest,
 		scheme,
 		hostAndPath,
+		cloneDest,
 		cloneDest,
 		cloneDest,
 		projectName,
