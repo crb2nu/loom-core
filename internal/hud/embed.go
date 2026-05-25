@@ -30,6 +30,7 @@ import (
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/hud/coordinator"
 	"github.com/crb2nu/loom/internal/hud/domain/memory"
+	"github.com/crb2nu/loom/internal/hud/mirror"
 	"github.com/crb2nu/loom/internal/hud/monitor"
 	"github.com/crb2nu/loom/internal/hud/shuttle"
 	"github.com/crb2nu/loom/pkg/codebase"
@@ -234,6 +235,18 @@ func (a *App) StartMonitors(ctx context.Context) error {
 	a.contextHealthMonitor.Start(5 * time.Second)
 	a.codebaseMonitor.Start(30 * time.Second)
 	a.shuttleMonitor.Start(3 * time.Second)
+
+	// HUD presence mirror: federate this daemon's active presence to a
+	// remote HUD when LOOM_HUD_MIRROR_URL is set. No-op otherwise.
+	if cfg := mirror.NewConfigFromEnv(); cfg.Enabled() {
+		a.hudMirror = mirror.New(cfg, a.agent, nil, a.logger)
+		a.hudMirror.Start(ctx)
+		a.logger.Info("hud presence mirror enabled",
+			"url", cfg.URL,
+			"interval", cfg.Interval,
+			"timeout", cfg.Timeout,
+		)
+	}
 
 	// Wire pipeline monitor → alert engine callback.
 	if a.pipelineMonitor != nil && a.alertEngine != nil {
@@ -485,6 +498,9 @@ func (a *App) StopMonitors() {
 	}
 	if a.shuttleMonitor != nil {
 		a.shuttleMonitor.Stop()
+	}
+	if a.hudMirror != nil {
+		a.hudMirror.Stop()
 	}
 	if a.coordinator != nil {
 		a.coordinator.Stop()
