@@ -524,6 +524,25 @@ type CleanupResponse struct {
 	LogTail string
 }
 
+// BranchPusher publishes a local branch to origin so the subsequent
+// CreateMR call has something to point at. Production wires a
+// CommandRunner-backed implementation that shells `git push`; tests
+// inject a fake.
+//
+// Why this exists: pre-2026-05-25 Mills had a structural gap — the
+// spawn agent committed to the NFS-shared worktree, the operator
+// then created the GitLab MR pointing at that branch, but no one
+// ever pushed. GitLab accepted the MR row anyway with no head_sha,
+// and ci_watch hung forever waiting on a pipeline that couldn't
+// exist. This interface makes the push explicit so future stages
+// see a real branch on origin.
+type BranchPusher interface {
+	// Push pushes HEAD of workingDir's git checkout to origin under
+	// the given branch name. Implementations should be idempotent —
+	// pushing an already-up-to-date ref must succeed, not error.
+	Push(ctx context.Context, workingDir, branch string) error
+}
+
 // GitLabWorker dispatches mr / ci_watch / merge / cleanup. The same
 // worker handles all four stages; it dispatches internally on jc.Stage.ID.
 type GitLabWorker struct {
@@ -542,6 +561,11 @@ type GitLabWorker struct {
 	// merge item.Policy.AutoMerge with policy.LabelOverrideFor. Nil
 	// means the worker falls back to jc.Item.Policy.AutoMerge alone.
 	AutoMergeFor func(jc JobContext) bool
+	// BranchPusher, when wired, pushes the source branch to origin
+	// before runMR calls CreateMR. Nil → skip push (legacy behaviour:
+	// assume some other path publishes the branch). Operator main
+	// wires a CommandRunner-backed clients.GitBranchPusher.
+	BranchPusher BranchPusher
 }
 
 // Run satisfies Worker.
@@ -567,6 +591,16 @@ func (w *GitLabWorker) runMR(ctx context.Context, jc JobContext) (StageOutput, e
 	sourceBranch := w.sourceBranch(jc)
 	if sourceBranch == "" {
 		return StageOutput{}, fmt.Errorf("mr: source branch unavailable for backlog %q", jc.Item.ID)
+	}
+	// Push the spawn agent's commits to origin before opening the MR.
+	// Without this, GitLab accepts the MR row but it has no head_sha
+	// (canary !518 surfaced this on 2026-05-25). Push is best-effort
+	// when worktree path is missing — the legacy code path assumed a
+	// pre-pushed branch.
+	if w.BranchPusher != nil && jc.Run != nil && jc.Run.WorktreePath != "" {
+		if err := w.BranchPusher.Push(ctx, jc.Run.WorktreePath, sourceBranch); err != nil {
+			return StageOutput{}, fmt.Errorf("mr: push %q to origin: %w", sourceBranch, err)
+		}
 	}
 	req := CreateMRRequest{
 		BacklogID:    jc.Item.ID,

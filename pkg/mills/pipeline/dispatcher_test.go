@@ -310,6 +310,91 @@ func TestGitLabWorker_CreateMR_RecordsIID(t *testing.T) {
 	}
 }
 
+// Pre-2026-05-25 empty-MR fix: runMR must push the source branch
+// before CreateMR, so GitLab actually has commits to point the MR at.
+// Pin both the call ordering and the push args (working dir + branch).
+type recordingPusher struct {
+	calls       []recordingPushCall
+	returnError error
+}
+type recordingPushCall struct {
+	WorkingDir string
+	Branch     string
+}
+
+func (p *recordingPusher) Push(_ context.Context, workingDir, branch string) error {
+	p.calls = append(p.calls, recordingPushCall{WorkingDir: workingDir, Branch: branch})
+	return p.returnError
+}
+
+func TestGitLabWorker_CreateMR_PushesBranchBeforeCreatingMR(t *testing.T) {
+	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	pusher := &recordingPusher{}
+	w := &GitLabWorker{Client: gl, BranchPusher: pusher}
+	if _, err := w.Run(context.Background(), sampleJobContext("mr")); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(pusher.calls) != 1 {
+		t.Fatalf("pusher called %d times, want 1", len(pusher.calls))
+	}
+	if pusher.calls[0].WorkingDir != "/tmp/wt" {
+		t.Errorf("push workingDir = %q, want /tmp/wt (from sampleJobContext)", pusher.calls[0].WorkingDir)
+	}
+	if pusher.calls[0].Branch != "feat/BL-X" {
+		t.Errorf("push branch = %q, want feat/BL-X (from BranchContractFor)", pusher.calls[0].Branch)
+	}
+	if len(gl.createCalls) != 1 {
+		t.Errorf("CreateMR called %d times after push, want 1", len(gl.createCalls))
+	}
+}
+
+func TestGitLabWorker_CreateMR_PushFailureBubblesUp(t *testing.T) {
+	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	pusher := &recordingPusher{returnError: errors.New("push refused")}
+	w := &GitLabWorker{Client: gl, BranchPusher: pusher}
+	_, err := w.Run(context.Background(), sampleJobContext("mr"))
+	if err == nil {
+		t.Fatal("expected error when pusher fails")
+	}
+	if len(gl.createCalls) != 0 {
+		t.Errorf("CreateMR fired despite push failure (calls=%d)", len(gl.createCalls))
+	}
+}
+
+func TestGitLabWorker_CreateMR_NoPusherStillWorks(t *testing.T) {
+	// Legacy behavior: GitLabWorker with no BranchPusher should still
+	// open the MR. We just won't push — keeps the old test fixtures green.
+	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	w := &GitLabWorker{Client: gl}
+	if _, err := w.Run(context.Background(), sampleJobContext("mr")); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(gl.createCalls) != 1 {
+		t.Errorf("CreateMR not called, len=%d", len(gl.createCalls))
+	}
+}
+
+func TestGitLabWorker_CreateMR_SkipsPushWhenWorktreeMissing(t *testing.T) {
+	// A run with no worktree path (e.g. resumed state where worktree
+	// allocation hasn't happened yet) shouldn't attempt the push — the
+	// CommandRunner would fail with cryptic errors. Skip cleanly.
+	gl := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	pusher := &recordingPusher{}
+	w := &GitLabWorker{Client: gl, BranchPusher: pusher}
+	jc := sampleJobContext("mr", func(jc *JobContext) {
+		jc.Run.WorktreePath = ""
+	})
+	if _, err := w.Run(context.Background(), jc); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(pusher.calls) != 0 {
+		t.Errorf("pusher called %d times despite missing worktree, want 0", len(pusher.calls))
+	}
+	if len(gl.createCalls) != 1 {
+		t.Errorf("CreateMR not called, len=%d", len(gl.createCalls))
+	}
+}
+
 // Slice 2a: when AutoMergeFor returns true, the CreateMRRequest carries
 // AutoMerge=true through to the GitLab client.
 func TestGitLabWorker_CreateMR_PassesAutoMergeFromCallback(t *testing.T) {

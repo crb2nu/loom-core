@@ -773,7 +773,11 @@ func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCP
 		logger.Warn("research stage stub: NoOpDispatcher (FLEXINFER_PROXY_URL unset)")
 	}
 	if gitlab != nil {
-		gw := &pipeline.GitLabWorker{Client: gitlab, AutoMergeFor: autoMerge}
+		gw := &pipeline.GitLabWorker{
+			Client:       gitlab,
+			AutoMergeFor: autoMerge,
+			BranchPusher: clients.NewGitBranchPusher(),
+		}
 		routes["mr"] = gw
 		routes["ci_watch"] = gw
 		routes["merge"] = gw
