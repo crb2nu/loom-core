@@ -134,6 +134,15 @@ func run(ctx context.Context) error {
 		syncExcludes:                 syncExcludes,
 		maxSyncSize:                  int64(maxSyncSizeMB) * 1024 * 1024,
 		warmProjects:                 warmProjects,
+		harvesterKubeconfig:          env.String("DEVBOX_HARVESTER_KUBECONFIG", ""),
+		harvesterBaseImage:           env.String("DEVBOX_HARVESTER_BASE_IMAGE", ""),
+		harvesterNamespace:           env.String("DEVBOX_HARVESTER_NAMESPACE", "default"),
+		harvesterStorageClass:        env.String("DEVBOX_HARVESTER_STORAGE_CLASS", ""),
+		harvesterNetworkAttachDef:    env.String("DEVBOX_HARVESTER_NETWORK_ATTACH_DEF", "default/lan10g"),
+		harvesterDefaultVCPUs:        env.Int("DEVBOX_HARVESTER_DEFAULT_VCPUS", 2),
+		harvesterDefaultMemMi:        env.Int("DEVBOX_HARVESTER_DEFAULT_MEM_MI", 4096),
+		harvesterDefaultDiskGi:       env.Int("DEVBOX_HARVESTER_DEFAULT_DISK_GI", 20),
+		harvesterSSHUser:             env.String("DEVBOX_HARVESTER_SSH_USER", "ubuntu"),
 	})
 	if err != nil {
 		return fmt.Errorf("init manager: %w", err)
