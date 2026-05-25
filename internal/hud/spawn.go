@@ -936,20 +936,26 @@ func buildAgentCommand(agentType, task, agentID string) string {
 		// stderr is suppressed via 2>/dev/null and the HUD-side completeSpawn /
 		// failSpawn will still call EndSession as a fallback.
 		//
-		// --full-auto was deprecated in @openai/codex 0.110+. The next-best
-		// option for a headless agent that must commit AND push is
-		// --sandbox danger-full-access (the codex equivalent of claude-code's
-		// --dangerously-skip-permissions): `workspace-write` blocks network
-		// access for shell commands, so `git push` silently fails inside the
-		// spawn pod and Mills' implement stage produced empty MRs even after
-		// the branch-checkout + workspace-chown fixes (ab6f8446, 5742ae07).
-		// The whole spawn pod is already isolated by K8s; the "danger" name
-		// refers to codex's per-command policy, not the surrounding sandbox.
-		// --skip-git-repo-check lets codex run in the spawn pod's /workspace
-		// clone where the .git dir might be at the working dir rather than a
-		// parent.
+		// --dangerously-bypass-approvals-and-sandbox is the codex equivalent of
+		// claude-code's --dangerously-skip-permissions: it bypasses BOTH the
+		// approval prompts (default approval="auto-edit" auto-approves file
+		// edits but still asks for every shell command — git add/commit/push,
+		// go test, etc.) AND the network-blocking workspace-write sandbox.
+		// Without both bypasses, Mills' implement stage produced empty MRs:
+		//   - --sandbox workspace-write alone: file edits land but `git push`
+		//     hangs/fails because shell commands need approval AND network.
+		//   - --sandbox danger-full-access alone: sandbox is open but codex
+		//     still pauses for approval on every shell command in a headless
+		//     pod where no human is around to type "yes".
+		// The pod itself is already isolated by Kubernetes and runs with a
+		// project-scoped GIT_TOKEN; the "EXTREMELY DANGEROUS" warning in the
+		// flag's help text refers to running codex on a developer workstation,
+		// not in an ephemeral spawn pod. See ab6f8446 / 5742ae07 / 46418c9f
+		// for the earlier coupled fixes.
+		// --skip-git-repo-check lets codex run in the /workspace clone where
+		// the .git directory might be at the working dir rather than a parent.
 		return fmt.Sprintf(
-			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --sandbox danger-full-access --skip-git-repo-check --json %q`,
+			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --json %q`,
 			agentID, task,
 		)
 	case "gemini":

@@ -140,6 +140,41 @@ it's on the default branch of a fresh shallow clone. Even if the
 agent successfully commits, those commits live in a pod-local
 ephemeral checkout that's destroyed when the spawn ends.
 
+## Post-merge verification log (2026-05-25 afternoon)
+
+Continuing the loop after the retro shipped revealed *three* coupled
+spawn-execution bugs, not the single one the diagnosis predicted. Each
+became visible only after the previous one was fixed:
+
+1. **Init container never checked out `req.Branch`** — MR `!525`
+   (`ab6f8446`). Canary `PIPE-MILLS-CANARY-20260525-140741`
+   verified: spawn pod ends on `feat/MILLS-CANARY-…` instead of
+   `main`.
+2. **Workspace cloned as root:0 0644, runtime is uid 1000** — MR
+   `!527` (`5742ae07`). Live evidence: `echo foo >> testdata/mills-
+   canary/heartbeat.md` ⇒ `Permission denied (uid 1000 agent)`.
+   Fix added `umask 002` + `chown -R 1000:1000 <dest>` to the
+   git-clone init script.
+3. **Codex sandbox + approval policy** — MR `!531` (`46418c9f`)
+   moved the flag to `--sandbox danger-full-access`, but the
+   injected `~/.codex/config.toml` still set `approval =
+   "auto-edit"` so codex paused for human approval on every shell
+   command (`git add/commit/push`). MR `!535` switches to
+   `--dangerously-bypass-approvals-and-sandbox` — codex's
+   documented "externally-sandboxed environment" flag and the
+   codex equivalent of claude's `--dangerously-skip-permissions`,
+   which Mills has been using all along on the claude-code path.
+
+Pattern: each fix is necessary but not sufficient; the next gap
+only becomes legible after the previous one no longer blocks the
+agent. The right way to discover the rest was running canaries and
+reading the failure mode each time.
+
+End-to-end auto-merge verification (real diff → real commits on
+origin → CI runs → MWPS auto-merges) is the kill-test for the
+combined fix set; it is gated on MR `!535` building + Flux rolling
+the HUD pod + one more canary.
+
 ## What's worth doing next
 
 Per `.loom/119-…` §1, the coupled fix is:
