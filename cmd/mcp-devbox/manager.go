@@ -59,6 +59,17 @@ type managerConfig struct {
 
 	// Warm pool: pre-provision pods for these projects on startup
 	warmProjects []string
+
+	// Harvester-VM-specific (used when backendType == "harvester-vm").
+	harvesterKubeconfig       string
+	harvesterBaseImage        string
+	harvesterNamespace        string
+	harvesterStorageClass     string
+	harvesterNetworkAttachDef string
+	harvesterDefaultVCPUs     int
+	harvesterDefaultMemMi     int
+	harvesterDefaultDiskGi    int
+	harvesterSSHUser          string
 }
 
 type manager struct {
@@ -213,8 +224,24 @@ func newManager(ctx context.Context, logger *slog.Logger, cfg managerConfig) (*m
 			return nil, err
 		}
 		b = kb
+	case "harvester-vm":
+		hb, err := backend.NewHarvesterVMBackend(backend.HarvesterVMBackendConfig{
+			KubeconfigPath:       cfg.harvesterKubeconfig,
+			Namespace:            cfg.harvesterNamespace,
+			BaseImageName:        cfg.harvesterBaseImage,
+			StorageClassName:     cfg.harvesterStorageClass,
+			NetworkAttachmentDef: cfg.harvesterNetworkAttachDef,
+			DefaultVCPUs:         cfg.harvesterDefaultVCPUs,
+			DefaultMemMi:         cfg.harvesterDefaultMemMi,
+			DefaultDiskGi:        cfg.harvesterDefaultDiskGi,
+			SSHUser:              cfg.harvesterSSHUser,
+		})
+		if err != nil {
+			return nil, err
+		}
+		b = hb
 	default:
-		return nil, fmt.Errorf("unsupported backend: %s (use 'docker' or 'k8s')", cfg.backendType)
+		return nil, fmt.Errorf("unsupported backend: %s (use 'docker', 'k8s', or 'harvester-vm')", cfg.backendType)
 	}
 
 	checkBackendHealth(ctx, logger, b.Health)
