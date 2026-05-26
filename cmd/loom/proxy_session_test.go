@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -315,6 +319,79 @@ func TestProxySessionHeartbeat_Rejected(t *testing.T) {
 	if proxySessionID != "" {
 		t.Fatalf("expected proxySessionID cleared on rejection, got %q", proxySessionID)
 	}
+}
+
+// TestProxySessionHeartbeat_TransportError reproduces the stderr spam regression
+// after a loomd restart: the daemon socket FD held by the proxy goes dead, every
+// keepalive tick hits the dead transport, and a log line gets printed on each
+// tick. The fix clears proxySessionID on transport error, which makes subsequent
+// ticks short-circuit (proxySessionID == "" early-return), so only one log line
+// is emitted per session generation. ensureDaemon() re-opens the session lazily
+// on the next inbound tool call.
+func TestProxySessionHeartbeat_TransportError(t *testing.T) {
+	oldSessionID := proxySessionID
+	oldEpoch := proxyDaemonEpoch
+	oldDisabled := proxySessionDisabled
+	defer func() {
+		proxySessionID = oldSessionID
+		proxyDaemonEpoch = oldEpoch
+		proxySessionDisabled = oldDisabled
+	}()
+
+	proxySessionID = "sess-dead-fd"
+	proxyDaemonEpoch = 1
+	proxySessionDisabled = false
+
+	transport := &sessionStubTransport{
+		sendErr: io.ErrClosedPipe, // simulate dead daemon socket FD
+	}
+
+	stderr := captureStderr(t, func() {
+		// Two ticks back-to-back, mimicking the keepalive ticker after loomd dies.
+		proxySessionHeartbeat(context.Background(), transport)
+		proxySessionHeartbeat(context.Background(), transport)
+	})
+
+	if proxySessionID != "" {
+		t.Fatalf("expected proxySessionID cleared on transport error, got %q", proxySessionID)
+	}
+
+	lines := strings.Count(stderr, "loom proxy: session heartbeat failed")
+	if lines != 1 {
+		t.Fatalf("expected exactly one heartbeat-failed log line per session generation, got %d. stderr:\n%s", lines, stderr)
+	}
+
+	// Second call must short-circuit without touching the transport (only the
+	// first call's send attempt should have been recorded; with sendErr set,
+	// sentMessages stays empty regardless).
+	if got := len(transport.sentMessages); got != 0 {
+		t.Fatalf("expected 0 recorded sends (sendErr path), got %d", got)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	orig := os.Stderr
+	defer func() { os.Stderr = orig }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	fn()
+
+	_ = w.Close()
+	return <-done
 }
 
 func TestProxySessionHeartbeat_Disabled(t *testing.T) {

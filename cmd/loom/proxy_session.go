@@ -62,8 +62,11 @@ func proxyOpenSession(ctx context.Context, transport mcp.Transport) {
 }
 
 // proxySessionHeartbeat sends a keepalive heartbeat to the daemon to extend the
-// session lease. On rejection (expired session or epoch mismatch), the session ID
-// is cleared so the next ensureDaemon() re-opens a fresh session.
+// session lease. On rejection (expired session or epoch mismatch) or transport
+// failure (daemon socket went away — typically a loomd restart), the session ID
+// is cleared so the next ensureDaemon() re-opens a fresh session. Clearing the
+// session also stops the keepalive ticker from re-firing into a dead transport,
+// which inherently rate-limits the stderr log to one line per session generation.
 func proxySessionHeartbeat(ctx context.Context, transport mcp.Transport) {
 	if proxySessionID == "" || proxySessionDisabled {
 		return
@@ -77,6 +80,7 @@ func proxySessionHeartbeat(ctx context.Context, transport mcp.Transport) {
 	resp, err := proxyDaemonRoundTrip(ctx, transport, req, "loom/session/heartbeat")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "loom proxy: session heartbeat failed: %v\n", err)
+		proxySessionID = ""
 		return
 	}
 
