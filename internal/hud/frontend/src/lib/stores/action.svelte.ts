@@ -15,6 +15,19 @@ export interface ActionEntry {
   endedAt: number | null;
   error: string | null;
   retryable: boolean;
+  /** Suppress success-state toasts for this entry. Audit drawer always shows it. */
+  silentSuccess: boolean;
+  /** Suppress error/rollback toasts for this entry. Audit drawer always shows it. */
+  silentError: boolean;
+}
+
+type RetryFn = () => Promise<unknown>;
+
+export interface ActionStartOptions {
+  retryable?: boolean;
+  retry?: RetryFn;
+  silentSuccess?: boolean;
+  silentError?: boolean;
 }
 
 const RING_SIZE = 50;
@@ -27,13 +40,16 @@ function loadInitial(): ActionEntry[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.slice(0, RING_SIZE);
+    // Backfill new fields for entries persisted by older builds.
+    return parsed.slice(0, RING_SIZE).map((e: Partial<ActionEntry>) => ({
+      silentSuccess: false,
+      silentError: false,
+      ...e,
+    })) as ActionEntry[];
   } catch {
     return [];
   }
 }
-
-type RetryFn = () => Promise<unknown>;
 
 class ActionStore {
   entries = $state<ActionEntry[]>(loadInitial());
@@ -54,8 +70,35 @@ class ActionStore {
     return this.entries.filter((e) => e.status === 'error').length;
   }
 
-  /** Allocate an id + record the action start. Returns the id for follow-up. */
-  start(label: string, source: string, retryable = true, retry?: RetryFn): string {
+  /**
+   * Allocate an id + record the action start. Returns the id for follow-up.
+   *
+   * Two call shapes are supported:
+   *   start(label, source)                                 // defaults: retryable, non-silent
+   *   start(label, source, { retry, silentError, ... })   // options form
+   *
+   * The legacy positional form `start(label, source, retryable, retry)` is
+   * still accepted for existing callers (presenceActions, tasks, reasoning).
+   */
+  start(
+    label: string,
+    source: string,
+    retryableOrOpts: boolean | ActionStartOptions = true,
+    retry?: RetryFn,
+  ): string {
+    let retryable = true;
+    let retryFn: RetryFn | undefined = retry;
+    let silentSuccess = false;
+    let silentError = false;
+    if (typeof retryableOrOpts === 'boolean') {
+      retryable = retryableOrOpts;
+    } else {
+      retryable = retryableOrOpts.retryable ?? true;
+      retryFn = retryableOrOpts.retry ?? retry;
+      silentSuccess = retryableOrOpts.silentSuccess ?? false;
+      silentError = retryableOrOpts.silentError ?? false;
+    }
+
     const id = `${this.nextId++}`;
     const entry: ActionEntry = {
       id,
@@ -66,10 +109,12 @@ class ActionStore {
       endedAt: null,
       error: null,
       retryable,
+      silentSuccess,
+      silentError,
     };
     this.entries = [entry, ...this.entries].slice(0, RING_SIZE);
-    if (retry && retryable) {
-      this.retryHandlers.set(id, retry);
+    if (retryFn && retryable) {
+      this.retryHandlers.set(id, retryFn);
       this.retryRegistryVersion++;
       this.evictRetryHandlers();
     }

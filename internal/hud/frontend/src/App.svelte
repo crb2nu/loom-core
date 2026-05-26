@@ -39,6 +39,7 @@
   import OverlayShell from './lib/components/OverlayShell.svelte';
   import Toast from './lib/widgets/Toast.svelte';
   import AuditDrawer from './lib/components/shared/action/AuditDrawer.svelte';
+  import ActionToast from './lib/components/shared/action/ActionToast.svelte';
 
   let showCommandPalette = $state(false);
   let showKeyboardHelp = $state(false);
@@ -536,6 +537,7 @@
   {/if}
 
   <Toast />
+  <ActionToast />
   <AuditDrawer />
 </div>
 {/if}
