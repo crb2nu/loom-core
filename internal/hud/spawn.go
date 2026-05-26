@@ -1648,10 +1648,23 @@ func agentSecretEnvVars(agentType string) []backend.SecretEnvVar {
 			{Name: "ANTHROPIC_API_KEY", SecretName: secretName, SecretKey: "ANTHROPIC_API_KEY"},
 		}
 	case "codex":
-		return []backend.SecretEnvVar{
-			{Name: "OPENAI_API_KEY", SecretName: secretName, SecretKey: "OPENAI_API_KEY"},
-			{Name: "CODEX_API_KEY", SecretName: secretName, SecretKey: "OPENAI_API_KEY"},
-		}
+		// Intentionally do NOT wire OPENAI_API_KEY / CODEX_API_KEY from the
+		// cluster-agent-api-keys secret. The codex CLI treats those env vars
+		// as an override that takes precedence over ~/.codex/auth.json, so a
+		// placeholder value ("PLACEHOLDER" in clusters without a static API
+		// key) silently breaks every codex spawn with `401 Unauthorized:
+		// Incorrect API key provided: PLACEHOLDER`. Mills' canary kept
+		// reaching status=completed with turn_count=1 and an empty MR
+		// because every codex LLM call failed at the auth gate before the
+		// agent could modify the workspace; only the diagnostic JSONL log
+		// in MR !543 made the actual 401 stream visible.
+		//
+		// The OAuth flow via the mounted auth.json (`auth_mode: "chatgpt"`)
+		// is the documented headless path for codex CLI 0.130+. Operators
+		// who genuinely use API-key auth should put the key in auth.json's
+		// `OPENAI_API_KEY` field (codex still honors it there) instead of
+		// going through this env path.
+		return nil
 	case "gemini":
 		return []backend.SecretEnvVar{
 			{Name: "GEMINI_API_KEY", SecretName: secretName, SecretKey: "GEMINI_API_KEY"},

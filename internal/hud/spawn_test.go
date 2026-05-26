@@ -360,7 +360,9 @@ func TestAgentSecretEnvVars_UsesClusterSecret(t *testing.T) {
 		ClusterAgentAPIKeysSecret: true,
 		ClusterAgentAuthSecret:    true,
 	}
-	for _, agentType := range []string{"claude-code", "codex", "gemini"} {
+	// codex intentionally omits API-key env vars to avoid overriding the
+	// mounted auth.json — pinned by TestAgentSecretEnvVars_CodexOmitsAPIKeyEnv.
+	for _, agentType := range []string{"claude-code", "gemini"} {
 		t.Run(agentType, func(t *testing.T) {
 			vars := agentSecretEnvVars(agentType)
 			if len(vars) == 0 {
@@ -373,6 +375,25 @@ func TestAgentSecretEnvVars_UsesClusterSecret(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAgentSecretEnvVars_CodexOmitsAPIKeyEnv pins the regression that
+// every codex spawn under MILLS-CANARY-* produced an empty MR before this
+// fix landed. The codex CLI treats OPENAI_API_KEY as an override that
+// takes precedence over auth.json — so a placeholder secret value
+// ("PLACEHOLDER" in clusters without a static API key) returned
+// `401 Unauthorized: Incorrect API key provided: PLACEHOLDER` from
+// api.openai.com and the agent silently produced no work. The fix is to
+// stop wiring those env vars; codex falls back to the OAuth auth.json
+// mounted at ~/.codex/auth.json by agentSecretMounts.
+func TestAgentSecretEnvVars_CodexOmitsAPIKeyEnv(t *testing.T) {
+	vars := agentSecretEnvVars("codex")
+	for _, v := range vars {
+		if v.Name == "OPENAI_API_KEY" || v.Name == "CODEX_API_KEY" {
+			t.Fatalf("codex must NOT receive %q env (overrides auth.json), got %+v",
+				v.Name, vars)
+		}
 	}
 }
 
