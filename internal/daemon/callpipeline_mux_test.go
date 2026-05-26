@@ -14,6 +14,7 @@ import (
 
 	"github.com/crb2nu/loom/internal/pool"
 	"github.com/crb2nu/loom/internal/router"
+	"github.com/crb2nu/loom/pkg/transport/muxstdio"
 )
 
 // asyncEchoTransport models a stdio server that accepts many in-flight
@@ -304,5 +305,147 @@ func TestMuxCache_EvictClosesMuxAndDrainsPending(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Recv did not return after Evict; mux teardown leaked")
+	}
+}
+
+// TestPerConnTransport_ConcurrentCallersWithCollidingCallerIDs is the
+// regression for the agent_context restart cascade where multiple
+// concurrent callers (e.g. embedded-hud heartbeats) all issued
+// requests with the same JSON-RPC id (id=1 from a fresh initialize)
+// against the same shared mux, causing muxstdio.ErrDuplicateID,
+// which the daemon misinterpreted as subprocess death and
+// triggered a restart cascade.
+//
+// The fix: perConnTransport.Send rewrites the id to a unique
+// internal value before forwarding to the shared mux, and restores
+// the caller's original id on the response. With that, colliding
+// caller ids are routed correctly to their originating conn.
+func TestPerConnTransport_ConcurrentCallersWithCollidingCallerIDs(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.muxStdio = true
+	d.muxCache = newMuxCache(d.logger)
+	t.Cleanup(d.muxCache.CloseAll)
+
+	const callers = 16
+	const delay = 25 * time.Millisecond
+
+	shared := newAsyncEchoTransport(delay)
+	t.Cleanup(func() { _ = shared.Close() })
+
+	mux := d.muxCache.GetOrCreate("collide_test", shared)
+
+	type result struct {
+		respID any
+		err    error
+	}
+	results := make(chan result, callers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn := newPerConnTransport(mux)
+			<-start
+			req := &mcp.Message{
+				JSONRPC: mcp.JSONRPCVersion,
+				// Every caller uses the SAME id, mirroring concurrent
+				// embedded-hud heartbeat retries after a subprocess restart.
+				ID:     int64(1),
+				Method: "tools/list",
+			}
+			if err := conn.Send(context.Background(), req); err != nil {
+				results <- result{err: err}
+				return
+			}
+			resp, err := conn.Recv(context.Background())
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{respID: resp.ID, err: nil}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("concurrent caller with id=1 failed (expected fix #3 to dedup ids): %v", r.err)
+		}
+		// Caller's original id must be restored on the response so the
+		// upstream callpipeline ID-match check (callpipeline_stages.go:433)
+		// passes.
+		if fmt.Sprint(r.respID) != "1" {
+			t.Fatalf("response id = %v (%T), want 1 — perConnTransport did not restore caller id",
+				r.respID, r.respID)
+		}
+		successes++
+	}
+	if successes != callers {
+		t.Fatalf("got %d successful responses, want %d", successes, callers)
+	}
+}
+
+// TestCallPipeline_MuxstdioDuplicateID_DoesNotRestartSubprocess is the
+// classifier regression for fix #2. Even if a duplicate-id error
+// reaches transportFailure (e.g. a future caller that bypasses
+// perConnTransport's id rewriter), the daemon must NOT tear down the
+// subprocess — duplicate-id is a muxer-side state error, not
+// subprocess death. Tearing down the subprocess on duplicate-id is
+// what amplified the 2026-05-25 agent_context cascade.
+func TestCallPipeline_MuxstdioDuplicateID_DoesNotRestartSubprocess(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+
+	d.router = router.New(router.Config{
+		HubEnabled:       false,
+		FailureThreshold: 10,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{Name: "dup_id_srv", Categories: []string{"local-only"}},
+			},
+		},
+	})
+
+	// Mark the server as already running so we can detect whether
+	// the daemon delete it (which would mean it tore down the
+	// subprocess).
+	d.runningServers.Store("dup_id_srv", true)
+
+	dials := 0
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     2,
+		MaxOpen:     2,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			dials++
+			// Fake transport that fails Send with ErrDuplicateID.
+			return &fakeTransport{
+				sendErr: fmt.Errorf("tools/call failed during send: %w", muxstdio.ErrDuplicateID),
+			}, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	msg := newCallMessage(t, map[string]any{
+		"server": "dup_id_srv",
+		"tool":   "check",
+	})
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected error response, got %+v", resp)
+	}
+
+	// Critical assertion: subprocess must NOT have been torn down.
+	// stopServerProc + runningServers.Delete would remove the entry.
+	if _, alive := d.runningServers.Load("dup_id_srv"); !alive {
+		t.Fatal("daemon deleted running server entry on muxstdio.ErrDuplicateID — subprocess was killed when it should have been preserved")
 	}
 }
