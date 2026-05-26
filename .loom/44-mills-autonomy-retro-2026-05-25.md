@@ -170,10 +170,47 @@ only becomes legible after the previous one no longer blocks the
 agent. The right way to discover the rest was running canaries and
 reading the failure mode each time.
 
-End-to-end auto-merge verification (real diff → real commits on
-origin → CI runs → MWPS auto-merges) is the kill-test for the
-combined fix set; it is gated on MR `!535` building + Flux rolling
-the HUD pod + one more canary.
+4. **Codex JSONL was being silently dropped by the parser** — MR
+   `!543` (`1d18cc67`). Diagnostic-only patch: HUD codex parser now
+   logs `item.started` (command + tool), `command_execution` (with
+   exit code + stderr_tail), `file_change` (path + kind),
+   `turn.failed`, and `error` events at INFO/WARN/ERROR. Without
+   this, every spawn pod was reaped immediately on completion and
+   there was no way to see what codex actually tried to do.
+5. **OPENAI_API_KEY=PLACEHOLDER env var overrode auth.json** — MR
+   `!545` (`c4aff279`). The diagnostic log from `!543` made the
+   actual root cause visible:
+
+     ```
+     level=ERROR msg="codex error event"
+       message="unexpected status 401 Unauthorized: Incorrect API
+       key provided: PLACEHOLDER. You can find your API key at
+       https://platform.openai.com/account/api-keys."
+     ```
+
+   Every codex LLM call had been failing at the auth gate for the
+   entire history of the canary, but the spawn marker still went
+   `status=completed` because codex's CLI exited cleanly after its
+   5-retry loop. Root cause: codex CLI treats `OPENAI_API_KEY` env
+   as an override that takes precedence over `~/.codex/auth.json`.
+   The cluster's `cluster-agent-api-keys` secret stores
+   `OPENAI_API_KEY` as the literal string "PLACEHOLDER" because
+   operators use OAuth — but `agentSecretEnvVars` wired the env var
+   anyway. Fix removes the OPENAI_API_KEY / CODEX_API_KEY env
+   wiring for codex; falls back to the mounted auth.json.
+
+Verified live in canary `PIPE-MILLS-CANARY-20260526-015233`: the
+codex error mode changed from `401 PLACEHOLDER` to
+`"Your access token could not be refreshed because your refresh
+token was already used. Please log out and sign in again."` —
+proof that codex is now reading auth.json instead of the env
+override.
+
+The remaining gap to a green end-to-end auto-merge is **operational,
+not code**: the OAuth tokens in `cluster-agent-auth.codex-auth-json`
+are stale. Refreshing requires `codex login` on a workstation with
+the Mills service account → re-encrypt the resulting auth.json into
+the SOPS-managed secret. Outside the scope of this code chain.
 
 ## What's worth doing next
 
