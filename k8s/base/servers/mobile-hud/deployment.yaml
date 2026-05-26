@@ -140,6 +140,16 @@ spec:
                 secretKeyRef:
                   name: loom-secrets
                   key: FLEXINFER_URL
+            # FLEXINFER_URL above is misnamed for historical reasons:
+            # on the canonical cluster it points at the LiteLLM gateway
+            # (litellm.ai.svc.cluster.local) used by the coordinator
+            # and spawn paths. The aimodels domain's flexinfer-models
+            # endpoint needs the FlexInfer proxy directly to surface
+            # model availability badges in the AuditPanel / CouncilPanel
+            # ensemble block, so wire the proxy URL as a separate var.
+            # No secret needed — the in-cluster service URL is public.
+            - name: FLEXINFER_PROXY_URL
+              value: http://flexinfer-proxy.flexinfer-system.svc.cluster.local
             - name: WEAVER_ROUTER_MODEL
               valueFrom:
                 secretKeyRef:
