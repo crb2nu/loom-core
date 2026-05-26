@@ -39,6 +39,7 @@
     maxRows = undefined,
     rowLabel = 'row',
     stableLayout = false,
+    keyboardNav = true,
     onSort,
     onSelect,
     onRowClick,
@@ -48,6 +49,11 @@
   } = $props();
 
   let colSpan = $derived((selectable ? 1 : 0) + columns.length);
+
+  // Keyboard navigation focus. -1 means no row is keyboard-focused; the wrap
+  // itself can still hold DOM focus for shortcut delivery.
+  let wrapEl = $state(null);
+  let focusedIndex = $state(-1);
 
   // Restore persisted sort state on mount (keyed by first column label).
   $effect(() => {
@@ -131,9 +137,66 @@
 
   let allSelected = $derived(rows.length > 0 && selectedIds.size === rows.length);
   let someSelected = $derived(selectedIds.size > 0 && selectedIds.size < rows.length);
+
+  // Keep focusedIndex in range as displayRows mutates (polling, filter, sort).
+  $effect(() => {
+    const max = displayRows.length;
+    if (focusedIndex >= max) focusedIndex = max - 1;
+    if (max === 0) focusedIndex = -1;
+  });
+
+  function scrollFocusedIntoView() {
+    if (focusedIndex < 0 || !wrapEl) return;
+    const row = wrapEl.querySelector(`tr[data-row-index="${focusedIndex}"]`);
+    if (row && typeof row.scrollIntoView === 'function') {
+      row.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+    }
+  }
+
+  function invokeRowAction(rowData) {
+    if (onRowClick) onRowClick(rowData);
+    else if (onToggleExpand) onToggleExpand(rowData);
+  }
+
+  function handleWrapKeydown(e) {
+    if (!keyboardNav) return;
+    if (loading || displayRows.length === 0) return;
+    // Don't hijack typing inside the table (e.g. an inline editor).
+    const tag = e.target?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) return;
+
+    switch (e.key) {
+      case 'j':
+      case 'ArrowDown':
+        e.preventDefault();
+        focusedIndex = focusedIndex < 0 ? 0 : Math.min(focusedIndex + 1, displayRows.length - 1);
+        scrollFocusedIntoView();
+        return;
+      case 'k':
+      case 'ArrowUp':
+        e.preventDefault();
+        focusedIndex = focusedIndex <= 0 ? 0 : focusedIndex - 1;
+        scrollFocusedIntoView();
+        return;
+      case 'Enter':
+        if (focusedIndex >= 0 && focusedIndex < displayRows.length) {
+          e.preventDefault();
+          invokeRowAction(displayRows[focusedIndex]);
+        }
+        return;
+      default:
+        return;
+    }
+  }
 </script>
 
-<div class="data-table-wrap">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+  class="data-table-wrap"
+  bind:this={wrapEl}
+  tabindex={keyboardNav ? 0 : -1}
+  onkeydown={handleWrapKeydown}
+>
   <table class="data-table" class:stable-layout={stableLayout} role="grid">
     <thead>
       <tr>
@@ -185,9 +248,11 @@
         {#each displayRows as rowData, index (rowData[idKey] ?? index)}
           {@const isExpanded = expandedIds.has(rowData[idKey])}
           <tr
+            data-row-index={index}
             class:selected={selectable && selectedIds.has(rowData[idKey])}
             class:clickable={!!onRowClick || !!onToggleExpand}
             class:expanded-row={isExpanded}
+            class:keyboard-focused={focusedIndex === index}
             onclick={() => { if (onRowClick) onRowClick(rowData); else if (onToggleExpand) onToggleExpand(rowData); }}
             onkeydown={(e) => { if ((onRowClick || onToggleExpand) && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); if (onRowClick) onRowClick(rowData); else if (onToggleExpand) onToggleExpand(rowData); } }}
             tabindex={(onRowClick || onToggleExpand) ? 0 : undefined}
@@ -236,6 +301,18 @@
     overflow-x: auto;
     flex: 1;
     min-height: 0;
+    outline: none;
+  }
+
+  .data-table-wrap:focus-visible {
+    box-shadow: inset 0 0 0 2px var(--info);
+    border-radius: var(--radius-sm);
+  }
+
+  .data-table tbody tr.keyboard-focused td {
+    background: rgba(1, 135, 153, 0.15);
+    color: var(--fg-primary);
+    box-shadow: inset 2px 0 0 var(--info);
   }
 
   .data-table {

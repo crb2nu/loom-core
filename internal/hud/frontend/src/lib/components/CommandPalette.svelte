@@ -1,9 +1,15 @@
 <script>
+  import { fleetStore } from '../stores/fleet.svelte.ts';
+  import { taskStore } from '../stores/tasks.svelte.ts';
+  import { spawnStore } from '../stores/spawn.svelte.ts';
+
   let { open = $bindable(false), onclose = () => {}, onselect = () => {} } = $props();
 
   let query = $state('');
   let selectedIndex = $state(0);
   let inputEl = $state(null);
+
+  const ENTITY_CAP = 30;
 
   const panels = [
     { id: 'fleet', label: 'Fleet Overview', category: 'Panels', icon: '\u2637' },
@@ -38,7 +44,71 @@
     { id: 'open-audit-drawer', label: 'Open Recent Actions', category: 'Actions', icon: '\u29C9' },
   ];
 
-  const allItems = [...panels, ...actions];
+  // Recent entities (sessions, tasks, spawns). Pulled at palette-open time
+  // from the existing stores so we don't pay for re-derivation on every
+  // keystroke. Capped at ENTITY_CAP per kind to keep the fuzzy index cheap.
+  let entityItems = $state([]);
+
+  function truncate(str, n) {
+    if (!str) return '';
+    return str.length > n ? str.slice(0, n - 1) + '…' : str;
+  }
+
+  function collectEntities() {
+    const items = [];
+
+    const sessions = fleetStore.sessions ?? [];
+    for (let i = 0; i < Math.min(sessions.length, ENTITY_CAP); i++) {
+      const s = sessions[i];
+      if (!s?.id) continue;
+      const label = truncate(s.description?.trim() || s.namespace || s.id, 80);
+      items.push({
+        id: `session:${s.id}`,
+        label: `${label}  ·  ${s.agent || s.agent_id || '?'}`,
+        category: 'Sessions',
+        icon: '⧉',
+        entity_kind: 'session',
+        detail_id: s.id,
+        target_view: 'fleet',
+      });
+    }
+
+    const tasks = taskStore.tasks ?? [];
+    for (let i = 0; i < Math.min(tasks.length, ENTITY_CAP); i++) {
+      const t = tasks[i];
+      if (!t?.id) continue;
+      const label = truncate(t.title || t.description || t.id, 80);
+      items.push({
+        id: `task:${t.id}`,
+        label: `${label}  ·  ${t.status}/${t.priority}`,
+        category: 'Tasks',
+        icon: '☑',
+        entity_kind: 'task',
+        detail_id: t.id,
+        target_view: 'tasks',
+      });
+    }
+
+    const spawns = spawnStore.spawns ?? [];
+    for (let i = 0; i < Math.min(spawns.length, ENTITY_CAP); i++) {
+      const sp = spawns[i];
+      if (!sp?.spawn_id) continue;
+      const label = truncate(sp.request?.description || sp.spawn_id, 80);
+      items.push({
+        id: `spawn:${sp.spawn_id}`,
+        label: `${label}  ·  ${sp.status}`,
+        category: 'Spawns',
+        icon: '❖',
+        entity_kind: 'spawn',
+        detail_id: sp.spawn_id,
+        target_view: 'spawn',
+      });
+    }
+
+    return items;
+  }
+
+  let allItems = $derived([...panels, ...actions, ...entityItems]);
 
   function fuzzyMatch(str, query) {
     const lower = str.toLowerCase();
@@ -87,11 +157,12 @@
     return Object.entries(groups);
   });
 
-  // Reset on open
+  // Reset on open + snapshot entities so the index is stable for this session.
   $effect(() => {
     if (open) {
       query = '';
       selectedIndex = 0;
+      entityItems = collectEntities();
       // Focus input after mount
       requestAnimationFrame(() => {
         inputEl?.focus();
@@ -153,9 +224,13 @@
     close();
   }
 
-  // Global keyboard listener
+  // Global keyboard listener. Cmd+K and Cmd+P both open this palette; the
+  // two shortcuts coexist with the legacy Cmd+K-only muscle memory while
+  // adding Cmd+P for users coming from Cursor / IntelliJ-style "go to
+  // anything" conventions.
   function handleGlobalKeydown(e) {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    if (!(e.metaKey || e.ctrlKey)) return;
+    if (e.key === 'k' || e.key === 'p') {
       e.preventDefault();
       open = !open;
       if (!open) onclose();
