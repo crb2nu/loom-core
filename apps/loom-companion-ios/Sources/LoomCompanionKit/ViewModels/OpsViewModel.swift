@@ -139,6 +139,7 @@ public final class OpsViewModel {
         case work
         case pipelines
         case runtime
+        case sandbox
         case context
     }
 
@@ -152,6 +153,7 @@ public final class OpsViewModel {
         await loadWorkSection()
         await loadPipelinesSection()
         await loadRuntimeSection()
+        await loadSandboxSection()
         await loadContextSection()
 
         loadedSections = Set(OpsSection.allCases)
@@ -198,7 +200,10 @@ public final class OpsViewModel {
         loadedSections.insert(.pipelines)
     }
 
-    /// Load only data needed by the Runtime section: presence, sandbox, topology, control plane.
+    /// Load only data needed by the Runtime section: presence, topology, control plane.
+    ///
+    /// Sandbox loads independently via `loadSandboxSection()` so the only mobile
+    /// mutation surface (start/stop sandbox) can be its own first-class peek.
     public func loadRuntimeSection() async {
         do {
             let response: MobilePresenceResponse = try await apiClient.request(.presence(limit: 50))
@@ -227,6 +232,12 @@ public final class OpsViewModel {
             controlPlane = nil
         }
 
+        loadedSections.insert(.runtime)
+    }
+
+    /// Load only sandbox/devbox summary. Separate from Runtime so the mutation
+    /// surface (the only one allowed on mobile) renders as its own peek.
+    public func loadSandboxSection() async {
         do {
             let response: MobileSandboxSummary = try await apiClient.request(.sandbox)
             sandboxSummary = response
@@ -234,7 +245,7 @@ public final class OpsViewModel {
             sandboxSummary = nil
         }
 
-        loadedSections.insert(.runtime)
+        loadedSections.insert(.sandbox)
     }
 
     /// Load only data needed by the Context section: memory, stream, graph, reasoning.
@@ -305,6 +316,7 @@ public final class OpsViewModel {
         case .work: await loadWorkSection()
         case .pipelines: await loadPipelinesSection()
         case .runtime: await loadRuntimeSection()
+        case .sandbox: await loadSandboxSection()
         case .context: await loadContextSection()
         }
     }

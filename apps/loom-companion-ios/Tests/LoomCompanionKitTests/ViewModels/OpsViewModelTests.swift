@@ -660,4 +660,79 @@ struct OpsViewModelTests {
         await vm.stopSandbox(project: " ")
         #expect(vm.sandboxMutationError == "Project is required")
     }
+
+    // MARK: - Section decomposition (Sandbox extracted from Runtime)
+
+    @Test("loadRuntimeSection no longer loads sandbox")
+    func runtimeSectionDoesNotLoadSandbox() async {
+        let client = MockAPIClient()
+        client.presenceResponse = MobilePresenceResponse(
+            agents: [],
+            claims: [],
+            worktrees: [],
+            summary: MobilePresenceSummary(activeAgents: 0, idleAgents: 0, offlineAgents: 0, totalAgents: 0, claimCount: 0, worktreeCount: 0)
+        )
+        client.topologyResponse = MobileTopologyResponse(nodes: [], edges: [], clusters: [], updatedAt: "2026-05-25T10:00:00Z")
+        client.controlPlaneResponse = MobileControlPlaneResponse(
+            cost: MobileControlPlaneCost(enabled: false, timestamp: nil, totalCalls: 0, totalErrors: 0, totalDenied: 0, totalCached: 0, totalDurationMs: 0, topAgent: nil, topServer: nil),
+            rbac: MobileControlPlaneRBAC(enabled: false, defaultPolicy: nil, roleCount: 0, bindingCount: 0, globalDenyCount: 0, rateLimitCount: 0, deniedCount: 0),
+            otel: MobileControlPlaneOTel(otlpConfigured: false, otlpEndpoint: nil, jsonLogsEnabled: false, tracedServers: 0, totalServers: 0, traceCoverage: nil),
+            health: MobileControlPlaneHealth(totalServers: 0, healthyServers: 0, degradedServers: 0, downServers: 0, idleServers: 0, hubTargets: 0, localTargets: 0, unavailableTargets: 0)
+        )
+        // Sandbox response intentionally configured but should NOT be fetched by loadRuntimeSection.
+        client.sandboxResponse = MobileSandboxSummary(
+            available: true,
+            projects: [MobileSandboxProject(project: "loom-core", status: "running", agentId: "codex", uptime: "1m", backend: "k8s")],
+            totalRunning: 1,
+            backend: "k8s"
+        )
+
+        let vm = OpsViewModel(apiClient: client)
+        await vm.loadRuntimeSection()
+
+        #expect(vm.loadedSections.contains(.runtime))
+        #expect(vm.loadedSections.contains(.sandbox) == false)
+        #expect(vm.sandboxSummary == nil)
+    }
+
+    @Test("loadSandboxSection loads only sandbox state")
+    func sandboxSectionLoadsSandboxOnly() async {
+        let client = MockAPIClient()
+        client.sandboxResponse = MobileSandboxSummary(
+            available: true,
+            projects: [MobileSandboxProject(project: "loom-core", status: "running", agentId: "codex", uptime: "1m", backend: "k8s")],
+            totalRunning: 1,
+            backend: "k8s"
+        )
+
+        let vm = OpsViewModel(apiClient: client)
+        await vm.loadSandboxSection()
+
+        #expect(vm.loadedSections.contains(.sandbox))
+        #expect(vm.loadedSections.contains(.runtime) == false)
+        #expect(vm.sandboxSummary?.totalRunning == 1)
+        #expect(vm.sandboxSummary?.projects.first?.project == "loom-core")
+        // Runtime-owned state stays empty because that section wasn't loaded.
+        #expect(vm.presenceAgents.isEmpty)
+        #expect(vm.topology == nil)
+        #expect(vm.controlPlane == nil)
+    }
+
+    @Test("loadSectionIfNeeded routes .sandbox to loadSandboxSection")
+    func loadSectionIfNeededRoutesSandbox() async {
+        let client = MockAPIClient()
+        client.sandboxResponse = MobileSandboxSummary(available: false, projects: [], totalRunning: 0, backend: "unknown")
+
+        let vm = OpsViewModel(apiClient: client)
+        await vm.loadSectionIfNeeded(.sandbox)
+
+        #expect(vm.loadedSections.contains(.sandbox))
+        #expect(vm.sandboxSummary?.available == false)
+
+        // Second call is a no-op because the section is already loaded.
+        client.sandboxResponse = MobileSandboxSummary(available: true, projects: [], totalRunning: 5, backend: "k8s")
+        await vm.loadSectionIfNeeded(.sandbox)
+        #expect(vm.sandboxSummary?.available == false)
+        #expect(vm.sandboxSummary?.totalRunning == 0)
+    }
 }
