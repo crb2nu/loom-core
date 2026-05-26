@@ -17,7 +17,6 @@
 // and the action is recorded as error with the message.
 
 import { actionStore } from '../stores/action.svelte.ts';
-import { toastStore } from '../stores/toasts.svelte.ts';
 
 export interface ActionConfig<T> {
   /** Human-readable label shown in toast + audit drawer. */
@@ -86,7 +85,12 @@ export function useAction<T = unknown>(config: ActionConfig<T>): ActionHandle<T>
     pending = true;
     error = null;
 
-    const id = actionStore.start(config.label, config.source, !config.nonRetryable, invoke);
+    const id = actionStore.start(config.label, config.source, {
+      retryable: !config.nonRetryable,
+      retry: invoke,
+      silentSuccess: !!config.silentSuccess,
+      silentError: !!config.silentError,
+    });
     currentId = id;
 
     if (config.optimistic) {
@@ -101,7 +105,6 @@ export function useAction<T = unknown>(config: ActionConfig<T>): ActionHandle<T>
       }
       lastResult = result;
       actionStore.succeed(id);
-      if (!config.silentSuccess) toastStore.success(`${config.label} ✓`);
       return result;
     } catch (e) {
       const msg = await extractErrorMessage(e);
@@ -111,7 +114,6 @@ export function useAction<T = unknown>(config: ActionConfig<T>): ActionHandle<T>
         try { config.rollback(); } catch { /* rollback best-effort */ }
         actionStore.markRolledBack(id);
       }
-      if (!config.silentError) toastStore.error(`${config.label} failed: ${msg}`);
       return undefined;
     } finally {
       pending = false;
