@@ -5,11 +5,21 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 
 	"github.com/crb2nu/loom/pkg/transport/muxstdio"
 )
+
+// perConnNextInternalID is the daemon-wide monotonic source for the
+// per-conn internal JSON-RPC ids the perConnTransport stamps on outgoing
+// messages before they reach the shared muxstdio.Transport. Allocating
+// a unique id per Send guarantees concurrent perConnTransports cannot
+// collide on the shared mux's pending map (which would surface as
+// muxstdio.ErrDuplicateID and trigger an unnecessary subprocess
+// restart cascade).
+var perConnNextInternalID atomic.Int64
 
 // muxCache owns one *muxstdio.Transport per local serverName. The cache is
 // the authoritative owner of each mux's lifetime: every pool.Conn for the
@@ -88,10 +98,18 @@ func (c *muxCache) CloseAll() {
 
 // perConnTransport gives each pool.Conn a "single-call" view over the
 // shared muxstdio.Transport for one serverName. The pipeline's call shape
-// is Send-then-Recv on the same Conn, so the wrapper just remembers the
-// id stamped on the most recent Send and replays it to mux.Recv.
+// is Send-then-Recv on the same Conn.
 //
-// Why this exists:
+// To prevent concurrent perConnTransports from colliding on the shared
+// mux's pending-id map (which would surface as muxstdio.ErrDuplicateID
+// and amplify a transient outage into a subprocess restart cascade), Send
+// rewrites the outgoing message id to a process-unique value drawn from
+// perConnNextInternalID and remembers the caller's original id. Recv
+// waits on the internal id and restores the caller's id on the response
+// so the upstream callpipeline's request/response id match still holds
+// (see callpipeline_stages.go:433).
+//
+// Why this wrapper exists:
 //   - muxstdio.Transport.Recv is id-aware (Recv(ctx, id)), but mcp.Transport
 //     and the daemon pipeline are not — they call Transport.Recv(ctx).
 //   - kitpool calls Transport.Close on unhealthy Put and on idle-pool
@@ -106,8 +124,9 @@ func (c *muxCache) CloseAll() {
 type perConnTransport struct {
 	mux *muxstdio.Transport
 
-	mu     sync.Mutex
-	lastID any
+	mu         sync.Mutex
+	callerID   any   // original id from the upstream caller; restored on Recv
+	internalID int64 // unique id stamped onto the shared mux for routing
 }
 
 func newPerConnTransport(mux *muxstdio.Transport) *perConnTransport {
@@ -118,14 +137,25 @@ func (p *perConnTransport) Send(ctx context.Context, msg *mcp.Message) error {
 	if msg == nil {
 		return fmt.Errorf("muxstdio: nil message")
 	}
+
+	internal := perConnNextInternalID.Add(1)
+	// Shallow copy so we don't mutate the caller's message; only the ID
+	// field is rewritten. Params/Result/Error byte slices and pointer
+	// fields remain shared, which is safe because they are not mutated.
+	rewritten := *msg
+	rewritten.ID = internal
+
 	p.mu.Lock()
-	p.lastID = msg.ID
+	p.callerID = msg.ID
+	p.internalID = internal
 	p.mu.Unlock()
-	if err := p.mux.Send(ctx, msg); err != nil {
-		// Send failed, no pending entry to wait on; clear lastID so a
+
+	if err := p.mux.Send(ctx, &rewritten); err != nil {
+		// Send failed, no pending entry to wait on; clear state so a
 		// follow-up Recv on this Conn does not block on a phantom id.
 		p.mu.Lock()
-		p.lastID = nil
+		p.callerID = nil
+		p.internalID = 0
 		p.mu.Unlock()
 		return err
 	}
@@ -134,13 +164,24 @@ func (p *perConnTransport) Send(ctx context.Context, msg *mcp.Message) error {
 
 func (p *perConnTransport) Recv(ctx context.Context) (*mcp.Message, error) {
 	p.mu.Lock()
-	id := p.lastID
-	p.lastID = nil
+	callerID := p.callerID
+	internalID := p.internalID
+	p.callerID = nil
+	p.internalID = 0
 	p.mu.Unlock()
-	if id == nil {
+	if callerID == nil {
 		return nil, fmt.Errorf("muxstdio: Recv without preceding Send on this conn")
 	}
-	return p.mux.Recv(ctx, id)
+	resp, err := p.mux.Recv(ctx, internalID)
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil {
+		// Restore the caller's original id; the upstream callpipeline
+		// asserts resp.ID == req.ID for transport-corruption defense.
+		resp.ID = callerID
+	}
+	return resp, nil
 }
 
 func (p *perConnTransport) Close() error { return nil }

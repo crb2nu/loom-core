@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/crb2nu/loom/internal/router"
+	"github.com/crb2nu/loom/pkg/transport/muxstdio"
 )
 
 // decompHintTokenThreshold is the estimated token count above which a
@@ -44,6 +46,26 @@ func (p *callPipeline) transportFailure(stage string, err error, start time.Time
 		p.daemon.logger.Warn("local server recv timed out; subprocess kept alive",
 			"server", p.serverName, "tool", p.toolName, "error", err)
 		p.recordTransportSpanEvent("daemon.server.recv_timeout_no_restart",
+			attribute.String("server.name", p.serverName),
+			attribute.String("failure.stage", stage),
+			attribute.String("failure.error", err.Error()),
+			attribute.String("target", p.targetStr),
+		)
+		return p.internalError(err)
+	}
+
+	// muxstdio.ErrDuplicateID means another concurrent caller registered
+	// the same JSON-RPC id on the shared mux before we did. The subprocess
+	// is alive — the failure is purely muxer-side state. Killing the
+	// subprocess in response amplifies a transient collision into the
+	// restart cascade seen on 2026-05-25. perConnTransport rewrites ids
+	// to unique internal values so this normally cannot happen, but the
+	// classifier remains as defense-in-depth for any caller that bypasses
+	// the rewriter.
+	if p.target == router.TargetLocal && errors.Is(err, muxstdio.ErrDuplicateID) {
+		p.daemon.logger.Warn("local server muxer rejected duplicate id; subprocess kept alive",
+			"server", p.serverName, "tool", p.toolName, "error", err)
+		p.recordTransportSpanEvent("daemon.server.muxer_duplicate_id_no_restart",
 			attribute.String("server.name", p.serverName),
 			attribute.String("failure.stage", stage),
 			attribute.String("failure.error", err.Error()),
