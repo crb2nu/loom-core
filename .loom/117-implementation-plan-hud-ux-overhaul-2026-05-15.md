@@ -1,8 +1,36 @@
 # Implementation Plan — HUD UI/UX Overhaul (2026-05-15)
 
 Companion: [115-brainstorm-hud-ux-improvements-2026-05-15.md](115-brainstorm-hud-ux-improvements-2026-05-15.md), [116-product-spec-hud-ux-overhaul-2026-05-15.md](116-product-spec-hud-ux-overhaul-2026-05-15.md)
-Status: proposed
-Cycle: 2026-05-15 → ~2026-06-12
+Status: ✅ shipped (2026-05-15 → 2026-05-26)
+Cycle: 2026-05-15 → ~2026-06-12 (closed 16 days ahead)
+
+## Status (2026-05-26)
+
+All 10 sub-slices merged to `main`. Plan closed.
+
+| Slice | Status | Ship commit / MR |
+|---|---|---|
+| A1 — Action Toolkit Primitives | ✅ shipped | `4c46f44f` + `11f75bd2` (`feat(hud): action toolkit primitives + HUD UX overhaul plan`) plus ActionToast follow-up `8c0eca5e` |
+| A2 — Triage Overview Rebuild | ✅ shipped | `406890a1` (`feat(hud): triage overview rebuild — operator inbox`) — `overview/{HeroSummary,InboxDeck,InboxCard,InstrumentStrip,SupportingStrip}.svelte`; iOS counterpart `97cd1f4c` |
+| A3 — Theme Sweep (F4-full) | ✅ shipped | `cd8cfd28` (`feat(hud): theme sweep — alerts-only glow + flat panel wash + unified agent palette`) |
+| A4 — Slice A Merge + Soak | ✅ closed via this MR | docs-only wrap; A1/A2/A3 soaked individually on mobile-hud + dev-local HUD |
+| B1 — Decomp Pattern + Canary (FleetPanel) | ✅ shipped | `b75f6c1c` (`feat(hud): FleetPanel decomp + panel decomposition pattern`) — `FleetPanel.svelte` 1777 → **176 lines** |
+| B2 — Decompose Remaining Panels | ✅ shipped | B2.1 SpawnPanel `abe7c167` (→48), B2.2 ServersPanel `1a98acec` (→125), B2.3 TasksPanel `1aebb573` (→290), B2.4 SandboxPanel `cab43b29` (→41), B2.5 GraphPanel `ae29b152` (→21). All five <300 lines. |
+| B3 — SSE Migration | ✅ shipped | `df180795` (`feat(hud): SSE migration across decomposed stores`) + closeout `4baba66b` (`feat(hud): stream store joins staleness tracking + B3 closeout`) |
+| B4 — Keyboard Nav + Cmd+P | ✅ shipped | `556c6f95` (`feat(hud): Cmd+P palette + DataTable j/k/Enter nav`) |
+| B5 — Responsive Reflow + Embed Subset | ✅ shipped | `86b77505` (`feat(hud): responsive layout + operator embed subset`) |
+| B6 — Slice B Merge + Cross-Panel Soak | ✅ closed via this MR | docs-only wrap; each B1–B5 sub-slice soaked individually |
+
+**Definition-of-Done evidence** (see Cross-Slice Validation Commands below):
+- `wc -l internal/hud/frontend/src/lib/components/{Fleet,Tasks,Sandbox,Spawn,Servers,Graph}Panel.svelte` — all <300 (176/290/41/48/125/21).
+- `OverviewPanel.svelte` 435 lines (<500 target).
+- Six panel stores wired for SSE + staleness (fleet/tasks/sandbox/spawn/servers/stream).
+- ConnectionBanner surfaces "stale" pill for silent SSE failures.
+- `loom hud --embed --subset operator` filters nav to Overview + Operations + Activity only.
+
+**Remaining follow-ups (out of plan scope)** — not Slice-A/B blockers, recorded for tracking:
+- OverviewPanel still starts 8 secondary stores (`memoryStore`/`costStore`/`rbacStore`/`coordinationStore`/`mergeQueueStore`/`shuttleStore`/`millsStore`/`otelStore`) at 30s polling; aligning to ≥60s is a candidate follow-up if dashboard request volume proves noisy.
+- F6 IA reorg explicitly deferred per the brainstorm; no spec yet.
 
 ## Execution Order
 
@@ -24,7 +52,7 @@ Each lettered sub-slice ends with `pnpm build && pnpm lint && go test ./internal
 
 ## Slice A — Operator Inbox
 
-### A1 — Action Toolkit Primitives
+### A1 — Action Toolkit Primitives ✅ SHIPPED
 
 **Files to add / change**
 
@@ -41,7 +69,7 @@ Each lettered sub-slice ends with `pnpm build && pnpm lint && go test ./internal
 - Visual smoke: open `OverviewPanel`, trigger one stub action, see Toast → see entry in AuditDrawer → click retry.
 - `pnpm build && pnpm lint` clean.
 
-### A2 — Triage Overview Rebuild
+### A2 — Triage Overview Rebuild ✅ SHIPPED
 
 **Files to add**
 
@@ -78,7 +106,7 @@ Each lettered sub-slice ends with `pnpm build && pnpm lint && go test ./internal
   - All cards empty → "System nominal" empty state.
 - `wc -l internal/hud/frontend/src/lib/components/OverviewPanel.svelte` < 500.
 
-### A3 — Theme Sweep (F4-full)
+### A3 — Theme Sweep (F4-full) ✅ SHIPPED
 
 **Files to change**
 
@@ -93,7 +121,7 @@ Each lettered sub-slice ends with `pnpm build && pnpm lint && go test ./internal
 - A11y: contrast remains AA on alert states; check with browser devtools.
 - `pnpm build` clean.
 
-### A4 — Slice A Merge + Soak
+### A4 — Slice A Merge + Soak ✅ CLOSED
 
 - Squash A1+A2+A3 if shipped together, or ship as separate MRs with the action-toolkit MR landing first.
 - Update `.loom/00-index.md` with brainstorm + spec + plan links.
@@ -104,7 +132,7 @@ Each lettered sub-slice ends with `pnpm build && pnpm lint && go test ./internal
 
 ## Slice B — Foundations
 
-### B1 — Decomp Pattern + Canary (FleetPanel)
+### B1 — Decomp Pattern + Canary (FleetPanel) ✅ SHIPPED
 
 **Pattern doc:** Add `docs/HUD_PANEL_DECOMP.md` (short — under 100 lines). Defines:
 
@@ -125,7 +153,7 @@ Each lettered sub-slice ends with `pnpm build && pnpm lint && go test ./internal
 - `pnpm build && pnpm lint && go test ./internal/hud/...` clean.
 - Bookmark URL `#agents/fleet` still resolves; `#agents/fleet/<sessionId>` still drills.
 
-### B2 — Decompose Remaining Panels
+### B2 — Decompose Remaining Panels ✅ SHIPPED
 
 Apply the B1 pattern to:
 
@@ -171,7 +199,7 @@ plan only requires the five decomposed panel stores at ≥60 s; the secondary
 stores can be aligned in a follow-up slice if dashboard request volume
 proves noisy.
 
-### B4 — Keyboard Nav + Cmd+P
+### B4 — Keyboard Nav + Cmd+P ✅ SHIPPED
 
 **Files to change**
 
@@ -185,7 +213,7 @@ proves noisy.
 - `Cmd+P`, type partial route/session id, Enter → navigates.
 - `?` help overlay updated to list new keys.
 
-### B5 — Responsive Reflow + Embed Subset
+### B5 — Responsive Reflow + Embed Subset ✅ SHIPPED
 
 **Responsive (≤800 px)**
 
@@ -205,7 +233,7 @@ proves noisy.
 - Mobile viewport (iPhone 17): Overview → Fleet → Stream all legible without horizontal scroll.
 - Backend test: `internal/hud/embed_test.go` covers subset allowlist.
 
-### B6 — Slice B Merge + Cross-Panel Soak
+### B6 — Slice B Merge + Cross-Panel Soak ✅ CLOSED
 
 - Confirm five panels all <300 lines.
 - Update `docs/HUD_PANEL_DECOMP.md` with any pattern adjustments learned during decomp.

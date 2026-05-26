@@ -61,6 +61,12 @@ MCP is now the de facto standard for AI-tool integration (8M+ downloads, 5,800+ 
   - Skill registry updates ([!295](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/295), [!296](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/296)) teach feature-dev/bugfix/repo-intake skills to consume the new signals.
   - 27 stranded codex branches across the workspace pushed to origin (no work lost). 52 dead worktrees swept (~1.3 GB reclaimed).
 
+- ✅ **HUD UI/UX overhaul — Slice A (Operator Inbox) + Slice B (Foundations), 2026-05-15 → 2026-05-26 (closed 16d ahead of plan)**
+  - Plan: [`.loom/117-implementation-plan-hud-ux-overhaul-2026-05-15.md`](.loom/117-implementation-plan-hud-ux-overhaul-2026-05-15.md) (brainstorm `115`, spec `116`).
+  - **Slice A — Operator Inbox**: A1 action toolkit primitives (`useAction`, `actionStore`, `ActionToast`, `AuditDrawer`, `ErrorCard`); A2 triage overview rebuild (`HeroSummary` / `InboxDeck` / `InboxCard` / `InstrumentStrip` / `SupportingStrip` extracted from `OverviewPanel`); A3 theme sweep — alerts-only glow + flat panel wash + unified agent palette.
+  - **Slice B — Foundations**: B1 FleetPanel decomp + pattern doc (`docs/HUD_PANEL_DECOMP.md`) — 1777 → 176 lines; B2 remaining-panel decomps — `SpawnPanel`→48, `ServersPanel`→125, `TasksPanel`→290, `SandboxPanel`→41, `GraphPanel`→21 (all <300); B3 SSE migration — six panel stores (fleet/tasks/sandbox/spawn/servers/stream) wired with `staleAfter` + `isStale` + `stalenessStore.register`, ConnectionBanner stale pill catches silent SSE failures; B4 Cmd+P fuzzy palette + DataTable j/k/Enter navigation; B5 responsive layout at ≤800px (bottom-fixed nav, stacked DataTable cards, full-screen DetailDrawer) + `loom hud --embed --subset operator` (gates to Overview/Operations/Activity at backend register time + frontend route guard).
+  - F6 IA reorg explicitly deferred at brainstorm time; no follow-up spec.
+
 - ✅ **HUD UI/UX overhaul (M1-M4 complete)**
   - Shipped design system foundation: tokens, type scale, spacing scale, elevation (`tokens.ts`, `theme.css`).
   - Shipped shared primitives: `PanelShell`, `DataTable`, `FilterBar`, `DetailDrawer`, `EmptyState`, `MetricCard`.
