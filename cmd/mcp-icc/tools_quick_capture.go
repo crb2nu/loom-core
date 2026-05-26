@@ -103,6 +103,7 @@ func makeQuickCaptureHandler(icc *iccclient.Client) iccToolHandler {
 			body["session_id"] = sessionID
 		}
 
+		ctx = iccclient.WithTool(ctx, "icc_quick_capture")
 		_, result, err := postJSON[json.RawMessage](ctx, icc, "/api/artifacts", body)
 		if err != nil {
 			return mcp.ErrorResult(fmt.Errorf("quick_capture: %w", err)), nil

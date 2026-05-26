@@ -107,7 +107,7 @@ func (c *Client) Post(ctx context.Context, path string, body any) (int, []byte, 
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request: %w", err)
 	}
-	c.setTrustedContextHeaders(req)
+	c.setTrustedContextHeaders(ctx, req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -149,7 +149,7 @@ func (c *Client) Get(ctx context.Context, path string, query map[string]string) 
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request: %w", err)
 	}
-	c.setTrustedContextHeaders(req)
+	c.setTrustedContextHeaders(ctx, req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -164,13 +164,44 @@ func (c *Client) Get(ctx context.Context, path string, query map[string]string) 
 	return resp.StatusCode, respBody, nil
 }
 
+// toolKey is the unexported context key used to thread the MCP tool
+// name through to setTrustedContextHeaders. Per-request attribution
+// is opt-in: handlers that want the X-ICC-MCP-Tool header set must
+// call WithTool on their context before invoking Post/Get/etc.
+type toolKey struct{}
+
+// WithTool returns a derived context carrying the MCP tool name so
+// the next outbound ICC request includes X-ICC-MCP-Tool: <name>.
+// Empty names are dropped; the backend reads this header to populate
+// the icc_mcp_writes_total{tool,outcome} metric. See
+// services/project-management/docs/connectors.md §"MCP Write Path".
+func WithTool(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, toolKey{}, name)
+}
+
+// toolFromContext extracts the tool name set by WithTool, or "" when
+// the caller did not opt in.
+func toolFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(toolKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // setTrustedContextHeaders applies the three headers the ICC backend's
-// origin gate accepts. Kept in one place so future hardening (e.g.
-// HMAC) has a single seam to extend.
-func (c *Client) setTrustedContextHeaders(req *http.Request) {
+// origin gate accepts, plus the per-tool attribution header when the
+// context carries a tool name. Kept in one place so future hardening
+// (e.g. HMAC) has a single seam to extend.
+func (c *Client) setTrustedContextHeaders(ctx context.Context, req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "integration-command-center")
 	req.Header.Set("Origin", c.baseURL)
+	if tool := toolFromContext(ctx); tool != "" {
+		req.Header.Set("X-ICC-MCP-Tool", tool)
+	}
 }
 
 // Envelope is the standard ICC response envelope:

@@ -16,7 +16,7 @@ import (
 // either way so the tool list stays stable across the gate setting.
 //
 // Tool counts to maintain in sync with README + registry entry:
-//   - 20 read tools
+//   - 23 read tools (22 GET-shaped + 1 POST-shaped composer)
 //   - 16 write tools (10 create + 4 update + 5 transition + others)
 //   - 1 convenience tool (icc_quick_capture)
 func registerTools(srv *mcpscaffold.Server, icc *iccclient.Client, writesEnabled bool) {
@@ -133,17 +133,34 @@ func registerReadTools(srv *mcpscaffold.Server, icc *iccclient.Client) {
 
 	srv.AddTracedTool(mcp.Tool{
 		Name:        "icc_code_ref_list",
-		Description: "List code_refs (raw notes / file pointers) with optional filters. Backed by /api/code/refs.",
-		InputSchema: listToolSchema("project_id", "kind", "classification", "limit"),
+		Description: "List code_refs (raw notes / file pointers) with optional filters. Triage helpers (icc-triage-loop): pass unpromoted=true to return only refs with no artifact_code_refs link; pass unattributed=true to return only refs assigned to the _inbox sentinel project; pass classification to narrow to one floor. Backed by /api/code/refs.",
+		InputSchema: listToolSchema("project_id", "workstream_id", "vendor_id", "kind",
+			"classification", "unpromoted", "unattributed", "limit"),
 	}, makeListReader(icc, "code_ref_list", "/api/code/refs",
-		"project_id", "kind", "classification", "limit"))
+		"project_id", "workstream_id", "vendor_id", "kind",
+		"classification", "unpromoted", "unattributed", "limit"))
 
 	srv.AddTracedTool(mcp.Tool{
 		Name:        "icc_session_link_list",
-		Description: "List session_links (agent session → artifact/ref bindings). Backed by /api/sessions.",
-		InputSchema: listToolSchema("project_id", "agent_id", "session_id", "limit"),
+		Description: "List session_links (agent session → artifact/ref bindings). Triage helpers (icc-triage-loop): pass unpromoted=true to return only session_links with no non-deleted capture_session artifact pointing back via source_system_id; pass unattributed=true to return only session_links assigned to the _inbox sentinel project. Backed by /api/sessions.",
+		InputSchema: listToolSchema("project_id", "agent", "active_only",
+			"unpromoted", "unattributed"),
 	}, makeListReader(icc, "session_link_list", "/api/sessions",
-		"project_id", "agent_id", "session_id", "limit"))
+		"project_id", "agent", "active_only", "unpromoted", "unattributed"))
+
+	srv.AddTracedTool(mcp.Tool{
+		Name:        "icc_artifact_list",
+		Description: "List active artifacts with structured filters (project_id, vendor_id, source_type, classification, limit). Distinct from icc_search (FTS over title + summary + evidence): use this when you want every artifact in a project or every artifact at a classification floor without composing a search query. Backed by GET /api/artifacts.",
+		InputSchema: listToolSchema("project_id", "vendor_id", "source_type",
+			"classification", "limit"),
+	}, makeListReader(icc, "artifact_list", "/api/artifacts",
+		"project_id", "vendor_id", "source_type", "classification", "limit"))
+
+	srv.AddTracedTool(mcp.Tool{
+		Name:        "icc_inbox_summary",
+		Description: "One-call aggregate of what's untriaged: per-project counts of unpromoted code_refs + un-promoted session_links + active _inbox artifacts, plus workspace-wide totals. Drives the 'morning loop' inbox count and the 'where should I start triaging' decision. Read-only. Backed by GET /api/inbox/summary.",
+		InputSchema: mcp.InputSchema{Type: "object", Properties: map[string]any{}},
+	}, makeListReader(icc, "inbox_summary", "/api/inbox/summary"))
 
 	// Single-entity GET.
 	srv.AddTracedTool(mcp.Tool{
@@ -176,6 +193,14 @@ func registerReadTools(srv *mcpscaffold.Server, icc *iccclient.Client) {
 		Description: "Workspace-wide rollup of items that need a human (overdue action items, at-risk milestones, etc). Backed by /api/needs-attention.",
 		InputSchema: mcp.InputSchema{Type: "object", Properties: map[string]any{}},
 	}, makeNeedsAttentionHandler(icc))
+
+	// Status-draft composer (SD-1/SD-2/SD-EA). Read-shaped but uses
+	// POST because the backend takes a JSON body.
+	srv.AddTracedTool(mcp.Tool{
+		Name:        "icc_draft_status_compose",
+		Description: "Compose a per-project (or per-vendor) Status Draft with the SD-1 'Since X' / SD-2 'Current state' / SD-EA 'Evidence added' sections, plus rendered markdown. Same surface as `iccctl drafts` and the SPA Status Draft modal. Backed by POST /api/drafts/status. Read-shaped — no writes_disabled gate.",
+		InputSchema: draftStatusComposeSchema(),
+	}, makeDraftStatusComposeHandler(icc))
 }
 
 // registerWriteTools wires up the ~16 write tools. Every handler is
@@ -330,7 +355,7 @@ func registerWriteTools(srv *mcpscaffold.Server, icc *iccclient.Client, writesEn
 
 	srv.AddTracedTool(mcp.Tool{
 		Name:        "icc_artifact_reclassify",
-		Description: "Change an artifact's classification floor (e.g. possible_phi → confirmed_phi). Payload: id, classification, reason. Gated behind ICC_MCP_WRITE_ENABLED.",
+		Description: "Change an artifact's classification floor (e.g. possible_phi → confirmed_phi). Payload: artifact_id, classification, reason. Response carries already_classified=true on no-op (prior == new) and already_classified=false on a real change — use this to render idempotent operator confirmations without comparing timestamps. Gated behind ICC_MCP_WRITE_ENABLED.",
 		InputSchema: payloadSchema("Artifact reclassify payload"),
 	}, gated(makeCreateHandler(icc, "artifact_reclassify", "/api/artifacts/reclassify")))
 

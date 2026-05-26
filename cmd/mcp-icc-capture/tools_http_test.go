@@ -55,6 +55,43 @@ func writeJSON(t *testing.T, w http.ResponseWriter, status int, payload any) {
 	}
 }
 
+// --- withTool wrapper ---------------------------------------------------
+
+// TestWithTool_SetsHeaderForCaptureHandler verifies the registration-time
+// withTool wrapper attaches X-ICC-MCP-Tool to outbound iccclient requests.
+// One representative test is enough — the wrapper is identical across all
+// 13 registrations in tools.go.
+func TestWithTool_SetsHeaderForCaptureHandler(t *testing.T) {
+	var seenHeaders http.Header
+	_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenHeaders = r.Header.Clone()
+		writeJSON(t, w, http.StatusCreated, map[string]any{
+			"ok": true,
+			"result": map[string]any{
+				"code_ref":     map[string]any{"id": "cref_1"},
+				"artifact":     map[string]any{"id": "art_1"},
+				"path_written": "/ws/x.md",
+			},
+		})
+	})
+
+	handler := withTool("icc_write_capture", makeWriteCaptureHandler(icc))
+	_, err := handler(context.Background(), map[string]any{
+		"project_id":     "prj_abc",
+		"source":         "slack",
+		"markdown":       "---\nproject: x\n---\n\n# body",
+		"suggested_path": "/ws/x.md",
+		"mode":           "both",
+		"title":          "X",
+	})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if got := seenHeaders.Get("X-ICC-MCP-Tool"); got != "icc_write_capture" {
+		t.Fatalf("expected X-ICC-MCP-Tool=icc_write_capture, got %q", got)
+	}
+}
+
 // --- icc_write_capture ---------------------------------------------------
 
 func TestWriteCapture_HappyPathModeBoth(t *testing.T) {
