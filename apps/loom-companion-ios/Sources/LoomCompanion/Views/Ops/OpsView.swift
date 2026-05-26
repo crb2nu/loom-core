@@ -6,13 +6,16 @@ import LoomCompanionKit
 /// The previous layout used a 4-way segmented picker (Queue / Pipelines /
 /// Runtime / Context) that treated all four as equals. In practice, Queue is
 /// the critical path — pending tasks, blockers, approvals. Pipelines, Runtime,
-/// and Context are supporting context: useful when triaging, noise otherwise.
+/// Sandbox, and Context are supporting context: useful when triaging, noise
+/// otherwise.
 ///
 /// New layout:
 ///   1. Queue section renders at the top of the scroll, always visible.
-///   2. Three DisclosureGroups below (Pipelines, Runtime, Context) with a
-///      summary line — expand inline to peek without losing Queue context.
+///   2. Four DisclosureGroups below (Pipelines, Runtime, Sandbox, Context) with
+///      a summary line — expand inline to peek without losing Queue context.
 ///   3. Sections load lazily on first expand + on pull-to-refresh when open.
+///   4. Sandbox is its own peek because it's the only mobile mutation surface
+///      and deserves first-class IA, not buried inside Runtime.
 struct OpsView: View {
     @State private var viewModel: OpsViewModel
     @Binding private var deepLinkWorkflowID: String?
@@ -27,6 +30,7 @@ struct OpsView: View {
 
     @State private var expandedPipelines = false
     @State private var expandedRuntime = false
+    @State private var expandedSandbox = false
     @State private var expandedContext = false
 
     init(
@@ -76,6 +80,17 @@ struct OpsView: View {
                 }
 
                 peekDisclosure(
+                    title: "Sandbox",
+                    icon: "shippingbox",
+                    color: sandboxAccent,
+                    summary: sandboxSummary,
+                    isExpanded: $expandedSandbox,
+                    onExpandLoad: { await viewModel.loadSectionIfNeeded(.sandbox) }
+                ) {
+                    OpsSandboxSection(viewModel: viewModel)
+                }
+
+                peekDisclosure(
                     title: "Context",
                     icon: "brain",
                     color: LoomColors.tierShortTerm,
@@ -89,6 +104,7 @@ struct OpsView: View {
             .padding()
             .animation(.spring(duration: 0.35, bounce: 0.18), value: expandedPipelines)
             .animation(.spring(duration: 0.35, bounce: 0.18), value: expandedRuntime)
+            .animation(.spring(duration: 0.35, bounce: 0.18), value: expandedSandbox)
             .animation(.spring(duration: 0.35, bounce: 0.18), value: expandedContext)
         }
         .navigationTitle("Work")
@@ -111,6 +127,10 @@ struct OpsView: View {
             if expandedRuntime {
                 viewModel.loadedSections.remove(.runtime)
                 await viewModel.loadRuntimeSection()
+            }
+            if expandedSandbox {
+                viewModel.loadedSections.remove(.sandbox)
+                await viewModel.loadSandboxSection()
             }
             if expandedContext {
                 viewModel.loadedSections.remove(.context)
@@ -323,6 +343,29 @@ struct OpsView: View {
         let offline = viewModel.presenceSummary.offlineAgents
         if offline > 0 && active == 0 { return LoomColors.statusDegraded }
         if active > 0 { return LoomColors.statusHealthy }
+        return LoomColors.fgMuted
+    }
+
+    private var sandboxSummary: String {
+        guard let sandbox = viewModel.sandboxSummary else {
+            return viewModel.loadedSections.contains(.sandbox) ? "no data" : "tap to load"
+        }
+        if !sandbox.available {
+            return "devbox unavailable"
+        }
+        let running = sandbox.totalRunning
+        if running == 0 {
+            return "idle · \(sandbox.backend)"
+        }
+        return "\(running) running · \(sandbox.backend)"
+    }
+
+    private var sandboxAccent: Color {
+        guard let sandbox = viewModel.sandboxSummary else {
+            return LoomColors.fgMuted
+        }
+        if !sandbox.available { return LoomColors.statusDegraded }
+        if sandbox.totalRunning > 0 { return LoomColors.statusHealthy }
         return LoomColors.fgMuted
     }
 
