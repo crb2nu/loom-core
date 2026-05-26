@@ -167,8 +167,14 @@
     }
   }
 
-  // Command palette handler — uses legacy navigate (auto-redirects)
+  // Command palette handler — uses legacy navigate (auto-redirects).
+  // Entity items (sessions/tasks/spawns) carry target_view + detail_id so
+  // we land directly on the record's drawer instead of just the panel.
   function handleCommand(item) {
+    if (item.entity_kind && item.target_view && item.detail_id) {
+      router.navigate(item.target_view, undefined, item.detail_id);
+      return;
+    }
     switch (item.id) {
       case 'refresh-all':
         fleetStore.fetch();
