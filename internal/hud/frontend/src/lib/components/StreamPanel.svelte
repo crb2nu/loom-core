@@ -8,15 +8,16 @@
   import { createStreamScroll } from '../widgets/useStreamScroll.svelte.ts';
   import UnseenAboveChip from '../widgets/UnseenAboveChip.svelte';
 
-  // Stream rows are bounded at 500 entries server-side but still poll every
-  // 2s and accumulate over the session; virtualize the render path so the
-  // long-tail of older entries doesn't sit in the DOM. Single-line rows fit
-  // a fixed height cleanly; 40px is enough for the padded line on desktop
-  // and stays close to the prior mobile touch-target minimum (44px).
+  // Stream rows are bounded at 500 entries server-side but accumulate over
+  // the session via SSE pushes (`hud.stream` every 5s); virtualize the render
+  // path so the long-tail of older entries doesn't sit in the DOM. Single-line
+  // rows fit a fixed height cleanly; 40px is enough for the padded line on
+  // desktop and stays close to the prior mobile touch-target minimum (44px).
   const STREAM_ROW_HEIGHT = 40;
 
+  // Slice B3 — polling is just a safety-net fallback for SSE disconnects.
   $effect(() => {
-    streamStore.startPolling(2000);
+    streamStore.startPolling(60000);
     return () => { streamStore.stopPolling(); };
   });
 

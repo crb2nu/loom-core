@@ -146,13 +146,13 @@ Each panel ships in its own MR with a legacy fallback. Order recommendation: Spa
 - Manual smoke for each panel against live daemon.
 - Quality gate green.
 
-### B3 — SSE Migration
+### B3 — SSE Migration ✅ SHIPPED
 
 **Files to change**
 
-- `internal/hud/frontend/src/lib/stores/events.svelte.ts` — add typed `subscribe<T>(eventType, handler)` returning unsubscribe; document supported `hud.*` events.
-- For each decomposed panel's store (`fleet`, `tasks`, `sandbox`, `spawn`, `servers`): add SSE subscriptions in `init()`; reduce polling interval from 10–30 s to ≥60 s (acts as watchdog + cold-load fallback).
-- Add `staleAfter: number` per store; `staleness` derived state; show "stale" pill in `ConnectionBanner.svelte` when any store flips.
+- `internal/hud/frontend/src/lib/stores/events.svelte.ts` — add typed `subscribe<T>(eventType, handler)` returning unsubscribe; document supported `hud.*` events. **Shipped**: `subscribe<T>` defined at `events.svelte.ts:86-91`; `SUPPORTED_HUD_EVENTS` registry at `events.svelte.ts:30-58`.
+- For each decomposed panel's store (`fleet`, `tasks`, `sandbox`, `spawn`, `servers`): add SSE subscriptions in `init()`; reduce polling interval from 10–30 s to ≥60 s (acts as watchdog + cold-load fallback). **Shipped**: all five panel stores subscribe to their `hud.*` event types and default `startPolling` to 60_000 ms. `stream` store added as a sixth in the B3 closeout.
+- Add `staleAfter: number` per store; `staleness` derived state; show "stale" pill in `ConnectionBanner.svelte` when any store flips. **Shipped**: `stores/staleness.svelte.ts` provides `clockStore` (5 s tick), `stalenessStore` (registry), `isStaleFromTimestamp(...)`; `ConnectionBanner.svelte:50-52` renders the stale pill listing affected stores; six stores register (`fleet`, `tasks`, `sandbox`, `spawn`, `servers`, `stream`).
 
 **Validation**
 
@@ -161,6 +161,15 @@ Each panel ships in its own MR with a legacy fallback. Order recommendation: Spa
   - Polling fallback restores data on next tick.
   - Restoring SSE clears the pill.
 - Prometheus `hud_api_requests_total` (or daemon log line count) shows reduced poll rate over 5-minute window — capture before/after numbers in MR description.
+
+**Follow-ups (out of B3 scope)**
+
+The `OverviewPanel.svelte` polling block still starts a handful of secondary
+stores (`memoryStore`, `costStore`, `rbacStore`, `coordinationStore`,
+`mergeQueueStore`, `shuttleStore`, `millsStore`, `otelStore`) at 30 s. The
+plan only requires the five decomposed panel stores at ≥60 s; the secondary
+stores can be aligned in a follow-up slice if dashboard request volume
+proves noisy.
 
 ### B4 — Keyboard Nav + Cmd+P
 
