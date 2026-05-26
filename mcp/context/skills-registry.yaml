@@ -8200,10 +8200,19 @@ skills:
           `icc_project_changes`, `icc_project_blocked`.
         - Entity lists: `icc_action_item_list`, `icc_decision_list`,
           `icc_risk_list`, `icc_milestone_list`, `icc_deliverable_list`,
-          `icc_dependency_list`, `icc_workstream_list`, `icc_code_ref_list`,
-          `icc_session_link_list`.
+          `icc_dependency_list`, `icc_workstream_list`, `icc_artifact_list`,
+          `icc_code_ref_list`, `icc_session_link_list`. The code_ref
+          and session_link lists accept `unpromoted=true` /
+          `unattributed=true` filters for the triage workflow (see
+          `[[icc-triage-loop]]`).
         - Detail: `icc_artifact_get`, `icc_artifact_links_list`.
-        - Cross-cutting: `icc_search`, `icc_needs_attention`.
+        - Cross-cutting: `icc_search`, `icc_needs_attention`,
+          `icc_inbox_summary`, `icc_draft_status_compose`.
+          `icc_inbox_summary` returns per-project counts of unpromoted
+          code_refs + un-promoted session_links + active `_inbox`
+          artifacts. `icc_draft_status_compose` wraps
+          `POST /api/drafts/status` (SD-1/SD-2/SD-EA Status Draft
+          composer — read-shaped, no write gate).
 
         ## Write tools (gated behind ICC_MCP_WRITE_ENABLED=1)
 
@@ -8264,7 +8273,625 @@ skills:
         - icc_action_item_list
         - icc_artifact_get
         - icc_artifact_links_list
+        - icc_artifact_list
         - icc_code_ref_list
+        - icc_decision_list
+        - icc_deliverable_list
+        - icc_dependency_list
+        - icc_draft_status_compose
+        - icc_inbox_summary
+        - icc_milestone_list
+        - icc_needs_attention
+        - icc_project_blocked
+        - icc_project_brief
+        - icc_project_calendar
+        - icc_project_changes
+        - icc_project_gantt
+        - icc_project_kanban
+        - icc_project_list
+        - icc_project_status
+        - icc_risk_list
+        - icc_search
+        - icc_session_link_list
+        - icc_workstream_list
+    targets:
+      codex:
+        enabled: true
+        type: skill
+      claude:
+        enabled: true
+        type: command
+        output_format: markdown
+      kilocode:
+        enabled: true
+        type: rule
+      gemini:
+        enabled: false
+      antigravity:
+        enabled: true
+        type: command
+        output_format: markdown
+
+  - name: icc-daily-pm-loop
+    categories: [icc, workflow, pm]
+    common:
+      description: |
+        Morning project-management loop on the Integration Command Center (ICC). Drives the day-start rhythm against the live ICC backend via the `mcp-icc` MCP server (and optionally `iccctl status`) instead of re-reading `.loom/*.md` files. Pulls the workspace-wide needs-attention rollup, per-project blocked rollups, recent changes, and the triage inbox; orients on what's open today; proposes new action items/decisions to log. Read-only by default — any create/update/transition pauses for explicit operator confirmation.
+      instructions: |
+        # ICC Daily PM Loop
+
+        Day-start workflow that turns the ICC backend into the source of truth
+        for "what should I work on today," using live MCP reads instead of
+        markdown backfill. Pairs with `[[icc-weekly-status-loop]]`,
+        `[[icc-triage-loop]]`, and `[[icc-handoff-prep]]`.
+
+        ## When to use
+
+        - User says "morning loop", "daily PM", "what's on my plate", "start
+          the day", or similar.
+        - User opens code-server and wants Claude/Codex oriented on ICC
+          state without dumping `.loom/00-index.md`.
+        - You're resuming a session and need the current cross-project
+          status before doing any work.
+
+        ## Prerequisites
+
+        - `mcp-icc` MCP server is connected. Read tools (always_allow) are
+          enough for the loop; mutations require `ICC_MCP_WRITE_ENABLED=1`
+          on the server process.
+        - `ICC_BASE_URL` resolves to the running ICC backend. On code-server
+          this is typically `http://icc.lan` or the in-cluster Service IP;
+          on the laptop it's `http://localhost:8080`.
+        - Optional: `iccctl` on `$PATH` with a token at
+          `~/.config/iccctl/token` (see `docs/chromebook-setup.md`).
+
+        ## Loop
+
+        1. **Orient (read-only).** Call in parallel:
+           - `icc__icc_needs_attention` — workspace-wide rollup of items
+             flagged for follow-up.
+           - `icc__icc_project_list` — current projects with summary
+             counts.
+           - `icc__icc_inbox_summary` — per-project counts of
+             unpromoted code_refs + un-promoted session_links + active
+             `_inbox` artifacts plus workspace totals. One call instead
+             of three list queries.
+           - For each project returned, `icc__icc_project_blocked` —
+             open-but-blocked items (dependencies / risks / overdue).
+           - `icc__icc_project_changes` for the top 1–2 projects (last
+             24–72h window) to see what landed since the last session.
+        2. **Surface the daily picture.** Render a compact summary:
+           - "Open across workspace: N action items, M risks, K
+             milestones in flight."
+           - Per project: 1-line headline + bullets for blocked items
+             and items due within 48h.
+           - Inbox: pull straight from the `icc_inbox_summary` totals
+             — `unpromoted_code_refs`, `unpromoted_session_links`,
+             `inbox_artifacts`. Hand off to `[[icc-triage-loop]]` if
+             any total is non-trivial.
+        3. **Propose, don't execute.** If the orient step surfaces
+           obvious gaps (new action item from a recent change, missing
+           owner on an at-risk item, an overdue risk that should
+           transition), list them as PROPOSALS with the exact tool call
+           that would land each one. Do NOT call writes yet.
+        4. **Confirm + write.** When the user OKs a proposal, call the
+           dedicated write tool (`icc_action_item_create`,
+           `icc_action_item_update`, `icc_risk_transition`,
+           `icc_decision_create`, etc.). Verify with the matching read
+           tool. If `writes_disabled` comes back, surface it and stop —
+           do not retry without `ICC_MCP_WRITE_ENABLED=1` set on the
+           server.
+        5. **Hand off.** End with the "focus today" line and a pointer
+           to follow-up loops: `/icc-triage-loop` if the inbox is
+           heavy, `/icc-handoff-prep <project>` if a sync is on the
+           calendar, `/icc-weekly-status-loop` if it's Friday.
+
+        ## iccctl fallback
+
+        When MCP is unavailable on the host (e.g. mid-session on a fresh
+        Chromebook), the same orient step works via the HTTP CLI:
+
+        ```bash
+        iccctl status                       # snapshot
+        iccctl handoffs --limit 10          # pending review handoffs
+        iccctl jobs --status running        # in-flight import jobs
+        ```
+
+        Prefer MCP when both are available — the tool args carry
+        structured filters MCP can compose, and `icc_search` /
+        `icc_needs_attention` have no `iccctl` equivalent.
+
+        ## Behavior notes
+
+        - Do not paste `.loom/00-index.md` or other planning markdown
+          into context unless the user asks — the point of this loop is
+          that the live backend already knows the state.
+        - All read tools in `always_allow` are safe to call without
+          prompting. Writes are NOT in `always_allow` for this skill.
+        - When proposing writes, show the full payload (`project_id`,
+          `title`, `owner`, `status`, etc.) so the operator can
+          accept/edit in one round-trip.
+        - If `icc__icc_project_blocked` returns nothing for every
+          project, surface that explicitly ("no blockers") rather than
+          omitting the section — silence is ambiguous.
+      scripts: []
+      references: []
+      assets: []
+      always_allow:
+        - icc_action_item_list
+        - icc_artifact_get
+        - icc_artifact_links_list
+        - icc_artifact_list
+        - icc_code_ref_list
+        - icc_decision_list
+        - icc_deliverable_list
+        - icc_dependency_list
+        - icc_inbox_summary
+        - icc_milestone_list
+        - icc_needs_attention
+        - icc_project_blocked
+        - icc_project_brief
+        - icc_project_calendar
+        - icc_project_changes
+        - icc_project_gantt
+        - icc_project_kanban
+        - icc_project_list
+        - icc_project_status
+        - icc_risk_list
+        - icc_search
+        - icc_session_link_list
+        - icc_workstream_list
+    targets:
+      codex:
+        enabled: true
+        type: skill
+      claude:
+        enabled: true
+        type: command
+        output_format: markdown
+      kilocode:
+        enabled: true
+        type: rule
+      gemini:
+        enabled: false
+      antigravity:
+        enabled: true
+        type: command
+        output_format: markdown
+
+  - name: icc-weekly-status-loop
+    categories: [icc, workflow, pm]
+    common:
+      description: |
+        End-of-week status update loop on the Integration Command Center (ICC). Drives the SD-1 ("Since X") + SD-2 ("Current state") + SD-EA ("Evidence added") Status Draft composer per project via `iccctl drafts` or the `/api/drafts/status` endpoint, surfaces the deterministic sections, lets the operator edit, and ships. Eliminates the "let me re-read 14 markdown files before I write a status" backfill.
+      instructions: |
+        # ICC Weekly Status Loop
+
+        Compose per-project status updates from the ICC backend's live
+        Status Draft composer (SD-1/SD-2/SD-EA pillars, shipped
+        2026-05-25/26) instead of hand-rolling markdown from
+        `.loom/iter-plan-*.md`. The composer's sections are
+        deterministic and reproducible — re-running yields the same
+        draft until new artifacts land. Pairs with
+        `[[icc-daily-pm-loop]]` (morning orient) and
+        `[[icc-handoff-prep]]` (single-meeting brief).
+
+        ## When to use
+
+        - User says "weekly status", "Friday update", "draft a status
+          for <project>", "ship the status update."
+        - End of week or end of milestone — anywhere a stakeholder ask
+          would otherwise trigger "let me re-read everything first."
+        - Prefer this skill over `[[icc-handoff-prep]]` when the output
+          will be shared broadly (project channel, manager update);
+          use handoff-prep for single-sync prep.
+
+        ## Prerequisites
+
+        - `mcp-icc` connected OR `iccctl` on `$PATH` with a valid
+          token. Both backends call the same `/api/drafts/status`
+          endpoint.
+        - `ICC_BASE_URL` resolves to the ICC backend. On code-server:
+          `http://icc.lan` (or the loom-gateway URL). On laptop:
+          `http://localhost:8080`.
+        - Refinery R2 has landed for the project's recent extractions
+          (SD-1 reads `output_json["refined"]` when present and falls
+          back to `candidates` when it isn't — older extractions still
+          work).
+
+        ## Loop
+
+        1. **Pick the project(s).** Read `icc__icc_project_list`. If
+           the user said "all", iterate; otherwise confirm the slug.
+           Capture `project_id` (preferred) or slug.
+        2. **Frame the window.** Default to the last 7 days
+           (`since-ms` = now - 7d in millis). Confirm the window with
+           the operator if a milestone closeout or a longer cadence
+           applies.
+        3. **Compose the draft.** Prefer the MCP wrapper; the CLI is
+           a fallback when MCP is unavailable:
+           - **MCP (preferred):** `icc__icc_draft_status_compose`
+             with `project_id`, optional `vendor_id`, and `since_ms`
+             / `until_ms` for the window. No write gate — composing
+             a draft is a read.
+           - **iccctl fallback:**
+             ```bash
+             iccctl drafts --project-id "$PROJECT_ID" \
+                 --since-ms "$SINCE_MS" --until-ms "$UNTIL_MS"
+             ```
+           Both wrap `POST /api/drafts/status`. The response contains
+           the three deterministic sections — SD-1 "Since X" (diff
+           of refined extractions), SD-2 "Current state" (open
+           action items, active risks, next milestone, recent
+           decisions), SD-EA "Evidence added" (artifacts that
+           landed in the window) — plus a pre-rendered markdown
+           string.
+        4. **Surface the draft.** Render it back to the operator as
+           markdown. Call out empty sections explicitly ("No new
+           decisions in window") rather than dropping them — the
+           reader needs to know the absence is intentional, not a bug.
+        5. **Edit, don't replace.** If the operator wants prose
+           polish, edit IN PLACE in the chat — do not regenerate the
+           composer output, which would lose the manual edits.
+        6. **Ship.** When the operator says "send it" / "post this",
+           do whatever the user's send pipeline is (paste to Slack /
+           email / Briefings drawer). If the user asks for a
+           persistent record, propose
+           `icc__icc_decision_create` or `icc_artifact_create`
+           (capture_source=`status_draft`) and pause for confirmation
+           — the composer itself does not auto-persist.
+
+        ## Section semantics (so you can edit intelligently)
+
+        - **SD-1 "Since X"**: deterministic diff over
+          `extraction_runs` in window. New entities (no merge
+          candidate), evidence-added merges (above auto-merge
+          threshold), dropped noise (R2 filter), status transitions
+          (R5). Sectioned "Shipped / New / At risk / Closed /
+          Decisions." Zero LLM cost.
+        - **SD-2 "Current state"**: composed from the four list
+          helpers — open action items (capped at 5,
+          `open_action_items_total` carries the rest), active risks
+          (capped at 5), next milestone (`upcoming` ∪ `at_risk`
+          earliest target), recent decisions. Uses the live entity
+          tables; no extraction dependency.
+        - **SD-EA "Evidence added"**: artifacts captured in window,
+          grouped by source (slack/email/meetings/research/sessions).
+          The "I have receipts" section.
+
+        ## Behavior notes
+
+        - The composer reads `output_json["refined"]` when Refinery R2
+          has run; otherwise falls back to `candidates`. Do not
+          re-run extractions just to refresh the draft — wait for
+          the existing Refinery cadence.
+        - PHI gate: any `confirmed_phi` artifact in the window
+          appears in counts but its body is NOT rendered into the
+          draft body. SD-EA shows the artifact title + classification
+          chip only.
+        - Do not edit `output_json` directly to "fix" a draft — that
+          mutates extraction provenance. If a row is wrong, file the
+          fix in the Refinery feedback corpus (NF6 from the
+          brainstorm; tooling lands in R3/R4).
+        - Backward compat: `/api/drafts/status`, `/loom/drafts/status`,
+          and `iccctl drafts` stay functional throughout the SD-x
+          rollout. If one path breaks, the other two are fallbacks.
+      scripts: []
+      references: []
+      assets: []
+      always_allow:
+        - icc_action_item_list
+        - icc_artifact_get
+        - icc_artifact_list
+        - icc_decision_list
+        - icc_deliverable_list
+        - icc_draft_status_compose
+        - icc_milestone_list
+        - icc_needs_attention
+        - icc_project_brief
+        - icc_project_changes
+        - icc_project_list
+        - icc_project_status
+        - icc_risk_list
+        - icc_search
+    targets:
+      codex:
+        enabled: true
+        type: skill
+      claude:
+        enabled: true
+        type: command
+        output_format: markdown
+      kilocode:
+        enabled: true
+        type: rule
+      gemini:
+        enabled: false
+      antigravity:
+        enabled: true
+        type: command
+        output_format: markdown
+
+  - name: icc-triage-loop
+    categories: [icc, workflow, pm]
+    common:
+      description: |
+        Inbound triage loop on the Integration Command Center (ICC). Walks the triage queue + recent unattributed captures (`_inbox` rows, raw `code_ref`s without artifacts), classifies them (default `possible_phi` until reviewed), promotes-or-archives, links to the right project, and proposes follow-up action items / risks. Composes `mcp-icc-capture` lifecycle tools with `mcp-icc` entity creates.
+      instructions: |
+        # ICC Triage Loop
+
+        Drain the ICC inbox: turn raw captures and `_inbox` rows into
+        attributed artifacts, action items, and decisions — without
+        leaving sensitive content unclassified. Pairs with
+        `[[icc-capture-ops]]` (which produces the inbox rows) and
+        `[[icc-daily-pm-loop]]` (which surfaces inbox counts).
+
+        ## When to use
+
+        - User says "triage the inbox", "process captures", "clean up
+          `_inbox`", "what's unattributed?"
+        - The morning loop surfaced a non-trivial inbox count.
+        - After bulk imports (Slack archive, email bundle) where new
+          captures need attribution.
+
+        ## Prerequisites
+
+        - `mcp-icc-capture` connected (lifecycle tools:
+          `icc_promote_to_artifact`, `icc_demote_artifact`,
+          `icc_archive_raw`, `icc_unarchive_raw`).
+        - `mcp-icc` connected (reads for orient, writes for entity
+          creates if `ICC_MCP_WRITE_ENABLED=1`).
+        - `ICC_WORKSPACE_ROOT` set on the backend if you'll be
+          promoting code_refs (deep-link path validation).
+
+        ## Default classification
+
+        Every new capture from an external source (Slack/email/meeting/
+        web/session) defaults to **`possible_phi`** until a human
+        reviews it. The triage loop is where that default gets
+        promoted DOWN to `internal` / `public` (after content review)
+        or kept at `possible_phi` / `confirmed_phi`. **Never promote a
+        classification without reading the content.**
+
+        ## Loop
+
+        1. **Inventory the inbox.** Start broad, then narrow:
+           - `icc__icc_inbox_summary` — one call returns per-project
+             counts (`unpromoted_code_refs`,
+             `unpromoted_session_links`, `inbox_artifacts`) plus
+             workspace totals. Pick the project with the heaviest
+             inbox; you don't need to enumerate everything yet.
+           - `icc__icc_code_ref_list` with `unpromoted=true` to
+             return only refs with no `artifact_code_refs` row; or
+             `unattributed=true` to return only refs assigned to the
+             `_inbox` sentinel project. Combine with `project_id` to
+             scope, or `classification` to focus on one floor.
+           - `icc__icc_session_link_list` with `unpromoted=true` for
+             session_links with no `capture_session` artifact
+             pointing back; `unattributed=true` for `_inbox` rows.
+           - `icc__icc_search` with the user's recent terms for
+             stragglers.
+        2. **Group by likely project.** Frontmatter `project:` field
+           or content keywords typically map cleanly. Surface the
+           inventory as a table: `id | source | snippet | suggested
+           project | suggested classification`.
+        3. **Per-item triage decision.** For each row, propose ONE of:
+           - **Promote** (`icc-capture__icc_promote_to_artifact`) when
+             the row is signal — assign `project_id`,
+             classification, optional `vendor_id`. Idempotent.
+           - **Archive raw** (`icc-capture__icc_archive_raw`) when the
+             row is keepable provenance but not artifact-worthy —
+             moves to `notes/archive/YYYY/MM/` and updates the
+             `code_ref` path. Idempotent.
+           - **Demote** (`icc-capture__icc_demote_artifact`) when the
+             row was already promoted but turned out to be noise.
+             REQUIRES a non-empty reason string.
+           - **Reclassify** (`icc__icc_artifact_reclassify`) when the
+             promotion was correct but the classification needs to
+             change after content review.
+           - **Re-attribute** (`icc__icc_artifact_update` with new
+             `project_id`/`vendor_id`) when the project guess was
+             wrong.
+        4. **Confirm + write.** Show the operator the batched plan
+           ("promote 4, archive 2, demote 1") before any write. On
+           OK, call the tools one at a time and report each result.
+           If a tool returns `already_promoted` / `already_archived`,
+           treat as success — they're idempotent.
+        5. **Follow-up entities.** For promoted artifacts that imply
+           work, propose (do not auto-create):
+           - `icc__icc_action_item_create` when the artifact contains
+             an ask / TODO.
+           - `icc__icc_risk_create` when it describes a problem with
+             potential impact.
+           - `icc__icc_decision_create` when it records a decision
+             that should be first-class.
+           Pause for the operator's OK per entity.
+        6. **Verify.** Re-run `icc_code_ref_list` for the touched
+           project to confirm the inbox is smaller. Note the residual
+           count + any rows that need follow-up review.
+
+        ## PHI gate reminder
+
+        - **Default new captures to `possible_phi`.** Do not propose
+          `internal` or `public` without reading content.
+        - **`confirmed_phi` is a one-way door** — once tagged, the
+          artifact body is gated from briefings, drafts, and external
+          send paths. Use it when content unambiguously contains
+          Devoted patient data.
+        - **No real data in git.** If a `confirmed_phi` artifact is
+          discovered to have been committed (e.g. in a `.loom/`
+          plan), STOP and surface it — that's an incident, not a
+          triage step.
+
+        ## Behavior notes
+
+        - Capture lifecycle tools are idempotent. Re-calling promote
+          on a promoted row returns `already_promoted=true` rather
+          than erroring; same for archive. `icc_artifact_reclassify`
+          returns `already_classified=true` on a no-op (prior == new)
+          so you can render a clean "no change" message without
+          comparing `updated_at`.
+        - `icc_archive_raw` updates the `code_ref`'s path; existing
+          references stay valid. Operators do not need to re-link.
+        - Do not loop forever on a stuck row. If a capture's project
+          attribution is genuinely ambiguous, leave it in `_inbox`
+          and surface it as a question for the user.
+        - The triage view in the SPA (`/triage`) is the visual
+          equivalent of this loop; this skill is what an agent does
+          when the user can't / won't open the SPA.
+      scripts: []
+      references: []
+      assets: []
+      always_allow:
+        - icc_action_item_list
+        - icc_artifact_get
+        - icc_artifact_links_list
+        - icc_artifact_list
+        - icc_code_ref_list
+        - icc_decision_list
+        - icc_inbox_summary
+        - icc_milestone_list
+        - icc_needs_attention
+        - icc_project_blocked
+        - icc_project_brief
+        - icc_project_list
+        - icc_risk_list
+        - icc_search
+        - icc_session_link_list
+    targets:
+      codex:
+        enabled: true
+        type: skill
+      claude:
+        enabled: true
+        type: command
+        output_format: markdown
+      kilocode:
+        enabled: true
+        type: rule
+      gemini:
+        enabled: false
+      antigravity:
+        enabled: true
+        type: command
+        output_format: markdown
+
+  - name: icc-handoff-prep
+    categories: [icc, workflow, pm]
+    common:
+      description: |
+        Pre-meeting / single-stakeholder handoff prep on the Integration Command Center (ICC). For a given project, pulls the project brief + open risks + recent decisions + blocked rollup + recent changes via `mcp-icc`, then produces a compact paste-ready brief for chat, a calendar invite, or a one-on-one. Narrower than `icc-weekly-status-loop` (one project, one moment, single audience).
+      instructions: |
+        # ICC Handoff Prep
+
+        Produce a short, structured brief for a specific project and a
+        specific upcoming sync — fast enough to run in the 5 minutes
+        before a meeting. Sources everything from the live ICC backend
+        via `mcp-icc` reads; no markdown backfill. Pairs with
+        `[[icc-daily-pm-loop]]` (broader orient) and
+        `[[icc-weekly-status-loop]]` (broadcast updates).
+
+        ## When to use
+
+        - "Prep me for the <vendor> sync in 10 minutes."
+        - "What's the state of <project> for tomorrow's standup?"
+        - "Give me a brief for the 1:1 about <project>."
+        - Pre-meeting: when you need a focused, scannable snapshot —
+          not a full status update.
+
+        ## Prerequisites
+
+        - `mcp-icc` connected. All reads in this skill are in
+          `always_allow` — no writes are needed for a brief.
+        - Operator supplies the project slug or `project_id`. If they
+          don't, ask once; do not guess.
+
+        ## Loop
+
+        1. **Resolve the project.** If given a slug, look up the id via
+           `icc__icc_project_list` (filter by slug). Capture both the
+           id and the display name.
+        2. **Pull the slices in parallel.** Issue these reads
+           concurrently:
+           - `icc__icc_project_brief` — headline numbers + recent
+             activity summary.
+           - `icc__icc_project_blocked` — open-but-blocked items.
+           - `icc__icc_project_status` — stacked-bars + sparkline
+             snapshot (counts only; you'll render bullets, not the
+             chart).
+           - `icc__icc_project_changes` — recent change events
+             (default last 7d; narrow to last 48h if the user says
+             "since yesterday").
+           - `icc__icc_risk_list` — active risks for the project
+             (`include_closed=False`).
+           - `icc__icc_decision_list` — recent decisions (default
+             last 14d window).
+           - `icc__icc_milestone_list` — upcoming + at-risk
+             milestones, soonest first.
+        3. **Compose the brief.** Render markdown sections in this
+           order (skip a section ONLY if its source returns nothing —
+           and even then, surface an explicit "no X" line):
+           ```
+           # <Project name> — handoff brief
+
+           **Headline**: <one sentence from project_brief + active
+           milestone>.
+
+           ## Blocked right now
+           - <item> — <blocker> — <owner>
+           ...
+
+           ## Active risks
+           - <risk title> (severity) — <mitigation owner>
+           ...
+
+           ## Recent decisions
+           - YYYY-MM-DD — <decision title> — <link/artifact id>
+           ...
+
+           ## Recent changes
+           - YYYY-MM-DD — <change summary>
+           ...
+
+           ## Next milestone
+           - <name> — target <date> — status <upcoming|at_risk>
+           ```
+        4. **Tighten.** Aim for under 30 lines. If a section has more
+           than 5 rows, cap at 5 with a "+N more" tail; the listener
+           can ask for the full list mid-meeting.
+        5. **Offer paste paths.** End with: "Want this as
+           markdown / plaintext / a Slack-formatted block?" Do not
+           auto-post or auto-message — this skill is read-only by
+           design.
+
+        ## Behavior notes
+
+        - **Read-only skill.** No `_create` / `_update` / `_transition`
+          tools are in `always_allow`. If during prep the operator
+          spots something that needs to be filed, hand off to
+          `[[icc-triage-loop]]` (for new artifacts) or
+          `[[icc-daily-pm-loop]]` (for new action items).
+        - **Audience matters.** If the meeting is with a vendor or
+          external stakeholder, default to dropping `confirmed_phi`
+          and `possible_phi` content from the brief body — show
+          counts only. Confirm with the operator before sharing
+          anything from those buckets externally.
+        - **Time math.** When `project_changes` returns
+          millisecond-precision timestamps, render as relative dates
+          ("2d ago", "yesterday") if within 7d; absolute date
+          otherwise.
+        - **Do not re-derive from `.loom/*.md`.** The whole point of
+          this loop is that the brief comes from the backend, not
+          from local markdown that may be stale by the time the
+          meeting starts.
+      scripts: []
+      references: []
+      assets: []
+      always_allow:
+        - icc_action_item_list
+        - icc_artifact_get
+        - icc_artifact_links_list
+        - icc_artifact_list
         - icc_decision_list
         - icc_deliverable_list
         - icc_dependency_list
