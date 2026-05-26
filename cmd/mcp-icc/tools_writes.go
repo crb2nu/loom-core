@@ -71,6 +71,7 @@ func makeCreateHandler(icc *iccclient.Client, label, path string) iccToolHandler
 		if err != nil {
 			return mcp.ErrorResult(err), nil
 		}
+		ctx = iccclient.WithTool(ctx, "icc_"+label)
 		_, result, err := postJSON[json.RawMessage](ctx, icc, path, payload)
 		if err != nil {
 			return mcp.ErrorResult(fmt.Errorf("%s: %w", label, err)), nil
@@ -104,6 +105,7 @@ func makeIDPayloadHandler(icc *iccclient.Client, label, path, idKey string) iccT
 		if _, ok := payload[idKey]; !ok {
 			payload[idKey] = id
 		}
+		ctx = iccclient.WithTool(ctx, "icc_"+label)
 		_, result, err := postJSON[json.RawMessage](ctx, icc, path, payload)
 		if err != nil {
 			return mcp.ErrorResult(fmt.Errorf("%s: %w", label, err)), nil
@@ -130,6 +132,7 @@ func makeIDInURLHandler(icc *iccclient.Client, label, idArg string, urlBuilder f
 		if err != nil {
 			return mcp.ErrorResult(err), nil
 		}
+		ctx = iccclient.WithTool(ctx, "icc_"+label)
 		_, result, err := postJSON[json.RawMessage](ctx, icc, urlBuilder(id), payload)
 		if err != nil {
 			return mcp.ErrorResult(fmt.Errorf("%s: %w", label, err)), nil

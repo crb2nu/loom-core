@@ -512,6 +512,163 @@ func TestWrite_MissingBaseURLFailsLoud(t *testing.T) {
 	}
 }
 
+// --- new triage / list tools ---------------------------------------
+
+func TestCodeRefList_ForwardsTriageFilters(t *testing.T) {
+	var seenQuery string
+	_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenQuery = r.URL.RawQuery
+		writeJSON(t, w, http.StatusOK, map[string]any{"code_refs": []any{}})
+	})
+	handler := makeListReader(icc, "code_ref_list", "/api/code/refs",
+		"project_id", "workstream_id", "vendor_id", "kind",
+		"classification", "unpromoted", "unattributed", "limit")
+	_, err := handler(context.Background(), map[string]any{
+		"project_id":   "prj_1",
+		"unpromoted":   true,
+		"unattributed": false,
+	})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !strings.Contains(seenQuery, "project_id=prj_1") {
+		t.Fatalf("missing project_id, got %q", seenQuery)
+	}
+	if !strings.Contains(seenQuery, "unpromoted=true") {
+		t.Fatalf("missing unpromoted=true, got %q", seenQuery)
+	}
+	if !strings.Contains(seenQuery, "unattributed=false") {
+		t.Fatalf("missing unattributed=false, got %q", seenQuery)
+	}
+}
+
+func TestArtifactList_HitsExpectedPath(t *testing.T) {
+	var seenPath, seenQuery string
+	_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenQuery = r.URL.RawQuery
+		writeJSON(t, w, http.StatusOK, map[string]any{"artifacts": []any{}})
+	})
+	handler := makeListReader(icc, "artifact_list", "/api/artifacts",
+		"project_id", "vendor_id", "source_type", "classification", "limit")
+	_, err := handler(context.Background(), map[string]any{
+		"project_id":     "prj_1",
+		"classification": "internal",
+	})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if seenPath != "/api/artifacts" {
+		t.Fatalf("expected /api/artifacts, got %s", seenPath)
+	}
+	if !strings.Contains(seenQuery, "project_id=prj_1") ||
+		!strings.Contains(seenQuery, "classification=internal") {
+		t.Fatalf("missing filters, got %q", seenQuery)
+	}
+}
+
+func TestInboxSummary_HitsExpectedPath(t *testing.T) {
+	var seenPath string
+	_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		writeJSON(t, w, http.StatusOK, map[string]any{
+			"summary": []any{},
+			"totals":  map[string]any{},
+		})
+	})
+	handler := makeListReader(icc, "inbox_summary", "/api/inbox/summary")
+	result, err := handler(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success, got: %s", result.Content[0].Text)
+	}
+	if seenPath != "/api/inbox/summary" {
+		t.Fatalf("expected /api/inbox/summary, got %s", seenPath)
+	}
+}
+
+// --- draft status composer ---------------------------------------------
+
+func TestDraftStatusCompose_ForwardsFiltersAsBody(t *testing.T) {
+	var seenPath, seenMethod string
+	var seenBody map[string]any
+	_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenMethod = r.Method
+		seenBody = readBody(t, r)
+		writeJSON(t, w, http.StatusOK, map[string]any{
+			"ok": true,
+			"result": map[string]any{
+				"draft":    map[string]any{"project_id": "prj_1", "sections": map[string]any{}},
+				"markdown": "# Status\n",
+			},
+		})
+	})
+
+	handler := makeDraftStatusComposeHandler(icc)
+	result, err := handler(context.Background(), map[string]any{
+		"project_id": "prj_1",
+		"since_ms":   float64(1700000000000),
+		"until_ms":   float64(1700604800000),
+	})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success, got: %s", result.Content[0].Text)
+	}
+	if seenMethod != http.MethodPost {
+		t.Fatalf("expected POST, got %s", seenMethod)
+	}
+	if seenPath != "/api/drafts/status" {
+		t.Fatalf("expected /api/drafts/status, got %s", seenPath)
+	}
+	if seenBody["project_id"] != "prj_1" {
+		t.Fatalf("expected project_id forwarded, got %+v", seenBody)
+	}
+	// since_ms / until_ms must be int64-shaped on the wire so backend
+	// can JSON-decode into Python int (epoch ms).
+	if got, ok := seenBody["since_ms"].(float64); !ok || int64(got) != 1700000000000 {
+		t.Fatalf("expected since_ms=1700000000000, got %+v", seenBody["since_ms"])
+	}
+	if got, ok := seenBody["until_ms"].(float64); !ok || int64(got) != 1700604800000 {
+		t.Fatalf("expected until_ms=1700604800000, got %+v", seenBody["until_ms"])
+	}
+	var got map[string]any
+	decodeResult(t, result.Content[0].Text, &got)
+	if got["markdown"] != "# Status\n" {
+		t.Fatalf("expected markdown pass-through, got %+v", got)
+	}
+}
+
+func TestDraftStatusCompose_OmitsEmptyFilters(t *testing.T) {
+	var seenBody map[string]any
+	_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenBody = readBody(t, r)
+		writeJSON(t, w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"result": map[string]any{"draft": map[string]any{}, "markdown": ""},
+		})
+	})
+
+	handler := makeDraftStatusComposeHandler(icc)
+	_, err := handler(context.Background(), map[string]any{
+		"project_id": "",
+		"vendor_id":  "",
+	})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if _, ok := seenBody["project_id"]; ok {
+		t.Fatalf("expected empty project_id to be omitted, got %+v", seenBody)
+	}
+	if _, ok := seenBody["vendor_id"]; ok {
+		t.Fatalf("expected empty vendor_id to be omitted, got %+v", seenBody)
+	}
+}
+
 // --- trusted-context headers ------------------------------------------
 
 func TestTrustedContextHeadersAreSent(t *testing.T) {
@@ -531,5 +688,117 @@ func TestTrustedContextHeadersAreSent(t *testing.T) {
 	}
 	if got := seenHeaders.Get("Origin"); got == "" {
 		t.Fatalf("expected non-empty Origin header")
+	}
+	if got := seenHeaders.Get("X-ICC-MCP-Tool"); got != "icc_project_list" {
+		t.Fatalf("expected X-ICC-MCP-Tool=icc_project_list, got %q", got)
+	}
+}
+
+func TestMCPToolHeader_SetForListHandlers(t *testing.T) {
+	cases := []struct {
+		name        string
+		makeHandler func(icc *iccclient.Client) iccToolHandler
+		args        map[string]any
+		wantTool    string
+	}{
+		{
+			name: "list_reader_action_items",
+			makeHandler: func(icc *iccclient.Client) iccToolHandler {
+				return makeListReader(icc, "action_item_list", "/api/action-items", "project_id")
+			},
+			args:     map[string]any{"project_id": "prj_1"},
+			wantTool: "icc_action_item_list",
+		},
+		{
+			name: "project_scoped_kanban",
+			makeHandler: func(icc *iccclient.Client) iccToolHandler {
+				return makeProjectScopedReader(icc, "project_kanban", "kanban")
+			},
+			args:     map[string]any{"project_id": "prj_1"},
+			wantTool: "icc_project_kanban",
+		},
+		{
+			name: "needs_attention",
+			makeHandler: func(icc *iccclient.Client) iccToolHandler {
+				return makeNeedsAttentionHandler(icc)
+			},
+			args:     map[string]any{},
+			wantTool: "icc_needs_attention",
+		},
+		{
+			name: "draft_status_compose",
+			makeHandler: func(icc *iccclient.Client) iccToolHandler {
+				return makeDraftStatusComposeHandler(icc)
+			},
+			args:     map[string]any{},
+			wantTool: "icc_draft_status_compose",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var seenHeaders http.Header
+			_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+				seenHeaders = r.Header.Clone()
+				writeJSON(t, w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{}})
+			})
+			handler := tc.makeHandler(icc)
+			if _, err := handler(context.Background(), tc.args); err != nil {
+				t.Fatalf("handler error: %v", err)
+			}
+			if got := seenHeaders.Get("X-ICC-MCP-Tool"); got != tc.wantTool {
+				t.Fatalf("expected X-ICC-MCP-Tool=%s, got %q", tc.wantTool, got)
+			}
+		})
+	}
+}
+
+func TestMCPToolHeader_SetForWriteHandlers(t *testing.T) {
+	cases := []struct {
+		name        string
+		makeHandler func(icc *iccclient.Client) iccToolHandler
+		args        map[string]any
+		wantTool    string
+	}{
+		{
+			name: "create_action_item",
+			makeHandler: func(icc *iccclient.Client) iccToolHandler {
+				return withWriteGate(true, makeCreateHandler(icc, "action_item_create", "/api/action-items"))
+			},
+			args:     map[string]any{"payload": map[string]any{"title": "x"}},
+			wantTool: "icc_action_item_create",
+		},
+		{
+			name: "update_artifact_folds_id",
+			makeHandler: func(icc *iccclient.Client) iccToolHandler {
+				return withWriteGate(true, makeIDPayloadHandler(icc, "artifact_update", "/api/artifacts/update", "id"))
+			},
+			args:     map[string]any{"id": "art_1", "payload": map[string]any{"title": "x"}},
+			wantTool: "icc_artifact_update",
+		},
+		{
+			name: "demote_artifact_id_in_url",
+			makeHandler: func(icc *iccclient.Client) iccToolHandler {
+				return withWriteGate(true, makeIDInURLHandler(icc, "artifact_demote", "artifact_id",
+					func(id string) string { return "/api/artifacts/" + id + "/demote" }))
+			},
+			args:     map[string]any{"artifact_id": "art_1", "payload": map[string]any{"reason": "x"}},
+			wantTool: "icc_artifact_demote",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var seenHeaders http.Header
+			_, icc := newTestICCServer(t, func(w http.ResponseWriter, r *http.Request) {
+				seenHeaders = r.Header.Clone()
+				writeJSON(t, w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{}})
+			})
+			handler := tc.makeHandler(icc)
+			if _, err := handler(context.Background(), tc.args); err != nil {
+				t.Fatalf("handler error: %v", err)
+			}
+			if got := seenHeaders.Get("X-ICC-MCP-Tool"); got != tc.wantTool {
+				t.Fatalf("expected X-ICC-MCP-Tool=%s, got %q", tc.wantTool, got)
+			}
+		})
 	}
 }

@@ -63,6 +63,7 @@ func projectListSchema() mcp.InputSchema {
 
 func makeProjectListHandler(icc *iccclient.Client) iccToolHandler {
 	return func(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+		ctx = iccclient.WithTool(ctx, "icc_project_list")
 		_, raw, err := getRaw[json.RawMessage](ctx, icc, "/api/projects/overview", nil)
 		if err != nil {
 			return mcp.ErrorResult(fmt.Errorf("project_list: %w", err)), nil
@@ -90,6 +91,7 @@ func makeProjectBriefHandler(icc *iccclient.Client) iccToolHandler {
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
+		ctx = iccclient.WithTool(ctx, "icc_project_brief")
 		_, raw, err := getRaw[json.RawMessage](ctx, icc,
 			"/api/project-brief", map[string]string{"project_id": projectID})
 		if err != nil {
@@ -128,6 +130,7 @@ func makeProjectScopedReader(icc *iccclient.Client, label, suffix string, extraQ
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
+		ctx = iccclient.WithTool(ctx, "icc_"+label)
 		path := fmt.Sprintf("/api/projects/%s/%s", projectID, suffix)
 		_, raw, err := getRaw[json.RawMessage](ctx, icc, path,
 			queryFromArgs(args, extraQueryKeys...))
@@ -158,6 +161,7 @@ func listToolSchema(filters ...string) mcp.InputSchema {
 // where the response is a bare {key: [...]} payload.
 func makeListReader(icc *iccclient.Client, label, path string, queryKeys ...string) iccToolHandler {
 	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		ctx = iccclient.WithTool(ctx, "icc_"+label)
 		_, raw, err := getRaw[json.RawMessage](ctx, icc, path,
 			queryFromArgs(args, queryKeys...))
 		if err != nil {
@@ -176,6 +180,7 @@ func makeGetByIDReader(icc *iccclient.Client, label, basePath, idArg string) icc
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
+		ctx = iccclient.WithTool(ctx, "icc_"+label)
 		path := basePath + "/" + id
 		_, raw, err := getRaw[json.RawMessage](ctx, icc, path, nil)
 		if err != nil {
@@ -212,6 +217,7 @@ func makeSearchHandler(icc *iccclient.Client) iccToolHandler {
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
+		ctx = iccclient.WithTool(ctx, "icc_search")
 		_, raw, err := getRaw[json.RawMessage](ctx, icc, "/api/search",
 			queryFromArgs(args, "q", "kind", "mode", "project_id", "vendor_id",
 				"classification", "limit", "include_phi", "reason"))
@@ -226,6 +232,7 @@ func makeSearchHandler(icc *iccclient.Client) iccToolHandler {
 
 func makeNeedsAttentionHandler(icc *iccclient.Client) iccToolHandler {
 	return func(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+		ctx = iccclient.WithTool(ctx, "icc_needs_attention")
 		_, raw, err := getRaw[json.RawMessage](ctx, icc, "/api/needs-attention", nil)
 		if err != nil {
 			return mcp.ErrorResult(fmt.Errorf("needs_attention: %w", err)), nil
@@ -253,6 +260,7 @@ func makeArtifactLinksHandler(icc *iccclient.Client) iccToolHandler {
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
+		ctx = iccclient.WithTool(ctx, "icc_artifact_links_list")
 		path := fmt.Sprintf("/api/artifacts/%s/links", artifactID)
 		_, raw, err := getRaw[json.RawMessage](ctx, icc, path, nil)
 		if err != nil {

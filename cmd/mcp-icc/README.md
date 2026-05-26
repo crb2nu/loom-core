@@ -49,8 +49,20 @@ can run with reads-only by default and opt into writes per-instance.
 | `icc_session_link_list` | `GET /api/sessions` |
 | `icc_artifact_get` | `GET /api/artifacts/<id>` |
 | `icc_artifact_links_list` | `GET /api/artifacts/<id>/links` |
+| `icc_artifact_list` | `GET /api/artifacts` (filter-based; distinct from FTS `/api/search`) |
 | `icc_search` | `GET /api/search` |
 | `icc_needs_attention` | `GET /api/needs-attention` |
+| `icc_inbox_summary` | `GET /api/inbox/summary` (per-project + workspace totals of unpromoted code_refs / session_links / `_inbox` artifacts) |
+| `icc_draft_status_compose` | `POST /api/drafts/status` (SD-1/SD-2/SD-EA composer; read-shaped, no write gate) |
+
+Triage-flow filters: `icc_code_ref_list` and `icc_session_link_list`
+accept `unpromoted=true` (no current artifact link) and
+`unattributed=true` (`project_id = '_inbox'`).
+
+Per-tool attribution: every outbound request carries
+`X-ICC-MCP-Tool: <tool_name>` so the backend's
+`icc_mcp_writes_total{tool,outcome}` metric can attribute writes
+per tool. Reads use the same header for symmetric observability.
 
 ### Write tools (gated)
 
