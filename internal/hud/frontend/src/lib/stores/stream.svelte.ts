@@ -1,6 +1,7 @@
 // Stream store - live context stream with SSE-first data flow
 
 import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 
 export interface StreamEntry {
   id: string;
@@ -26,6 +27,14 @@ class StreamStore {
   paused = $state(false);
   filterType = $state<string>('all');
   filterAgent = $state<string>('all');
+
+  // Staleness (Slice B3) — see fleet.svelte.ts for the pattern. Stream events
+  // arrive every 5s when healthy; 90s without an update means SSE is silently
+  // failing or the daemon stopped emitting.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastTimestamp: string | null = null;
@@ -115,7 +124,7 @@ class StreamStore {
     this.seenIds.clear();
   }
 
-  startPolling(intervalMs = 30000): void {
+  startPolling(intervalMs = 60000): void {
     this.stopPolling();
 
     // Subscribe to SSE events for real-time delivery.
@@ -128,9 +137,12 @@ class StreamStore {
     });
     this.eventUnsubs.push(unsub);
 
-    // Initial HTTP fetch + slow fallback polling.
+    // Initial HTTP fetch + slow fallback polling. Poll fires when SSE is
+    // disconnected OR the store has gone stale (silent SSE failure).
     this.fetch();
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.pollTimer = setInterval(() => {
+      if (!eventStore.connected || this.isStale) this.fetch();
+    }, intervalMs);
   }
 
   stopPolling(): void {
@@ -146,3 +158,4 @@ class StreamStore {
 }
 
 export const streamStore = new StreamStore();
+stalenessStore.register('stream', () => streamStore.isStale);

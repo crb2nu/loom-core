@@ -78,7 +78,7 @@
     healthStore.startPolling(60000);
     taskStore.startPolling(60000);
     memoryStore.startPolling(30000);
-    streamStore.startPolling(15000);
+    streamStore.startPolling(60000);
     costStore.startPolling(30000);
     rbacStore.startPolling(30000);
     coordinationStore.startPolling(30000);
