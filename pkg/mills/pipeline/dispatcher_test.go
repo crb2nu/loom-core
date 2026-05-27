@@ -598,7 +598,7 @@ func TestDispatcher_RegisterReplacesRoute(t *testing.T) {
 }
 
 func TestDefaultRoutes_WiresAllStages(t *testing.T) {
-	routes := DefaultRoutes(&fakeSpawn{}, &fakeWeaver{}, &fakeDevbox{}, &fakeGitLab{}, "loom-core", "claude-code", nil)
+	routes := DefaultRoutes(&fakeSpawn{}, &fakeWeaver{}, &fakeDevbox{}, &fakeGitLab{}, "loom-core", "claude-code", nil, nil)
 	for _, want := range []string{"plan_slice", "research", "implement", "tests", "pr_self_review", "mr", "ci_watch", "merge", "cleanup"} {
 		if _, ok := routes[want]; !ok {
 			t.Errorf("DefaultRoutes missing %s", want)
@@ -610,3 +610,90 @@ func TestDefaultRoutes_WiresAllStages(t *testing.T) {
 type workerFn func(ctx context.Context, jc JobContext) (StageOutput, error)
 
 func (f workerFn) Run(ctx context.Context, jc JobContext) (StageOutput, error) { return f(ctx, jc) }
+
+// TestSpawnWorker_Substrate_FromPolicy covers Slice 2b's contract: the
+// SpawnWorker reads SubstrateFor at every Run, populates
+// SpawnRequest.Substrate, and stays nil-safe so a worker without a
+// SubstrateFor closure preserves pre-Slice-2b behavior (empty
+// Substrate = spawn-service default backend).
+//
+// Spec: .loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md
+func TestSpawnWorker_Substrate_FromPolicy(t *testing.T) {
+	cases := []struct {
+		name         string
+		substrateFor func(stage string) string
+		stage        string
+		want         string
+	}{
+		{name: "nil_closure_yields_empty", substrateFor: nil, stage: "implement", want: ""},
+		{name: "policy_default_yields_k8s",
+			substrateFor: func(string) string { return "k8s" },
+			stage:        "implement",
+			want:         "k8s"},
+		{name: "policy_harvester_vm_for_implement",
+			substrateFor: func(stage string) string {
+				if stage == "implement" {
+					return "harvester-vm"
+				}
+				return "k8s"
+			},
+			stage: "implement",
+			want:  "harvester-vm"},
+		{name: "policy_keeps_plan_slice_on_k8s",
+			substrateFor: func(stage string) string {
+				if stage == "implement" {
+					return "harvester-vm"
+				}
+				return "k8s"
+			},
+			stage: "plan_slice",
+			want:  "k8s"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spawn := &fakeSpawn{}
+			w := &SpawnWorker{
+				Client:       spawn,
+				PromptFor:    func(JobContext) string { return "noop" },
+				SubstrateFor: tc.substrateFor,
+			}
+			jc := sampleJobContext(tc.stage, func(j *JobContext) {
+				// SpawnWorker requires a non-empty source branch; the default
+				// fixture provides feat/BL-X via the branch contract.
+			})
+			if _, err := w.Run(context.Background(), jc); err != nil {
+				t.Fatalf("Run: unexpected error: %v", err)
+			}
+			if got := len(spawn.calls); got != 1 {
+				t.Fatalf("expected 1 spawn call, got %d", got)
+			}
+			if got := spawn.calls[0].Substrate; got != tc.want {
+				t.Errorf("SpawnRequest.Substrate: got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDefaultRoutes_PropagatesSubstrateForToSpawnWorkers confirms the
+// three spawn-driven stages constructed by DefaultRoutes carry the
+// caller-supplied substrateFor closure. Without this, a downstream
+// caller wiring a real policy closure would silently send empty
+// Substrate values on every stage.
+func TestDefaultRoutes_PropagatesSubstrateForToSpawnWorkers(t *testing.T) {
+	subFor := func(stage string) string { return "harvester-vm" }
+	routes := DefaultRoutes(&fakeSpawn{}, &fakeWeaver{}, &fakeDevbox{}, &fakeGitLab{}, "loom-core", "claude-code", nil, subFor)
+	for _, stage := range []string{"plan_slice", "implement", "pr_self_review"} {
+		sw, ok := routes[stage].(*SpawnWorker)
+		if !ok {
+			t.Fatalf("route %q: expected *SpawnWorker, got %T", stage, routes[stage])
+		}
+		if sw.SubstrateFor == nil {
+			t.Errorf("route %q: SubstrateFor was not propagated", stage)
+			continue
+		}
+		if got := sw.SubstrateFor(stage); got != "harvester-vm" {
+			t.Errorf("route %q: SubstrateFor returned %q, want %q", stage, got, "harvester-vm")
+		}
+	}
+}
