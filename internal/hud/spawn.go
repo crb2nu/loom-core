@@ -449,6 +449,40 @@ func (p *spawnTelemetryPublisher) Publish(eventType string, payload any) {
 	})
 }
 
+// buildSpawnPodEnv returns the env-var map the orchestrator passes to
+// backend.StartOpts.Env when creating the spawn pod. Extracted from
+// runSpawn so the routing logic is unit-testable without spinning up
+// the full orchestrator.
+//
+// Substrate → DEVBOX_BACKEND is the Slice 2c hop: Mills selects a
+// per-stage devbox backend in policy.SubstrateForStage, propagates it
+// to pipeline.SpawnRequest.Substrate (Slice 2b), HUDSpawnClient sends
+// it on the spawn POST body (Slice 2c, this slice), and the in-pod
+// mcp-devbox reads DEVBOX_BACKEND at startup to route subsequent
+// devbox_* MCP calls. The pod itself still runs on the orchestrator's
+// single backend; Slice 2d will add per-spawn backend selection.
+func buildSpawnPodEnv(req SpawnRequest, agentID, spawnID string) map[string]string {
+	env := map[string]string{
+		"AGENT_ID":  agentID,
+		"SPAWN_ID":  spawnID,
+		"NAMESPACE": req.Namespace,
+	}
+	if req.ParentSessionID != "" {
+		env["LOOM_PARENT_SESSION_ID"] = req.ParentSessionID
+	}
+	// Gemini picks up service-account auth via this standard Google env
+	// var, which the Google Auth Library reads to find the SA JSON file.
+	// Harmless when the SA JSON isn't present — Gemini falls back to
+	// GEMINI_API_KEY from cluster-agent-api-keys.
+	if req.AgentType == "gemini" {
+		env["GOOGLE_APPLICATION_CREDENTIALS"] = GeminiSAMountPath + "/" + GeminiSAFilename
+	}
+	if req.Substrate != "" {
+		env["DEVBOX_BACKEND"] = req.Substrate
+	}
+	return env
+}
+
 // runSpawn executes the full spawn lifecycle in a background goroutine.
 func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	ctx, span := o.tracer.Start(context.Background(), "agent.spawn",
@@ -522,21 +556,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	// Step 2: Start K8s pod.
 	o.logger.Info("build completed, starting pod", "spawn_id", spawnID, "image", buildResult.ImageTag)
 	_, podSpan := o.tracer.Start(ctx, "agent.spawn.pod_create")
-	env := map[string]string{
-		"AGENT_ID":  state.AgentID,
-		"SPAWN_ID":  spawnID,
-		"NAMESPACE": req.Namespace,
-	}
-	if req.ParentSessionID != "" {
-		env["LOOM_PARENT_SESSION_ID"] = req.ParentSessionID
-	}
-	// Gemini picks up service-account auth via this standard Google env
-	// var, which the Google Auth Library reads to find the SA JSON file.
-	// Harmless when the SA JSON isn't present — Gemini falls back to
-	// GEMINI_API_KEY from cluster-agent-api-keys.
-	if req.AgentType == "gemini" {
-		env["GOOGLE_APPLICATION_CREDENTIALS"] = GeminiSAMountPath + "/" + GeminiSAFilename
-	}
+	env := buildSpawnPodEnv(req, state.AgentID, spawnID)
 	startResult, err := o.backend.Start(ctx, backend.StartOpts{
 		Name:              "spawn-" + spawnID,
 		ImageTag:          buildResult.ImageTag,
