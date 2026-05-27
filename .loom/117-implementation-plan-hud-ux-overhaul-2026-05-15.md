@@ -29,7 +29,9 @@ All 10 sub-slices merged to `main`. Plan closed.
 - `loom hud --embed --subset operator` filters nav to Overview + Operations + Activity only.
 
 **Remaining follow-ups (out of plan scope)** — not Slice-A/B blockers, recorded for tracking:
-- OverviewPanel still starts 8 secondary stores (`memoryStore`/`costStore`/`rbacStore`/`coordinationStore`/`mergeQueueStore`/`shuttleStore`/`millsStore`/`otelStore`) at 30s polling; aligning to ≥60s is a candidate follow-up if dashboard request volume proves noisy.
+- ✅ **2026-05-26**: 6 of the 8 secondary OverviewPanel stores aligned to 60s polling (`memoryStore`/`costStore`/`rbacStore`/`coordinationStore`/`mergeQueueStore`/`shuttleStore`). All six have SSE event subscriptions (`hud.memory`/`hud.cost`/`access.denied`/`hud.fleet` snapshots), so polling is purely a watchdog. `millsStore` + `otelStore` skipped because they have no `eventStore.on/subscribe` subscriptions — bumping them to 60s would add a 30s data lag.
+- **Open**: wire `millsStore` + `otelStore` to SSE (`hud.pipeline*` snapshots for Mills already emitted by `cmd/loom-mills-operator`; `hud.otel.*` would need a new event family) before bumping their polling cadence.
+- **Open**: staleness tracking (`staleAfter` + `isStale` + `stalenessStore.register`) only covers the six canonical panel stores from B3 (fleet/tasks/sandbox/spawn/servers/stream). The six secondary stores aligned to 60s above could grow the same coverage if silent SSE failures become a problem in practice.
 - F6 IA reorg explicitly deferred per the brainstorm; no spec yet.
 
 ## Execution Order
