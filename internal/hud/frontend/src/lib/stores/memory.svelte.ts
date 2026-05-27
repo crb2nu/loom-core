@@ -1,7 +1,8 @@
 // Memory store - tiered memory management
-// v2: SSE-first for stats with 30s fallback. Items still fetched on demand.
+// v2: SSE-first for stats with 60s fallback poll. Items still fetched on demand.
 import { actionStore } from './action.svelte.ts';
 import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 import { arraysEqualById } from '../utils/diff.ts';
 
 function errorMessage(e: unknown): string {
@@ -64,6 +65,14 @@ class MemoryStore {
 
   filterTier = $state<string>('all');
   searchQuery = $state<string>('');
+
+  // Staleness (Slice B3 follow-up) — see fleet.svelte.ts for the pattern.
+  // hud.memory snapshots arrive every 10s; 90s without an update means SSE
+  // is silently failing or the daemon stopped emitting.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private eventUnsubs: Array<() => void> = [];
@@ -277,11 +286,14 @@ class MemoryStore {
     }
   }
 
-  startPolling(intervalMs = 30000): void {
+  startPolling(intervalMs = 60000): void {
     this.stopPolling();
     this.fetch();
-    // 30s fallback poll (SSE is the primary data source for stats).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    // 60s fallback poll. SSE is the primary data source; poll fires when SSE
+    // is disconnected OR the store has gone stale (silent SSE failure).
+    this.pollTimer = setInterval(() => {
+      if (!eventStore.connected || this.isStale) this.fetch();
+    }, intervalMs);
 
     // Subscribe to SSE events: apply stats directly from hud.memory snapshots.
     this.eventUnsubs.push(
@@ -305,3 +317,4 @@ class MemoryStore {
 }
 
 export const memoryStore = new MemoryStore();
+stalenessStore.register('memory', () => memoryStore.isStale);
