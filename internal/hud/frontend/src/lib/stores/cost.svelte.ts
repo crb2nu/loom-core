@@ -1,6 +1,7 @@
 // Cost store — fetches cost/usage data from GET /api/cost
 // and subscribes to SSE hud.cost events for real-time updates.
 import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 
 export interface CostSnapshot {
   enabled: boolean;
@@ -32,6 +33,13 @@ class CostStore {
   loading = $state(false);
   error = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
+
+  // Staleness (Slice B3 follow-up) — hud.cost snapshots arrive every 10s;
+  // 90s without an update means SSE is silently failing.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private eventUnsubs: Array<() => void> = [];
@@ -77,10 +85,13 @@ class CostStore {
     this.error = null;
   }
 
-  startPolling(intervalMs = 30000): void {
+  startPolling(intervalMs = 60000): void {
     this.stopPolling();
     this.fetch();
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    // 60s watchdog poll — fires when SSE is down OR the store has gone stale.
+    this.pollTimer = setInterval(() => {
+      if (!eventStore.connected || this.isStale) this.fetch();
+    }, intervalMs);
 
     this.eventUnsubs.push(
       eventStore.on('hud.cost', (e) => this.applySnapshot(e.data)),
@@ -98,3 +109,4 @@ class CostStore {
 }
 
 export const costStore = new CostStore();
+stalenessStore.register('cost', () => costStore.isStale);
