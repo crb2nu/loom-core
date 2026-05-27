@@ -79,7 +79,7 @@ variables:
   CUSTOM_SERVER_IMAGE_REPO: mcp/custom-server
   BUILDKIT_HOST: "tcp://buildkitd-central.ci-build.svc.cluster.local:1234"
   BUILDKIT_FALLBACK_HOSTS: "tcp://buildkitd-central.ci-build.svc.cluster.local:1234,tcp://buildkitd.ci-build.svc.cluster.local:1234"
-  BUILDKIT_CLI_IMAGE: "registry.harbor.lan/dockerhub-cache/moby/buildkit:v0.12.5"
+  BUILDKIT_CLI_IMAGE: "docker.io/moby/buildkit:v0.12.5"
   # The CI runner injects a pre-build step that waits for a Docker daemon when DOCKER_HOST is tcp://localhost:2375.
   # This repo doesn't use DinD for its Go jobs; disable that wait globally to prevent jobs hanging.
   DOCKER_HOST: ""
@@ -366,7 +366,7 @@ security:govulncheck:
     expire_in: 1 week
 
 lint:mcp-godot:
-  image: registry.harbor.lan/dockerhub-cache/library/node:20
+  image: docker.io/library/node:20
   stage: lint
   variables:
     # This job needs repository files under tools/mcp-godot.
@@ -711,7 +711,7 @@ release:
 
 deploy:homebrew:
   stage: deploy
-  image: registry.harbor.lan/dockerhub-cache/library/alpine:latest
+  image: docker.io/library/alpine:3.21
   before_script:
     - apk add --no-cache git curl
   script:

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Build stage
-ARG RUNTIME_REGISTRY=registry.harbor.lan
-FROM golang:1.25.10-alpine AS builder
+ARG PUBLIC_BASE_REGISTRY=docker.io
+FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.25.10-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 ENV GOWORK=off \
@@ -70,7 +70,7 @@ RUN --mount=type=secret,id=ci_job_token,required=false \
         'CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -trimpath -ldflags="-s -w" -o "/bin/$1" "./cmd/$1"' _ {}
 
 # Runtime stage - minimal image
-FROM ${RUNTIME_REGISTRY}/dockerhub-cache/library/alpine:3.21
+FROM ${PUBLIC_BASE_REGISTRY}/library/alpine:3.21
 
 RUN apk add --no-cache ca-certificates git
 
