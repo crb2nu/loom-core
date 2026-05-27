@@ -145,6 +145,67 @@ type PipelinePolicy struct {
 	ProtectedPaths         []string        `yaml:"protected_paths,omitempty"`
 	Retry                  RetryPolicy     `yaml:"retry"`
 	AutoRevertOnRegression bool            `yaml:"auto_revert_on_regression,omitempty"`
+
+	// StageSubstrate selects which devbox backend each spawn-driven stage
+	// runs against (harvester-vm Slice 2). Keys are stage IDs; values are
+	// backend names. Empty / unset entries fall back to SubstrateDefault.
+	// Only spawn-driven stages are configurable here (plan_slice, research,
+	// implement, tests, pr_self_review); GitLabWorker-driven stages (mr,
+	// ci_watch, merge, cleanup) are HTTP-only and have no sandbox.
+	//
+	//	pipeline:
+	//	  stage_substrate:
+	//	    plan_slice:     k8s
+	//	    research:       k8s
+	//	    implement:      harvester-vm
+	//	    tests:          harvester-vm
+	//	    pr_self_review: k8s
+	//
+	// Spec: .loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md
+	StageSubstrate map[string]string `yaml:"stage_substrate,omitempty"`
+}
+
+// SubstrateDefault is the substrate returned by Policy.SubstrateForStage when
+// no explicit mapping exists. Today's prod baseline is the k3s buildah-in-pod
+// path; switch to "harvester-vm" only via explicit per-stage opt-in until the
+// substrate proves out (see Slice 4 in .loom/45-…).
+const SubstrateDefault = "k8s"
+
+// SubstrateValuesValid is the closed set of devbox backend identifiers
+// permitted in PipelinePolicy.StageSubstrate values.
+var SubstrateValuesValid = map[string]struct{}{
+	"k8s":          {},
+	"harvester-vm": {},
+}
+
+// StageSubstrateKeysValid is the closed set of spawn-driven stage IDs whose
+// substrate is operator-configurable. Keep in lockstep with the SpawnWorker
+// entries in pkg/mills/pipeline/dispatcher.go::BuildDefaultWorkers and the
+// `Type: "agent_spawn"` / `Type: "shell"` (tests) entries in
+// pkg/mills/pipeline/runner.go::DefaultStages. Stages run by GitLabWorker
+// (mr, ci_watch, merge, cleanup) are intentionally excluded — they have no
+// devbox sandbox to choose.
+var StageSubstrateKeysValid = map[string]struct{}{
+	"plan_slice":     {},
+	"research":       {},
+	"implement":      {},
+	"tests":          {},
+	"pr_self_review": {},
+}
+
+// SubstrateForStage returns the configured devbox backend for stage. Returns
+// SubstrateDefault ("k8s") when the stage has no entry, when the entry is
+// the empty string, or when p is nil. This is the only caller-facing
+// accessor; callers must not range over StageSubstrate directly so the
+// fallback rule stays in one place.
+func (p *Policy) SubstrateForStage(stage string) string {
+	if p == nil {
+		return SubstrateDefault
+	}
+	if v, ok := p.Pipeline.StageSubstrate[stage]; ok && v != "" {
+		return v
+	}
+	return SubstrateDefault
 }
 
 // LabelOverride lets a label flip auto_merge / human_review for a specific
@@ -421,6 +482,14 @@ func (p *Policy) Validate() error {
 	for i, gp := range p.Pipeline.ProtectedPaths {
 		if !doublestar.ValidatePattern(gp) {
 			return fmt.Errorf("pipeline.protected_paths[%d] %q is not a valid glob", i, gp)
+		}
+	}
+	for stage, sub := range p.Pipeline.StageSubstrate {
+		if _, ok := StageSubstrateKeysValid[stage]; !ok {
+			return fmt.Errorf("pipeline.stage_substrate: %q is not a configurable stage (allowed: plan_slice, research, implement, tests, pr_self_review)", stage)
+		}
+		if _, ok := SubstrateValuesValid[sub]; !ok {
+			return fmt.Errorf("pipeline.stage_substrate[%s]: %q is not a recognized substrate (allowed: k8s, harvester-vm)", stage, sub)
 		}
 	}
 	if p.Council.Ensemble.Editor.Model != "" && p.Council.Ensemble.Editor.Backend == "" {
