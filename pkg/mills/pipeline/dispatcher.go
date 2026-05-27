@@ -157,6 +157,15 @@ type SpawnRequest struct {
 	Branch     string
 	BaseBranch string
 	Namespace  string
+
+	// Substrate is the devbox backend identifier the spawn service should
+	// run this stage against (e.g. "k8s", "harvester-vm"). Populated by
+	// SpawnWorker from policy via SubstrateFor; empty means "use the
+	// spawn service's default backend" — current behavior pre-Slice-2b.
+	// The HUD spawn server consumes this in a follow-up slice (2c) by
+	// translating it to DEVBOX_BACKEND on the spawn pod's env. Spec:
+	// .loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md
+	Substrate string
 }
 
 // SpawnResponse summarises what the spawn returned. Workers translate
@@ -199,6 +208,14 @@ type SpawnWorker struct {
 	// BaseBranch is what spawned worktrees branch off. Empty falls
 	// through to spawn-side default ("main").
 	BaseBranch string
+	// SubstrateFor returns the devbox backend the spawn service should
+	// use for the given stage id. The operator wires this from
+	// PolicyManager.Current().SubstrateForStage so hot-reloaded policy
+	// changes take effect on the next stage attempt. Nil-safe: when
+	// unset, Run leaves SpawnRequest.Substrate empty and the spawn
+	// service falls back to its compiled-in default backend (current
+	// behavior pre-Slice-2b). Spec: .loom/45-product-spec-mills-…
+	SubstrateFor func(stage string) string
 }
 
 // Run satisfies Worker.
@@ -222,6 +239,10 @@ func (w *SpawnWorker) Run(ctx context.Context, jc JobContext) (StageOutput, erro
 	if branch == "" {
 		return StageOutput{}, fmt.Errorf("spawn worker: source branch unavailable for backlog %q", jc.Item.ID)
 	}
+	substrate := ""
+	if w.SubstrateFor != nil {
+		substrate = w.SubstrateFor(jc.Stage.ID)
+	}
 	req := SpawnRequest{
 		Prompt:          prompt,
 		WorkingDir:      jc.Run.WorktreePath,
@@ -238,6 +259,7 @@ func (w *SpawnWorker) Run(ctx context.Context, jc JobContext) (StageOutput, erro
 		Branch:          branch,
 		BaseBranch:      w.BaseBranch,
 		Namespace:       namespace,
+		Substrate:       substrate,
 	}
 	if jc.ResumeSpawnID != "" {
 		resumer, ok := w.Client.(SpawnResumeClient)
@@ -752,17 +774,23 @@ func callOr(fn func(JobContext) string, jc JobContext, fallback string) string {
 // Callers supply concrete clients; nil clients produce errors at run
 // time, surfaced in stage_results.outcome=error so the failure is
 // auditable rather than silent.
-func DefaultRoutes(spawn SpawnClient, weaver WeaverClient, devbox DevboxClient, gitlab GitLabClient, project, agentID string, promptFor func(string) func(JobContext) string) map[string]Worker {
+//
+// substrateFor selects the devbox backend per spawn-driven stage; a nil
+// value is permitted and yields SpawnRequest.Substrate="" (the spawn
+// service's default backend). Production wires
+// PolicyManager.Current().SubstrateForStage here so hot-reloaded policy
+// changes take effect on the next stage attempt.
+func DefaultRoutes(spawn SpawnClient, weaver WeaverClient, devbox DevboxClient, gitlab GitLabClient, project, agentID string, promptFor func(string) func(JobContext) string, substrateFor func(stage string) string) map[string]Worker {
 	if promptFor == nil {
 		promptFor = func(string) func(JobContext) string { return nil }
 	}
 	gw := &GitLabWorker{Client: gitlab}
 	return map[string]Worker{
-		"plan_slice":     &SpawnWorker{Client: spawn, PromptFor: promptFor("plan_slice")},
+		"plan_slice":     &SpawnWorker{Client: spawn, PromptFor: promptFor("plan_slice"), SubstrateFor: substrateFor},
 		"research":       &WeaverWorker{Client: weaver, PromptFor: promptFor("research")},
-		"implement":      &SpawnWorker{Client: spawn, PromptFor: promptFor("implement"), NeedsWorktree: true},
+		"implement":      &SpawnWorker{Client: spawn, PromptFor: promptFor("implement"), NeedsWorktree: true, SubstrateFor: substrateFor},
 		"tests":          &DevboxWorker{Client: devbox, Project: project, AgentID: agentID},
-		"pr_self_review": &SpawnWorker{Client: spawn, PromptFor: promptFor("pr_self_review")},
+		"pr_self_review": &SpawnWorker{Client: spawn, PromptFor: promptFor("pr_self_review"), SubstrateFor: substrateFor},
 		"mr":             gw,
 		"ci_watch":       gw,
 		"merge":          gw,

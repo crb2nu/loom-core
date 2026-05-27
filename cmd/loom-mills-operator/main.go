@@ -201,7 +201,7 @@ func run(cfg Config) error {
 	// Worker dispatcher: real clients where configured, NoOpDispatcher
 	// for stages whose backing service isn't wired yet. The operator
 	// logs each gap so it's obvious which surfaces are stub vs production.
-	dispatcher, realStages := buildDispatcher(cfg, flexClient, hubClient, st, logger, autoMergeFor(pm))
+	dispatcher, realStages := buildDispatcher(cfg, flexClient, hubClient, st, logger, autoMergeFor(pm), substrateForStage(pm))
 	capabilities.DispatcherRealStages = realStages
 	capabilities.BranchContractReady = true
 	capabilities.BranchContractSource = "pkg/mills/pipeline/branch_contract.go"
@@ -681,6 +681,18 @@ func autoMergeFor(pm *mills.PolicyManager) func(pipeline.JobContext) bool {
 	}
 }
 
+// substrateForStage returns a closure that consults the active policy on
+// every invocation so hot-reloaded `pipeline.stage_substrate` changes
+// take effect on the next stage attempt. Mirrors autoMergeFor's pattern.
+// Nil-safe via Policy.SubstrateForStage which returns SubstrateDefault
+// on a nil receiver, so an unwired PolicyManager.Current() never blocks
+// a spawn — it just falls back to the default backend.
+func substrateForStage(pm *mills.PolicyManager) func(stage string) string {
+	return func(stage string) string {
+		return pm.Current().SubstrateForStage(stage)
+	}
+}
+
 // buildCanaryGC returns a configured stale-canary GC when policy
 // has intake.canary_gc.enabled = true. Returns nil otherwise.
 func buildCanaryGC(pm *mills.PolicyManager, st *store.Store, logger *slog.Logger) *intake.CanaryGC {
@@ -749,7 +761,7 @@ func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, 
 //   - GitLabWorker (mr/ci_watch/merge/cleanup): GitLab REST API
 //   - DevboxWorker (tests): mcp-devbox via MCP hub
 //   - SpawnWorker (plan_slice/implement/pr_self_review): HUD mobile API
-func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger, autoMerge func(pipeline.JobContext) bool) (pipeline.WorkerDispatcher, map[string]bool) {
+func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger, autoMerge func(pipeline.JobContext) bool, substrateFor func(stage string) string) (pipeline.WorkerDispatcher, map[string]bool) {
 	noop := &pipeline.NoOpDispatcher{}
 	gitlab := buildGitLabClient(cfg, logger)
 	spawn := buildHUDSpawnClient(cfg, logger)
@@ -822,11 +834,12 @@ func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCP
 			spawnAgent = "claude-code"
 		}
 		routes["plan_slice"] = &pipeline.SpawnWorker{
-			Client:    spawn,
-			Model:     spawnAgent,
-			Project:   project,
-			Namespace: "loom-mills",
-			PromptFor: stagePromptFor("plan_slice"),
+			Client:       spawn,
+			Model:        spawnAgent,
+			Project:      project,
+			Namespace:    "loom-mills",
+			PromptFor:    stagePromptFor("plan_slice"),
+			SubstrateFor: substrateFor,
 		}
 		routes["implement"] = &pipeline.SpawnWorker{
 			Client:        spawn,
@@ -835,13 +848,15 @@ func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCP
 			Namespace:     "loom-mills",
 			PromptFor:     stagePromptFor("implement"),
 			NeedsWorktree: true,
+			SubstrateFor:  substrateFor,
 		}
 		routes["pr_self_review"] = &pipeline.SpawnWorker{
-			Client:    spawn,
-			Model:     spawnAgent,
-			Project:   project,
-			Namespace: "loom-mills",
-			PromptFor: stagePromptFor("pr_self_review"),
+			Client:       spawn,
+			Model:        spawnAgent,
+			Project:      project,
+			Namespace:    "loom-mills",
+			PromptFor:    stagePromptFor("pr_self_review"),
+			SubstrateFor: substrateFor,
 		}
 		realStages["plan_slice"] = true
 		realStages["implement"] = true
