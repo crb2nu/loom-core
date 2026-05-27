@@ -535,3 +535,138 @@ func TestPolicyManager_BadReloadKeepsOld(t *testing.T) {
 		t.Errorf("bad reload clobbered policy: now %d", mgr.Current().Budgets.Pipeline.MaxConcurrentRuns)
 	}
 }
+
+func TestPolicy_StageSubstrate_Defaults(t *testing.T) {
+	// nil receiver and empty map both fall back to SubstrateDefault.
+	var nilPol *Policy
+	if got := nilPol.SubstrateForStage("implement"); got != SubstrateDefault {
+		t.Errorf("nil policy: got %q want %q", got, SubstrateDefault)
+	}
+
+	p := &Policy{}
+	for _, stage := range []string{"plan_slice", "research", "implement", "tests", "pr_self_review", "mr"} {
+		if got := p.SubstrateForStage(stage); got != SubstrateDefault {
+			t.Errorf("empty policy stage %s: got %q want %q", stage, got, SubstrateDefault)
+		}
+	}
+
+	// Explicit empty value also falls back to default.
+	p.Pipeline.StageSubstrate = map[string]string{"implement": ""}
+	if got := p.SubstrateForStage("implement"); got != SubstrateDefault {
+		t.Errorf("empty-string entry: got %q want %q", got, SubstrateDefault)
+	}
+}
+
+func TestPolicy_StageSubstrate_LookupHits(t *testing.T) {
+	p := &Policy{
+		Pipeline: PipelinePolicy{
+			StageSubstrate: map[string]string{
+				"plan_slice":     "k8s",
+				"implement":      "harvester-vm",
+				"tests":          "harvester-vm",
+				"pr_self_review": "k8s",
+			},
+		},
+	}
+	cases := []struct{ stage, want string }{
+		{"plan_slice", "k8s"},
+		{"implement", "harvester-vm"},
+		{"tests", "harvester-vm"},
+		{"pr_self_review", "k8s"},
+		{"research", SubstrateDefault}, // unset → default
+		{"mr", SubstrateDefault},       // not configurable → default
+		{"unknown", SubstrateDefault},  // never configured → default
+	}
+	for _, tc := range cases {
+		t.Run(tc.stage, func(t *testing.T) {
+			if got := p.SubstrateForStage(tc.stage); got != tc.want {
+				t.Errorf("SubstrateForStage(%q): got %q want %q", tc.stage, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPolicy_StageSubstrate_Validate(t *testing.T) {
+	cases := []struct {
+		name        string
+		substrate   map[string]string
+		wantErrFrag string // empty = expect success
+	}{
+		{
+			name: "all valid keys + values",
+			substrate: map[string]string{
+				"plan_slice":     "k8s",
+				"research":       "k8s",
+				"implement":      "harvester-vm",
+				"tests":          "harvester-vm",
+				"pr_self_review": "k8s",
+			},
+		},
+		{
+			name:        "unknown stage key",
+			substrate:   map[string]string{"mr": "k8s"},
+			wantErrFrag: "is not a configurable stage",
+		},
+		{
+			name:        "unknown substrate value",
+			substrate:   map[string]string{"implement": "docker"},
+			wantErrFrag: "is not a recognized substrate",
+		},
+		{
+			name:        "empty substrate value rejected by validate",
+			substrate:   map[string]string{"implement": ""},
+			wantErrFrag: "is not a recognized substrate",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParsePolicy([]byte(fixtureV1))
+			if err != nil {
+				t.Fatalf("setup parse: %v", err)
+			}
+			p.Pipeline.StageSubstrate = tc.substrate
+			err = p.Validate()
+			if tc.wantErrFrag == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrFrag)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrFrag) {
+				t.Errorf("expected error containing %q, got %v", tc.wantErrFrag, err)
+			}
+		})
+	}
+}
+
+func TestPolicy_StageSubstrate_Roundtrip(t *testing.T) {
+	body := `
+version: 2
+budgets:
+  council:  { max_usd_per_run: 15, max_usd_per_day: 50 }
+  pipeline: { max_usd_per_run: 5, max_usd_per_day: 75 }
+pipeline:
+  retry: { max_attempts: 3, cooldown_seconds: 300 }
+  stage_substrate:
+    plan_slice:     k8s
+    implement:      harvester-vm
+    tests:          harvester-vm
+    pr_self_review: k8s
+`
+	p, err := ParsePolicy([]byte(body))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if got, want := p.SubstrateForStage("implement"), "harvester-vm"; got != want {
+		t.Errorf("SubstrateForStage(implement): got %q want %q", got, want)
+	}
+	if got, want := p.SubstrateForStage("research"), SubstrateDefault; got != want {
+		t.Errorf("SubstrateForStage(research): got %q want %q", got, want)
+	}
+}

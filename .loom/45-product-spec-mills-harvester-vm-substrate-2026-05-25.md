@@ -177,8 +177,8 @@ boot-time spec target. ~2-4h of virt-customize iteration.
 
 ### Slice 2 — Mills opts in for `mills-canary-*` items
 
-- `pipeline.stage_substrate` field in policy
-- `GitLabWorker` selects backend per stage by label match
+- `pipeline.stage_substrate` field in policy ✅ **SHIPPED 2026-05-27**: `pkg/mills/policy.PipelinePolicy.StageSubstrate map[string]string` + `Policy.SubstrateForStage(stage) string` accessor + validation (keys ∈ {plan_slice, research, implement, tests, pr_self_review}, values ∈ {k8s, harvester-vm}) + tests. Default fallback is `k8s` (the prod baseline). YAML roundtrip pinned by `TestPolicy_StageSubstrate_Roundtrip`. **No runtime consumer yet** — the spawn dispatcher still picks backend at startup via `DEVBOX_BACKEND` env. Slice 2.5 wires `SpawnWorker` (the spawn-driven dispatcher, not `GitLabWorker` — that runs mr/ci_watch/merge/cleanup which have no sandbox) to thread the per-stage substrate hint through `SpawnRequest` so the HUD spawn API can pick the matching backend at pod-start time.
+- **Slice 2.5 (next)**: thread `Policy.SubstrateForStage(jc.Stage)` through `SpawnWorker.Run` into `pipeline.SpawnRequest`, add a `Substrate string` field on `SpawnRequest` + `hudSpawnRequestBody` + `internal/spawn.Request`, and have the HUD spawn orchestrator pick the matching backend instance (requires multi-backend initialization in `cmd/mcp-devbox` + a backend lookup in `internal/hud/spawn.go`).
 - Acceptance: 1 successful end-to-end auto-merge of a canary item via
   `harvester-vm` (prod currently 0/56)
 
