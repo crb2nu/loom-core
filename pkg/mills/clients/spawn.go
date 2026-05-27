@@ -145,6 +145,12 @@ type hudSpawnRequestBody struct {
 	MaxTurns        int               `json:"max_turns,omitempty"`
 	ParentSessionID string            `json:"parent_session_id,omitempty"`
 	Metadata        map[string]string `json:"metadata,omitempty"`
+	// Substrate carries the per-stage devbox backend selection from
+	// policy.SubstrateForStage. The HUD spawn server translates it to
+	// DEVBOX_BACKEND on the spawn pod's env so the pod's in-pod
+	// mcp-devbox routes devbox_* calls onto the named substrate.
+	// Slice 2c — see .loom/121-iteration-plan-…-slice2c-2026-05-27.md.
+	Substrate string `json:"substrate,omitempty"`
 }
 
 // hudSpawnAcceptResponse is what POST /spawn returns on success.
@@ -208,6 +214,7 @@ func (c *HUDSpawnClient) Run(ctx context.Context, req pipeline.SpawnRequest) (pi
 		MaxTurns:        req.BudgetTurns,
 		ParentSessionID: req.ParentSessionID,
 		Metadata:        buildSpawnMetadata(req),
+		Substrate:       req.Substrate,
 	}
 
 	spawnID, err := c.startSpawn(ctx, body)

@@ -633,3 +633,89 @@ func TestSpawnOrchestrator_BroadcastWeaverParent_OnlyOnFirstEvent(t *testing.T) 
 		}
 	}
 }
+
+// TestBuildSpawnPodEnv covers the Slice 2c env-propagation helper. The
+// helper is what runSpawn calls before backend.Start, so its output
+// shape IS the pod env contract.
+func TestBuildSpawnPodEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		req      SpawnRequest
+		wantHave map[string]string // keys that must equal these values
+		wantMiss []string          // keys that must NOT be present
+	}{
+		{
+			name: "baseline_no_substrate_no_parent",
+			req: SpawnRequest{
+				AgentType: "claude-code",
+				Namespace: "loom-mills",
+			},
+			wantHave: map[string]string{
+				"AGENT_ID":  "agent-1",
+				"SPAWN_ID":  "spawn-1",
+				"NAMESPACE": "loom-mills",
+			},
+			wantMiss: []string{
+				"LOOM_PARENT_SESSION_ID",
+				"GOOGLE_APPLICATION_CREDENTIALS",
+				"DEVBOX_BACKEND",
+			},
+		},
+		{
+			name: "substrate_harvester_vm_lands_as_DEVBOX_BACKEND",
+			req: SpawnRequest{
+				AgentType: "claude-code",
+				Namespace: "loom-mills",
+				Substrate: "harvester-vm",
+			},
+			wantHave: map[string]string{
+				"DEVBOX_BACKEND": "harvester-vm",
+			},
+		},
+		{
+			name: "substrate_k8s_explicit",
+			req: SpawnRequest{
+				AgentType: "claude-code",
+				Substrate: "k8s",
+			},
+			wantHave: map[string]string{
+				"DEVBOX_BACKEND": "k8s",
+			},
+		},
+		{
+			name: "parent_session_id_propagates",
+			req: SpawnRequest{
+				AgentType:       "claude-code",
+				ParentSessionID: "sess-abc",
+			},
+			wantHave: map[string]string{
+				"LOOM_PARENT_SESSION_ID": "sess-abc",
+			},
+			wantMiss: []string{"DEVBOX_BACKEND"},
+		},
+		{
+			name: "gemini_gets_GOOGLE_APPLICATION_CREDENTIALS",
+			req: SpawnRequest{
+				AgentType: "gemini",
+			},
+			wantHave: map[string]string{
+				"GOOGLE_APPLICATION_CREDENTIALS": GeminiSAMountPath + "/" + GeminiSAFilename,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := buildSpawnPodEnv(tc.req, "agent-1", "spawn-1")
+			for k, want := range tc.wantHave {
+				if got := env[k]; got != want {
+					t.Errorf("env[%q] = %q; want %q", k, got, want)
+				}
+			}
+			for _, k := range tc.wantMiss {
+				if v, ok := env[k]; ok {
+					t.Errorf("env[%q] unexpectedly present (= %q)", k, v)
+				}
+			}
+		})
+	}
+}

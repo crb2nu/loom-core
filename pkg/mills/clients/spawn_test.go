@@ -196,6 +196,50 @@ func TestRun_PostsCorrectRequestAndAuth(t *testing.T) {
 	if body.Metadata["loom_mills_stage"] != "plan_slice" {
 		t.Errorf("metadata.loom_mills_stage missing: %v", body.Metadata)
 	}
+	// Default sampleSpawnReq has empty Substrate → omitempty must drop
+	// the field from the POST body so Slice 2c stays a no-op for callers
+	// that have not opted into stage-substrate routing.
+	if body.Substrate != "" {
+		t.Errorf("substrate must be omitted when SpawnRequest.Substrate empty; got %q", body.Substrate)
+	}
+}
+
+// TestRun_PropagatesSubstrate covers the Slice 2c hop:
+// pipeline.SpawnRequest.Substrate must land in the POST body as the
+// JSON "substrate" field so the HUD spawn server can promote it to
+// DEVBOX_BACKEND on the pod env. Empty-substrate omission is covered
+// by TestRun_PostsCorrectRequestAndAuth above.
+func TestRun_PropagatesSubstrate(t *testing.T) {
+	ft := &hudFakeTransport{
+		post: func(_ *http.Request) (int, any) {
+			return 202, hudSpawnAcceptResponse{SpawnID: "spawn-sub", Status: "creating"}
+		},
+		get: func(_ *http.Request) (int, any) {
+			return 200, hudSpawnState{SpawnID: "spawn-sub", Status: "completed"}
+		},
+	}
+	c := newHUDStub(t, ft)
+	req := sampleSpawnReq()
+	req.Substrate = "harvester-vm"
+	if _, err := c.Run(context.Background(), req); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	requests := ft.recordedRequests()
+	if len(requests) < 1 {
+		t.Fatalf("expected at least one request")
+	}
+	var body hudSpawnRequestBody
+	if err := json.Unmarshal([]byte(requests[0].Body), &body); err != nil {
+		t.Fatalf("decode post body: %v", err)
+	}
+	if body.Substrate != "harvester-vm" {
+		t.Errorf("substrate = %q; want %q", body.Substrate, "harvester-vm")
+	}
+	// Raw JSON must include the substrate key (defensive against future
+	// struct-field renames that would silently break the wire contract).
+	if !strings.Contains(requests[0].Body, `"substrate":"harvester-vm"`) {
+		t.Errorf("raw POST body missing substrate key: %s", requests[0].Body)
+	}
 }
 
 func TestRun_RetriesTransientPostFailure(t *testing.T) {

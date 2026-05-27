@@ -121,6 +121,18 @@ type Request struct {
 	// weaver query Y". Keys are free-form; consumers should namespace
 	// their own keys (e.g. weaver_*).
 	Metadata map[string]string `json:"metadata,omitempty"`
+	// Substrate selects the devbox backend the spawn pod's in-pod
+	// mcp-devbox should route subsequent devbox_* MCP calls to. Mills
+	// populates this via pipeline.SpawnRequest.Substrate, which is
+	// derived from policy.SubstrateForStage (see
+	// .loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md).
+	// Empty means "use the in-pod mcp-devbox's compiled-in default
+	// backend" — current behavior pre-Slice-2c. The HUD spawn
+	// orchestrator translates this to DEVBOX_BACKEND on the pod env.
+	// Slice 2d will add a per-spawn backend lookup so the pod itself
+	// runs on the named substrate; today the pod still lives on the
+	// orchestrator's single backend.
+	Substrate string `json:"substrate,omitempty"`
 }
 
 // AuthMode describes which cluster credential path the spawned agent was
