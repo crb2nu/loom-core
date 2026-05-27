@@ -10,10 +10,10 @@
 #   - VERSION is stamped into main.version via -ldflags, surfaced by --version.
 #   - The image is multi-arch capable; the K3s deployment pins linux/amd64.
 #
-ARG RUNTIME_REGISTRY=registry.harbor.lan
+ARG PUBLIC_BASE_REGISTRY=docker.io
 
 # ---------- Build stage ----------
-FROM golang:1.25.10-alpine AS builder
+FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.25.10-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 ENV GOWORK=off \
@@ -69,7 +69,7 @@ RUN --mount=type=secret,id=ci_job_token,required=false \
       -o /bin/loom-mills-operator ./cmd/loom-mills-operator
 
 # ---------- Runtime stage ----------
-FROM ${RUNTIME_REGISTRY}/dockerhub-cache/library/alpine:3.21 AS runtime
+FROM ${PUBLIC_BASE_REGISTRY}/library/alpine:3.21 AS runtime
 
 # ca-certificates: outbound TLS to Anthropic / OpenAI / GitLab.
 # git: repo-root bootstrap + integration branch merging.
