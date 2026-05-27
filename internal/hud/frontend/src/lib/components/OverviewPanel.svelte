@@ -70,20 +70,23 @@
   });
 
   // Polling bootstrap: this is currently the landing view, so eagerly start
-  // every store the dashboard reads. The 5 decomposed stores (fleet, tasks,
-  // sandbox, spawn, health) now use SSE-first 60s watchdog polling per
-  // Slice B3 — the intervals below are just safety nets for SSE disconnects.
+  // every store the dashboard reads. Stores with SSE-backed snapshots use
+  // 60s watchdog polling — SSE pushes drive the data, polling is a safety
+  // net for SSE disconnects (Slice B3 + B3 follow-up). Stores without SSE
+  // (mills, otel) keep their 30s cadence until they get SSE coverage.
   $effect(() => {
     fleetStore.startPolling(60000, fleetPollingOwner);
     healthStore.startPolling(60000);
     taskStore.startPolling(60000);
-    memoryStore.startPolling(30000);
     streamStore.startPolling(60000);
-    costStore.startPolling(30000);
-    rbacStore.startPolling(30000);
-    coordinationStore.startPolling(30000);
-    mergeQueueStore.startPolling(30000);
-    shuttleStore.startPolling(30000);
+    memoryStore.startPolling(60000);
+    costStore.startPolling(60000);
+    rbacStore.startPolling(60000);
+    coordinationStore.startPolling(60000);
+    mergeQueueStore.startPolling(60000);
+    shuttleStore.startPolling(60000);
+    // mills + otel have no SSE backing — bumping them to 60s would add a
+    // 30s data lag. Leave at 30s until they get hud.* event subscriptions.
     millsStore.startPolling(30000);
     otelStore.startPolling(30000, otelPollingOwner);
     liveSessionsStore.connect();
