@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -247,6 +248,55 @@ func (k *K8sBackend) Health(ctx context.Context) error {
 		return fmt.Errorf("namespace %q not accessible: %w", k.namespace, err)
 	}
 	return nil
+}
+
+// ResolveSecretEnv implements SecretResolver. Reads each referenced K8s
+// Secret via the backend's Clientset and returns a name → plaintext value
+// map. Missing Secrets and missing keys are skipped silently (Optional
+// semantics matching how K8s SecretKeyRef behaves on pod-spec env). Reads
+// are cached by SecretName so multiple SecretEnvVar entries pointing at
+// the same Secret hit the API once.
+//
+// Errors are returned only for unexpected failures (e.g., permission
+// denied, transport error). NotFound on a Secret is treated as absent.
+func (k *K8sBackend) ResolveSecretEnv(ctx context.Context, secrets []SecretEnvVar) (map[string]string, error) {
+	out := make(map[string]string, len(secrets))
+	if len(secrets) == 0 {
+		return out, nil
+	}
+	type cacheEntry struct {
+		data    map[string][]byte
+		present bool
+	}
+	cache := make(map[string]cacheEntry, len(secrets))
+	for _, s := range secrets {
+		if s.Name == "" || s.SecretName == "" || s.SecretKey == "" {
+			continue
+		}
+		entry, ok := cache[s.SecretName]
+		if !ok {
+			secret, err := k.clientset.CoreV1().Secrets(k.namespace).Get(ctx, s.SecretName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					entry = cacheEntry{present: false}
+				} else {
+					return nil, fmt.Errorf("get secret %q: %w", s.SecretName, err)
+				}
+			} else {
+				entry = cacheEntry{data: secret.Data, present: true}
+			}
+			cache[s.SecretName] = entry
+		}
+		if !entry.present {
+			continue
+		}
+		val, ok := entry.data[s.SecretKey]
+		if !ok {
+			continue
+		}
+		out[s.Name] = string(val)
+	}
+	return out, nil
 }
 
 // buildNameRe matches characters unsafe for K8s resource names.

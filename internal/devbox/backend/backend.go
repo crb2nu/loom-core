@@ -70,6 +70,18 @@ type SecretEnvVar struct {
 	SecretKey  string // key within the secret
 }
 
+// SecretResolver translates SecretEnvVar references (K8s Secret name + key)
+// into plaintext env-var values. K8sBackend implements this natively via
+// its existing Clientset; non-K8s backends (e.g., HarvesterVMBackend) accept
+// it as an optional dependency so they can flatten Secret-backed env into
+// the per-VM cloud-init payload at Start time. Missing Secrets or missing
+// keys are treated as no-ops (matching the Optional semantics K8s
+// SecretKeyRef applies on the pod-spec side) so a partially-populated
+// cluster Secret does not break Start.
+type SecretResolver interface {
+	ResolveSecretEnv(ctx context.Context, secrets []SecretEnvVar) (map[string]string, error)
+}
+
 // SecretMount mounts individual keys from a K8s Secret as files in the container.
 type SecretMount struct {
 	SecretName string // K8s secret name (e.g., "agent-auth-tokens")

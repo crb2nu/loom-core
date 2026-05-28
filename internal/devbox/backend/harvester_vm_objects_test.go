@@ -31,7 +31,7 @@ func TestBuildVMManifest_HappyPath(t *testing.T) {
 	cfg := validHarvesterCfg()
 	opts := StartOpts{Name: "test-vm-1"}
 
-	objs, err := buildVMManifest(opts, cfg, testPubKey)
+	objs, err := buildVMManifest(opts, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestBuildVMManifest_ResourceOverridesFromStartOpts(t *testing.T) {
 	cfg.DefaultMemMi = 16384
 	cfg.DefaultDiskGi = 100
 
-	objs, err := buildVMManifest(StartOpts{Name: "big-vm"}, cfg, testPubKey)
+	objs, err := buildVMManifest(StartOpts{Name: "big-vm"}, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestBuildVMManifest_CustomNetworkAttachmentDef(t *testing.T) {
 	cfg := validHarvesterCfg()
 	cfg.NetworkAttachmentDef = "custom-ns/mgmt-vlan"
 
-	objs, err := buildVMManifest(StartOpts{Name: "net-vm"}, cfg, testPubKey)
+	objs, err := buildVMManifest(StartOpts{Name: "net-vm"}, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestBuildVMManifest_RequiredFieldErrors(t *testing.T) {
 			pk := testPubKey
 			tc.mutate(&opts, &cfg, &pk)
 
-			_, err := buildVMManifest(opts, cfg, pk)
+			_, err := buildVMManifest(opts, cfg, pk, nil)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -381,7 +381,7 @@ func TestBuildVMManifest_EmptyBaseImageNameIsAccepted(t *testing.T) {
 	cfg := validHarvesterCfg()
 	cfg.BaseImageName = ""
 
-	objs, err := buildVMManifest(StartOpts{Name: "no-base"}, cfg, testPubKey)
+	objs, err := buildVMManifest(StartOpts{Name: "no-base"}, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestBuildVMManifest_AgentIDPropagatesAsLabel(t *testing.T) {
 	objs, err := buildVMManifest(StartOpts{
 		Name:    "labeled-vm",
 		AgentID: "claude-code-42",
-	}, cfg, testPubKey)
+	}, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -420,7 +420,7 @@ func TestBuildVMManifest_ManagedByOverride(t *testing.T) {
 	objs, err := buildVMManifest(StartOpts{
 		Name:              "spawn-vm",
 		ManagedByOverride: "loom-spawn",
-	}, cfg, testPubKey)
+	}, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestBuildVMManifest_ExtraLabelsMerge(t *testing.T) {
 	objs, err := buildVMManifest(StartOpts{
 		Name:        "labeled-vm",
 		ExtraLabels: map[string]string{"team": "platform", "tier": "test"},
-	}, cfg, testPubKey)
+	}, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -454,11 +454,11 @@ func TestBuildVMManifest_StableNamesForRepeatedBuilds(t *testing.T) {
 	cfg := validHarvesterCfg()
 	opts := StartOpts{Name: "stable-vm"}
 
-	a, err := buildVMManifest(opts, cfg, testPubKey)
+	a, err := buildVMManifest(opts, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	b, err := buildVMManifest(opts, cfg, testPubKey)
+	b, err := buildVMManifest(opts, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestApplyOwnerReference_PatchesPVCWithVMRef(t *testing.T) {
 	// is populated). We assert apiVersion + kind + name + controller flag
 	// are correct; UID round-trips through GetUID/SetUID.
 	cfg := validHarvesterCfg()
-	objs, err := buildVMManifest(StartOpts{Name: "ownerref-vm"}, cfg, testPubKey)
+	objs, err := buildVMManifest(StartOpts{Name: "ownerref-vm"}, cfg, testPubKey, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest: %v", err)
 	}
@@ -557,4 +557,104 @@ func mustGetSliceAt(t *testing.T, root map[string]any, path ...string) []any {
 		t.Fatalf("path %v not found or wrong type: found=%v err=%v", path, found, err)
 	}
 	return v
+}
+
+func TestBuildVMManifest_RendersEnvIntoCloudInit(t *testing.T) {
+	cfg := validHarvesterCfg()
+	env := map[string]string{
+		"ANTHROPIC_API_KEY": "sk-ant-test-token",
+		"DEVBOX_BACKEND":    "harvester-vm",
+		"WITH_QUOTE":        "it's-quoted",
+	}
+	objs, err := buildVMManifest(StartOpts{Name: "env-vm"}, cfg, testPubKey, env)
+	if err != nil {
+		t.Fatalf("buildVMManifest returned error: %v", err)
+	}
+
+	volumes := mustGetSliceAt(t, objs.VM.Object, "spec", "template", "spec", "volumes")
+	var userData string
+	for _, v := range volumes {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		ci, ok := vm["cloudInitNoCloud"].(map[string]any)
+		if !ok {
+			continue
+		}
+		userData, _ = ci["userData"].(string)
+	}
+	if userData == "" {
+		t.Fatalf("cloud-init userData not found in VM manifest")
+	}
+
+	// Sorted KEY='value' entries, single-quoted, with POSIX escape for `'`.
+	wantSubstrings := []string{
+		"write_files:",
+		"path: /etc/loom-spawn.env",
+		"ANTHROPIC_API_KEY='sk-ant-test-token'",
+		"DEVBOX_BACKEND='harvester-vm'",
+		`WITH_QUOTE='it'\''s-quoted'`,
+	}
+	for _, want := range wantSubstrings {
+		if !strings.Contains(userData, want) {
+			t.Errorf("userData missing %q\n--- userData ---\n%s", want, userData)
+		}
+	}
+}
+
+func TestBuildVMManifest_RejectsNewlineEnv(t *testing.T) {
+	cfg := validHarvesterCfg()
+	env := map[string]string{"BAD": "line1\nline2"}
+	_, err := buildVMManifest(StartOpts{Name: "bad-env"}, cfg, testPubKey, env)
+	if err == nil {
+		t.Fatalf("expected error for newline-bearing env value, got nil")
+	}
+	if !strings.Contains(err.Error(), "newline") {
+		t.Errorf("error message should mention newline; got %q", err.Error())
+	}
+}
+
+func TestBuildVMManifest_EmptyEnvOmitsWriteFiles(t *testing.T) {
+	cfg := validHarvesterCfg()
+	objs, err := buildVMManifest(StartOpts{Name: "no-env-vm"}, cfg, testPubKey, nil)
+	if err != nil {
+		t.Fatalf("buildVMManifest returned error: %v", err)
+	}
+	volumes := mustGetSliceAt(t, objs.VM.Object, "spec", "template", "spec", "volumes")
+	for _, v := range volumes {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		ci, ok := vm["cloudInitNoCloud"].(map[string]any)
+		if !ok {
+			continue
+		}
+		ud, _ := ci["userData"].(string)
+		if strings.Contains(ud, "write_files") {
+			t.Errorf("expected no write_files block when env is empty; got userData:\n%s", ud)
+		}
+	}
+}
+
+func TestRenderCloudInitEnvBlock_EmptyInputs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{"nil", nil},
+		{"empty", map[string]string{}},
+		{"all-empty-keys", map[string]string{"": "value"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := renderCloudInitEnvBlock(tc.env)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if out != "" {
+				t.Errorf("expected empty block, got %q", out)
+			}
+		})
+	}
 }

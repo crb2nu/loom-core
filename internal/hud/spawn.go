@@ -838,11 +838,17 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 			},
 		)
 	} else {
-		// Fallback: buffered exec (no real-time telemetry).
+		// Fallback: buffered exec (no real-time telemetry). Pass the same
+		// env that landed on the substrate at Start time. For K8s pods env
+		// is already on the container so this is redundant; for harvester-vm
+		// the SSH shell prefix is the delivery channel — without this the
+		// agent CLI runs without spawn env (DEVBOX_BACKEND, LOOM_HUD_URL,
+		// resolved SecretEnv API keys, etc.).
 		execResult, execErr = be.Exec(execCtx, backend.ExecOpts{
 			ContainerID: startResult.ContainerID,
 			Command:     agentCmd,
 			WorkDir:     podProjectDir,
+			Env:         env,
 			TimeoutSec:  req.TimeoutMinutes * 60,
 		})
 	}
