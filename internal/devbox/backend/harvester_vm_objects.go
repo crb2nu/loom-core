@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"encoding/base64"
 	"fmt"
 	"sort"
 	"strings"
@@ -65,12 +66,20 @@ type harvesterVMObjects struct {
 // (legitimate env-var values don't contain `\n`, and accepting them would
 // let a malformed secret bleed into the manifest).
 //
+// `files` is the SecretMount resolution from a SecretResolver: one entry
+// per (mount, item) with an absolute Path inside the VM and binary-safe
+// Content. Each file becomes a cloud-init write_files entry with
+// `encoding: b64`, owner `vmSecretFileOwner`, and mode from
+// ResolvedSecretFile.Mode (default `0600`). When env + files are both
+// non-empty they share a single `write_files:` block (cloud-init parses
+// each top-level key once).
+//
 // Cloud-init injects the pubkey into the `ubuntu` user's
 // authorized_keys, disables password auth, and defensively re-enables
 // qemu-guest-agent + ssh even though the pre-baked image already has
 // them enabled (Slice 1.5 evidence:
 // `.loom/local/handoffs/mills-harvester-vm-slice15-2026-05-25.md`).
-func buildVMManifest(opts StartOpts, cfg HarvesterVMBackendConfig, sshPubKey string, env map[string]string) (*harvesterVMObjects, error) {
+func buildVMManifest(opts StartOpts, cfg HarvesterVMBackendConfig, sshPubKey string, env map[string]string, files []ResolvedSecretFile) (*harvesterVMObjects, error) {
 	if opts.Name == "" {
 		return nil, fmt.Errorf("StartOpts.Name is required")
 	}
@@ -86,7 +95,7 @@ func buildVMManifest(opts StartOpts, cfg HarvesterVMBackendConfig, sshPubKey str
 	if sshPubKey == "" {
 		return nil, fmt.Errorf("sshPubKey is required")
 	}
-	envBlock, err := renderCloudInitEnvBlock(env)
+	envBlock, err := renderCloudInitWriteFiles(env, files)
 	if err != nil {
 		return nil, err
 	}
@@ -251,16 +260,53 @@ ssh_pwauth: false
 	return &harvesterVMObjects{PVC: pvc, VM: vm}, nil
 }
 
-// renderCloudInitEnvBlock returns a `write_files:` block (with a trailing
-// newline) that lands `KEY='value'` shell-sourceable lines at
-// vmEnvFilePath. Empty input returns an empty string so the calling
-// fmt.Sprintf can drop it cleanly between the cloud-init `ssh_pwauth`
-// stanza and `runcmd`. Keys are sorted for deterministic output.
+// vmSecretFileOwner is the owner stanza for cloud-init write_files entries
+// holding Secret-resolved file content. Must match the user created by the
+// cloud-init `users:` stanza in buildVMManifest — currently hardcoded to
+// `ubuntu` — so the SSH session can read the files at exec time.
+const vmSecretFileOwner = "ubuntu:ubuntu"
+
+// renderCloudInitWriteFiles returns a single cloud-init `write_files:`
+// block (with a trailing newline) containing zero or more entries:
+//   - An env-file entry at vmEnvFilePath with `KEY='value'` shell-sourceable
+//     lines (root-owned, 0644). Skipped when env yields no usable keys.
+//   - One entry per ResolvedSecretFile with `encoding: b64` + base64-encoded
+//     Content, owned by vmSecretFileOwner, mode from file.Mode (default
+//     "0600"). Skipped when files is empty.
 //
-// Values are single-quoted with embedded single-quotes escaped using the
-// POSIX-portable `'\”` sequence. Newline-bearing values are rejected so
-// a malformed Secret can't bleed into the cloud-init YAML payload.
-func renderCloudInitEnvBlock(env map[string]string) (string, error) {
+// Empty input (no env entries AND no files) returns an empty string so the
+// calling fmt.Sprintf can drop the block cleanly between the cloud-init
+// `ssh_pwauth` stanza and `runcmd`. Env keys + file paths are sorted for
+// deterministic output.
+//
+// Env values are single-quoted with embedded single-quotes escaped using
+// the POSIX-portable `'\”` sequence. Newline-bearing env values are
+// rejected so a malformed Secret can't bleed into the cloud-init YAML
+// payload. File content is binary-safe via base64 — newline rejection
+// does not apply.
+func renderCloudInitWriteFiles(env map[string]string, files []ResolvedSecretFile) (string, error) {
+	var entries []string
+
+	envEntry, err := renderEnvFileEntry(env)
+	if err != nil {
+		return "", err
+	}
+	if envEntry != "" {
+		entries = append(entries, envEntry)
+	}
+
+	entries = append(entries, renderSecretFileEntries(files)...)
+
+	if len(entries) == 0 {
+		return "", nil
+	}
+	return "write_files:\n" + strings.Join(entries, "\n") + "\n", nil
+}
+
+// renderEnvFileEntry returns one write_files item (without the
+// `write_files:` header) for the env file at vmEnvFilePath, or an empty
+// string when env yields no usable keys.
+func renderEnvFileEntry(env map[string]string) (string, error) {
 	if len(env) == 0 {
 		return "", nil
 	}
@@ -294,12 +340,46 @@ func renderCloudInitEnvBlock(env map[string]string) (string, error) {
 	indented := strings.ReplaceAll(content.String(), "\n", "\n      ")
 	indented = strings.TrimRight(indented, " ")
 
-	return fmt.Sprintf(`write_files:
-  - path: %s
+	return fmt.Sprintf(`  - path: %s
     owner: root:root
     permissions: '0644'
     content: |
       %s`, vmEnvFilePath, indented), nil
+}
+
+// renderSecretFileEntries returns one write_files item per ResolvedSecretFile
+// with binary-safe base64 content. Entries are sorted by Path for
+// deterministic output. Files with empty Path are skipped.
+func renderSecretFileEntries(files []ResolvedSecretFile) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	sorted := make([]ResolvedSecretFile, 0, len(files))
+	for _, f := range files {
+		if f.Path == "" {
+			continue
+		}
+		sorted = append(sorted, f)
+	}
+	if len(sorted) == 0 {
+		return nil
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+
+	out := make([]string, 0, len(sorted))
+	for _, f := range sorted {
+		mode := f.Mode
+		if mode == "" {
+			mode = "0600"
+		}
+		encoded := base64.StdEncoding.EncodeToString(f.Content)
+		out = append(out, fmt.Sprintf(`  - path: %s
+    owner: %s
+    permissions: '%s'
+    encoding: b64
+    content: %s`, f.Path, vmSecretFileOwner, mode, encoded))
+	}
+	return out
 }
 
 // applyOwnerReference rewrites the PVC's metadata.ownerReferences so it

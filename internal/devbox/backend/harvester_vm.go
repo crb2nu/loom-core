@@ -234,7 +234,12 @@ func (h *HarvesterVMBackend) Start(ctx context.Context, opts StartOpts) (*StartR
 		return nil, fmt.Errorf("resolve secret env: %w", err)
 	}
 
-	objs, err := buildVMManifest(opts, h.cfg, pubKey, env)
+	files, err := h.resolveStartMounts(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("resolve secret mounts: %w", err)
+	}
+
+	objs, err := buildVMManifest(opts, h.cfg, pubKey, env, files)
 	if err != nil {
 		return nil, fmt.Errorf("build vm manifest: %w", err)
 	}
@@ -571,6 +576,31 @@ func (h *HarvesterVMBackend) resolveStartEnv(ctx context.Context, opts StartOpts
 		env[k] = v
 	}
 	return env, nil
+}
+
+// resolveStartMounts flattens StartOpts.SecretMounts into a slice of
+// ResolvedSecretFile entries via the configured SecretResolver. K8s pods
+// get file delivery via SecretVolumeSource; Harvester VMs need the bytes
+// rendered into the cloud-init userData at boot time.
+//
+// Nil-safe parity with resolveStartEnv: nil cfg.SecretResolver +
+// non-empty opts.SecretMounts logs a warning and returns nil (no files).
+// Returning nil — rather than an empty slice — lets buildVMManifest skip
+// the write_files render path cleanly when there's nothing to mount.
+func (h *HarvesterVMBackend) resolveStartMounts(ctx context.Context, opts StartOpts) ([]ResolvedSecretFile, error) {
+	if len(opts.SecretMounts) == 0 {
+		return nil, nil
+	}
+	if h.cfg.SecretResolver == nil {
+		h.logger.Warn("StartOpts.SecretMounts requested but no SecretResolver configured; mount files will be absent on the VM",
+			"vm", opts.Name, "mount_count", len(opts.SecretMounts))
+		return nil, nil
+	}
+	files, err := h.cfg.SecretResolver.ResolveSecretMounts(ctx, opts.SecretMounts)
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // ---------- internals: SSH key management ----------

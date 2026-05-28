@@ -299,6 +299,68 @@ func (k *K8sBackend) ResolveSecretEnv(ctx context.Context, secrets []SecretEnvVa
 	return out, nil
 }
 
+// ResolveSecretMounts implements SecretResolver. For each SecretMount,
+// reads the referenced K8s Secret and emits one ResolvedSecretFile per
+// item whose Key is present in Secret.Data. Missing Secrets and missing
+// Keys are skipped silently (Optional semantics matching how
+// SecretVolumeSource.Optional=true behaves on pod-spec volumes — see
+// buildPodSpec in k8s_objects.go where Optional=true is hard-coded for
+// the K8s side). Per-SecretName cache keeps multiple mounts that reference
+// the same Secret to a single API Get.
+//
+// Errors are returned only for unexpected failures (e.g., permission
+// denied, transport error). NotFound on a Secret is treated as absent.
+func (k *K8sBackend) ResolveSecretMounts(ctx context.Context, mounts []SecretMount) ([]ResolvedSecretFile, error) {
+	if len(mounts) == 0 {
+		return nil, nil
+	}
+	type cacheEntry struct {
+		data    map[string][]byte
+		present bool
+	}
+	cache := make(map[string]cacheEntry, len(mounts))
+	out := make([]ResolvedSecretFile, 0, len(mounts))
+	for _, m := range mounts {
+		if m.SecretName == "" || m.MountPath == "" {
+			continue
+		}
+		entry, ok := cache[m.SecretName]
+		if !ok {
+			secret, err := k.clientset.CoreV1().Secrets(k.namespace).Get(ctx, m.SecretName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					entry = cacheEntry{present: false}
+				} else {
+					return nil, fmt.Errorf("get secret %q: %w", m.SecretName, err)
+				}
+			} else {
+				entry = cacheEntry{data: secret.Data, present: true}
+			}
+			cache[m.SecretName] = entry
+		}
+		if !entry.present {
+			continue
+		}
+		for _, it := range m.Items {
+			if it.Key == "" || it.Path == "" {
+				continue
+			}
+			val, ok := entry.data[it.Key]
+			if !ok {
+				continue
+			}
+			content := make([]byte, len(val))
+			copy(content, val)
+			out = append(out, ResolvedSecretFile{
+				Path:    filepath.Join(m.MountPath, it.Path),
+				Content: content,
+				Mode:    "0600",
+			})
+		}
+	}
+	return out, nil
+}
+
 // buildNameRe matches characters unsafe for K8s resource names.
 var buildNameRe = regexp.MustCompile(`[^a-zA-Z0-9-]`)
 

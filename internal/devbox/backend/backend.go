@@ -70,16 +70,30 @@ type SecretEnvVar struct {
 	SecretKey  string // key within the secret
 }
 
-// SecretResolver translates SecretEnvVar references (K8s Secret name + key)
-// into plaintext env-var values. K8sBackend implements this natively via
-// its existing Clientset; non-K8s backends (e.g., HarvesterVMBackend) accept
-// it as an optional dependency so they can flatten Secret-backed env into
-// the per-VM cloud-init payload at Start time. Missing Secrets or missing
-// keys are treated as no-ops (matching the Optional semantics K8s
-// SecretKeyRef applies on the pod-spec side) so a partially-populated
-// cluster Secret does not break Start.
+// SecretResolver translates Secret references into the concrete artifacts
+// a spawn backend needs to bake into its sandbox payload (env values for
+// SecretEnv; file contents for SecretMount). K8sBackend implements both
+// methods natively via its existing Clientset; non-K8s backends (e.g.,
+// HarvesterVMBackend) accept it as an optional dependency so they can
+// flatten Secret-backed env + files into the per-VM cloud-init payload at
+// Start time. Missing Secrets or missing keys are treated as no-ops
+// (matching the Optional semantics K8s SecretKeyRef and SecretVolumeSource
+// apply on the pod-spec side) so a partially-populated cluster Secret does
+// not break Start.
 type SecretResolver interface {
 	ResolveSecretEnv(ctx context.Context, secrets []SecretEnvVar) (map[string]string, error)
+	ResolveSecretMounts(ctx context.Context, mounts []SecretMount) ([]ResolvedSecretFile, error)
+}
+
+// ResolvedSecretFile is one file's worth of Secret content resolved out of
+// a SecretMount. Path is the absolute destination inside the sandbox,
+// already computed by the resolver as filepath.Join(mount.MountPath,
+// item.Path). Content is the raw bytes (binary-safe). Mode is the POSIX
+// file mode (default "0600" — matches K8s SecretVolumeSource.DefaultMode).
+type ResolvedSecretFile struct {
+	Path    string
+	Content []byte
+	Mode    string
 }
 
 // SecretMount mounts individual keys from a K8s Secret as files in the container.
