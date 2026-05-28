@@ -190,9 +190,9 @@ func TestControlFilePathForSpawn(t *testing.T) {
 // first append.
 func TestInjectControlFile(t *testing.T) {
 	rb := &recordingBackend{}
-	o := &SpawnOrchestrator{backend: rb}
+	o := &SpawnOrchestrator{}
 
-	if err := o.injectControlFile(context.Background(), "container-1", "spawn-abc"); err != nil {
+	if err := o.injectControlFile(context.Background(), rb, "container-1", "spawn-abc"); err != nil {
 		t.Fatalf("injectControlFile: %v", err)
 	}
 	if len(rb.execCalls) != 1 {
@@ -219,10 +219,10 @@ func TestInjectControlFile(t *testing.T) {
 // per-spawn control file.
 func TestInjectControlMessage_Message(t *testing.T) {
 	rb := &recordingBackend{}
-	o := &SpawnOrchestrator{backend: rb}
+	o := &SpawnOrchestrator{}
 
 	cmd := SpawnControlCommand{Type: "message", Text: "follow up please"}
-	if err := o.injectControlMessage(context.Background(), "container-2", "spawn-xyz", cmd); err != nil {
+	if err := o.injectControlMessage(context.Background(), rb, "container-2", "spawn-xyz", cmd); err != nil {
 		t.Fatalf("injectControlMessage: %v", err)
 	}
 	if len(rb.execCalls) != 1 {
@@ -247,9 +247,9 @@ func TestInjectControlMessage_Message(t *testing.T) {
 // TestInjectControlMessage_Interrupt covers the no-payload variant.
 func TestInjectControlMessage_Interrupt(t *testing.T) {
 	rb := &recordingBackend{}
-	o := &SpawnOrchestrator{backend: rb}
+	o := &SpawnOrchestrator{}
 
-	if err := o.injectControlMessage(context.Background(), "container-3", "spawn-int", SpawnControlCommand{Type: "interrupt"}); err != nil {
+	if err := o.injectControlMessage(context.Background(), rb, "container-3", "spawn-int", SpawnControlCommand{Type: "interrupt"}); err != nil {
 		t.Fatalf("injectControlMessage: %v", err)
 	}
 	if len(rb.execCalls) != 1 {
@@ -265,8 +265,8 @@ func TestInjectControlMessage_Interrupt(t *testing.T) {
 // rejected before any Exec call hits the backend.
 func TestInjectControlMessage_RequiresType(t *testing.T) {
 	rb := &recordingBackend{}
-	o := &SpawnOrchestrator{backend: rb}
-	err := o.injectControlMessage(context.Background(), "container-4", "spawn-bad", SpawnControlCommand{})
+	o := &SpawnOrchestrator{}
+	err := o.injectControlMessage(context.Background(), rb, "container-4", "spawn-bad", SpawnControlCommand{})
 	if err == nil {
 		t.Fatal("expected error for empty type, got nil")
 	}
@@ -280,8 +280,8 @@ func TestInjectControlMessage_RequiresType(t *testing.T) {
 // silently swallowing pod failures.
 func TestInjectControlMessage_BackendError(t *testing.T) {
 	rb := &recordingBackend{execErr: errors.New("boom")}
-	o := &SpawnOrchestrator{backend: rb}
-	err := o.injectControlMessage(context.Background(), "container-5", "spawn-err", SpawnControlCommand{Type: "shutdown"})
+	o := &SpawnOrchestrator{}
+	err := o.injectControlMessage(context.Background(), rb, "container-5", "spawn-err", SpawnControlCommand{Type: "shutdown"})
 	if err == nil {
 		t.Fatal("expected propagated error, got nil")
 	}

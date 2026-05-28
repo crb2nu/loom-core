@@ -33,6 +33,11 @@ MCP is now the de facto standard for AI-tool integration (8M+ downloads, 5,800+ 
 
 ## Recently Shipped (post `v0.9.7`)
 
+- 🚧 **Mills harvester-vm substrate (Slices 0 → 2d, 2026-05-25 → 2026-05-27)**
+  - Spec: `.loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md`.
+  - Slice 0 (capacity kill-test, 4 concurrent VMs at 72% CPU / 78% MEM) ✅; Slice 1.5 (base VM + DHCP + qemu-guest-agent, 130s cold-boot) ✅; Slice 1 (`harvester-vm` devbox backend, ~2583 LOC + tests, `1ed1cd05` + `82c3bc17`) ✅; Slice 2a (`pipeline.stage_substrate` policy field, `2a9c6c3a`) ✅; Slice 2b (`SpawnWorker → pipeline.SpawnRequest.Substrate`, `a6979762` [!564](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/564)) ✅; Slice 2c (`HUDSpawnClient` sends `Substrate`; pod env gets `DEVBOX_BACKEND`, `57052ce0` [!566](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/566)) ✅; **Slice 2d** (HUD multi-backend init + `substrateBackend(req.Substrate)` routing for all Build/Start/Exec/Stop callsites, [!568](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/568)) 🚧 **in flight**.
+  - Remaining: Slice 2d.5 (HarvesterVMBackend env propagation — `Start` drops `opts.Env`, blocks agent CLI auth), Slice 2e (`cmd/mcp-devbox` multi-backend init), then Slice 2 acceptance kill-test (1 end-to-end canary auto-merge on harvester-vm).
+
 - ✅ **Spectator + EPIC 2 Unify closeout arc (2026-05-06 → 2026-05-07)**
   - Spectator Phase 2.2 ([!307](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/307)) — Claude Code hooks → `loom agent event-emit`.
   - Spectator Phase 2.2b/c ([!309](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/309)) — Gemini + Codex event-emit.

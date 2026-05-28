@@ -50,11 +50,25 @@ type SpawnRequest = spawn.Request
 // SpawnState is a type alias for spawn.State.
 type SpawnState = spawn.State
 
+// DefaultSubstrate is the substrate name used when a SpawnRequest leaves
+// req.Substrate empty. Mirrors policy.SubstrateDefault in pkg/mills so
+// callers can opt OUT of routing without juggling literals.
+const DefaultSubstrate = "k8s"
+
 // SpawnOrchestrator manages the full lifecycle of headless agent spawns.
 // It delegates state management to a spawn.Controller, keeping the HUD layer
 // focused on shuttle concerns (build, deploy, exec, SSE, metrics).
 type SpawnOrchestrator struct {
-	backend     backend.Backend
+	// backends maps substrate name → Backend impl. At least one entry
+	// (the default substrate, typically "k8s") must be present; harvester-vm
+	// is registered only when the operator configures it. Lookup goes
+	// through substrateBackend(substrate) which handles fallback +
+	// warn-on-unknown so a misconfigured Mills policy surfaces in logs
+	// rather than silently wedging. Slice 2d: spec
+	// .loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md
+	backends         map[string]backend.Backend
+	defaultSubstrate string
+
 	agentBridge *bridge.AgentBridge
 	sseHub      *SSEHub
 	tracer      trace.Tracer
@@ -155,8 +169,19 @@ func DefaultSpawnConfig() SpawnOrchestratorConfig {
 // NewSpawnOrchestrator creates a new spawn orchestrator. It initialises a
 // spawn.K8sController backed by a FileStore for persistence and wires it
 // into the HUD shuttle layer.
+//
+// backends must contain at least the entry for defaultSubstrate (which
+// is also returned for empty / unknown substrate lookups). The
+// single-backend production path passes
+// {DefaultSubstrate: k8sBackend}, defaultSubstrate=DefaultSubstrate;
+// the harvester-vm-enabled path adds an extra "harvester-vm" entry.
+//
+// NewSpawnOrchestratorSingleBackend is the legacy single-backend
+// convenience wrapper for tests + callers that don't care about
+// substrate routing.
 func NewSpawnOrchestrator(
-	b backend.Backend,
+	backends map[string]backend.Backend,
+	defaultSubstrate string,
 	agentBridge *bridge.AgentBridge,
 	sseHub *SSEHub,
 	tracer trace.Tracer,
@@ -171,11 +196,24 @@ func NewSpawnOrchestrator(
 
 	spawnLogger := logger.With("component", "spawn")
 
+	if defaultSubstrate == "" {
+		defaultSubstrate = DefaultSubstrate
+	}
+	// Defensive copy + ensure default is registered; otherwise lookups
+	// would always fall back to a nil backend.
+	bs := make(map[string]backend.Backend, len(backends))
+	for k, v := range backends {
+		bs[k] = v
+	}
+	defaultBackend := bs[defaultSubstrate]
+
 	// Initialize persistent spawn store. In Kubernetes, use a ConfigMap
 	// in the spawn namespace so HUD rollouts preserve accepted/in-flight
-	// spawns. Local/dev backends keep the legacy FileStore.
+	// spawns. Local/dev backends keep the legacy FileStore. The K8s
+	// ConfigMap lives in the default backend's namespace regardless of
+	// which substrate a particular spawn runs on — state is HUD-side.
 	var store spawn.Store
-	if k8s, ok := b.(streamExecCapable); ok && k8s.Clientset() != nil && k8s.Namespace() != "" {
+	if k8s, ok := defaultBackend.(streamExecCapable); ok && k8s.Clientset() != nil && k8s.Namespace() != "" {
 		store = spawn.NewK8sConfigMapStore(k8s.Clientset(), k8s.Namespace(), "loom-spawn-state")
 		spawnLogger.Info("using kubernetes spawn state store", "namespace", k8s.Namespace(), "configmap", "loom-spawn-state")
 	} else {
@@ -201,21 +239,28 @@ func NewSpawnOrchestrator(
 	}
 
 	o := &SpawnOrchestrator{
-		backend:        b,
-		agentBridge:    agentBridge,
-		sseHub:         sseHub,
-		tracer:         tracer,
-		metrics:        metrics,
-		logger:         spawnLogger,
-		ctrl:           ctrl,
-		maxConcurrent:  cfg.MaxConcurrent,
-		buildSlots:     newBuildSlots(cfg.MaxConcurrentBuilds),
-		defaultTimeout: cfg.DefaultTimeout,
-		defaultMemory:  cfg.DefaultMemory,
-		defaultCPUs:    cfg.DefaultCPUs,
-		workspaceRoot:  wsRoot,
-		projects:       cfg.Projects,
+		backends:         bs,
+		defaultSubstrate: defaultSubstrate,
+		agentBridge:      agentBridge,
+		sseHub:           sseHub,
+		tracer:           tracer,
+		metrics:          metrics,
+		logger:           spawnLogger,
+		ctrl:             ctrl,
+		maxConcurrent:    cfg.MaxConcurrent,
+		buildSlots:       newBuildSlots(cfg.MaxConcurrentBuilds),
+		defaultTimeout:   cfg.DefaultTimeout,
+		defaultMemory:    cfg.DefaultMemory,
+		defaultCPUs:      cfg.DefaultCPUs,
+		workspaceRoot:    wsRoot,
+		projects:         cfg.Projects,
 	}
+	registered := make([]string, 0, len(bs))
+	for k := range bs {
+		registered = append(registered, k)
+	}
+	spawnLogger.Info("spawn substrate backends registered",
+		"default", defaultSubstrate, "available", registered)
 	// Wire the controller's terminal-cleanup hook so Reconcile reaps the
 	// pod + presence + agent session for any spawn it observes in a
 	// terminal state without CleanupAt set. This covers:
@@ -226,6 +271,54 @@ func NewSpawnOrchestrator(
 	ctrl.SetTerminalHook(o.reapTerminalSpawn)
 	o.resumePreRuntimeSpawns()
 	return o
+}
+
+// NewSpawnOrchestratorSingleBackend is a legacy convenience wrapper for
+// callers that don't care about per-spawn substrate routing (most tests
+// + non-Mills HUD users). It registers `b` under DefaultSubstrate as
+// the only backend.
+func NewSpawnOrchestratorSingleBackend(
+	b backend.Backend,
+	agentBridge *bridge.AgentBridge,
+	sseHub *SSEHub,
+	tracer trace.Tracer,
+	metrics *HUDMetrics,
+	logger *slog.Logger,
+	cfg SpawnOrchestratorConfig,
+) *SpawnOrchestrator {
+	return NewSpawnOrchestrator(
+		map[string]backend.Backend{DefaultSubstrate: b},
+		DefaultSubstrate,
+		agentBridge, sseHub, tracer, metrics, logger, cfg,
+	)
+}
+
+// substrateBackend picks the Backend impl for the named substrate.
+//
+// Empty substrate → default backend (matches current behavior pre-Slice 2c).
+// Known substrate → its registered backend.
+// Unknown substrate → default backend + warning log (so an operator who
+// asked for harvester-vm without configuring it sees the misconfiguration
+// in logs instead of silently running on k8s).
+//
+// Never returns nil so long as the orchestrator was constructed with the
+// default substrate registered (NewSpawnOrchestrator's invariant).
+func (o *SpawnOrchestrator) substrateBackend(substrate string) backend.Backend {
+	if o == nil {
+		return nil
+	}
+	key := substrate
+	if key == "" {
+		key = o.defaultSubstrate
+	}
+	if b, ok := o.backends[key]; ok {
+		return b
+	}
+	if substrate != "" && o.logger != nil {
+		o.logger.Warn("spawn substrate unknown; falling back to default",
+			"requested", substrate, "default", o.defaultSubstrate)
+	}
+	return o.backends[o.defaultSubstrate]
 }
 
 func newBuildSlots(maxConcurrentBuilds int) chan struct{} {
@@ -265,7 +358,7 @@ func (o *SpawnOrchestrator) RecoverSpawns() {
 }
 
 func (o *SpawnOrchestrator) resumePreRuntimeSpawns() {
-	if o == nil || o.ctrl == nil || o.backend == nil {
+	if o == nil || o.ctrl == nil || len(o.backends) == 0 {
 		return
 	}
 	for _, state := range o.ctrl.List() {
@@ -497,6 +590,14 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 
 	state, _ := o.ctrl.Get(spawnID)
 
+	// Pick the substrate backend once per spawn so Build/Start/Exec/Stop
+	// in this goroutine all hit the same impl. Slice 2d.
+	be := o.substrateBackend(req.Substrate)
+	if be == nil {
+		o.failSpawn(ctx, state, fmt.Sprintf("no backend registered for substrate %q (default %q)", req.Substrate, o.defaultSubstrate))
+		return
+	}
+
 	// Resolve which cluster auth path this spawn will use. Populated on
 	// the state so HUD detail endpoints can surface "cluster_api_key" vs
 	// "cluster_service_account" without introspecting the pod. In Slice 2a
@@ -540,7 +641,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		o.failSpawn(ctx, state, fmt.Sprintf("image build queue failed: %v", slotErr))
 		return
 	}
-	buildResult, err := o.backend.Build(ctx, backend.BuildOpts{
+	buildResult, err := be.Build(ctx, backend.BuildOpts{
 		Tag:            buildTag,
 		Dockerfile:     df,
 		ContextDir:     projectDir,
@@ -557,7 +658,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	o.logger.Info("build completed, starting pod", "spawn_id", spawnID, "image", buildResult.ImageTag)
 	_, podSpan := o.tracer.Start(ctx, "agent.spawn.pod_create")
 	env := buildSpawnPodEnv(req, state.AgentID, spawnID)
-	startResult, err := o.backend.Start(ctx, backend.StartOpts{
+	startResult, err := be.Start(ctx, backend.StartOpts{
 		Name:              "spawn-" + spawnID,
 		ImageTag:          buildResult.ImageTag,
 		WorkDir:           podProjectDir,
@@ -594,7 +695,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	_, cfgSpan := o.tracer.Start(ctx, "agent.spawn.config_inject")
 	cfgCtx, cfgCancel := context.WithTimeout(ctx, 30*time.Second)
 	o.logger.Info("injecting agent config", "spawn_id", spawnID, "pod", startResult.ContainerID, "agent_type", req.AgentType)
-	if err := o.injectAgentConfig(cfgCtx, startResult.ContainerID, req.AgentType, podProjectDir); err != nil {
+	if err := o.injectAgentConfig(cfgCtx, be, startResult.ContainerID, req.AgentType, podProjectDir); err != nil {
 		cfgCancel()
 		cfgSpan.End()
 		o.failSpawn(ctx, state, fmt.Sprintf("config injection failed: %v", err))
@@ -646,7 +747,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	var agentCmd string
 	if req.UseSDKDriver {
 		injectCtx, injectCancel := context.WithTimeout(ctx, 30*time.Second)
-		if err := o.injectSDKDriver(injectCtx, startResult.ContainerID); err != nil {
+		if err := o.injectSDKDriver(injectCtx, be, startResult.ContainerID); err != nil {
 			injectCancel()
 			execSpan.End()
 			heartbeatCancel()
@@ -660,7 +761,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		// `{type:"message"|"interrupt"|"shutdown"}` lines into this file.
 		var controlFilePath string
 		if req.MultiTurn {
-			if err := o.injectControlFile(injectCtx, startResult.ContainerID, spawnID); err != nil {
+			if err := o.injectControlFile(injectCtx, be, startResult.ContainerID, spawnID); err != nil {
 				injectCancel()
 				execSpan.End()
 				heartbeatCancel()
@@ -719,8 +820,11 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		close(watcherDone)
 	}
 
-	// Use streaming exec if backend supports it and we have a parser; fall back to buffered.
-	if sec, ok := o.backend.(streamExecCapable); ok && parser != nil {
+	// Use streaming exec if the substrate's backend supports it (K8s only)
+	// and we have a parser; otherwise fall back to buffered Exec. The
+	// harvester-vm backend doesn't implement streamExecCapable so its
+	// spawns always take the buffered path.
+	if sec, ok := be.(streamExecCapable); ok && parser != nil {
 		execResult, execErr = backend.StreamExec(execCtx,
 			sec.Clientset(), sec.RestConfig(), sec.Namespace(), sec.NFSFlush(),
 			backend.StreamExecOpts{
@@ -735,7 +839,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		)
 	} else {
 		// Fallback: buffered exec (no real-time telemetry).
-		execResult, execErr = o.backend.Exec(execCtx, backend.ExecOpts{
+		execResult, execErr = be.Exec(execCtx, backend.ExecOpts{
 			ContainerID: startResult.ContainerID,
 			Command:     agentCmd,
 			WorkDir:     podProjectDir,
@@ -857,11 +961,15 @@ func sanitizeImageTagComponent(value string) string {
 // "/workspace/services/loom-core"), already resolved by the caller via
 // resolveProjectPath so this function does not need to know about
 // workspace bucket layouts.
-func (o *SpawnOrchestrator) injectAgentConfig(ctx context.Context, containerID, agentType, projectDir string) error {
+//
+// be is the substrate-specific backend chosen by the caller (Slice 2d):
+// runSpawn picks via o.substrateBackend(req.Substrate) once per spawn,
+// then threads it through to keep all backend calls on one impl.
+func (o *SpawnOrchestrator) injectAgentConfig(ctx context.Context, be backend.Backend, containerID, agentType, projectDir string) error {
 	writeCmd := func(dir, file, content string) error {
 		encoded := base64.StdEncoding.EncodeToString([]byte(content))
 		cmd := fmt.Sprintf("mkdir -p %s && echo '%s' | base64 -d > %s/%s", dir, encoded, dir, file)
-		_, err := o.backend.Exec(ctx, backend.ExecOpts{
+		_, err := be.Exec(ctx, backend.ExecOpts{
 			ContainerID: containerID,
 			Command:     cmd,
 			TimeoutSec:  30,
@@ -917,7 +1025,7 @@ unified_exec = true
 		// Best-effort symlink; pipe "true" at the end so the exec doesn't
 		// fail when the auth mount is absent (API-key-only operators).
 		linkCmd := "ln -sf " + AgentHomeDir + "/.codex.auth/auth.json " + AgentHomeDir + "/.codex/auth.json 2>/dev/null || true"
-		if _, err := o.backend.Exec(ctx, backend.ExecOpts{
+		if _, err := be.Exec(ctx, backend.ExecOpts{
 			ContainerID: containerID,
 			Command:     linkCmd,
 			TimeoutSec:  10,
@@ -992,9 +1100,12 @@ func (o *SpawnOrchestrator) StopSpawn(ctx context.Context, spawnID string) error
 		return fmt.Errorf("spawn %s not found", spawnID)
 	}
 
-	// Stop via devbox backend (handles pod deletion + cleanup).
+	// Stop via the substrate the spawn was created on. The substrate is
+	// persisted on state.Request from Slice 2c so it survives operator
+	// restarts. Empty/unknown substrates fall back to the default backend
+	// via substrateBackend.
 	if state.PodName != "" {
-		if err := o.backend.Stop(ctx, state.PodName); err != nil {
+		if err := o.substrateBackend(state.Request.Substrate).Stop(ctx, state.PodName); err != nil {
 			o.logger.Warn("failed to stop spawn pod", "spawn_id", spawnID, "error", err)
 		}
 	}
@@ -1055,7 +1166,7 @@ func (o *SpawnOrchestrator) SendControlMessage(ctx context.Context, spawnID stri
 		return fmt.Errorf("spawn %s has no pod name; cannot inject control command", spawnID)
 	}
 
-	if err := o.injectControlMessage(ctx, state.PodName, spawnID, cmd); err != nil {
+	if err := o.injectControlMessage(ctx, o.substrateBackend(state.Request.Substrate), state.PodName, spawnID, cmd); err != nil {
 		return fmt.Errorf("inject control command for %s: %w", spawnID, err)
 	}
 
@@ -1104,9 +1215,9 @@ func (o *SpawnOrchestrator) failSpawn(ctx context.Context, state *SpawnState, re
 	podName := state.PodName
 	o.ctrl.UpdateState(ctx, state)
 
-	// Clean up K8s pod if one was created.
+	// Clean up the pod/VM on the substrate it was created on.
 	if podName != "" {
-		if err := o.backend.Stop(ctx, podName); err != nil {
+		if err := o.substrateBackend(state.Request.Substrate).Stop(ctx, podName); err != nil {
 			o.logger.Warn("failed to clean up pod on spawn failure",
 				"spawn_id", state.SpawnID, "pod", podName, "error", err)
 		}
@@ -1226,8 +1337,8 @@ func (o *SpawnOrchestrator) reapTerminalSpawn(ctx context.Context, state spawn.S
 		}
 	}
 
-	if state.PodName != "" && o.backend != nil {
-		if err := o.backend.Stop(ctx, state.PodName); err != nil {
+	if state.PodName != "" && len(o.backends) > 0 {
+		if err := o.substrateBackend(state.Request.Substrate).Stop(ctx, state.PodName); err != nil {
 			o.logger.Warn("reap: failed to stop pod",
 				"spawn_id", state.SpawnID, "pod", state.PodName, "error", err)
 		}

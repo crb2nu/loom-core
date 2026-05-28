@@ -79,6 +79,20 @@ func newHudCmd(socketPath string) *cobra.Command {
 	var spawnBuildEphemeralStorageLimit string
 	var spawnBuildAvoidNodes string
 
+	// Harvester KubeVirt VM substrate (Mills harvester-vm backend, Slice 2d).
+	// All optional. Empty SpawnHarvesterKubeconfig leaves the substrate
+	// unregistered; HUD runs k8s-only and any Mills request with
+	// Substrate="harvester-vm" falls back to k8s with a warning log.
+	var spawnHarvesterKubeconfig string
+	var spawnHarvesterBaseImage string
+	var spawnHarvesterNamespace string
+	var spawnHarvesterStorageClass string
+	var spawnHarvesterNetworkAttachDef string
+	var spawnHarvesterDefaultVCPUs int
+	var spawnHarvesterDefaultMemMi int
+	var spawnHarvesterDefaultDiskGi int
+	var spawnHarvesterSSHUser string
+
 	cmd := &cobra.Command{
 		Use:   "hud",
 		Short: "Launch the Agent HUD (command center)",
@@ -193,6 +207,15 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 			applyEnvString("spawn-build-ephemeral-storage-request", "SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST", &spawnBuildEphemeralStorageRequest)
 			applyEnvString("spawn-build-ephemeral-storage-limit", "SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT", &spawnBuildEphemeralStorageLimit)
 			applyEnvString("spawn-build-avoid-nodes", "SPAWN_BUILD_AVOID_NODES", &spawnBuildAvoidNodes)
+			applyEnvString("spawn-harvester-kubeconfig", "SPAWN_HARVESTER_KUBECONFIG", &spawnHarvesterKubeconfig)
+			applyEnvString("spawn-harvester-base-image", "SPAWN_HARVESTER_BASE_IMAGE", &spawnHarvesterBaseImage)
+			applyEnvString("spawn-harvester-namespace", "SPAWN_HARVESTER_NAMESPACE", &spawnHarvesterNamespace)
+			applyEnvString("spawn-harvester-storage-class", "SPAWN_HARVESTER_STORAGE_CLASS", &spawnHarvesterStorageClass)
+			applyEnvString("spawn-harvester-network-attach-def", "SPAWN_HARVESTER_NAD", &spawnHarvesterNetworkAttachDef)
+			applyEnvInt("spawn-harvester-default-vcpus", "SPAWN_HARVESTER_DEFAULT_VCPUS", &spawnHarvesterDefaultVCPUs)
+			applyEnvInt("spawn-harvester-default-mem-mi", "SPAWN_HARVESTER_DEFAULT_MEM_MI", &spawnHarvesterDefaultMemMi)
+			applyEnvInt("spawn-harvester-default-disk-gi", "SPAWN_HARVESTER_DEFAULT_DISK_GI", &spawnHarvesterDefaultDiskGi)
+			applyEnvString("spawn-harvester-ssh-user", "SPAWN_HARVESTER_SSH_USER", &spawnHarvesterSSHUser)
 			// SPAWN_ENABLED env var (boolean).
 			if !cmd.Flags().Changed("spawn-enabled") {
 				if v := os.Getenv("SPAWN_ENABLED"); v == "true" || v == "1" {
@@ -279,6 +302,15 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 				SpawnBuildEphemeralStorageRequest: spawnBuildEphemeralStorageRequest,
 				SpawnBuildEphemeralStorageLimit:   spawnBuildEphemeralStorageLimit,
 				SpawnBuildAvoidNodes:              spawnBuildAvoidNodes,
+				SpawnHarvesterKubeconfig:          spawnHarvesterKubeconfig,
+				SpawnHarvesterBaseImage:           spawnHarvesterBaseImage,
+				SpawnHarvesterNamespace:           spawnHarvesterNamespace,
+				SpawnHarvesterStorageClass:        spawnHarvesterStorageClass,
+				SpawnHarvesterNetworkAttachDef:    spawnHarvesterNetworkAttachDef,
+				SpawnHarvesterDefaultVCPUs:        spawnHarvesterDefaultVCPUs,
+				SpawnHarvesterDefaultMemMi:        spawnHarvesterDefaultMemMi,
+				SpawnHarvesterDefaultDiskGi:       spawnHarvesterDefaultDiskGi,
+				SpawnHarvesterSSHUser:             spawnHarvesterSSHUser,
 				EmbedSubset:                       embedSubset,
 			}
 
@@ -365,6 +397,17 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 	cmd.Flags().StringVar(&spawnBuildEphemeralStorageRequest, "spawn-build-ephemeral-storage-request", os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST"), "Buildah ephemeral-storage request for spawn image builds [$SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST]")
 	cmd.Flags().StringVar(&spawnBuildEphemeralStorageLimit, "spawn-build-ephemeral-storage-limit", os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT"), "Buildah ephemeral-storage limit for spawn image builds [$SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT]")
 	cmd.Flags().StringVar(&spawnBuildAvoidNodes, "spawn-build-avoid-nodes", os.Getenv("SPAWN_BUILD_AVOID_NODES"), "Comma-separated node names to avoid for spawn image builds [$SPAWN_BUILD_AVOID_NODES]")
+
+	// Harvester KubeVirt VM substrate (Mills harvester-vm backend, Slice 2d).
+	cmd.Flags().StringVar(&spawnHarvesterKubeconfig, "spawn-harvester-kubeconfig", os.Getenv("SPAWN_HARVESTER_KUBECONFIG"), "Kubeconfig for the Harvester cluster. Empty leaves the harvester-vm substrate unregistered. [$SPAWN_HARVESTER_KUBECONFIG]")
+	cmd.Flags().StringVar(&spawnHarvesterBaseImage, "spawn-harvester-base-image", os.Getenv("SPAWN_HARVESTER_BASE_IMAGE"), "VirtualMachineImage name for harvester-vm spawns (e.g. mills-devbox-base-2026-05-25) [$SPAWN_HARVESTER_BASE_IMAGE]")
+	cmd.Flags().StringVar(&spawnHarvesterNamespace, "spawn-harvester-namespace", os.Getenv("SPAWN_HARVESTER_NAMESPACE"), "Harvester namespace for VMs + PVCs (default: default) [$SPAWN_HARVESTER_NAMESPACE]")
+	cmd.Flags().StringVar(&spawnHarvesterStorageClass, "spawn-harvester-storage-class", os.Getenv("SPAWN_HARVESTER_STORAGE_CLASS"), "Storage class for per-VM PVCs (e.g. longhorn-image-<id>); required when --spawn-harvester-kubeconfig is set [$SPAWN_HARVESTER_STORAGE_CLASS]")
+	cmd.Flags().StringVar(&spawnHarvesterNetworkAttachDef, "spawn-harvester-network-attach-def", os.Getenv("SPAWN_HARVESTER_NAD"), "Multus NetworkAttachmentDefinition reference (default: default/lan10g) [$SPAWN_HARVESTER_NAD]")
+	cmd.Flags().IntVar(&spawnHarvesterDefaultVCPUs, "spawn-harvester-default-vcpus", 0, "Per-VM vCPU count (default: 2) [$SPAWN_HARVESTER_DEFAULT_VCPUS]")
+	cmd.Flags().IntVar(&spawnHarvesterDefaultMemMi, "spawn-harvester-default-mem-mi", 0, "Per-VM memory in MiB (default: 4096) [$SPAWN_HARVESTER_DEFAULT_MEM_MI]")
+	cmd.Flags().IntVar(&spawnHarvesterDefaultDiskGi, "spawn-harvester-default-disk-gi", 0, "Per-VM OS disk in GiB (default: 20) [$SPAWN_HARVESTER_DEFAULT_DISK_GI]")
+	cmd.Flags().StringVar(&spawnHarvesterSSHUser, "spawn-harvester-ssh-user", os.Getenv("SPAWN_HARVESTER_SSH_USER"), "Cloud-init-provisioned SSH user inside the VM (default: ubuntu) [$SPAWN_HARVESTER_SSH_USER]")
 
 	// Service management subcommands.
 	cmd.AddCommand(
