@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -1198,4 +1199,208 @@ func TestK8sBackend_ResolveSecretEnv(t *testing.T) {
 	_ = strings.Contains
 	_ = schema.GroupVersion{}
 	_ = watch.NewFake
+}
+
+func TestK8sBackend_ResolveSecretMounts(t *testing.T) {
+	const ns = "devbox"
+	auth := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-agent-auth", Namespace: ns},
+		Data: map[string][]byte{
+			"claude-oauth-json": []byte(`{"claudeAiOauth":{"accessToken":"sk-ant"}}`),
+			"codex-auth-json":   []byte(`{"OPENAI_API_KEY":"sk-codex"}`),
+			"binary-blob":       {0x00, 0xff, 0x10, 0x7f, 0x80, 0x0a, 0x00},
+		},
+	}
+	apiKeys := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-agent-api-keys", Namespace: ns},
+		Data: map[string][]byte{
+			"gemini-service-account.json": []byte(`{"type":"service_account"}`),
+		},
+	}
+	client := k8sfake.NewSimpleClientset(auth, apiKeys)
+	k := testK8sBackend()
+	k.clientset = client
+
+	t.Run("happy path resolves multi-mount, multi-item secrets", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.claude.auth",
+				Items: []SecretMountItem{
+					{Key: "claude-oauth-json", Path: "oauth.json"},
+				},
+			},
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.codex.auth",
+				Items: []SecretMountItem{
+					{Key: "codex-auth-json", Path: "auth.json"},
+				},
+			},
+			{
+				SecretName: "cluster-agent-api-keys",
+				MountPath:  "/home/agent/.gcp",
+				Items: []SecretMountItem{
+					{Key: "gemini-service-account.json", Path: "sa.json"},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("expected 3 resolved files, got %d: %#v", len(got), got)
+		}
+		byPath := make(map[string][]byte, len(got))
+		for _, f := range got {
+			byPath[f.Path] = f.Content
+			if f.Mode != "0600" {
+				t.Errorf("file %q: Mode = %q, want 0600", f.Path, f.Mode)
+			}
+		}
+		want := map[string]string{
+			"/home/agent/.claude.auth/oauth.json": `{"claudeAiOauth":{"accessToken":"sk-ant"}}`,
+			"/home/agent/.codex.auth/auth.json":   `{"OPENAI_API_KEY":"sk-codex"}`,
+			"/home/agent/.gcp/sa.json":            `{"type":"service_account"}`,
+		}
+		for path, content := range want {
+			if string(byPath[path]) != content {
+				t.Errorf("byPath[%q] = %q, want %q", path, byPath[path], content)
+			}
+		}
+	})
+
+	t.Run("binary content roundtrips byte-for-byte", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/tmp/bin",
+				Items:      []SecretMountItem{{Key: "binary-blob", Path: "payload.bin"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 file, got %d", len(got))
+		}
+		wantBytes := []byte{0x00, 0xff, 0x10, 0x7f, 0x80, 0x0a, 0x00}
+		if !bytes.Equal(got[0].Content, wantBytes) {
+			t.Errorf("binary content mismatch: got %v, want %v", got[0].Content, wantBytes)
+		}
+	})
+
+	t.Run("missing secret is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "nonexistent-secret",
+				MountPath:  "/tmp/missing",
+				Items:      []SecretMountItem{{Key: "k", Path: "f"}},
+			},
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.claude.auth",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "oauth.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts returned error for absent secret: %v", err)
+		}
+		if len(got) != 1 || got[0].Path != "/home/agent/.claude.auth/oauth.json" {
+			t.Errorf("expected only the present secret's file; got %#v", got)
+		}
+	})
+
+	t.Run("missing key is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.codex.auth",
+				Items: []SecretMountItem{
+					{Key: "NOT_A_KEY", Path: "auth.json"},
+					{Key: "codex-auth-json", Path: "auth.json"},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts returned error for absent key: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 file (missing key skipped), got %d: %#v", len(got), got)
+		}
+	})
+
+	t.Run("empty input returns nil", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts(nil): %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil, got %#v", got)
+		}
+	})
+
+	t.Run("caches secret reads across mounts referencing same Secret", func(t *testing.T) {
+		var gets int
+		client2 := k8sfake.NewSimpleClientset(auth)
+		client2.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			gets++
+			return false, nil, nil
+		})
+		k2 := testK8sBackend()
+		k2.clientset = client2
+
+		_, err := k2.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.claude.auth",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "oauth.json"}},
+			},
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.codex.auth",
+				Items:      []SecretMountItem{{Key: "codex-auth-json", Path: "auth.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if gets != 1 {
+			t.Errorf("expected 1 Secret Get (cached), got %d", gets)
+		}
+	})
+
+	t.Run("returned content is a copy, mutating it doesn't poison cache", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/tmp/copy-test",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "first.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 file, got %d", len(got))
+		}
+		// Mutate caller-visible bytes, then re-resolve — second read must still
+		// see the original Secret value, not the mutated copy.
+		for i := range got[0].Content {
+			got[0].Content[i] = 0
+		}
+		got2, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/tmp/copy-test-2",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "second.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts (second call): %v", err)
+		}
+		if string(got2[0].Content) != `{"claudeAiOauth":{"accessToken":"sk-ant"}}` {
+			t.Errorf("Secret content was mutated by caller; got %q", got2[0].Content)
+		}
+	})
 }

@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -31,7 +32,7 @@ func TestBuildVMManifest_HappyPath(t *testing.T) {
 	cfg := validHarvesterCfg()
 	opts := StartOpts{Name: "test-vm-1"}
 
-	objs, err := buildVMManifest(opts, cfg, testPubKey, nil)
+	objs, err := buildVMManifest(opts, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -270,7 +271,7 @@ func TestBuildVMManifest_ResourceOverridesFromStartOpts(t *testing.T) {
 	cfg.DefaultMemMi = 16384
 	cfg.DefaultDiskGi = 100
 
-	objs, err := buildVMManifest(StartOpts{Name: "big-vm"}, cfg, testPubKey, nil)
+	objs, err := buildVMManifest(StartOpts{Name: "big-vm"}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -296,7 +297,7 @@ func TestBuildVMManifest_CustomNetworkAttachmentDef(t *testing.T) {
 	cfg := validHarvesterCfg()
 	cfg.NetworkAttachmentDef = "custom-ns/mgmt-vlan"
 
-	objs, err := buildVMManifest(StartOpts{Name: "net-vm"}, cfg, testPubKey, nil)
+	objs, err := buildVMManifest(StartOpts{Name: "net-vm"}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -362,7 +363,7 @@ func TestBuildVMManifest_RequiredFieldErrors(t *testing.T) {
 			pk := testPubKey
 			tc.mutate(&opts, &cfg, &pk)
 
-			_, err := buildVMManifest(opts, cfg, pk, nil)
+			_, err := buildVMManifest(opts, cfg, pk, nil, nil)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -381,7 +382,7 @@ func TestBuildVMManifest_EmptyBaseImageNameIsAccepted(t *testing.T) {
 	cfg := validHarvesterCfg()
 	cfg.BaseImageName = ""
 
-	objs, err := buildVMManifest(StartOpts{Name: "no-base"}, cfg, testPubKey, nil)
+	objs, err := buildVMManifest(StartOpts{Name: "no-base"}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -395,7 +396,7 @@ func TestBuildVMManifest_AgentIDPropagatesAsLabel(t *testing.T) {
 	objs, err := buildVMManifest(StartOpts{
 		Name:    "labeled-vm",
 		AgentID: "claude-code-42",
-	}, cfg, testPubKey, nil)
+	}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -420,7 +421,7 @@ func TestBuildVMManifest_ManagedByOverride(t *testing.T) {
 	objs, err := buildVMManifest(StartOpts{
 		Name:              "spawn-vm",
 		ManagedByOverride: "loom-spawn",
-	}, cfg, testPubKey, nil)
+	}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -437,7 +438,7 @@ func TestBuildVMManifest_ExtraLabelsMerge(t *testing.T) {
 	objs, err := buildVMManifest(StartOpts{
 		Name:        "labeled-vm",
 		ExtraLabels: map[string]string{"team": "platform", "tier": "test"},
-	}, cfg, testPubKey, nil)
+	}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -454,11 +455,11 @@ func TestBuildVMManifest_StableNamesForRepeatedBuilds(t *testing.T) {
 	cfg := validHarvesterCfg()
 	opts := StartOpts{Name: "stable-vm"}
 
-	a, err := buildVMManifest(opts, cfg, testPubKey, nil)
+	a, err := buildVMManifest(opts, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	b, err := buildVMManifest(opts, cfg, testPubKey, nil)
+	b, err := buildVMManifest(opts, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -478,7 +479,7 @@ func TestApplyOwnerReference_PatchesPVCWithVMRef(t *testing.T) {
 	// is populated). We assert apiVersion + kind + name + controller flag
 	// are correct; UID round-trips through GetUID/SetUID.
 	cfg := validHarvesterCfg()
-	objs, err := buildVMManifest(StartOpts{Name: "ownerref-vm"}, cfg, testPubKey, nil)
+	objs, err := buildVMManifest(StartOpts{Name: "ownerref-vm"}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest: %v", err)
 	}
@@ -566,7 +567,7 @@ func TestBuildVMManifest_RendersEnvIntoCloudInit(t *testing.T) {
 		"DEVBOX_BACKEND":    "harvester-vm",
 		"WITH_QUOTE":        "it's-quoted",
 	}
-	objs, err := buildVMManifest(StartOpts{Name: "env-vm"}, cfg, testPubKey, env)
+	objs, err := buildVMManifest(StartOpts{Name: "env-vm"}, cfg, testPubKey, env, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -606,7 +607,7 @@ func TestBuildVMManifest_RendersEnvIntoCloudInit(t *testing.T) {
 func TestBuildVMManifest_RejectsNewlineEnv(t *testing.T) {
 	cfg := validHarvesterCfg()
 	env := map[string]string{"BAD": "line1\nline2"}
-	_, err := buildVMManifest(StartOpts{Name: "bad-env"}, cfg, testPubKey, env)
+	_, err := buildVMManifest(StartOpts{Name: "bad-env"}, cfg, testPubKey, env, nil)
 	if err == nil {
 		t.Fatalf("expected error for newline-bearing env value, got nil")
 	}
@@ -617,7 +618,7 @@ func TestBuildVMManifest_RejectsNewlineEnv(t *testing.T) {
 
 func TestBuildVMManifest_EmptyEnvOmitsWriteFiles(t *testing.T) {
 	cfg := validHarvesterCfg()
-	objs, err := buildVMManifest(StartOpts{Name: "no-env-vm"}, cfg, testPubKey, nil)
+	objs, err := buildVMManifest(StartOpts{Name: "no-env-vm"}, cfg, testPubKey, nil, nil)
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
@@ -638,17 +639,20 @@ func TestBuildVMManifest_EmptyEnvOmitsWriteFiles(t *testing.T) {
 	}
 }
 
-func TestRenderCloudInitEnvBlock_EmptyInputs(t *testing.T) {
+func TestRenderCloudInitWriteFiles_EmptyInputs(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		env  map[string]string
+		name  string
+		env   map[string]string
+		files []ResolvedSecretFile
 	}{
-		{"nil", nil},
-		{"empty", map[string]string{}},
-		{"all-empty-keys", map[string]string{"": "value"}},
+		{"nil-nil", nil, nil},
+		{"empty-env-nil-files", map[string]string{}, nil},
+		{"all-empty-env-keys", map[string]string{"": "value"}, nil},
+		{"empty-files-slice", nil, []ResolvedSecretFile{}},
+		{"files-with-empty-paths-only", nil, []ResolvedSecretFile{{Path: "", Content: []byte("x")}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := renderCloudInitEnvBlock(tc.env)
+			out, err := renderCloudInitWriteFiles(tc.env, tc.files)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -657,4 +661,138 @@ func TestRenderCloudInitEnvBlock_EmptyInputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildVMManifest_RendersSecretFilesIntoCloudInit(t *testing.T) {
+	cfg := validHarvesterCfg()
+	files := []ResolvedSecretFile{
+		{
+			// Out-of-order on purpose — render must sort by Path.
+			Path:    "/home/agent/.gcp/sa.json",
+			Content: []byte(`{"type":"service_account","project_id":"x"}`),
+		},
+		{
+			Path:    "/home/agent/.claude.auth/oauth.json",
+			Content: []byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oauth"}}`),
+			Mode:    "0400",
+		},
+		{
+			// Binary blob to prove encoding: b64 is binary-safe.
+			Path:    "/etc/binary-blob",
+			Content: []byte{0x00, 0xff, 0x10, 0x7f, 0x80, 0x0a, 0x00},
+		},
+	}
+	objs, err := buildVMManifest(StartOpts{Name: "secret-vm"}, cfg, testPubKey, nil, files)
+	if err != nil {
+		t.Fatalf("buildVMManifest returned error: %v", err)
+	}
+
+	userData := extractUserData(t, objs)
+
+	for i, f := range files {
+		encoded := base64.StdEncoding.EncodeToString(f.Content)
+		wantSubstrings := []string{
+			"path: " + f.Path,
+			"owner: " + vmSecretFileOwner,
+			"encoding: b64",
+			"content: " + encoded,
+		}
+		for _, want := range wantSubstrings {
+			if !strings.Contains(userData, want) {
+				t.Errorf("file[%d] %s: userData missing %q\n--- userData ---\n%s",
+					i, f.Path, want, userData)
+			}
+		}
+	}
+
+	if c := strings.Count(userData, "write_files:"); c != 1 {
+		t.Errorf("expected exactly one write_files: block, got %d\n--- userData ---\n%s", c, userData)
+	}
+
+	// Default mode 0600 when ResolvedSecretFile.Mode is empty; honored mode
+	// override (0400) survives the render.
+	if !strings.Contains(userData, "permissions: '0600'") {
+		t.Errorf("expected default permissions 0600 for unset Mode; got userData:\n%s", userData)
+	}
+	if !strings.Contains(userData, "permissions: '0400'") {
+		t.Errorf("expected permissions 0400 from explicit Mode; got userData:\n%s", userData)
+	}
+
+	// Deterministic Path sort: /etc/binary-blob precedes the /home/agent paths
+	// in the rendered output.
+	binaryIdx := strings.Index(userData, "path: /etc/binary-blob")
+	claudeIdx := strings.Index(userData, "path: /home/agent/.claude.auth/oauth.json")
+	gcpIdx := strings.Index(userData, "path: /home/agent/.gcp/sa.json")
+	if binaryIdx < 0 || binaryIdx >= claudeIdx || claudeIdx >= gcpIdx {
+		t.Errorf("write_files entries not sorted by Path (binary=%d claude=%d gcp=%d)",
+			binaryIdx, claudeIdx, gcpIdx)
+	}
+}
+
+func TestBuildVMManifest_MergesEnvAndFilesIntoSingleBlock(t *testing.T) {
+	cfg := validHarvesterCfg()
+	env := map[string]string{"ANTHROPIC_API_KEY": "sk-ant-merged"}
+	files := []ResolvedSecretFile{
+		{Path: "/home/agent/.codex.auth/auth.json", Content: []byte(`{"token":"x"}`)},
+	}
+	objs, err := buildVMManifest(StartOpts{Name: "merged-vm"}, cfg, testPubKey, env, files)
+	if err != nil {
+		t.Fatalf("buildVMManifest returned error: %v", err)
+	}
+	userData := extractUserData(t, objs)
+
+	if c := strings.Count(userData, "write_files:"); c != 1 {
+		t.Errorf("env + files must share one write_files block; got %d blocks\n%s", c, userData)
+	}
+	for _, want := range []string{
+		"path: /etc/loom-spawn.env",
+		"ANTHROPIC_API_KEY='sk-ant-merged'",
+		"path: /home/agent/.codex.auth/auth.json",
+		"encoding: b64",
+	} {
+		if !strings.Contains(userData, want) {
+			t.Errorf("merged block missing %q\n--- userData ---\n%s", want, userData)
+		}
+	}
+}
+
+func TestBuildVMManifest_FilesOnlyOmitsEnvEntry(t *testing.T) {
+	cfg := validHarvesterCfg()
+	files := []ResolvedSecretFile{
+		{Path: "/home/agent/.codex.auth/auth.json", Content: []byte(`{"token":"x"}`)},
+	}
+	objs, err := buildVMManifest(StartOpts{Name: "files-only-vm"}, cfg, testPubKey, nil, files)
+	if err != nil {
+		t.Fatalf("buildVMManifest returned error: %v", err)
+	}
+	userData := extractUserData(t, objs)
+
+	if !strings.Contains(userData, "write_files:") {
+		t.Errorf("expected write_files block; got userData:\n%s", userData)
+	}
+	if strings.Contains(userData, "path: /etc/loom-spawn.env") {
+		t.Errorf("files-only render must not include env file entry; got userData:\n%s", userData)
+	}
+}
+
+// extractUserData pulls the cloud-init userData string out of the rendered
+// VirtualMachine manifest. Shared across the secret-file rendering tests.
+func extractUserData(t *testing.T, objs *harvesterVMObjects) string {
+	t.Helper()
+	volumes := mustGetSliceAt(t, objs.VM.Object, "spec", "template", "spec", "volumes")
+	for _, v := range volumes {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		ci, ok := vm["cloudInitNoCloud"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if ud, _ := ci["userData"].(string); ud != "" {
+			return ud
+		}
+	}
+	t.Fatalf("cloud-init userData not found in VM manifest")
+	return ""
 }
