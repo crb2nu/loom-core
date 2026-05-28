@@ -591,6 +591,12 @@ func (a *App) initSpawnOrchestrator(ctx context.Context) error {
 			DefaultMemMi:         cfg.SpawnHarvesterDefaultMemMi,
 			DefaultDiskGi:        cfg.SpawnHarvesterDefaultDiskGi,
 			SSHUser:              cfg.SpawnHarvesterSSHUser,
+			// K8sBackend implements SecretResolver natively. Without it,
+			// SecretEnv refs (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY,
+			// GEMINI_API_KEY) would be silently dropped on harvester-vm
+			// spawns and the agent CLI would run without credentials.
+			// Slice 2d.5.
+			SecretResolver: spawnBackend,
 		})
 		if herr != nil {
 			// Don't fail HUD startup over an optional substrate; log loud

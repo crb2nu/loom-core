@@ -1088,3 +1088,114 @@ func TestBuildPodSpec_ExtraLabels(t *testing.T) {
 		}
 	})
 }
+
+func TestK8sBackend_ResolveSecretEnv(t *testing.T) {
+	const ns = "devbox"
+	apiKeys := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-api-keys", Namespace: ns},
+		Data: map[string][]byte{
+			"ANTHROPIC_API_KEY": []byte("sk-ant-12345"),
+			"GEMINI_API_KEY":    []byte("AIza-67890"),
+		},
+	}
+	auth := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-auth", Namespace: ns},
+		Data: map[string][]byte{
+			"claude-oauth-token": []byte("oauth-abcdef"),
+		},
+	}
+	client := k8sfake.NewSimpleClientset(apiKeys, auth)
+	k := testK8sBackend()
+	k.clientset = client
+
+	t.Run("happy path", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "ANTHROPIC_API_KEY", SecretName: "agent-api-keys", SecretKey: "ANTHROPIC_API_KEY"},
+			{Name: "GEMINI_API_KEY", SecretName: "agent-api-keys", SecretKey: "GEMINI_API_KEY"},
+			{Name: "CLAUDE_CODE_OAUTH_TOKEN", SecretName: "agent-auth", SecretKey: "claude-oauth-token"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv: %v", err)
+		}
+		want := map[string]string{
+			"ANTHROPIC_API_KEY":       "sk-ant-12345",
+			"GEMINI_API_KEY":          "AIza-67890",
+			"CLAUDE_CODE_OAUTH_TOKEN": "oauth-abcdef",
+		}
+		for name, val := range want {
+			if got[name] != val {
+				t.Errorf("got[%q] = %q, want %q", name, got[name], val)
+			}
+		}
+	})
+
+	t.Run("missing secret is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "ANTHROPIC_API_KEY", SecretName: "agent-api-keys", SecretKey: "ANTHROPIC_API_KEY"},
+			{Name: "NO_SUCH_VAR", SecretName: "nonexistent-secret", SecretKey: "k"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv returned error for absent secret: %v", err)
+		}
+		if got["ANTHROPIC_API_KEY"] != "sk-ant-12345" {
+			t.Errorf("present secret should still resolve; got %v", got)
+		}
+		if _, ok := got["NO_SUCH_VAR"]; ok {
+			t.Errorf("missing secret should be omitted from result; got %v", got)
+		}
+	})
+
+	t.Run("missing key is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "MISSING_KEY", SecretName: "agent-api-keys", SecretKey: "NOT_IN_SECRET"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv returned error for absent key: %v", err)
+		}
+		if _, ok := got["MISSING_KEY"]; ok {
+			t.Errorf("missing key should be omitted from result; got %v", got)
+		}
+	})
+
+	t.Run("empty input returns empty map", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv(nil): %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("expected empty map, got %v", got)
+		}
+	})
+
+	t.Run("caches secret reads", func(t *testing.T) {
+		// Pre-existing reactor instrumentation: count Get calls on Secrets.
+		var gets int
+		client2 := k8sfake.NewSimpleClientset(apiKeys)
+		client2.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			gets++
+			// Fall through to default tracker
+			return false, nil, nil
+		})
+		k2 := testK8sBackend()
+		k2.clientset = client2
+
+		_, err := k2.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "A", SecretName: "agent-api-keys", SecretKey: "ANTHROPIC_API_KEY"},
+			{Name: "B", SecretName: "agent-api-keys", SecretKey: "GEMINI_API_KEY"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv: %v", err)
+		}
+		if gets != 1 {
+			t.Errorf("expected 1 Secret Get (cached), got %d", gets)
+		}
+	})
+
+	// Sanity: the fake apierrors helper is imported elsewhere in this file;
+	// silence the linter if it's unused locally.
+	_ = apierrors.IsNotFound
+	_ = errors.Is
+	_ = strings.Contains
+	_ = schema.GroupVersion{}
+	_ = watch.NewFake
+}

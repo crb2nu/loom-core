@@ -97,6 +97,17 @@ type HarvesterVMBackendConfig struct {
 	// SSHUser is the cloud-init-provisioned user. Default "ubuntu" —
 	// matches the Slice 1.5 manifest.
 	SSHUser string
+
+	// SecretResolver, when non-nil, lets Start flatten StartOpts.SecretEnv
+	// into plaintext values that are baked into the VM's cloud-init env
+	// file. K8s pods get Secret resolution via the API server's SecretKeyRef
+	// machinery; Harvester VMs have no equivalent, so the orchestrator
+	// passes its K8sBackend (which implements SecretResolver natively) when
+	// it wires this backend up.
+	//
+	// Nil-safe: when nil, Start logs a warning if StartOpts.SecretEnv is
+	// non-empty and proceeds with StartOpts.Env only.
+	SecretResolver SecretResolver
 }
 
 // HarvesterVMBackend implements Backend using KubeVirt VirtualMachines
@@ -218,7 +229,12 @@ func (h *HarvesterVMBackend) Start(ctx context.Context, opts StartOpts) (*StartR
 		return nil, fmt.Errorf("generate ssh key: %w", err)
 	}
 
-	objs, err := buildVMManifest(opts, h.cfg, pubKey)
+	env, err := h.resolveStartEnv(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("resolve secret env: %w", err)
+	}
+
+	objs, err := buildVMManifest(opts, h.cfg, pubKey, env)
 	if err != nil {
 		return nil, fmt.Errorf("build vm manifest: %w", err)
 	}
@@ -425,6 +441,12 @@ func (h *HarvesterVMBackend) Exec(_ context.Context, opts ExecOpts) (*ExecResult
 		}
 		shellCmd = envPrefix.String() + shellCmd
 	}
+	// Source the cloud-init env file first so any env baked in at Start
+	// is honored even when callers don't pass ExecOpts.Env. `2>/dev/null`
+	// keeps the prefix safe on VMs where the file is absent (older base
+	// images, first-boot races). `set -a` auto-exports the assignments so
+	// the values reach the spawned process tree.
+	shellCmd = fmt.Sprintf("set -a; . %s 2>/dev/null; set +a; %s", vmEnvFilePath, shellCmd)
 	if opts.WorkDir != "" {
 		shellCmd = fmt.Sprintf("cd %s && %s", shellQuote(opts.WorkDir), shellCmd)
 	}
@@ -522,6 +544,33 @@ func (h *HarvesterVMBackend) CleanupBuilds(ctx context.Context, maxAge time.Dura
 		cleaned++
 	}
 	return cleaned, nil
+}
+
+// resolveStartEnv merges StartOpts.Env with any SecretEnv values resolved
+// through the configured SecretResolver. Caller-supplied opts.Env keys win
+// on conflict so explicit overrides survive Secret resolution. Returns a
+// map with the same identity semantics as the inputs (empty map, not nil,
+// to keep buildVMManifest's downstream handling simple).
+func (h *HarvesterVMBackend) resolveStartEnv(ctx context.Context, opts StartOpts) (map[string]string, error) {
+	env := make(map[string]string, len(opts.Env)+len(opts.SecretEnv))
+	if len(opts.SecretEnv) > 0 {
+		if h.cfg.SecretResolver == nil {
+			h.logger.Warn("StartOpts.SecretEnv requested but no SecretResolver configured; secrets will be absent on the VM",
+				"vm", opts.Name, "secret_count", len(opts.SecretEnv))
+		} else {
+			resolved, err := h.cfg.SecretResolver.ResolveSecretEnv(ctx, opts.SecretEnv)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range resolved {
+				env[k] = v
+			}
+		}
+	}
+	for k, v := range opts.Env {
+		env[k] = v
+	}
+	return env, nil
 }
 
 // ---------- internals: SSH key management ----------
