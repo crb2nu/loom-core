@@ -113,6 +113,21 @@ type Config struct {
 	SpawnBuildEphemeralStorageLimit   string  // Buildah pod ephemeral-storage limit for spawn images.
 	SpawnBuildAvoidNodes              string  // Comma-separated node names to avoid for spawn image builds.
 
+	// Harvester KubeVirt VM substrate (Mills harvester-vm backend).
+	// When SpawnHarvesterKubeconfig is empty, the harvester-vm backend
+	// is NOT registered and any spawn request with Substrate="harvester-vm"
+	// falls back to the default (k8s) backend with a warning log.
+	// Spec: .loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md
+	SpawnHarvesterKubeconfig       string // Kubeconfig for the Harvester cluster.
+	SpawnHarvesterBaseImage        string // VirtualMachineImage name (e.g. "mills-devbox-base-2026-05-25").
+	SpawnHarvesterNamespace        string // VM namespace (default: "default" — Slice 1.5 same-NS PVC pattern).
+	SpawnHarvesterStorageClass     string // Storage class for per-VM PVCs (e.g. "longhorn-image-<id>"). Required when SpawnHarvesterKubeconfig set.
+	SpawnHarvesterNetworkAttachDef string // Multus NAD ref (default: "default/lan10g").
+	SpawnHarvesterDefaultVCPUs     int    // Per-VM vCPU count (default: 2).
+	SpawnHarvesterDefaultMemMi     int    // Per-VM memory MiB (default: 4096).
+	SpawnHarvesterDefaultDiskGi    int    // Per-VM OS disk GiB (default: 20).
+	SpawnHarvesterSSHUser          string // Cloud-init-provisioned user (default: "ubuntu").
+
 	// Pipeline monitoring (GitLab CI).
 	PipelineProjects string // Comma-separated GitLab project paths to monitor.
 

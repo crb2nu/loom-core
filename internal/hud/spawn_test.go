@@ -719,3 +719,80 @@ func TestBuildSpawnPodEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestSubstrateBackend covers the Slice 2d substrate routing helper.
+// Empty substrate → default backend (current pre-Slice-2c behavior).
+// Known substrate → its registered backend.
+// Unknown substrate → default backend (clean fallback, not nil).
+func TestSubstrateBackend(t *testing.T) {
+	k8s := &recordingBackend{}
+	hvm := &recordingBackend{}
+	o := &SpawnOrchestrator{
+		backends: map[string]backend.Backend{
+			DefaultSubstrate: k8s,
+			"harvester-vm":   hvm,
+		},
+		defaultSubstrate: DefaultSubstrate,
+		logger:           slog.Default(),
+	}
+
+	tests := []struct {
+		name      string
+		substrate string
+		want      backend.Backend
+	}{
+		{"empty substrate falls back to default", "", k8s},
+		{"explicit k8s lookup", "k8s", k8s},
+		{"explicit harvester-vm lookup", "harvester-vm", hvm},
+		{"unknown substrate falls back to default with warn log", "podman", k8s},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := o.substrateBackend(tc.substrate)
+			if got != tc.want {
+				t.Errorf("substrateBackend(%q) = %v; want %v", tc.substrate, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubstrateBackend_NilSafe covers the nil-orchestrator + empty-map
+// edge cases so callers in test code (NewSpawnOrchestratorForTest) and
+// the early-init resumePreRuntimeSpawns guard don't panic.
+func TestSubstrateBackend_NilSafe(t *testing.T) {
+	var nilOrch *SpawnOrchestrator
+	if got := nilOrch.substrateBackend("anything"); got != nil {
+		t.Errorf("nil orchestrator: substrateBackend → %v; want nil", got)
+	}
+
+	empty := &SpawnOrchestrator{
+		backends:         map[string]backend.Backend{},
+		defaultSubstrate: DefaultSubstrate,
+		logger:           slog.Default(),
+	}
+	if got := empty.substrateBackend(""); got != nil {
+		t.Errorf("empty backends: substrateBackend(\"\") → %v; want nil", got)
+	}
+}
+
+// TestNewSpawnOrchestratorSingleBackend covers the legacy convenience
+// wrapper so existing single-backend tests + callers keep their shape.
+func TestNewSpawnOrchestratorSingleBackend(t *testing.T) {
+	rb := &recordingBackend{}
+	o := NewSpawnOrchestratorSingleBackend(
+		rb, nil, nil, nil, nil, slog.Default(),
+		SpawnOrchestratorConfig{},
+	)
+	if o == nil {
+		t.Fatal("nil orchestrator")
+	}
+	if got := o.substrateBackend(""); got != rb {
+		t.Errorf("substrateBackend(\"\") = %v; want %v", got, rb)
+	}
+	if got := o.substrateBackend(DefaultSubstrate); got != rb {
+		t.Errorf("substrateBackend(%q) = %v; want %v", DefaultSubstrate, got, rb)
+	}
+	if got := o.substrateBackend("harvester-vm"); got != rb {
+		t.Errorf("unknown substrate must fall back to default; got %v want %v", got, rb)
+	}
+}

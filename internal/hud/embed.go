@@ -572,8 +572,42 @@ func (a *App) initSpawnOrchestrator(ctx context.Context) error {
 	if cfg.SpawnMaxConcurrentBuilds > 0 {
 		spawnCfg.MaxConcurrentBuilds = cfg.SpawnMaxConcurrentBuilds
 	}
+	// Slice 2d: assemble the substrate backend map. K8s is the default and
+	// always registered; the harvester-vm backend is optional and gated on
+	// SpawnHarvesterKubeconfig being set. Mills opts in per-stage via
+	// pipeline.stage_substrate (Slice 2a) → SpawnRequest.Substrate
+	// (Slice 2b/2c) → o.substrateBackend(req.Substrate).
+	backends := map[string]backend.Backend{
+		DefaultSubstrate: spawnBackend,
+	}
+	if cfg.SpawnHarvesterKubeconfig != "" {
+		hvm, herr := backend.NewHarvesterVMBackend(backend.HarvesterVMBackendConfig{
+			KubeconfigPath:       cfg.SpawnHarvesterKubeconfig,
+			BaseImageName:        cfg.SpawnHarvesterBaseImage,
+			Namespace:            cfg.SpawnHarvesterNamespace,
+			StorageClassName:     cfg.SpawnHarvesterStorageClass,
+			NetworkAttachmentDef: cfg.SpawnHarvesterNetworkAttachDef,
+			DefaultVCPUs:         cfg.SpawnHarvesterDefaultVCPUs,
+			DefaultMemMi:         cfg.SpawnHarvesterDefaultMemMi,
+			DefaultDiskGi:        cfg.SpawnHarvesterDefaultDiskGi,
+			SSHUser:              cfg.SpawnHarvesterSSHUser,
+		})
+		if herr != nil {
+			// Don't fail HUD startup over an optional substrate; log loud
+			// and continue with k8s only. Mills runs that target
+			// harvester-vm will fall back via substrateBackend's warn-log
+			// path until the config is fixed.
+			a.logger.Warn("harvester-vm substrate disabled (config error)", "error", herr)
+		} else {
+			backends["harvester-vm"] = hvm
+			a.logger.Info("harvester-vm substrate enabled",
+				"namespace", cfg.SpawnHarvesterNamespace,
+				"base_image", cfg.SpawnHarvesterBaseImage)
+		}
+	}
+
 	a.spawner = NewSpawnOrchestrator(
-		spawnBackend, a.agent, a.sseHub, a.tracer, a.metrics, a.logger,
+		backends, DefaultSubstrate, a.agent, a.sseHub, a.tracer, a.metrics, a.logger,
 		spawnCfg,
 	)
 	a.fleetMonitor.SetSpawnLister(spawnAdapter{a.spawner})

@@ -74,7 +74,7 @@ func sanitizeSpawnID(id string) string {
 // pod. It uses the same base64-encoded `cat | base64 -d` heredoc pattern as
 // injectAgentConfig (stdout-only Exec) to avoid the K3s SPDY stdin hangs
 // documented in spawn.go.
-func (o *SpawnOrchestrator) injectSDKDriver(ctx context.Context, containerID string) error {
+func (o *SpawnOrchestrator) injectSDKDriver(ctx context.Context, be backend.Backend, containerID string) error {
 	if len(spawnDriverBundle) == 0 {
 		return fmt.Errorf("spawn driver bundle is empty (build asset missing)")
 	}
@@ -85,7 +85,7 @@ func (o *SpawnOrchestrator) injectSDKDriver(ctx context.Context, containerID str
 		spawnDriverPodDir, encoded, spawnDriverPodPath, spawnDriverPodPath,
 	)
 
-	_, err := o.backend.Exec(ctx, backend.ExecOpts{
+	_, err := be.Exec(ctx, backend.ExecOpts{
 		ContainerID: containerID,
 		Command:     cmd,
 		TimeoutSec:  30,
@@ -101,10 +101,10 @@ func (o *SpawnOrchestrator) injectSDKDriver(ctx context.Context, containerID str
 // for `{type:"message"|"interrupt"|"shutdown"}` commands. We create it
 // before exec so the driver's fs.watch fires immediately on the first
 // REST-driven append instead of waiting on the 200ms poll fallback.
-func (o *SpawnOrchestrator) injectControlFile(ctx context.Context, containerID, spawnID string) error {
+func (o *SpawnOrchestrator) injectControlFile(ctx context.Context, be backend.Backend, containerID, spawnID string) error {
 	path := controlFilePathForSpawn(spawnID)
 	cmd := fmt.Sprintf("mkdir -p %s && : > %s", spawnControlFileDir, path)
-	_, err := o.backend.Exec(ctx, backend.ExecOpts{
+	_, err := be.Exec(ctx, backend.ExecOpts{
 		ContainerID: containerID,
 		Command:     cmd,
 		TimeoutSec:  15,
@@ -129,7 +129,7 @@ type SpawnControlCommand = spawn.ControlCommand
 // Slice 8c wires this up to the REST handlers via SendControlMessage; slice
 // 8b ships the helper so it's reachable and unit-tested ahead of the
 // wire-up.
-func (o *SpawnOrchestrator) injectControlMessage(ctx context.Context, containerID, spawnID string, cmd spawn.ControlCommand) error {
+func (o *SpawnOrchestrator) injectControlMessage(ctx context.Context, be backend.Backend, containerID, spawnID string, cmd spawn.ControlCommand) error {
 	if cmd.Type == "" {
 		return fmt.Errorf("control command type is required")
 	}
@@ -143,7 +143,7 @@ func (o *SpawnOrchestrator) injectControlMessage(ctx context.Context, containerI
 	path := controlFilePathForSpawn(spawnID)
 	shellCmd := fmt.Sprintf("mkdir -p %s && echo '%s' | base64 -d >> %s",
 		spawnControlFileDir, encoded, path)
-	_, err = o.backend.Exec(ctx, backend.ExecOpts{
+	_, err = be.Exec(ctx, backend.ExecOpts{
 		ContainerID: containerID,
 		Command:     shellCmd,
 		TimeoutSec:  15,
