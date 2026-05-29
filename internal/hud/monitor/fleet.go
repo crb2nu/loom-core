@@ -468,6 +468,29 @@ func (m *FleetMonitor) refresh(force bool) error {
 		sessionsOK = true
 	}
 
+	// Defense-in-depth: union an explicit status="active" fetch into the
+	// snapshot so the live counters and stale-session reaper are never
+	// blind to actively running work, even if Sessions() ever regresses
+	// to the "1000 ended rows, zero actives" failure mode the
+	// sessionListScrollCap fix was written for. The filtered scroll path
+	// in agent_session_list has always been correct (status=active
+	// returns a small bounded result), so this is a cheap safety net.
+	if sessionsOK {
+		if active, err := m.agent.ActiveSessions(); err != nil {
+			m.Logger.Warn("fleet: failed to fetch active sessions for merge", "error", err)
+		} else if len(active) > 0 {
+			seen := make(map[string]bool, len(snap.Sessions))
+			for _, s := range snap.Sessions {
+				seen[s.ID] = true
+			}
+			for _, s := range active {
+				if !seen[s.ID] {
+					snap.Sessions = append(snap.Sessions, s)
+				}
+			}
+		}
+	}
+
 	// Fetch all tasks.
 	if tasks, err := m.agent.AllTasks(); err != nil {
 		m.Logger.Warn("fleet: failed to fetch tasks", "error", err)

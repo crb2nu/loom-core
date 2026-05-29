@@ -11,6 +11,19 @@ import (
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
+// sessionListScrollCap bounds how many session points we will scroll from
+// Qdrant before sorting and truncating to the caller's limit. Qdrant scroll
+// returns points in internal point-ID order, not by StartedAt — so applying
+// the caller's limit at the scroll layer would silently drop the most
+// recently started sessions (the HUD's Live Sessions panel hit exactly this
+// bug: agent_session_list(limit=1000) came back with 1000 ended rows while
+// a dozen active sessions were running, because the scroll's ID-ordered
+// truncation never reached them). 10000 is well above the realistic working
+// set per backend (sessions are pruned at 72h via agent_session_prune) and
+// matches the cap used by other "fetch everything then filter" callers
+// like workflow_persist.go.
+const sessionListScrollCap = 10000
+
 // List returns sessions matching optional filters.
 func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
@@ -39,7 +52,7 @@ func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallT
 		filter = FilterMust(conds...)
 	}
 
-	points, err := ss.qdrant.ScrollPoints(ctx, filter, limit, false)
+	points, err := ss.qdrant.ScrollPoints(ctx, filter, sessionListScrollCap, false)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("list sessions: %w", err)), nil
 	}

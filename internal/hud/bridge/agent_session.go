@@ -544,6 +544,26 @@ func (a *AgentBridge) Sessions() ([]SessionInfo, error) {
 	}, 3*time.Second)
 }
 
+// ActiveSessions returns sessions explicitly filtered to status="active".
+//
+// Fleet view defense-in-depth: Sessions() asks the agent-context server
+// for the most recent N sessions across all statuses. When the underlying
+// list endpoint mis-orders or pre-truncates (as it did before
+// sessionListScrollCap landed), Sessions() can come back with zero
+// active rows while a dozen are actually running. Reading the active
+// set through an explicit status filter sidesteps that failure mode —
+// the server's filtered scroll path was always correct.
+//
+// Callers that need to count live work or reap stale sessions should
+// merge ActiveSessions() into Sessions() rather than trust the
+// unfiltered fetch alone.
+func (a *AgentBridge) ActiveSessions() ([]SessionInfo, error) {
+	return a.SessionsWithParams(map[string]any{
+		"limit":  defaultSessionListLimit,
+		"status": "active",
+	}, 3*time.Second)
+}
+
 // SessionsWithParams returns sessions for an arbitrary session-list parameter
 // set, optionally bounded by a per-call timeout.
 func (a *AgentBridge) SessionsWithParams(params map[string]any, timeout time.Duration) ([]SessionInfo, error) {
