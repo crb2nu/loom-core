@@ -679,3 +679,128 @@ func TestFleetMonitor_CarryOverOnPresenceFetchError(t *testing.T) {
 		t.Errorf("TotalSessions changed despite session fetch success: got %d, want %d", got.TotalSessions, baseline.TotalSessions)
 	}
 }
+
+// TestFleetMonitor_MergesActiveSessionsWhenUnfilteredListMissesThem is the
+// regression test for the HUD "0 active sessions while 12 were running" bug.
+//
+// The unfiltered agent_session_list call can come back with a window of
+// ended/summarized rows that excludes the actively running sessions (the
+// production failure mode that prompted sessionListScrollCap). FleetMonitor
+// is expected to compensate by also calling the filtered status="active"
+// path and union-ing the results into snap.Sessions, so the live counters
+// and stale-session reaper stay correct.
+//
+// This test wires the mock daemon to return only ended sessions for the
+// unfiltered call and a fresh active session for the filtered call, then
+// asserts that the snapshot contains both — and that ActiveSessions > 0.
+func TestFleetMonitor_MergesActiveSessionsWhenUnfilteredListMissesThem(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	client, agent := newBridges(t, sockPath)
+
+	handlers.handle("loom/status", func(_ json.RawMessage) (any, error) {
+		return map[string]any{
+			"running": true, "servers": 1, "activeConns": 0, "idleConns": 0,
+			"processes": []string{"agent_context"},
+		}, nil
+	})
+
+	now := time.Now().UTC()
+	endedStart := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	activeStart := now.Add(-1 * time.Minute).Format(time.RFC3339Nano)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			// Mirror the production failure mode: the unfiltered call
+			// returns only ended history, the filtered call returns the
+			// live actives. This is what the Qdrant scroll bug looked
+			// like in practice before sessionListScrollCap landed.
+			status, _ := req.Arguments["status"].(string)
+			if status == "active" {
+				return toolEnvelope(map[string]any{
+					"sessions": []map[string]any{
+						{
+							"id": "sess-active-1", "agent_id": "claude-live",
+							"status": "active", "started_at": activeStart,
+						},
+					},
+				}), nil
+			}
+			return toolEnvelope(map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id": "sess-ended-1", "agent_id": "claude-old",
+						"status": "ended", "started_at": endedStart,
+					},
+				},
+			}), nil
+		case "agent_context__agent_task_list":
+			return toolEnvelope(map[string]any{"tasks": []map[string]any{}}), nil
+		case "agent_context__agent_memory_stats":
+			return toolEnvelope(map[string]any{"total_items": 0, "total_tokens": 0}), nil
+		case "agent_context__agent_graph_stats":
+			return toolEnvelope(map[string]any{"total_entities": 0, "total_relations": 0}), nil
+		case "agent_context__agent_workflow_list":
+			return toolEnvelope(map[string]any{"workflows": []map[string]any{}}), nil
+		case "agent_context__agent_presence_list":
+			heartbeat := now.Format(time.RFC3339Nano)
+			return toolEnvelope(map[string]any{
+				"agents": []map[string]any{
+					{
+						"agent_id": "claude-live", "session_id": "sess-active-1",
+						"status": "active", "last_heartbeat": heartbeat,
+					},
+				},
+			}), nil
+		case "agent_context__agent_file_claim_list":
+			return toolEnvelope(map[string]any{"claims": []map[string]any{}}), nil
+		case "agent_context__agent_worktree_list":
+			return toolEnvelope(map[string]any{"assignments": []map[string]any{}}), nil
+		case "agent_context__agent_handoff_inbox":
+			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
+		default:
+			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
+		}
+	})
+
+	monitor := NewFleetMonitor(client, agent, nil)
+	if err := monitor.Refresh(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	snap := monitor.Snapshot()
+	if len(snap.Sessions) != 2 {
+		t.Fatalf("expected merged snapshot of 2 sessions (1 ended + 1 active), got %d: %+v",
+			len(snap.Sessions), snap.Sessions)
+	}
+
+	var sawActive, sawEnded bool
+	for _, s := range snap.Sessions {
+		switch s.ID {
+		case "sess-active-1":
+			sawActive = true
+			if s.Status != "active" {
+				t.Errorf("merged active row has wrong status %q", s.Status)
+			}
+		case "sess-ended-1":
+			sawEnded = true
+		}
+	}
+	if !sawActive {
+		t.Error("active session was not merged into snap.Sessions — the union path didn't fire")
+	}
+	if !sawEnded {
+		t.Error("ended session was dropped from snap.Sessions — the merge replaced instead of unioned")
+	}
+
+	if snap.ActiveSessions != 1 {
+		t.Errorf("expected ActiveSessions=1 after merge, got %d", snap.ActiveSessions)
+	}
+}
