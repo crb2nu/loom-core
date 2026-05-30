@@ -16,6 +16,18 @@ import (
 // parity with the orchestrator's exec environment.
 const vmEnvFilePath = "/etc/loom-spawn.env"
 
+// vmAgentUser / vmAgentHome define the cloud-init-provisioned login user on
+// mills VMs. They mirror the K8s spawn pod's uid-1000 `agent` user with
+// HOME=/home/agent (internal/hud/spawn.go: AgentHomeDir) so that
+// SecretMount paths and injectAgentConfig writes — all hardcoded to
+// /home/agent — line up with the SSH user's home dir. Without parity the
+// agent CLIs look up `~/.codex/auth.json` under the wrong home and miss the
+// mounted credentials (Slice 2d.5c).
+const (
+	vmAgentUser = "agent"
+	vmAgentHome = "/home/agent"
+)
+
 // KubeVirt API GVRs used by this backend.
 //
 // Pinned to v1 — the spec is built against KubeVirt v1.4.0 (Harvester
@@ -69,16 +81,29 @@ type harvesterVMObjects struct {
 // `files` is the SecretMount resolution from a SecretResolver: one entry
 // per (mount, item) with an absolute Path inside the VM and binary-safe
 // Content. Each file becomes a cloud-init write_files entry with
-// `encoding: b64`, owner `vmSecretFileOwner`, and mode from
-// ResolvedSecretFile.Mode (default `0600`). When env + files are both
-// non-empty they share a single `write_files:` block (cloud-init parses
-// each top-level key once).
+// `encoding: b64`, written root-owned, and mode from ResolvedSecretFile.Mode
+// (default `0600`). When env + files are both non-empty they share a single
+// `write_files:` block (cloud-init parses each top-level key once).
 //
-// Cloud-init injects the pubkey into the `ubuntu` user's
-// authorized_keys, disables password auth, and defensively re-enables
-// qemu-guest-agent + ssh even though the pre-baked image already has
-// them enabled (Slice 1.5 evidence:
-// `.loom/local/handoffs/mills-harvester-vm-slice15-2026-05-25.md`).
+// Cloud-init creates the `agent` user (HOME=/home/agent) via the `users:`
+// stanza so the VM mirrors the K8s spawn pod's uid-1000 agent user:
+// SecretMount files and injectAgentConfig writes all target /home/agent, and
+// the agent CLIs resolve `~/.codex/auth.json` etc. to those paths once SSH'd
+// in as `agent` (Slice 2d.5c).
+//
+// Ordering note: cloud-init's `write-files` module runs *before*
+// `users-groups`, so the agent user does not exist when secret files are
+// written. They are therefore written root-owned, and a `runcmd` step
+// (`chown -R agent:agent /home/agent`, which runs after the user exists)
+// hands them to the agent. Relying on the `users:` stanza to create the
+// user — rather than pre-creating it in `bootcmd` — keeps SSH-key injection
+// reliable across cloud-init versions (some skip key application for a
+// pre-existing user).
+//
+// Cloud-init injects the pubkey into the agent user's authorized_keys,
+// disables password auth, and defensively re-enables qemu-guest-agent +
+// ssh even though the pre-baked image already has them enabled (Slice 1.5
+// evidence: `.loom/local/handoffs/mills-harvester-vm-slice15-2026-05-25.md`).
 func buildVMManifest(opts StartOpts, cfg HarvesterVMBackendConfig, sshPubKey string, env map[string]string, files []ResolvedSecretFile) (*harvesterVMObjects, error) {
 	if opts.Name == "" {
 		return nil, fmt.Errorf("StartOpts.Name is required")
@@ -156,16 +181,18 @@ func buildVMManifest(opts StartOpts, cfg HarvesterVMBackendConfig, sshPubKey str
 	userData := fmt.Sprintf(`#cloud-config
 hostname: %s
 users:
-  - name: ubuntu
+  - name: %s
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
+    home: %s
     ssh_authorized_keys:
       - %s
 ssh_pwauth: false
 %sruncmd:
   - [ systemctl, enable, --now, qemu-guest-agent ]
   - [ systemctl, enable, --now, ssh ]
-`, opts.Name, sshPubKey, envBlock)
+  - [ chown, -R, %s, %s ]
+`, opts.Name, vmAgentUser, vmAgentHome, sshPubKey, envBlock, vmSecretFileOwner, vmAgentHome)
 
 	vmTemplateLabels := map[string]any{
 		"app":            opts.Name,
@@ -260,19 +287,28 @@ ssh_pwauth: false
 	return &harvesterVMObjects{PVC: pvc, VM: vm}, nil
 }
 
-// vmSecretFileOwner is the owner stanza for cloud-init write_files entries
-// holding Secret-resolved file content. Must match the user created by the
-// cloud-init `users:` stanza in buildVMManifest — currently hardcoded to
-// `ubuntu` — so the SSH session can read the files at exec time.
-const vmSecretFileOwner = "ubuntu:ubuntu"
+// vmSecretFileOwner is the final `user:group` that should own the
+// Secret-resolved files inside the VM — the agent login user, so the SSH
+// session can read them at exec time. It is applied by a `runcmd` chown of
+// vmAgentHome (not by the write_files `owner:` field), because cloud-init's
+// write-files module runs before the agent user exists. See buildVMManifest.
+const vmSecretFileOwner = vmAgentUser + ":" + vmAgentUser
+
+// vmWriteFilesOwner is the owner cloud-init assigns to write_files entries
+// at write time. Must be a user that already exists during the early
+// write-files module — `root` — since the agent user is created later by the
+// users-groups module. The runcmd chown (vmSecretFileOwner) reassigns the
+// agent-home files afterward.
+const vmWriteFilesOwner = "root:root"
 
 // renderCloudInitWriteFiles returns a single cloud-init `write_files:`
 // block (with a trailing newline) containing zero or more entries:
 //   - An env-file entry at vmEnvFilePath with `KEY='value'` shell-sourceable
 //     lines (root-owned, 0644). Skipped when env yields no usable keys.
 //   - One entry per ResolvedSecretFile with `encoding: b64` + base64-encoded
-//     Content, owned by vmSecretFileOwner, mode from file.Mode (default
-//     "0600"). Skipped when files is empty.
+//     Content, written root-owned (vmWriteFilesOwner) and later chowned to
+//     the agent by a runcmd, mode from file.Mode (default "0600"). Skipped
+//     when files is empty.
 //
 // Empty input (no env entries AND no files) returns an empty string so the
 // calling fmt.Sprintf can drop the block cleanly between the cloud-init
@@ -348,8 +384,11 @@ func renderEnvFileEntry(env map[string]string) (string, error) {
 }
 
 // renderSecretFileEntries returns one write_files item per ResolvedSecretFile
-// with binary-safe base64 content. Entries are sorted by Path for
-// deterministic output. Files with empty Path are skipped.
+// with binary-safe base64 content, written root-owned (vmWriteFilesOwner)
+// because the agent user does not yet exist during cloud-init's write-files
+// module; a later runcmd chown reassigns vmAgentHome to the agent. Entries
+// are sorted by Path for deterministic output. Files with empty Path are
+// skipped.
 func renderSecretFileEntries(files []ResolvedSecretFile) []string {
 	if len(files) == 0 {
 		return nil
@@ -377,7 +416,7 @@ func renderSecretFileEntries(files []ResolvedSecretFile) []string {
     owner: %s
     permissions: '%s'
     encoding: b64
-    content: %s`, f.Path, vmSecretFileOwner, mode, encoded))
+    content: %s`, f.Path, vmWriteFilesOwner, mode, encoded))
 	}
 	return out
 }

@@ -37,7 +37,7 @@ func newFakeHarvesterVMBackend(t *testing.T, objs ...runtime.Object) (*Harvester
 			Namespace:            "default",
 			StorageClassName:     "longhorn-image-abc",
 			NetworkAttachmentDef: "default/lan10g",
-			SSHUser:              "ubuntu",
+			SSHUser:              "agent",
 			DefaultVCPUs:         defaultHarvesterVCPUs,
 			DefaultMemMi:         defaultHarvesterMemMi,
 			DefaultDiskGi:        defaultHarvesterDiskGi,
@@ -722,8 +722,8 @@ func TestNewHarvesterVMBackend_DefaultsAndOverrides(t *testing.T) {
 		if h.cfg.DefaultDiskGi != defaultHarvesterDiskGi {
 			t.Errorf("disk = %d, want %d", h.cfg.DefaultDiskGi, defaultHarvesterDiskGi)
 		}
-		if h.cfg.SSHUser != "ubuntu" {
-			t.Errorf("ssh user = %q, want ubuntu", h.cfg.SSHUser)
+		if h.cfg.SSHUser != defaultHarvesterSSHUser {
+			t.Errorf("ssh user = %q, want %q", h.cfg.SSHUser, defaultHarvesterSSHUser)
 		}
 		if h.dynamicClient == nil || h.discoveryClient == nil || h.restConfig == nil {
 			t.Errorf("clients/restConfig not wired: %+v", h)

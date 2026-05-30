@@ -18,7 +18,7 @@ func validHarvesterCfg() HarvesterVMBackendConfig {
 		StorageClassName:     "longhorn-image-abc123",
 		NetworkAttachmentDef: "default/lan10g",
 		BaseImageName:        "mills-devbox-base-2026-05-25",
-		SSHUser:              "ubuntu",
+		SSHUser:              "agent",
 	}
 }
 
@@ -693,7 +693,9 @@ func TestBuildVMManifest_RendersSecretFilesIntoCloudInit(t *testing.T) {
 		encoded := base64.StdEncoding.EncodeToString(f.Content)
 		wantSubstrings := []string{
 			"path: " + f.Path,
-			"owner: " + vmSecretFileOwner,
+			// Files are written root-owned; a runcmd chown hands /home/agent
+			// to the agent after the users-groups module creates the user.
+			"owner: " + vmWriteFilesOwner,
 			"encoding: b64",
 			"content: " + encoded,
 		}
@@ -772,6 +774,51 @@ func TestBuildVMManifest_FilesOnlyOmitsEnvEntry(t *testing.T) {
 	}
 	if strings.Contains(userData, "path: /etc/loom-spawn.env") {
 		t.Errorf("files-only render must not include env file entry; got userData:\n%s", userData)
+	}
+}
+
+// TestBuildVMManifest_CreatesAgentUserForHomeParity pins the Slice 2d.5c
+// behavior: the VM must provision an `agent` user with HOME=/home/agent so
+// SecretMount paths and injectAgentConfig writes (all hardcoded to
+// /home/agent in internal/hud/spawn.go) resolve to the SSH user's home dir.
+func TestBuildVMManifest_CreatesAgentUserForHomeParity(t *testing.T) {
+	cfg := validHarvesterCfg()
+	files := []ResolvedSecretFile{
+		{Path: "/home/agent/.codex.auth/auth.json", Content: []byte(`{"token":"x"}`)},
+	}
+	objs, err := buildVMManifest(StartOpts{Name: "parity-vm"}, cfg, testPubKey, nil, files)
+	if err != nil {
+		t.Fatalf("buildVMManifest returned error: %v", err)
+	}
+	userData := extractUserData(t, objs)
+
+	// The login user is `agent`, not the base image's `ubuntu`.
+	if !strings.Contains(userData, "name: agent") {
+		t.Errorf("users: stanza must define the agent user\n--- userData ---\n%s", userData)
+	}
+	if strings.Contains(userData, "name: ubuntu") {
+		t.Errorf("users: stanza must not define the ubuntu user (Slice 2d.5c)\n--- userData ---\n%s", userData)
+	}
+	if !strings.Contains(userData, "home: /home/agent") {
+		t.Errorf("agent user must have HOME=/home/agent\n--- userData ---\n%s", userData)
+	}
+
+	// Secret files are written root-owned because the agent user does not
+	// exist yet during cloud-init's write-files module (which runs before
+	// users-groups). A regression that writes them owner: agent:agent would
+	// make cloud-init fail the chown and potentially abort the write.
+	if !strings.Contains(userData, "owner: root:root") {
+		t.Errorf("secret files must be written root-owned\n--- userData ---\n%s", userData)
+	}
+	if strings.Contains(userData, "owner: agent:agent") {
+		t.Errorf("write_files must not use owner: agent:agent (agent not created until users-groups)\n--- userData ---\n%s", userData)
+	}
+
+	// A runcmd chown hands /home/agent (and the secret files under it) to the
+	// agent after the users-groups module has created the user. This is what
+	// makes the mounted credentials readable by the agent CLIs at exec time.
+	if !strings.Contains(userData, "[ chown, -R, agent:agent, /home/agent ]") {
+		t.Errorf("runcmd must chown /home/agent to the agent user\n--- userData ---\n%s", userData)
 	}
 }
 
