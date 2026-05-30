@@ -34,6 +34,10 @@ const (
 	defaultHarvesterVCPUs   = 2
 	defaultHarvesterMemMi   = 4096
 	defaultHarvesterDiskGi  = 20
+	// defaultHarvesterSSHUser mirrors the K8s spawn pod's agent user so
+	// mounted credential paths under /home/agent resolve to the SSH user's
+	// home dir (Slice 2d.5c). Must equal vmAgentUser in harvester_vm_objects.go.
+	defaultHarvesterSSHUser = vmAgentUser
 
 	// vmReadyTimeout bounds cold-boot from manifest creation to SSH-ready.
 	// Slice 1.5 measured 130s on the apt-get path and projects ≤60s on the
@@ -94,8 +98,10 @@ type HarvesterVMBackendConfig struct {
 	DefaultMemMi  int
 	DefaultDiskGi int
 
-	// SSHUser is the cloud-init-provisioned user. Default "ubuntu" —
-	// matches the Slice 1.5 manifest.
+	// SSHUser is the cloud-init-provisioned login user. Default "agent"
+	// (defaultHarvesterSSHUser) — the user buildVMManifest creates with
+	// HOME=/home/agent so mounted credential paths resolve correctly
+	// (Slice 2d.5c). Override only if a custom base image uses another user.
 	SSHUser string
 
 	// SecretResolver, when non-nil, lets Start flatten StartOpts.SecretEnv
@@ -150,7 +156,7 @@ func NewHarvesterVMBackend(cfg HarvesterVMBackendConfig) (*HarvesterVMBackend, e
 		cfg.DefaultDiskGi = defaultHarvesterDiskGi
 	}
 	if cfg.SSHUser == "" {
-		cfg.SSHUser = "ubuntu"
+		cfg.SSHUser = defaultHarvesterSSHUser
 	}
 	if cfg.StorageClassName == "" {
 		return nil, fmt.Errorf("HarvesterVMBackendConfig.StorageClassName is required")
