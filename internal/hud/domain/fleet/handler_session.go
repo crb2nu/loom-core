@@ -99,6 +99,14 @@ func (d *FleetDomain) handleAgentHeartbeat(w http.ResponseWriter, r *http.Reques
 		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
+
+	// Ingest mirror-forwarded tool-call activity unconditionally, before any of
+	// the presence/coalesce branches that return early. This is independent of
+	// presence registration, and mirror heartbeats use ensure_session=true whose
+	// bootstrap path returns before the handler's tail — so placing it there
+	// would silently drop every distributed agent's calls.
+	d.ingestRecentToolCalls(body)
+
 	var ensureSessionErr error
 	if body.EnsureSession {
 		namespace := strings.TrimSpace(body.Namespace)
@@ -233,8 +241,6 @@ func (d *FleetDomain) handleAgentHeartbeat(w http.ResponseWriter, r *http.Reques
 		resp["nudges"] = nudges
 	}
 	d.deps.MaybeSampleContextTelemetry(body.AgentID, body.SessionID, body.AgentType, "heartbeat")
-
-	d.ingestRecentToolCalls(body)
 
 	d.deps.WriteJSON(w, http.StatusOK, resp)
 }

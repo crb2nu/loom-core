@@ -1386,6 +1386,47 @@ func TestHandler_AgentSessionStart_NewNamespaceStartsNewSession(t *testing.T) {
 	}
 }
 
+// TestHandler_AgentHeartbeat_IngestsToolCallsOnBootstrapPath is the regression
+// for the mirror tool-call ingest placement: mirror heartbeats use
+// ensure_session=true, whose bootstrap branch returns before the handler tail.
+// Tool-call ingestion must therefore run unconditionally up front, so a
+// distributed agent's forwarded calls land in the EventLog even when the
+// heartbeat takes (and even fails on) the ensure_session path.
+func TestHandler_AgentHeartbeat_IngestsToolCallsOnBootstrapPath(t *testing.T) {
+	app, mux, handlers := newTestAppWithHandlers(t)
+	app.eventLog = NewEventLog(100)
+
+	// ensure_session bootstrap fails -> handler returns 502 BEFORE its tail.
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(params, &req)
+		switch req.Name {
+		case "agent_context__agent_session_start":
+			return json.RawMessage(`{"isError":true,"content":[{"type":"text","text":"transport closed"}]}`), nil
+		case "agent_context__agent_presence_heartbeat":
+			return json.RawMessage(`{"isError":true,"content":[{"type":"text","text":"agent kt not registered; call agent_presence_register first"}]}`), nil
+		default:
+			return json.RawMessage(`{"content":[{"type":"text","text":"{}"}]}`), nil
+		}
+	})
+
+	const sid = "regress-sess-1"
+	body := `{"agent_id":"kt","session_id":"` + sid + `","status":"active","ensure_session":true,` +
+		`"recent_tool_calls":[{"session_id":"` + sid + `","server":"git","tool":"status"}]}`
+	req := httptest.NewRequest("POST", "/api/agent/heartbeat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// The forwarded tool call must have been ingested regardless of the 502.
+	events := app.sessionTraceEvents(sid, nil, "", 100)
+	if len(events) != 1 || events[0].EventType != "tool.call" {
+		t.Fatalf("expected 1 tool.call event ingested on the bootstrap path, got %+v (status=%d)", events, w.Code)
+	}
+}
+
 func TestHandler_AgentHeartbeat_EnsureSessionFailureDoesNotRegisterBarePresence(t *testing.T) {
 	_, mux, handlers := newTestAppWithHandlers(t)
 
