@@ -132,6 +132,28 @@ spec:
               value: 40Gi
             - name: SPAWN_BUILD_AVOID_NODES
               value: k3s-w-7,k3s-w-11
+            # harvester-vm spawn substrate (Mills roadmap Slice A1). Registers
+            # the harvester-vm backend so Mills can route implement+tests of
+            # mills-canary-harvester-vm items to KubeVirt VMs. Empty kubeconfig
+            # would leave the substrate unregistered (k8s-only). The kubeconfig
+            # is mounted from the loom-hub harvester-kubeconfig Secret below,
+            # which holds a token for the namespaced `mills-spawn`
+            # ServiceAccount (harvester default ns) — NOT hypervisor admin.
+            # The SA's Role grants only the VM/VMI/PVC/Secret verbs
+            # HarvesterVMBackend needs; see platform/gitops/harvester/flux/
+            # apps/mills-spawn-rbac.yaml.
+            # SSH user is intentionally unset → backend defaults to "agent"
+            # (Slice 2d.5c home-parity). Storage class is the stock Ubuntu
+            # image for now; the curated mills-devbox-base image (B1) will
+            # swap it for a faster pre-baked class.
+            - name: SPAWN_HARVESTER_KUBECONFIG
+              value: /etc/harvester/kubeconfig
+            - name: SPAWN_HARVESTER_NAMESPACE
+              value: default
+            - name: SPAWN_HARVESTER_STORAGE_CLASS
+              value: longhorn-image-mc9ph
+            - name: SPAWN_HARVESTER_NAD
+              value: default/lan10g
             # Embedded weaver (LLM-orchestrated multi-tool queries)
             - name: WEAVER_ENABLED
               value: "true"
@@ -218,6 +240,11 @@ spec:
             - name: registry
               mountPath: /etc/loom
               readOnly: true
+            # harvester-vm spawn substrate kubeconfig (Slice A1). Mounted as a
+            # file at SPAWN_HARVESTER_KUBECONFIG=/etc/harvester/kubeconfig.
+            - name: harvester-kubeconfig
+              mountPath: /etc/harvester
+              readOnly: true
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
@@ -226,3 +253,9 @@ spec:
         - name: registry
           configMap:
             name: mobile-hud-registry
+        - name: harvester-kubeconfig
+          secret:
+            secretName: harvester-kubeconfig
+            items:
+              - key: kubeconfig
+                path: kubeconfig
