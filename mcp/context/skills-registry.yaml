@@ -64,7 +64,7 @@
 # Sync: loom sync <profile> --regen --hub-mode --all-projects --skip-worktrees
 
 version: 1
-updated: 2026-05-26
+updated: 2026-06-01
 skills:
   - name: flux-gitops-operator
     categories: [kubernetes, gitops, operations]
@@ -9614,3 +9614,170 @@ skills:
       antigravity:
         enabled: true
         type: rule
+
+  - name: deslopper
+    categories: [development, workflow, quality]
+    common:
+      description: |
+        Detect and remediate AI 'slop' — the fingerprints of weaker-model code generation. Use to maintain and uplift codebases as models improve.
+      instructions: |
+        # Deslopper
+
+        Detect and remediate **AI slop** — the fingerprints of weaker-model code
+        generation — then verify behavior is unchanged and ship the cleanup.
+
+        As frontier models improve, code written by earlier/weaker models ages
+        poorly: it is verbose, over-defensive, over-commented, and structurally
+        timid. Deslopping is the deliberate, **behavior-preserving** uplift of
+        that code to the standard a strong model would write today.
+
+        ## When to use
+
+        - Maintaining or modernizing code an earlier model generated
+        - Cleaning a diff before it merges so fresh slop never lands
+        - Periodic maintenance sweeps of a package or service
+        - The user says "deslop", "clean up the AI slop", "tighten this up",
+          "this reads like it was written by a weaker model"
+
+        Deslopper is distinct from neighbors:
+        - `refactor` — restructures for design/debt goals (may change interfaces)
+        - `simplify` / `code-review` — general quality/bug passes on a diff
+        - **Deslopper** — narrowly targets *generation-artifact* patterns and
+          preserves behavior and public interfaces by default.
+
+        ## What "slop" is (taxonomy)
+
+        Full catalog with examples and fixes: `references/slop-taxonomy.md`.
+        The high-signal categories:
+
+        1. **Over-commenting** — comments that restate the code
+           (`i++ // increment i`), banner/section comments, narration of the
+           obvious. Keep comments that explain *why*; cut comments that explain
+           *what* the code already says.
+        2. **Dead scaffolding** — unused vars/imports/params, unreachable
+           branches, `TODO`/`FIXME` left by generation, commented-out code,
+           vestigial helpers called once.
+        3. **Redundant defensive code** — nil/None checks the type system or
+           caller contract already guarantees, double-validation, try/except
+           that swallows-then-reraises, belt-and-suspenders guards.
+        4. **Over-abstraction** — single-use wrapper functions, one-impl
+           interfaces, premature factories/managers, indirection with no payoff.
+        5. **Copy-paste duplication** — near-identical blocks that should be one
+           function; repeated literals that should be a constant.
+        6. **Verbose boilerplate** — multi-line forms of one-line idioms,
+           manual loops where a stdlib/comprehension fits, intermediate vars
+           used once, `if x: return True else: return False`.
+        7. **Tonal slop** — marketing adjectives and emoji in code comments,
+           "robust/comprehensive/seamless" narration, inconsistent naming
+           drift, gratuitous logging.
+
+        ## Guardrails (read before editing)
+
+        - **Behavior-preserving by default.** Do not change public interfaces,
+          outputs, error semantics, or logged contracts. If a cleanup *would*
+          change behavior, stop and surface it as a separate decision — do not
+          silently fold it in.
+        - **Slop ≠ defensiveness that earns its keep.** A nil-check at a real
+          trust boundary (external input, deserialization, public API) is not
+          slop. Only remove guards proven redundant by the type system or an
+          enforced caller contract.
+        - **A deleted comment is not always slop.** Keep `why`, intent,
+          invariants, links to issues/specs, and non-obvious gotchas.
+        - **No churn for churn's sake.** Skip files where the slop density is
+          low; the diff must pay for the review cost it imposes.
+        - **Tests are the contract.** Existing tests must stay green unchanged.
+          If a cleanup needs a test edited, that is a behavior change — escalate.
+
+        ## Workflow
+
+        1. **Resolve scope.** Accept a target arg (file, package/dir, or `diff`).
+           Default with no arg → the current branch diff vs `main` (cheap, stops
+           fresh slop). Whole-repo sweep is opt-in (`--repo` / "sweep the repo").
+        2. **Initialize session** — `agent_session_start(namespace="<repo>/deslop/<scope>", description="...")`; `agent_recall` prior deslop notes for this area.
+        3. **Allocate worktree** (multi-file) — `agent_worktree_allocate(branch_name="refactor/deslop-<scope>", base_branch="main", purpose="...")`.
+        4. **Baseline behavior** — run the existing test suite / quality gate
+           and record it GREEN *before* touching code. This is the contract you
+           must preserve. If baseline is red, fix that out-of-band first or
+           narrow scope to untouched-by-failure files.
+        5. **Scan for slop** — run `scripts/scan_slop.sh <path>` (read-only,
+           grep-based) to surface candidate signatures fast, then read the hits
+           in context. The script flags candidates; **you** confirm true slop —
+           it is a flashlight, not a judge. Augment with semantic search
+           (`codebase_text_search`, call-graph for single-use abstractions).
+        6. **Classify + rank** — bucket findings by the taxonomy above and by
+           confidence. Remediate high-confidence, low-risk slop first.
+        7. **Remediate incrementally** — one taxonomy category (or one cohesive
+           file) per logical step. Keep edits behavior-preserving. After each
+           step, re-run the relevant tests.
+        8. **Verify** — run the full baseline gate again; assert it is still
+           GREEN and that no public behavior drifted. Prefer
+           `auto-quality-gate` / `devbox_quality_gate`.
+        9. **Self-review** — diff-check: every removed line is provably slop, no
+           interface/behavior change snuck in, no test was weakened. Use the
+           `pr-self-review` checklist.
+        10. **Landing Procedure** (when mode = ship)
+            a. Stage only deslop-related files (never `.env`, secrets, unrelated).
+            b. Commit conventional: `refactor(deslop/<scope>): remove <category> slop` + `Co-Authored-By` trailer.
+            c. Push (`-u` on first push).
+            d. Create or reuse MR/PR (check existing MRs for the branch first).
+            e. Request auto-merge where policy allows.
+            f. Poll CI to terminal; red → fix → re-push → re-poll.
+            g. Confirm merged or document the blocker.
+        11. **Release worktree** — `agent_worktree_release(...)`.
+        12. **End session** — `agent_session_end(summarize=true)`; record which
+            slop categories dominated this area (durable signal for next sweep).
+
+        ## Output
+
+        Always produce a short **slop report** even in ship mode: per file, the
+        categories found, count remediated, and anything deliberately left
+        (with the reason — e.g. "guard kept: real trust boundary"). This makes
+        the cleanup auditable and feeds the next maintenance pass.
+
+        ## Anti-goals
+
+        - Do not rewrite working code into a different style for taste alone.
+        - Do not "modernize" by adopting unproven idioms the repo doesn't use.
+        - Do not expand scope into feature work or bug fixes — note them as
+          follow-ups (`agent_task_add`) and stay in your lane.
+      scripts:
+        - name: scan_slop.sh
+          path: scripts/scan_slop.sh
+          description: Read-only grep-based scanner that surfaces candidate AI-slop signatures (banner comments, dead scaffolding, generation TODOs, commented-out code, boolean-return verbosity, tonal markers) with file:line evidence. Detection only — never edits.
+      references:
+        - slop-taxonomy.md
+      assets: []
+      always_allow:
+        - scan_slop.sh
+        # ^ Read-only scanner: detects candidate slop signatures, never edits.
+    targets:
+      codex:
+        enabled: true
+        type: skill
+        instructions_append: |
+          ## Codex Notes
+          - Bundled scanner at `${SKILL_PATH}/scripts/scan_slop.sh` (read-only).
+          - Use `multi_tool_use.parallel` to read several slop-hit sites at once.
+      claude:
+        enabled: true
+        type: command
+        instructions_append: |
+          ## Claude Code Notes
+          - Use the `Task` tool with `subagent_type="Explore"` to fan out a
+            whole-repo slop sweep across packages, then remediate serially.
+          - Delegate CI polling to a background `Task` while you review the diff.
+      kilocode:
+        enabled: true
+        type: rule
+        instructions_append: |
+          ## Kilocode Notes
+          - Staged phases: baseline → scan → classify → remediate → verify → ship.
+      gemini:
+        enabled: true
+        type: skill
+        instructions_append: |
+          ## Gemini Notes
+          - Checkpoint after each taxonomy category so a long sweep can resume.
+      antigravity:
+        enabled: true
+        type: command
