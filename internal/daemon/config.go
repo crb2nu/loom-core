@@ -118,12 +118,29 @@ type EmbeddedHUDConfig struct {
 	SpawnBuildEphemeralStorageRequest string  `yaml:"spawn_build_ephemeral_storage_request,omitempty"`
 	SpawnBuildEphemeralStorageLimit   string  `yaml:"spawn_build_ephemeral_storage_limit,omitempty"`
 	SpawnBuildAvoidNodes              string  `yaml:"spawn_build_avoid_nodes,omitempty"`
-	PipelineProjects                  string  `yaml:"pipeline_projects,omitempty"`
-	BindAddress                       string  `yaml:"bind_address,omitempty"`
-	FlexInferURL                      string  `yaml:"flexinfer_url,omitempty"`
-	FlexInferProxyURL                 string  `yaml:"flexinfer_proxy_url,omitempty"`
-	FlexInferKey                      string  `yaml:"flexinfer_key,omitempty"`
-	CoordinatorModel                  string  `yaml:"coordinator_model,omitempty"`
+
+	// harvester-vm substrate (Slice 2d / harvester-vm rollout). Empty
+	// SpawnHarvesterKubeconfig leaves the substrate unregistered and all
+	// harvester-vm spawns fall back to k8s. These mirror the hud.Config
+	// fields the `loom hud` command wires in cmd/loom/hud.go so the
+	// prod daemon path (loomd → startEmbeddedHUD) can register the
+	// substrate from SPAWN_HARVESTER_* env injection.
+	SpawnHarvesterKubeconfig       string `yaml:"spawn_harvester_kubeconfig,omitempty"`
+	SpawnHarvesterBaseImage        string `yaml:"spawn_harvester_base_image,omitempty"`
+	SpawnHarvesterNamespace        string `yaml:"spawn_harvester_namespace,omitempty"`
+	SpawnHarvesterStorageClass     string `yaml:"spawn_harvester_storage_class,omitempty"`
+	SpawnHarvesterNetworkAttachDef string `yaml:"spawn_harvester_network_attach_def,omitempty"`
+	SpawnHarvesterDefaultVCPUs     int    `yaml:"spawn_harvester_default_vcpus,omitempty"`
+	SpawnHarvesterDefaultMemMi     int    `yaml:"spawn_harvester_default_mem_mi,omitempty"`
+	SpawnHarvesterDefaultDiskGi    int    `yaml:"spawn_harvester_default_disk_gi,omitempty"`
+	SpawnHarvesterSSHUser          string `yaml:"spawn_harvester_ssh_user,omitempty"`
+
+	PipelineProjects  string `yaml:"pipeline_projects,omitempty"`
+	BindAddress       string `yaml:"bind_address,omitempty"`
+	FlexInferURL      string `yaml:"flexinfer_url,omitempty"`
+	FlexInferProxyURL string `yaml:"flexinfer_proxy_url,omitempty"`
+	FlexInferKey      string `yaml:"flexinfer_key,omitempty"`
+	CoordinatorModel  string `yaml:"coordinator_model,omitempty"`
 
 	// Inbound webhook receiver — feeds the GitLab/GitHub CI failure
 	// routing path in internal/hud/domain/webhook. Disabled by default
