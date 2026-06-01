@@ -106,11 +106,17 @@ func resolveProxyIdentity(agentHint string) (agentID, agentType string) {
 }
 
 func stableWorkspaceProxyAgentID(agentType string) (string, bool) {
-	// Generated Codex notify hooks use codex-<cksum(workspace root)> for the
-	// keepalive wrapper. Match that here so proxy heartbeats and hook
-	// heartbeats update the same HUD agent instead of creating a process-scoped
-	// duplicate like codex-host-pid-namespace.
-	if agentType != "codex" {
+	// Derive the same workspace-scoped key the CLI session hooks register:
+	// <type>-<cksum(workspace root)> (see hookAgentIDBootstrap in
+	// pkg/generator/configs_hooks.go — its WS_HASH is `cksum` of the same git
+	// toplevel). The hooks append a per-Claude-session suffix the proxy cannot
+	// know (no session_id is exposed to MCP servers), so this is the base the
+	// HUD base-matches to attribute proxy tool-call activity to the agent's
+	// session(s) in this workspace. Previously gated to codex only — which is
+	// why every other platform's calls carried a non-matching process-scoped id
+	// and showed "0 calls". A stable workspace key also stops the per-restart
+	// host-pid roster proliferation.
+	if strings.TrimSpace(agentType) == "" {
 		return "", false
 	}
 

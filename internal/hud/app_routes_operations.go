@@ -278,11 +278,32 @@ func (a *App) sessionTraceEvents(sessionID string, session *bridge.SessionInfo, 
 	return events
 }
 
+// agentIDMatchesSession correlates a tool-call/audit agent_id with a session's
+// agent_id. Interactive-agent proxies emit the workspace-scoped base
+// "<type>-<WS_HASH>" (they cannot know the per-Claude-session suffix the CLI
+// hooks append — no session_id is exposed to MCP servers), while the HUD roster
+// session carries the full "<type>-<WS_HASH>-<SESSION_SCOPE>". Accept an exact
+// match OR a "<base>-<scope>" boundary match in either direction; the trailing
+// "-" prevents matching across workspaces (different WS_HASH) or agent types
+// (different prefix). KNOWN LIMITATION: workspace-grouped — an agent's activity
+// can surface under multiple concurrent same-workspace sessions of the same
+// type. See .loom/spec-hud-agent-id-correlation-2026-06-01.md.
+func agentIDMatchesSession(eventAgentID, sessionAgentID string) bool {
+	if eventAgentID == "" || sessionAgentID == "" {
+		return false
+	}
+	if eventAgentID == sessionAgentID {
+		return true
+	}
+	return strings.HasPrefix(sessionAgentID, eventAgentID+"-") ||
+		strings.HasPrefix(eventAgentID, sessionAgentID+"-")
+}
+
 func eventMatchesSessionTrace(evt TimelineEntry, sessionID string, session *bridge.SessionInfo, agentID string) bool {
 	if sessionID != "" && eventDataString(evt.Data, "session_id") == sessionID {
 		return true
 	}
-	if agentID == "" || evt.AgentID != agentID {
+	if !agentIDMatchesSession(evt.AgentID, agentID) {
 		return false
 	}
 	if session == nil {
@@ -298,7 +319,7 @@ func filterSessionTraceAuditEntries(traces []traceAPIEntry, session *bridge.Sess
 	}
 	filtered := make([]traceAPIEntry, 0, capacity)
 	for _, trace := range traces {
-		if agentID != "" && trace.AgentID != agentID {
+		if agentID != "" && !agentIDMatchesSession(trace.AgentID, agentID) {
 			continue
 		}
 		if session != nil {
