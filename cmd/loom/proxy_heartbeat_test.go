@@ -160,7 +160,7 @@ func TestResolveProxyIdentity_UsesEnvOverride(t *testing.T) {
 	}
 }
 
-func TestResolveProxyIdentity_GeneratesStableProcessScopedID(t *testing.T) {
+func TestResolveProxyIdentity_GeneratesStableWorkspaceScopedID(t *testing.T) {
 	t.Setenv("LOOM_PROXY_AGENT_ID", "")
 	proxyIdentityOnce = sync.Once{}
 	proxyAgentID = ""
@@ -178,13 +178,19 @@ func TestResolveProxyIdentity_GeneratesStableProcessScopedID(t *testing.T) {
 		t.Fatalf("expected stable ID within process, got %q != %q", id1, id2)
 	}
 
+	// claude-code (like every platform now) resolves to the workspace-scoped
+	// key <type>-<cksum(workspace root)> so its tool calls correlate to the
+	// hook-registered HUD session — NOT a process-scoped host-pid id.
 	prefix := "claude-code-"
 	if !strings.HasPrefix(id1, prefix) {
 		t.Fatalf("expected id %q to start with %q", id1, prefix)
 	}
+	if want, ok := stableWorkspaceProxyAgentID("claude-code"); !ok || id1 != want {
+		t.Fatalf("expected workspace-scoped id %q, got %q (ok=%v)", want, id1, ok)
+	}
 	pidFragment := fmt.Sprintf("-%d", os.Getpid())
-	if !strings.Contains(id1, pidFragment) {
-		t.Fatalf("expected id %q to include pid fragment %q", id1, pidFragment)
+	if strings.Contains(id1, pidFragment) {
+		t.Fatalf("id %q must NOT include the pid fragment %q (workspace-scoped, not process-scoped)", id1, pidFragment)
 	}
 }
 
@@ -281,4 +287,33 @@ func mustAtoi(s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// TestStableWorkspaceProxyAgentID_AllPlatforms verifies the workspace-scoped
+// proxy id now applies to every agent type (not just codex) so interactive
+// agents' tool calls carry a HUD-correlatable <type>-<WS_HASH> id. Mirrors the
+// hook's cksum-of-git-toplevel derivation.
+func TestStableWorkspaceProxyAgentID_AllPlatforms(t *testing.T) {
+	for _, typ := range []string{"claude-code", "codex", "gemini-cli", "kilocode"} {
+		id, ok := stableWorkspaceProxyAgentID(typ)
+		if !ok {
+			t.Fatalf("stableWorkspaceProxyAgentID(%q) ok=false, want true (gate should be removed for all types)", typ)
+		}
+		if !strings.HasPrefix(id, typ+"-") {
+			t.Fatalf("id %q does not start with %q-", id, typ)
+		}
+		// suffix must be the numeric cksum of the workspace root
+		suffix := strings.TrimPrefix(id, typ+"-")
+		if suffix == "" {
+			t.Fatalf("id %q has empty cksum suffix", id)
+		}
+		for _, r := range suffix {
+			if r < '0' || r > '9' {
+				t.Fatalf("id %q cksum suffix %q is not all digits", id, suffix)
+			}
+		}
+	}
+	if _, ok := stableWorkspaceProxyAgentID(""); ok {
+		t.Fatal("empty agent type should not yield a stable id")
+	}
 }
