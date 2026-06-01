@@ -35,7 +35,7 @@ func (f *fakeReader) PresenceList(_ bool) ([]presence.PresenceInfo, error) {
 	return f.agents, f.presenceErr
 }
 
-func (f *fakeReader) Sessions() ([]bridge.SessionInfo, error) {
+func (f *fakeReader) ActiveSessions() ([]bridge.SessionInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.sessions, f.sessionsErr

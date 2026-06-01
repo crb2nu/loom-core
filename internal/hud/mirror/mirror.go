@@ -53,7 +53,14 @@ type Doer interface {
 // real MCP transport.
 type PresenceReader interface {
 	PresenceList(includeOffline bool) ([]presence.PresenceInfo, error)
-	Sessions() ([]bridge.SessionInfo, error)
+	// ActiveSessions returns the active-only, lightweight session list. The
+	// mirror only enriches active agents, so it must NOT use the heavy
+	// full-fidelity Sessions() (limit=1000, no light projection) — that call
+	// blows the daemon's 3s tools/call recv budget on machines with a large
+	// session history, starving the entire mirror (no heartbeats posted, so no
+	// presence OR tool-call telemetry reaches the central HUD). See !579 and
+	// project_hud_no_agents_session_list_timeout.
+	ActiveSessions() ([]bridge.SessionInfo, error)
 }
 
 // ToolCallReader supplies recent per-session tool-call activity to forward to
@@ -239,10 +246,12 @@ func (s *Service) mirrorOnce(ctx context.Context) (posted, failed int) {
 		return 0, 0
 	}
 
-	// Sessions are optional context — they let us forward richer
-	// namespace/description info. If the call fails we still mirror
-	// presence-only rows (the cluster will bootstrap a session).
-	sessions, sessionsErr := s.reader.Sessions()
+	// Active sessions are optional context — they let us forward richer
+	// namespace info. If the call fails we still mirror presence-only rows
+	// (the cluster will bootstrap a session). Use the lightweight active-only
+	// projection: it stays inside the 3s recv budget where full Sessions()
+	// times out and silently kills the mirror.
+	sessions, sessionsErr := s.reader.ActiveSessions()
 	if sessionsErr != nil {
 		s.logErr("sessions", sessionsErr)
 	}
