@@ -227,7 +227,11 @@ func TestBuildVMManifest_HappyPath(t *testing.T) {
 			t.Fatal("cloudinit volume missing")
 		}
 		ciData, _ := ciVol["cloudInitNoCloud"].(map[string]any)
-		userData, _ := ciData["userData"].(string)
+		ref, _ := ciData["secretRef"].(map[string]any)
+		if name, _ := ref["name"].(string); name != "test-vm-1-cloudinit" {
+			t.Errorf("cloudinit volume secretRef.name = %q, want %q", name, "test-vm-1-cloudinit")
+		}
+		userData := extractUserData(t, objs)
 		if !strings.Contains(userData, testPubKey) {
 			t.Errorf("userData does not contain pubkey: %s", userData)
 		}
@@ -572,22 +576,7 @@ func TestBuildVMManifest_RendersEnvIntoCloudInit(t *testing.T) {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
 
-	volumes := mustGetSliceAt(t, objs.VM.Object, "spec", "template", "spec", "volumes")
-	var userData string
-	for _, v := range volumes {
-		vm, ok := v.(map[string]any)
-		if !ok {
-			continue
-		}
-		ci, ok := vm["cloudInitNoCloud"].(map[string]any)
-		if !ok {
-			continue
-		}
-		userData, _ = ci["userData"].(string)
-	}
-	if userData == "" {
-		t.Fatalf("cloud-init userData not found in VM manifest")
-	}
+	userData := extractUserData(t, objs)
 
 	// Sorted KEY='value' entries, single-quoted, with POSIX escape for `'`.
 	wantSubstrings := []string{
@@ -622,20 +611,9 @@ func TestBuildVMManifest_EmptyEnvOmitsWriteFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildVMManifest returned error: %v", err)
 	}
-	volumes := mustGetSliceAt(t, objs.VM.Object, "spec", "template", "spec", "volumes")
-	for _, v := range volumes {
-		vm, ok := v.(map[string]any)
-		if !ok {
-			continue
-		}
-		ci, ok := vm["cloudInitNoCloud"].(map[string]any)
-		if !ok {
-			continue
-		}
-		ud, _ := ci["userData"].(string)
-		if strings.Contains(ud, "write_files") {
-			t.Errorf("expected no write_files block when env is empty; got userData:\n%s", ud)
-		}
+	ud := extractUserData(t, objs)
+	if strings.Contains(ud, "write_files") {
+		t.Errorf("expected no write_files block when env is empty; got userData:\n%s", ud)
 	}
 }
 
@@ -820,13 +798,30 @@ func TestBuildVMManifest_CreatesAgentUserForHomeParity(t *testing.T) {
 	if !strings.Contains(userData, "[ chown, -R, agent:agent, /home/agent ]") {
 		t.Errorf("runcmd must chown /home/agent to the agent user\n--- userData ---\n%s", userData)
 	}
+
+	// Self-heal qemu-guest-agent on stock-Ubuntu base images that lack it.
+	// Without the agent KubeVirt never reports the VM's DHCP IP and
+	// Start.waitForVMReady times out (Slice 2d.5d kill-test evidence). The
+	// `command -v qemu-ga` guard makes it a no-op on the curated image.
+	if !strings.Contains(userData, "command -v qemu-ga") || !strings.Contains(userData, "apt-get install -y qemu-guest-agent") {
+		t.Errorf("runcmd must install qemu-guest-agent when missing\n--- userData ---\n%s", userData)
+	}
 }
 
 // extractUserData pulls the cloud-init userData string out of the rendered
 // VirtualMachine manifest. Shared across the secret-file rendering tests.
+// extractUserData returns the cloud-init userData. Since Slice 2d.5d it lives
+// in the out-of-line CloudInitSecret (cloudInitNoCloud.secretRef), not inline
+// on the VM volume. Also asserts the VM volume references that Secret by name.
 func extractUserData(t *testing.T, objs *harvesterVMObjects) string {
 	t.Helper()
+	if objs.CloudInitSecret == nil {
+		t.Fatalf("CloudInitSecret is nil; expected out-of-line cloud-init")
+	}
+	// The VM's cloudinit volume must reference the Secret by name.
+	wantRef := objs.CloudInitSecret.GetName()
 	volumes := mustGetSliceAt(t, objs.VM.Object, "spec", "template", "spec", "volumes")
+	foundRef := false
 	for _, v := range volumes {
 		vm, ok := v.(map[string]any)
 		if !ok {
@@ -836,10 +831,24 @@ func extractUserData(t *testing.T, objs *harvesterVMObjects) string {
 		if !ok {
 			continue
 		}
+		ref, _ := ci["secretRef"].(map[string]any)
+		if name, _ := ref["name"].(string); name == wantRef {
+			foundRef = true
+		}
 		if ud, _ := ci["userData"].(string); ud != "" {
-			return ud
+			t.Fatalf("inline userData present (%d bytes); must use secretRef (KubeVirt 2048-byte cap)", len(ud))
 		}
 	}
-	t.Fatalf("cloud-init userData not found in VM manifest")
-	return ""
+	if !foundRef {
+		t.Fatalf("VM cloudinit volume does not reference secret %q via secretRef", wantRef)
+	}
+	sd, _, err := unstructured.NestedStringMap(objs.CloudInitSecret.Object, "stringData")
+	if err != nil {
+		t.Fatalf("read CloudInitSecret stringData: %v", err)
+	}
+	ud, ok := sd["userdata"]
+	if !ok || ud == "" {
+		t.Fatalf("CloudInitSecret stringData missing non-empty 'userdata' key")
+	}
+	return ud
 }
