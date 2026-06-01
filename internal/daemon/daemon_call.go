@@ -128,9 +128,35 @@ func (d *Daemon) handleCallWithOptions(ctx context.Context, msg *mcp.Message, sk
 	return execResp, nil
 }
 
+// resolveEffectiveAgentID returns the agent id to stamp on audit, cost, and
+// OTel records. Calls proxied through a session lease (e.g. an interactive CLI
+// agent's MCP calls) frequently omit the per-call params.AgentID, which would
+// otherwise leave every audit trace with an empty agent_id — making the HUD's
+// per-session activity panel unable to correlate traces to a session/agent.
+// When params.AgentID is empty we fall back to the proxy session's recorded
+// presence agent id (preferred) or its agent hint, keyed by params.SessionID.
+func (d *Daemon) resolveEffectiveAgentID(params callParams) string {
+	if params.AgentID != "" {
+		return params.AgentID
+	}
+	if params.SessionID == "" || d.sessions == nil {
+		return params.AgentID
+	}
+	sess, ok := d.sessions.Get(params.SessionID)
+	if !ok {
+		return params.AgentID
+	}
+	if sess.ClientInfo.PresenceAgentID != "" {
+		return sess.ClientInfo.PresenceAgentID
+	}
+	return sess.ClientInfo.AgentHint
+}
+
 // emitAudit writes a structured audit entry, cost record, and OTel metrics if enabled.
 func (d *Daemon) emitAudit(params callParams, server, tool, target string, start time.Time, status, errMsg string, cached bool, policy *GatewayPolicyDecision, pipelineStage string, reqBytes, resBytes int64, timings auditTimings) {
 	durationMs := time.Since(start).Milliseconds()
+
+	agentID := d.resolveEffectiveAgentID(params)
 
 	policyRuleID := ""
 	policyReasonCode := ""
@@ -142,7 +168,7 @@ func (d *Daemon) emitAudit(params callParams, server, tool, target string, start
 	if d.audit != nil {
 		d.audit.Log(AuditEntry{
 			Timestamp:        start.UTC(),
-			AgentID:          params.AgentID,
+			AgentID:          agentID,
 			AgentType:        params.AgentType,
 			Server:           server,
 			Tool:             tool,
@@ -168,7 +194,7 @@ func (d *Daemon) emitAudit(params callParams, server, tool, target string, start
 			costStatus = "cached"
 		}
 		d.cost.Record(UsageRecord{
-			AgentID:       params.AgentID,
+			AgentID:       agentID,
 			AgentType:     params.AgentType,
 			Server:        server,
 			Tool:          tool,
@@ -180,7 +206,7 @@ func (d *Daemon) emitAudit(params callParams, server, tool, target string, start
 	}
 
 	if d.otelMetrics != nil {
-		d.otelMetrics.RecordToolCallFromAudit(server, tool, params.AgentID, status, target, durationMs, reqBytes, resBytes)
+		d.otelMetrics.RecordToolCallFromAudit(server, tool, agentID, status, target, durationMs, reqBytes, resBytes)
 	}
 }
 
