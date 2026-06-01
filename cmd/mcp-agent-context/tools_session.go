@@ -117,6 +117,10 @@ func registerSessionTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 					"type":        "integer",
 					"description": "Maximum sessions to return (default: 20).",
 				},
+				"light": map[string]any{
+					"type":        "boolean",
+					"description": "Return a trimmed projection (id, agent_id, namespace, project, status, started_at, ended_at, entry_count, total_tokens, parent/root session ids) and skip the per-session stat recompute. Used by the HUD fleet poller to keep large histories inside the recv budget. Default: false.",
+				},
 			},
 		},
 	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
