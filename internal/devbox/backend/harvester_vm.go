@@ -21,10 +21,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -250,10 +252,30 @@ func (h *HarvesterVMBackend) Start(ctx context.Context, opts StartOpts) (*StartR
 		return nil, fmt.Errorf("build vm manifest: %w", err)
 	}
 
+	// Create the cloud-init Secret first so VM-create failure can clean it up
+	// and so the VM's userDataSecretRef resolves on first boot.
+	createdSecret, err := h.dynamicClient.Resource(secretGVR).
+		Namespace(h.cfg.Namespace).
+		Create(ctx, objs.CloudInitSecret, metav1.CreateOptions{})
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		return nil, fmt.Errorf("create cloudinit secret: %w", err)
+	}
+	if createdSecret == nil {
+		createdSecret, err = h.dynamicClient.Resource(secretGVR).
+			Namespace(h.cfg.Namespace).
+			Get(ctx, objs.CloudInitSecret.GetName(), metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("get existing cloudinit secret: %w", err)
+		}
+	}
+
 	createdPVC, err := h.dynamicClient.Resource(pvcGVR).
 		Namespace(h.cfg.Namespace).
 		Create(ctx, objs.PVC, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
+		_ = h.dynamicClient.Resource(secretGVR).
+			Namespace(h.cfg.Namespace).
+			Delete(context.Background(), objs.CloudInitSecret.GetName(), metav1.DeleteOptions{})
 		return nil, fmt.Errorf("create pvc: %w", err)
 	}
 	if createdPVC == nil {
@@ -269,20 +291,27 @@ func (h *HarvesterVMBackend) Start(ctx context.Context, opts StartOpts) (*StartR
 		Namespace(h.cfg.Namespace).
 		Create(ctx, objs.VM, metav1.CreateOptions{})
 	if err != nil {
-		// Best-effort PVC cleanup so we don't leave orphans for
-		// CleanupBuilds to sweep later.
+		// Best-effort PVC + cloud-init Secret cleanup so we don't leave
+		// orphans for CleanupBuilds to sweep later.
 		_ = h.dynamicClient.Resource(pvcGVR).
 			Namespace(h.cfg.Namespace).
 			Delete(context.Background(), objs.PVC.GetName(), metav1.DeleteOptions{})
+		_ = h.dynamicClient.Resource(secretGVR).
+			Namespace(h.cfg.Namespace).
+			Delete(context.Background(), objs.CloudInitSecret.GetName(), metav1.DeleteOptions{})
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
 
-	// Patch the PVC's owner reference so VM delete cascades the PVC.
-	applyOwnerReference(createdPVC, createdVM)
-	if _, err := h.dynamicClient.Resource(pvcGVR).
-		Namespace(h.cfg.Namespace).
-		Update(ctx, createdPVC, metav1.UpdateOptions{}); err != nil {
+	// Patch owner references so VM delete cascades the PVC + cloud-init Secret.
+	// Retry on conflict: the CDI/Longhorn + secret controllers mutate these
+	// objects concurrently right after create, and a lost ownerRef update
+	// orphans a 20Gi PVC every run (only swept later by CleanupBuilds).
+	if err := h.setOwnerRefWithRetry(ctx, pvcGVR, createdPVC.GetName(), createdVM); err != nil {
 		h.logger.Warn("set pvc ownerRef failed (orphan cleanup will sweep later)",
+			"vm", opts.Name, "error", err)
+	}
+	if err := h.setOwnerRefWithRetry(ctx, secretGVR, createdSecret.GetName(), createdVM); err != nil {
+		h.logger.Warn("set cloudinit secret ownerRef failed (orphan cleanup will sweep later)",
 			"vm", opts.Name, "error", err)
 	}
 
@@ -509,29 +538,45 @@ func (h *HarvesterVMBackend) Exec(_ context.Context, opts ExecOpts) (*ExecResult
 	}, nil
 }
 
-// CleanupBuilds deletes orphan PVCs older than maxAge that carry the
-// managed-by label but no longer have an owning VM. VM-owned PVCs cascade
-// with the VM and aren't orphans.
+// CleanupBuilds deletes orphan PVCs and cloud-init Secrets older than maxAge
+// that carry the managed-by label but no longer have an owning VM. VM-owned
+// objects cascade with the VM and aren't orphans; this sweeps the rare case
+// where Start crashed after creating a PVC/Secret but before the VM's
+// ownerReference was set.
 func (h *HarvesterVMBackend) CleanupBuilds(ctx context.Context, maxAge time.Duration) (int, error) {
+	cutoff := time.Now().Add(-maxAge)
+	pvcCleaned, err := h.cleanupOrphans(ctx, pvcGVR, "pvc", cutoff)
+	if err != nil {
+		return pvcCleaned, err
+	}
+	secretCleaned, err := h.cleanupOrphans(ctx, secretGVR, "cloudinit secret", cutoff)
+	if err != nil {
+		return pvcCleaned + secretCleaned, err
+	}
+	return pvcCleaned + secretCleaned, nil
+}
+
+// cleanupOrphans deletes managed-by-labeled objects of the given resource that
+// are older than cutoff and have no living VirtualMachine owner.
+func (h *HarvesterVMBackend) cleanupOrphans(ctx context.Context, gvr schema.GroupVersionResource, kind string, cutoff time.Time) (int, error) {
 	listOpts := metav1.ListOptions{
 		LabelSelector: "app.kubernetes.io/managed-by=" + harvesterManagedByLabel,
 	}
-	pvcs, err := h.dynamicClient.Resource(pvcGVR).
+	items, err := h.dynamicClient.Resource(gvr).
 		Namespace(h.cfg.Namespace).
 		List(ctx, listOpts)
 	if err != nil {
-		return 0, fmt.Errorf("list pvcs: %w", err)
+		return 0, fmt.Errorf("list %ss: %w", kind, err)
 	}
 
-	cutoff := time.Now().Add(-maxAge)
 	cleaned := 0
-	for i := range pvcs.Items {
-		pvc := &pvcs.Items[i]
-		if pvc.GetCreationTimestamp().After(cutoff) {
+	for i := range items.Items {
+		obj := &items.Items[i]
+		if obj.GetCreationTimestamp().After(cutoff) {
 			continue
 		}
 		ownerAlive := false
-		for _, owner := range pvc.GetOwnerReferences() {
+		for _, owner := range obj.GetOwnerReferences() {
 			if owner.Kind != "VirtualMachine" {
 				continue
 			}
@@ -543,13 +588,13 @@ func (h *HarvesterVMBackend) CleanupBuilds(ctx context.Context, maxAge time.Dura
 		if ownerAlive {
 			continue
 		}
-		if err := h.dynamicClient.Resource(pvcGVR).
+		if err := h.dynamicClient.Resource(gvr).
 			Namespace(h.cfg.Namespace).
-			Delete(ctx, pvc.GetName(), metav1.DeleteOptions{}); err != nil {
+			Delete(ctx, obj.GetName(), metav1.DeleteOptions{}); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			h.logger.Warn("cleanup: delete pvc failed", "name", pvc.GetName(), "error", err)
+			h.logger.Warn("cleanup: delete "+kind+" failed", "name", obj.GetName(), "error", err)
 			continue
 		}
 		cleaned++
@@ -765,6 +810,26 @@ func (h *HarvesterVMBackend) vmAddress(ctx context.Context, name string) (string
 }
 
 // ---------- internals: cluster reads ----------
+
+// setOwnerRefWithRetry re-Gets the named object and stamps the VM as its
+// owner, retrying on the optimistic-concurrency conflict that the CDI/Longhorn
+// and secret controllers trigger by mutating the freshly-created object. A
+// lost update would orphan the PVC/Secret (cascade delete never fires).
+func (h *HarvesterVMBackend) setOwnerRefWithRetry(ctx context.Context, gvr schema.GroupVersionResource, name string, vm *unstructured.Unstructured) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := h.dynamicClient.Resource(gvr).
+			Namespace(h.cfg.Namespace).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		applyOwnerReference(latest, vm)
+		_, err = h.dynamicClient.Resource(gvr).
+			Namespace(h.cfg.Namespace).
+			Update(ctx, latest, metav1.UpdateOptions{})
+		return err
+	})
+}
 
 func (h *HarvesterVMBackend) getVM(ctx context.Context, name string) (*unstructured.Unstructured, error) {
 	return h.dynamicClient.Resource(vmGVR).

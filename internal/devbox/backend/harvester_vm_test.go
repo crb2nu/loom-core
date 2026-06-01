@@ -27,9 +27,10 @@ func newFakeHarvesterVMBackend(t *testing.T, objs ...runtime.Object) (*Harvester
 	t.Helper()
 	scheme := runtime.NewScheme()
 	gvrToListKind := map[schema.GroupVersionResource]string{
-		vmGVR:  "VirtualMachineList",
-		vmiGVR: "VirtualMachineInstanceList",
-		pvcGVR: "PersistentVolumeClaimList",
+		vmGVR:     "VirtualMachineList",
+		vmiGVR:    "VirtualMachineInstanceList",
+		pvcGVR:    "PersistentVolumeClaimList",
+		secretGVR: "SecretList",
 	}
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind, objs...)
 	h := &HarvesterVMBackend{

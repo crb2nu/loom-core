@@ -50,6 +50,11 @@ var (
 		Version:  "v1",
 		Resource: "persistentvolumeclaims",
 	}
+	secretGVR = schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "secrets",
+	}
 )
 
 // harvesterVMObjects bundles the manifests produced by buildVMManifest:
@@ -63,6 +68,14 @@ var (
 type harvesterVMObjects struct {
 	PVC *unstructured.Unstructured
 	VM  *unstructured.Unstructured
+	// CloudInitSecret carries the cloud-init userData out-of-line via a
+	// Secret referenced by the VM's cloudInitNoCloud.userDataSecretRef.
+	// KubeVirt rejects inline userData over 2048 bytes, which a real
+	// multi-KB SecretMount payload (e.g. the codex auth.json) exceeds, so
+	// the manifest always routes userData through this Secret (Slice 2d.5d).
+	// The caller owns creating it alongside the PVC + VM and owner-referencing
+	// it to the VM for cascade cleanup.
+	CloudInitSecret *unstructured.Unstructured
 }
 
 // buildVMManifest constructs the per-VM PVC + VirtualMachine manifests.
@@ -101,9 +114,13 @@ type harvesterVMObjects struct {
 // pre-existing user).
 //
 // Cloud-init injects the pubkey into the agent user's authorized_keys,
-// disables password auth, and defensively re-enables qemu-guest-agent +
-// ssh even though the pre-baked image already has them enabled (Slice 1.5
-// evidence: `.loom/local/handoffs/mills-harvester-vm-slice15-2026-05-25.md`).
+// disables password auth, and enables qemu-guest-agent + ssh. The first
+// runcmd self-heals stock-Ubuntu base images that ship without
+// qemu-guest-agent: without the agent, KubeVirt never reports the VM's
+// DHCP IP and Start's waitForVMReady times out (Slice 2d.5d kill-test
+// evidence — base image `longhorn-image-mc9ph` lacked it). The curated
+// mills-devbox-base image (Slice 1.5) has it pre-installed, so the
+// `command -v qemu-ga` guard makes the apt-get install a no-op there.
 func buildVMManifest(opts StartOpts, cfg HarvesterVMBackendConfig, sshPubKey string, env map[string]string, files []ResolvedSecretFile) (*harvesterVMObjects, error) {
 	if opts.Name == "" {
 		return nil, fmt.Errorf("StartOpts.Name is required")
@@ -155,6 +172,7 @@ func buildVMManifest(opts StartOpts, cfg HarvesterVMBackendConfig, sshPubKey str
 	}
 
 	pvcName := opts.Name + "-os"
+	cloudInitSecretName := opts.Name + "-cloudinit"
 
 	pvc := &unstructured.Unstructured{
 		Object: map[string]any{
@@ -189,6 +207,7 @@ users:
       - %s
 ssh_pwauth: false
 %sruncmd:
+  - [ bash, -c, "command -v qemu-ga >/dev/null 2>&1 || { apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent; }" ]
   - [ systemctl, enable, --now, qemu-guest-agent ]
   - [ systemctl, enable, --now, ssh ]
   - [ chown, -R, %s, %s ]
@@ -274,7 +293,16 @@ ssh_pwauth: false
 							map[string]any{
 								"name": "cloudinit",
 								"cloudInitNoCloud": map[string]any{
-									"userData": userData,
+									// Out-of-line via Secret: inline userData has a hard
+									// 2048-byte cap in KubeVirt that real SecretMount
+									// payloads exceed (Slice 2d.5d).
+									// NOTE: JSON key is `secretRef`, not `userDataSecretRef`.
+									// KubeVirt's CloudInitNoCloudSource.UserDataSecretRef
+									// has json tag `secretRef`; only the network ref is
+									// `networkDataSecretRef`. An unknown `userDataSecretRef`
+									// is dropped, then the VM is rejected for having no
+									// userdata source.
+									"secretRef": map[string]any{"name": cloudInitSecretName},
 								},
 							},
 						},
@@ -284,7 +312,26 @@ ssh_pwauth: false
 		},
 	}
 
-	return &harvesterVMObjects{PVC: pvc, VM: vm}, nil
+	// Cloud-init userData carried out-of-line in a Secret (KubeVirt's
+	// userDataSecretRef reads the `userdata` key). stringData lets the
+	// apiserver base64-encode it. Shares the VM's labels so list/cleanup
+	// scopes by the same selector.
+	cloudInitSecret := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"name":      cloudInitSecretName,
+				"namespace": cfg.Namespace,
+				"labels":    labels,
+			},
+			"stringData": map[string]any{
+				"userdata": userData,
+			},
+		},
+	}
+
+	return &harvesterVMObjects{PVC: pvc, VM: vm, CloudInitSecret: cloudInitSecret}, nil
 }
 
 // vmSecretFileOwner is the final `user:group` that should own the
