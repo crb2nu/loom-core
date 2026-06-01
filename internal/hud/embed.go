@@ -240,6 +240,10 @@ func (a *App) StartMonitors(ctx context.Context) error {
 	// remote HUD when LOOM_HUD_MIRROR_URL is set. No-op otherwise.
 	if cfg := mirror.NewConfigFromEnv(); cfg.Enabled() {
 		a.hudMirror = mirror.New(cfg, a.agent, nil, a.logger)
+		// Forward this daemon's per-session tool-call activity (captured in the
+		// EventLog via the embedded event bridge) to the remote HUD, so a
+		// distributed agent's calls surface in the central HUD's session trace.
+		a.hudMirror.SetToolCalls(a)
 		a.hudMirror.Start(ctx)
 		a.logger.Info("hud presence mirror enabled",
 			"url", cfg.URL,

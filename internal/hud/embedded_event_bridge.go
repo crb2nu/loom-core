@@ -3,10 +3,56 @@ package hud
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/crb2nu/loom/internal/hud/bridge"
 )
+
+// RecentToolCallsForSession returns this session's tool.call* event payloads
+// from the EventLog with a timestamp strictly newer than sinceUnixNano (newest
+// first, up to limit), plus the max timestamp seen across ALL matching events
+// (so the HUD mirror can advance its per-session cursor past everything it has
+// observed, not just the truncated batch). Implements mirror.ToolCallReader so
+// a distributed daemon can forward local tool-call activity to the central HUD.
+func (a *App) RecentToolCallsForSession(sessionID string, sinceUnixNano int64, limit int) ([]map[string]any, int64) {
+	if a.eventLog == nil || sessionID == "" {
+		return nil, sinceUnixNano
+	}
+	out := make([]map[string]any, 0, limit)
+	maxTS := sinceUnixNano
+	for _, e := range a.eventLog.All(1000) {
+		if !strings.HasPrefix(e.EventType, "tool.call") {
+			continue
+		}
+		ts := e.Timestamp.UnixNano()
+		if ts <= sinceUnixNano {
+			continue
+		}
+		var data map[string]any
+		if len(e.Data) > 0 {
+			if err := json.Unmarshal(e.Data, &data); err != nil {
+				continue
+			}
+		}
+		if data == nil {
+			continue
+		}
+		if sid, _ := data["session_id"].(string); sid != sessionID {
+			continue
+		}
+		if ts > maxTS {
+			maxTS = ts
+		}
+		if len(out) < limit {
+			if _, ok := data["ts"]; !ok {
+				data["ts"] = e.Timestamp.UTC().Format(time.RFC3339Nano)
+			}
+			out = append(out, data)
+		}
+	}
+	return out, maxTS
+}
 
 // daemonEventLogTypes are the daemon EventBus event types the HUD appends to
 // its in-memory EventLog (which buildSessionTrace reads for per-session

@@ -53,3 +53,46 @@ func TestIngestDaemonEventNilSafe(t *testing.T) {
 	a.IngestDaemonEvent("tool.call", time.Now(), json.RawMessage(`{"session_id":"x"}`))
 	a.IngestDaemonEvent("session.start", time.Time{}, nil)
 }
+
+// TestRecentToolCallsForSession filters tool.call events by session + cursor and
+// advances maxTS past everything seen (so the mirror cursor never re-sends).
+func TestRecentToolCallsForSession(t *testing.T) {
+	log := NewEventLog(20)
+	mk := func(sid, tool string, tsNano int64) {
+		b, _ := json.Marshal(map[string]any{"session_id": sid, "tool": tool})
+		log.Append(TimelineEntry{Timestamp: time.Unix(0, tsNano), EventType: "tool.call", Data: b})
+	}
+	mk("S", "a", 100)
+	mk("other", "x", 150)
+	mk("S", "b", 200)
+	mk("S", "c", 300)
+
+	a := &App{eventLog: log}
+
+	// since=0: all three S calls, maxTS=300.
+	calls, maxTS := a.RecentToolCallsForSession("S", 0, 25)
+	if len(calls) != 3 {
+		t.Fatalf("calls=%d want 3", len(calls))
+	}
+	if maxTS != 300 {
+		t.Fatalf("maxTS=%d want 300", maxTS)
+	}
+
+	// since=200: only the 300 call.
+	calls, maxTS = a.RecentToolCallsForSession("S", 200, 25)
+	if len(calls) != 1 || calls[0]["tool"] != "c" {
+		t.Fatalf("incremental calls=%v", calls)
+	}
+	if maxTS != 300 {
+		t.Fatalf("maxTS=%d want 300", maxTS)
+	}
+
+	// limit truncates the batch but maxTS still advances past all matches.
+	calls, maxTS = a.RecentToolCallsForSession("S", 0, 1)
+	if len(calls) != 1 {
+		t.Fatalf("limited calls=%d want 1", len(calls))
+	}
+	if maxTS != 300 {
+		t.Fatalf("maxTS=%d want 300 (must advance past truncated batch)", maxTS)
+	}
+}

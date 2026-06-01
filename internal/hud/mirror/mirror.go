@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,6 +55,18 @@ type PresenceReader interface {
 	PresenceList(includeOffline bool) ([]presence.PresenceInfo, error)
 	Sessions() ([]bridge.SessionInfo, error)
 }
+
+// ToolCallReader supplies recent per-session tool-call activity to forward to
+// the remote HUD alongside the presence heartbeat. Implemented by the embedded
+// HUD App over its EventLog. Returns the matching tool.call payloads with an
+// event timestamp strictly greater than sinceUnixNano (up to limit), plus the
+// max timestamp observed so the mirror can advance its per-session cursor and
+// avoid re-forwarding the same calls every cycle.
+type ToolCallReader interface {
+	RecentToolCallsForSession(sessionID string, sinceUnixNano int64, limit int) (calls []map[string]any, maxTSUnixNano int64)
+}
+
+const mirrorToolCallLimit = 25
 
 // Config controls the mirror loop. Zero-valued fields fall back to
 // sane defaults.
@@ -104,9 +117,40 @@ type Service struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
+	// Optional per-session tool-call forwarding (nil = disabled).
+	toolCalls  ToolCallReader
+	tcCursorMu sync.Mutex
+	tcCursor   map[string]int64 // session_id -> last forwarded event ts (unix nano)
+
 	// Coalesce identical errors to one log line per failure streak.
 	lastErr        atomic.Pointer[string]
 	consecutiveErr atomic.Int64
+}
+
+// SetToolCalls wires an optional tool-call source whose recent per-session
+// activity is forwarded alongside each heartbeat. Call once before Start.
+func (s *Service) SetToolCalls(r ToolCallReader) { s.toolCalls = r }
+
+// recentToolCallsSince returns this session's tool calls newer than the stored
+// cursor and advances the cursor past them. Returns nil when none/disabled.
+func (s *Service) recentToolCallsSince(sessionID string) []map[string]any {
+	if s.toolCalls == nil || sessionID == "" {
+		return nil
+	}
+	s.tcCursorMu.Lock()
+	since := s.tcCursor[sessionID]
+	s.tcCursorMu.Unlock()
+
+	calls, maxTS := s.toolCalls.RecentToolCallsForSession(sessionID, since, mirrorToolCallLimit)
+	if maxTS > since {
+		s.tcCursorMu.Lock()
+		s.tcCursor[sessionID] = maxTS
+		s.tcCursorMu.Unlock()
+	}
+	if len(calls) == 0 {
+		return nil
+	}
+	return calls
 }
 
 // New constructs a Service. cfg.URL must be non-empty; callers should
@@ -125,11 +169,12 @@ func New(cfg Config, reader PresenceReader, client Doer, logger *slog.Logger) *S
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Service{
-		cfg:    cfg,
-		reader: reader,
-		client: client,
-		logger: logger,
-		done:   make(chan struct{}),
+		cfg:      cfg,
+		reader:   reader,
+		client:   client,
+		logger:   logger,
+		done:     make(chan struct{}),
+		tcCursor: make(map[string]int64),
 	}
 }
 
@@ -217,6 +262,11 @@ func (s *Service) mirrorOnce(ctx context.Context) (posted, failed int) {
 			continue
 		}
 		body := buildHeartbeatBody(a, sessionByAgent[a.AgentID])
+		if sid, _ := body["session_id"].(string); sid != "" {
+			if calls := s.recentToolCallsSince(sid); len(calls) > 0 {
+				body["recent_tool_calls"] = calls
+			}
+		}
 		if err := s.postHeartbeat(ctx, body); err != nil {
 			failed++
 			s.logErr("heartbeat", err)
