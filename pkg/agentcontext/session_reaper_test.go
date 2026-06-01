@@ -144,6 +144,34 @@ func newSessionsQdrantStub(t *testing.T, seeded ...Session) (*QdrantClient, *ses
 		writeJSON(t, w, map[string]any{"status": "ok"})
 	})
 
+	// Delete by point IDs: /points/delete accepts a list of point UUIDs.
+	// We index sessions by string ID, so resolve UUIDs back via toPointID.
+	mux.HandleFunc("/collections/"+CollSessions+"/points/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode delete body: %v", err)
+		}
+		rawIDs, _ := body["points"].([]any)
+		wantUUIDs := make(map[string]bool, len(rawIDs))
+		for _, raw := range rawIDs {
+			if s, ok := raw.(string); ok {
+				wantUUIDs[s] = true
+			}
+		}
+		stub.mu.Lock()
+		for id := range stub.sessions {
+			if wantUUIDs[toPointID(id)] {
+				delete(stub.sessions, id)
+			}
+		}
+		stub.mu.Unlock()
+		writeJSON(t, w, map[string]any{"status": "ok"})
+	})
+
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -525,6 +553,67 @@ func TestEndStaleSessions_PersistsOnlyExpiredSessionsWithoutLivePresence(t *test
 	}
 	if cached.EndedAt == nil {
 		t.Fatal("cached stale-dead EndedAt should be set")
+	}
+}
+
+func TestSessionReaperTick_PrunesOldEndedSessionsByMaxAge(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	oldEndedAt := now.Add(-100 * time.Hour)
+	recentEndedAt := now.Add(-10 * time.Hour)
+	seeded := []Session{
+		{
+			ID:        "old-ended",
+			AgentID:   "agent-1",
+			Status:    string(SessionStatusEnded),
+			StartedAt: now.Add(-101 * time.Hour),
+			EndedAt:   &oldEndedAt,
+		},
+		{
+			ID:        "old-summarized",
+			AgentID:   "agent-1",
+			Status:    string(SessionStatusSummarized),
+			StartedAt: now.Add(-101 * time.Hour),
+			EndedAt:   &oldEndedAt,
+		},
+		{
+			ID:        "recent-ended",
+			AgentID:   "agent-1",
+			Status:    string(SessionStatusEnded),
+			StartedAt: now.Add(-11 * time.Hour),
+			EndedAt:   &recentEndedAt,
+		},
+	}
+
+	qdrant, stub := newSessionsQdrantStub(t, seeded...)
+	svc := newTestService()
+	svc.sess.qdrant = qdrant
+	svc.sess.cfg.SessionReaperMaxAge = 72 // prune ended/summarized older than 72h
+
+	// Mirror into the in-memory cache to verify it is pruned too.
+	for _, s := range seeded {
+		s := s
+		svc.sess.sessions[s.ID] = &s
+	}
+
+	svc.sess.reaperTick(context.Background())
+
+	if _, ok := stub.sessionByID("old-ended"); ok {
+		t.Error("old-ended should have been pruned from persisted store")
+	}
+	if _, ok := stub.sessionByID("old-summarized"); ok {
+		t.Error("old-summarized should have been pruned from persisted store")
+	}
+	if _, ok := stub.sessionByID("recent-ended"); !ok {
+		t.Error("recent-ended should have been retained (within max age)")
+	}
+
+	svc.sess.mu.RLock()
+	defer svc.sess.mu.RUnlock()
+	if _, ok := svc.sess.sessions["old-ended"]; ok {
+		t.Error("old-ended should have been evicted from in-memory cache")
+	}
+	if _, ok := svc.sess.sessions["recent-ended"]; !ok {
+		t.Error("recent-ended should remain in in-memory cache")
 	}
 }
 
