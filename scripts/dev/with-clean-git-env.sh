@@ -27,8 +27,17 @@ fi
 if [[ -z "${GOTMPDIR:-}" ]]; then
   export GOTMPDIR="${tmp_root%/}/loom-gotmp"
 fi
+# PRE_COMMIT_HOME stores git clones of hook repos, NOT scratch build output.
+# Unlike the Go caches above it needs no short path (no Unix sockets), and
+# pre-commit ABORTS with InvalidManifestError on a partially-deleted clone
+# instead of rebuilding it. Anchoring it under tmp_root (/tmp) exposed it to the
+# workspace /tmp reaper (disk-pressure monitor, workspace-clean --tmp-agent),
+# which would delete part of a hook-repo clone and corrupt every later commit.
+# Keep it in the stable XDG cache so the reaper can't touch it. This matches the
+# default already assumed by scripts/hooks/run-pre-commit-hook.sh's writability
+# check; if that path is unwritable, the runner falls back to native hooks.
 if [[ -z "${PRE_COMMIT_HOME:-}" ]]; then
-  export PRE_COMMIT_HOME="${tmp_root%/}/loom-pre-commit"
+  export PRE_COMMIT_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}/pre-commit"
 fi
 mkdir -p "${GOCACHE}" "${GOTMPDIR}" "${PRE_COMMIT_HOME}"
 
