@@ -804,3 +804,105 @@ func TestFleetMonitor_MergesActiveSessionsWhenUnfilteredListMissesThem(t *testin
 		t.Errorf("expected ActiveSessions=1 after merge, got %d", snap.ActiveSessions)
 	}
 }
+
+// TestFleetMonitor_ActiveFallbackWhenUnfilteredSessionListTimesOut is the
+// regression test for the recurring HUD "No active agents" bug.
+//
+// Production failure mode: once enough ended/summarized sessions accumulate,
+// the unfiltered limit=1000 agent_session_list payload exceeds the daemon's
+// recv cap and times out on every refresh. The status="active" path stays
+// fast (small bounded result). Before the fix, the unfiltered timeout left
+// sessionsOK=false, the coupled sessions+presence join was skipped, and the
+// live agent roster was blanked even though PresenceList succeeded.
+//
+// FleetMonitor must fall back to the active-only fetch so the agent roster
+// (driven by presence) and the live session counters stay populated.
+func TestFleetMonitor_ActiveFallbackWhenUnfilteredSessionListTimesOut(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	client, agent := newBridges(t, sockPath)
+
+	handlers.handle("loom/status", func(_ json.RawMessage) (any, error) {
+		return map[string]any{
+			"running": true, "servers": 1, "activeConns": 0, "idleConns": 0,
+			"processes": []string{"agent_context"},
+		}, nil
+	})
+
+	now := time.Now().UTC()
+	activeStart := now.Add(-1 * time.Minute).Format(time.RFC3339Nano)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			// Only the unfiltered fetch times out (the oversized payload);
+			// the filtered status="active" path stays healthy.
+			status, _ := req.Arguments["status"].(string)
+			if status != "active" {
+				return nil, fmt.Errorf("simulated tools/call timeout during recv after 3s")
+			}
+			return toolEnvelope(map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id": "sess-active-1", "agent_id": "claude-live",
+						"status": "active", "started_at": activeStart, "total_tokens": 42,
+					},
+				},
+			}), nil
+		case "agent_context__agent_task_list":
+			return toolEnvelope(map[string]any{"tasks": []map[string]any{}}), nil
+		case "agent_context__agent_memory_stats":
+			return toolEnvelope(map[string]any{"total_items": 0, "total_tokens": 0}), nil
+		case "agent_context__agent_graph_stats":
+			return toolEnvelope(map[string]any{"total_entities": 0, "total_relations": 0}), nil
+		case "agent_context__agent_workflow_list":
+			return toolEnvelope(map[string]any{"workflows": []map[string]any{}}), nil
+		case "agent_context__agent_presence_list":
+			heartbeat := now.Format(time.RFC3339Nano)
+			return toolEnvelope(map[string]any{
+				"agents": []map[string]any{
+					{
+						"agent_id": "claude-live", "session_id": "sess-active-1",
+						"status": "active", "last_heartbeat": heartbeat,
+					},
+				},
+			}), nil
+		case "agent_context__agent_file_claim_list":
+			return toolEnvelope(map[string]any{"claims": []map[string]any{}}), nil
+		case "agent_context__agent_worktree_list":
+			return toolEnvelope(map[string]any{"assignments": []map[string]any{}}), nil
+		case "agent_context__agent_handoff_inbox":
+			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
+		default:
+			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
+		}
+	})
+
+	monitor := NewFleetMonitor(client, agent, nil)
+	if err := monitor.Refresh(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	snap := monitor.Snapshot()
+	// The core regression: the agent roster must NOT be blanked when the
+	// unfiltered session list times out but presence succeeded.
+	if snap.ActiveAgents != 1 {
+		t.Errorf("ActiveAgents blanked by unfiltered-session timeout: got %d, want 1", snap.ActiveAgents)
+	}
+	if len(snap.Agents) != 1 {
+		t.Errorf("agent roster empty after fallback: got %d agents, want 1", len(snap.Agents))
+	}
+	// The live session counters should recover from the active-only fetch.
+	if snap.ActiveSessions != 1 {
+		t.Errorf("ActiveSessions not recovered via fallback: got %d, want 1", snap.ActiveSessions)
+	}
+	if snap.TotalTokens != 42 {
+		t.Errorf("TotalTokens not recovered via fallback: got %d, want 42", snap.TotalTokens)
+	}
+}

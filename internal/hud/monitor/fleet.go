@@ -462,7 +462,24 @@ func (m *FleetMonitor) refresh(force bool) error {
 	// the fleetview.Join below so the stale-session filter can drop zombie
 	// sessions (no fresh heartbeat) from the snapshot in a single pass.
 	if sessions, err := m.agent.Sessions(); err != nil {
-		m.Logger.Warn("fleet: failed to fetch sessions", "error", err)
+		// The unfiltered limit=1000 session list can exceed the daemon's
+		// recv cap once enough ended/summarized sessions accumulate — the
+		// payload size, not the query, is the bottleneck, so it times out
+		// on every refresh and never recovers on its own. Without a
+		// fallback, sessionsOK stays false and the coupled sessions+presence
+		// join below is skipped, which silently blanks the entire agent
+		// roster (the "No active agents" bug) even though PresenceList
+		// succeeded. The live Fleet view only needs the actively running
+		// sessions, and the status="active" path returns a small bounded
+		// result, so fall back to it: a heavy-history timeout must not
+		// discard good presence data.
+		m.Logger.Warn("fleet: failed to fetch sessions (unfiltered); falling back to active-only", "error", err)
+		if active, aerr := m.agent.ActiveSessions(); aerr != nil {
+			m.Logger.Warn("fleet: active-only session fallback also failed", "error", aerr)
+		} else {
+			snap.Sessions = active
+			sessionsOK = true
+		}
 	} else {
 		snap.Sessions = sessions
 		sessionsOK = true
