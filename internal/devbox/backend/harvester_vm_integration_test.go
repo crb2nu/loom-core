@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // TestHarvesterVMBackend_Integration_StartExecStop exercises the full
@@ -105,14 +107,21 @@ func TestHarvesterVMBackend_Integration_StartExecStop(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	// Give the API server a moment to converge before asking Status.
-	time.Sleep(2 * time.Second)
-	st, err := backend.Status(context.Background(), vmName)
-	if err != nil {
-		t.Fatalf("Status after Stop: %v", err)
-	}
-	if st.Status != "not_found" && st.Status != "stopping" {
-		t.Errorf("Status after Stop = %q, want not_found or stopping", st.Status)
+	// KubeVirt VM deletion is async: the VMI can still report phase "running"
+	// for a moment after Stop returns. Poll Status until it converges to
+	// not_found/stopping rather than reading once and racing the delete.
+	statusCtx, statusCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer statusCancel()
+	var lastStatus string
+	if err := wait.PollUntilContextTimeout(statusCtx, 2*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		st, err := backend.Status(ctx, vmName)
+		if err != nil {
+			return false, err
+		}
+		lastStatus = st.Status
+		return st.Status == "not_found" || st.Status == "stopping", nil
+	}); err != nil {
+		t.Errorf("Status after Stop did not converge to not_found/stopping within 30s (last=%q): %v", lastStatus, err)
 	}
 }
 
