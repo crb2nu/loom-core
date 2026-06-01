@@ -35,6 +35,35 @@ func (d *Daemon) startEmbeddedHUD(ctx context.Context, mux *http.ServeMux) error
 	app.RegisterRoutes(mux)
 	d.hudApp = app
 
+	// Bridge the daemon EventBus into the embedded HUD's EventLog/SSE. The
+	// embedded HUD bypasses the standalone SSE event consumer, so without this
+	// no daemon event (session.*, agent.status.change, tool.call*) ever reaches
+	// the per-session activity trace the HUD renders — the in-cluster HUD would
+	// show every session as "no captured activity". The consumer goroutine
+	// exits when ctx is cancelled.
+	if d.eventBus != nil {
+		subID, ch := d.eventBus.Subscribe()
+		go func() {
+			defer d.eventBus.Unsubscribe(subID)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case evt, ok := <-ch:
+					if !ok {
+						return
+					}
+					data, err := json.Marshal(evt.Data)
+					if err != nil {
+						continue
+					}
+					app.IngestDaemonEvent(string(evt.Type), evt.Timestamp, data)
+				}
+			}
+		}()
+		logger.Info("embedded HUD event bridge wired")
+	}
+
 	// Refresh snapshots in the background so slow monitor warm-up does not block
 	// route registration and the HUD HTTP listener from becoming probeable.
 	go app.RefreshMonitors()

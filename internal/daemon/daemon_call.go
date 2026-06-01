@@ -208,6 +208,27 @@ func (d *Daemon) emitAudit(params callParams, server, tool, target string, start
 	if d.otelMetrics != nil {
 		d.otelMetrics.RecordToolCallFromAudit(server, tool, agentID, status, target, durationMs, reqBytes, resBytes)
 	}
+
+	// Publish a session-scoped tool.call event so the HUD's per-session activity
+	// panel can render "calls". Scoped to calls carrying a proxy session_id:
+	// those are exactly the interactive-agent calls the Live Sessions panel
+	// tracks, and the scoping keeps ambient/ID-less daemon traffic off the bus.
+	// The embedded HUD bridges this event into its EventLog (see
+	// startEmbeddedHUD / IngestDaemonEvent), where buildSessionTrace reads it
+	// (matched by session_id).
+	if d.eventBus != nil && params.SessionID != "" {
+		d.eventBus.Publish(EventToolCall, map[string]any{
+			"session_id":  params.SessionID,
+			"agent_id":    agentID,
+			"agent_type":  params.AgentType,
+			"server":      server,
+			"tool":        tool,
+			"status":      status,
+			"target":      target,
+			"duration_ms": durationMs,
+			"cached":      cached,
+		})
+	}
 }
 
 // logAccessDecision logs an RBAC access decision and publishes deny events.
