@@ -1417,6 +1417,27 @@ servers:
           FLEXINFER_NAMESPACE: "flexinfer-system"
           FLEXINFER_PROXY_URL: "${env:FLEXINFER_PROXY_URL}"
 
+  - name: agent-loop
+    categories: [ai, inference, agent, local-only]
+    common:
+      description: F4 append-only tool-loop ReAct engine — prefix-cache-pinned sessions against the FlexInfer proxy
+      hint: Use to drive a bounded ReAct loop (real read-only file tools) against an OpenAI-compatible endpoint with prefix-cache routing and per-turn metrics (agent_loop_run), or run the offline wiring gate (agent_loop_self_check). The flat upstream_ms vs growing prompt_tokens signal is the prefix cache paying off.
+      command: "${repo}/services/loom-core/bin/mcp-agent-loop"
+      args: []
+      timeout: 600
+      always_allow:
+        - agent_loop_self_check
+      env:
+        FLEXINFER_PROXY_URL: "${env:FLEXINFER_PROXY_URL}"
+        LOG_LEVEL: info
+    targets:
+      vscode:
+        type: stdio
+        command: "${repo}/services/loom-core/bin/mcp-agent-loop"
+        args: []
+        env:
+          FLEXINFER_PROXY_URL: "${env:FLEXINFER_PROXY_URL}"
+
   - name: mentatlab
     categories: [ai, orchestration]
     common:
