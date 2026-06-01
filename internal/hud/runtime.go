@@ -114,6 +114,18 @@ func (a *App) startStandaloneEventConsumer(cfg Config, logger *slog.Logger) func
 		a.eventLog.Append(TimelineEntry{Timestamp: e.Timestamp, EventType: "agent.status.change", Data: e.Data})
 		a.fleetMonitor.Refresh()
 	})
+	// Per-session tool-call activity (the daemon publishes tool.call from its
+	// audit chokepoint; CLI hooks inject tool.call.start/end). Appended to the
+	// EventLog so buildSessionTrace can surface "calls"; matched to a session by
+	// Data.session_id. No fleet refresh — high-frequency and roster-neutral.
+	appendToolCall := func(eventType string) func(bridge.SSEEvent) {
+		return func(e bridge.SSEEvent) {
+			a.eventLog.Append(TimelineEntry{Timestamp: e.Timestamp, EventType: eventType, Data: e.Data})
+		}
+	}
+	ec.On("tool.call", appendToolCall("tool.call"))
+	ec.On("tool.call.start", appendToolCall("tool.call.start"))
+	ec.On("tool.call.end", appendToolCall("tool.call.end"))
 	// Only broadcast to SSE hub when browser clients may be connected.
 	// In TUI mode no browser connects, so skip the fan-out overhead.
 	if !cfg.TUI {
