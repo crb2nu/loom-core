@@ -542,6 +542,13 @@ type HeartbeatRequest struct {
 	CurrentTask         string   `json:"current_task,omitempty"`
 	Branch              string   `json:"branch,omitempty"`
 	HeartbeatTTLSeconds int      `json:"heartbeat_ttl_seconds,omitempty"`
+	// RecentToolCalls carries per-session tool-call activity forwarded by the
+	// HUD mirror from a distributed daemon (whose tool calls never reach this
+	// central daemon's EventBus). Each entry is an opaque tool.call payload
+	// (session_id, agent_id, server, tool, status, duration_ms, ts); the
+	// central HUD re-broadcasts them so buildSessionTrace can surface "calls"
+	// for distributed agents. Omitted by non-mirror heartbeat clients.
+	RecentToolCalls []map[string]any `json:"recent_tool_calls,omitempty"`
 }
 
 // Normalize trims string fields and normalizes list values.

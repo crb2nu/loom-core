@@ -234,7 +234,36 @@ func (d *FleetDomain) handleAgentHeartbeat(w http.ResponseWriter, r *http.Reques
 	}
 	d.deps.MaybeSampleContextTelemetry(body.AgentID, body.SessionID, body.AgentType, "heartbeat")
 
+	d.ingestRecentToolCalls(body)
+
 	d.deps.WriteJSON(w, http.StatusOK, resp)
+}
+
+// ingestRecentToolCalls re-broadcasts tool-call activity forwarded by a HUD
+// mirror so it lands in the central HUD's EventLog (via BroadcastAgentEvent ->
+// eventLog.Append) and surfaces in buildSessionTrace for distributed agents
+// whose tool calls never reach this daemon's EventBus directly. Each entry's
+// session_id/agent_id is defaulted from the heartbeat when the mirror omitted
+// it. Bounded per heartbeat to keep a noisy session from flooding the log.
+func (d *FleetDomain) ingestRecentToolCalls(body bridge.HeartbeatRequest) {
+	const maxPerHeartbeat = 50
+	n := 0
+	for _, tc := range body.RecentToolCalls {
+		if tc == nil {
+			continue
+		}
+		if n >= maxPerHeartbeat {
+			break
+		}
+		if _, ok := tc["session_id"].(string); !ok && body.SessionID != "" {
+			tc["session_id"] = body.SessionID
+		}
+		if _, ok := tc["agent_id"].(string); !ok && body.AgentID != "" {
+			tc["agent_id"] = body.AgentID
+		}
+		d.deps.BroadcastAgentEvent("tool.call", tc)
+		n++
+	}
 }
 
 // handleAgentSession returns the active session for an agent.
