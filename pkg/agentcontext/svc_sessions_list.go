@@ -5,11 +5,53 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
 	"github.com/crb2nu/loom/pkg/validate"
 )
+
+// sessionLite is the trimmed projection returned when a caller passes
+// light=true to agent_session_list. It carries only the identity, timing,
+// status, and token fields the HUD fleet view needs and drops the heavier
+// metadata (description, working_dir, pipeline_ref, last_summary_at).
+//
+// The fleet monitor polls agent_session_list on a ~5s cadence with no status
+// filter. Once thousands of ended/summarized sessions accumulate, the full
+// payload exceeds the daemon's 3s tools/call recv budget and every refresh
+// times out (see project_hud_no_agents_session_list_timeout). The light
+// projection plus the bounded recompute in List keep that call cheap at the
+// source. Field json tags match the wire format bridge.SessionInfo decodes.
+type sessionLite struct {
+	ID              string     `json:"id"`
+	AgentID         string     `json:"agent_id"`
+	Namespace       string     `json:"namespace,omitempty"`
+	Project         string     `json:"project,omitempty"`
+	StartedAt       time.Time  `json:"started_at"`
+	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	Status          string     `json:"status"`
+	EntryCount      int        `json:"entry_count"`
+	TotalTokens     int        `json:"total_tokens"`
+	ParentSessionID string     `json:"parent_session_id,omitempty"`
+	RootSessionID   string     `json:"root_session_id,omitempty"`
+}
+
+func toSessionLite(s Session) sessionLite {
+	return sessionLite{
+		ID:              s.ID,
+		AgentID:         s.AgentID,
+		Namespace:       s.Namespace,
+		Project:         s.Project,
+		StartedAt:       s.StartedAt,
+		EndedAt:         s.EndedAt,
+		Status:          s.Status,
+		EntryCount:      s.EntryCount,
+		TotalTokens:     s.TotalTokens,
+		ParentSessionID: s.ParentSessionID,
+		RootSessionID:   s.RootSessionID,
+	}
+}
 
 // sessionListScrollCap bounds how many session points we will scroll from
 // Qdrant before sorting and truncating to the caller's limit. Qdrant scroll
@@ -31,6 +73,7 @@ func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallT
 	namespace := strings.TrimSpace(v.String("namespace", ""))
 	status := strings.TrimSpace(v.String("status", ""))
 	limit := v.Int("limit", 20)
+	light := v.Bool("light", false)
 
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
@@ -72,15 +115,6 @@ func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallT
 			sess.TotalTokens = live.TotalTokens
 		}
 		ss.mu.RUnlock()
-		// For sessions not in memory with 0 entry count, recompute from
-		// the context collection (covers HUD-restart data loss).
-		if !inMem && sess.EntryCount == 0 && ss.countContextEntries != nil {
-			entries, tokens := ss.countContextEntries(ctx, sess.ID)
-			if entries > 0 {
-				sess.EntryCount = entries
-				sess.TotalTokens = tokens
-			}
-		}
 		sessions = append(sessions, *sess)
 	}
 
@@ -90,6 +124,45 @@ func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallT
 
 	if len(sessions) > limit {
 		sessions = sessions[:limit]
+	}
+
+	// Recompute entry/token stats for ended sessions whose persisted counts
+	// are 0 (covers HUD-restart data loss). This is deliberately done AFTER
+	// the sort+truncate so it runs at most `limit` times, not once per
+	// scrolled point. Previously this lived in the scroll loop above and
+	// fired for every one of up to sessionListScrollCap points — each
+	// EntryCount==0 ended session triggered its own Qdrant scroll, so a large
+	// history of short hook-driven sessions turned a single agent_session_list
+	// into thousands of serial round-trips and blew the daemon's 3s recv
+	// budget. The light fleet path skips the recompute entirely: the fleet
+	// view counts live work and tolerates the persisted/in-memory stats.
+	if !light && ss.countContextEntries != nil {
+		for i := range sessions {
+			s := &sessions[i]
+			ss.mu.RLock()
+			_, inMem := ss.sessions[s.ID]
+			ss.mu.RUnlock()
+			if inMem || s.EntryCount != 0 {
+				continue
+			}
+			entries, tokens := ss.countContextEntries(ctx, s.ID)
+			if entries > 0 {
+				s.EntryCount = entries
+				s.TotalTokens = tokens
+			}
+		}
+	}
+
+	if light {
+		lite := make([]sessionLite, len(sessions))
+		for i, s := range sessions {
+			lite[i] = toSessionLite(s)
+		}
+		return mcp.JSONResult(map[string]any{
+			"ok":       true,
+			"sessions": lite,
+			"count":    len(lite),
+		})
 	}
 
 	return mcp.JSONResult(map[string]any{

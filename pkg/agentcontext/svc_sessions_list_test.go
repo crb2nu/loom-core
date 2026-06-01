@@ -3,6 +3,7 @@ package agentcontext
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -267,6 +268,121 @@ func TestSessionList_FilterByStatusActiveStillWorks(t *testing.T) {
 	if sessions[0].StartedAt.Before(sessions[1].StartedAt) {
 		t.Errorf("filtered result not StartedAt DESC: %v before %v",
 			sessions[0].StartedAt, sessions[1].StartedAt)
+	}
+}
+
+// TestSessionList_LargeHistoryBoundsRecompute is the regression test for the
+// agent_session_list recv-budget timeout (project_hud_no_agents_session_list_timeout).
+//
+// Before the fix, the per-session stat recompute (countContextEntries) ran
+// inside the scroll loop for every one of up to sessionListScrollCap points.
+// Each ended session with a persisted EntryCount of 0 — the common shape for
+// short hook-driven sessions — fired its own Qdrant scroll, so a single
+// agent_session_list over a large history fanned out into thousands of serial
+// round-trips and blew the daemon's 3s recv budget on every fleet refresh.
+//
+// The fix moves the recompute after sort+truncate (so it runs at most `limit`
+// times) and skips it entirely in light mode. We assert both bounds by
+// counting recompute invocations against a deterministic 2000-session history.
+func TestSessionList_LargeHistoryBoundsRecompute(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	now := time.Date(2026, 5, 28, 9, 0, 0, 0, time.UTC)
+
+	const total = 2000
+	seeded := make([]Session, 0, total)
+	for i := 0; i < total; i++ {
+		seeded = append(seeded, Session{
+			// 16-char hex, unique per index (stableHexID collides every 256).
+			ID:        fmt.Sprintf("%016x", i),
+			AgentID:   "agent-hooks",
+			Status:    string(SessionStatusEnded),
+			StartedAt: now.Add(-time.Duration(total-i) * time.Minute),
+			// EntryCount left at 0 — this is what triggered the per-row
+			// recompute fan-out in the pre-fix scroll loop.
+		})
+	}
+
+	client, _ := newOrderedSessionsQdrantStub(t, seeded...)
+	svc := newTestService()
+	svc.sess = NewSessionSvc(client, svc.cfg, svc.logger, svc.metrics)
+
+	// Count how many times the expensive recompute is invoked. This is a
+	// deterministic proxy for "stays inside the recv budget": the pre-fix
+	// code called it once per scrolled point (up to `total`), which is the
+	// fan-out that caused the timeout.
+	var recomputeCalls int
+	svc.sess.countContextEntries = func(_ context.Context, _ string) (int, int) {
+		recomputeCalls++
+		return 0, 0
+	}
+
+	// Full mode: recompute must be bounded by `limit`, not by the history
+	// size. With the pre-fix loop this would have been ~2000.
+	const limit = 50
+	recomputeCalls = 0
+	full, err := svc.HandleSessionList(context.Background(), map[string]any{
+		"limit": limit,
+	})
+	if err != nil {
+		t.Fatalf("HandleSessionList (full): %v", err)
+	}
+	if full.IsError {
+		t.Fatalf("HandleSessionList (full) returned error result: %+v", full)
+	}
+	fullSessions := decodeListResult(t, full)
+	if len(fullSessions) != limit {
+		t.Fatalf("full mode returned %d sessions, want %d", len(fullSessions), limit)
+	}
+	if recomputeCalls > limit {
+		t.Errorf("full mode invoked recompute %d times; must be bounded by limit=%d (pre-fix fan-out was ~%d)",
+			recomputeCalls, limit, total)
+	}
+	// Full mode must return the most recent sessions, sorted DESC.
+	for i := 1; i < len(fullSessions); i++ {
+		if fullSessions[i-1].StartedAt.Before(fullSessions[i].StartedAt) {
+			t.Fatalf("full result not StartedAt DESC at %d", i)
+		}
+	}
+
+	// Light mode: recompute must never fire, and the payload must omit the
+	// heavy fields while keeping the fleet-view essentials.
+	recomputeCalls = 0
+	light, err := svc.HandleSessionList(context.Background(), map[string]any{
+		"limit": 1000,
+		"light": true,
+	})
+	if err != nil {
+		t.Fatalf("HandleSessionList (light): %v", err)
+	}
+	if light.IsError {
+		t.Fatalf("HandleSessionList (light) returned error result: %+v", light)
+	}
+	if recomputeCalls != 0 {
+		t.Errorf("light mode invoked recompute %d times; must be 0", recomputeCalls)
+	}
+
+	// Decode the raw light payload to assert the projection shape: the
+	// fleet essentials are present and the heavy fields are absent.
+	var lightPayload struct {
+		Count    int              `json:"count"`
+		Sessions []map[string]any `json:"sessions"`
+	}
+	if err := json.Unmarshal([]byte(light.Content[0].Text), &lightPayload); err != nil {
+		t.Fatalf("unmarshal light payload: %v", err)
+	}
+	if lightPayload.Count != 1000 {
+		t.Fatalf("light mode returned count=%d, want 1000", lightPayload.Count)
+	}
+	row := lightPayload.Sessions[0]
+	for _, want := range []string{"id", "agent_id", "status", "started_at", "total_tokens"} {
+		if _, ok := row[want]; !ok {
+			t.Errorf("light projection missing required field %q: %v", want, row)
+		}
+	}
+	for _, heavy := range []string{"description", "working_dir", "last_summary_at", "pipeline_ref"} {
+		if _, ok := row[heavy]; ok {
+			t.Errorf("light projection should omit heavy field %q: %v", heavy, row)
+		}
 	}
 }
 

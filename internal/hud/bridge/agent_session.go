@@ -544,6 +544,21 @@ func (a *AgentBridge) Sessions() ([]SessionInfo, error) {
 	}, 3*time.Second)
 }
 
+// FleetSessions returns the unfiltered recent-session list using the
+// lightweight projection (light=true). The fleet monitor polls this on a ~5s
+// cadence; the trimmed payload plus the bounded server-side stat recompute
+// keep the call inside the daemon's 3s tools/call recv budget even when
+// thousands of ended/summarized sessions have accumulated. The full-fidelity
+// Sessions() is reserved for callers that need session metadata
+// (descriptions, working dirs). See svc_sessions_list.go and
+// project_hud_no_agents_session_list_timeout.
+func (a *AgentBridge) FleetSessions() ([]SessionInfo, error) {
+	return a.SessionsWithParams(map[string]any{
+		"limit": defaultSessionListLimit,
+		"light": true,
+	}, 3*time.Second)
+}
+
 // ActiveSessions returns sessions explicitly filtered to status="active".
 //
 // Fleet view defense-in-depth: Sessions() asks the agent-context server
@@ -561,6 +576,7 @@ func (a *AgentBridge) ActiveSessions() ([]SessionInfo, error) {
 	return a.SessionsWithParams(map[string]any{
 		"limit":  defaultSessionListLimit,
 		"status": "active",
+		"light":  true,
 	}, 3*time.Second)
 }
 
