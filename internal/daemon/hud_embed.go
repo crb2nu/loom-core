@@ -18,59 +18,7 @@ import (
 // mounting its routes on the given HTTP mux. The HUD uses a LocalCaller
 // that dispatches directly to d.handleMessage (in-process, no socket).
 func (d *Daemon) startEmbeddedHUD(ctx context.Context, mux *http.ServeMux) error {
-	cfg := d.fileCfg.EmbeddedHUD
-
-	// Build the HUD config from the embedded HUD config section.
-	// Environment variables are checked as fallbacks for K8s deployment
-	// where secrets are injected as env vars.
-	hudCfg := hud.Config{
-		RegistryPath:                      firstNonEmpty(d.cfg.RegistryPath, os.Getenv("LOOM_REGISTRY_PATH"), os.Getenv("LOOM_REGISTRY")),
-		AdminToken:                        firstNonEmpty(cfg.AdminToken, os.Getenv("LOOM_HUD_ADMIN_TOKEN"), os.Getenv("HUD_ADMIN_TOKEN")),
-		MobileOperatorToken:               firstNonEmpty(cfg.MobileOperatorToken, os.Getenv("HUD_MOBILE_OPERATOR_TOKEN")),
-		MobileOperatorScopes:              firstNonEmpty(cfg.MobileOperatorScopes, os.Getenv("HUD_MOBILE_OPERATOR_SCOPES")),
-		SpawnEnabled:                      cfg.SpawnEnabled || os.Getenv("SPAWN_ENABLED") == "true",
-		SpawnNamespace:                    firstNonEmpty(cfg.SpawnNamespace, os.Getenv("SPAWN_NAMESPACE")),
-		SpawnRegistry:                     firstNonEmpty(cfg.SpawnRegistry, os.Getenv("SPAWN_REGISTRY")),
-		SpawnSyncMode:                     firstNonEmpty(cfg.SpawnSyncMode, os.Getenv("SPAWN_SYNC_MODE")),
-		SpawnGitBaseURL:                   firstNonEmpty(cfg.SpawnGitBaseURL, os.Getenv("SPAWN_GIT_BASE_URL")),
-		SpawnGitSecret:                    firstNonEmpty(cfg.SpawnGitSecret, os.Getenv("SPAWN_GIT_SECRET")),
-		SpawnGitCloneImage:                firstNonEmpty(cfg.SpawnGitCloneImage, os.Getenv("SPAWN_GIT_CLONE_IMAGE")),
-		SpawnProjects:                     firstNonEmpty(cfg.SpawnProjects, os.Getenv("SPAWN_PROJECTS")),
-		SpawnDefaultCPU:                   firstPositiveFloat(cfg.SpawnDefaultCPU, os.Getenv("SPAWN_DEFAULT_CPU")),
-		SpawnDefaultMemory:                firstPositiveInt(cfg.SpawnDefaultMemory, os.Getenv("SPAWN_DEFAULT_MEMORY_MB")),
-		SpawnMaxConcurrent:                firstPositiveInt(cfg.SpawnMaxConcurrent, os.Getenv("SPAWN_MAX_CONCURRENT")),
-		SpawnMaxConcurrentBuilds:          firstPositiveInt(cfg.SpawnMaxConcurrentBuilds, os.Getenv("SPAWN_MAX_CONCURRENT_BUILDS")),
-		SpawnBuildCPURequest:              firstNonEmpty(cfg.SpawnBuildCPURequest, os.Getenv("SPAWN_BUILD_CPU_REQUEST")),
-		SpawnBuildCPULimit:                firstNonEmpty(cfg.SpawnBuildCPULimit, os.Getenv("SPAWN_BUILD_CPU_LIMIT")),
-		SpawnBuildMemoryRequest:           firstNonEmpty(cfg.SpawnBuildMemoryRequest, os.Getenv("SPAWN_BUILD_MEMORY_REQUEST")),
-		SpawnBuildMemoryLimit:             firstNonEmpty(cfg.SpawnBuildMemoryLimit, os.Getenv("SPAWN_BUILD_MEMORY_LIMIT")),
-		SpawnBuildEphemeralStorageRequest: firstNonEmpty(cfg.SpawnBuildEphemeralStorageRequest, os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST")),
-		SpawnBuildEphemeralStorageLimit:   firstNonEmpty(cfg.SpawnBuildEphemeralStorageLimit, os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT")),
-		SpawnBuildAvoidNodes:              firstNonEmpty(cfg.SpawnBuildAvoidNodes, os.Getenv("SPAWN_BUILD_AVOID_NODES")),
-		PipelineProjects:                  firstNonEmpty(cfg.PipelineProjects, os.Getenv("HUD_PIPELINE_PROJECTS")),
-		BindAddress:                       firstNonEmpty(cfg.BindAddress, os.Getenv("HUD_BIND_ADDRESS")),
-		FlexInferURL:                      firstNonEmpty(cfg.FlexInferURL, os.Getenv("FLEXINFER_URL")),
-		FlexInferProxyURL:                 firstNonEmpty(cfg.FlexInferProxyURL, os.Getenv("FLEXINFER_PROXY_URL")),
-		FlexInferKey:                      firstNonEmpty(cfg.FlexInferKey, os.Getenv("FLEXINFER_API_KEY")),
-		CoordinatorModel:                  firstNonEmpty(cfg.CoordinatorModel, os.Getenv("COORDINATOR_MODEL")),
-		MillsOperatorURL:                  os.Getenv("LOOM_MILLS_OPERATOR_URL"),
-		MillsOperatorToken:                os.Getenv("LOOM_MILLS_OPERATOR_TOKEN"),
-
-		// Inbound webhook intake (GitLab/GitHub CI failure routing).
-		// File config wins; envs are fallbacks for K8s secret injection.
-		// `WEBHOOK_INBOUND_ENABLED=true` flips the gate; secrets are HMAC
-		// verifiers, not bearer tokens, and are required when the
-		// originating system signs its requests (always on for GitLab,
-		// recommended for GitHub).
-		WebhookInboundEnabled: cfg.WebhookInboundEnabled || envBoolTrue(os.Getenv("WEBHOOK_INBOUND_ENABLED")),
-		WebhookGitLabSecret:   firstNonEmpty(cfg.WebhookGitLabSecret, os.Getenv("WEBHOOK_GITLAB_SECRET")),
-		WebhookGitHubSecret:   firstNonEmpty(cfg.WebhookGitHubSecret, os.Getenv("WEBHOOK_GITHUB_SECRET")),
-	}
-
-	// Default mobile operator scopes when token is set.
-	if hudCfg.MobileOperatorToken != "" && hudCfg.MobileOperatorScopes == "" {
-		hudCfg.MobileOperatorScopes = "mobile:read,mobile:session:create,mobile:session:end,mobile:push"
-	}
+	hudCfg := buildEmbeddedHUDConfig(d.fileCfg.EmbeddedHUD, d.cfg.RegistryPath)
 
 	// Create an in-process caller that dispatches directly to the daemon.
 	caller := bridge.NewLocalCaller(d.handleMessage)
@@ -213,6 +161,82 @@ func (d *Daemon) handleHUDSessions(w http.ResponseWriter, r *http.Request) {
 // CLI flag (--hud-port) without requiring a config file change.
 func (d *Daemon) EnableEmbeddedHUD() {
 	d.fileCfg.EmbeddedHUD.Enabled = true
+}
+
+// buildEmbeddedHUDConfig maps the daemon's embedded-HUD file config and the
+// SPAWN_*/HUD_*/FLEXINFER_* environment fallbacks (used for K8s secret
+// injection) into a hud.Config. File config wins; env is the fallback.
+// Pure function so the env→config mapping — notably the harvester-vm
+// substrate fields that gate substrate registration — is unit-testable
+// without standing up a full Daemon.
+func buildEmbeddedHUDConfig(cfg EmbeddedHUDConfig, registryPath string) hud.Config {
+	hudCfg := hud.Config{
+		RegistryPath:                      firstNonEmpty(registryPath, os.Getenv("LOOM_REGISTRY_PATH"), os.Getenv("LOOM_REGISTRY")),
+		AdminToken:                        firstNonEmpty(cfg.AdminToken, os.Getenv("LOOM_HUD_ADMIN_TOKEN"), os.Getenv("HUD_ADMIN_TOKEN")),
+		MobileOperatorToken:               firstNonEmpty(cfg.MobileOperatorToken, os.Getenv("HUD_MOBILE_OPERATOR_TOKEN")),
+		MobileOperatorScopes:              firstNonEmpty(cfg.MobileOperatorScopes, os.Getenv("HUD_MOBILE_OPERATOR_SCOPES")),
+		SpawnEnabled:                      cfg.SpawnEnabled || os.Getenv("SPAWN_ENABLED") == "true",
+		SpawnNamespace:                    firstNonEmpty(cfg.SpawnNamespace, os.Getenv("SPAWN_NAMESPACE")),
+		SpawnRegistry:                     firstNonEmpty(cfg.SpawnRegistry, os.Getenv("SPAWN_REGISTRY")),
+		SpawnSyncMode:                     firstNonEmpty(cfg.SpawnSyncMode, os.Getenv("SPAWN_SYNC_MODE")),
+		SpawnGitBaseURL:                   firstNonEmpty(cfg.SpawnGitBaseURL, os.Getenv("SPAWN_GIT_BASE_URL")),
+		SpawnGitSecret:                    firstNonEmpty(cfg.SpawnGitSecret, os.Getenv("SPAWN_GIT_SECRET")),
+		SpawnGitCloneImage:                firstNonEmpty(cfg.SpawnGitCloneImage, os.Getenv("SPAWN_GIT_CLONE_IMAGE")),
+		SpawnProjects:                     firstNonEmpty(cfg.SpawnProjects, os.Getenv("SPAWN_PROJECTS")),
+		SpawnDefaultCPU:                   firstPositiveFloat(cfg.SpawnDefaultCPU, os.Getenv("SPAWN_DEFAULT_CPU")),
+		SpawnDefaultMemory:                firstPositiveInt(cfg.SpawnDefaultMemory, os.Getenv("SPAWN_DEFAULT_MEMORY_MB")),
+		SpawnMaxConcurrent:                firstPositiveInt(cfg.SpawnMaxConcurrent, os.Getenv("SPAWN_MAX_CONCURRENT")),
+		SpawnMaxConcurrentBuilds:          firstPositiveInt(cfg.SpawnMaxConcurrentBuilds, os.Getenv("SPAWN_MAX_CONCURRENT_BUILDS")),
+		SpawnBuildCPURequest:              firstNonEmpty(cfg.SpawnBuildCPURequest, os.Getenv("SPAWN_BUILD_CPU_REQUEST")),
+		SpawnBuildCPULimit:                firstNonEmpty(cfg.SpawnBuildCPULimit, os.Getenv("SPAWN_BUILD_CPU_LIMIT")),
+		SpawnBuildMemoryRequest:           firstNonEmpty(cfg.SpawnBuildMemoryRequest, os.Getenv("SPAWN_BUILD_MEMORY_REQUEST")),
+		SpawnBuildMemoryLimit:             firstNonEmpty(cfg.SpawnBuildMemoryLimit, os.Getenv("SPAWN_BUILD_MEMORY_LIMIT")),
+		SpawnBuildEphemeralStorageRequest: firstNonEmpty(cfg.SpawnBuildEphemeralStorageRequest, os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST")),
+		SpawnBuildEphemeralStorageLimit:   firstNonEmpty(cfg.SpawnBuildEphemeralStorageLimit, os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT")),
+		SpawnBuildAvoidNodes:              firstNonEmpty(cfg.SpawnBuildAvoidNodes, os.Getenv("SPAWN_BUILD_AVOID_NODES")),
+
+		// harvester-vm substrate. Empty SpawnHarvesterKubeconfig leaves the
+		// substrate unregistered (initSpawnOrchestrator gates on it) and
+		// harvester-vm-targeted spawns fall back to k8s. SSHUser is left
+		// empty here on purpose: the backend defaults it to "agent"
+		// (defaultHarvesterSSHUser) to match the K8s spawn pod's uid-1000
+		// agent user and the Slice 2d.5c home-parity contract.
+		SpawnHarvesterKubeconfig:       firstNonEmpty(cfg.SpawnHarvesterKubeconfig, os.Getenv("SPAWN_HARVESTER_KUBECONFIG")),
+		SpawnHarvesterBaseImage:        firstNonEmpty(cfg.SpawnHarvesterBaseImage, os.Getenv("SPAWN_HARVESTER_BASE_IMAGE")),
+		SpawnHarvesterNamespace:        firstNonEmpty(cfg.SpawnHarvesterNamespace, os.Getenv("SPAWN_HARVESTER_NAMESPACE")),
+		SpawnHarvesterStorageClass:     firstNonEmpty(cfg.SpawnHarvesterStorageClass, os.Getenv("SPAWN_HARVESTER_STORAGE_CLASS")),
+		SpawnHarvesterNetworkAttachDef: firstNonEmpty(cfg.SpawnHarvesterNetworkAttachDef, os.Getenv("SPAWN_HARVESTER_NAD")),
+		SpawnHarvesterDefaultVCPUs:     firstPositiveInt(cfg.SpawnHarvesterDefaultVCPUs, os.Getenv("SPAWN_HARVESTER_DEFAULT_VCPUS")),
+		SpawnHarvesterDefaultMemMi:     firstPositiveInt(cfg.SpawnHarvesterDefaultMemMi, os.Getenv("SPAWN_HARVESTER_DEFAULT_MEM_MI")),
+		SpawnHarvesterDefaultDiskGi:    firstPositiveInt(cfg.SpawnHarvesterDefaultDiskGi, os.Getenv("SPAWN_HARVESTER_DEFAULT_DISK_GI")),
+		SpawnHarvesterSSHUser:          firstNonEmpty(cfg.SpawnHarvesterSSHUser, os.Getenv("SPAWN_HARVESTER_SSH_USER")),
+
+		PipelineProjects:   firstNonEmpty(cfg.PipelineProjects, os.Getenv("HUD_PIPELINE_PROJECTS")),
+		BindAddress:        firstNonEmpty(cfg.BindAddress, os.Getenv("HUD_BIND_ADDRESS")),
+		FlexInferURL:       firstNonEmpty(cfg.FlexInferURL, os.Getenv("FLEXINFER_URL")),
+		FlexInferProxyURL:  firstNonEmpty(cfg.FlexInferProxyURL, os.Getenv("FLEXINFER_PROXY_URL")),
+		FlexInferKey:       firstNonEmpty(cfg.FlexInferKey, os.Getenv("FLEXINFER_API_KEY")),
+		CoordinatorModel:   firstNonEmpty(cfg.CoordinatorModel, os.Getenv("COORDINATOR_MODEL")),
+		MillsOperatorURL:   os.Getenv("LOOM_MILLS_OPERATOR_URL"),
+		MillsOperatorToken: os.Getenv("LOOM_MILLS_OPERATOR_TOKEN"),
+
+		// Inbound webhook intake (GitLab/GitHub CI failure routing).
+		// File config wins; envs are fallbacks for K8s secret injection.
+		// `WEBHOOK_INBOUND_ENABLED=true` flips the gate; secrets are HMAC
+		// verifiers, not bearer tokens, and are required when the
+		// originating system signs its requests (always on for GitLab,
+		// recommended for GitHub).
+		WebhookInboundEnabled: cfg.WebhookInboundEnabled || envBoolTrue(os.Getenv("WEBHOOK_INBOUND_ENABLED")),
+		WebhookGitLabSecret:   firstNonEmpty(cfg.WebhookGitLabSecret, os.Getenv("WEBHOOK_GITLAB_SECRET")),
+		WebhookGitHubSecret:   firstNonEmpty(cfg.WebhookGitHubSecret, os.Getenv("WEBHOOK_GITHUB_SECRET")),
+	}
+
+	// Default mobile operator scopes when token is set.
+	if hudCfg.MobileOperatorToken != "" && hudCfg.MobileOperatorScopes == "" {
+		hudCfg.MobileOperatorScopes = "mobile:read,mobile:session:create,mobile:session:end,mobile:push"
+	}
+
+	return hudCfg
 }
 
 // firstNonEmpty returns the first non-empty string from the arguments.

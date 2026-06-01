@@ -102,6 +102,79 @@ func TestFirstPositiveFloat(t *testing.T) {
 	}
 }
 
+// TestBuildEmbeddedHUDConfig_HarvesterFromEnv pins the A1 fix: the prod
+// daemon path (loomd → startEmbeddedHUD → buildEmbeddedHUDConfig) must read
+// the SPAWN_HARVESTER_* env vars into hud.Config so initSpawnOrchestrator
+// can register the harvester-vm substrate. Before this, the daemon dropped
+// every harvester field and substrate-targeted spawns silently fell back to
+// k8s regardless of deployment env.
+func TestBuildEmbeddedHUDConfig_HarvesterFromEnv(t *testing.T) {
+	t.Setenv("SPAWN_HARVESTER_KUBECONFIG", "/etc/harvester/kubeconfig")
+	t.Setenv("SPAWN_HARVESTER_BASE_IMAGE", "mills-devbox-base-2026-06-01")
+	t.Setenv("SPAWN_HARVESTER_NAMESPACE", "default")
+	t.Setenv("SPAWN_HARVESTER_STORAGE_CLASS", "longhorn-image-abc123")
+	t.Setenv("SPAWN_HARVESTER_NAD", "default/lan10g")
+	t.Setenv("SPAWN_HARVESTER_DEFAULT_VCPUS", "2")
+	t.Setenv("SPAWN_HARVESTER_DEFAULT_MEM_MI", "4096")
+	t.Setenv("SPAWN_HARVESTER_DEFAULT_DISK_GI", "20")
+
+	got := buildEmbeddedHUDConfig(EmbeddedHUDConfig{}, "")
+
+	if got.SpawnHarvesterKubeconfig != "/etc/harvester/kubeconfig" {
+		t.Errorf("Kubeconfig = %q, want /etc/harvester/kubeconfig", got.SpawnHarvesterKubeconfig)
+	}
+	if got.SpawnHarvesterBaseImage != "mills-devbox-base-2026-06-01" {
+		t.Errorf("BaseImage = %q", got.SpawnHarvesterBaseImage)
+	}
+	if got.SpawnHarvesterNamespace != "default" {
+		t.Errorf("Namespace = %q", got.SpawnHarvesterNamespace)
+	}
+	if got.SpawnHarvesterStorageClass != "longhorn-image-abc123" {
+		t.Errorf("StorageClass = %q", got.SpawnHarvesterStorageClass)
+	}
+	if got.SpawnHarvesterNetworkAttachDef != "default/lan10g" {
+		t.Errorf("NAD = %q", got.SpawnHarvesterNetworkAttachDef)
+	}
+	if got.SpawnHarvesterDefaultVCPUs != 2 || got.SpawnHarvesterDefaultMemMi != 4096 || got.SpawnHarvesterDefaultDiskGi != 20 {
+		t.Errorf("resource defaults = %d/%d/%d, want 2/4096/20",
+			got.SpawnHarvesterDefaultVCPUs, got.SpawnHarvesterDefaultMemMi, got.SpawnHarvesterDefaultDiskGi)
+	}
+	// SSHUser intentionally unset → empty, so the backend applies its
+	// "agent" default for home-parity. We must NOT inject "ubuntu" here.
+	if got.SpawnHarvesterSSHUser != "" {
+		t.Errorf("SSHUser = %q, want empty (backend defaults to agent)", got.SpawnHarvesterSSHUser)
+	}
+}
+
+// TestBuildEmbeddedHUDConfig_HarvesterUnsetLeavesEmpty confirms the safe
+// default: with no env and no file config, SpawnHarvesterKubeconfig is empty,
+// which leaves the substrate unregistered (k8s-only) — the current prod
+// behavior, so this change is inert until the deployment opts in.
+func TestBuildEmbeddedHUDConfig_HarvesterUnsetLeavesEmpty(t *testing.T) {
+	for _, k := range []string{
+		"SPAWN_HARVESTER_KUBECONFIG", "SPAWN_HARVESTER_BASE_IMAGE",
+		"SPAWN_HARVESTER_STORAGE_CLASS", "SPAWN_HARVESTER_NAD",
+	} {
+		t.Setenv(k, "")
+	}
+	got := buildEmbeddedHUDConfig(EmbeddedHUDConfig{}, "")
+	if got.SpawnHarvesterKubeconfig != "" {
+		t.Errorf("Kubeconfig = %q, want empty (substrate stays unregistered)", got.SpawnHarvesterKubeconfig)
+	}
+}
+
+// TestBuildEmbeddedHUDConfig_HarvesterFileConfigWins confirms file config
+// takes precedence over env, matching every other spawn field's contract.
+func TestBuildEmbeddedHUDConfig_HarvesterFileConfigWins(t *testing.T) {
+	t.Setenv("SPAWN_HARVESTER_KUBECONFIG", "/from/env")
+	got := buildEmbeddedHUDConfig(EmbeddedHUDConfig{
+		SpawnHarvesterKubeconfig: "/from/file",
+	}, "")
+	if got.SpawnHarvesterKubeconfig != "/from/file" {
+		t.Errorf("Kubeconfig = %q, want /from/file (file config wins)", got.SpawnHarvesterKubeconfig)
+	}
+}
+
 func TestWriteEmbeddedHUDPortFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)

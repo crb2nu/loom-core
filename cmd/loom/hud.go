@@ -407,7 +407,7 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 	cmd.Flags().IntVar(&spawnHarvesterDefaultVCPUs, "spawn-harvester-default-vcpus", 0, "Per-VM vCPU count (default: 2) [$SPAWN_HARVESTER_DEFAULT_VCPUS]")
 	cmd.Flags().IntVar(&spawnHarvesterDefaultMemMi, "spawn-harvester-default-mem-mi", 0, "Per-VM memory in MiB (default: 4096) [$SPAWN_HARVESTER_DEFAULT_MEM_MI]")
 	cmd.Flags().IntVar(&spawnHarvesterDefaultDiskGi, "spawn-harvester-default-disk-gi", 0, "Per-VM OS disk in GiB (default: 20) [$SPAWN_HARVESTER_DEFAULT_DISK_GI]")
-	cmd.Flags().StringVar(&spawnHarvesterSSHUser, "spawn-harvester-ssh-user", os.Getenv("SPAWN_HARVESTER_SSH_USER"), "Cloud-init-provisioned SSH user inside the VM (default: ubuntu) [$SPAWN_HARVESTER_SSH_USER]")
+	cmd.Flags().StringVar(&spawnHarvesterSSHUser, "spawn-harvester-ssh-user", os.Getenv("SPAWN_HARVESTER_SSH_USER"), "Cloud-init-provisioned SSH user inside the VM (default: agent, matching the spawn pod's uid-1000 user for home-parity) [$SPAWN_HARVESTER_SSH_USER]")
 
 	// Service management subcommands.
 	cmd.AddCommand(
