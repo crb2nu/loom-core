@@ -35,6 +35,7 @@ func handleAgentLoopRun(ctx context.Context, args map[string]any) (*mcp.CallTool
 	maxRounds := v.Int("max_rounds", 20)
 	systemTokens := v.Int("system_tokens", 0)
 	temperature := v.Float("temperature", 0)
+	wantPrefixHit := v.Bool("want_prefix_hit", true)
 	if systemTokens <= 0 {
 		systemTokens = agentloop.EstimateTokens(system)
 	}
@@ -48,10 +49,11 @@ func handleAgentLoopRun(ctx context.Context, args map[string]any) (*mcp.CallTool
 		return mcp.ErrorResult(err), nil
 	}
 	client, err := agentloop.NewChatClient(agentloop.ChatClientConfig{
-		Endpoint:    endpoint,
-		Model:       model,
-		CacheKey:    session,
-		Temperature: temperature,
+		Endpoint:      endpoint,
+		Model:         model,
+		CacheKey:      session,
+		Temperature:   temperature,
+		WantPrefixHit: wantPrefixHit,
 	})
 	if err != nil {
 		return mcp.ErrorResult(err), nil
