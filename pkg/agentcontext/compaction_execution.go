@@ -38,11 +38,9 @@ func (cs *CompactionScheduler) runCompaction(ctx context.Context) (*CompactionSt
 		}
 	}
 
-	// Get initial state
 	hierStats := cs.hierarchy.Stats()
 	stats.TokensBefore = int64(hierStats.TotalTokens)
 
-	// Record initial tier states
 	stats.TierStats["working"] = TierCompactionStats{
 		ItemsBefore:    hierStats.WorkingMemory.ItemCount,
 		CapacityBefore: cs.calculateCapacity(hierStats.WorkingMemory.ItemCount, hierStats.WorkingMemory.TokenCount),
@@ -63,7 +61,6 @@ func (cs *CompactionScheduler) runCompaction(ctx context.Context) (*CompactionSt
 	promoted := cs.runPromotionDemotion(ctx)
 	stats.ItemsPromoted = promoted
 
-	// Process each tier
 	processedCount := 0
 
 	// Phase 1: Compress old items in working memory
@@ -86,12 +83,10 @@ func (cs *CompactionScheduler) runCompaction(ctx context.Context) (*CompactionSt
 
 	stats.ItemsProcessed = processedCount
 
-	// Get final state
 	finalStats := cs.hierarchy.Stats()
 	stats.TokensAfter = int64(finalStats.TotalTokens)
 	stats.TokensSaved = stats.TokensBefore - stats.TokensAfter
 
-	// Update final tier states
 	if ts, ok := stats.TierStats["working"]; ok {
 		ts.ItemsAfter = finalStats.WorkingMemory.ItemCount
 		ts.CapacityAfter = cs.calculateCapacity(finalStats.WorkingMemory.ItemCount, finalStats.WorkingMemory.TokenCount)

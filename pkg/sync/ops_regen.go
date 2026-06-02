@@ -123,6 +123,14 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 		if p.SkillsTarget == "codex" {
 			outputDir = ""
 		}
+		// zed/opencode write SKILL.md bundles under <SkillsHomePath>, which may
+		// differ from the MCP-config HomeDir (Zed's config lives in
+		// Library/Application Support/Zed but its skills home is
+		// $HOME/.config/zed/skills). The generator appends skills/<name>, so
+		// point OutputDir at the parent of SkillsHomePath.
+		if (p.SkillsTarget == "zed" || p.SkillsTarget == "opencode") && p.SkillsHomePath != "" {
+			outputDir = filepath.Dir(os.ExpandEnv(p.SkillsHomePath))
+		}
 	}
 
 	gen, err := skills.NewGenerator(skills.GeneratorOptions{
@@ -170,6 +178,11 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 	manifestDir := repoPath
 	if p.SkillsDirectToHome {
 		manifestDir = m.ResolveHomePath(p)
+		// zed/opencode write under the parent of SkillsHomePath (see outputDir
+		// above); the manifest lands there too.
+		if (p.SkillsTarget == "zed" || p.SkillsTarget == "opencode") && p.SkillsHomePath != "" {
+			manifestDir = filepath.Dir(os.ExpandEnv(p.SkillsHomePath))
+		}
 	}
 	manifest, _ := skills.ReadManifest(manifestDir)
 	if manifest != nil {

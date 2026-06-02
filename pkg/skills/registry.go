@@ -203,6 +203,12 @@ func (s *Skill) ResolveInstructions(target, codexHome, skillSourceDir string) st
 	case "gemini":
 		// For Gemini, use actual paths (similar to Claude)
 		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", skillSourceDir)
+	case "zed":
+		// Zed reads SKILL.md bundles from $HOME/.config/zed/skills/<name>.
+		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", fmt.Sprintf("$HOME/.config/zed/skills/%s", s.Name))
+	case "opencode":
+		// OpenCode reads SKILL.md bundles from $HOME/.config/opencode/skills/<name>.
+		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", fmt.Sprintf("$HOME/.config/opencode/skills/%s", s.Name))
 	}
 
 	// Restore escaped references to literal ${...}.

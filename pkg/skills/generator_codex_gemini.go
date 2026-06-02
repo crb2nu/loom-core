@@ -99,6 +99,13 @@ func (g *Generator) generateCodexSkill(skill *Skill) error {
 
 // generateCodexSkillMD generates the SKILL.md content for a Codex skill.
 func (g *Generator) generateCodexSkillMD(skill *Skill) string {
+	return g.generateBundleSkillMD(skill, "codex")
+}
+
+// generateBundleSkillMD builds the Anthropic-compatible SKILL.md content for
+// any SKILL.md-format target (codex, zed, opencode). The target only affects
+// ${SKILL_PATH}/${CODEX_HOME} resolution in the instructions body.
+func (g *Generator) generateBundleSkillMD(skill *Skill, target string) string {
 	var sb strings.Builder
 
 	// YAML frontmatter
@@ -118,7 +125,7 @@ func (g *Generator) generateCodexSkillMD(skill *Skill) string {
 
 	// Instructions body with resolved paths
 	sourceSkillDir := filepath.Join(g.SourceDir, skill.Name)
-	instructions := skill.ResolveInstructions("codex", g.CodexHome, sourceSkillDir)
+	instructions := skill.ResolveInstructions(target, g.CodexHome, sourceSkillDir)
 	sb.WriteString(instructions)
 
 	// Bundled Resources section (only if resources exist)

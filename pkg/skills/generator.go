@@ -163,6 +163,11 @@ func (g *Generator) generateForTarget(target string) error {
 			if err == nil {
 				files = append(files, g.geminiManifestFiles(skill)...)
 			}
+		case "zed", "opencode":
+			err = g.generateBundleSkill(skill, target)
+			if err == nil {
+				files = append(files, g.codexManifestFiles(skill)...)
+			}
 		default:
 			return fmt.Errorf("unknown target: %s", target)
 		}
