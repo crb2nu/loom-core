@@ -62,7 +62,11 @@ the deployed HUD API from inside the cluster (`k8s_exec` into pod
   (e.g. `{"server":"agent_context","tool":"agent_context_search","agent_id":"",
   "target":"local"}`).
 
-**Why Slices 1+2 are inert on this path.** `emitAudit`
+**Why Slices 1+2 are inert on this path** (⚠️ PARTIALLY SUPERSEDED — see
+"Correction 2026-06-02" below: the local proxy→daemon path is **not** inert; it
+stamps the stable id correctly. The empty-`agent_id` entries are two distinct
+populations, and the real cross-host fix is relocated to `buildForwardRequest`).
+`emitAudit`
 (`internal/daemon/daemon_call.go:219`) publishes `EventToolCall` only
 `if d.eventBus != nil && params.SessionID != ""`, and stamps the audit with
 `agentID`. For interactive-agent calls reaching the **central** daemon via the
@@ -85,6 +89,70 @@ call params for proxy-routed calls — set `LOOM_AGENT_ID` (read in
 hooks register, and ensure the central daemon receives `params.SessionID` +
 `params.AgentID` for `target:local` interactive calls. Re-run THIS kill-test
 against the deployed HUD before any further downstream work.
+
+## Correction 2026-06-02 (local rebuild + isolated kill-test)
+
+The "rebuild local HUD + retest" path was run with a fresh isolated daemon built
+from current `main` (`b0129e86`). Two claims in the deployed-kill-test verdict
+above are corrected by **live evidence** (raw audit kept at `/tmp/kt/audit.jsonl`):
+
+**1. The merged correlation code is NOT inert — the proxy→daemon path stamps the
+stable id correctly.** Driving one `loom proxy --agent-hint claude-code` tool call
+(`time__get_current_time`) through an isolated current-`main` daemon with
+`LOOM_AUDIT_ENABLED=true` produced this audit entry:
+
+```json
+{"agent_id":"claude-code-2236829634","server":"time","tool":"get_current_time","status":"success"}
+```
+
+`claude-code-<cksum>` is exactly the workspace-scoped base the HUD base-matches
+(`agentIDMatchesSession`). So Slice 1 (proxy derivation) + Slice 2 (HUD base-match)
+DO work end-to-end for an interactive call that reaches the daemon **the proxy is
+connected to**. The cksum differs from 552019522 only because the isolated daemon's
+git-toplevel differed; the form is identical.
+
+**2. The empty-`agent_id` entries are TWO distinct populations, not one.**
+- (a) **The HUD's own background fleet-monitor polls.** The same isolated run wrote
+  **28** `agent_id:""` entries — all `agent_session_list` / `agent_memory_stats` /
+  `agent_context_search` / `devbox_summary` / `codebase_stats`, i.e. the embedded
+  HUD's monitor polling its own backends. These legitimately have no agent identity
+  (they originate from the daemon/HUD, not a proxy). The deployed central daemon
+  runs the same embedded HUD → most of its 48k `agent_id:""` lines are this noise,
+  **not** interactive calls. The prior verdict mistook this noise for the dev
+  session's calls.
+- (b) **Genuinely hub-forwarded interactive calls that lose identity in transit.**
+  `agent_context` + `devbox` are hub-delegated by default
+  (`internal/daemon/hub_delegate.go:18-20`). This session's `--hub-prefer` daemon
+  forwards those calls over the hub to the **central** daemon, where they execute
+  `target:local` and are re-audited. But the forwarded request is built by
+  `buildForwardRequest` (`internal/daemon/callpipeline_stages.go:302-334`) as a
+  **bare standard `tools/call`** (`{name, arguments}`) — it does NOT carry
+  `p.params.AgentID` / `p.params.SessionID`. So the central daemon's `callParams`
+  parse them as empty → central audit stamps `agent_id:""`.
+
+**3. The prior "local test was stale code" diagnosis was also wrong.** The running
+local daemon is `~/.local/bin/loomd` (started `Jun 1 18:54`, **after** `f30b37e8`
+merged `18:51`) — not the repo `bin/loomd` (26 May) the prior session checked. The
+local kill-test showed `trace_enabled:false` simply because the local daemon has
+**audit disabled** (no `~/.config/loom/audit.jsonl`). With audit enabled, traces
+render.
+
+**Relocated keystone fix.** The cross-host (central-HUD) gap is NOT "the central
+daemon's call params" in isolation, and NOT `--agent-hint`/`LOOM_AGENT_ID` (already
+set; local stamping already works). It is the **forwarding** daemon's hub egress:
+`buildForwardRequest` must inject `agent_id` + `session_id` into `forwardParams`
+when `p.target == hub`, so the receiving central daemon stamps them.
+
+**UNVERIFIED sub-assumption (gate before shipping the fix):** that the central
+daemon's hub ingress parses `agent_id`/`session_id` out of an incoming `tools/call`
+params blob into its own `callParams`. If it does not, the egress injection is
+inert and the ingress must be patched too. Verify this (read the central daemon's
+hub-server request handling, or add the injection + a deployed re-test) BEFORE
+declaring the fix done.
+
+**Same-host path (free win):** for the LOCAL HUD to show an interactive session's
+calls, only **enable audit on the local daemon** — no code change. The correlation
+already works there (proven above).
 
 ## Verified facts (2026-06-01, this machine)
 
