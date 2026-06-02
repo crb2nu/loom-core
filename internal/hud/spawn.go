@@ -720,6 +720,11 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	if sessErr == nil && sessRes != nil {
 		spawnSessionID = sessRes.SessionID
 	}
+	// Persist the session ID on the durable state so terminal transitions
+	// (completeSpawn/failSpawn → persistTelemetrySummary) can write the
+	// telemetry summary under a real, existing session. The state is flushed
+	// to the controller below when we mark the spawn running.
+	state.SessionID = spawnSessionID
 	sessSpan.End()
 
 	// Mark running and broadcast event.
@@ -1247,13 +1252,18 @@ func (o *SpawnOrchestrator) failSpawn(ctx context.Context, state *SpawnState, re
 	o.logger.Error("spawn failed", "spawn_id", state.SpawnID, "reason", reason)
 	o.broadcastSpawnEvent("agent.spawn.failed", state)
 
-	// Record failure and end the agent session.
+	// Record failure and end the agent session. Resolve the spawn's session
+	// so agent_context_add lands the error entry instead of being rejected
+	// for an empty session_id (skip the write when no session resolves).
+	failSessionID := o.resolveSpawnSessionID(state)
 	go func() {
-		_ = o.agentBridge.ContextAdd("", []map[string]any{{
-			"entry_type": "error",
-			"title":      "Spawn failed: " + state.SpawnID,
-			"content":    reason,
-		}})
+		if failSessionID != "" {
+			_ = o.agentBridge.ContextAdd(failSessionID, []map[string]any{{
+				"entry_type": "error",
+				"title":      "Spawn failed: " + state.SpawnID,
+				"content":    reason,
+			}})
+		}
 		summarize := false
 		o.agentBridge.EndSession(bridge.SessionEndParams{AgentID: state.AgentID, Summarize: &summarize})
 	}()
@@ -1394,6 +1404,34 @@ func (o *SpawnOrchestrator) recordSpawnTelemetryMetrics(ctx context.Context, sta
 	}
 }
 
+// resolveSpawnSessionID returns the agent-context session ID under which this
+// spawn's telemetry and error entries should be recorded. Resolution order:
+//
+//  1. state.SessionID — the session created for this spawn at spawn-start.
+//  2. state.Request.ParentSessionID — the proxy session that originated it.
+//  3. the agent's currently-active session, looked up by agent_id.
+//
+// Returns "" when none resolves (e.g., the spawn failed before its session was
+// registered, or agent-context is unreachable). Callers must skip persistence
+// on an empty result — agent_context_add rejects an empty session_id.
+func (o *SpawnOrchestrator) resolveSpawnSessionID(state *SpawnState) string {
+	if state == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(state.SessionID); id != "" {
+		return id
+	}
+	if id := strings.TrimSpace(state.Request.ParentSessionID); id != "" {
+		return id
+	}
+	if o.agentBridge != nil && strings.TrimSpace(state.AgentID) != "" {
+		if active, err := o.agentBridge.GetActiveSession(state.AgentID); err == nil && active != nil {
+			return active.ID
+		}
+	}
+	return ""
+}
+
 // persistTelemetrySummary writes a structured telemetry summary to the
 // agent-context session associated with this spawn. Called from completeSpawn
 // and failSpawn after the telemetry snapshot has been attached to state.
@@ -1409,6 +1447,18 @@ func (o *SpawnOrchestrator) persistTelemetrySummary(state *SpawnState, status st
 		return
 	}
 	if state.Telemetry == nil {
+		return
+	}
+
+	// agent_context_add requires a session_id that resolves to an existing
+	// session. Resolve one from the spawn's own session (set at spawn-start)
+	// before falling back to the originating proxy session. If neither
+	// resolves, skip the persist rather than emit a guaranteed-to-fail call
+	// that floods logs with "session_id: is required".
+	sessionID := o.resolveSpawnSessionID(state)
+	if sessionID == "" {
+		o.logger.Debug("skipping spawn telemetry summary persist: no session id",
+			"spawn_id", state.SpawnID)
 		return
 	}
 
@@ -1456,7 +1506,7 @@ func (o *SpawnOrchestrator) persistTelemetrySummary(state *SpawnState, status st
 		defer cancel()
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- o.agentBridge.ContextAdd("", []map[string]any{entry})
+			errCh <- o.agentBridge.ContextAdd(sessionID, []map[string]any{entry})
 		}()
 		select {
 		case err := <-errCh:
