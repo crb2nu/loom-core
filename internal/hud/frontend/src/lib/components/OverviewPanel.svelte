@@ -321,7 +321,11 @@
         route: 'fleet',
         label: 'Attention',
         action: leadAgent?.session_id ? 'Session' : 'Traces',
-        value: `${coordinationSummary.agents_needing_attention} agent${coordinationSummary.agents_needing_attention === 1 ? '' : 's'}`,
+        // "flagged", not "agents": this is a needs-review backlog from the
+        // coordination engine that can exceed the live-agent count — labeling
+        // it "N agents" right next to the "2 live agents" status reads as a
+        // contradiction (e.g. "22 agents" when only 2 are live).
+        value: `${coordinationSummary.agents_needing_attention} flagged`,
         detail: leadAgent
           ? `${leadAgent.agent_id} · ${leadAgent.attention_reasons?.[0] || 'needs review'}`
           : 'Needs review',
@@ -400,7 +404,7 @@
     <InboxDeck cards={inboxCards} />
 
     <section class="live-sessions-section">
-      <LiveSessionsCard agentCount={agentCount} />
+      <LiveSessionsCard agentCount={agentCount} sessionCount={sessionCount} />
     </section>
 
     <MillsKPIRow />
