@@ -139,7 +139,8 @@ backend-resolution wiring has a prod gap the unit tests don't cover, and
 Phase B/C/D are all premature. We'd reopen the spawn-execution
 investigation (`.loom/119`) against the VM path specifically.
 
-**Status**: not run (gated on Slice A1 wiring).
+**Status**: not run (Slice A1 wiring **DONE 2026-06-01**; A2 kill-test not yet
+run). Evidence: `.loom/local/handoffs/mills-harvester-vm-slice-a1-canary-2026-06-01.md`.
 
 > This kill-test gates the entire rest of the plan. Phases B, C, D do not
 > start until Phase A produces one real autonomous merge.
@@ -153,7 +154,18 @@ investigation (`.loom/119`) against the VM path specifically.
 The single highest-leverage work. Until one canary merges unattended
 through harvester-vm, every other improvement is speculative.
 
-**Slice A1 — Wire harvester-vm into the prod spawn path.**
+**Slice A1 — Wire harvester-vm into the prod spawn path. ✅ DONE 2026-06-01.**
+Evidence: `.loom/local/handoffs/mills-harvester-vm-slice-a1-canary-2026-06-01.md`.
+Shipped via [loom-core!587](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/587)
+(mobile-hud mounts the scoped kubeconfig + `SPAWN_HARVESTER_KUBECONFIG`) on top of
+the least-privilege SA work ([gitops!199](https://gitlab.flexinfer.ai/platform/gitops/-/merge_requests/199)
++ [gitops!201](https://gitlab.flexinfer.ai/platform/gitops/-/merge_requests/201)).
+Confirmed live: `available="[k8s harvester-vm]"`, no RBAC errors; an
+operator-path canary (`PIPE-MILLS-CANARY-20260601-233435`) routed its implement
+stage to harvester-vm and provably spawned VMI `spawn-spawn-64e203df77f5` (+ Bound
+20Gi PVC) via the scoped `mills-spawn` SA, zero forbidden. VM cascade-cleaned on
+Stop. **Caveat for A2**: routing was reverted right after the spawn, so only the
+implement stage ran on the VM — no end-to-end merge yet.
 - Set `--spawn-harvester-kubeconfig` (+ base-image, namespace,
   storage-class, network-attach-def) on the operator/HUD deployment from
   the existing `harvester-kubeconfig` secret
