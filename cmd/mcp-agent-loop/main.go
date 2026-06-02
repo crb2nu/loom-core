@@ -91,6 +91,10 @@ func run(ctx context.Context) error {
 					"type":        "number",
 					"description": "Sampling temperature. Default 0.",
 				},
+				"want_prefix_hit": map[string]any{
+					"type":        "boolean",
+					"description": "Ask the proxy for the engine prefix-cache hit rate (X-Flexinfer-Prefix-Cache-Hit-Rate) — the direct signal when the engine omits cached_tokens. Default true.",
+				},
 			},
 			Required: []string{"model", "prompt"},
 		},
