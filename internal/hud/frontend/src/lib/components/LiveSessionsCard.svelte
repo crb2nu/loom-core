@@ -20,7 +20,14 @@
   // from "agents connected but idle between turns". Without this, operators
   // who saw N live agents in the footer + zero sessions assumed something
   // was wrong with the spectator pipeline (it was just idle).
-  let { agentCount = 0 }: { agentCount?: number } = $props();
+  //
+  // sessionCount is the canonical active-session count from the fleet snapshot
+  // (`fleetStore.activeSessions.length`) — the SAME source the status bar uses.
+  // The headline reads it directly so this card and the status bar can never
+  // disagree (previously the headline counted SSE-store entries, which drift
+  // from the REST snapshot by a session or two — the "18 active vs 17 active
+  // sessions" jank). The row list below still streams from liveSessionsStore.
+  let { agentCount = 0, sessionCount }: { agentCount?: number; sessionCount?: number } = $props();
 
   let expandedSessionID: string | null = $state(null);
 
@@ -34,7 +41,9 @@
   });
 
   let sessions = $derived(liveSessionsStore.visibleSessions);
-  let activeCount = $derived(liveSessionsStore.activeSessionCount);
+  // Prefer the canonical fleet-snapshot count; fall back to the SSE store only
+  // when this card is mounted standalone without the prop.
+  let activeCount = $derived(sessionCount ?? liveSessionsStore.activeSessionCount);
   let inFlightCount = $derived(liveSessionsStore.inFlightCallCount);
 
   function toggleExpand(sid: string) {

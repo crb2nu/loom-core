@@ -164,9 +164,17 @@
     background: var(--bg-primary); border: 1px solid var(--border-subtle);
     border-radius: var(--radius-sm); color: var(--fg-secondary);
   }
+  /* Match the shared EmptyState icon chip (bordered circle) so empty states
+     read with one visual language across panels, while keeping this banner's
+     compact inline layout. */
   .econ-empty-icon {
-    font-size: 18px; opacity: 0.7; color: var(--fg-dim);
+    font-size: 16px; opacity: 0.9; color: var(--fg-secondary);
     flex: 0 0 auto;
+    width: 32px; height: 32px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
   }
   .econ-empty-text { display: flex; flex-direction: column; gap: 2px; }
   .econ-empty-heading {

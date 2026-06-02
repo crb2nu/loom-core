@@ -71,6 +71,10 @@
   .command-section {
     display: grid;
     grid-template-columns: 1fr minmax(260px, 0.5fr);
+    /* Center the short headline block against the taller attention-lane
+       column so it doesn't float at the top with a large void beneath it
+       when several lanes are present. */
+    align-items: center;
     width: 100%;
     max-width: 100%;
     min-width: 0;
