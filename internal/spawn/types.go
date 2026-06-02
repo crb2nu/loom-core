@@ -161,8 +161,16 @@ const (
 
 // State holds the state of a spawned agent.
 type State struct {
-	SpawnID   string                 `json:"spawn_id"`
-	AgentID   string                 `json:"agent_id"`
+	SpawnID string `json:"spawn_id"`
+	AgentID string `json:"agent_id"`
+	// SessionID is the agent-context session created for this spawn at
+	// spawn-start (via AgentBridge.StartSession). It is the durable home for
+	// the spawn's telemetry summary and error entries. Without it, terminal
+	// transitions call agent_context_add with an empty session_id, which the
+	// store rejects with "session_id: is required" — silently dropping the
+	// agent's turn-level telemetry. Empty when the spawn failed before the
+	// session was registered.
+	SessionID string                 `json:"session_id,omitempty"`
 	PodName   string                 `json:"pod_name"`
 	Status    Status                 `json:"status"`
 	Request   Request                `json:"request"`
