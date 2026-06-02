@@ -395,3 +395,59 @@ func TestCoerceStringSlice(t *testing.T) {
 		})
 	}
 }
+
+// TestCheck_DataToolNotBlockedByCommandGuardrail is a regression test: recording
+// a note that merely mentions a blocked command via a non-execution tool (e.g.
+// agent_context_add) must NOT be denied. Command guardrails are scoped to
+// command-executing tools.
+func TestCheck_DataToolNotBlockedByCommandGuardrail(t *testing.T) {
+	reg := testRegistryWithGuardrails(map[string]any{
+		"gitops_flux": map[string]any{
+			"blocked_commands": []any{"kubectl apply", "kubectl rollout restart"},
+			"message":          "blocked",
+		},
+	})
+	engine := NewEngineFromRegistry(reg)
+
+	note := []byte(`{"entries":[{"content":"Mitigation: ran kubectl rollout restart deploy/loom-gateway; durable fix is the kubectl apply via GitOps."}]}`)
+	if _, blocked := engine.Check("agent_context_add", note); blocked {
+		t.Fatal("data tool recording a note must not be blocked by a command guardrail")
+	}
+}
+
+// TestCheck_ExecToolStillBlocked confirms the guardrail still denies a real
+// kubectl mutation issued through a command-executing tool.
+func TestCheck_ExecToolStillBlocked(t *testing.T) {
+	reg := testRegistryWithGuardrails(map[string]any{
+		"gitops_flux": map[string]any{
+			"blocked_commands": []any{"kubectl apply"},
+			"message":          "blocked",
+		},
+	})
+	engine := NewEngineFromRegistry(reg)
+
+	call := []byte(`{"command":"kubectl apply -f manifest.yaml"}`)
+	for _, tool := range []string{"server_execSafe", "devbox_exec", "server_sshCommand", "router_execCommand"} {
+		if _, blocked := engine.Check(tool, call); !blocked {
+			t.Errorf("exec tool %q running 'kubectl apply' must be blocked", tool)
+		}
+	}
+}
+
+// TestCheck_AppliesToWildcard verifies applies_to:["*"] opts back into matching
+// every tool (legacy unscoped behavior).
+func TestCheck_AppliesToWildcard(t *testing.T) {
+	reg := testRegistryWithGuardrails(map[string]any{
+		"gitops_flux": map[string]any{
+			"blocked_commands": []any{"kubectl apply"},
+			"applies_to":       []any{"*"},
+			"message":          "blocked",
+		},
+	})
+	engine := NewEngineFromRegistry(reg)
+
+	note := []byte(`{"content":"kubectl apply -f x.yaml"}`)
+	if _, blocked := engine.Check("agent_context_add", note); !blocked {
+		t.Fatal("applies_to:[*] should match every tool, including data tools")
+	}
+}

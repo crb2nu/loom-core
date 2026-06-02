@@ -1,7 +1,22 @@
 name: gitops_flux
 description: >-
-  Block direct kubectl mutations that bypass GitOps. Operators should edit
-  manifests in platform/gitops/, commit, push, and let Flux reconcile.
+  Block raw kubectl mutations that bypass GitOps. For spec changes, edit
+  manifests in platform/gitops/, commit, push, and let Flux reconcile. For
+  GitOps-safe operations (cycling pods, rolling restarts) use the ops_mcp tools.
+# applies_to scopes this command guardrail to command-executing tools only
+# (shells, exec, ssh, run_repo_script). Data/recording tools such as
+# agent_context_add are NOT gated, so a note that merely mentions a kubectl
+# command is not denied. Use applies_to: ["*"] to match every tool. When
+# omitted, the policy engine defaults to this same exec-tool scope.
+applies_to:
+  - "exec"
+  - "ssh"
+  - "command"
+  - "bash"
+  - "shell"
+  - "script"
+  - "run_repo"
+  - "terminal"
 blocked_commands:
   - "kubectl apply"
   - "kubectl delete"
@@ -14,5 +29,7 @@ blocked_commands:
   - "kubectl rollout restart"
   - "kubectl rollout undo"
 message: >-
-  GitOps policy: Direct kubectl mutations bypass git history and Flux reconciliation.
-  Edit manifests in platform/gitops/, commit, push, then run flux reconcile.
+  GitOps policy: raw kubectl mutations are blocked here. For spec changes, edit
+  manifests in platform/gitops/, commit, push, then run flux reconcile. For
+  GitOps-safe operations (cycling pods, rolling restarts) use the ops_mcp tools
+  instead: k8s_rollout_restart, k8s_delete_pod, k8s_rollout_status.

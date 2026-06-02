@@ -137,6 +137,21 @@ func handleKubectl(args []string) {
 		return
 	}
 
+	if strings.Contains(cmdStr, "rollout restart deployment/test-deploy") {
+		fmt.Println("deployment.apps/test-deploy restarted")
+		return
+	}
+
+	if strings.Contains(cmdStr, "rollout status deployment/test-deploy") {
+		fmt.Println("deployment \"test-deploy\" successfully rolled out")
+		return
+	}
+
+	if strings.Contains(cmdStr, "delete pod my-pod --wait=false") {
+		fmt.Println("pod \"my-pod\" deleted")
+		return
+	}
+
 	// Default fallback
 	fmt.Printf("Mock kubectl executed: %s\n", cmdStr)
 }
@@ -237,5 +252,104 @@ func TestHandleVipLabelNode(t *testing.T) {
 	content := result.Content[0].Text
 	if !strings.Contains(content, "labeled") {
 		t.Errorf("Expected output to contain 'labeled', got %s", content)
+	}
+}
+
+func TestHandleRolloutRestart(t *testing.T) {
+	execCommand = fakeExecCommand
+	defer func() { execCommand = exec.CommandContext }()
+
+	ctx := context.Background()
+	result, err := handleRolloutRestart(ctx, map[string]any{
+		"namespace":  "default",
+		"name":       "test-deploy",
+		"kubeconfig": "/tmp/kubeconfig",
+	})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Expected success, got error: %s", result.Content[0].Text)
+	}
+	if !strings.Contains(result.Content[0].Text, "restarted") {
+		t.Errorf("Expected output to contain 'restarted', got %s", result.Content[0].Text)
+	}
+}
+
+func TestHandleRolloutRestart_RejectsBadKind(t *testing.T) {
+	execCommand = fakeExecCommand
+	defer func() { execCommand = exec.CommandContext }()
+
+	result, err := handleRolloutRestart(context.Background(), map[string]any{
+		"namespace": "default",
+		"name":      "test-deploy",
+		"kind":      "configmap",
+	})
+	if err != nil {
+		t.Fatalf("Expected no transport error, got %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("Expected error result for unsupported kind, got success")
+	}
+}
+
+func TestHandleRolloutStatus(t *testing.T) {
+	execCommand = fakeExecCommand
+	defer func() { execCommand = exec.CommandContext }()
+
+	result, err := handleRolloutStatus(context.Background(), map[string]any{
+		"namespace": "default",
+		"name":      "test-deploy",
+	})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if !strings.Contains(result.Content[0].Text, "successfully rolled out") {
+		t.Errorf("Expected rollout status output, got %s", result.Content[0].Text)
+	}
+}
+
+func TestHandleDeletePod(t *testing.T) {
+	execCommand = fakeExecCommand
+	defer func() { execCommand = exec.CommandContext }()
+
+	result, err := handleDeletePod(context.Background(), map[string]any{
+		"namespace": "default",
+		"name":      "my-pod",
+	})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if !strings.Contains(result.Content[0].Text, "deleted") {
+		t.Errorf("Expected output to contain 'deleted', got %s", result.Content[0].Text)
+	}
+}
+
+func TestResolveKubeconfig(t *testing.T) {
+	dir := t.TempDir()
+	existing := dir + "/exists.yaml"
+	if err := os.WriteFile(existing, []byte("apiVersion: v1\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	t.Setenv("KUBECONFIG", "")
+
+	// Explicit path that exists is used as-is.
+	if got := resolveKubeconfig(existing); got != existing {
+		t.Errorf("explicit existing: got %q want %q", got, existing)
+	}
+
+	// Explicit path that does NOT exist falls through; with KUBECONFIG empty and
+	// (typically) no ~/.kube files in CI, it returns the explicit value so
+	// kubectl emits a clear error rather than silently using a wrong config.
+	missing := dir + "/missing.yaml"
+	if got := resolveKubeconfig(missing); got != missing && got == "" {
+		t.Errorf("explicit missing: expected a non-empty fallback, got %q", got)
+	}
+
+	// KUBECONFIG is honored when the explicit path is empty and it exists.
+	t.Setenv("KUBECONFIG", existing)
+	if got := resolveKubeconfig(""); got != existing {
+		t.Errorf("from KUBECONFIG: got %q want %q", got, existing)
 	}
 }

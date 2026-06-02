@@ -116,6 +116,55 @@ func registerTools(server *mcp.Server, wrap func(string, mcp.ToolHandler) mcp.To
 	}, wrap("k8s_delete_pods_by_phase", handleDeletePodsByPhase))
 
 	server.AddTool(mcp.Tool{
+		Name: "k8s_rollout_restart",
+		Description: "GitOps-safe rolling restart of a workload (adds the restartedAt " +
+			"annotation; cycles pods with the same spec, so it does not drift from Git). " +
+			"Use this instead of raw 'kubectl rollout restart'.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"namespace":  map[string]any{"type": "string"},
+				"name":       map[string]any{"type": "string"},
+				"kind":       map[string]any{"type": "string", "enum": []string{"deployment", "statefulset", "daemonset"}, "description": "Workload kind (default: deployment)"},
+				"kubeconfig": map[string]any{"type": "string"},
+			},
+			Required: []string{"namespace", "name"},
+		},
+	}, wrap("k8s_rollout_restart", handleRolloutRestart))
+
+	server.AddTool(mcp.Tool{
+		Name:        "k8s_rollout_status",
+		Description: "Wait for / report a workload's rollout status (read-only).",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"namespace":      map[string]any{"type": "string"},
+				"name":           map[string]any{"type": "string"},
+				"kind":           map[string]any{"type": "string", "enum": []string{"deployment", "statefulset", "daemonset"}, "description": "Workload kind (default: deployment)"},
+				"timeoutSeconds": map[string]any{"type": "integer", "description": "Max seconds to wait (default 60)"},
+				"kubeconfig":     map[string]any{"type": "string"},
+			},
+			Required: []string{"namespace", "name"},
+		},
+	}, wrap("k8s_rollout_status", handleRolloutStatus))
+
+	server.AddTool(mcp.Tool{
+		Name: "k8s_delete_pod",
+		Description: "GitOps-safe delete of a single pod by name (the owning controller " +
+			"recreates it from the Git-managed spec). Use this to cycle one pod instead " +
+			"of raw 'kubectl delete pod'.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"namespace":  map[string]any{"type": "string"},
+				"name":       map[string]any{"type": "string"},
+				"kubeconfig": map[string]any{"type": "string"},
+			},
+			Required: []string{"namespace", "name"},
+		},
+	}, wrap("k8s_delete_pod", handleDeletePod))
+
+	server.AddTool(mcp.Tool{
 		Name:        "vip_label_node",
 		Description: "Set kube-vip eligibility label on a node",
 		InputSchema: mcp.InputSchema{
@@ -218,13 +267,52 @@ func runKubectlStdoutOnly(ctx context.Context, kubeconfig string, args ...string
 	return runKubectlWithStderr(ctx, kubeconfig, false, args...)
 }
 
+// resolveKubeconfig returns the first kubeconfig path that exists, trying (in
+// order): the explicit value, $KUBECONFIG, the configured K3S_KUBECONFIG, and
+// the conventional ~/.kube/k3s.yaml and ~/.kube/config. This makes the tools
+// resilient when the configured path is absent — e.g. the registry sets
+// K3S_KUBECONFIG to platform/gitops/.kube/k3s.yaml (present in-cluster) but the
+// server runs locally where only ~/.kube/k3s.yaml exists. When nothing exists,
+// the explicit/configured value is returned so kubectl emits a clear error.
+func resolveKubeconfig(explicit string) string {
+	candidates := []string{
+		strings.TrimSpace(explicit),
+		strings.TrimSpace(os.Getenv("KUBECONFIG")),
+		k3sKubeconfig,
+		os.ExpandEnv("$HOME/.kube/k3s.yaml"),
+		os.ExpandEnv("$HOME/.kube/config"),
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		// KUBECONFIG may be a colon-separated list; honor it verbatim if any
+		// segment exists.
+		if strings.Contains(c, string(os.PathListSeparator)) {
+			for _, seg := range filepath.SplitList(c) {
+				if seg != "" {
+					if _, err := os.Stat(seg); err == nil {
+						return c
+					}
+				}
+			}
+			continue
+		}
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	if strings.TrimSpace(explicit) != "" {
+		return explicit
+	}
+	return k3sKubeconfig
+}
+
 func runKubectlWithStderr(ctx context.Context, kubeconfig string, includeStderrOnSuccess bool, args ...string) (string, error) {
 	ctx, cancel := withDefaultTimeout(ctx, "MCP_OPS_KUBECTL_TIMEOUT_SECONDS", 55)
 	defer cancel()
 
-	if kubeconfig == "" {
-		kubeconfig = k3sKubeconfig
-	}
+	kubeconfig = resolveKubeconfig(kubeconfig)
 	cmdArgs := make([]string, len(args))
 	copy(cmdArgs, args)
 	if kubeconfig != "" {
@@ -381,6 +469,75 @@ func handleDeletePodsByPhase(ctx context.Context, args map[string]any) (*mcp.Cal
 	delArgs := []string{"-n", ns, "delete", "pod", "--wait=false"}
 	delArgs = append(delArgs, toDelete...)
 	out, err = runKubectl(ctx, kc, delArgs...)
+	return formatResult(out, err)
+}
+
+// normalizeWorkloadKind maps a kind input to a kubectl resource type, defaulting
+// to deployment and rejecting anything outside the GitOps-safe rollout set.
+func normalizeWorkloadKind(kind string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "", "deploy", "deployment", "deployments":
+		return "deployment", nil
+	case "sts", "statefulset", "statefulsets":
+		return "statefulset", nil
+	case "ds", "daemonset", "daemonsets":
+		return "daemonset", nil
+	default:
+		return "", fmt.Errorf("unsupported kind %q (allowed: deployment, statefulset, daemonset)", kind)
+	}
+}
+
+func handleRolloutRestart(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	ns := v.Required("namespace")
+	name := v.Required("name")
+	kindIn := v.String("kind", "deployment")
+	kc := v.String("kubeconfig", "")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	kind, err := normalizeWorkloadKind(kindIn)
+	if err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+
+	out, err := runKubectl(ctx, kc, "-n", ns, "rollout", "restart", fmt.Sprintf("%s/%s", kind, name))
+	return formatResult(out, err)
+}
+
+func handleRolloutStatus(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	ns := v.Required("namespace")
+	name := v.Required("name")
+	kindIn := v.String("kind", "deployment")
+	timeoutSeconds := v.Int("timeoutSeconds", 60)
+	kc := v.String("kubeconfig", "")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	kind, err := normalizeWorkloadKind(kindIn)
+	if err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 60
+	}
+
+	out, err := runKubectl(ctx, kc, "-n", ns, "rollout", "status",
+		fmt.Sprintf("%s/%s", kind, name), fmt.Sprintf("--timeout=%ds", timeoutSeconds))
+	return formatResult(out, err)
+}
+
+func handleDeletePod(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	ns := v.Required("namespace")
+	name := v.Required("name")
+	kc := v.String("kubeconfig", "")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+
+	out, err := runKubectl(ctx, kc, "-n", ns, "delete", "pod", name, "--wait=false")
 	return formatResult(out, err)
 }
 
