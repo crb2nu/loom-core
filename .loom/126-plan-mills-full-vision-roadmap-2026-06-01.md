@@ -139,8 +139,21 @@ backend-resolution wiring has a prod gap the unit tests don't cover, and
 Phase B/C/D are all premature. We'd reopen the spawn-execution
 investigation (`.loom/119`) against the VM path specifically.
 
-**Status**: not run (Slice A1 wiring **DONE 2026-06-01**; A2 kill-test not yet
-run). Evidence: `.loom/local/handoffs/mills-harvester-vm-slice-a1-canary-2026-06-01.md`.
+**Status**: **FAILED 2026-06-02** — empty diff. North-star still 0.
+Slice A1 wiring DONE 2026-06-01
+(`.loom/local/handoffs/mills-harvester-vm-slice-a1-canary-2026-06-01.md`).
+A2 ran live (`PIPE-MILLS-CANARY-20260602-000708`, agent=codex) and reached the
+`mr` stage, but the substrate fix did **not** close the gap: codex executed
+**`turn_count=0`** on the VM (`spawn-ae6f26eb2085`: execute→complete in 0.3s;
+`spawn-bb92dc191161`: reaped `failed`), so the branch was empty (0 commits, MR
+`loom-core!598` closed). The failure is the `.loom/44` **agent-execution gap**
+reproduced on the VM path — NOT substrate routing or scoped-SA creds (those
+worked: VMs booted, zero forbidden, cascade-cleaned). Worktree-visibility is
+moot when the agent makes no changes. Evidence + next steps:
+`.loom/local/handoffs/mills-harvester-vm-slice-a2-killtest-2026-06-01.md`.
+**Phases B/C/D remain correctly gated.** Next investigation is the
+spawn-execution path (reopen `.loom/119` against the VM path), not the
+substrate plumbing.
 
 > This kill-test gates the entire rest of the plan. Phases B, C, D do not
 > start until Phase A produces one real autonomous merge.
