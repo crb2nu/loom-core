@@ -68,6 +68,20 @@ daemon with empty `session_id` AND empty `agent_id` (audit entries observed with
 2026-06-02". Slice 3 (distribution) and Slice 4 (hygiene) remain BLOCKED until the
 identity-propagation keystone lands and this kill-test passes.
 
+**Correction 2026-06-02 (local rebuild + isolated kill-test).** The root-cause
+phrasing above is refined by live evidence — see the correlation spec's
+"Correction 2026-06-02" section. Summary: (1) the merged sink+source are **not**
+inert — a `loom proxy --agent-hint claude-code` call through a current-`main`
+audit-enabled daemon publishes a `tool.call` and audits with the stable id
+`claude-code-<cksum>`; (2) the central daemon's `agent_id:""` lines are mostly the
+HUD's own background fleet-monitor polls, plus genuinely hub-forwarded interactive
+calls that lose identity at `buildForwardRequest`
+(`internal/daemon/callpipeline_stages.go:302-334`, a bare `tools/call`); (3) the
+local daemon merely had **audit disabled** (not stale code). The keystone for THIS
+channel's cross-host visibility is the same hub-egress injection in
+`buildForwardRequest` (so `params.SessionID` is non-empty on the central daemon →
+`EventToolCall` fires). For the LOCAL HUD, enabling audit is sufficient.
+
 ---
 
 ## Architecture trace (as-is)
