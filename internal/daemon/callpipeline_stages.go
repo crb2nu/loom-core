@@ -333,6 +333,21 @@ func (p *callPipeline) buildForwardRequest() (*mcp.Message, *mcp.Message) {
 		}
 	}
 
+	// Hub egress: propagate the interactive agent's identity into the forwarded
+	// params so the receiving (central) daemon stamps the audit entry + tool.call
+	// event with a non-empty agent_id and session_id. Without this, a proxy-routed
+	// call leaves this daemon as a bare {name, arguments} blob; the central daemon
+	// then audits agent_id:"" and the HUD's per-session activity panel cannot
+	// correlate the call back to its session (every "Live Sessions" row shows
+	// 0 calls). The receiving daemon parses these top-level fields via callParams
+	// (parseAndResolve). Local-target calls already stamp from p.params directly,
+	// so this only applies on hub egress.
+	if p.target == router.TargetHub {
+		if injected, ok := p.injectForwardIdentity(forwardParams); ok {
+			forwardParams = injected
+		}
+	}
+
 	req, err := mcp.NewRequest(p.msg.ID, p.method, forwardParams)
 	if err != nil {
 		span.RecordError(err)
@@ -340,6 +355,44 @@ func (p *callPipeline) buildForwardRequest() (*mcp.Message, *mcp.Message) {
 		return nil, p.internalErrorWithAudit(p.targetStr, err)
 	}
 	return req, nil
+}
+
+// injectForwardIdentity merges the call's effective agent_id, session_id, and
+// agent_type into a forwarded params object so a downstream daemon receiving
+// this request over the hub can stamp them. It returns (params, false) and
+// leaves the input untouched when there is nothing to inject or the params are
+// not a JSON object. The effective agent_id resolves from p.params.AgentID or,
+// when that is empty, the proxy session lease's presence id — the same value
+// this daemon would stamp locally.
+func (p *callPipeline) injectForwardIdentity(params json.RawMessage) (json.RawMessage, bool) {
+	agentID := p.daemon.resolveEffectiveAgentID(p.params)
+	sessionID := p.params.SessionID
+	if agentID == "" && sessionID == "" {
+		return params, false
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(params, &obj); err != nil || obj == nil {
+		// Non-object params (or undecodable): leave the request as-is rather
+		// than risk corrupting a payload we do not understand.
+		return params, false
+	}
+
+	if agentID != "" {
+		obj["agent_id"] = agentID
+	}
+	if sessionID != "" {
+		obj["session_id"] = sessionID
+	}
+	if p.params.AgentType != "" {
+		obj["agent_type"] = p.params.AgentType
+	}
+
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return params, false
+	}
+	return out, true
 }
 
 func (p *callPipeline) execute(req *mcp.Message) *mcp.Message {
