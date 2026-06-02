@@ -48,6 +48,19 @@ func (pe *ParallelEmbedder) SetTimeout(timeout time.Duration) {
 	pe.timeout = timeout
 }
 
+// splitBatches divides texts into consecutive batches of at most pe.batchSize.
+func (pe *ParallelEmbedder) splitBatches(texts []string) [][]string {
+	var batches [][]string
+	for i := 0; i < len(texts); i += pe.batchSize {
+		end := i + pe.batchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		batches = append(batches, texts[i:end])
+	}
+	return batches
+}
+
 // EmbedAll embeds all texts in parallel batches
 func (pe *ParallelEmbedder) EmbedAll(ctx context.Context, texts []string) ([][]float64, error) {
 	if len(texts) == 0 {
@@ -59,15 +72,7 @@ func (pe *ParallelEmbedder) EmbedAll(ctx context.Context, texts []string) ([][]f
 		return pe.embedFunc(ctx, texts)
 	}
 
-	// Split into batches
-	var batches [][]string
-	for i := 0; i < len(texts); i += pe.batchSize {
-		end := i + pe.batchSize
-		if end > len(texts) {
-			end = len(texts)
-		}
-		batches = append(batches, texts[i:end])
-	}
+	batches := pe.splitBatches(texts)
 
 	// Create result channels
 	resultCh := make(chan EmbedBatchResult, len(batches))
@@ -168,15 +173,7 @@ func (pe *ParallelEmbedder) EmbedStream(ctx context.Context, texts []string) <-c
 			return
 		}
 
-		// Split into batches
-		var batches [][]string
-		for i := 0; i < len(texts); i += pe.batchSize {
-			end := i + pe.batchSize
-			if end > len(texts) {
-				end = len(texts)
-			}
-			batches = append(batches, texts[i:end])
-		}
+		batches := pe.splitBatches(texts)
 
 		// Worker pool
 		var wg sync.WaitGroup
@@ -229,15 +226,7 @@ func (pe *ParallelEmbedder) EmbedWithProgress(ctx context.Context, texts []strin
 		return nil, nil
 	}
 
-	// Split into batches
-	var batches [][]string
-	for i := 0; i < len(texts); i += pe.batchSize {
-		end := i + pe.batchSize
-		if end > len(texts) {
-			end = len(texts)
-		}
-		batches = append(batches, texts[i:end])
-	}
+	batches := pe.splitBatches(texts)
 
 	progress := EmbedProgress{
 		Total:   len(batches),
