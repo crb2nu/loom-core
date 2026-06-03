@@ -375,6 +375,53 @@ func TestPipeline_RoundTrip(t *testing.T) {
 // PipelineRunning returns a state value; small helper to keep call site readable.
 func PipelineRunning() PipelineState { return PipelineImplementing }
 
+func TestPipeline_ListByMRIID(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	parent := &BacklogItem{
+		ID: "MILLS-MR", Title: "mr", State: BacklogQueued, Priority: P2, CreatedBy: "test",
+	}
+	if err := st.Backlog.Put(ctx, parent); err != nil {
+		t.Fatalf("put backlog: %v", err)
+	}
+
+	mr := int64(4242)
+	withMR := &PipelineRun{
+		ID: "PIPE-MR", BacklogID: parent.ID, Template: "mills-default-pipeline",
+		State: PipelineMerging, CurrentStage: "merge", Attempts: 1,
+		MRIID: &mr, StartedAt: time.Now().UTC(),
+	}
+	withoutMR := &PipelineRun{
+		ID: "PIPE-NOMR", BacklogID: parent.ID, Template: "mills-default-pipeline",
+		State: PipelineImplementing, CurrentStage: "implement", Attempts: 2,
+		StartedAt: time.Now().UTC(),
+	}
+	if err := st.Pipeline.PutRun(ctx, withMR); err != nil {
+		t.Fatalf("put withMR: %v", err)
+	}
+	if err := st.Pipeline.PutRun(ctx, withoutMR); err != nil {
+		t.Fatalf("put withoutMR: %v", err)
+	}
+
+	got, err := st.Pipeline.ListByMRIID(ctx, mr)
+	if err != nil {
+		t.Fatalf("ListByMRIID: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "PIPE-MR" {
+		t.Fatalf("ListByMRIID(%d) = %+v, want one run PIPE-MR", mr, got)
+	}
+
+	// Unknown iid → empty, no error.
+	none, err := st.Pipeline.ListByMRIID(ctx, 9999)
+	if err != nil {
+		t.Fatalf("ListByMRIID(unknown): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("ListByMRIID(unknown) = %+v, want empty", none)
+	}
+}
+
 func TestKPI_RoundTrip(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

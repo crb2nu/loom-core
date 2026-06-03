@@ -806,3 +806,54 @@ func TestParseLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestHandlePipelineRunsList_FiltersByMRIID(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := op.store.Backlog.Put(ctx, &store.BacklogItem{
+		ID: "MILLS-AUDIT", Title: "audit", State: store.BacklogQueued, Priority: store.P2, CreatedBy: "test",
+	}); err != nil {
+		t.Fatalf("seed backlog: %v", err)
+	}
+	mr := int64(777)
+	if err := op.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+		ID: "PIPE-AUDIT", BacklogID: "MILLS-AUDIT", Template: "mills-default-pipeline",
+		State: store.PipelineMerging, CurrentStage: "merge", Attempts: 1,
+		MRIID: &mr, StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+
+	// Match: terminal run surfaces via mr_iid even though it's not "active".
+	rec := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?mr_iid=777", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var runs []store.PipelineRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ID != "PIPE-AUDIT" {
+		t.Fatalf("mr_iid filter = %+v, want one run PIPE-AUDIT", runs)
+	}
+
+	// Unknown iid → 200 + [].
+	rec = httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?mr_iid=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unknown status: %d", rec.Code)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != "[]" {
+		t.Fatalf("unknown iid body = %q, want []", got)
+	}
+
+	// Non-integer iid → 400.
+	rec = httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?mr_iid=abc", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad iid status: %d, want 400", rec.Code)
+	}
+}
