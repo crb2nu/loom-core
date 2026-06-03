@@ -502,3 +502,105 @@ func TestListIssues_PropagatesServerError(t *testing.T) {
 
 var _ pipeline.GitLabClient = (*GitLabClient)(nil)
 var _ pipeline.IssueClient = (*GitLabClient)(nil)
+
+// ----- GetRawFile + CreateCommit (kill-switch GitOps auto-PR) -----
+
+// rawRoundTripper serves a fixed status + raw (non-JSON) body and records
+// the last request, for exercising the raw file-read path.
+type rawRoundTripper struct {
+	status  int
+	body    string
+	lastReq *http.Request
+	ua      string
+}
+
+func (rt *rawRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.lastReq = req
+	rt.ua = req.Header.Get("User-Agent")
+	return &http.Response{
+		StatusCode: rt.status,
+		Body:       io.NopCloser(strings.NewReader(rt.body)),
+		Header:     make(http.Header),
+	}, nil
+}
+
+func TestGitLabClient_GetRawFile(t *testing.T) {
+	cli, err := NewGitLabClient(GitLabConfig{
+		APIURL:    "https://gitlab.example/api/v4",
+		Token:     "tok-123",
+		Project:   "platform/gitops",
+		UserAgent: "loom-mills-operator/kill-switch",
+	})
+	if err != nil {
+		t.Fatalf("ctor: %v", err)
+	}
+	rt := &rawRoundTripper{status: 200, body: "version: 2\nenabled: true\n"}
+	cli.SetTransport(rt)
+
+	got, err := cli.GetRawFile(context.Background(), "k3s/mills/configmap-policy.yaml", "main")
+	if err != nil {
+		t.Fatalf("GetRawFile: %v", err)
+	}
+	if !strings.Contains(got, "enabled: true") {
+		t.Fatalf("raw content mismatch: %q", got)
+	}
+	// Path must be percent-encoded + carry the raw segment + ref query.
+	wantPath := "/projects/platform%2Fgitops/repository/files/k3s%2Fmills%2Fconfigmap-policy.yaml/raw"
+	if !strings.Contains(rt.lastReq.URL.RawPath, wantPath) {
+		t.Errorf("raw path = %q, want it to contain %q", rt.lastReq.URL.RawPath, wantPath)
+	}
+	if rt.lastReq.URL.Query().Get("ref") != "main" {
+		t.Errorf("ref = %q, want main", rt.lastReq.URL.Query().Get("ref"))
+	}
+	if rt.ua != "loom-mills-operator/kill-switch" {
+		t.Errorf("User-Agent = %q, want the configured UA", rt.ua)
+	}
+}
+
+func TestGitLabClient_GetRawFile_NotFound(t *testing.T) {
+	cli, _ := NewGitLabClient(GitLabConfig{
+		APIURL: "https://gitlab.example/api/v4", Token: "t", Project: "platform/gitops",
+	})
+	cli.SetTransport(&rawRoundTripper{status: 404, body: `{"message":"404 File Not Found"}`})
+	if _, err := cli.GetRawFile(context.Background(), "missing.yaml", "main"); err == nil {
+		t.Fatal("expected error on 404")
+	}
+}
+
+func TestGitLabClient_CreateCommit(t *testing.T) {
+	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"POST /api/v4/projects/services%2Floom-core/repository/commits": func(_ *http.Request) (int, any) {
+			return 201, map[string]any{"id": "abc123", "web_url": "https://gitlab.example/commit/abc123"}
+		},
+	})
+	got, err := cli.CreateCommit(context.Background(), CreateCommitRequest{
+		Branch:        "mills/kill-switch-pause-x",
+		StartBranch:   "main",
+		CommitMessage: "chore(mills): pause",
+		Actions: []CommitAction{{
+			Action: "update", FilePath: "k3s/mills/configmap-policy.yaml", Content: "enabled: false\n",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	if got.ID != "abc123" || got.WebURL == "" {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+	last := rt.requests[len(rt.requests)-1]
+	if !strings.Contains(last.Body, `"start_branch":"main"`) ||
+		!strings.Contains(last.Body, `"branch":"mills/kill-switch-pause-x"`) ||
+		!strings.Contains(last.Body, `"action":"update"`) {
+		t.Errorf("commit body missing expected fields: %s", last.Body)
+	}
+}
+
+func TestGitLabClient_CreateCommit_Validation(t *testing.T) {
+	cli, _ := newGitLabStub(t, nil)
+	if _, err := cli.CreateCommit(context.Background(), CreateCommitRequest{Branch: ""}); err == nil {
+		t.Error("expected error for empty branch")
+	}
+	if _, err := cli.CreateCommit(context.Background(), CreateCommitRequest{Branch: "b"}); err == nil {
+		t.Error("expected error for no actions")
+	}
+}

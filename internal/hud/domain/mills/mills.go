@@ -78,6 +78,10 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	// browser tabs from triggering the autonomy loop.
 	mux.HandleFunc("POST /api/mills/council/run", mw(d.handleProxyAdminPost))
 	mux.HandleFunc("POST /api/mills/council/dryrun", mw(d.handleProxyAdminPost))
+	// Global autonomy kill-switch (plan 42 Slice 1b). Opens a GitOps
+	// auto-PR flipping policy `enabled:`; double-gated through the HUD
+	// admin token before the operator's own admin gate.
+	mux.HandleFunc("POST /api/mills/policy/kill-switch", mw(d.handleProxyAdminPost))
 	mux.HandleFunc("POST /api/mills/pipeline/runs/{backlog_id}/start", mw(d.handleProxyAdminPost))
 	mux.HandleFunc("POST /api/mills/pipeline/runs/{id}/pause", mw(d.handleProxyAdminPost))
 	mux.HandleFunc("POST /api/mills/pipeline/runs/{id}/resume", mw(d.handleProxyAdminPost))

@@ -174,9 +174,17 @@ func run(cfg Config) error {
 	capabilities.CouncilConfigured = councilRunner != nil
 	capabilities.CouncilUsesFakeAgents = councilUsesFakeAgents
 
+	// GitOps-scoped GitLab client for the autonomy kill-switch auto-PR
+	// (plan 42 Slice 1b). Separate from the pipeline GitLab client: the
+	// pipeline token is walled off from platform/gitops by policy, so the
+	// kill-switch needs its own credential. Returns a nil interface (not a
+	// typed nil) when unconfigured so the endpoint reports 503.
+	gitopsKillSwitch := buildGitOpsGitLabClient(cfg, logger)
+
 	op := newOperator(st, pm, budget, logger).
 		withRunner(councilRunner).
-		withSquadsLoader(squadsLoader)
+		withSquadsLoader(squadsLoader).
+		withKillSwitch(gitopsKillSwitch, cfg.GitOpsPolicyPath, cfg.GitOpsDefaultBranch)
 	// Audit subsystem is attached below after the pipeline runner +
 	// FlexInfer client are ready; handlers read the fields at request
 	// time so late attachment is fine.
@@ -629,6 +637,41 @@ func buildGitLabClient(cfg Config, logger *slog.Logger) *clients.GitLabClient {
 		logger.Error("gitlab client init failed; mr/ci/merge/cleanup stages will stub", "error", err)
 		return nil
 	}
+	return c
+}
+
+// buildGitOpsGitLabClient returns a GitLab client scoped to the GitOps
+// repo for the autonomy kill-switch auto-PR (plan 42 Slice 1b), or a nil
+// gitopsCommitter interface when GITOPS_GITLAB_TOKEN + GITOPS_GITLAB_PROJECT
+// are unset (the endpoint then reports 503). The return type is the
+// interface — not *clients.GitLabClient — so an unconfigured build yields a
+// true nil interface rather than a typed-nil that would slip past the
+// handler's `== nil` guard and panic. An explicit User-Agent is set because
+// this client may transit the public GitLab edge (Cloudflare 403s the
+// default Go UA), unlike the in-cluster pipeline client.
+func buildGitOpsGitLabClient(cfg Config, logger *slog.Logger) gitopsCommitter {
+	if cfg.GitOpsGitLabToken == "" || cfg.GitOpsGitLabProject == "" {
+		return nil
+	}
+	apiURL := cfg.GitOpsGitLabAPIURL
+	if apiURL == "" {
+		apiURL = cfg.GitLabAPIURL
+	}
+	if apiURL == "" {
+		logger.Warn("gitops kill-switch disabled: no GITOPS_GITLAB_API_URL and no GITLAB_API_URL fallback")
+		return nil
+	}
+	c, err := clients.NewGitLabClient(clients.GitLabConfig{
+		APIURL:    apiURL,
+		Token:     cfg.GitOpsGitLabToken,
+		Project:   cfg.GitOpsGitLabProject,
+		UserAgent: "loom-mills-operator/kill-switch",
+	})
+	if err != nil {
+		logger.Error("gitops gitlab client init failed; kill-switch endpoint will 503", "error", err)
+		return nil
+	}
+	logger.Info("gitops kill-switch client configured", "project", cfg.GitOpsGitLabProject)
 	return c
 }
 

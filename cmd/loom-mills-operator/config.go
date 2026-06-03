@@ -85,6 +85,26 @@ type Config struct {
 	// project the operator manages MRs against.
 	GitLabProject string
 
+	// GitOpsGitLabToken is a SEPARATE GitLab token scoped to the GitOps
+	// repo (platform/gitops). The pipeline token (GitLabToken) is
+	// deliberately walled off from platform/gitops (it's a protected
+	// path), so the HUD pause/resume kill-switch — which opens a GitOps
+	// auto-PR flipping policy `enabled:` — needs its own credential.
+	// Empty disables the kill-switch endpoint (returns 503).
+	GitOpsGitLabToken string
+	// GitOpsGitLabProject is the slug/id of the GitOps repo, e.g.
+	// "platform/gitops". Empty disables the kill-switch endpoint.
+	GitOpsGitLabProject string
+	// GitOpsGitLabAPIURL overrides the API base for the GitOps client.
+	// Defaults to GitLabAPIURL when unset (same GitLab instance).
+	GitOpsGitLabAPIURL string
+	// GitOpsPolicyPath is the in-repo path to the mills policy ConfigMap
+	// the kill-switch edits. Defaults to "k3s/mills/configmap-policy.yaml".
+	GitOpsPolicyPath string
+	// GitOpsDefaultBranch is the branch the kill-switch MR targets and
+	// branches off. Defaults to "main".
+	GitOpsDefaultBranch string
+
 	// HUDBaseURL is the loom HUD's HTTP base, e.g.
 	// "http://hud.loom-system.svc.cluster.local:8090". Empty disables
 	// the HUD spawn client (plan_slice/implement/pr_self_review fall
@@ -182,6 +202,21 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := strings.TrimSpace(os.Getenv("GITLAB_PROJECT")); v != "" {
 		c.GitLabProject = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITOPS_GITLAB_TOKEN")); v != "" {
+		c.GitOpsGitLabToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITOPS_GITLAB_PROJECT")); v != "" {
+		c.GitOpsGitLabProject = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITOPS_GITLAB_API_URL")); v != "" {
+		c.GitOpsGitLabAPIURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITOPS_POLICY_PATH")); v != "" {
+		c.GitOpsPolicyPath = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITOPS_DEFAULT_BRANCH")); v != "" {
+		c.GitOpsDefaultBranch = v
 	}
 	if v := strings.TrimSpace(os.Getenv("LOOM_HUD_URL")); v != "" {
 		c.HUDBaseURL = v

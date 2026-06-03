@@ -14,6 +14,7 @@ import (
 
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/audit"
+	"github.com/crb2nu/loom/pkg/mills/clients"
 	"github.com/crb2nu/loom/pkg/mills/gates"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 	"github.com/crb2nu/loom/pkg/mills/runner"
@@ -47,6 +48,14 @@ type operator struct {
 	// disabled (V2-D6 default), so wiring it from newOperator is
 	// safe.
 	subrunGuard *pipeline.SubrunGuard
+
+	// Kill-switch GitOps auto-PR (plan 42 Slice 1b). gitopsClient is a
+	// SEPARATE GitLab client scoped to platform/gitops — the pipeline
+	// token can't (and mustn't) write there. nil leaves
+	// POST /api/mills/policy/kill-switch returning 503.
+	gitopsClient        gitopsCommitter
+	gitopsPolicyPath    string
+	gitopsDefaultBranch string
 
 	logger *slog.Logger
 
@@ -110,6 +119,33 @@ func (o *operator) withAudit(d *audit.Dispatcher, w *audit.QueueWorker, t *audit
 	return o
 }
 
+// gitopsCommitter is the slice of the GitLab client the kill-switch
+// handler needs: read the policy file and stage a branch+commit. Kept as
+// an interface so handler tests can stub GitOps without a live GitLab.
+// *clients.GitLabClient satisfies it.
+type gitopsCommitter interface {
+	GetRawFile(ctx context.Context, filePath, ref string) (string, error)
+	CreateCommit(ctx context.Context, req clients.CreateCommitRequest) (clients.CreateCommitResponse, error)
+	CreateMR(ctx context.Context, req pipeline.CreateMRRequest) (pipeline.CreateMRResponse, error)
+}
+
+// withKillSwitch attaches the GitOps-scoped GitLab client + the policy
+// file path the kill-switch MR edits. nil client leaves
+// POST /api/mills/policy/kill-switch returning 503. policyPath / branch
+// fall back to sane defaults when empty.
+func (o *operator) withKillSwitch(c gitopsCommitter, policyPath, branch string) *operator {
+	o.gitopsClient = c
+	o.gitopsPolicyPath = policyPath
+	if o.gitopsPolicyPath == "" {
+		o.gitopsPolicyPath = "k3s/mills/configmap-policy.yaml"
+	}
+	o.gitopsDefaultBranch = branch
+	if o.gitopsDefaultBranch == "" {
+		o.gitopsDefaultBranch = "main"
+	}
+	return o
+}
+
 // markReady flips the readyz response from 503 to 200. Called once startup
 // completes so Kubernetes only routes traffic after migrations + initial
 // policy load are done.
@@ -127,6 +163,11 @@ func (o *operator) httpMux() *http.ServeMux {
 	mux.HandleFunc("GET /api/mills/capabilities", o.handleCapabilities)
 	mux.HandleFunc("GET /api/mills/policy", o.handlePolicy)
 	mux.HandleFunc("GET /api/mills/kpis", o.handleKPIs)
+
+	// Global autonomy kill-switch (plan 42 Slice 1b). Opens a GitOps
+	// auto-PR flipping policy `enabled:` in platform/gitops rather than a
+	// live write-through (Flux owns the ConfigMap). Admin-gated.
+	mux.HandleFunc("POST /api/mills/policy/kill-switch", requireAdmin(o.handlePolicyKillSwitch))
 
 	// Council.
 	mux.HandleFunc("GET /api/mills/council/runs", o.handleCouncilRunsList)
