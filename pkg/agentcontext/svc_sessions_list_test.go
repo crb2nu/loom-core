@@ -386,6 +386,67 @@ func TestSessionList_LargeHistoryBoundsRecompute(t *testing.T) {
 	}
 }
 
+// TestSessionList_RecomputeFanoutHardCapped guards the source-side defense for
+// project_hud_no_agents_session_list_timeout: even on the full (non-light) path
+// with a large caller limit, the per-call stat recompute fan-out is bounded by
+// maxSessionListRecompute — not by `limit`. Before this cap, a caller passing
+// limit=1000 (the HUD bridge default) over a history of zero-entry hook
+// sessions fired ~1000 serial Qdrant scrolls per call and blew the daemon's 3s
+// recv budget. The two hot-loop monitors that used to hit this now call the
+// light path, but the cap keeps any future large-limit non-light caller safe.
+func TestSessionList_RecomputeFanoutHardCapped(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	now := time.Date(2026, 6, 3, 9, 0, 0, 0, time.UTC)
+
+	const total = 2000
+	seeded := make([]Session, 0, total)
+	for i := 0; i < total; i++ {
+		seeded = append(seeded, Session{
+			ID:        fmt.Sprintf("%016x", i),
+			AgentID:   "agent-hooks",
+			Status:    string(SessionStatusEnded),
+			StartedAt: now.Add(-time.Duration(total-i) * time.Minute),
+			// EntryCount 0 — every row is recompute-eligible, so an uncapped
+			// loop would recompute min(limit, total) times.
+		})
+	}
+
+	client, _ := newOrderedSessionsQdrantStub(t, seeded...)
+	svc := newTestService()
+	svc.sess = NewSessionSvc(client, svc.cfg, svc.logger, svc.metrics)
+
+	var recomputeCalls int
+	svc.sess.countContextEntries = func(_ context.Context, _ string) (int, int) {
+		recomputeCalls++
+		return 0, 0
+	}
+
+	// Non-light call with a large limit: recompute must be capped by the
+	// constant, NOT by limit. Pre-cap this would have been 1000.
+	res, err := svc.HandleSessionList(context.Background(), map[string]any{
+		"limit": 1000,
+	})
+	if err != nil {
+		t.Fatalf("HandleSessionList: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("HandleSessionList returned error result: %+v", res)
+	}
+	if recomputeCalls > maxSessionListRecompute {
+		t.Errorf("recompute fired %d times; must be capped at maxSessionListRecompute=%d regardless of limit=1000",
+			recomputeCalls, maxSessionListRecompute)
+	}
+	// Sanity: the cap actually engaged for this large-limit, all-eligible case.
+	if recomputeCalls != maxSessionListRecompute {
+		t.Errorf("expected exactly %d recomputes (cap engaged), got %d", maxSessionListRecompute, recomputeCalls)
+	}
+	// The result itself still honors the caller's limit (capping recompute must
+	// not truncate the returned set).
+	if got := decodeListResult(t, res); len(got) != 1000 {
+		t.Errorf("returned %d sessions, want 1000 (recompute cap must not truncate results)", len(got))
+	}
+}
+
 // stableHexID returns a deterministic 16-char hex string for tests.
 // Mirrors the shape of GenerateID output without depending on time.
 func stableHexID(seed int) string {

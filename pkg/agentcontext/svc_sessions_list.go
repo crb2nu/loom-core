@@ -66,6 +66,18 @@ func toSessionLite(s Session) sessionLite {
 // like workflow_persist.go.
 const sessionListScrollCap = 10000
 
+// maxSessionListRecompute hard-caps how many ended-session stat recomputes a
+// single non-light List may perform, independent of the caller's limit. Each
+// recompute is its own Qdrant scroll (countContextEntries); the a4e84836 fix
+// bounded the fan-out to `limit`, but callers that pass a large limit (the HUD
+// bridge defaults to 1000) could still trigger ~1000 serial round-trips per
+// call and blow the daemon's 3s recv budget. Sessions are sorted StartedAt
+// DESC before this loop, so the cap preserves recomputed stats for the most
+// recent sessions — the ones a human is actually looking at — and lets the
+// long tail keep its persisted (possibly 0) counts. See
+// project_hud_no_agents_session_list_timeout.
+const maxSessionListRecompute = 64
+
 // List returns sessions matching optional filters.
 func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
@@ -137,6 +149,7 @@ func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallT
 	// budget. The light fleet path skips the recompute entirely: the fleet
 	// view counts live work and tolerates the persisted/in-memory stats.
 	if !light && ss.countContextEntries != nil {
+		recomputed := 0
 		for i := range sessions {
 			s := &sessions[i]
 			ss.mu.RLock()
@@ -145,7 +158,14 @@ func (ss *SessionSvc) List(ctx context.Context, args map[string]any) (*mcp.CallT
 			if inMem || s.EntryCount != 0 {
 				continue
 			}
+			// Hard-cap the per-call recompute fan-out so a large limit cannot
+			// turn one List into hundreds of serial Qdrant scrolls. The tail
+			// keeps its persisted counts (see maxSessionListRecompute).
+			if recomputed >= maxSessionListRecompute {
+				break
+			}
 			entries, tokens := ss.countContextEntries(ctx, s.ID)
+			recomputed++
 			if entries > 0 {
 				s.EntryCount = entries
 				s.TotalTokens = tokens

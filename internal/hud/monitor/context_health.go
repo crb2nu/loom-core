@@ -170,7 +170,14 @@ func (m *ContextHealthMonitor) Refresh() error {
 
 // refresh fetches all active sessions and computes health for each.
 func (m *ContextHealthMonitor) refresh(_ context.Context) (ContextHealthSnapshot, error) {
-	sessions, err := m.agent.Sessions()
+	// ActiveSessions() is the light, status=active projection. This monitor
+	// only inspects active sessions (it skips the rest below) and reads
+	// fields all carried by the light projection, with live token/entry stats
+	// overlaid server-side for active sessions. Using the full Sessions()
+	// here paid for an unbounded recompute fan-out on a 5s poll loop and blew
+	// the daemon's recv budget at large histories
+	// (project_hud_no_agents_session_list_timeout).
+	sessions, err := m.agent.ActiveSessions()
 	if err != nil {
 		return ContextHealthSnapshot{}, fmt.Errorf("context: fetch sessions: %w", err)
 	}
