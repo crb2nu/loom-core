@@ -710,21 +710,15 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	// this spawn. StartSession is idempotent — repeat spawns under the same
 	// namespace reuse the same session.
 	_, sessSpan := o.tracer.Start(ctx, "agent.spawn.session_register")
-	sessRes, sessErr := o.agentBridge.StartSession(bridge.SessionStartParams{
-		Namespace:   req.Namespace,
-		AgentID:     state.AgentID,
-		AgentType:   req.AgentType,
-		Description: req.TaskDescription,
-	})
-	var spawnSessionID string
-	if sessErr == nil && sessRes != nil {
-		spawnSessionID = sessRes.SessionID
-	}
 	// Persist the session ID on the durable state so terminal transitions
 	// (completeSpawn/failSpawn → persistTelemetrySummary) can write the
 	// telemetry summary under a real, existing session. The state is flushed
-	// to the controller below when we mark the spawn running.
-	state.SessionID = spawnSessionID
+	// to the controller below when we mark the spawn running. A failed
+	// registration is logged inside registerSpawnSession (not swallowed): an
+	// empty session id here makes persistTelemetrySummary skip the write,
+	// silently dropping the spawn's turn-level telemetry — the exact blind
+	// spot that hid the in-VM codex failure during the Mills A2 kill-test.
+	state.SessionID = o.registerSpawnSession(req, state.AgentID)
 	sessSpan.End()
 
 	// Mark running and broadcast event.
@@ -798,7 +792,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	// only ever showed empty session rows for in-cluster spawn agents.
 	acc := bridge.NewSpawnTelemetryAccumulatorWithPublisher(
 		newSpawnTelemetryPublisher(o.sseHub),
-		spawnSessionID,
+		state.SessionID,
 		state.AgentID,
 	)
 	o.telemetry.Store(spawnID, acc)
@@ -1401,6 +1395,44 @@ func (o *SpawnOrchestrator) recordSpawnTelemetryMetrics(ctx context.Context, sta
 	for _, e := range tel.Errors {
 		o.metrics.SpawnErrorsTotal.Add(ctx, 1,
 			attrs, metric.WithAttributes(attribute.String("error_type", e.Type)))
+	}
+}
+
+// registerSpawnSession registers the agent-context session for a spawn at
+// spawn-start and returns its session id ("" when registration fails). The
+// failure is logged at Warn rather than swallowed: an empty session id makes
+// persistTelemetrySummary skip the telemetry write, silently dropping the
+// spawn's turn-level summary (turn_count / stop_reason / last_message). That
+// silent drop is what hid the in-VM codex failure during the Mills A2
+// first-autonomous-merge kill-test — codex exited with turn_count=0 and an
+// empty diff, invisible from operator logs. Make the registration failure
+// observable so the next live debug is not blind.
+func (o *SpawnOrchestrator) registerSpawnSession(req SpawnRequest, agentID string) string {
+	if o.agentBridge == nil {
+		return ""
+	}
+	sessRes, sessErr := o.agentBridge.StartSession(bridge.SessionStartParams{
+		Namespace:   req.Namespace,
+		AgentID:     agentID,
+		AgentType:   req.AgentType,
+		Description: req.TaskDescription,
+	})
+	switch {
+	case sessErr != nil:
+		o.logger.Warn("spawn session registration failed; turn-level telemetry will be dropped for this spawn",
+			"agent_id", agentID,
+			"agent_type", req.AgentType,
+			"namespace", req.Namespace,
+			"error", sessErr)
+		return ""
+	case sessRes == nil || strings.TrimSpace(sessRes.SessionID) == "":
+		o.logger.Warn("spawn session registration returned no session id; turn-level telemetry will be dropped for this spawn",
+			"agent_id", agentID,
+			"agent_type", req.AgentType,
+			"namespace", req.Namespace)
+		return ""
+	default:
+		return sessRes.SessionID
 	}
 }
 

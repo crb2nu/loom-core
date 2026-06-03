@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Spawn session-registration failures are now observable** (`internal/hud/spawn.go`): `runSpawn` silently swallowed `StartSession` errors at spawn-start, leaving `state.SessionID` empty — which makes `persistTelemetrySummary` skip the write, so the spawn's turn-level telemetry (`turn_count` / `stop_reason` / `last_message`) vanishes with no log. That blind spot hid the in-VM codex failure during the Mills A2 first-autonomous-merge kill-test (codex exited `turn_count=0` with an empty diff, invisible from operator logs). Extracted `registerSpawnSession`, which logs a `Warn` on registration failure (or empty session id) instead of swallowing it. Regression tests in `internal/hud/spawn_telemetry_persist_test.go`.
+
 ### Security
 - **Bump Go toolchain 1.25.10 → 1.25.11** (`go.mod`, `go.work`, `.gitlab-ci.yml` `GO_VERSION`, and the `golang:*-alpine` builder base in `Dockerfile`, `Dockerfile.custom-server`, `Dockerfile.loom-mills-operator`, `Dockerfile.custom-server.local`, `Dockerfile.local`): patches 3 stdlib vulnerabilities flagged by `security:govulncheck` — `GO-2026-5039` (net/textproto: arbitrary inputs included in errors unescaped), `GO-2026-5038` (mime: quadratic complexity in `WordDecoder.DecodeHeader`), `GO-2026-5037` (crypto/x509: inefficient candidate hostname parsing). All three are fixed in `stdlib@go1.25.11`. The govulncheck job (lint stage, `allow_failure:false`) was failing on `main`, which blocked the `deploy` stage from building images — so this also unblocks the post-!611 `loom-mills-operator` image build that carries the autonomy kill-switch (plan-42 Slice 1b).
 

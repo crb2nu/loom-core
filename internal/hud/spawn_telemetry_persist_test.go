@@ -1,8 +1,10 @@
 package hud
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +12,36 @@ import (
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/spawn"
 )
+
+// captureHandler is a slog.Handler that records emitted records so tests can
+// assert that a specific log line (level + message substring) fired.
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *captureHandler) has(level slog.Level, substr string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == level && strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
 
 // TestResolveSpawnSessionID covers the session-id resolution order used by the
 // telemetry/error persist path. The agentBridge is nil here, so the
@@ -206,5 +238,100 @@ func TestPersistTelemetrySummary_SkipsWhenNoSession(t *testing.T) {
 	defer mu.Unlock()
 	if addCalls != 0 {
 		t.Fatalf("expected no agent_context_add call when no session resolves, got %d", addCalls)
+	}
+}
+
+// startSessionMockDaemon wires a mock daemon whose agent_session_start either
+// fails (isError) or returns the given session id, and whose active-session
+// lookup reports no active session (so StartSession proceeds to start).
+func startSessionMockDaemon(t *testing.T, startFails bool, sessionID string) *SpawnOrchestrator {
+	t.Helper()
+	sockPath, handlers := newMockDaemonForApp(t)
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+		switch req.Name {
+		case "agent_context__agent_session_start":
+			if startFails {
+				return map[string]any{
+					"isError": true,
+					"content": []map[string]any{{"type": "text", "text": "simulated session-start failure"}},
+				}, nil
+			}
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{{"type": "text", "text": `{"session_id":"` + sessionID + `"}`}},
+			}, nil
+		default:
+			// agent_session_list (active lookup), presence, etc. → benign empty.
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{{"type": "text", "text": `{"sessions":[]}`}},
+			}, nil
+		}
+	})
+
+	client := bridge.NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect to mock daemon: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return &SpawnOrchestrator{agentBridge: bridge.NewAgentBridge(client)}
+}
+
+// TestRegisterSpawnSession_LogsOnStartFailure is the regression guard for the
+// A2 blind spot: when spawn-start session registration fails, the error must be
+// logged (not silently swallowed), because an empty session id makes
+// persistTelemetrySummary skip the write and the spawn's turn-level telemetry
+// vanishes — exactly what hid the in-VM codex failure.
+func TestRegisterSpawnSession_LogsOnStartFailure(t *testing.T) {
+	o := startSessionMockDaemon(t, true, "")
+	capLog := &captureHandler{}
+	o.logger = slog.New(capLog)
+
+	sid := o.registerSpawnSession(SpawnRequest{
+		AgentType:       "codex",
+		Namespace:       "mills/harvester-vm",
+		TaskDescription: "canary",
+	}, "codex-vm")
+
+	if sid != "" {
+		t.Fatalf("expected empty session id on registration failure, got %q", sid)
+	}
+	if !capLog.has(slog.LevelWarn, "session registration failed") {
+		t.Fatal("expected a Warn log when spawn session registration fails (the A2 blind spot)")
+	}
+}
+
+// TestRegisterSpawnSession_ReturnsSessionOnSuccess confirms the happy path
+// returns the new session id and logs no failure warning.
+func TestRegisterSpawnSession_ReturnsSessionOnSuccess(t *testing.T) {
+	o := startSessionMockDaemon(t, false, "sess-new-1")
+	capLog := &captureHandler{}
+	o.logger = slog.New(capLog)
+
+	sid := o.registerSpawnSession(SpawnRequest{
+		AgentType: "codex",
+		Namespace: "mills/x",
+	}, "codex-vm")
+
+	if sid != "sess-new-1" {
+		t.Fatalf("registerSpawnSession() = %q, want sess-new-1", sid)
+	}
+	if capLog.has(slog.LevelWarn, "session registration failed") {
+		t.Fatal("did not expect a failure Warn on the success path")
+	}
+}
+
+// TestRegisterSpawnSession_NilBridge returns empty without panicking when no
+// agent bridge is configured.
+func TestRegisterSpawnSession_NilBridge(t *testing.T) {
+	o := &SpawnOrchestrator{logger: slog.Default()}
+	if sid := o.registerSpawnSession(SpawnRequest{Namespace: "x"}, "a"); sid != "" {
+		t.Fatalf("expected empty session id with nil bridge, got %q", sid)
 	}
 }
