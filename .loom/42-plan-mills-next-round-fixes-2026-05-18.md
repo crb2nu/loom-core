@@ -10,7 +10,7 @@ the deferred polish from the most recent KPI/Sub-tab feature.
 | Slice | Status | Evidence |
 | --- | --- | --- |
 | 0 — Kill-test (operator walkthrough) | **PASSED 2026-06-02** | Operator interview: 5/5 day-2 actions answered "used recently + would use a button" (gate was ≥3). Kill-switch routing decided = GitOps auto-PR. |
-| 1 — HUD action parity for day-2 ops | **all 5 actions SHIPPED + deploy MRs merged** (live 1e pending image rollout) | 4/5 via !609 (force-escalate, council run/dryrun, audit-by-iid); 5th = pause/resume autonomy kill-switch via `POST /api/mills/policy/kill-switch` GitOps auto-PR, merged !611 (`98f82f62`) + env wiring `platform/gitops!216` (`1f0bdd56`, merged). Dedicated `loom-mills-gitops` token (id 16) **installed** + env **reconciled** (deploy rev 323, confirmed 2026-06-03). Iteration plan: `.loom/127-…`. **Sole remaining gate: fresh operator image build off `main` + Flux rollout** — running image `:20260603-043339` predates the !611 merge (14:10Z) so the endpoint isn't in the live binary yet — then the live 1e operator kill-test. |
+| 1 — HUD action parity for day-2 ops | **✅ COMPLETE — all 5 actions shipped + live 1e kill-test PASSED 2026-06-03** | 4/5 via !609 (force-escalate, council run/dryrun, audit-by-iid); 5th = pause/resume autonomy kill-switch via `POST /api/mills/policy/kill-switch` GitOps auto-PR, merged !611 (`98f82f62`) + env wiring `platform/gitops!216` (`1f0bdd56`). Deploy unblocked by !613 (Go 1.25.10→1.25.11; a red `govulncheck` on `main` had been blocking the deploy stage → no image built). Operator image `:20260603-170700` rolled by Flux IUA; pod 1/1 healthy. **Live 1e kill-test PASSED**: `action=pause` → HTTP 200, opened gitops MR !217 with the exact 1-line flip `enabled: true→false` on the `# kill switch` anchor (no nested fields touched); MR closed unmerged + branch deleted, `main` policy stays `enabled: true`. Iteration plan: `.loom/127-…`. |
 | 2 — KPI honesty | **shipped 2026-05-19** | `dbccd413` (MR merged via `a748d138`) |
 | 3 — Sub-tab counts coverage | **shipped 2026-05-19** | `f99a48ef` (MR merged via `e6110f95`) |
 | 4 — Spawn/escalator stabilization debt | **shipped 2026-05-19** | `985f2f5d` (MR merged via `55a0bcf0`); STATES.md at `pkg/mills/pipeline/STATES.md` |
@@ -22,14 +22,16 @@ owns the spawn lifecycle state machine; `pkg/mills/runner/` is the
 council runner. The doc covers both state machines + the cross-component
 seam and includes the 4a regression-test audit inline.
 
-All five slices have now shipped code, and both kill-switch deploy MRs
-(loom-core!611 + gitops!216) are merged, the `loom-mills-gitops` secret
-is installed, and the operator env is reconciled. The only remaining gate
-is a **fresh operator image build off `main` + Flux rollout** (the running
-image predates the !611 merge) followed by the **live 1e operator
-kill-test** on the deployed HUD. Slice 4 finished ahead of Slice 1 because
-Slices 2/3/4/5 are mutually independent and 4 did not require the operator
-walkthrough.
+**✅ Plan 42 is fully complete (2026-06-03).** All five slices shipped, and
+Slice 1b (the kill-switch) is verified live end-to-end. The deploy was
+unblocked by !613 (Go 1.25.10→1.25.11): a red `security:govulncheck` on `main`
+had been silently blocking the `deploy` stage, so no post-!611 operator image
+was building. After the bump, Flux IUA rolled `:20260603-170700` and the live
+1e kill-test passed — `action=pause` opened gitops MR !217 with the exact
+1-line `enabled: true→false` flip on the `# kill switch` anchor; the probe MR
+was closed unmerged and its branch deleted, so prod autonomy stays
+`enabled: true`. Slice 4 finished ahead of Slice 1 because Slices 2/3/4/5 are
+mutually independent and 4 did not require the operator walkthrough.
 
 ## Riskiest assumption + kill-test
 
