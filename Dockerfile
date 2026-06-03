@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Build stage
 ARG PUBLIC_BASE_REGISTRY=docker.io
-FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.25.10-alpine AS builder
+FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.25.11-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 ENV GOWORK=off \
