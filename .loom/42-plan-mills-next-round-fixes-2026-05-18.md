@@ -5,12 +5,12 @@ to operator-facing leverage: data trust on the Overview, HUD parity with the
 CLI for the few day-2 actions that still force a terminal drop, and closing
 the deferred polish from the most recent KPI/Sub-tab feature.
 
-## Status (2026-05-21)
+## Status (2026-06-02)
 
 | Slice | Status | Evidence |
 | --- | --- | --- |
-| 0 — Kill-test (operator walkthrough) | not run | requires live operator session |
-| 1 — HUD action parity for day-2 ops | not started | kill-test-gated |
+| 0 — Kill-test (operator walkthrough) | **PASSED 2026-06-02** | Operator interview: 5/5 day-2 actions answered "used recently + would use a button" (gate was ≥3). Kill-switch routing decided = GitOps auto-PR. |
+| 1 — HUD action parity for day-2 ops | **planned + scoped down** | Unblocked by Slice 0. Backend largely already exists (see `.loom/127`); now mostly a frontend slice. Iteration plan: `.loom/127-iteration-plan-mills-hud-action-parity-2026-06-02.md` |
 | 2 — KPI honesty | **shipped 2026-05-19** | `dbccd413` (MR merged via `a748d138`) |
 | 3 — Sub-tab counts coverage | **shipped 2026-05-19** | `f99a48ef` (MR merged via `e6110f95`) |
 | 4 — Spawn/escalator stabilization debt | **shipped 2026-05-19** | `985f2f5d` (MR merged via `55a0bcf0`); STATES.md at `pkg/mills/pipeline/STATES.md` |
