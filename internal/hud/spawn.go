@@ -804,6 +804,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 
 	var execResult *backend.ExecResult
 	var execErr error
+	usedStreaming := false
 
 	// Cancellable exec context so the budget watcher can abort the run when
 	// MaxCostUSD or MaxTurns is exceeded.
@@ -824,6 +825,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	// harvester-vm backend doesn't implement streamExecCapable so its
 	// spawns always take the buffered path.
 	if sec, ok := be.(streamExecCapable); ok && parser != nil {
+		usedStreaming = true
 		execResult, execErr = backend.StreamExec(execCtx,
 			sec.Clientset(), sec.RestConfig(), sec.Namespace(), sec.NFSFlush(),
 			backend.StreamExecOpts{
@@ -859,10 +861,44 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	execSpan.End()
 	heartbeatCancel()
 
-	// Capture agent output as a context entry for session visibility.
-	if execResult != nil && execResult.StdoutTail != "" {
+	// Buffered (non-streaming) path — harvester-vm and any other backend that
+	// is not streamExecCapable. The parser never saw the agent's output here,
+	// so without this the spawn shows turn_count=0 regardless of what the agent
+	// actually did, and a nonzero exit / stderr is invisible. This buffered
+	// path silently swallowing the result is what hid the in-VM codex failure
+	// during the Mills A2 first-autonomous-merge kill-test (empty diff,
+	// turn_count=0, spawn marked "completed"). Make it observable:
+	//   1. feed the captured stdout tail through the parser for best-effort
+	//      telemetry (full real-time telemetry still needs a stream-capable
+	//      backend — harvester-vm is not one yet),
+	//   2. log a full exec summary (exit code, durations, stdout/stderr tails).
+	if !usedStreaming && execResult != nil {
+		if parser != nil && execResult.StdoutTail != "" {
+			for _, line := range strings.Split(execResult.StdoutTail, "\n") {
+				if strings.TrimSpace(line) != "" {
+					parser.HandleLine([]byte(line))
+				}
+			}
+		}
+		o.logger.Info("buffered agent exec finished",
+			"spawn_id", state.SpawnID,
+			"agent_type", req.AgentType,
+			"exit_code", execResult.ExitCode,
+			"duration_ms", execResult.DurationMs,
+			"stdout_lines", execResult.StdoutLines,
+			"stderr_lines", execResult.StderrLines,
+			"stderr_tail", execResult.StderrTail)
+	}
+
+	// Capture agent output as a context entry for session visibility. Include
+	// the stderr tail when present — on a failing agent CLI that is where the
+	// actionable diagnostic lives.
+	if execResult != nil && (execResult.StdoutTail != "" || execResult.StderrTail != "") {
 		go func() {
 			truncated := execResult.StdoutTail
+			if execResult.StderrTail != "" {
+				truncated += "\n--- stderr ---\n" + execResult.StderrTail
+			}
 			if len(truncated) > 8000 {
 				truncated = truncated[:8000] + "\n... (truncated)"
 			}
@@ -879,7 +915,41 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		o.failSpawn(ctx, state, fmt.Sprintf("agent execution failed: %v", execErr))
 		return
 	}
+	// A nonzero exit from the agent CLI is a failure even though Backend.Exec
+	// returns a nil Go error for command-level nonzero exits. Previously only
+	// execErr was checked, so a failing agent on the buffered path fell through
+	// to completeSpawn and the spawn showed as "completed" with no signal.
+	if msg, failed := bufferedExecFailure(execResult); failed {
+		o.logger.Warn("agent CLI exited nonzero",
+			"spawn_id", state.SpawnID,
+			"agent_type", req.AgentType,
+			"exit_code", execResult.ExitCode,
+			"stderr_tail", execResult.StderrTail,
+			"stdout_tail", execResult.StdoutTail)
+		o.failSpawn(ctx, state, msg)
+		return
+	}
 	o.completeSpawn(ctx, state)
+}
+
+// bufferedExecFailure reports whether a buffered ExecResult represents an agent
+// CLI failure (nonzero exit) and builds an operator-facing message that prefers
+// the stderr tail (where the actionable diagnostic lives), falling back to the
+// stdout tail. Backend.Exec returns a nil Go error for command-level nonzero
+// exits, so the spawn finalizer must inspect ExitCode explicitly — not doing so
+// is what let failing harvester-vm spawns report "completed" during the A2
+// kill-test. Returns ("", false) for a nil result or a clean (exit 0) run.
+func bufferedExecFailure(execResult *backend.ExecResult) (string, bool) {
+	if execResult == nil || execResult.ExitCode == 0 {
+		return "", false
+	}
+	msg := fmt.Sprintf("agent CLI exited %d", execResult.ExitCode)
+	if s := strings.TrimSpace(execResult.StderrTail); s != "" {
+		msg += ": " + s
+	} else if s := strings.TrimSpace(execResult.StdoutTail); s != "" {
+		msg += " (no stderr; stdout: " + s + ")"
+	}
+	return msg, true
 }
 
 // generateDockerfile builds a lean agent runtime image. Spawned agents get
