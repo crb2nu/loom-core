@@ -34,7 +34,10 @@ func (m *ShuttleMonitor) Start(interval time.Duration) {
 
 // refresh builds a fresh ShuttleSnapshot from bridge data.
 func (m *ShuttleMonitor) refresh(_ context.Context) (ShuttleSnapshot, error) {
-	sessions, err := m.bridge.Sessions()
+	// Light projection: the shuttle snapshot only counts capacity by
+	// status/agent_id, so it must not pay for the full Sessions() recompute
+	// fan-out on a 3s poll loop (project_hud_no_agents_session_list_timeout).
+	sessions, err := m.bridge.FleetSessions()
 	if err != nil {
 		m.Logger.Warn("shuttle: failed to fetch sessions", "error", err)
 		return ShuttleSnapshot{}, err

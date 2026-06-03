@@ -12,7 +12,12 @@ import (
 
 // Bridge defines the subset of AgentBridge methods the engine needs.
 type Bridge interface {
-	Sessions() ([]bridge.SessionInfo, error)
+	// FleetSessions returns the lightweight (light=true) session projection.
+	// The shuttle monitor only needs status/agent_id/token fields for capacity
+	// counting, so it must use this path rather than the full Sessions() to
+	// stay inside the daemon's recv budget at large session histories — see
+	// project_hud_no_agents_session_list_timeout.
+	FleetSessions() ([]bridge.SessionInfo, error)
 	AllTasks() ([]bridge.TaskInfo, error)
 	PresenceList(includeOffline bool) ([]presence.PresenceInfo, error)
 	FileClaimList(agentID string) ([]bridge.FileClaimInfo, error)
