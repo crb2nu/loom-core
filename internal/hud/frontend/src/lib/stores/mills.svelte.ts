@@ -210,6 +210,20 @@ export interface MillsStatus {
   last_council_at?: string | null;
 }
 
+// KillSwitchResult mirrors the operator's POST /api/mills/policy/kill-switch
+// response. When `changed` is false the desired state already matched gitops
+// and no MR was opened. Otherwise mr_url/mr_iid link the auto-PR that, once
+// merged + reconciled, applies the flip.
+export interface KillSwitchResult {
+  changed: boolean;
+  previous_enabled: boolean;
+  desired_enabled: boolean;
+  mr_url?: string;
+  mr_iid?: number;
+  branch?: string;
+  message: string;
+}
+
 // PolicyProposal mirrors the operator's proposals row. Field casing is
 // PascalCase because the proposals handler relies on Go's default JSON
 // marshalling (no explicit json: tags). Phase 7 slice 7.1/7.2 own the
@@ -655,6 +669,20 @@ class MillsStore {
   async dryrunCouncil(reason: string = 'hud'): Promise<boolean> {
     await this.postJSON(`/api/mills/council/dryrun`, { trigger: 'manual', reason });
     return true;
+  }
+
+  // setKillSwitch flips global autonomy via a GitOps auto-PR. The operator
+  // opens an MR against platform/gitops flipping policy `enabled:` (it does
+  // NOT write through — Flux owns the ConfigMap). action is
+  // 'pause' | 'resume' | 'toggle'. Returns the MR info so the caller can
+  // link it. Does not refresh stores: the change only takes effect after
+  // the MR is merged and Flux reconciles. The HUD proxy injects the admin
+  // bearer; the browser never handles a token.
+  async setKillSwitch(
+    action: 'pause' | 'resume' | 'toggle',
+    reason: string = 'hud-overview',
+  ): Promise<KillSwitchResult | null> {
+    return this.postJSON<KillSwitchResult>('/api/mills/policy/kill-switch', { action, reason });
   }
 
   // escalateRun force-escalates a stuck pipeline run via

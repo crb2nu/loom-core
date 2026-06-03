@@ -40,6 +40,14 @@ type GitLabConfig struct {
 	MergeMethod string
 	// Timeout caps any individual HTTP call. Default 30s.
 	Timeout time.Duration
+	// UserAgent, when non-empty, is sent as the User-Agent header on
+	// every request. The in-cluster operator reaches gitlab via internal
+	// DNS so Go's default UA is fine for the pipeline token, but the
+	// gitops kill-switch client may transit the public edge (Cloudflare
+	// 403s the default urllib/Go UA with error 1010) — set this to a
+	// browser-acceptable identifier there. Empty preserves prior behavior
+	// (no explicit UA header).
+	UserAgent string
 }
 
 // GitLabClient implements pipeline.GitLabClient + pipeline.IssueClient
@@ -105,6 +113,9 @@ func (c *GitLabClient) requestJSON(ctx context.Context, method, path string, bod
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("PRIVATE-TOKEN", c.cfg.Token)
+	if c.cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("gitlab: %s %s: %w", method, path, err)
@@ -369,4 +380,105 @@ func (c *GitLabClient) ListIssues(ctx context.Context, opts ListIssuesOpts) ([]I
 		return nil, err
 	}
 	return got, nil
+}
+
+// ----- Repository file read + commit (GitOps auto-PR for the kill-switch) -----
+//
+// These two methods back the operator's POST /api/mills/policy/kill-switch
+// endpoint, which flips `enabled:` in platform/gitops' mills policy
+// ConfigMap via a branch+commit+MR rather than fighting Flux with a live
+// write-through. They are general-purpose (any caller can read a file or
+// stage a commit) but exist for the gitops-scoped client instance.
+
+// GetRawFile fetches the raw contents of a repository file at ref using
+// GET /projects/:id/repository/files/:path/raw. Returns the body verbatim
+// (the file is not JSON-decoded). A 404 surfaces as an error containing
+// the GitLab message so callers can distinguish "no such file/ref".
+func (c *GitLabClient) GetRawFile(ctx context.Context, filePath, ref string) (string, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return "", errors.New("gitlab: GetRawFile: filePath required")
+	}
+	if ref == "" {
+		ref = "main"
+	}
+	path := fmt.Sprintf("/projects/%s/repository/files/%s/raw?ref=%s",
+		c.projectPath(), url.PathEscape(filePath), url.QueryEscape(ref))
+	full := strings.TrimRight(c.cfg.APIURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: new request: %w", err)
+	}
+	req.Header.Set("PRIVATE-TOKEN", c.cfg.Token)
+	if c.cfg.UserAgent != "" {
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: GET %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB ceiling
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("gitlab: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(buf)))
+	}
+	return string(buf), nil
+}
+
+// CommitAction is one file action in a commits-API request. Action is
+// "create" | "update" | "delete" | "move"; Content is required for
+// create/update.
+type CommitAction struct {
+	Action   string `json:"action"`
+	FilePath string `json:"file_path"`
+	Content  string `json:"content,omitempty"`
+}
+
+// CreateCommitRequest creates a commit on Branch, optionally branching it
+// off StartBranch when Branch does not yet exist (GitLab creates the
+// branch as part of the commit when start_branch is set).
+type CreateCommitRequest struct {
+	Branch        string
+	StartBranch   string
+	CommitMessage string
+	Actions       []CommitAction
+}
+
+// CreateCommitResponse is the subset of the commit object the kill-switch
+// flow needs.
+type CreateCommitResponse struct {
+	ID     string
+	WebURL string
+}
+
+type createCommitBody struct {
+	Branch        string         `json:"branch"`
+	StartBranch   string         `json:"start_branch,omitempty"`
+	CommitMessage string         `json:"commit_message"`
+	Actions       []CommitAction `json:"actions"`
+}
+
+type commitResponse struct {
+	ID     string `json:"id"`
+	WebURL string `json:"web_url"`
+}
+
+// CreateCommit posts to POST /projects/:id/repository/commits, creating
+// Branch (off StartBranch) and applying Actions atomically.
+func (c *GitLabClient) CreateCommit(ctx context.Context, req CreateCommitRequest) (CreateCommitResponse, error) {
+	if req.Branch == "" {
+		return CreateCommitResponse{}, errors.New("gitlab: CreateCommit: Branch required")
+	}
+	if len(req.Actions) == 0 {
+		return CreateCommitResponse{}, errors.New("gitlab: CreateCommit: at least one action required")
+	}
+	// createCommitBody is field-identical to CreateCommitRequest (it only
+	// adds JSON tags), so a direct conversion is both correct and what
+	// staticcheck prefers over a field-by-field literal.
+	body := createCommitBody(req)
+	var got commitResponse
+	path := fmt.Sprintf("/projects/%s/repository/commits", c.projectPath())
+	if err := c.requestJSON(ctx, http.MethodPost, path, body, &got); err != nil {
+		return CreateCommitResponse{}, err
+	}
+	return CreateCommitResponse(got), nil
 }

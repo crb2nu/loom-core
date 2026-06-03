@@ -10,7 +10,7 @@ the deferred polish from the most recent KPI/Sub-tab feature.
 | Slice | Status | Evidence |
 | --- | --- | --- |
 | 0 — Kill-test (operator walkthrough) | **PASSED 2026-06-02** | Operator interview: 5/5 day-2 actions answered "used recently + would use a button" (gate was ≥3). Kill-switch routing decided = GitOps auto-PR. |
-| 1 — HUD action parity for day-2 ops | **planned + scoped down** | Unblocked by Slice 0. Backend largely already exists (see `.loom/127`); now mostly a frontend slice. Iteration plan: `.loom/127-iteration-plan-mills-hud-action-parity-2026-06-02.md` |
+| 1 — HUD action parity for day-2 ops | **all 5 actions SHIPPED** (live 1e pending) | 4/5 via !609 (force-escalate, council run/dryrun, audit-by-iid); 5th = pause/resume autonomy kill-switch via `POST /api/mills/policy/kill-switch` GitOps auto-PR (this MR). Needed a dedicated `loom-mills-gitops` token — pipeline token can't write platform/gitops (kill-test 2026-06-03). Iteration plan: `.loom/127-…`. Remaining: live operator kill-test (1e) after gitops deploy MR + secret. |
 | 2 — KPI honesty | **shipped 2026-05-19** | `dbccd413` (MR merged via `a748d138`) |
 | 3 — Sub-tab counts coverage | **shipped 2026-05-19** | `f99a48ef` (MR merged via `e6110f95`) |
 | 4 — Spawn/escalator stabilization debt | **shipped 2026-05-19** | `985f2f5d` (MR merged via `55a0bcf0`); STATES.md at `pkg/mills/pipeline/STATES.md` |
@@ -22,9 +22,11 @@ owns the spawn lifecycle state machine; `pkg/mills/runner/` is the
 council runner. The doc covers both state machines + the cross-component
 seam and includes the 4a regression-test audit inline.
 
-The kill-test for Slice 1 is the only remaining gate. Slice 4 finished
-ahead of Slice 1 because Slices 2/3/4/5 are mutually independent and 4
-did not require the operator walkthrough.
+All five slices have now shipped code; the only remaining gate is the
+**live 1e operator kill-test** for the kill-switch on the deployed HUD
+(after the gitops deployment MR merges + the `loom-mills-gitops` secret
+is installed). Slice 4 finished ahead of Slice 1 because Slices 2/3/4/5
+are mutually independent and 4 did not require the operator walkthrough.
 
 ## Riskiest assumption + kill-test
 

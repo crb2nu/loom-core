@@ -2,6 +2,7 @@
   import type { MillsCapabilityRow, SystemHealth } from '../../stores/mills.svelte.ts';
   import { millsStore } from '../../stores/mills.svelte.ts';
   import { router } from '../../stores/router.svelte.ts';
+  import { toastStore } from '../../stores/toasts.svelte.ts';
   import MetricCard from '../shared/MetricCard.svelte';
   import PanelShell from '../shared/PanelShell.svelte';
 
@@ -94,6 +95,50 @@
 
   let councilRunning = $state(false);
   let councilError = $state<string | null>(null);
+
+  // Global autonomy kill-switch (plan 42 Slice 1b). The flip routes through
+  // a GitOps auto-PR, so clicking pause/resume opens an MR rather than
+  // mutating live state — the change lands once that MR merges + Flux
+  // reconciles. `autonomyEnabled` reads the operator's live policy state.
+  let autonomyEnabled = $derived(status?.policy_enabled ?? policy?.enabled ?? true);
+  let killSwitchBusy = $state(false);
+
+  async function toggleKillSwitch(): Promise<void> {
+    if (killSwitchBusy) return;
+    const action = autonomyEnabled ? 'pause' : 'resume';
+    const verb = autonomyEnabled ? 'Pause' : 'Resume';
+    if (
+      !globalThis.confirm(
+        `${verb} Mills autonomy?\n\nThis opens a GitOps merge request flipping the policy ` +
+          `kill-switch. The change takes effect only after the MR is merged and Flux reconciles.`,
+      )
+    ) {
+      return;
+    }
+    killSwitchBusy = true;
+    try {
+      const res = await millsStore.setKillSwitch(action, 'hud-overview');
+      if (!res) {
+        toastStore.error('Kill-switch: no response from operator');
+        return;
+      }
+      if (!res.changed) {
+        toastStore.info(res.message);
+        return;
+      }
+      if (res.mr_url) {
+        globalThis.open(res.mr_url, '_blank', 'noopener');
+        toastStore.show(`Opened MR to ${action} autonomy: ${res.mr_url}`, 'success', 8000);
+      } else {
+        toastStore.success(res.message);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toastStore.error(`Kill-switch failed: ${msg}`);
+    } finally {
+      killSwitchBusy = false;
+    }
+  }
 
   async function runBannerAction(h: SystemHealth): Promise<void> {
     switch (h.state) {
@@ -245,6 +290,19 @@
         <span class="meta-divider"></span>
         Updated {fmtTime(status?.time)}
       </div>
+      <button
+        type="button"
+        class="kill-switch"
+        class:pause={autonomyEnabled}
+        class:resume={!autonomyEnabled}
+        onclick={toggleKillSwitch}
+        disabled={killSwitchBusy || disabled}
+        title={autonomyEnabled
+          ? 'Pause autonomy via a GitOps merge request'
+          : 'Resume autonomy via a GitOps merge request'}
+      >
+        {killSwitchBusy ? 'Opening MR…' : autonomyEnabled ? 'Pause autonomy' : 'Resume autonomy'}
+      </button>
     </div>
   {/snippet}
 
@@ -504,6 +562,45 @@
     border-radius: var(--radius-sm);
     color: var(--error);
     font-size: var(--text-xs);
+  }
+
+  /* Global autonomy kill-switch button (plan 42 Slice 1b). Pause reads as
+     a destructive action (error-tinted); resume reads as recovery
+     (success-tinted). Sits to the right of the status meta. */
+  .kill-switch {
+    align-self: flex-start;
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--fg-secondary);
+    border-radius: var(--radius-sm);
+    padding: 4px var(--space-3);
+    font: inherit;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: var(--tracking-wide);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .kill-switch.pause {
+    border-color: color-mix(in srgb, var(--error) 50%, var(--border));
+    color: var(--error);
+  }
+
+  .kill-switch.resume {
+    border-color: color-mix(in srgb, var(--success, var(--accent)) 50%, var(--border));
+    color: var(--success, var(--accent));
+  }
+
+  .kill-switch:hover,
+  .kill-switch:focus-visible {
+    border-color: var(--border-focus, var(--accent));
+    outline: none;
+  }
+
+  .kill-switch[disabled] {
+    cursor: progress;
+    opacity: 0.65;
   }
 
   .system-health-banner.intent-broken .banner-action {
