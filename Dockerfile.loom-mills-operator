@@ -13,7 +13,7 @@
 ARG PUBLIC_BASE_REGISTRY=docker.io
 
 # ---------- Build stage ----------
-FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.25.10-alpine AS builder
+FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.25.11-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 ENV GOWORK=off \
