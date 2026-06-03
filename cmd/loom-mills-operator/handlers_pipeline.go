@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills"
@@ -16,8 +17,29 @@ import (
 // escalated / paused) so the HUD pipeline panel renders only what's
 // in-flight by default. Slice 5.2 will add a query param to surface
 // recent terminal runs.
+//
+// When the `mr_iid` query param is present, it instead returns the
+// pipeline run(s) that produced that merge request — terminal or not —
+// powering the HUD "audit by MR iid" lookup (Loop B attribution).
 func (o *operator) handlePipelineRunsList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	if raw := r.URL.Query().Get("mr_iid"); raw != "" {
+		mrIID, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			http.Error(w, "mr_iid must be an integer", http.StatusBadRequest)
+			return
+		}
+		runs, err := o.store.Pipeline.ListByMRIID(ctx, mrIID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if runs == nil {
+			runs = []*store.PipelineRun{}
+		}
+		writeJSON(w, http.StatusOK, runs)
+		return
+	}
 	// "Active" is the union of every non-terminal state. Listing each
 	// state separately would race a state-transition mid-call; the DAO's
 	// CountActive uses the same predicate so the two endpoints agree.

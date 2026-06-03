@@ -10,10 +10,33 @@
     type GateOutcome,
     type StageResult,
   } from '../../stores/mills.svelte.ts';
+  import ConfirmDialog from '../shared/ConfirmDialog.svelte';
+  import { runAdminAction } from './shared/millsActions.ts';
 
   let load = $derived(millsStore.openPipelineDetail);
   let open = $derived(millsStore.selectedRunID !== null);
   let detail = $derived(load && load.status === 'loaded' ? load.detail : null);
+
+  // Force-escalate (plan 42 Slice 1): only offered while the run is
+  // still in-flight. Terminal runs (merged/done/failed/escalated) have
+  // nothing to escalate. The reconciler does not auto-retry escalated
+  // items, so this hands ownership back to the operator.
+  const TERMINAL_STATES = new Set(['merged', 'done', 'failed', 'escalated']);
+  let canEscalate = $derived(!!detail && !TERMINAL_STATES.has(detail.run.State));
+  let escalating = $state(false);
+  let confirmEscalate = $state(false);
+
+  async function doEscalate(): Promise<void> {
+    confirmEscalate = false;
+    const id = detail?.run.ID;
+    if (!id) return;
+    escalating = true;
+    await runAdminAction(() => millsStore.escalateRun(id, 'manual escalation from HUD'), {
+      success: 'Run escalated — operator owns the next move',
+      failurePrefix: 'Escalate failed',
+    });
+    escalating = false;
+  }
 
   // expandedStages tracks which stage rows have the log+artifacts
   // panel open. Stored locally (not on the store) because expansion
@@ -130,7 +153,20 @@
           <span class="run-state state-{detail.run.State}">{detail.run.State}</span>
         {/if}
       </div>
-      <button type="button" class="run-close" onclick={close} aria-label="Close run detail">✕</button>
+      <div class="run-header-actions">
+        {#if canEscalate}
+          <button
+            type="button"
+            class="run-escalate"
+            disabled={escalating}
+            onclick={() => (confirmEscalate = true)}
+            title="Force-escalate this run — stops the pipeline and hands ownership to the operator"
+          >
+            {escalating ? 'Escalating…' : '⚠ Escalate'}
+          </button>
+        {/if}
+        <button type="button" class="run-close" onclick={close} aria-label="Close run detail">✕</button>
+      </div>
     </header>
 
     {#if load?.status === 'loading' && !detail}
@@ -317,6 +353,16 @@
   </aside>
 {/if}
 
+<ConfirmDialog
+  open={confirmEscalate}
+  title="Force-escalate this run?"
+  message="Marks the pipeline run as escalated and stops automated progress. The reconciler will not auto-retry it — an operator owns the next move."
+  confirmLabel="Escalate"
+  variant="danger"
+  onConfirm={doEscalate}
+  onCancel={() => (confirmEscalate = false)}
+/>
+
 <style>
   .run-scrim {
     position: fixed;
@@ -395,6 +441,18 @@
   .run-state.state-escalated { background: rgba(220, 140, 60, 0.15); color: rgb(240, 180, 100); }
   .run-state.state-paused    { background: rgba(180, 180, 60, 0.15); color: rgb(220, 220, 120); }
 
+  .run-header-actions { display: flex; gap: 8px; align-items: center; }
+  .run-escalate {
+    padding: 4px 10px;
+    border: 1px solid rgba(220, 140, 60, 0.5);
+    background: rgba(220, 140, 60, 0.1);
+    color: rgb(240, 180, 100);
+    border-radius: var(--radius-xs);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .run-escalate:hover:not(:disabled) { background: rgba(220, 140, 60, 0.2); }
+  .run-escalate:disabled { opacity: 0.5; cursor: not-allowed; }
   .run-close {
     padding: 4px 10px;
     border: 1px solid var(--border);

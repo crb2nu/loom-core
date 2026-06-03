@@ -648,6 +648,34 @@ class MillsStore {
     return true;
   }
 
+  // dryrunCouncil runs a council pass against a scratch DB (no commits,
+  // no backlog writes) via POST /api/mills/council/dryrun. Used by the
+  // Council panel to preview what the current ensemble would propose
+  // before committing to a real run. Does not refresh the live stores.
+  async dryrunCouncil(reason: string = 'hud'): Promise<boolean> {
+    await this.postJSON(`/api/mills/council/dryrun`, { trigger: 'manual', reason });
+    return true;
+  }
+
+  // escalateRun force-escalates a stuck pipeline run via
+  // POST /api/mills/pipeline/runs/{id}/escalate. The reconciler does not
+  // auto-retry escalated items, so the operator owns the next move.
+  async escalateRun(runID: string, reason: string = 'manual escalation'): Promise<boolean> {
+    await this.postJSON(`/api/mills/pipeline/runs/${encodeURIComponent(runID)}/escalate`, { reason });
+    await this.fetchAll();
+    return true;
+  }
+
+  // auditByMRIID looks up the pipeline run(s) that produced a given
+  // merged MR (Loop B attribution) via GET /api/mills/pipeline/runs?mr_iid=.
+  // Returns [] when no run matches the iid.
+  async auditByMRIID(mrIID: number): Promise<PipelineRun[]> {
+    const runs = await this.getJSON<PipelineRun[]>(
+      `/api/mills/pipeline/runs?mr_iid=${encodeURIComponent(String(mrIID))}`,
+    );
+    return runs ?? [];
+  }
+
   startPolling(intervalMs = 15000): void {
     this.stopPolling();
     void this.fetchAll();

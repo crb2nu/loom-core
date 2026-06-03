@@ -1,7 +1,9 @@
 <script lang="ts">
   import { millsAuditStore, type AuditFinding } from '../../stores/mills_audit.svelte.ts';
+  import { millsStore, type PipelineRun } from '../../stores/mills.svelte.ts';
   import { flexinferModelsStore, type ModelStatus } from '../../stores/flexinfer_models.svelte.ts';
   import PanelShell from '../shared/PanelShell.svelte';
+  import PipelineRunDetail from './PipelineRunDetail.svelte';
 
   $effect(() => {
     millsAuditStore.startPolling(15000);
@@ -34,6 +36,40 @@
     if (!details[id]) {
       void millsAuditStore.fetchDetail(id);
     }
+  }
+
+  // Audit-by-MR-iid lookup (plan 42 Slice 1): given a merged MR's iid,
+  // find the pipeline run(s) that produced it (Loop B attribution) so
+  // the operator can drill into the originating run without curl.
+  let mrIIDInput = $state('');
+  let searching = $state(false);
+  let searched = $state(false);
+  let auditRuns = $state<PipelineRun[]>([]);
+  let searchError = $state<string | null>(null);
+
+  async function doAuditSearch(): Promise<void> {
+    const iid = Number.parseInt(mrIIDInput.trim(), 10);
+    if (!Number.isInteger(iid) || iid <= 0) {
+      searchError = 'Enter a positive MR iid';
+      searched = true;
+      auditRuns = [];
+      return;
+    }
+    searching = true;
+    searchError = null;
+    try {
+      auditRuns = await millsStore.auditByMRIID(iid);
+    } catch (e) {
+      searchError = e instanceof Error ? e.message : String(e);
+      auditRuns = [];
+    } finally {
+      searching = false;
+      searched = true;
+    }
+  }
+
+  function openRun(runID: string): void {
+    millsStore.openRunDetail(runID);
   }
 
   function fmtScore(v: number | undefined): string {
@@ -122,6 +158,50 @@
     ? 'Set LOOM_MILLS_OPERATOR_URL on the HUD to connect.'
     : (error ?? 'Findings appear when council artifacts commit and pipeline merges land.')}
 >
+  {#snippet toolbar()}
+    <form class="audit-search" onsubmit={(e) => { e.preventDefault(); void doAuditSearch(); }}>
+      <label class="audit-search-label" for="audit-mr-iid">Audit by MR iid</label>
+      <input
+        id="audit-mr-iid"
+        class="audit-search-input"
+        type="number"
+        min="1"
+        inputmode="numeric"
+        placeholder="e.g. 598"
+        bind:value={mrIIDInput}
+        disabled={disabled || searching}
+      />
+      <button type="submit" class="audit-search-btn" disabled={disabled || searching || !mrIIDInput.trim()}>
+        {searching ? 'Searching…' : 'Find run'}
+      </button>
+    </form>
+  {/snippet}
+
+  {#if searched}
+    <div class="audit-search-results">
+      {#if searchError}
+        <span class="audit-search-error">{searchError}</span>
+      {:else if auditRuns.length === 0}
+        <span class="audit-search-empty">No pipeline run found for MR !{mrIIDInput.trim()}.</span>
+      {:else}
+        <span class="audit-search-heading">
+          {auditRuns.length} run{auditRuns.length === 1 ? '' : 's'} produced MR !{mrIIDInput.trim()}:
+        </span>
+        <ul class="audit-run-list">
+          {#each auditRuns as run (run.ID)}
+            <li class="audit-run-item">
+              <button type="button" class="audit-run-link" onclick={() => openRun(run.ID)} title="Open run detail">
+                <span class="mono">{run.ID}</span>
+              </button>
+              <span class="audit-run-state state-{run.State}">{run.State}</span>
+              <span class="mono audit-run-backlog">{run.BacklogID}</span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
+
   {#if allLikelyNoRun}
     <div class="all-no-run-banner" role="alert">
       <strong>Every audit returned 0 with no cost.</strong>
@@ -260,7 +340,57 @@
   </div>
 </PanelShell>
 
+<!-- Drawer for an audited run; driven by millsStore.selectedRunID. -->
+<PipelineRunDetail />
+
 <style>
+  .audit-search { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .audit-search-label { font-size: 0.78rem; color: var(--text-muted, #889); }
+  .audit-search-input {
+    width: 7rem;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.82rem;
+    border: 1px solid var(--border, #334);
+    border-radius: 4px;
+    background: var(--bg-subtle, #1a1d26);
+    color: var(--text, #cdd);
+  }
+  .audit-search-btn {
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+    border-radius: 4px;
+    border: 1px solid rgb(90, 140, 220);
+    background: var(--bg-subtle, #1a1d26);
+    color: rgb(150, 190, 250);
+    cursor: pointer;
+  }
+  .audit-search-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .audit-search-results {
+    margin: 0.25rem 0.25rem 0.75rem;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid var(--border, #334);
+    border-radius: 6px;
+    background: var(--bg-subtle, #14171f);
+    font-size: 0.85rem;
+  }
+  .audit-search-error { color: rgb(240, 130, 130); }
+  .audit-search-empty { color: var(--text-muted, #889); }
+  .audit-search-heading { color: var(--text-muted, #aab); }
+  .audit-run-list { list-style: none; margin: 0.4rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+  .audit-run-item { display: flex; align-items: center; gap: 0.6rem; }
+  .audit-run-link {
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: rgb(150, 190, 250); text-decoration: underline;
+  }
+  .audit-run-state {
+    font-size: 0.72rem; padding: 0.1rem 0.4rem; border-radius: 3px;
+    background: rgba(64, 144, 240, 0.15); color: rgb(120, 180, 240);
+  }
+  .audit-run-state.state-merged, .audit-run-state.state-done { background: rgba(72, 200, 128, 0.15); color: rgb(120, 220, 160); }
+  .audit-run-state.state-escalated { background: rgba(220, 140, 60, 0.15); color: rgb(240, 180, 100); }
+  .audit-run-state.state-failed { background: rgba(220, 80, 80, 0.15); color: rgb(240, 130, 130); }
+  .audit-run-backlog { color: var(--text-muted, #889); font-size: 0.78rem; }
+  .mono { font-family: var(--font-mono, monospace); }
   .all-no-run-banner {
     margin: 0.25rem 0.25rem 0.75rem;
     padding: 0.7rem 0.9rem;

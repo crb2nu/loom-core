@@ -2,6 +2,8 @@
   import { millsStore, type CouncilAgent } from '../../stores/mills.svelte.ts';
   import { flexinferModelsStore, type ModelStatus } from '../../stores/flexinfer_models.svelte.ts';
   import PanelShell from '../shared/PanelShell.svelte';
+  import ConfirmDialog from '../shared/ConfirmDialog.svelte';
+  import { runAdminAction } from './shared/millsActions.ts';
 
   $effect(() => {
     millsStore.startPolling(15000);
@@ -28,6 +30,31 @@
     if (expanded[runID]) {
       void millsStore.loadDebate(runID);
     }
+  }
+
+  // Day-2 admin actions (plan 42 Slice 1): replay a real council pass or
+  // a safe dryrun without dropping to `loom mills council run/dryrun`.
+  let replaying = $state(false);
+  let dryrunning = $state(false);
+  let confirmReplay = $state(false);
+
+  async function doReplay(): Promise<void> {
+    confirmReplay = false;
+    replaying = true;
+    await runAdminAction(() => millsStore.runCouncil('hud-council-panel'), {
+      success: 'Council run triggered',
+      failurePrefix: 'Council run failed',
+    });
+    replaying = false;
+  }
+
+  async function doDryrun(): Promise<void> {
+    dryrunning = true;
+    await runAdminAction(() => millsStore.dryrunCouncil('hud-council-panel'), {
+      success: 'Council dryrun complete (scratch DB, no commits)',
+      failurePrefix: 'Council dryrun failed',
+    });
+    dryrunning = false;
   }
 
   function fmtTime(ts?: string): string {
@@ -117,6 +144,27 @@
     </div>
   {/snippet}
 
+  {#snippet actions()}
+    <button
+      type="button"
+      class="mills-action-btn secondary"
+      disabled={disabled || dryrunning}
+      onclick={doDryrun}
+      title="Run the current ensemble against a scratch DB — no commits, no backlog writes"
+    >
+      {dryrunning ? 'Dryrun…' : 'Dryrun'}
+    </button>
+    <button
+      type="button"
+      class="mills-action-btn primary"
+      disabled={disabled || replaying}
+      onclick={() => (confirmReplay = true)}
+      title="Fire a real council pass now (may create backlog items)"
+    >
+      {replaying ? 'Running…' : 'Replay council'}
+    </button>
+  {/snippet}
+
   <table class="mills-table">
     <thead>
       <tr>
@@ -136,7 +184,8 @@
         {@const debate = millsStore.debateByRun[r.ID]}
         {@const instant = isSuspiciouslyInstant(r)}
         {@const debateBroken = debate && debate.status === 'error'}
-        <tr class="row-summary" class:row-suspicious={instant || debateBroken} on:click={() => toggle(r.ID)}>
+        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+        <tr class="row-summary" class:row-suspicious={instant || debateBroken} onclick={() => toggle(r.ID)}>
           <td class="expander">
             <span class="caret" class:open={isOpen} aria-hidden="true">▸</span>
           </td>
@@ -200,7 +249,7 @@
               {:else if debate.status === 'error'}
                 <div class="debate-status error">
                   <strong>Failed to load debate:</strong> {debate.message}
-                  <button type="button" class="retry-btn" on:click|stopPropagation={() => millsStore.loadDebate(r.ID)}>↻ retry</button>
+                  <button type="button" class="retry-btn" onclick={(e) => { e.stopPropagation(); void millsStore.loadDebate(r.ID); }}>↻ retry</button>
                 </div>
               {:else if debate.rounds.length === 0}
                 <div class="debate-status muted">No debate ran for this council run (single-pass).</div>
@@ -243,12 +292,34 @@
   </table>
 </PanelShell>
 
+<ConfirmDialog
+  open={confirmReplay}
+  title="Replay council now?"
+  message="Fires a real council pass with the current ensemble. This may create new backlog items and incur model cost."
+  confirmLabel="Replay"
+  variant="warn"
+  onConfirm={doReplay}
+  onCancel={() => (confirmReplay = false)}
+/>
+
 <style>
   .policy-row { display: flex; gap: 0.75rem; align-items: center; font-size: 0.85rem; }
   .kill-switch { color: var(--text-muted, #889); }
   .kill-switch.enabled { color: rgb(120, 220, 160); }
   .kill-switch strong { color: inherit; }
   .policy-version { color: var(--text-muted, #889); font-size: 0.75rem; }
+  .mills-action-btn {
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+    border-radius: 4px;
+    border: 1px solid var(--border, #334);
+    background: var(--bg-subtle, #1a1d26);
+    color: var(--text, #cdd);
+    cursor: pointer;
+  }
+  .mills-action-btn:hover:not(:disabled) { background: var(--bg-hover, #232733); }
+  .mills-action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .mills-action-btn.primary { border-color: rgb(90, 140, 220); color: rgb(150, 190, 250); }
   .mills-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
   .mills-table th, .mills-table td {
     text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border-subtle, #233);

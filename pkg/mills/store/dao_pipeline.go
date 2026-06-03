@@ -332,6 +332,28 @@ func (d *PipelineDAO) ListByBacklog(ctx context.Context, backlogID string) ([]*P
 	return out, rows.Err()
 }
 
+// ListByMRIID returns pipeline runs whose mr_iid matches, newest-first.
+// Powers the HUD "audit by MR iid" lookup (Loop B attribution): given a
+// merged MR's iid, find the pipeline run(s) that produced it.
+func (d *PipelineDAO) ListByMRIID(ctx context.Context, mrIID int64) ([]*PipelineRun, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+pipelineColumns+` FROM pipeline_runs WHERE mr_iid = ? ORDER BY started_at DESC`,
+		mrIID)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline list-mriid: %w", err)
+	}
+	defer rows.Close()
+	var out []*PipelineRun
+	for rows.Next() {
+		r, err := scanPipelineRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func scanPipelineRun(s scanner) (*PipelineRun, error) {
 	var (
 		run                                                                  PipelineRun
