@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/mills/eval"
@@ -97,6 +98,34 @@ func TestFlexInferCouncilEditorNonEmptyResponseNotMarkedEmpty(t *testing.T) {
 	}
 	if out.Empty {
 		t.Fatalf("Empty = true, want false for non-empty response")
+	}
+}
+
+// Regression: the editor must stamp Sidecar.StartedAt before the chat
+// call so the artifact writer preserves a real start time. Without
+// this, both StartedAt and EndedAt would get the same post-write
+// timestamp and the Council tab would render every run as 0ms /
+// 'instant' even for runs that took multiple seconds.
+func TestFlexInferCouncilEditorStampsStartedAt(t *testing.T) {
+	cli := newStubClient(t, `{
+		"model":"gemma4-26b-a4b-gptq",
+		"choices":[{"message":{"role":"assistant","content":"## Research\nFindings."}}],
+		"usage":{"prompt_tokens":40,"completion_tokens":10,"total_tokens":50}
+	}`, 200)
+	editor := &FlexInferCouncilEditor{Client: cli, Model: "gemma4-26b-a4b-gptq"}
+
+	before := time.Now().UTC().Add(-time.Second)
+	out, err := editor.Edit(context.Background(), &council.Brief{Markdown: "Brief"}, nil)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	after := time.Now().UTC().Add(time.Second)
+
+	if out.Sidecar.StartedAt.IsZero() {
+		t.Fatalf("Sidecar.StartedAt was zero; runner can't tell start from end")
+	}
+	if out.Sidecar.StartedAt.Before(before) || out.Sidecar.StartedAt.After(after) {
+		t.Errorf("Sidecar.StartedAt = %v, want within [%v, %v]", out.Sidecar.StartedAt, before, after)
 	}
 }
 

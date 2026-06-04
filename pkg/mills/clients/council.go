@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/mills/eval"
@@ -76,6 +77,14 @@ func (e *FlexInferCouncilEditor) Edit(ctx context.Context, brief *council.Brief,
 		maxTokens = 4096
 	}
 	prompt := buildCouncilEditorPrompt(brief, reviews)
+	// Capture StartedAt BEFORE the chat call so the artifact writer
+	// (artifacts.go) sees a non-zero StartedAt and preserves it instead
+	// of stamping the post-write time over it. Without this, both
+	// StartedAt and EndedAt got the same post-write timestamp, the
+	// council_runs row reported 0ms duration on every successful run,
+	// and the Council tab rendered the misleading 'instant' badge for
+	// runs that actually took multiple seconds.
+	started := time.Now().UTC()
 	raw, cost, err := e.Client.Chat(ctx, e.Model, prompt, maxTokens)
 	if err != nil {
 		return nil, err
@@ -101,7 +110,8 @@ func (e *FlexInferCouncilEditor) Edit(ctx context.Context, brief *council.Brief,
 			{Kind: council.KindImplementation, Title: "Mills council implementation plan", Body: sections.implementation},
 		},
 		Sidecar: council.Sidecar{
-			Models: models,
+			Models:    models,
+			StartedAt: started,
 			CostUSD: council.SidecarCost{
 				Local: cost + reviewCost(reviews),
 			},
