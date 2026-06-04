@@ -28,6 +28,14 @@ var keywordIndexesByKind = map[string][]string{
 	CollFileClaims: {"agent_id", "status", "file_path"},
 }
 
+// datetimeIndexesByKind lists payload fields stored as RFC3339 strings that
+// need range-filter support. Sessions: started_at/ended_at let the reaper
+// query "older than X" via Qdrant's range filter instead of post-filtering
+// in Go after a full scroll.
+var datetimeIndexesByKind = map[string][]string{
+	CollSessions: {"started_at", "ended_at"},
+}
+
 // EnsureKeywordIndex idempotently creates a keyword payload index on the named
 // field. Qdrant's PUT /collections/{name}/index is idempotent: it succeeds if
 // the index already exists with the same schema.
@@ -53,15 +61,44 @@ func (c *QdrantClient) EnsureKeywordIndexes(ctx context.Context, fields ...strin
 	return nil
 }
 
-// ensureRegisteredIndexes applies the canonical keyword index set for the
-// client's kind. No-op when kind is empty or unregistered.
+// EnsureDatetimeIndex idempotently creates a datetime payload index.
+// Required for range filters like {"key":"started_at","range":{"lt":"..."}}.
+func (c *QdrantClient) EnsureDatetimeIndex(ctx context.Context, field string) error {
+	body := map[string]any{
+		"field_name":   field,
+		"field_schema": "datetime",
+	}
+	if err := c.doJSON(ctx, http.MethodPut, "/collections/"+c.collection+"/index", body, nil); err != nil {
+		return fmt.Errorf("ensure datetime index %s.%s: %w", c.collection, field, err)
+	}
+	return nil
+}
+
+// EnsureDatetimeIndexes applies a list of datetime payload indexes.
+func (c *QdrantClient) EnsureDatetimeIndexes(ctx context.Context, fields ...string) error {
+	for _, f := range fields {
+		if err := c.EnsureDatetimeIndex(ctx, f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureRegisteredIndexes applies the canonical keyword + datetime index sets
+// for the client's kind. No-op when kind is empty or unregistered.
 func (c *QdrantClient) ensureRegisteredIndexes(ctx context.Context) error {
 	if c == nil || c.kind == "" {
 		return nil
 	}
-	fields, ok := keywordIndexesByKind[c.kind]
-	if !ok || len(fields) == 0 {
-		return nil
+	if fields, ok := keywordIndexesByKind[c.kind]; ok && len(fields) > 0 {
+		if err := c.EnsureKeywordIndexes(ctx, fields...); err != nil {
+			return err
+		}
 	}
-	return c.EnsureKeywordIndexes(ctx, fields...)
+	if fields, ok := datetimeIndexesByKind[c.kind]; ok && len(fields) > 0 {
+		if err := c.EnsureDatetimeIndexes(ctx, fields...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
