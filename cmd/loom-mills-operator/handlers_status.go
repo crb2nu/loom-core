@@ -26,6 +26,11 @@ func (o *operator) handleStatusFull(w http.ResponseWriter, r *http.Request) {
 		t := runs[0].StartedAt
 		lastCouncil = &t
 	}
+	// last_merge_at is the all-time most-recent autonomous merge. The HUD
+	// health banner cannot derive this from its active-only pipeline-run
+	// list (terminal `done` runs are excluded), so the operator surfaces
+	// it here. nil until the first merge ever lands.
+	lastMerge, _ := o.store.Pipeline.LatestMergedAt(ctx)
 	capabilities := o.capabilityReport(ctx)
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -38,6 +43,7 @@ func (o *operator) handleStatusFull(w http.ResponseWriter, r *http.Request) {
 		"queue_depth":          queueDepth,
 		"active_pipeline_runs": active,
 		"last_council_at":      lastCouncil,
+		"last_merge_at":        lastMerge,
 		"slice":                "2.4-rest-surface",
 	})
 }

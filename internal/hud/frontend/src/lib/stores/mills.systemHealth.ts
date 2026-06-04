@@ -93,6 +93,12 @@ export function computeSystemHealth(input: {
   // counts otherwise.
   mergedRuns24h?: number | null;
   escalatedRuns24h?: number | null;
+  // Authoritative all-time last-merge timestamp from the operator status
+  // (handleStatusFull `last_merge_at`). The run-list derivation below can
+  // only see ACTIVE runs, so its lastSuccessfulMergeAt is ~always null and
+  // the `broken` banner would falsely read "No successful merge on
+  // record". Prefer this when present.
+  lastMergeAt?: string | null;
 }): SystemHealth {
   const now = input.now ?? Date.now();
   const cutoff = now - TWENTY_FOUR_HOURS_MS;
@@ -144,6 +150,12 @@ export function computeSystemHealth(input: {
   }
   if (typeof input.escalatedRuns24h === 'number' && Number.isFinite(input.escalatedRuns24h)) {
     escalations24h = input.escalatedRuns24h;
+  }
+
+  // Authoritative all-time last-merge wins over the active-only run-list
+  // derivation (which can't see terminal merged runs at all).
+  if (typeof input.lastMergeAt === 'string' && input.lastMergeAt) {
+    lastSuccessfulMergeAt = input.lastMergeAt;
   }
 
   const councilRunsTotal = input.councilRuns.length;

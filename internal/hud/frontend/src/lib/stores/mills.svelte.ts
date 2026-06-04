@@ -208,6 +208,10 @@ export interface MillsStatus {
   queue_depth?: number;
   active_pipeline_runs?: number;
   last_council_at?: string | null;
+  // All-time most-recent autonomous merge (operator-sourced). The health
+  // banner can't derive this from the active-only pipelineRuns list, which
+  // never holds terminal `done` runs — see systemHealth `lastMergeAt`.
+  last_merge_at?: string | null;
 }
 
 // KillSwitchResult mirrors the operator's POST /api/mills/policy/kill-switch
@@ -410,6 +414,11 @@ class MillsStore {
       // the active-only pipelineRuns list.
       mergedRuns24h: this.kpis?.metrics?.pipeline_merged_runs,
       escalatedRuns24h: this.kpis?.metrics?.pipeline_escalated_runs,
+      // All-time last merge from the operator status. Lets the `broken`
+      // banner say "Last successful merge: <time>" honestly instead of
+      // falsely claiming "No successful merge on record" — the active-only
+      // run list can never carry a terminal merged run.
+      lastMergeAt: this.status?.last_merge_at,
     });
   }
 

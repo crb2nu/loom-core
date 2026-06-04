@@ -690,6 +690,58 @@ func TestPipeline_ListRecentTerminal(t *testing.T) {
 	}
 }
 
+func TestPipeline_LatestMergedAt(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	parent := &BacklogItem{
+		ID: "MILLS-LMA", Title: "lma", State: BacklogQueued, Priority: P2, CreatedBy: "test",
+	}
+	if err := st.Backlog.Put(ctx, parent); err != nil {
+		t.Fatalf("put backlog: %v", err)
+	}
+
+	// No merged run yet → nil, no error.
+	got, err := st.Pipeline.LatestMergedAt(ctx)
+	if err != nil {
+		t.Fatalf("latest-merged-at (empty): %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil before any merge, got %v", got)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	attempt := 0
+	put := func(id string, state PipelineState, endedAt time.Time) {
+		t.Helper()
+		attempt++
+		ended := endedAt
+		if err := st.Pipeline.PutRun(ctx, &PipelineRun{
+			ID: id, BacklogID: parent.ID, Template: "t", State: state,
+			Attempts: attempt, StartedAt: endedAt.Add(-time.Hour), EndedAt: &ended,
+		}); err != nil {
+			t.Fatalf("put run %s: %v", id, err)
+		}
+	}
+	// An older merge, a newer escalation (must NOT win), an active run (no
+	// ended_at), and the newest merge — the one we expect back.
+	put("DONE-OLD", PipelineDone, now.Add(-48*time.Hour))
+	put("ESC-NEW", PipelineEscalated, now.Add(-1*time.Minute))
+	put("DONE-NEW", PipelineDone, now.Add(-2*time.Hour))
+
+	got, err = st.Pipeline.LatestMergedAt(ctx)
+	if err != nil {
+		t.Fatalf("latest-merged-at: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected the newest merged run's ended_at, got nil")
+	}
+	want := now.Add(-2 * time.Hour)
+	if !got.Equal(want) {
+		t.Fatalf("latest-merged-at = %v, want %v (newest done run, not the escalation)", got, want)
+	}
+}
+
 func idsOf(runs []*PipelineRun) []string {
 	out := make([]string, len(runs))
 	for i, r := range runs {
