@@ -543,6 +543,7 @@ func (s *Service) HandleUnifiedRecall(ctx context.Context, args map[string]any) 
 	totalTokens := 0
 	totalCount := 0
 	totalCandidates := 0
+	rerankBackend := ""
 
 	// --- Context backend ---
 	if includeContext {
@@ -573,6 +574,11 @@ func (s *Service) HandleUnifiedRecall(ctx context.Context, args map[string]any) 
 			backendsFailed = append(backendsFailed, "context")
 			warnings = append(warnings, fmt.Sprintf("context backend failed: %v", err))
 		} else {
+			// Second-stage rerank (default-off via WEAVER_RERANKER): reorder
+			// the merged candidate set by cross-encoder relevance to the query.
+			// No-op + zero I/O when disabled; soft-fails to the embedding /
+			// priority order when the rerank proxy is unavailable.
+			entries, rerankBackend = s.rerankRecallEntries(ctx, query, entries)
 			totalCandidates += len(entries)
 			for _, e := range entries {
 				totalTokens += e.TokenCount
@@ -671,6 +677,9 @@ func (s *Service) HandleUnifiedRecall(ctx context.Context, args map[string]any) 
 		"token_budget_used":  totalTokens,
 		"token_budget_total": tokenBudget,
 		"latency_ms":         time.Since(recallStart).Milliseconds(),
+	}
+	if rerankBackend != "" {
+		recallMeta["rerank_backend"] = rerankBackend
 	}
 	resp["recall_meta"] = recallMeta
 
@@ -819,6 +828,29 @@ func (s *Service) getEntriesForSymbol(ctx context.Context, agentID, symbol strin
 // conflicts with slices A2 (tools) and A3 (graph query) that edit
 // adjacent files.
 // =========================================================================
+
+// rerankRecallEntries applies the Service's configured reranker as a second
+// retrieval stage over context recall entries. It is a thin, deterministic
+// wrapper around ApplyReranker that gates on the wired backend:
+//
+//   - nil reranker or "off" backend -> entries unchanged, empty backend tag
+//     (zero network I/O; keeps the default response path byte-stable).
+//   - any other backend            -> entries reordered by relevance, backend
+//     tag returned so callers can surface it in recall_meta.
+//
+// Soft failures (proxy down / timeout) are swallowed by ApplyReranker, which
+// returns the original embedding/priority order — recall never fails because
+// the reranker is unavailable.
+func (s *Service) rerankRecallEntries(ctx context.Context, query string, entries []ContextEntry) (out []ContextEntry, backend string) {
+	if s == nil || s.reranker == nil {
+		return entries, ""
+	}
+	if s.reranker.Backend() == string(RerankerKindOff) {
+		return entries, ""
+	}
+	reordered, _ := s.ApplyReranker(ctx, s.reranker, query, entries)
+	return reordered, s.reranker.Backend()
+}
 
 // ApplyReranker runs the configured Reranker against the supplied entries
 // and returns the (possibly reordered) slice. A nil or off reranker

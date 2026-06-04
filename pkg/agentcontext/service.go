@@ -28,6 +28,13 @@ func WithTracer(tp trace.TracerProvider) ServiceOption {
 	return func(s *Service) { s.tracer = tp.Tracer("agentcontext") }
 }
 
+// WithReranker overrides the recall reranker. Production wires this from
+// WEAVER_RERANKER env config; tests inject a fake to exercise the recall
+// second-stage rerank deterministically.
+func WithReranker(r Reranker) ServiceOption {
+	return func(s *Service) { s.reranker = r }
+}
+
 // WithCommandRunner wires a backend for engram `command:` proof verification.
 // When set, HandleEngramVerify will execute commands via the runner instead of
 // returning skipped. Production binaries adapt this to devbox; tests inject a
@@ -44,6 +51,12 @@ type Service struct {
 
 	qdrant *QdrantRegistry
 	embed  embed.Embedder
+
+	// Recall reranker (default NoopReranker / "off"). Constructed from
+	// WEAVER_RERANKER env config in NewServiceFromEnv; overridable in tests
+	// via WithReranker. HandleUnifiedRecall applies it as a second stage
+	// after embedding retrieval.
+	reranker Reranker
 
 	vectorSize int
 
@@ -183,6 +196,19 @@ func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 		svc.tracer = noop.NewTracerProvider().Tracer("agentcontext")
 	}
 	svc.metrics = GetMetrics()
+
+	// Recall reranker: default-off (NoopReranker) unless WEAVER_RERANKER is
+	// set. A WithReranker option (tests) takes precedence over env config.
+	if svc.reranker == nil {
+		rcfg := LoadRerankerConfigFromEnv()
+		svc.reranker = NewReranker(rcfg.Kind, rcfg, svc.logger)
+		if rcfg.Kind != RerankerKindOff {
+			svc.logger.Info("recall reranker enabled",
+				"backend", svc.reranker.Backend(),
+				"base_url", rcfg.BaseURL,
+				"model", rcfg.Model)
+		}
+	}
 
 	// Initialize domain sub-services
 	svc.presence = NewPresenceSvc(qdrantReg.Get(CollPresence), cfg, svc.logger, svc.metrics)

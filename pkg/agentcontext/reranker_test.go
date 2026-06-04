@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -253,4 +254,86 @@ func TestLoadRerankerConfigFromEnv_ParsesFlexInfer(t *testing.T) {
 	if cfg.Timeout != 7*time.Second {
 		t.Errorf("Timeout = %v, want %v", cfg.Timeout, 7*time.Second)
 	}
+}
+
+// fakeReranker is a deterministic test backend. It reverses the entry order
+// and reports a fixed backend tag so the recall-wiring tests can assert that
+// HandleUnifiedRecall's second stage actually runs.
+type fakeReranker struct {
+	backend string
+	calls   int
+}
+
+func (f *fakeReranker) Backend() string { return f.backend }
+
+func (f *fakeReranker) Rerank(_ context.Context, _ string, entries []ContextEntry) ([]ContextEntry, error) {
+	f.calls++
+	out := make([]ContextEntry, len(entries))
+	for i := range entries {
+		out[i] = entries[len(entries)-1-i]
+	}
+	return out, nil
+}
+
+// TestRerankRecallEntries_NilRerankerIsNoOp asserts the recall-stage wrapper
+// short-circuits (no reorder, empty backend) when no reranker is wired.
+func TestRerankRecallEntries_NilRerankerIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	svc := &Service{}
+	entries := []ContextEntry{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	out, backend := svc.rerankRecallEntries(context.Background(), "q", entries)
+	if backend != "" {
+		t.Errorf("backend = %q, want empty", backend)
+	}
+	if len(out) != 3 || out[0].ID != "a" || out[2].ID != "c" {
+		t.Errorf("order changed for nil reranker: %v", idsOf(out))
+	}
+}
+
+// TestRerankRecallEntries_OffBackendIsNoOp asserts a wired-but-"off" reranker
+// (NoopReranker) is treated as disabled: no reorder, empty backend tag, and
+// the response path stays byte-stable.
+func TestRerankRecallEntries_OffBackendIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	svc := &Service{reranker: NoopReranker{}}
+	entries := []ContextEntry{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	out, backend := svc.rerankRecallEntries(context.Background(), "q", entries)
+	if backend != "" {
+		t.Errorf("backend = %q, want empty for off backend", backend)
+	}
+	if len(out) != 3 || out[0].ID != "a" {
+		t.Errorf("off backend reordered entries: %v", idsOf(out))
+	}
+}
+
+// TestRerankRecallEntries_ActiveBackendReorders asserts that a wired, active
+// reranker reorders the candidate set and reports its backend tag for
+// recall_meta.
+func TestRerankRecallEntries_ActiveBackendReorders(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeReranker{backend: "flexinfer"}
+	svc := &Service{reranker: fake}
+	entries := []ContextEntry{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	out, backend := svc.rerankRecallEntries(context.Background(), "q", entries)
+	if backend != "flexinfer" {
+		t.Errorf("backend = %q, want flexinfer", backend)
+	}
+	if fake.calls != 1 {
+		t.Errorf("reranker called %d times, want 1", fake.calls)
+	}
+	want := []string{"c", "b", "a"}
+	if got := idsOf(out); !reflect.DeepEqual(got, want) {
+		t.Errorf("order = %v, want %v", got, want)
+	}
+}
+
+func idsOf(entries []ContextEntry) []string {
+	ids := make([]string, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	return ids
 }
