@@ -119,6 +119,29 @@ if (oldMerge.last_successful_merge_at !== TWO_DAYS_AGO) {
   allOk = false;
 }
 
+// 6. blind active-only list (real-world shape): the operator endpoint
+// returns ONLY active runs, so the list has no terminal `done` row — the
+// run-list derivation yields last_successful_merge_at=null. The
+// authoritative `lastMergeAt` override (from status.last_merge_at) must
+// win so the broken banner can report a real "last successful merge".
+const blindWithOverride = computeSystemHealth({
+  pipelineRuns: [
+    { ID: 'r1', BacklogID: 'b1', Template: 't', State: 'escalated', Attempts: 1, EndedAt: HOUR_AGO },
+  ] as PipelineRun[],
+  status: baseStatus,
+  councilRuns: [{ ID: 'c1', Trigger: 'cron', Outcome: 'ok' } as CouncilRun],
+  backlog: [],
+  now: NOW,
+  escalatedRuns24h: 1,
+  mergedRuns24h: 0,
+  lastMergeAt: TWO_DAYS_AGO,
+});
+allOk = run('blind-list-override', blindWithOverride, { state: 'broken', escalations_24h: 1, merges_24h: 0 }) && allOk;
+if (blindWithOverride.last_successful_merge_at !== TWO_DAYS_AGO) {
+  console.error('FAIL blind-list-override: lastMergeAt override did not win over blind null derivation');
+  allOk = false;
+}
+
 if (!allOk) {
   console.error('mills.systemHealth fixture: FAILURES detected');
   // Avoid process.exit so this remains safely importable for SSR-ish flows.

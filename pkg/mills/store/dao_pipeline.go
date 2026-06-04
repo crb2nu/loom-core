@@ -246,6 +246,30 @@ func (d *PipelineDAO) ListInFlight(ctx context.Context) ([]*PipelineRun, error) 
 	return out, rows.Err()
 }
 
+// LatestMergedAt returns the EndedAt of the most recently merged
+// (state=done) pipeline run, or nil when none has ever merged. Unlike
+// the windowed KPI counts this is an all-time lookup: it answers "when
+// did autonomy last successfully merge anything?" — the exact signal the
+// Overview health banner needs when zero runs merged in the last 24h.
+// The active-only pipeline-run list the HUD polls can never surface a
+// terminal merged run, so the frontend cannot derive this itself.
+func (d *PipelineDAO) LatestMergedAt(ctx context.Context) (*time.Time, error) {
+	row := d.db.QueryRowContext(ctx, `
+		SELECT ended_at FROM pipeline_runs
+		WHERE state = ? AND ended_at IS NOT NULL AND ended_at != ''
+		ORDER BY ended_at DESC
+		LIMIT 1
+	`, string(PipelineDone))
+	var endedAt sql.NullString
+	if err := row.Scan(&endedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("pipeline latest-merged-at: %w", err)
+	}
+	return nullableTime(endedAt)
+}
+
 // SumCostSince totals pipeline spend since the given timestamp.
 func (d *PipelineDAO) SumCostSince(ctx context.Context, since time.Time) (float64, error) {
 	row := d.db.QueryRowContext(ctx,
