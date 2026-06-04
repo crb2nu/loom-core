@@ -276,6 +276,14 @@ export interface MillsKPISnapshot {
     auto_merge_rate?: number;       // 0..1
     regression_rate?: number;       // 0..1
     council_roi?: number;           // merged-changes-per-council-USD
+    // Absolute window counts the operator already emits but the UI did
+    // not previously surface. pipeline_merged_runs over the 1d window is
+    // the north-star: autonomous merges in the last 24h.
+    pipeline_merged_runs?: number;
+    pipeline_escalated_runs?: number;
+    escalation_rate?: number;       // 0..1
+    council_runs?: number;
+    pipeline_runs?: number;
   };
 }
 
@@ -396,6 +404,12 @@ class MillsStore {
       status: this.status,
       councilRuns: this.councilRuns,
       backlog: this.backlog,
+      // Authoritative 24h terminal counts from the rolling-1d KPI snapshot
+      // (this.kpis is the window=1d snapshot). Without these the health
+      // banner is blind to merged/escalated runs — they never appear in
+      // the active-only pipelineRuns list.
+      mergedRuns24h: this.kpis?.metrics?.pipeline_merged_runs,
+      escalatedRuns24h: this.kpis?.metrics?.pipeline_escalated_runs,
     });
   }
 
