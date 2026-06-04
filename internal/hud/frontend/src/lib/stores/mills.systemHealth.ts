@@ -83,6 +83,16 @@ export function computeSystemHealth(input: {
   councilRuns: CouncilRunLike[];
   backlog: BacklogItemLike[];
   now?: number;
+  // Authoritative 24h terminal counts from the operator's KPI snapshot
+  // (kpi_snapshots.metrics.pipeline_merged_runs / _escalated_runs). The
+  // run-list derivation below only sees ACTIVE runs — terminal merged /
+  // escalated runs are excluded by the active-only pipeline endpoint — so
+  // without these overrides merges_24h/escalations_24h are ~always 0 and
+  // the banner can neither report merges nor reach the `broken` state.
+  // Prefer them when present (finite number); fall back to the derived
+  // counts otherwise.
+  mergedRuns24h?: number | null;
+  escalatedRuns24h?: number | null;
 }): SystemHealth {
   const now = input.now ?? Date.now();
   const cutoff = now - TWENTY_FOUR_HOURS_MS;
@@ -125,6 +135,15 @@ export function computeSystemHealth(input: {
   }
   if (typeof input.status?.queue_depth === 'number') {
     queued = input.status.queue_depth;
+  }
+
+  // Authoritative terminal counts win over the active-only run-list
+  // derivation (which can't see merged/escalated runs at all).
+  if (typeof input.mergedRuns24h === 'number' && Number.isFinite(input.mergedRuns24h)) {
+    merges24h = input.mergedRuns24h;
+  }
+  if (typeof input.escalatedRuns24h === 'number' && Number.isFinite(input.escalatedRuns24h)) {
+    escalations24h = input.escalatedRuns24h;
   }
 
   const councilRunsTotal = input.councilRuns.length;

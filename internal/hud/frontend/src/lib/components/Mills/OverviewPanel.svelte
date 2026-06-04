@@ -48,7 +48,7 @@
   function bannerHeadline(h: SystemHealth): string {
     switch (h.state) {
       case 'broken':
-        return `${h.escalations_24h} escalated · 0 merged in 24h`;
+        return `${h.escalations_24h} escalated · ${h.merges_24h} merged in 24h`;
       case 'in_flight':
         return `${h.active_runs} ${h.active_runs === 1 ? 'pipeline' : 'pipelines'} in flight`;
       case 'idle':
@@ -308,6 +308,13 @@
 
   <div class="overview-layout">
     <section class="metric-grid" aria-label="Mills operating counters">
+      <MetricCard
+        label="Auto-merges 24h"
+        value={fmtNumber(health.merges_24h)}
+        color={health.merges_24h > 0 ? 'var(--success)' : 'var(--fg-muted)'}
+        compact
+        onclick={() => goto('pipelines')}
+      />
       <MetricCard
         label="Queue"
         value={fmtNumber(status?.queue_depth)}

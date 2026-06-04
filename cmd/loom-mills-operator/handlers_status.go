@@ -54,8 +54,11 @@ func (o *operator) handlePolicy(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleKPIs returns the most recent KPI snapshot for the requested
-// rolling window. Slice 5.1 wires the reconciler to record snapshots; the
-// handler is correct today but returns 404 until a snapshot exists.
+// rolling window. The scheduler's KPIWriter (pkg/mills/kpi_writer.go)
+// records a snapshot per window after every successful reconciler tick,
+// so this returns data once the operator has ticked at least once; the
+// 404 is reserved for the brief pre-first-tick window (the HUD renders a
+// placeholder card rather than an error in that case).
 func (o *operator) handleKPIs(w http.ResponseWriter, r *http.Request) {
 	window := r.URL.Query().Get("window")
 	seconds := windowSeconds(window)
