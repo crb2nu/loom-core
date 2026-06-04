@@ -332,6 +332,63 @@ func (d *PipelineDAO) ListByBacklog(ctx context.Context, backlogID string) ([]*P
 	return out, rows.Err()
 }
 
+// pipelineTerminalStates is the set of states a run can no longer leave:
+// it has merged (done), been handed to a human (escalated), or been
+// parked (paused). ListRecentTerminal + the HUD "history" view read these;
+// CountActive/ListInFlight use the complement. Keep the two predicates in
+// sync — a state added here must be excluded from "active" everywhere.
+var pipelineTerminalStates = []PipelineState{
+	PipelineDone, PipelineEscalated, PipelinePaused,
+}
+
+// ListRecentTerminal returns finished pipeline runs (done / escalated /
+// paused), newest-first, so the HUD can show run history instead of only
+// what's in flight. `since` bounds the window (zero = no lower bound);
+// `limit` caps the row count (<=0 falls back to 50, hard-capped at 200 so
+// a caller can't pull the whole table). This is the read side of the
+// monitoring gap the active-only list left open.
+func (d *PipelineDAO) ListRecentTerminal(ctx context.Context, since time.Time, limit int) ([]*PipelineRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	// Build the IN (?,?,?) placeholder list from the shared terminal set so
+	// the query and the predicate can never drift.
+	args := make([]any, 0, len(pipelineTerminalStates)+2)
+	placeholders := ""
+	for i, s := range pipelineTerminalStates {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args = append(args, string(s))
+	}
+	q := `SELECT ` + pipelineColumns + ` FROM pipeline_runs WHERE state IN (` + placeholders + `)`
+	if !since.IsZero() {
+		q += ` AND started_at >= ?`
+		args = append(args, timeRFC3339(since))
+	}
+	q += ` ORDER BY started_at DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline list-recent-terminal: %w", err)
+	}
+	defer rows.Close()
+	var out []*PipelineRun
+	for rows.Next() {
+		r, err := scanPipelineRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ListByMRIID returns pipeline runs whose mr_iid matches, newest-first.
 // Powers the HUD "audit by MR iid" lookup (Loop B attribution): given a
 // merged MR's iid, find the pipeline run(s) that produced it.

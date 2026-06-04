@@ -13,23 +13,60 @@ import (
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
-// handlePipelineRunsList returns active runs (anything not in done /
-// escalated / paused) so the HUD pipeline panel renders only what's
-// in-flight by default. Slice 5.2 will add a query param to surface
-// recent terminal runs.
+// handlePipelineRunsList returns pipeline runs for the HUD pipeline panel.
 //
-// When the `mr_iid` query param is present, it instead returns the
-// pipeline run(s) that produced that merge request — terminal or not —
-// powering the HUD "audit by MR iid" lookup (Loop B attribution).
+// Query params (checked in precedence order):
+//   - mr_iid=N      → the run(s) that produced that merge request (terminal
+//     or not), powering the HUD "audit by MR iid" lookup (Loop B attribution).
+//   - state=terminal → finished runs (done / escalated / paused), newest-first,
+//     bounded by since= (RFC3339, default last 7d) and limit= (default 50,
+//     max 200). This is the run-history view; without it the panel could only
+//     ever show in-flight work and a run vanished the moment it merged.
+//
+// With no params it returns active (non-terminal) runs — the historical
+// default, kept for back-compat with existing callers.
 func (o *operator) handlePipelineRunsList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if raw := r.URL.Query().Get("mr_iid"); raw != "" {
+	q := r.URL.Query()
+	if raw := q.Get("mr_iid"); raw != "" {
 		mrIID, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
 			http.Error(w, "mr_iid must be an integer", http.StatusBadRequest)
 			return
 		}
 		runs, err := o.store.Pipeline.ListByMRIID(ctx, mrIID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if runs == nil {
+			runs = []*store.PipelineRun{}
+		}
+		writeJSON(w, http.StatusOK, runs)
+		return
+	}
+	if state := q.Get("state"); state == "terminal" || state == "history" {
+		var since time.Time
+		if raw := q.Get("since"); raw != "" {
+			t, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				http.Error(w, "since must be an RFC3339 timestamp", http.StatusBadRequest)
+				return
+			}
+			since = t
+		} else {
+			since = time.Now().Add(-7 * 24 * time.Hour)
+		}
+		limit := 50
+		if raw := q.Get("limit"); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n <= 0 {
+				http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+				return
+			}
+			limit = n
+		}
+		runs, err := o.store.Pipeline.ListRecentTerminal(ctx, since, limit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
