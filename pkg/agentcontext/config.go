@@ -101,7 +101,7 @@ type Config struct {
 	// Session reaper
 	SessionReaperEnabled      bool // default: true
 	SessionReaperInterval     int  // seconds, default: 1800 (30 minutes)
-	SessionReaperMaxAge       int  // hours, default: 168 (7 days)
+	SessionReaperMaxAge       int  // hours, default: 72 (3 days) — ended/summarized retention
 	SessionReaperActiveMaxAge int  // hours, default: 24 — reap "active" sessions older than this
 
 	// Worktree reconciler
@@ -211,7 +211,7 @@ func LoadConfigFromEnv() (Config, error) {
 		// Session reaper
 		SessionReaperEnabled:      env.Bool("AGENT_CONTEXT_SESSION_REAPER_ENABLED", true),
 		SessionReaperInterval:     env.IntWithZero("AGENT_CONTEXT_SESSION_REAPER_INTERVAL", 1800),
-		SessionReaperMaxAge:       env.IntWithZero("AGENT_CONTEXT_SESSION_REAPER_MAX_AGE_HOURS", 168),
+		SessionReaperMaxAge:       env.IntWithZero("AGENT_CONTEXT_SESSION_REAPER_MAX_AGE_HOURS", 72),
 		SessionReaperActiveMaxAge: env.IntWithZero("AGENT_CONTEXT_SESSION_REAPER_ACTIVE_MAX_AGE_HOURS", 24),
 
 		// Worktree reconciler
