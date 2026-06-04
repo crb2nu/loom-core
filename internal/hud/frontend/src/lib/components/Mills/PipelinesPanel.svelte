@@ -4,25 +4,57 @@
   import PanelShell from '../shared/PanelShell.svelte';
   import PipelineRunDetail from './PipelineRunDetail.svelte';
 
+  // 'active' shows in-flight runs (the live poll); 'history' shows finished
+  // runs (done/escalated/paused), newest-first, so an operator can review
+  // what the Mills actually did — the active list drops a run the instant it
+  // terminates, which is why a dedicated history view is needed to monitor.
+  let view = $state<'active' | 'history'>('active');
+
   $effect(() => {
     millsStore.startPolling(15000);
-    return () => { millsStore.stopPolling(); };
+    return () => {
+      millsStore.stopPolling();
+      millsStore.historyActive = false;
+    };
+  });
+
+  // Drive history loading off the selected view. Setting historyActive lets
+  // fetchAll refresh history on the same 15s cadence; the immediate fetch
+  // gives instant feedback on switch instead of waiting a full tick.
+  $effect(() => {
+    const wantHistory = view === 'history';
+    millsStore.historyActive = wantHistory;
+    if (wantHistory) void millsStore.fetchPipelineHistory();
   });
 
   let runs = $derived(millsStore.pipelineRuns);
+  let history = $derived(millsStore.pipelineHistory);
   let counts = $derived(millsStore.pipelinesByState);
-  let loading = $derived(millsStore.loading && millsStore.pipelineRuns.length === 0);
+  let loading = $derived(
+    view === 'history'
+      ? millsStore.historyLoading && millsStore.pipelineHistory.length === 0
+      : millsStore.loading && millsStore.pipelineRuns.length === 0,
+  );
   let disabled = $derived(millsStore.disabled);
-  let error = $derived(millsStore.error);
+  let error = $derived(view === 'history' ? millsStore.historyError : millsStore.error);
   let autonomyBlocked = $derived(millsStore.autonomyBlocked);
   let blockers = $derived(millsStore.autonomyBlockers);
   let status = $derived(millsStore.status);
 
-  // sortedRuns groups subruns directly under their parent (Phase 6
-  // slice 6.3). Top-level runs are rendered in their original order;
-  // each subrun follows its parent so the depth indicator + indent
-  // reads as a parent→child tree without a recursive layout.
-  let sortedRuns = $derived.by(() => {
+  function fmtCost(c?: number): string {
+    if (c == null || !Number.isFinite(c)) return '—';
+    return `$${c.toFixed(4)}`;
+  }
+
+  // displayRuns is what the table renders. History is a flat, already
+  // newest-first list (terminal runs don't spawn live subruns worth
+  // tree-grouping). Active groups subruns directly under their parent
+  // (Phase 6 slice 6.3): top-level runs keep their order; each subrun
+  // follows its parent so the depth indicator + indent reads as a
+  // parent→child tree without a recursive layout.
+  let displayRuns = $derived.by(() => {
+    if (view === 'history') return history;
+    const runs = millsStore.pipelineRuns;
     const byParent = new Map<string, PipelineRun[]>();
     const tops: PipelineRun[] = [];
     for (const r of runs) {
@@ -55,7 +87,9 @@
     if (!ts) return '—';
     const d = new Date(ts);
     if (isNaN(d.getTime())) return ts;
-    return d.toLocaleTimeString();
+    // History runs can be days old, so a bare time would be ambiguous —
+    // show the full date+time there; the live active view stays compact.
+    return view === 'history' ? d.toLocaleString() : d.toLocaleTimeString();
   }
 
   function depthIndent(d?: number): string {
@@ -91,14 +125,16 @@
 
   function emptyMessage(): string {
     if (disabled) return 'Mills operator not configured';
-    if (error) return 'Failed to load pipeline runs';
+    if (error) return view === 'history' ? 'Failed to load run history' : 'Failed to load pipeline runs';
+    if (view === 'history') return 'No finished runs yet';
     if (autonomyBlocked) return 'Mills autonomy is blocked';
-    return 'No pipeline runs yet';
+    return 'No active pipeline runs';
   }
 
   function emptyHint(): string {
     if (disabled) return 'Set LOOM_MILLS_OPERATOR_URL on the HUD to connect.';
-    if (error) return error;
+    if (error) return error ?? '';
+    if (view === 'history') return 'Runs appear here once they merge, escalate, or pause (last 7 days).';
     if (autonomyBlocked) return blockers.slice(0, 2).join(' · ');
     if (status?.autonomy_ready) {
       return `Operator ready · queue ${status.queue_depth ?? 0} · active ${status.active_pipeline_runs ?? 0}`;
@@ -110,15 +146,37 @@
 <PanelShell
   title="Pipelines"
   icon="⛓"
-  count={runs.length}
+  count={view === 'history' ? history.length : runs.length}
   loading={loading}
-  empty={runs.length === 0}
+  empty={(view === 'history' ? history.length : runs.length) === 0}
   emptyIcon={disabled ? '◯' : '□'}
   emptyMessage={emptyMessage()}
   emptyHint={emptyHint()}
 >
   {#snippet header()}
-    {#if status}
+    <div class="view-toggle" role="tablist" aria-label="Pipeline run view">
+      <button
+        type="button"
+        role="tab"
+        class="view-tab"
+        class:active={view === 'active'}
+        aria-selected={view === 'active'}
+        onclick={() => (view = 'active')}
+      >
+        Active{#if runs.length > 0}<span class="view-count">{runs.length}</span>{/if}
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="view-tab"
+        class:active={view === 'history'}
+        aria-selected={view === 'history'}
+        onclick={() => (view = 'history')}
+      >
+        History{#if view === 'history' && history.length > 0}<span class="view-count">{history.length}</span>{/if}
+      </button>
+    </div>
+    {#if status && view === 'active'}
       <div class="readiness-banner" class:ready={status.autonomy_ready} role="status">
         <span class="readiness-kicker">{status.autonomy_ready ? 'Ready' : 'Fail-closed'}</span>
         <span class="readiness-main">{status.autonomy_ready ? 'Autonomy gate passing' : 'Autonomy paused'}</span>
@@ -134,7 +192,7 @@
         {/if}
       </div>
     {/if}
-    {#if Object.keys(counts).length > 0}
+    {#if view === 'active' && Object.keys(counts).length > 0}
       <div class="counts-row">
         {#each Object.entries(counts) as [state, n]}
           <span class="count-pill state-{state}">{state}: {n}</span>
@@ -152,12 +210,14 @@
         <th>State</th>
         <th>Stage</th>
         <th>Attempts</th>
+        <th>MR</th>
+        <th>Cost</th>
         <th>Started</th>
         <th>Ended</th>
       </tr>
     </thead>
     <tbody>
-      {#each sortedRuns as r (r.ID)}
+      {#each displayRuns as r (r.ID)}
         <tr
           class:subrun={(r.Depth ?? 0) > 0}
           class:selected={selectedID === r.ID}
@@ -188,6 +248,14 @@
             {/if}
           </td>
           <td>{r.Attempts}</td>
+          <td class="mono">
+            {#if r.MRIID != null}
+              <span class="mr-ref" title="merge request !{r.MRIID}">!{r.MRIID}</span>
+            {:else}
+              <span class="mr-empty">—</span>
+            {/if}
+          </td>
+          <td class="mono cost">{fmtCost(r.CostUSD)}</td>
           <td>{fmtTime(r.StartedAt)}</td>
           <td>{fmtTime(r.EndedAt)}</td>
         </tr>
@@ -199,6 +267,43 @@
 <PipelineRunDetail />
 
 <style>
+  .view-toggle {
+    display: inline-flex;
+    gap: 0.15rem;
+    padding: 0.15rem;
+    border-radius: 7px;
+    background: var(--bg-subtle, #1a1d26);
+    border: 1px solid var(--border-subtle, #233);
+  }
+  .view-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.7rem;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-muted, #889);
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.1s ease-out, color 0.1s ease-out;
+  }
+  .view-tab:hover { color: var(--fg-primary, #dfe); }
+  .view-tab.active {
+    background: color-mix(in srgb, var(--accent, #58a) 22%, transparent);
+    color: var(--fg-primary, #dfe);
+  }
+  .view-count {
+    padding: 0.02rem 0.35rem;
+    border-radius: 999px;
+    background: var(--bg-deep, #11151c);
+    color: var(--text-muted, #aab);
+    font-size: 0.68rem;
+    font-family: ui-monospace, monospace;
+  }
+  .mr-ref { color: rgb(150, 190, 250); }
+  .mr-empty { color: var(--text-muted, #667); }
+  .cost { color: var(--text-muted, #889); font-variant-numeric: tabular-nums; }
   .counts-row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
   .readiness-banner {
     display: grid;

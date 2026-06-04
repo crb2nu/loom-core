@@ -607,6 +607,97 @@ func TestOpen_RejectsEmptyPath(t *testing.T) {
 	}
 }
 
+// TestPipeline_ListRecentTerminal guards the run-history read path: only
+// terminal runs (done/escalated/paused) come back, newest-first, and the
+// since/limit bounds hold. Without this query the HUD pipeline panel could
+// only ever show in-flight work — a run vanished the moment it merged.
+func TestPipeline_ListRecentTerminal(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	parent := &BacklogItem{
+		ID: "MILLS-HIST", Title: "history", State: BacklogQueued, Priority: P2, CreatedBy: "test",
+	}
+	if err := st.Backlog.Put(ctx, parent); err != nil {
+		t.Fatalf("put backlog: %v", err)
+	}
+
+	now := time.Now().UTC()
+	attempt := 0
+	put := func(id string, state PipelineState, startedAt time.Time) {
+		t.Helper()
+		// pipeline_runs has a UNIQUE(backlog_id, attempts) index; give each
+		// row a distinct attempt so the shared parent doesn't collide.
+		attempt++
+		if err := st.Pipeline.PutRun(ctx, &PipelineRun{
+			ID: id, BacklogID: parent.ID, Template: "t", State: state,
+			Attempts: attempt, StartedAt: startedAt,
+		}); err != nil {
+			t.Fatalf("put run %s: %v", id, err)
+		}
+	}
+	// Two active runs (must be excluded), three terminal runs at distinct
+	// times, and one terminal run 10 days old (outside the default window).
+	put("ACT-1", PipelineImplementing, now.Add(-30*time.Minute))
+	put("ACT-2", PipelineCI, now.Add(-20*time.Minute))
+	put("DONE-1", PipelineDone, now.Add(-3*time.Hour))
+	put("ESC-1", PipelineEscalated, now.Add(-1*time.Hour))
+	put("PAUSE-1", PipelinePaused, now.Add(-2*time.Hour))
+	put("OLD-1", PipelineDone, now.Add(-10*24*time.Hour))
+
+	// Window = last 7d, generous limit: terminal-only, newest-first,
+	// the 10-day-old row excluded.
+	got, err := st.Pipeline.ListRecentTerminal(ctx, now.Add(-7*24*time.Hour), 50)
+	if err != nil {
+		t.Fatalf("list-recent-terminal: %v", err)
+	}
+	gotIDs := make([]string, len(got))
+	for i, r := range got {
+		gotIDs[i] = r.ID
+	}
+	want := []string{"ESC-1", "PAUSE-1", "DONE-1"} // newest-first by started_at
+	if len(gotIDs) != len(want) {
+		t.Fatalf("ids = %v, want %v", gotIDs, want)
+	}
+	for i := range want {
+		if gotIDs[i] != want[i] {
+			t.Fatalf("ids = %v, want %v", gotIDs, want)
+		}
+	}
+
+	// since=zero pulls every terminal row (including the old one); active
+	// runs still excluded.
+	all, err := st.Pipeline.ListRecentTerminal(ctx, time.Time{}, 50)
+	if err != nil {
+		t.Fatalf("list-recent-terminal (all): %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("expected 4 terminal rows with no window, got %d", len(all))
+	}
+	for _, r := range all {
+		if r.State != PipelineDone && r.State != PipelineEscalated && r.State != PipelinePaused {
+			t.Fatalf("non-terminal run leaked: %s state=%s", r.ID, r.State)
+		}
+	}
+
+	// limit caps the row count, keeping newest-first.
+	lim, err := st.Pipeline.ListRecentTerminal(ctx, time.Time{}, 2)
+	if err != nil {
+		t.Fatalf("list-recent-terminal (limit): %v", err)
+	}
+	if len(lim) != 2 || lim[0].ID != "ESC-1" || lim[1].ID != "PAUSE-1" {
+		t.Fatalf("limit=2 = %v, want [ESC-1 PAUSE-1]", idsOf(lim))
+	}
+}
+
+func idsOf(runs []*PipelineRun) []string {
+	out := make([]string, len(runs))
+	for i, r := range runs {
+		out[i] = r.ID
+	}
+	return out
+}
+
 // Compile-time guard: scanner must accept *sql.Row and *sql.Rows.
 var (
 	_ scanner = (*sql.Row)(nil)

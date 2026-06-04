@@ -340,6 +340,17 @@ class MillsStore {
   // estimate is stable for a given backlog item until policy changes.
   costPreviews = $state<Record<string, CostEstimate>>({});
 
+  // Run history (terminal runs: done / escalated / paused) for the
+  // Pipelines "History" view. Kept separate from the live active-run list
+  // so the default panel stays in-flight-only and cheap. Only refreshed on
+  // the 15s tick while historyActive is true (the panel sets it when the
+  // History view is showing), so an operator who never opens history pays
+  // nothing. Errors are local to the history view, not the whole panel.
+  pipelineHistory = $state<PipelineRun[]>([]);
+  historyLoading = $state(false);
+  historyError = $state<string | null>(null);
+  historyActive = $state(false);
+
   // Connection state
   loading = $state(false);
   error = $state<string | null>(null);
@@ -420,6 +431,9 @@ class MillsStore {
       // cadence — the drawer otherwise frozen at open-time would
       // misrepresent in-flight runs as their stages advance.
       void this.refreshOpenPipelineDetail();
+      // Keep run history fresh on the same cadence, but only while the
+      // Pipelines panel is actually showing the History view.
+      if (this.historyActive) void this.fetchPipelineHistory();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // Treat 503 from the proxy as "Mills disabled" rather than an error,
@@ -692,6 +706,34 @@ class MillsStore {
     await this.postJSON(`/api/mills/pipeline/runs/${encodeURIComponent(runID)}/escalate`, { reason });
     await this.fetchAll();
     return true;
+  }
+
+  // fetchPipelineHistory loads finished runs (done / escalated / paused),
+  // newest-first, for the Pipelines "History" view via
+  // GET /api/mills/pipeline/runs?state=terminal. Separate from the live
+  // active-run poll; a failure is held in historyError (local to the
+  // history view) so it doesn't red-flag the whole panel. A 503 means the
+  // operator is unconfigured — fetchAll already surfaces that via disabled,
+  // so we swallow it here to avoid a duplicate error line.
+  async fetchPipelineHistory(limit = 50): Promise<void> {
+    this.historyLoading = true;
+    this.historyError = null;
+    try {
+      const runs = await this.getJSON<PipelineRun[]>(
+        `/api/mills/pipeline/runs?state=terminal&limit=${encodeURIComponent(String(limit))}`,
+      );
+      this.pipelineHistory = runs ?? [];
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('503') || msg.toLowerCase().includes('not configured')) {
+        this.pipelineHistory = [];
+        this.historyError = null;
+      } else {
+        this.historyError = msg;
+      }
+    } finally {
+      this.historyLoading = false;
+    }
   }
 
   // auditByMRIID looks up the pipeline run(s) that produced a given

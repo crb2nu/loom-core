@@ -514,6 +514,65 @@ func TestHandlePipelineRuns_GetWithStagesAndGates(t *testing.T) {
 	}
 }
 
+// TestHandlePipelineRuns_TerminalHistory covers the run-history read mode:
+// GET /api/mills/pipeline/runs?state=terminal returns finished runs (and
+// excludes in-flight ones), and bad since/limit params are rejected 400.
+func TestHandlePipelineRuns_TerminalHistory(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := op.store.Backlog.Put(ctx, &store.BacklogItem{
+		ID: "MILLS-H", Title: "h", State: store.BacklogRunning,
+		Priority: store.P2, CreatedBy: "test",
+	}); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	now := time.Now().UTC()
+	seed := func(id string, st store.PipelineState, attempt int, started time.Time) {
+		t.Helper()
+		if err := op.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: "MILLS-H", Template: "t", State: st,
+			Attempts: attempt, StartedAt: started,
+		}); err != nil {
+			t.Fatalf("seed run %s: %v", id, err)
+		}
+	}
+	seed("H-ACTIVE", store.PipelineImplementing, 1, now.Add(-10*time.Minute))
+	seed("H-DONE", store.PipelineDone, 2, now.Add(-2*time.Hour))
+	seed("H-ESC", store.PipelineEscalated, 3, now.Add(-1*time.Hour))
+
+	rec := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?state=terminal", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var runs []store.PipelineRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("expected 2 terminal runs, got %d (%+v)", len(runs), runs)
+	}
+	// Newest-first: H-ESC (-1h) before H-DONE (-2h); active run absent.
+	if runs[0].ID != "H-ESC" || runs[1].ID != "H-DONE" {
+		t.Fatalf("order = [%s %s], want [H-ESC H-DONE]", runs[0].ID, runs[1].ID)
+	}
+
+	// Bad since → 400.
+	recBad := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(recBad, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?state=terminal&since=notatime", nil))
+	if recBad.Code != http.StatusBadRequest {
+		t.Errorf("bad since: got %d want 400", recBad.Code)
+	}
+	// Bad limit → 400.
+	recLim := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(recLim, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?state=terminal&limit=0", nil))
+	if recLim.Code != http.StatusBadRequest {
+		t.Errorf("bad limit: got %d want 400", recLim.Code)
+	}
+}
+
 type recordingPipelineStarter struct {
 	calls int
 	runID string
