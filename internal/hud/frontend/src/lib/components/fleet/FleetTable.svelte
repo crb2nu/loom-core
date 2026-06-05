@@ -121,7 +121,9 @@
           </div>
           {#if row.session}
             <div class="agent-hierarchy-row">
-              {#if row.parentSession}
+              {#if row.agentRootChild}
+                <span class="hierarchy-pill hierarchy-pill-child">same agent</span>
+              {:else if row.parentSession}
                 <span class="hierarchy-pill hierarchy-pill-child">child of {sessionLabel(row.parentSession)}</span>
               {:else if row.rootSession?.id === row.session.id}
                 <span class="hierarchy-pill hierarchy-pill-root">root session</span>

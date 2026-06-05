@@ -13,7 +13,11 @@
 
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { liveSessionsStore, type LiveSession, type ToolCall } from '../stores/liveSessions.svelte.ts';
+  import {
+    liveSessionsStore,
+    type LiveSession,
+    type ToolCall,
+  } from '../stores/liveSessions.svelte.ts';
   import EmptyState from './shared/EmptyState.svelte';
 
   // agentCount lets the empty state distinguish "no agents connected at all"
@@ -40,10 +44,15 @@
     // panels may also subscribe. Disconnect happens on App teardown.
   });
 
-  let sessions = $derived(liveSessionsStore.visibleSessions);
+  // Sessions are grouped by workspace-scoped agent so sibling conversations of
+  // one agent render under a single header instead of as flat, unrelated rows
+  // (the lifecycle hooks mint a distinct agent_id per conversation). agentCount
+  // here is the distinct-agent count derived from the visible groups.
+  let groups = $derived(liveSessionsStore.groupedSessions);
   // Prefer the canonical fleet-snapshot count; fall back to the SSE store only
   // when this card is mounted standalone without the prop.
   let activeCount = $derived(sessionCount ?? liveSessionsStore.activeSessionCount);
+  let groupCount = $derived(groups.length);
   let inFlightCount = $derived(liveSessionsStore.inFlightCallCount);
 
   function toggleExpand(sid: string) {
@@ -98,6 +107,11 @@
   <header class="card-header">
     <h3>Live Sessions</h3>
     <div class="header-meta">
+      {#if groupCount > 0 && groupCount !== activeCount}
+        <span class="meta-pill" data-testid="agent-count">
+          <span class="meta-num">{groupCount}</span> agent{groupCount === 1 ? '' : 's'}
+        </span>
+      {/if}
       <span class="meta-pill" data-testid="active-count">
         <span class="meta-num">{activeCount}</span> active
       </span>
@@ -109,7 +123,7 @@
     </div>
   </header>
 
-  {#if sessions.length === 0}
+  {#if groups.length === 0}
     {#if agentCount > 0}
       <EmptyState
         compact
@@ -124,53 +138,65 @@
       />
     {/if}
   {:else}
-    <ul class="session-list">
-      {#each sessions as session (session.session_id)}
-        {@const expanded = expandedSessionID === session.session_id}
-        {@const collapsed = expanded ? session.recent_calls : session.recent_calls.slice(0, 4)}
-        <li class="session-row" data-testid="session-row" data-session-id={session.session_id}>
-          <button
-            class="session-row-button"
-            type="button"
-            aria-expanded={expanded}
-            onclick={() => toggleExpand(session.session_id)}
-          >
-            <span class="agent-id">
-              <span class={`status-dot ${statusClass(session.agent_status)}`} aria-hidden="true"></span>
-              {session.agent_id || '(unknown agent)'}
-            </span>
-            <span class="session-id">{session.session_id.slice(0, 8)}</span>
-            {#if session.ended_at}
-              <span class="ended-pill">ended</span>
+    <ul class="agent-group-list">
+      {#each groups as group (group.root)}
+        <li class="agent-group" data-testid="agent-group" data-root={group.root}>
+          <div class="group-header">
+            <span class={`status-dot ${statusClass(group.status)}`} aria-hidden="true"></span>
+            <span class="agent-id">{group.root || '(unknown agent)'}</span>
+            {#if group.sessions.length > 1}
+              <span class="group-count" data-testid="group-session-count"
+                >{group.sessions.length} sessions</span
+              >
             {/if}
-            <span class="call-count">
-              {activityLabel(session)}
-            </span>
-          </button>
+          </div>
 
-          {#if collapsed.length === 0}
-            <p class="row-empty">No captured activity for this session yet.</p>
-          {:else}
-            <ul class="call-list" class:expanded>
-              {#each collapsed as call (call.call_id)}
-                <li class="call-row">
-                  <span class={`badge ${callBadgeClass(call)}`} aria-hidden="true"></span>
-                  <span class="tool-name" title={formatToolName(call)}>{formatToolName(call)}</span>
-                  <span class="dur">{formatDuration(call.duration_ms)}</span>
-                  {#if call.error}
-                    <span class="err" title={call.error}>{call.error}</span>
-                  {:else if call.result_summary}
-                    <span class="summary" title={call.result_summary}>{call.result_summary}</span>
-                  {:else if call.in_flight}
-                    <span class="summary muted">running…</span>
+          <ul class="session-list">
+            {#each group.sessions as session (session.session_id)}
+              {@const expanded = expandedSessionID === session.session_id}
+              {@const collapsed = expanded ? session.recent_calls : session.recent_calls.slice(0, 4)}
+              <li class="session-row" data-testid="session-row" data-session-id={session.session_id}>
+                <button
+                  class="session-row-button"
+                  type="button"
+                  aria-expanded={expanded}
+                  onclick={() => toggleExpand(session.session_id)}
+                >
+                  <span class="session-id session-id-primary">{session.session_id.slice(0, 8)}</span>
+                  {#if session.ended_at}
+                    <span class="ended-pill">ended</span>
                   {/if}
-                </li>
-              {/each}
-            </ul>
-            {#if !expanded && session.recent_calls.length > 4}
-              <p class="more-hint">…and {session.recent_calls.length - 4} more — click to expand</p>
-            {/if}
-          {/if}
+                  <span class="call-count">
+                    {activityLabel(session)}
+                  </span>
+                </button>
+
+                {#if collapsed.length === 0}
+                  <p class="row-empty">No captured activity for this session yet.</p>
+                {:else}
+                  <ul class="call-list" class:expanded>
+                    {#each collapsed as call (call.call_id)}
+                      <li class="call-row">
+                        <span class={`badge ${callBadgeClass(call)}`} aria-hidden="true"></span>
+                        <span class="tool-name" title={formatToolName(call)}>{formatToolName(call)}</span>
+                        <span class="dur">{formatDuration(call.duration_ms)}</span>
+                        {#if call.error}
+                          <span class="err" title={call.error}>{call.error}</span>
+                        {:else if call.result_summary}
+                          <span class="summary" title={call.result_summary}>{call.result_summary}</span>
+                        {:else if call.in_flight}
+                          <span class="summary muted">running…</span>
+                        {/if}
+                      </li>
+                    {/each}
+                  </ul>
+                  {#if !expanded && session.recent_calls.length > 4}
+                    <p class="more-hint">…and {session.recent_calls.length - 4} more — click to expand</p>
+                  {/if}
+                {/if}
+              </li>
+            {/each}
+          </ul>
         </li>
       {/each}
     </ul>
@@ -222,11 +248,41 @@
     font-weight: 600;
   }
 
+  .agent-group-list,
   .session-list,
   .call-list {
     list-style: none;
     padding: 0;
     margin: 0;
+  }
+
+  /* Strong separator between logical agents; sessions within an agent are
+     separated by the lighter .session-row rule below. */
+  .agent-group + .agent-group {
+    border-top: 1px solid var(--border-subtle, #262a31);
+    padding-top: var(--space-sm, 8px);
+    margin-top: var(--space-sm, 8px);
+  }
+
+  .group-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs, 6px);
+    padding: 2px 0;
+  }
+
+  .group-count {
+    background: var(--surface-2, #1c1f24);
+    border: 1px solid var(--border-subtle, #262a31);
+    border-radius: 999px;
+    padding: 0 6px;
+    font-size: 10px;
+    color: var(--text-muted, #8a929b);
+  }
+
+  /* Sessions nest under their agent header. */
+  .session-list {
+    padding-left: 14px;
   }
 
   .session-row {
@@ -239,6 +295,10 @@
     border-top: none;
     margin-top: 0;
     padding-top: 0;
+  }
+
+  .session-id-primary {
+    flex: 1 1 auto;
   }
 
   .session-row-button {

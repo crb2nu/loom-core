@@ -17,6 +17,7 @@
 // guarantees redaction at TierPublic before publication).
 
 import { eventStore, type SSEEvent } from './events.svelte.ts';
+import { groupSessionsByRootAgent } from '../utils/agents.ts';
 
 /** Maximum tool calls retained per session in the ring buffer. */
 export const RECENT_CALLS_PER_SESSION = 20;
@@ -59,6 +60,24 @@ export interface LiveSession {
   last_activity: number;
   /** Set when a session.end event arrives; entry is reaped after ENDED_RETENTION_MS. */
   ended_at?: number;
+}
+
+/**
+ * A group of live sessions that belong to one logical (workspace-scoped)
+ * agent. The lifecycle hooks mint a distinct agent_id per conversation
+ * (`<base>-<WS_HASH>-<SESSION_SCOPE>`), so a single agent running several
+ * conversations shows up as several sessions; this collapses them under one
+ * header keyed by `rootAgentId`. See `groupedSessions`.
+ */
+export interface LiveSessionGroup {
+  /** Workspace-scoped root agent id — the group key and display label. */
+  root: string;
+  /** Sessions in this group, most-recent activity first. */
+  sessions: LiveSession[];
+  /** Most "live" status across the group's sessions (active > idle > …). */
+  status: AgentStatus;
+  /** Max last_activity across the group, for sorting groups. */
+  last_activity: number;
 }
 
 class LiveSessionsStore {
@@ -119,6 +138,21 @@ class LiveSessionsStore {
 
   get activeSessionCount(): number {
     return this.visibleSessions.filter((s) => s.ended_at === undefined).length;
+  }
+
+  /**
+   * Visible sessions collapsed into per-agent groups so sibling conversations
+   * of one workspace agent render under a single header instead of as flat,
+   * unrelated rows. Groups and the sessions within them stay sorted by most
+   * recent activity, matching `visibleSessions`.
+   */
+  get groupedSessions(): LiveSessionGroup[] {
+    return groupSessionsByRootAgent(this.visibleSessions) as LiveSessionGroup[];
+  }
+
+  /** Distinct logical (workspace-scoped) agents among visible sessions. */
+  get agentGroupCount(): number {
+    return this.groupedSessions.length;
   }
 
   /** In-flight tool calls across all visible sessions. */
