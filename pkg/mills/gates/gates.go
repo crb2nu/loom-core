@@ -97,6 +97,7 @@ func NewRegistry() *Registry {
 // they need a FlexInfer client wired in.
 func Default() *Registry {
 	r := NewRegistry()
+	r.Register(&NonEmptyDiff{})
 	r.Register(&DiffSize{})
 	r.Register(&Scope{})
 	r.Register(&PathPolicy{})

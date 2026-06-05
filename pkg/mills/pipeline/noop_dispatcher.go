@@ -39,10 +39,17 @@ func (n *NoOpDispatcher) Dispatch(_ context.Context, _ *store.PipelineRun, _ *st
 	out := StageOutput{CostUSD: cost}
 	switch stage.ID {
 	case "implement":
+		// Emit a non-empty placeholder diff so the deterministic gates this
+		// dispatcher is documented to satisfy include the nonempty_diff guard.
+		// FilesChanged is intentionally left empty so the scope/path_policy
+		// gates still short-circuit to pass on no-slice smoke items; the
+		// non-empty DiffPatch alone is what satisfies nonempty_diff.
 		out.FilesChanged = []string{}
-		out.LinesAdded = 0
+		out.LinesAdded = 1
 		out.LinesRemoved = 0
-		out.DiffPatch = nil
+		out.DiffPatch = []byte("diff --git a/NOOP_STUB b/NOOP_STUB\n" +
+			"--- a/NOOP_STUB\n+++ b/NOOP_STUB\n@@ -0,0 +1 @@\n" +
+			"+noop dispatcher placeholder change\n")
 		out.CommitMessages = []string{"feat(stub): noop dispatcher placeholder"}
 		out.Artifacts = map[string]any{"stub": true}
 	case "mr":
