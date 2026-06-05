@@ -114,6 +114,49 @@ func TestClassify_DefaultsToCode(t *testing.T) {
 	}
 }
 
+func TestClassify_KubeletExecDial502(t *testing.T) {
+	// Real log_tail from the 2026-06-05 A2 kill-test: a plan_slice codex
+	// spawn on k3s-w-10 failed because the apiserver could not reach the
+	// node's kubelet (:10250) for exec streaming. Before this fix it fell
+	// through to ClassCode and escalated after the attempt cap (turn_count=0,
+	// $0 cost), blocking the first harvester-vm canary. It is a transient
+	// konnectivity blip — the node was Ready before and after — so it must
+	// be a free retry.
+	cases := []struct {
+		name string
+		msg  string
+		want ErrorClass
+	}{
+		{
+			name: "kubelet exec dial 502 bad gateway (the A2 fixture)",
+			msg:  "agent CLI exited 1: exec error: error dialing backend: proxy error from 127.0.0.1:6443 while dialing 192.168.50.213:10250, code 502: 502 Bad Gateway",
+			want: ClassTransient,
+		},
+		{
+			name: "error dialing backend without a status prefix",
+			msg:  "stage=implement attempt=1 spawn=spawn-abc: exec error: error dialing backend: EOF",
+			want: ClassTransient,
+		},
+		{
+			name: "worded 503 service unavailable",
+			msg:  "spawn poll: 503 Service Unavailable",
+			want: ClassTransient,
+		},
+		{
+			name: "worded 504 gateway timeout",
+			msg:  "spawn stream: 504 Gateway Timeout",
+			want: ClassTransient,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Classify(errors.New(tc.msg)); got != tc.want {
+				t.Errorf("Classify(%q) = %s, want %s", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsFreeRetry(t *testing.T) {
 	cases := []struct {
 		c    ErrorClass
