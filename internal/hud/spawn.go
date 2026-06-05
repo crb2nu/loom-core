@@ -1161,8 +1161,22 @@ func buildAgentCommand(agentType, task, agentID string) string {
 		// for the earlier coupled fixes.
 		// --skip-git-repo-check lets codex run in the /workspace clone where
 		// the .git directory might be at the working dir rather than a parent.
+		//
+		// `< /dev/null` is REQUIRED. codex 0.120.0+ `exec` with a prompt arg
+		// still inspects stdin: when stdin is a non-TTY pipe that is open but
+		// never written/closed, codex reports "Reading additional input from
+		// stdin..." and reads it as additional prompt input — then hangs (or,
+		// under a session whose stdin EOFs oddly, exits 1) instead of running
+		// the single turn. BOTH spawn exec paths leave stdin in exactly that
+		// state — the K8s StreamExec sets PodExecOptions{Stdin:false} and the
+		// harvester-vm SSH session leaves session.Stdin nil — so without this
+		// redirect codex starts a thread + turn then dies with turn_count=1 and
+		// no diff. This is the agent-execution gap the Mills A2 kill-test hit on
+		// the VM path (and the latent cause of codex's empty implements on k8s).
+		// Refs openai/codex#20919; the prompt is already passed as an arg, so no
+		// real stdin is needed.
 		return fmt.Sprintf(
-			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --json %q`,
+			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --json %q < /dev/null`,
 			agentID, task,
 		)
 	case "gemini":
