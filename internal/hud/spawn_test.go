@@ -109,6 +109,11 @@ func TestBuildAgentCommand(t *testing.T) {
 				"--dangerously-bypass-approvals-and-sandbox",
 				"--skip-git-repo-check",
 				"--json",
+				// `< /dev/null` prevents the codex 0.120.0+ "Reading
+				// additional input from stdin..." hang/exit when stdin is a
+				// non-TTY pipe (both the K8s StreamExec Stdin:false path and
+				// the harvester-vm SSH nil-stdin path). Refs openai/codex#20919.
+				"< /dev/null",
 				"trap",
 				"session-end",
 				"spawn-codex-abc123",
