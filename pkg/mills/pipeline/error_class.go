@@ -99,17 +99,29 @@ func Classify(err error) ErrorClass {
 		"context deadline exceeded",
 		"no such host",
 		"connection refused",
+		// k8s exec-stream konnectivity blip: the apiserver can't reach the
+		// target node's kubelet (:10250), so spawn/`kubectl exec` streaming
+		// fails with "error dialing backend ... 502 Bad Gateway". Transient —
+		// the node is typically reachable again on the next attempt.
+		// 2026-06-05 A2 kill-test: a plan_slice codex spawn on k3s-w-10
+		// escalated on this (turn_count=0, $0 cost), blocking the first
+		// harvester-vm canary before it could reach the implement stage.
+		"error dialing backend",
 	} {
 		if strings.Contains(lower, needle) {
 			return ClassTransient
 		}
 	}
 
-	// Upstream 5xx — return a transient_quota so we back off without
-	// burning attempts. Matches `status 500`..`status 599` and
-	// `status 502: …` shapes used by the GitLab and devbox clients.
+	// Upstream 5xx — transient so we retry instead of escalating. Matches
+	// the `status 5xx` shape used by the GitLab and devbox clients AND the
+	// worded gateway forms emitted by the k8s apiserver proxy / ingress
+	// ("502 Bad Gateway", "503 Service Unavailable", "504 Gateway Timeout"),
+	// which arrive without a "status NNN" prefix (e.g. "code 502: 502 Bad
+	// Gateway" from the exec dialer).
 	for _, needle := range []string{
 		"status 500", "status 501", "status 502", "status 503", "status 504",
+		"bad gateway", "service unavailable", "gateway timeout",
 	} {
 		if strings.Contains(lower, needle) {
 			return ClassTransient
