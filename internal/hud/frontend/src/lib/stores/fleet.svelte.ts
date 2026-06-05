@@ -7,6 +7,7 @@ import { spawnStore, type SpawnState } from './spawn.svelte.ts';
 import {
   buildUnifiedAgents,
   summarizeUnifiedAgents,
+  rootAgentId,
   type UnifiedAgent,
   type UnifiedAgentSummary,
 } from '../utils/agents.ts';
@@ -263,6 +264,19 @@ class FleetStore {
 
   get liveAgents(): UnifiedAgent[] {
     return this.unifiedAgents.filter((agent) => agent.status === 'active' || agent.status === 'idle');
+  }
+
+  /**
+   * Distinct *logical* live agents — per-conversation agent_ids collapsed to
+   * their workspace-scoped root (see rootAgentId). This is the honest "N live
+   * agents" the status bar and badges should show; liveAgents.length counts
+   * per-session rows and over-reports when one agent runs several
+   * conversations in the same workspace.
+   */
+  get liveAgentCount(): number {
+    const roots = new Set<string>();
+    for (const agent of this.liveAgents) roots.add(rootAgentId(agent.agent_id));
+    return roots.size;
   }
 
   get totalTokens(): number {

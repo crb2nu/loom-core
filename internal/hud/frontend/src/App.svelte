@@ -205,7 +205,7 @@
   let daemonOnline = $derived(fleetStore.status.running);
   let serverCount = $derived(fleetStore.status.servers);
   let activeSessionCount = $derived(fleetStore.activeSessions.length);
-  let liveAgentCount = $derived(fleetStore.liveAgents.length);
+  let liveAgentCount = $derived(fleetStore.liveAgentCount);
   let liveAgentSummary = $derived(fleetStore.unifiedSummary);
   let healthySrv = $derived(healthStore.healthyCount);
   let availableSrv = $derived(healthStore.availableCount);
@@ -214,7 +214,7 @@
 
   // Badge counts for nav tabs
   let badgeCounts = $derived({
-    agents: fleetStore.liveAgents.length,
+    agents: fleetStore.liveAgentCount,
     infra: healthStore.degradedCount + healthStore.downCount,
     tasks: taskStore.pendingCount + taskStore.inProgressCount,
   });

@@ -121,6 +121,97 @@ export function inferAgentType(agentId: string | null | undefined, declaredType?
   return id.split('-')[0] || 'unknown';
 }
 
+// rootAgentId collapses a per-conversation agent_id down to its stable,
+// workspace-scoped identity so sibling conversations of one agent group
+// together. The lifecycle hooks mint agent_ids as
+// `<base>-<WS_HASH>[-<SESSION_SCOPE>]` (pkg/generator/configs_hooks.go),
+// where WS_HASH is `cksum` of the git workspace root (stable per workspace)
+// and SESSION_SCOPE is `cksum` of the conversation/session id (changes every
+// conversation). Both suffixes are all-decimal; the base prefix
+// (`claude-code`, `codex`, `gemini-cli`, …) never is. So the root identity is
+// everything up to and including the FIRST all-numeric segment (the WS_HASH);
+// any later numeric segment is the session scope we strip. Ids with no
+// numeric segment (`codex-7b28`, `spawn-claude-code-<hex>`, a bare
+// `claude-code`) are already roots and pass through unchanged.
+//
+// Examples:
+//   claude-code-552019522-2804496862 → claude-code-552019522
+//   claude-code-552019522-3116397616 → claude-code-552019522  (groups w/ above)
+//   codex-4188162495                 → codex-4188162495
+//   codex-4188162495-2303882182      → codex-4188162495        (groups w/ above)
+//   codex-7b28                       → codex-7b28              (no WS_HASH suffix)
+export function rootAgentId(agentId: string | null | undefined): string {
+  const id = (agentId ?? '').trim();
+  if (!id) return '';
+  const parts = id.split('-');
+  for (let i = 0; i < parts.length; i += 1) {
+    if (parts[i].length > 0 && /^[0-9]+$/.test(parts[i])) {
+      return parts.slice(0, i + 1).join('-');
+    }
+  }
+  return id;
+}
+
+/** Minimal shape needed to group live sessions by their owning agent. */
+export interface RootGroupableSession {
+  session_id: string;
+  agent_id: string;
+  agent_status: string;
+  last_activity: number;
+}
+
+/** A set of sessions belonging to one workspace-scoped (root) agent. */
+export interface RootAgentSessionGroup<T extends RootGroupableSession> {
+  /** Workspace-scoped root agent id — the group key and display label. */
+  root: string;
+  /** Member sessions, in their incoming order (callers pre-sort). */
+  sessions: T[];
+  /** Most "live" status across the group (active > idle > unknown > offline). */
+  status: string;
+  /** Max last_activity across the group, for ordering groups. */
+  last_activity: number;
+}
+
+/** Status rank: higher wins when merging a group's session statuses. */
+export function liveStatusRank(status: string | null | undefined): number {
+  switch ((status ?? '').trim().toLowerCase()) {
+    case 'active':
+      return 3;
+    case 'idle':
+      return 2;
+    case 'unknown':
+    case '':
+      return 1;
+    default:
+      return 0; // offline / expired / anything else terminal
+  }
+}
+
+// groupSessionsByRootAgent collapses a list of live sessions into per-agent
+// groups keyed by rootAgentId, so sibling conversations of one workspace agent
+// render together instead of as flat, unrelated rows. Input order is preserved
+// within each group (callers sort by recency first); groups come back ordered
+// by most-recent activity. Pure + rune-free so it is unit-testable.
+export function groupSessionsByRootAgent<T extends RootGroupableSession>(
+  sessions: T[],
+): RootAgentSessionGroup<T>[] {
+  const groups = new Map<string, RootAgentSessionGroup<T>>();
+  for (const session of sessions) {
+    const root = rootAgentId(session.agent_id) || session.agent_id || session.session_id;
+    let group = groups.get(root);
+    if (!group) {
+      group = { root, sessions: [], status: 'unknown', last_activity: 0 };
+      groups.set(root, group);
+    }
+    group.sessions.push(session);
+    group.last_activity = Math.max(group.last_activity, session.last_activity);
+    if (liveStatusRank(session.agent_status) > liveStatusRank(group.status)) {
+      group.status = session.agent_status;
+    }
+  }
+  return Array.from(groups.values()).sort((a, b) => b.last_activity - a.last_activity);
+}
+
 export function normalizeUnifiedStatus(raw: string | null | undefined): UnifiedAgentStatus {
   const status = (raw ?? '').trim().toLowerCase();
   if (status === 'active') return 'active';
@@ -403,19 +494,26 @@ export function summarizeUnifiedAgents(agents: UnifiedAgent[]): UnifiedAgentSumm
     orphans: 0,
   };
 
+  // live_agents counts distinct *logical* agents (workspace-scoped roots),
+  // not per-conversation agent_ids. Two conversations of the same agent
+  // (e.g. claude-code-552019522-2804496862 and -3116397616) are one live
+  // agent, so the "Active Agents" headline and footer read the agent count,
+  // not the session count. See rootAgentId.
+  const liveRoots = new Set<string>();
   for (const agent of agents) {
     if (agent.status === 'active') summary.active_agents += 1;
     else if (agent.status === 'idle') summary.idle_agents += 1;
     else summary.offline_agents += 1;
 
     if (agent.status === 'active' || agent.status === 'idle') {
-      summary.live_agents += 1;
+      liveRoots.add(rootAgentId(agent.agent_id));
     }
     if (agent.has_session) summary.with_sessions += 1;
     if (agent.has_presence) summary.with_presence += 1;
     if (agent.has_spawn) summary.with_spawns += 1;
     if (agent.is_orphan) summary.orphans += 1;
   }
+  summary.live_agents = liveRoots.size;
 
   return summary;
 }
