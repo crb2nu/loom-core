@@ -126,7 +126,7 @@ type Config struct {
 	SpawnHarvesterDefaultVCPUs     int    // Per-VM vCPU count (default: 2).
 	SpawnHarvesterDefaultMemMi     int    // Per-VM memory MiB (default: 4096).
 	SpawnHarvesterDefaultDiskGi    int    // Per-VM OS disk GiB (default: 20).
-	SpawnHarvesterSSHUser          string // Cloud-init-provisioned user (default: "ubuntu").
+	SpawnHarvesterSSHUser          string // Cloud-init-provisioned user (default: "agent").
 
 	// Pipeline monitoring (GitLab CI).
 	PipelineProjects string // Comma-separated GitLab project paths to monitor.

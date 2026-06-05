@@ -142,7 +142,15 @@ func run(ctx context.Context) error {
 		harvesterDefaultVCPUs:        env.Int("DEVBOX_HARVESTER_DEFAULT_VCPUS", 2),
 		harvesterDefaultMemMi:        env.Int("DEVBOX_HARVESTER_DEFAULT_MEM_MI", 4096),
 		harvesterDefaultDiskGi:       env.Int("DEVBOX_HARVESTER_DEFAULT_DISK_GI", 20),
-		harvesterSSHUser:             env.String("DEVBOX_HARVESTER_SSH_USER", "ubuntu"),
+		// Empty default on purpose: NewHarvesterVMBackend applies the canonical
+		// "agent" user (backend.defaultHarvesterSSHUser) when SSHUser is unset.
+		// Slice 2d.5c moved the VM's cloud-init login + auth-file home to the
+		// uid-1000 "agent" user for home-parity with the K8s spawn pod; the old
+		// hardcoded "ubuntu" fallback here made devbox-launched harvester-vm
+		// sandboxes SSH as the wrong user, so mounted agent auth files
+		// (~/.codex/auth.json etc.) would not resolve. Let the backend be the
+		// single source of truth, matching the operator/HUD spawn path.
+		harvesterSSHUser: env.String("DEVBOX_HARVESTER_SSH_USER", ""),
 	})
 	if err != nil {
 		return fmt.Errorf("init manager: %w", err)
