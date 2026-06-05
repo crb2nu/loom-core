@@ -149,6 +149,14 @@ func (a *App) StartMonitors(ctx context.Context) error {
 
 	a.costMonitor = monitor.NewCostMonitor(a.client, a.logger)
 
+	a.otelMonitor = monitor.NewOTelMonitor(a.client, a.logger)
+
+	// Mills status monitor — only when the operator URL is configured (unset
+	// on developer laptops, where every /api/mills route 503s anyway).
+	if a.config.MillsOperatorURL != "" {
+		a.millsMonitor = monitor.NewMillsMonitor(a.config.MillsOperatorURL, a.logger)
+	}
+
 	pipelineProjects := a.config.PipelineProjects
 	if pipelineProjects == "" {
 		if detected := codebase.DetectPipelineProject(ctx, "."); detected != "" {
@@ -229,6 +237,10 @@ func (a *App) StartMonitors(ctx context.Context) error {
 	a.streamMonitor.Start(5 * time.Second)
 	a.sandboxMonitor.Start(10 * time.Second)
 	a.costMonitor.Start(10 * time.Second)
+	a.otelMonitor.Start(30 * time.Second)
+	if a.millsMonitor != nil {
+		a.millsMonitor.Start(15 * time.Second)
+	}
 	if a.pipelineMonitor != nil {
 		a.pipelineMonitor.Start(10 * time.Second)
 	}
@@ -345,6 +357,16 @@ func (a *App) RefreshMonitors() {
 	if a.costMonitor != nil {
 		if err := a.costMonitor.Refresh(); err != nil {
 			a.logger.Warn("embedded refresh: cost refresh failed", "error", err)
+		}
+	}
+	if a.otelMonitor != nil {
+		if err := a.otelMonitor.Refresh(); err != nil {
+			a.logger.Warn("embedded refresh: otel refresh failed", "error", err)
+		}
+	}
+	if a.millsMonitor != nil {
+		if err := a.millsMonitor.Refresh(); err != nil {
+			a.logger.Warn("embedded refresh: mills refresh failed", "error", err)
 		}
 	}
 	if a.pipelineMonitor != nil && a.pipelineMonitor.Ready() {
@@ -781,6 +803,34 @@ func (a *App) wireMonitorCallbacks() {
 			Data:      data,
 		})
 	})
+	if a.otelMonitor != nil {
+		a.otelMonitor.OnRefresh(func(snap bridge.OTelStatusResult) {
+			data, err := json.Marshal(snap)
+			if err != nil {
+				return
+			}
+			a.sseHub.Broadcast(bridge.SSEEvent{
+				ID:        fmt.Sprintf("hud-otel-%d", time.Now().UnixMilli()),
+				Type:      "hud.otel",
+				Timestamp: time.Now(),
+				Data:      data,
+			})
+		})
+	}
+	if a.millsMonitor != nil {
+		a.millsMonitor.OnRefresh(func(snap monitor.MillsSnapshot) {
+			data, err := json.Marshal(snap)
+			if err != nil {
+				return
+			}
+			a.sseHub.Broadcast(bridge.SSEEvent{
+				ID:        fmt.Sprintf("hud-mills-%d", time.Now().UnixMilli()),
+				Type:      "hud.mills",
+				Timestamp: time.Now(),
+				Data:      data,
+			})
+		})
+	}
 	if a.pipelineMonitor != nil {
 		a.pipelineMonitor.OnRefresh(func(pipelines []bridge.PipelineInfo) {
 			data, err := json.Marshal(map[string]any{"pipelines": pipelines})

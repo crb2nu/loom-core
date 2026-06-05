@@ -187,6 +187,8 @@ type App struct {
 	contextHealthMonitor *monitor.ContextHealthMonitor
 	codebaseMonitor      *monitor.CodebaseMonitor
 	shuttleMonitor       *shuttle.ShuttleMonitor
+	otelMonitor          *monitor.OTelMonitor
+	millsMonitor         *monitor.MillsMonitor
 
 	// hudMirror federates this daemon's active presence to a remote HUD
 	// when LOOM_HUD_MIRROR_URL is set. Nil when mirroring is disabled.

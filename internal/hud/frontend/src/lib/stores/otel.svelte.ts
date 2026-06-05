@@ -1,4 +1,9 @@
-// OTel store — fetches OTel observability status from GET /api/otel.
+// OTel store — fetches OTel observability status from GET /api/otel and
+// subscribes to SSE `hud.otel` snapshots for real-time updates (Slice B3
+// follow-up — plan 117). Polling drops to a 60s watchdog that fires only when
+// SSE is down or the store has gone stale.
+import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 
 export interface OTelStatus {
   otlp_endpoint: string;
@@ -29,8 +34,16 @@ class OTelStore {
   error = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
+  // Staleness (plan-117 cohort) — hud.otel snapshots arrive every 30s; 90s
+  // without an update means SSE is silently failing.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
+
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private pollingOwners = new Map<PollingOwner, number>();
+  private eventUnsubs: Array<() => void> = [];
 
   get configured(): boolean {
     return this.data?.runtime_otlp_configured ?? false;
@@ -88,6 +101,13 @@ class OTelStore {
     }
   }
 
+  /** Apply a status snapshot directly from an SSE hud.otel event. */
+  applySnapshot(data: Record<string, unknown>): void {
+    this.data = data as unknown as OTelStatus;
+    this.lastUpdated = new Date();
+    this.error = null;
+  }
+
   private refreshPollTimer(): void {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
@@ -95,20 +115,34 @@ class OTelStore {
     }
     if (this.pollingOwners.size === 0) return;
     const intervalMs = Math.min(...this.pollingOwners.values());
-    this.pollTimer = setInterval(() => this.fetch(), intervalMs);
+    // Watchdog poll — fires only when SSE is down OR the store has gone stale,
+    // so a healthy SSE stream carries updates and polling stays quiet.
+    this.pollTimer = setInterval(() => {
+      if (!eventStore.connected || this.isStale) this.fetch();
+    }, intervalMs);
   }
 
   startPolling(intervalMs = 60000, owner: PollingOwner = DEFAULT_POLLING_OWNER): void {
     const wasIdle = this.pollingOwners.size === 0;
     this.pollingOwners.set(owner, intervalMs);
     this.refreshPollTimer();
-    if (wasIdle) this.fetch();
+    if (wasIdle) {
+      this.fetch();
+      this.eventUnsubs.push(
+        eventStore.on('hud.otel', (e) => this.applySnapshot(e.data)),
+      );
+    }
   }
 
   stopPolling(owner: PollingOwner = DEFAULT_POLLING_OWNER): void {
     this.pollingOwners.delete(owner);
     this.refreshPollTimer();
+    if (this.pollingOwners.size === 0) {
+      for (const unsub of this.eventUnsubs) unsub();
+      this.eventUnsubs = [];
+    }
   }
 }
 
 export const otelStore = new OTelStore();
+stalenessStore.register('otel', () => otelStore.isStale);

@@ -359,6 +359,11 @@ const KPI_HISTORY_MAX = 24;
 export type { SystemHealth, SystemHealthState } from './mills.systemHealth.ts';
 import { computeSystemHealth } from './mills.systemHealth.ts';
 import type { SystemHealth } from './mills.systemHealth.ts';
+// SSE + staleness (plan-117 cohort). The `hud.mills` event is a refresh signal
+// (the store fans out to many operator endpoints, so it re-runs fetchAll rather
+// than applying a partial snapshot); the watchdog poll drops to 60s.
+import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 
 class MillsStore {
   // Per-panel data
@@ -423,7 +428,17 @@ class MillsStore {
   disabled = $state(false); // operator URL unset → 503 from proxy
   lastUpdated = $state<Date | null>(null);
 
+  // Staleness (plan-117 cohort). Suppressed while `disabled` so the
+  // ConnectionBanner stale pill stays quiet on laptops where the operator
+  // isn't configured (no hud.mills events ever arrive there by design).
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    if (this.disabled) return false;
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
+
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private eventUnsubs: Array<() => void> = [];
 
   get pipelinesByState(): Record<string, number> {
     const out: Record<string, number> = {};
@@ -911,10 +926,19 @@ class MillsStore {
     return runs ?? [];
   }
 
-  startPolling(intervalMs = 15000): void {
+  startPolling(intervalMs = 60000): void {
     this.stopPolling();
     void this.fetchAll();
-    this.pollTimer = setInterval(() => void this.fetchAll(), intervalMs);
+    // Watchdog poll — fires only when SSE is down OR the store has gone stale.
+    // A healthy stream drives refreshes via the `hud.mills` tick below.
+    this.pollTimer = setInterval(() => {
+      if (!eventStore.connected || this.isStale) void this.fetchAll();
+    }, intervalMs);
+    // The operator status monitor pushes a `hud.mills` tick (~15s); treat it as
+    // a refresh signal so all browsers re-pull on push without each polling.
+    this.eventUnsubs.push(
+      eventStore.on('hud.mills', () => void this.fetchAll()),
+    );
   }
 
   stopPolling(): void {
@@ -922,7 +946,10 @@ class MillsStore {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    for (const unsub of this.eventUnsubs) unsub();
+    this.eventUnsubs = [];
   }
 }
 
 export const millsStore = new MillsStore();
+stalenessStore.register('mills', () => millsStore.isStale);
