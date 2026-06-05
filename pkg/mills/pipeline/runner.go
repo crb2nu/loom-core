@@ -61,7 +61,7 @@ var DefaultStages = []Stage{
 		Type:      "auto_gate",
 		State:     store.PipelineImplementing,
 		RetryFrom: "implement",
-		Gates:     []string{"diff_size", "scope", "path_policy", "secret_scan", "commit_format"},
+		Gates:     []string{"nonempty_diff", "diff_size", "scope", "path_policy", "secret_scan", "commit_format"},
 	},
 	{ID: "tests", Type: "shell", State: store.PipelineTesting},
 	{
