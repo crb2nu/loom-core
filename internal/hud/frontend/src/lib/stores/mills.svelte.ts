@@ -18,6 +18,53 @@ export interface BacklogItem {
   UpdatedAt?: string;
 }
 
+// BacklogItemDetail is the full item returned by GET /api/mills/backlog/{id}
+// (operator handleBacklogGet → writeJSON(item)). The list endpoint omits
+// these heavier fields, so they're all optional on the shared base. Nested
+// shapes use the operator's snake_case json tags (pkg/mills/store/types.go);
+// the top-level BacklogItem fields are PascalCase Go field names (untagged),
+// matching BacklogItem above. This is what makes the backlog drawer worth a
+// click: the spec, the slice decomposition, the budget, and cross-links to
+// the council run that birthed the item and the GitLab issue behind it.
+export interface BacklogSlice {
+  name: string;
+  files?: string[];
+  tests?: string[];
+  parallel_with?: string[];
+}
+export interface BacklogSuccessCriteria {
+  tests?: string[];
+  metrics?: string[];
+  manual_check?: string;
+}
+export interface BacklogBudget {
+  max_cost_usd?: number;
+  max_turns?: number;
+  max_pipeline_minutes?: number;
+}
+export interface BacklogItemPolicy {
+  require_human_review?: boolean;
+  auto_merge?: boolean;
+  protected_paths_touched?: string[];
+}
+export interface BacklogItemDetail extends BacklogItem {
+  GitLabIssueIID?: number | null;
+  SpecDoc?: string;
+  SpecAnchor?: string;
+  Success?: BacklogSuccessCriteria;
+  Budget?: BacklogBudget;
+  Policy?: BacklogItemPolicy;
+  Slices?: BacklogSlice[];
+  Dependencies?: string[];
+  CouncilRunID?: string | null;
+}
+
+type BacklogDetailLoadState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'loaded'; detail: BacklogItemDetail }
+  | { status: 'error'; message: string };
+
 export interface PipelineRun {
   ID: string;
   BacklogID: string;
@@ -342,6 +389,13 @@ class MillsStore {
   selectedRunID = $state<string | null>(null);
   pipelineDetailByRun = $state<Record<string, PipelineDetailLoadState>>({});
 
+  // Backlog drilldown state — mirrors the pipeline-run drawer pattern.
+  // selectedBacklogID drives the BacklogDetail drawer; backlogDetailByID
+  // caches the full item so re-opening is instant, and the 15s poll
+  // refreshes only the open item (see refreshOpenBacklogDetail).
+  selectedBacklogID = $state<string | null>(null);
+  backlogDetailByID = $state<Record<string, BacklogDetailLoadState>>({});
+
   // Pending adaptive policy proposals (Phase 7 slice 7.1/7.2). Refreshed
   // alongside the rest of fetchAll so the card stays in sync with the
   // 15s poll cadence used elsewhere.
@@ -454,6 +508,9 @@ class MillsStore {
       // cadence — the drawer otherwise frozen at open-time would
       // misrepresent in-flight runs as their stages advance.
       void this.refreshOpenPipelineDetail();
+      // Same for an open backlog drawer — state/labels can change as the
+      // council re-prioritises, so keep it live rather than frozen.
+      void this.refreshOpenBacklogDetail();
       // Keep run history fresh on the same cadence, but only while the
       // Pipelines panel is actually showing the History view.
       if (this.historyActive) void this.fetchPipelineHistory();
@@ -587,6 +644,81 @@ class MillsStore {
       this.pipelineDetailByRun = {
         ...this.pipelineDetailByRun,
         [runID]: { status: 'error', message },
+      };
+    }
+  }
+
+  // --- Backlog drilldown (mirrors the pipeline-run drawer above) ---------
+
+  // currentBacklogDetail is the derived load-state for the selected backlog
+  // item; null when nothing is open so the drawer renders off one signal.
+  // (Named distinctly from the openBacklogDetail() method below — a getter
+  // and method sharing a name would collide as duplicate class members.)
+  get currentBacklogDetail(): BacklogDetailLoadState | null {
+    if (!this.selectedBacklogID) return null;
+    return this.backlogDetailByID[this.selectedBacklogID] ?? { status: 'idle' };
+  }
+
+  openBacklogDetail(id: string): void {
+    if (!id) return;
+    this.selectedBacklogID = id;
+    const cached = this.backlogDetailByID[id];
+    if (!cached || cached.status === 'idle' || cached.status === 'error') {
+      this.backlogDetailByID = {
+        ...this.backlogDetailByID,
+        [id]: { status: 'loading' },
+      };
+    }
+    void this.fetchBacklogDetail(id);
+  }
+
+  closeBacklogDetail(): void {
+    this.selectedBacklogID = null;
+  }
+
+  async refreshOpenBacklogDetail(): Promise<void> {
+    const id = this.selectedBacklogID;
+    if (!id) return;
+    await this.fetchBacklogDetail(id);
+  }
+
+  // pipelineRunsForBacklog returns every known run (active + history)
+  // spawned for a backlog item, newest-first. This is the load-bearing
+  // cross-link in the drawer: "why is this item escalated?" → its runs.
+  pipelineRunsForBacklog(backlogID: string): PipelineRun[] {
+    if (!backlogID) return [];
+    const seen = new Set<string>();
+    const out: PipelineRun[] = [];
+    for (const r of [...this.pipelineRuns, ...this.pipelineHistory]) {
+      if (r.BacklogID !== backlogID || seen.has(r.ID)) continue;
+      seen.add(r.ID);
+      out.push(r);
+    }
+    out.sort((a, b) => (b.StartedAt ?? '').localeCompare(a.StartedAt ?? ''));
+    return out;
+  }
+
+  private async fetchBacklogDetail(id: string): Promise<void> {
+    try {
+      const detail = await this.getJSON<BacklogItemDetail>(
+        `/api/mills/backlog/${encodeURIComponent(id)}`,
+      );
+      if (!detail) {
+        this.backlogDetailByID = {
+          ...this.backlogDetailByID,
+          [id]: { status: 'error', message: 'backlog item not found' },
+        };
+        return;
+      }
+      this.backlogDetailByID = {
+        ...this.backlogDetailByID,
+        [id]: { status: 'loaded', detail },
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this.backlogDetailByID = {
+        ...this.backlogDetailByID,
+        [id]: { status: 'error', message },
       };
     }
   }
@@ -727,6 +859,16 @@ class MillsStore {
   // auto-retry escalated items, so the operator owns the next move.
   async escalateRun(runID: string, reason: string = 'manual escalation'): Promise<boolean> {
     await this.postJSON(`/api/mills/pipeline/runs/${encodeURIComponent(runID)}/escalate`, { reason });
+    await this.fetchAll();
+    return true;
+  }
+
+  // startPipeline kicks off a pipeline run for a backlog item via
+  // POST /api/mills/pipeline/runs/{backlog_id}/start. Surfaced from the
+  // backlog drawer so an operator can act on an item without leaving the
+  // detail view. Refreshes so the new run appears in the cross-link list.
+  async startPipeline(backlogID: string): Promise<boolean> {
+    await this.postJSON(`/api/mills/pipeline/runs/${encodeURIComponent(backlogID)}/start`, {});
     await this.fetchAll();
     return true;
   }
