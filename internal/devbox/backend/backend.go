@@ -142,6 +142,17 @@ type StartOpts struct {
 	// does not yet exist on origin. Defaults to "main" when empty.
 	// Only consulted in git-clone sync mode.
 	BaseBranch string
+
+	// AgentCLIInstallCmd is a guarded, idempotent shell snippet that ensures
+	// the agent CLI (codex/claude-code/gemini) is present on the substrate
+	// before the agent runs. The K8s backend bakes the CLI into the per-agent
+	// runtime image at Build time and ignores this field. The harvester-vm
+	// backend has a no-op Build (one shared base image), so it runs this
+	// snippet over SSH at Start time to install the CLI on the VM. Written to
+	// be a fast no-op (`command -v <cli> || install`) so a future curated base
+	// image with the CLI pre-baked makes provisioning instant. Empty means
+	// "assume the CLI is already on the substrate".
+	AgentCLIInstallCmd string
 }
 
 // Mount describes a bind mount.

@@ -677,6 +677,10 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		// the failure mode .loom/119 diagnoses.
 		Branch:     req.Branch,
 		BaseBranch: req.BaseBranch,
+		// AgentCLIInstallCmd is consumed only by backends whose Build doesn't
+		// bake the CLI into a runtime image (harvester-vm). The K8s backend
+		// ignores it (the CLI is in the per-agent image via agentCLIInstallLines).
+		AgentCLIInstallCmd: agentCLIInstallShell(req.AgentType),
 		ExtraLabels: map[string]string{
 			spawn.SpawnIDLabel: spawnID,
 			spawn.AgentIDLabel: state.AgentID,
@@ -2048,6 +2052,30 @@ func agentCLIInstallLines(agentType string) string {
 		return fmt.Sprintf("%s\nRUN npm install -g @openai/codex@%s", ensureNPM, codexVersion)
 	case "gemini":
 		return fmt.Sprintf("%s\nRUN npm install -g @google/gemini-cli@%s", ensureNPM, geminiVersion)
+	default:
+		return ""
+	}
+}
+
+// agentCLIInstallShell returns a guarded, idempotent shell snippet that ensures
+// the agent CLI is installed on a substrate whose Build does not bake it into a
+// runtime image. The K8s backend uses agentCLIInstallLines (Dockerfile RUN) at
+// Build time; the harvester-vm backend has a no-op Build against one shared base
+// image, so the orchestrator passes this snippet as StartOpts.AgentCLIInstallCmd
+// and the VM backend runs it over SSH at Start. Versions stay pinned to the same
+// consts as agentCLIInstallLines. The `command -v <cli>` guard makes it a fast
+// no-op when the CLI is already present (curated base image or reused VM), and
+// it uses sudo because the VM's SSH user installs to the system npm prefix.
+// Returns "" for unknown agent types (the VM backend then skips CLI install).
+func agentCLIInstallShell(agentType string) string {
+	const ensureNPM = `if ! command -v npm >/dev/null 2>&1; then sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm; fi`
+	switch agentType {
+	case "claude-code":
+		return fmt.Sprintf(`if ! command -v claude >/dev/null 2>&1; then %s; sudo npm install -g @anthropic-ai/claude-code@%s; fi`, ensureNPM, claudeCodeVersion)
+	case "codex":
+		return fmt.Sprintf(`if ! command -v codex >/dev/null 2>&1; then %s; sudo npm install -g @openai/codex@%s; fi`, ensureNPM, codexVersion)
+	case "gemini":
+		return fmt.Sprintf(`if ! command -v gemini >/dev/null 2>&1; then %s; sudo npm install -g @google/gemini-cli@%s; fi`, ensureNPM, geminiVersion)
 	default:
 		return ""
 	}
