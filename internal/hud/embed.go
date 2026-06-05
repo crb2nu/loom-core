@@ -595,6 +595,13 @@ func (a *App) initSpawnOrchestrator(ctx context.Context) error {
 			DefaultMemMi:         cfg.SpawnHarvesterDefaultMemMi,
 			DefaultDiskGi:        cfg.SpawnHarvesterDefaultDiskGi,
 			SSHUser:              cfg.SpawnHarvesterSSHUser,
+			// Git clone config so Start can hydrate the VM workspace (the VM
+			// disk IS the worktree). Reuses the same base URL + token Secret
+			// the K8s git-clone init container uses. Without this the VM boots
+			// with an empty /workspace and the agent fails with
+			// `cd: <workdir>: No such file or directory` (Mills A2 kill-test).
+			GitBaseURL: cfg.SpawnGitBaseURL,
+			GitSecret:  cfg.SpawnGitSecret,
 			// K8sBackend implements SecretResolver natively. Without it,
 			// SecretEnv refs (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY,
 			// GEMINI_API_KEY) would be silently dropped on harvester-vm

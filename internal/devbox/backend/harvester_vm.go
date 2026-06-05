@@ -56,6 +56,13 @@ const (
 
 	// execDefaultTimeout matches K8sBackend.Exec.
 	execDefaultTimeout = 5 * time.Minute
+
+	// provisionTimeout bounds the post-boot SSH provisioning step (workspace
+	// clone + guarded agent-CLI install). On a bare Ubuntu base image this
+	// includes a cold `apt-get` + `npm install -g`, so it is generous; on a
+	// curated base image the guarded installs are no-ops and it returns in
+	// seconds.
+	provisionTimeout = 10 * time.Minute
 )
 
 // HarvesterVMBackendConfig configures the per-run KubeVirt VM backend on
@@ -116,6 +123,23 @@ type HarvesterVMBackendConfig struct {
 	// Nil-safe: when nil, Start logs a warning if StartOpts.SecretEnv is
 	// non-empty and proceeds with StartOpts.Env only.
 	SecretResolver SecretResolver
+
+	// GitBaseURL is the base git URL for workspace repos (e.g.,
+	// "http://192.168.50.218/services"). When set, Start clones
+	// "<GitBaseURL>/<project>.git" into StartOpts.WorkDir over SSH after the
+	// VM is ready, mirroring the K8s backend's git-clone init container — the
+	// VM's disk IS the worktree (spec §"Why a new backend"). The project name
+	// is the last path segment of WorkDir. Empty disables cloning (Start
+	// leaves the workspace untouched), preserving pre-provisioning behavior
+	// for non-Mills callers.
+	GitBaseURL string
+
+	// GitSecret is the K8s Secret (resolved via SecretResolver) whose `token`
+	// key holds the git access token used for the clone. Matches the K8s
+	// backend's gitSecret. Only consulted when GitBaseURL is set; an empty
+	// token then fails Start with an actionable error rather than cloning
+	// anonymously against a private repo.
+	GitSecret string
 }
 
 // HarvesterVMBackend implements Backend using KubeVirt VirtualMachines
@@ -325,6 +349,19 @@ func (h *HarvesterVMBackend) Start(ctx context.Context, opts StartOpts) (*StartR
 	}
 
 	h.logger.Info("VM ready", "name", opts.Name)
+
+	// Provision the workspace + agent runtime on the freshly-booted VM. Unlike
+	// the K8s backend — where Build bakes the agent CLI into the runtime image
+	// and a git-clone init container hydrates the workspace — the harvester-vm
+	// Build is a no-op against one shared base image, so neither the repo nor
+	// the CLI exists until we put them there. Skipping this is exactly what
+	// produced the Mills A2 empty-diff kill-test failure (`cd: ...: No such
+	// file or directory` + `codex: command not found`, exit 127).
+	if err := h.provisionVM(ctx, opts); err != nil {
+		_ = h.Stop(context.Background(), opts.Name)
+		return nil, fmt.Errorf("provision vm: %w", err)
+	}
+
 	return &StartResult{ContainerID: opts.Name}, nil
 }
 
@@ -652,6 +689,155 @@ func (h *HarvesterVMBackend) resolveStartMounts(ctx context.Context, opts StartO
 		return nil, err
 	}
 	return files, nil
+}
+
+// ---------- internals: VM provisioning ----------
+
+// provisionVM hydrates a freshly-booted VM with the project workspace and the
+// agent runtime. It is the harvester-vm analogue of two K8s-backend mechanisms
+// the no-op VM Build skips: the per-agent runtime image (agent CLI) and the
+// git-clone init container (workspace). The VM's disk IS the worktree, so both
+// must be materialized in-place over SSH after boot. The provisioning script is
+// guarded/idempotent (`command -v <cli> || install`, clone only when absent) so
+// it is a fast no-op on a curated base image that pre-bakes the CLI and on a
+// reused VM whose workspace already exists.
+func (h *HarvesterVMBackend) provisionVM(ctx context.Context, opts StartOpts) error {
+	// Resolve the git token only when a clone is actually requested, so
+	// CLI-only provisioning (or no provisioning at all) needs no Secret.
+	var gitToken string
+	if h.cloneRequested(opts) {
+		if h.cfg.SecretResolver == nil {
+			return fmt.Errorf("git clone requested (GitBaseURL=%q) but no SecretResolver configured", h.cfg.GitBaseURL)
+		}
+		vals, err := h.cfg.SecretResolver.ResolveSecretEnv(ctx, []SecretEnvVar{{
+			Name:       "GIT_TOKEN",
+			SecretName: h.cfg.GitSecret,
+			SecretKey:  "token",
+		}})
+		if err != nil {
+			return fmt.Errorf("resolve git token from secret %q: %w", h.cfg.GitSecret, err)
+		}
+		gitToken = vals["GIT_TOKEN"]
+		if gitToken == "" {
+			return fmt.Errorf("git token empty (secret %q key \"token\"); cannot clone private repo %s", h.cfg.GitSecret, opts.WorkDir)
+		}
+	}
+
+	script, doClone := h.buildProvisionScript(opts, gitToken)
+	if script == "" {
+		return nil // nothing to install and nothing to clone
+	}
+
+	provCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
+	defer cancel()
+
+	h.logger.Info("provisioning VM",
+		"name", opts.Name,
+		"clone", doClone,
+		"workdir", opts.WorkDir,
+		"cli_install", opts.AgentCLIInstallCmd != "")
+
+	start := time.Now()
+	_, stderr, err := h.execOverSSH(provCtx, opts.Name, script)
+	dur := time.Since(start).Round(time.Second)
+	if err != nil {
+		// apt/npm/git failures land on stderr — surface the tail so the
+		// operator sees the real cause instead of a bare exit code.
+		tail, _, _ := TruncateOutput(string(stderr), 20)
+		tail = strings.TrimSpace(tail)
+		var sshErr *ssh.ExitError
+		if errors.As(err, &sshErr) {
+			return fmt.Errorf("provision script exited %d after %s: %s", sshErr.ExitStatus(), dur, tail)
+		}
+		return fmt.Errorf("provision exec failed after %s: %w (stderr: %s)", dur, err, tail)
+	}
+	h.logger.Info("VM provisioned", "name", opts.Name, "duration", dur.String(), "clone", doClone)
+	return nil
+}
+
+// cloneRequested reports whether Start should clone a repo into the VM
+// workspace: a base URL is configured and WorkDir names a concrete project
+// directory (not the bare /workspace root).
+func (h *HarvesterVMBackend) cloneRequested(opts StartOpts) bool {
+	return h.cfg.GitBaseURL != "" &&
+		opts.WorkDir != "" &&
+		strings.TrimSuffix(opts.WorkDir, "/") != "/workspace"
+}
+
+// buildProvisionScript assembles the idempotent bash run on the VM after boot.
+// Returns the script and whether it includes a git clone. An empty string means
+// there is nothing to do (no CLI install requested and no clone configured).
+//
+// The script mirrors K8sBackend.gitCloneInitContainer's branch logic so the VM
+// ends up on the requested branch (created from BaseBranch when origin lacks
+// it), and runs the orchestrator-supplied AgentCLIInstallCmd to install the CLI
+// the no-op VM Build does not bake in.
+func (h *HarvesterVMBackend) buildProvisionScript(opts StartOpts, gitToken string) (string, bool) {
+	doClone := h.cloneRequested(opts) && gitToken != ""
+	cliInstall := strings.TrimSpace(opts.AgentCLIInstallCmd)
+	if !doClone && cliInstall == "" {
+		return "", false
+	}
+
+	user := h.cfg.SSHUser
+	if user == "" {
+		user = defaultHarvesterSSHUser
+	}
+
+	var b strings.Builder
+	b.WriteString("set -e\numask 002\n")
+
+	// Base tooling. git is required for the clone and is absent from a stock
+	// Ubuntu cloud image; ca-certificates/curl make https work for both the
+	// clone and CLI installers. Guarded so it's a no-op on the curated image.
+	b.WriteString("if ! command -v git >/dev/null 2>&1; then sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates curl; fi\n")
+
+	if cliInstall != "" {
+		b.WriteString(cliInstall)
+		b.WriteString("\n")
+	}
+
+	if doClone {
+		dest := strings.TrimSuffix(opts.WorkDir, "/")
+		parts := strings.Split(dest, "/")
+		project := parts[len(parts)-1]
+		repoURL := strings.TrimSuffix(h.cfg.GitBaseURL, "/") + "/" + project + ".git"
+		scheme := "https"
+		if strings.HasPrefix(repoURL, "http://") {
+			scheme = "http"
+		}
+		hostAndPath := strings.TrimPrefix(strings.TrimPrefix(repoURL, "https://"), "http://")
+		base := opts.BaseBranch
+		if base == "" {
+			base = "main"
+		}
+
+		// /workspace is root-owned on first boot; hand the tree to the agent
+		// user before cloning so the agent (not root) owns the worktree and
+		// can write/commit. The token is exported inline (not persisted to the
+		// cloud-init env file) so it lives only for this SSH session.
+		fmt.Fprintf(&b, "export GIT_TOKEN=%s\n", shellQuote(gitToken))
+		fmt.Fprintf(&b, "sudo mkdir -p %s\n", shellQuote(dest))
+		fmt.Fprintf(&b, "sudo chown -R %s:%s /workspace\n", user, user)
+		fmt.Fprintf(&b, "if [ ! -e %s/.git ]; then git clone \"%s://token:${GIT_TOKEN}@%s\" %s; fi\n",
+			shellQuote(dest), scheme, hostAndPath, shellQuote(dest))
+		fmt.Fprintf(&b, "cd %s\n", shellQuote(dest))
+
+		if opts.Branch != "" {
+			fmt.Fprintf(&b, "BASE=%s\n", shellQuote(base))
+			fmt.Fprintf(&b, "if git ls-remote --exit-code --heads origin %s >/dev/null 2>&1; then git checkout %s; ",
+				shellQuote(opts.Branch), shellQuote(opts.Branch))
+			fmt.Fprintf(&b, "elif git ls-remote --exit-code --heads origin \"${BASE}\" >/dev/null 2>&1; then git checkout -b %s \"origin/${BASE}\"; ",
+				shellQuote(opts.Branch))
+			fmt.Fprintf(&b, "else git checkout -b %s; fi\n", shellQuote(opts.Branch))
+		}
+		// Re-assert ownership over anything the clone wrote, then prove the
+		// branch in the log tail for operator debugging.
+		fmt.Fprintf(&b, "sudo chown -R %s:%s %s\n", user, user, shellQuote(dest))
+		b.WriteString("echo \"provision: workspace ready on $(git rev-parse --abbrev-ref HEAD)\"\n")
+	}
+
+	return b.String(), doClone
 }
 
 // ---------- internals: SSH key management ----------
