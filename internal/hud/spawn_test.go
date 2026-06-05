@@ -3,6 +3,9 @@ package hud
 import (
 	"context"
 	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +196,80 @@ func TestBuildAgentCommand_ClaudeStreamJSON(t *testing.T) {
 	// Count occurrences: "stream-json" should appear exactly once.
 	if count := strings.Count(cmd, "stream-json"); count != 1 {
 		t.Errorf("expected exactly 1 occurrence of stream-json, got %d in: %q", count, cmd)
+	}
+}
+
+// TestBuildAgentCommand_PromptShellQuotedAgainstInjection is the regression
+// for the Mills A2 plan_slice failure (2026-06-05, run
+// PIPE-MILLS-CANARY-20260605-145334). The canary SpecDoc wraps the fixture
+// path and backlog id in backticks (`testdata/mills-canary/heartbeat.md`,
+// `MILLS-CANARY-...`). buildAgentCommand interpolated the prompt with Go %q
+// and the result runs via `sh -c`, so the shell command-substituted those
+// backticks before the agent CLI ran:
+//
+//	sh: testdata/mills-canary/heartbeat.md: Permission denied
+//	sh: MILLS-CANARY-20260605-145334: not found
+//
+// and the agent received a prompt with the backtick spans silently stripped —
+// blocking the first autonomous merge. The fix shell-quotes the prompt. This
+// test executes the built command under a real shell with stubbed agent
+// binaries and asserts the prompt reaches the CLI verbatim with no shell
+// evaluation. It fails on the old %q construction (the $(...) marker fires and
+// the captured prompt is mangled) and passes once shellQuote is used.
+func TestBuildAgentCommand_PromptShellQuotedAgainstInjection(t *testing.T) {
+	binDir := t.TempDir()
+	argsOut := filepath.Join(t.TempDir(), "args.txt")
+	pwnedMarker := filepath.Join(t.TempDir(), "pwned")
+
+	// A canary-shaped prompt: backticks around the path + id, a $(...) command
+	// substitution, a $VAR expansion, and an embedded single quote to exercise
+	// the '\'' splice in shellQuote.
+	task := "Plan `MILLS-CANARY-20260605-145334`: update only " +
+		"`testdata/mills-canary/heartbeat.md`. $(touch " + pwnedMarker + ") " +
+		"keep $HOME untouched; it's deterministic."
+
+	// Stub every binary the commands may invoke (codex/claude/gemini run the
+	// turn; loom fires in the codex EXIT trap). Each stub appends the args it
+	// received so we can assert the agent saw the prompt verbatim.
+	stub := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> " + shellQuote(argsOut) + "; done\n"
+	for _, name := range []string{"codex", "claude", "gemini", "loom"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(stub), 0o755); err != nil {
+			t.Fatalf("write stub %s: %v", name, err)
+		}
+	}
+
+	for _, agentType := range []string{"claude-code", "codex", "gemini"} {
+		t.Run(agentType, func(t *testing.T) {
+			_ = os.Remove(argsOut)
+			cmd := buildAgentCommand(agentType, task, "spawn-"+agentType+"-abc123")
+
+			c := exec.CommandContext(context.Background(), "sh", "-c", cmd)
+			c.Env = append(os.Environ(),
+				"PATH="+binDir+":"+os.Getenv("PATH"),
+				"HOME=/home/stub-should-not-expand",
+			)
+			out, _ := c.CombinedOutput()
+
+			// No $(...) side effect: the prompt must not be evaluated.
+			if _, err := os.Stat(pwnedMarker); err == nil {
+				_ = os.Remove(pwnedMarker)
+				t.Fatalf("$(...) in the prompt was executed by the shell; cmd=%q", cmd)
+			}
+			// No prompt token executed as a command.
+			if s := string(out); strings.Contains(s, "not found") || strings.Contains(s, "Permission denied") {
+				t.Fatalf("prompt tokens ran as shell commands: %q\ncmd=%q", s, cmd)
+			}
+
+			recorded, err := os.ReadFile(argsOut)
+			if err != nil {
+				t.Fatalf("agent stub captured no args (prompt never reached the CLI): %v\ncmd=%q", err, cmd)
+			}
+			// The agent must receive the prompt byte-for-byte: backticks intact,
+			// $(...) and $HOME unexpanded, single quote preserved.
+			if !strings.Contains(string(recorded), task) {
+				t.Fatalf("agent CLI received a mangled prompt.\n got: %q\nwant substring: %q\ncmd=%q", recorded, task, cmd)
+			}
+		})
 	}
 }
 

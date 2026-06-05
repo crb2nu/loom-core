@@ -1127,6 +1127,20 @@ unified_exec = true
 }
 
 // buildAgentCommand constructs the CLI command to run the agent headlessly.
+//
+// The returned string is executed via `sh -c` (see backend.StreamExec /
+// K8sBackend.Exec), so the prompt MUST be shell-quoted, not Go-quoted. Go's
+// %q yields a *Go* string literal, which leaves shell metacharacters live:
+// backticks and $(...) inside the prompt are evaluated by the shell as
+// command substitution before the agent CLI ever sees them. The Mills canary
+// SpecDoc wraps the fixture path and backlog id in backticks
+// (`testdata/mills-canary/heartbeat.md`, `MILLS-CANARY-...`), so a %q prompt
+// produced `sh: testdata/mills-canary/heartbeat.md: Permission denied` /
+// `sh: MILLS-CANARY-...: not found` and a prompt with those spans silently
+// stripped — the plan_slice stage that blocked the first autonomous merge.
+// shellQuote wraps the prompt in single quotes (with '\” escaping) so every
+// metacharacter is passed through literally. The buildSDKDriverCommand path
+// already uses shellQuote; this is the legacy CLI path catching up.
 func buildAgentCommand(agentType, task, agentID string) string {
 	switch agentType {
 	case "claude-code":
@@ -1136,7 +1150,7 @@ func buildAgentCommand(agentType, task, agentID string) string {
 		// stream-json requires --verbose"). Without --verbose the CLI prints
 		// that one line and exits 0 *without making any API call*, which is
 		// why every Mills spawn showed turn_count=0 / cost=$0 / file_changes=0.
-		return fmt.Sprintf(`claude -p %q --dangerously-skip-permissions --output-format stream-json --verbose --max-turns 50`, task)
+		return fmt.Sprintf(`claude -p %s --dangerously-skip-permissions --output-format stream-json --verbose --max-turns 50`, shellQuote(task))
 	case "codex":
 		// Wrap with EXIT trap so loom session-end fires even without a native hook.
 		// The trap is best-effort: if the loom binary is not in the pod PATH,
@@ -1175,12 +1189,19 @@ func buildAgentCommand(agentType, task, agentID string) string {
 		// the VM path (and the latent cause of codex's empty implements on k8s).
 		// Refs openai/codex#20919; the prompt is already passed as an arg, so no
 		// real stdin is needed.
+		//
+		// task is shell-quoted (not Go %q): the result runs via `sh -c`, so
+		// backticks / $(...) / $VAR in the prompt would otherwise be evaluated by
+		// the shell before codex sees them — the canary's backtick-wrapped
+		// fixture path + backlog id died as `sh: ...: not found`. agentID stays
+		// %q: it sits inside the trap's single-quoted body and is a controlled
+		// identifier, never user text.
 		return fmt.Sprintf(
-			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --json %q < /dev/null`,
-			agentID, task,
+			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --json %s < /dev/null`,
+			agentID, shellQuote(task),
 		)
 	case "gemini":
-		return fmt.Sprintf(`gemini -p %q --yolo --output-format stream-json`, task)
+		return fmt.Sprintf(`gemini -p %s --yolo --output-format stream-json`, shellQuote(task))
 	default:
 		return fmt.Sprintf(`echo "Unsupported agent type: %s"`, agentType)
 	}
