@@ -2,6 +2,8 @@
   import type { CostEstimate } from '../../stores/mills.svelte.ts';
   import { millsStore } from '../../stores/mills.svelte.ts';
   import PanelShell from '../shared/PanelShell.svelte';
+  import BacklogDetail from './BacklogDetail.svelte';
+  import PipelineRunDetail from './PipelineRunDetail.svelte';
 
   $effect(() => {
     millsStore.startPolling(15000);
@@ -59,6 +61,19 @@
     if (autonomyBlocked) return blockers.slice(0, 2).join(' · ');
     return 'The council has not produced any items yet.';
   }
+
+  let selectedID = $derived(millsStore.selectedBacklogID);
+
+  function openItem(id: string): void {
+    millsStore.openBacklogDetail(id);
+  }
+
+  function onRowKeydown(ev: KeyboardEvent, id: string): void {
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      openItem(id);
+    }
+  }
 </script>
 
 <PanelShell
@@ -99,7 +114,15 @@
     <tbody>
       {#each items as item (item.ID)}
         {@const est = previews[item.ID]}
-        <tr>
+        <tr
+          class="clickable"
+          class:selected={selectedID === item.ID}
+          role="button"
+          tabindex="0"
+          aria-label={`Open detail for backlog item ${item.ID}`}
+          onclick={() => openItem(item.ID)}
+          onkeydown={(ev) => onRowKeydown(ev, item.ID)}
+        >
           <td class="mono">{item.ID}</td>
           <td><span class="state state-{item.State}">{item.State}</span></td>
           <td>{item.Priority}</td>
@@ -132,6 +155,12 @@
   </table>
 </PanelShell>
 
+<!-- Drilldown drawers. BacklogDetail is driven by selectedBacklogID;
+     PipelineRunDetail is mounted here too so the backlog drawer's
+     "open run" cross-link renders (it's driven by selectedRunID). -->
+<BacklogDetail />
+<PipelineRunDetail />
+
 <style>
   .readiness-banner {
     display: grid;
@@ -163,6 +192,13 @@
     text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border-subtle, #233);
   }
   .mills-table th { font-weight: 600; color: var(--text-muted, #889); }
+  .clickable { cursor: pointer; transition: background 0.1s ease-out; }
+  .clickable:hover { background: rgba(120, 144, 200, 0.08); }
+  .clickable:focus-visible { outline: 2px solid var(--accent, #58a); outline-offset: -2px; }
+  .clickable.selected {
+    background: rgba(120, 144, 200, 0.14);
+    box-shadow: inset 3px 0 0 var(--accent, #58a);
+  }
   .mono { font-family: ui-monospace, monospace; }
   .state { padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.75rem; }
   .state-queued    { background: var(--bg-subtle, #233); color: var(--text-muted, #aab); }
