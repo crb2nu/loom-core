@@ -5,7 +5,7 @@
 
 import type { Session, SessionTreeNode } from '../stores/fleet.svelte.ts';
 import type { SpawnState } from '../stores/spawn.svelte.ts';
-import type { UnifiedAgent } from './agents.ts';
+import { rootAgentId, type UnifiedAgent } from './agents.ts';
 import { sanitizeText } from './format.ts';
 
 export interface FleetRow {
@@ -13,6 +13,11 @@ export interface FleetRow {
   agent: UnifiedAgent;
   depth: number;
   ungrouped: boolean;
+  // True when this row was nested under a lead by *workspace-agent identity*
+  // (rootAgentId) rather than a real session parent/child link — i.e. a
+  // sibling conversation of the same agent. The renderer shows a "same agent"
+  // pill instead of the misleading "root session" badge.
+  agentRootChild: boolean;
   session: Session | null;
   parentSession: Session | null;
   rootSession: Session | null;
@@ -104,6 +109,7 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
       agent,
       depth,
       ungrouped,
+      agentRootChild: false,
       session,
       parentSession: parent,
       rootSession: root,
@@ -180,11 +186,53 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
     return new Date(left.session.started_at ?? 0).getTime() - new Date(right.session.started_at ?? 0).getTime();
   });
 
+  // Flatten each session-tree root into its row list (preserving real
+  // subagent depth), then bucket those root-lists by the lead agent's
+  // workspace-scoped identity (rootAgentId). This is what collapses sibling
+  // conversations of one agent — which have NO session parent/root linkage in
+  // production (parent_session_id is null) and so would otherwise each show as
+  // their own "root session" — under a single lead, nested one level in.
+  const rootLists: Array<{ key: string; rows: FleetRow[] }> = [];
   for (const root of sortedRoots) {
     const rows = flattenSessionNode(root, agentBySessionId);
     if (rows.length === 0) continue;
-    groupedRows.push(...rows);
-    for (const row of rows) seenAgents.add(row.agent.agent_id);
+    const lead = rows[0].agent;
+    rootLists.push({ key: rootAgentId(lead.agent_id) || lead.agent_id, rows });
+  }
+
+  const bucketsByKey = new Map<string, FleetRow[][]>();
+  const bucketOrder: string[] = [];
+  for (const rl of rootLists) {
+    let bucket = bucketsByKey.get(rl.key);
+    if (!bucket) {
+      bucket = [];
+      bucketsByKey.set(rl.key, bucket);
+      bucketOrder.push(rl.key);
+    }
+    bucket.push(rl.rows);
+  }
+
+  for (const key of bucketOrder) {
+    const lists = bucketsByKey.get(key)!;
+    lists.forEach((rows, listIndex) => {
+      if (listIndex === 0) {
+        // The lead root-list keeps its real (session-tree) depths.
+        groupedRows.push(...rows);
+      } else {
+        // Subsequent root-lists are sibling conversations of the same agent:
+        // indent one level under the lead. The list's own root row (rowIndex
+        // 0) is flagged agentRootChild so the renderer shows "same agent";
+        // any genuine subagents below it keep their session-child pills.
+        rows.forEach((row, rowIndex) => {
+          groupedRows.push({
+            ...row,
+            depth: row.depth + 1,
+            agentRootChild: rowIndex === 0 ? true : row.agentRootChild,
+          });
+        });
+      }
+    });
+    for (const rows of lists) for (const row of rows) seenAgents.add(row.agent.agent_id);
   }
 
   // Anything not slotted into a session tree (orphans, idle session-less
@@ -205,12 +253,8 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
     }
   }
 
-  const groupKeys = new Set<string>();
-  for (const row of groupedRows) {
-    if (row.ungrouped) continue;
-    const groupKey = row.rootSession?.id || row.session?.id || row.id;
-    groupKeys.add(groupKey);
-  }
+  // One root group per distinct workspace-agent bucket in the grouped section.
+  const groupKeys = new Set<string>(bucketOrder);
 
   const ungroupedCount = groupedRows.filter((r) => r.ungrouped).length;
 
