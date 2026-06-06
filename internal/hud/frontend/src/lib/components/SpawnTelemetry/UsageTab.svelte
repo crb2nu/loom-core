@@ -1,11 +1,15 @@
 <script lang="ts">
   import type { SpawnTelemetry } from '../../stores/spawn.svelte.ts';
+  import { labsAuthStore } from '../../stores/labsAuth.svelte.ts';
+  import EmptyState from '../shared/EmptyState.svelte';
 
   interface Props {
     telemetry: SpawnTelemetry | null;
   }
 
   let { telemetry }: Props = $props();
+
+  let hasToken = $derived(labsAuthStore.hasToken);
 
   type TokenRow = { label: string; value: number };
 
@@ -47,8 +51,20 @@
 </script>
 
 <div class="tab-content">
-  {#if !telemetry}
-    <div class="tab-empty">No telemetry yet.</div>
+  {#if !hasToken}
+    <EmptyState
+      icon={'\u{1F511}'}
+      heading="Labs admin token required"
+      description="Add a Labs admin token to view usage telemetry."
+      compact
+    />
+  {:else if !telemetry}
+    <EmptyState
+      icon={'□'}
+      heading="No telemetry yet"
+      description="Token usage and per-model cost will appear once the agent reports usage."
+      compact
+    />
   {:else}
     <section class="usage-section">
       <div class="section-label">Token usage</div>
@@ -96,12 +112,6 @@
     border-radius: var(--radius-md);
     border: 1px solid var(--border);
     font-family: var(--font-mono);
-  }
-
-  .tab-empty {
-    padding: var(--space-2);
-    color: var(--fg-secondary);
-    font-size: var(--text-sm);
   }
 
   .usage-section {

@@ -2,6 +2,7 @@
   import type { AgentErrorEntry, PaginatedResponse } from './types.ts';
   import { PAGE_LIMIT } from './types.ts';
   import { adminFetch } from '../../stores/labsAuth.svelte.ts';
+  import EmptyState from '../shared/EmptyState.svelte';
 
   interface Props {
     spawnId: string;
@@ -73,11 +74,21 @@
 
 <div class="tab-content">
   {#if error}
-    <div class="tab-error">{error}</div>
+    <EmptyState
+      icon={'⚠'}
+      heading="Error telemetry unavailable"
+      description={error}
+      compact
+    />
   {:else if !initialized && loading}
     <div class="tab-loading">Loading errors...</div>
   {:else if items.length === 0}
-    <div class="tab-empty">No errors recorded.</div>
+    <EmptyState
+      icon={'✓'}
+      heading="No errors recorded"
+      description="The spawn has not reported any errors."
+      compact
+    />
   {:else}
     <div class="items-list">
       {#each items as err, i (i)}
@@ -112,16 +123,9 @@
     font-family: var(--font-mono);
   }
 
-  .tab-loading,
-  .tab-empty {
+  .tab-loading {
     padding: var(--space-2);
     color: var(--fg-secondary);
-    font-size: var(--text-sm);
-  }
-
-  .tab-error {
-    padding: var(--space-2);
-    color: var(--error);
     font-size: var(--text-sm);
   }
 
