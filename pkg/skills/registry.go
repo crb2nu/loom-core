@@ -137,7 +137,8 @@ func (s *Skill) GetOutputFormat(target string) string {
 }
 
 // GetType returns the output type for a target, using platform-specific defaults.
-// Default types: claude → "command", codex → "skill", kilocode → "rule", gemini → "skill".
+// Default types: claude -> "command", codex -> "skill", kilocode -> "rule",
+// gemini/antigravity -> "skill".
 func (s *Skill) GetType(target string) string {
 	if s.Targets != nil {
 		if spec, ok := s.Targets[target]; ok && spec.Type != "" {
@@ -153,7 +154,7 @@ func (s *Skill) GetType(target string) string {
 		return "skill"
 	case "kilocode":
 		return "rule"
-	case "gemini":
+	case "gemini", "antigravity":
 		return "skill"
 	default:
 		return "skill"
@@ -200,8 +201,9 @@ func (s *Skill) ResolveInstructions(target, codexHome, skillSourceDir string) st
 	case "kilocode":
 		// For Kilocode, use actual paths (similar to Claude)
 		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", skillSourceDir)
-	case "gemini":
-		// For Gemini, use actual paths (similar to Claude)
+	case "gemini", "antigravity":
+		// For Gemini-style bundles, callers pass the final skill path so
+		// generated references stay stable after sync.
 		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", skillSourceDir)
 	case "zed":
 		// Zed reads SKILL.md bundles from $HOME/.config/zed/skills/<name>.

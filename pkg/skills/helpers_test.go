@@ -132,10 +132,11 @@ func TestEscapeYAMLString_Empty(t *testing.T) {
 
 func TestAllTargets_ContainsExpectedPlatforms(t *testing.T) {
 	expected := map[string]bool{
-		"codex":    false,
-		"claude":   false,
-		"kilocode": false,
-		"gemini":   false,
+		"codex":       false,
+		"claude":      false,
+		"kilocode":    false,
+		"gemini":      false,
+		"antigravity": false,
 	}
 
 	for _, target := range AllTargets {
@@ -150,7 +151,7 @@ func TestAllTargets_ContainsExpectedPlatforms(t *testing.T) {
 		}
 	}
 
-	if len(AllTargets) != 4 {
-		t.Errorf("expected 4 targets, got %d", len(AllTargets))
+	if len(AllTargets) != 5 {
+		t.Errorf("expected 5 targets, got %d", len(AllTargets))
 	}
 }

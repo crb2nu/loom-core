@@ -48,7 +48,7 @@ type GeneratorOptions struct {
 }
 
 // AllTargets lists all supported skill generation targets.
-var AllTargets = []string{"codex", "claude", "kilocode", "gemini"}
+var AllTargets = []string{"codex", "claude", "kilocode", "gemini", "antigravity"}
 
 // NewGenerator creates a new skill generator.
 func NewGenerator(opts GeneratorOptions) (*Generator, error) {
@@ -137,6 +137,13 @@ func (g *Generator) generateForTarget(target string) error {
 		}
 
 		skillType := skill.GetType(target)
+		if target == "antigravity" && skillType != "instruction" {
+			// Antigravity uses Gemini-style skill bundles, not Claude-style
+			// slash-command files. Older registry entries used type=command
+			// for Antigravity; normalize them at generation time so the
+			// Antigravity target overrides are still honored.
+			skillType = "skill"
+		}
 
 		// Collect instruction-type skills for composite instructions.md / GEMINI.md
 		if skillType == "instruction" {
@@ -163,6 +170,11 @@ func (g *Generator) generateForTarget(target string) error {
 			if err == nil {
 				files = append(files, g.geminiManifestFiles(skill)...)
 			}
+		case "antigravity":
+			err = g.generateAntigravitySkill(skill)
+			if err == nil {
+				files = append(files, g.geminiManifestFiles(skill)...)
+			}
 		case "zed", "opencode":
 			err = g.generateBundleSkill(skill, target)
 			if err == nil {
@@ -183,7 +195,7 @@ func (g *Generator) generateForTarget(target string) error {
 		sortSkillsByPriority(instructionSkills)
 
 		filename := "instructions.md"
-		if target == "gemini" {
+		if target == "gemini" || target == "antigravity" {
 			filename = "GEMINI.md"
 		}
 		files, err := g.generateInstructionsFile(target, instructionSkills, bundleSkills)
@@ -232,6 +244,8 @@ func (g *Generator) resolveTargetDir(target string) string {
 			return filepath.Join(g.RepoRoot, ".kilocode")
 		case "gemini":
 			return filepath.Join(g.RepoRoot, ".gemini")
+		case "antigravity":
+			return filepath.Join(g.RepoRoot, ".gemini", "antigravity")
 		}
 	}
 	return ""

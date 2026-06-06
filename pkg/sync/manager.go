@@ -202,7 +202,7 @@ func (m *Manager) registerProfiles() {
 			"hooks.json": "config/hooks.json",
 		},
 		SyncGeneratedOnly:  true,
-		SkillsTarget:       "gemini",
+		SkillsTarget:       "antigravity",
 		SkillsManifest:     ".loom-skills-manifest.json",
 		SkillsHomePath:     "$HOME/.gemini/antigravity/skills",
 		SkillsDirectToHome: true,

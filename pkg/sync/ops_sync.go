@@ -79,9 +79,10 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 		}
 
 		if p.SkillsDirectToHome {
-			manifest, _ := skills.ReadManifest(homePath)
+			manifestDir := skillsHomeManifestDir(p, homePath)
+			manifest, _ := skills.ReadManifest(manifestDir)
 			if manifest != nil && len(manifest.Generated) > 0 {
-				fmt.Printf("Generated %d skill files directly to %s\n", len(manifest.Generated), homePath)
+				fmt.Printf("Generated %d skill files directly to %s\n", len(manifest.Generated), manifestDir)
 			}
 		}
 		writePolicyHashForProfile(m.RepoRoot, homePath)

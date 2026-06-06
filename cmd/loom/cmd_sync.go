@@ -217,6 +217,9 @@ Platform output formats:
             .kilocode/workflows/<name>.yaml (workflows)
   Gemini:   .gemini/skills/<name>/SKILL.md + scripts/ + references/ + assets/
             .gemini/GEMINI.md (composite from instruction-type skills)
+  Antigravity:
+            .gemini/antigravity/skills/<name>/SKILL.md + resources
+            .gemini/antigravity/GEMINI.md (composite from instruction-type skills)
 
 Skills with type=instruction are assembled into a composite instructions.md (or GEMINI.md for Gemini).
 
@@ -224,7 +227,8 @@ Example:
   loom generate skills --target all
   loom generate skills --target codex
   loom generate skills --target kilocode --dry-run
-  loom generate skills --target gemini --verbose`,
+  loom generate skills --target gemini --verbose
+  loom generate skills --target antigravity --verbose`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target, _ := cmd.Flags().GetString("target")
 			outputDir, _ := cmd.Flags().GetString("output-dir")
@@ -305,7 +309,7 @@ Example:
 			return gen.Generate()
 		},
 	}
-	cmd.Flags().String("target", "all", "Target platform (all, codex, claude, kilocode, gemini)")
+	cmd.Flags().String("target", "all", "Target platform (all, codex, claude, kilocode, gemini, antigravity)")
 	cmd.Flags().String("output-dir", "", "Output directory (default: platform-specific)")
 	cmd.Flags().String("registry", "", "Path to skills-registry.yaml")
 	cmd.Flags().String("codex-home", "", "Codex home directory (default: ~/.codex)")

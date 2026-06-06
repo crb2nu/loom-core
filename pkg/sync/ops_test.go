@@ -1830,6 +1830,75 @@ func TestSyncToHome_SkillsDirectToHome_SkipsRepoCopy(t *testing.T) {
 	}
 }
 
+func TestRegenerateSkills_AntigravityUsesOwnTargetAndHomePath(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	regDir := filepath.Join(repoDir, "mcp", "context")
+	if err := os.MkdirAll(regDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	registryYAML := `version: 1
+skills:
+  - name: ag-only
+    common:
+      description: Antigravity-only helper
+      instructions: "Run ${SKILL_PATH}/scripts/run.sh"
+    targets:
+      gemini:
+        enabled: false
+        type: skill
+        instructions_append: |
+          ## Gemini Notes
+          wrong target
+      antigravity:
+        enabled: true
+        type: command
+        instructions_append: |
+          ## Antigravity Notes
+          right target
+`
+	if err := os.WriteFile(filepath.Join(regDir, "skills-registry.yaml"), []byte(registryYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := NewManager(repoDir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	m.HomeDir = homeDir
+	p := m.Get("antigravity")
+	p.SkillsHomePath = filepath.Join(homeDir, ".gemini", "antigravity", "skills")
+
+	if err := m.regenerateSkills(p); err != nil {
+		t.Fatalf("regenerateSkills(antigravity): %v", err)
+	}
+
+	antigravitySkill := filepath.Join(homeDir, ".gemini", "antigravity", "skills", "ag-only", "SKILL.md")
+	data, err := os.ReadFile(antigravitySkill)
+	if err != nil {
+		t.Fatalf("expected Antigravity skill at %s: %v", antigravitySkill, err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "## Antigravity Notes") {
+		t.Fatalf("expected Antigravity target override in skill:\n%s", text)
+	}
+	if strings.Contains(text, "Gemini Notes") {
+		t.Fatalf("Antigravity skill used Gemini target override:\n%s", text)
+	}
+	if Exists(filepath.Join(homeDir, ".gemini", "skills", "ag-only", "SKILL.md")) {
+		t.Fatal("did not expect Antigravity sync to write into the Gemini skills root")
+	}
+
+	manifest, err := skills.ReadManifest(filepath.Join(homeDir, ".gemini", "antigravity"))
+	if err != nil {
+		t.Fatalf("read Antigravity manifest: %v", err)
+	}
+	if manifest == nil || manifest.Platform != "antigravity" {
+		t.Fatalf("manifest platform = %#v, want antigravity", manifest)
+	}
+}
+
 // =============================================================================
 // Gemini MCP Extension Pruning Tests
 // =============================================================================
@@ -2025,10 +2094,11 @@ func TestAllSkillProfiles_HaveSkillsDirectToHome(t *testing.T) {
 		}
 	}
 
-	// Verify antigravity uses gemini skills target
+	// Verify antigravity uses its own registry target while emitting
+	// Gemini-style SKILL.md bundles.
 	antigravity := m.Get("antigravity")
-	if antigravity.SkillsTarget != "gemini" {
-		t.Errorf("antigravity SkillsTarget = %q, want %q", antigravity.SkillsTarget, "gemini")
+	if antigravity.SkillsTarget != "antigravity" {
+		t.Errorf("antigravity SkillsTarget = %q, want %q", antigravity.SkillsTarget, "antigravity")
 	}
 }
 

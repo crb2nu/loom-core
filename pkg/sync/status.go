@@ -135,7 +135,7 @@ func (m *Manager) GetSyncStatus(profileName string) (*SyncStatus, error) {
 		var skillDrift []DriftItem
 		if profile.SkillsDirectToHome {
 			// Skills live only in home; verify they exist there.
-			skillDrift = compareHomeSkillFiles(homePath)
+			skillDrift = compareHomeSkillFiles(skillsHomeManifestDir(profile, homePath))
 		} else {
 			skillDrift = compareSkillFiles(repoPath, homePath, profile)
 		}

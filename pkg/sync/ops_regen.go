@@ -123,12 +123,12 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 		if p.SkillsTarget == "codex" {
 			outputDir = ""
 		}
-		// zed/opencode write SKILL.md bundles under <SkillsHomePath>, which may
-		// differ from the MCP-config HomeDir (Zed's config lives in
-		// Library/Application Support/Zed but its skills home is
-		// $HOME/.config/zed/skills). The generator appends skills/<name>, so
-		// point OutputDir at the parent of SkillsHomePath.
-		if (p.SkillsTarget == "zed" || p.SkillsTarget == "opencode") && p.SkillsHomePath != "" {
+		// SKILL.md bundle targets write under <SkillsHomePath>, which may
+		// differ from the MCP-config HomeDir (Antigravity config lives under
+		// ~/.gemini but its skills live under ~/.gemini/antigravity/skills).
+		// The generator appends skills/<name>, so point OutputDir at the parent
+		// of SkillsHomePath.
+		if skillTargetUsesHomePathParent(p) {
 			outputDir = filepath.Dir(os.ExpandEnv(p.SkillsHomePath))
 		}
 	}
@@ -140,7 +140,7 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 		WorkspaceRoot: m.WorkspaceRoot,
 		OutputDir:     outputDir,
 		GeminiSkillsHome: func() string {
-			if p.SkillsTarget != "gemini" {
+			if p.SkillsTarget != "gemini" && p.SkillsTarget != "antigravity" {
 				return ""
 			}
 			return p.SkillsHomePath
@@ -177,12 +177,7 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 	// Read manifest from the directory where skills were generated.
 	manifestDir := repoPath
 	if p.SkillsDirectToHome {
-		manifestDir = m.ResolveHomePath(p)
-		// zed/opencode write under the parent of SkillsHomePath (see outputDir
-		// above); the manifest lands there too.
-		if (p.SkillsTarget == "zed" || p.SkillsTarget == "opencode") && p.SkillsHomePath != "" {
-			manifestDir = filepath.Dir(os.ExpandEnv(p.SkillsHomePath))
-		}
+		manifestDir = skillsHomeManifestDir(p, m.ResolveHomePath(p))
 	}
 	manifest, _ := skills.ReadManifest(manifestDir)
 	if manifest != nil {
@@ -190,6 +185,25 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 	}
 
 	return nil
+}
+
+func skillTargetUsesHomePathParent(p *Profile) bool {
+	if p == nil || p.SkillsHomePath == "" {
+		return false
+	}
+	switch p.SkillsTarget {
+	case "gemini", "antigravity", "zed", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
+func skillsHomeManifestDir(p *Profile, homePath string) string {
+	if skillTargetUsesHomePathParent(p) {
+		return filepath.Dir(os.ExpandEnv(p.SkillsHomePath))
+	}
+	return homePath
 }
 
 // cleanRepoSkills removes stale skill files from the repo directory when
@@ -297,9 +311,10 @@ func (m *Manager) SyncSkills(profileName string, repoOnly bool) error {
 	// When skills are generated directly to home, no copy step needed.
 	if p.SkillsDirectToHome {
 		homePath := m.ResolveHomePath(p)
-		manifest, _ := skills.ReadManifest(homePath)
+		manifestDir := skillsHomeManifestDir(p, homePath)
+		manifest, _ := skills.ReadManifest(manifestDir)
 		if manifest != nil {
-			fmt.Printf("Generated %d skill files directly to %s\n", len(manifest.Generated), homePath)
+			fmt.Printf("Generated %d skill files directly to %s\n", len(manifest.Generated), manifestDir)
 		}
 		return nil
 	}

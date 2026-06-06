@@ -28,6 +28,7 @@
 #   - claude: Claude Code specific settings
 #   - kilocode: Kilocode specific settings
 #   - gemini: Gemini CLI specific settings
+#   - antigravity: Antigravity 2.0 specific settings
 #   - instructions_append: Optional additive markdown appended after common.instructions
 #
 # ## Variable Substitution
@@ -46,7 +47,7 @@
 # ## Skill Types
 # Each target can specify a `type` that determines the output format:
 # - command: Slash command (Claude .claude/commands/, Kilocode workflows)
-# - skill: Full skill bundle (Codex ~/.codex/skills/)
+# - skill: Full skill bundle (Codex ~/.codex/skills/, Gemini/Antigravity SKILL.md bundles)
 # - rule: Rule file (Claude .claude/rules/, Kilocode .kilocode/rules/)
 # - instruction: Included in composite instructions.md (Codex, Kilocode, Gemini)
 # - workflow: YAML workflow file (Kilocode .kilocode/workflows/)
@@ -60,11 +61,11 @@
 # Context window priority favors content near the top.
 #
 # ## Generation
-# Run: loom generate skills --target <codex|claude|kilocode|gemini|all>
+# Run: loom generate skills --target <codex|claude|kilocode|gemini|antigravity|all>
 # Sync: loom sync <profile> --regen --hub-mode --all-projects --skip-worktrees
 
 version: 1
-updated: 2026-06-01
+updated: 2026-06-06
 skills:
   - name: flux-gitops-operator
     categories: [kubernetes, gitops, operations]

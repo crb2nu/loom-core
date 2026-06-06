@@ -528,6 +528,84 @@ func TestGenerateGeminiSkillMD_UsesConfiguredSkillsHomePath(t *testing.T) {
 	}
 }
 
+func TestGenerateAntigravitySkills_UsesAntigravityOverridesAndHomePath(t *testing.T) {
+	tmpDir := t.TempDir()
+	outputDir := filepath.Join(tmpDir, ".gemini", "antigravity")
+	enabled := true
+	disabled := false
+
+	g := &Generator{
+		Registry: &Registry{Skills: []*Skill{
+			{
+				Name: "core-instructions",
+				Common: &SkillSpec{
+					Description:  "Core instruction set",
+					Instructions: "# Core\n\nUse the Antigravity target.",
+				},
+				Targets: map[string]*TargetSpec{
+					"antigravity": {Enabled: &enabled, Type: "instruction"},
+				},
+			},
+			{
+				Name: "ag-only",
+				Common: &SkillSpec{
+					Description:  "Antigravity-only helper",
+					Instructions: "Run ${SKILL_PATH}/scripts/run.sh",
+				},
+				Targets: map[string]*TargetSpec{
+					"gemini":      {Enabled: &disabled, Type: "skill", InstructionsAppend: "## Gemini Notes\nWrong target."},
+					"antigravity": {Enabled: &enabled, Type: "command", InstructionsAppend: "## Antigravity Notes\nRight target."},
+				},
+			},
+		}},
+		SourceDir:        filepath.Join(tmpDir, "mcp", "skills"),
+		Target:           "antigravity",
+		OutputDir:        outputDir,
+		RepoRoot:         tmpDir,
+		CodexHome:        "/tmp/codex",
+		GeminiSkillsHome: "$HOME/.gemini/antigravity/skills",
+	}
+
+	if err := g.generateForTarget("antigravity"); err != nil {
+		t.Fatalf("generateForTarget(antigravity): %v", err)
+	}
+
+	skillPath := filepath.Join(outputDir, "skills", "ag-only", "SKILL.md")
+	data, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read Antigravity skill: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"name: ag-only",
+		"$HOME/.gemini/antigravity/skills/ag-only/scripts/run.sh",
+		"## Antigravity Notes",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected Antigravity skill to contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Gemini Notes") {
+		t.Fatalf("Antigravity skill used Gemini target override:\n%s", text)
+	}
+
+	instructions, err := os.ReadFile(filepath.Join(outputDir, "GEMINI.md"))
+	if err != nil {
+		t.Fatalf("read Antigravity GEMINI.md: %v", err)
+	}
+	if !strings.Contains(string(instructions), "$HOME/.gemini/antigravity/skills/ag-only/SKILL.md") {
+		t.Fatalf("GEMINI.md missing Antigravity skill home path:\n%s", instructions)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(outputDir, ManifestFilename))
+	if err != nil {
+		t.Fatalf("read Antigravity manifest: %v", err)
+	}
+	if !strings.Contains(string(manifest), `"platform": "antigravity"`) {
+		t.Fatalf("manifest platform should be antigravity:\n%s", manifest)
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, v := range values {
 		if v == want {
@@ -704,6 +782,9 @@ func TestValidate_DisabledSkillSkipped(t *testing.T) {
 		"claude":   {Enabled: &disabled},
 		"kilocode": {Enabled: &disabled},
 		"gemini":   {Enabled: &disabled},
+		"antigravity": {
+			Enabled: &disabled,
+		},
 	}
 
 	g := &Generator{
