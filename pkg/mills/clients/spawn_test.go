@@ -561,6 +561,64 @@ func TestIsTerminalSpawnStatus(t *testing.T) {
 	}
 }
 
+// TestRun_DecodesCostEstimatedFromWire proves the operator decodes the
+// HUD spawn API's existing `cost_estimated` field (Codex's estimated-cost
+// marker) into SpawnResponse.CostEstimated. The detail endpoint already
+// serialises this on the wire; the operator subset historically dropped
+// it. We feed the raw JSON (not the Go struct) so the json tag is
+// exercised end-to-end.
+func TestRun_DecodesCostEstimatedFromWire(t *testing.T) {
+	cases := []struct {
+		name          string
+		costJSON      string // value for total_cost_usd + cost_estimated
+		wantCost      float64
+		wantEstimated bool
+	}{
+		{
+			name:          "claude real cost",
+			costJSON:      `"total_cost_usd": 1.23`,
+			wantCost:      1.23,
+			wantEstimated: false,
+		},
+		{
+			name:          "codex estimated cost",
+			costJSON:      `"total_cost_usd": 0.42, "cost_estimated": true`,
+			wantCost:      0.42,
+			wantEstimated: true,
+		},
+		{
+			name:          "gemini unavailable cost",
+			costJSON:      `"total_cost_usd": 0`,
+			wantCost:      0,
+			wantEstimated: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw := json.RawMessage(`{"spawn_id":"sp-1","status":"completed","telemetry":{` + c.costJSON + `}}`)
+			ft := &hudFakeTransport{
+				post: func(_ *http.Request) (int, any) {
+					return 202, hudSpawnAcceptResponse{SpawnID: "sp-1", Status: "creating"}
+				},
+				get: func(_ *http.Request) (int, any) {
+					return 200, raw
+				},
+			}
+			c2 := newHUDStub(t, ft)
+			resp, err := c2.Run(context.Background(), sampleSpawnReq())
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if resp.CostUSD != c.wantCost {
+				t.Errorf("CostUSD = %v, want %v", resp.CostUSD, c.wantCost)
+			}
+			if resp.CostEstimated != c.wantEstimated {
+				t.Errorf("CostEstimated = %v, want %v", resp.CostEstimated, c.wantEstimated)
+			}
+		})
+	}
+}
+
 // ----- DiffPatch + CommitMessages capture -----
 
 // spawnTelGitRunner records every invocation and returns canned stdout per
