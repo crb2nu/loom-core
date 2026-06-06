@@ -450,7 +450,27 @@
       {/snippet}
     </FilterBar>
 
-    {#if sortedItems.length === 0}
+    {#if memoryStore.error}
+      <!-- Fetch errors on /memory/* were otherwise swallowed: a cold-
+           start failure showed the same empty-state as a tier with no
+           items, and a refresh failure left stale items on screen with
+           no signal the data had gone stale. Banner mirrors the
+           CatalogPanel pattern; auto-clears on the next successful
+           fetch (the store resets error to null at fetch start). -->
+      <div class="error-banner" role="alert" aria-live="polite">
+        <span class="error-banner-icon" aria-hidden="true">\u26A0</span>
+        <span class="error-banner-text">Memory refresh failed: {memoryStore.error}</span>
+      </div>
+    {/if}
+
+    {#if sortedItems.length === 0 && memoryStore.lastUpdated && !memoryStore.loading}
+      <!-- Gate the empty state on a completed fetch (lastUpdated set) and
+           idle (loading=false); during a refetch or tier switch the
+           previous run had finished so sortedItems briefly drops to 0
+           while the next fetch is in flight, flashing this empty state.
+           The DataTable below renders nothing when fed an empty rows
+           array, so the skeleton/loading-bar carries the visual state
+           during the gap. -->
       <EmptyState icon={'\u25A1'} heading="No items in this tier" compact />
     {:else}
       <DataTable
@@ -635,6 +655,32 @@
     flex-direction: column;
     overflow-y: auto;
     gap: var(--space-4);
+  }
+
+  /* Error banner — matches CatalogPanel/KnowledgePanel so all three
+     panels surface fetch failures with the same shape. */
+  .error-banner {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-start;
+    padding: 8px var(--space-3);
+    margin-bottom: var(--space-2);
+    background: color-mix(in srgb, var(--error) 18%, var(--bg-secondary));
+    border: 1px solid var(--error);
+    border-radius: var(--radius-md);
+    color: var(--fg-primary);
+    font-size: var(--text-sm);
+  }
+
+  .error-banner-icon {
+    color: var(--error);
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .error-banner-text {
+    flex: 1;
+    word-break: break-word;
   }
 
   /* Tier Overview */

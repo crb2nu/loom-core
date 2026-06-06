@@ -178,7 +178,14 @@
     {/if}
 
     {#if filtered.length === 0}
-      <EmptyState icon={'\u25C9'} heading="No activity yet" description="Context entries will appear here in real-time" />
+      {#if streamStore.error}
+        <!-- A failed /stream/recent fetch previously rendered the same
+             "No activity yet" copy as an empty cold-start, hiding the
+             reason from the operator. -->
+        <EmptyState icon={'\u26A0'} heading="Stream unavailable" description={streamStore.error} />
+      {:else}
+        <EmptyState icon={'\u25C9'} heading="No activity yet" description="Context entries will appear here in real-time" />
+      {/if}
     {:else}
       <VirtualList items={filtered} itemHeight={STREAM_ROW_HEIGHT} bind:containerEl={scroll.containerEl}>
         {#snippet children({ item: entry, index })}
