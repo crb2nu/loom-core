@@ -189,6 +189,30 @@
   --glow-warning: rgba(255, 184, 48, 0.12);
   --glow-success: rgba(212, 238, 244, 0.05);
   --glow-info:    rgba(212, 238, 244, 0.05);
+
+  /* ── Phantom Token Aliases ──────────────────────────────────── */
+  /* Alias block: phantom tokens used across panels (Mills, LiveSessionsCard,
+     AlertsPanel, SpawnDetailPanel, ConfirmDialog, WeaverPanel, etc.)
+     resolve to canonical brand tokens instead of silently rendering
+     hardcoded hex fallbacks. See audit !641-followup, slice 1. */
+  --text-primary:   var(--fg-primary);
+  --text-secondary: var(--fg-secondary);
+  --text-muted:     var(--fg-muted);
+  --text-default:   var(--fg-primary);
+  --text-dim:       var(--fg-dim);
+  --color-success:  var(--success);
+  --color-info:     var(--info);
+  --color-warn:     var(--warning);
+  --color-warning:  var(--warning);
+  --color-error:    var(--error);
+  --color-danger:   var(--error);
+  --color-muted:    var(--fg-muted);
+  --surface-1:      var(--bg-secondary);
+  --surface-2:      var(--bg-tertiary);
+  --surface-3:      var(--bg-elevated);
+  --bg-subtle:      var(--bg-tertiary);
+  --danger:         var(--error);
+  --scrim:          rgba(6, 12, 16, 0.6);
 }
 
 
@@ -265,6 +289,12 @@ button {
   color: var(--fg-primary);
   font-size: inherit;
   letter-spacing: inherit;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+  border-radius: inherit;
 }
 
 input, select, textarea {

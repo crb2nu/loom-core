@@ -685,6 +685,12 @@
     border-color: color-mix(in srgb, var(--border-focus) 70%, transparent);
   }
 
+  .nav-tab:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   .nav-tab.active {
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent),
