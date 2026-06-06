@@ -92,7 +92,21 @@ The `5fc4dd75` telemetry fix means this time the turn detail **will** be
 captured, so the next debug is not blind. Reopen `.loom/119` against the VM
 path with the captured turn output.
 
-**Status**: not run (code-ready 2026-06-05; live re-run human-gated).
+**Status**: **FAILED 2026-06-06** — but on a NEW blocker, downstream of all
+four verified fixes (which worked). The live re-run ran (`gitops!230` flip →
+canary `MILLS-CANARY-A2-20260606-011720` → `gitops!231` revert; window ≈6
+min). codex had the CLI + workspace, did NOT hang on stdin, authenticated,
+and **started a turn** — then the OpenAI API returned **HTTP 400: "The
+'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT
+account."** This is **substrate-independent** (it failed at `plan_slice` on
+k8s, before `implement` reached a VM): `buildAgentCommand` runs `codex exec`
+with **no `--model`**, so codex uses its default (`gpt-5.3-codex`), which the
+mounted ChatGPT-account OAuth doesn't grant. The `nonempty_diff` gate
+escalated cleanly — **no junk MR** (MRIID:None, $0). Evidence + the small
+next-fix options:
+`.loom/local/handoffs/mills-harvester-vm-slice-a2-killtest-2026-06-05.md`.
+**Next**: run the first canary on `gemini` (clean auth — recommended), or pin
+a ChatGPT-supported `--model` on the codex exec.
 
 > Per `.loom/126`, this kill-test gates the entire rest of the plan. Phases
 > B, C, D do not start until it produces one real autonomous merge.
