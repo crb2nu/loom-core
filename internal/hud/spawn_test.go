@@ -117,11 +117,20 @@ func TestBuildAgentCommand(t *testing.T) {
 				// non-TTY pipe (both the K8s StreamExec Stdin:false path and
 				// the harvester-vm SSH nil-stdin path). Refs openai/codex#20919.
 				"< /dev/null",
+				// --model pins a ChatGPT-account-supported codex model.
+				// codex's default (gpt-5.3-codex) is deprecated for
+				// ChatGPT sign-in and 400s ("not supported when using
+				// Codex with a ChatGPT account") — the Mills A2 kill-test
+				// failure mode (2026-06-06). See resolveCodexModel.
+				"--model 'gpt-5.5'",
 				"trap",
 				"session-end",
 				"spawn-codex-abc123",
 			},
 			wantNotContains: []string{
+				// The deprecated default model must never be emitted — it
+				// 400s under ChatGPT-account auth.
+				"gpt-5.3-codex",
 				// --full-auto was removed in codex 0.110+; verify we
 				// don't regress to the deprecated flag.
 				"--full-auto",
@@ -183,6 +192,37 @@ func TestBuildAgentCommand_CodexTrapContainsAgentID(t *testing.T) {
 	if !strings.Contains(cmd, "2>/dev/null") {
 		t.Errorf("codex command missing stderr suppression in trap: %q", cmd)
 	}
+}
+
+func TestResolveCodexModel(t *testing.T) {
+	// Default: the pinned ChatGPT-account-supported model. Must NOT be the
+	// deprecated codex default (gpt-5.3-codex), which 400s under ChatGPT auth.
+	t.Run("default", func(t *testing.T) {
+		t.Setenv("SPAWN_CODEX_MODEL", "")
+		if got := resolveCodexModel(); got != defaultCodexModel {
+			t.Errorf("resolveCodexModel() = %q, want %q", got, defaultCodexModel)
+		}
+		if defaultCodexModel == "gpt-5.3-codex" {
+			t.Fatalf("defaultCodexModel must not be the deprecated ChatGPT-unsupported model")
+		}
+	})
+
+	// Env override lets operators retune without a rebuild when OpenAI shifts
+	// the ChatGPT-supported model set again.
+	t.Run("env override", func(t *testing.T) {
+		t.Setenv("SPAWN_CODEX_MODEL", "gpt-5.4")
+		if got := resolveCodexModel(); got != "gpt-5.4" {
+			t.Errorf("resolveCodexModel() with override = %q, want %q", got, "gpt-5.4")
+		}
+	})
+
+	// Whitespace-only override falls back to the default (not an empty --model).
+	t.Run("blank override falls back", func(t *testing.T) {
+		t.Setenv("SPAWN_CODEX_MODEL", "   ")
+		if got := resolveCodexModel(); got != defaultCodexModel {
+			t.Errorf("resolveCodexModel() with blank override = %q, want %q", got, defaultCodexModel)
+		}
+	})
 }
 
 func TestBuildAgentCommand_ClaudeStreamJSON(t *testing.T) {

@@ -1126,6 +1126,29 @@ unified_exec = true
 	return nil
 }
 
+// defaultCodexModel is the codex model used for spawn exec when
+// SPAWN_CODEX_MODEL is unset. codex 0.120.0+ defaults to gpt-5.3-codex, which
+// OpenAI DEPRECATED for ChatGPT-account (sign-in-with-ChatGPT) auth — so
+// `codex exec` with no --model fails with HTTP 400 "The 'gpt-5.3-codex' model
+// is not supported when using Codex with a ChatGPT account." (Mills A2
+// kill-test, 2026-06-06: codex authenticated and started a turn, then the API
+// rejected the default model). gpt-5.5 is the current model available with
+// ChatGPT sign-in per https://developers.openai.com/codex/models (fetched
+// 2026-06-06; supported there: gpt-5.5, gpt-5.4, gpt-5.4-mini; ChatGPT-Pro
+// only: gpt-5.3-codex-spark; deprecated: gpt-5.2, gpt-5.3-codex).
+const defaultCodexModel = "gpt-5.5"
+
+// resolveCodexModel returns the codex model id to pin on `codex exec --model`.
+// It is an env override (SPAWN_CODEX_MODEL) over defaultCodexModel so operators
+// can retune WITHOUT a rebuild the next time OpenAI shifts the
+// ChatGPT-supported model set — the failure class that broke the A2 kill-test.
+func resolveCodexModel() string {
+	if m := strings.TrimSpace(os.Getenv("SPAWN_CODEX_MODEL")); m != "" {
+		return m
+	}
+	return defaultCodexModel
+}
+
 // buildAgentCommand constructs the CLI command to run the agent headlessly.
 //
 // The returned string is executed via `sh -c` (see backend.StreamExec /
@@ -1190,15 +1213,24 @@ func buildAgentCommand(agentType, task, agentID string) string {
 		// Refs openai/codex#20919; the prompt is already passed as an arg, so no
 		// real stdin is needed.
 		//
+		// `--model` is REQUIRED. codex 0.120.0+ `exec` with no --model uses its
+		// CLI default (gpt-5.3-codex), which OpenAI deprecated for ChatGPT-account
+		// auth: the Mills A2 kill-test (2026-06-06) saw codex authenticate and
+		// start a turn, then fail with HTTP 400 "The 'gpt-5.3-codex' model is not
+		// supported when using Codex with a ChatGPT account." resolveCodexModel
+		// pins a ChatGPT-supported model (default gpt-5.5) with a SPAWN_CODEX_MODEL
+		// env override so a future model-set shift is an env flip, not a rebuild.
+		//
 		// task is shell-quoted (not Go %q): the result runs via `sh -c`, so
 		// backticks / $(...) / $VAR in the prompt would otherwise be evaluated by
 		// the shell before codex sees them — the canary's backtick-wrapped
 		// fixture path + backlog id died as `sh: ...: not found`. agentID stays
 		// %q: it sits inside the trap's single-quoted body and is a controlled
-		// identifier, never user text.
+		// identifier, never user text. The model is shell-quoted too (defensive;
+		// it is a controlled identifier, never user text).
 		return fmt.Sprintf(
-			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --json %s < /dev/null`,
-			agentID, shellQuote(task),
+			`trap 'loom agent session-end --agent-id %q --summarize --summary-async --quiet 2>/dev/null' EXIT; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model %s --json %s < /dev/null`,
+			agentID, shellQuote(resolveCodexModel()), shellQuote(task),
 		)
 	case "gemini":
 		return fmt.Sprintf(`gemini -p %s --yolo --output-format stream-json`, shellQuote(task))
