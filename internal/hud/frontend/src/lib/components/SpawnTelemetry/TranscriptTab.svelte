@@ -10,6 +10,7 @@
 
   import type { Message, SpawnTraceResponse } from './types.ts';
   import { adminFetch } from '../../stores/labsAuth.svelte.ts';
+  import EmptyState from '../shared/EmptyState.svelte';
 
   interface Props {
     spawnId: string;
@@ -104,11 +105,21 @@
 
 <div class="tab-content">
   {#if error}
-    <div class="tab-error">error: {error}</div>
+    <EmptyState
+      icon={'⚠'}
+      heading="Transcript unavailable"
+      description={error}
+      compact
+    />
   {:else if !initialized && loading}
     <div class="tab-loading">Loading transcript…</div>
   {:else if messages.length === 0}
-    <div class="tab-empty">No transcript yet — agent has not emitted text.</div>
+    <EmptyState
+      icon={'\u{1F4AC}'}
+      heading="No transcript yet"
+      description="Agent has not emitted text. Messages will appear once the spawn begins responding."
+      compact
+    />
   {:else}
     <div class="messages-list" aria-label="Spawn transcript">
       {#each messages as m, i (i)}
@@ -144,16 +155,9 @@
     font-family: var(--font-mono);
   }
 
-  .tab-loading,
-  .tab-empty {
+  .tab-loading {
     padding: var(--space-2);
     color: var(--fg-secondary);
-    font-size: var(--text-sm);
-  }
-
-  .tab-error {
-    padding: var(--space-2);
-    color: var(--error);
     font-size: var(--text-sm);
   }
 

@@ -2,6 +2,7 @@
   import type { ToolCallEntry, PaginatedResponse } from './types.ts';
   import { PAGE_LIMIT } from './types.ts';
   import { adminFetch } from '../../stores/labsAuth.svelte.ts';
+  import EmptyState from '../shared/EmptyState.svelte';
 
   interface Props {
     spawnId: string;
@@ -65,11 +66,21 @@
 
 <div class="tab-content">
   {#if error}
-    <div class="tab-error">{error}</div>
+    <EmptyState
+      icon={'⚠'}
+      heading="Tool calls unavailable"
+      description={error}
+      compact
+    />
   {:else if !initialized && loading}
     <div class="tab-loading">Loading tool calls...</div>
   {:else if items.length === 0}
-    <div class="tab-empty">No tool calls recorded.</div>
+    <EmptyState
+      icon={'\u{1F527}'}
+      heading="No tool calls recorded"
+      description="Tool invocations will appear here as the agent runs."
+      compact
+    />
   {:else}
     <div class="items-list">
       {#each items as tc, i (i)}
@@ -110,16 +121,9 @@
     font-family: var(--font-mono);
   }
 
-  .tab-loading,
-  .tab-empty {
+  .tab-loading {
     padding: var(--space-2);
     color: var(--fg-secondary);
-    font-size: var(--text-sm);
-  }
-
-  .tab-error {
-    padding: var(--space-2);
-    color: var(--error);
     font-size: var(--text-sm);
   }
 

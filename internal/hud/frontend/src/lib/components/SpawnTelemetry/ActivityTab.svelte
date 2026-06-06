@@ -1,11 +1,16 @@
 <script lang="ts">
   import { spawnStore, type SpawnActivityEvent } from '../../stores/spawn.svelte.ts';
+  import { eventStore } from '../../stores/events.svelte.ts';
+  import EmptyState from '../shared/EmptyState.svelte';
 
   interface Props {
     spawnId: string;
   }
 
   let { spawnId }: Props = $props();
+
+  let connState = $derived(eventStore.connectionState);
+  let streamOffline = $derived(connState === 'disconnected' || connState === 'circuit-open');
 
   let events = $derived(spawnStore.activityBySpawnId.get(spawnId) ?? []);
   let reversed = $derived([...events].reverse());
@@ -93,8 +98,20 @@
 </script>
 
 <div class="activity-tab">
-  {#if reversed.length === 0}
-    <div class="empty">No activity events yet. Events stream in real-time while the spawn is running.</div>
+  {#if reversed.length === 0 && streamOffline}
+    <EmptyState
+      icon={'⚠'}
+      heading="Activity stream offline"
+      description={'Event stream is ' + connState + '. Activity will resume when reconnected.'}
+      compact
+    />
+  {:else if reversed.length === 0}
+    <EmptyState
+      icon={'◯'}
+      heading="No activity yet"
+      description="Spawn activity will stream here as the agent runs."
+      compact
+    />
   {:else}
     <div class="event-count">{events.length} event{events.length === 1 ? '' : 's'}</div>
     <div class="event-list">
@@ -115,13 +132,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-  }
-
-  .empty {
-    padding: var(--space-3);
-    color: var(--fg-dim);
-    font-size: var(--text-sm);
-    font-family: var(--font-mono);
   }
 
   .event-count {
