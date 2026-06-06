@@ -1,10 +1,14 @@
 # Mills Workflow Runtime — S1c/S6 Sequencing Addendum
 
 **Date**: 2026-06-06
-**Status**: Design resolved; S1c **blocked on infra** (cluster unreachable) and **two code prerequisites** (AlreadyExists backstop, pre-merge canary scoping). See §4 and §3.
+**Status**: Design resolved. S1c gated on the **build chain** (S0 → S6-min) + **two code prerequisites** (AlreadyExists backstop, pre-merge canary scoping) — NOT on the cluster (see Correction below). See §4 and §3.
+
+> ## ⚠️ Correction (2026-06-06, supersedes the "infra-blocked / cluster unreachable" framing below)
+> **The k3s cluster is healthy and reachable.** The "cluster unreachable / hard blocker" claim in §4 B1 and the risks section was a **false conclusion from a sandboxed/cold-route probe environment**, not a real outage: the planning subagent's `kubectl` returned `EHOSTUNREACH` to `192.168.50.200:6443`, but a direct `curl -sk https://192.168.50.200:6443/version` returns a valid Kubernetes API `Status`, and `nc` shows `:6443` OPEN. The operator owner confirmed the cluster is up. The `EHOSTUNREACH` is transient/intermittent routing to the Harvester-VM-hosted API from the automation host (ARP cold-miss / flaky route), **not** a cluster-down condition.
+> **Corrected gating:** S1c is **not** blocked on the cluster. It is gated on (a) building + deploying **S6-min** (the crash subject), (b) the **§5 AlreadyExists backstop** code fix, and (c) having a **stable cluster-access vantage** to drive the kill-test (the live `kubectl`/pod-kill steps must run from a context with a reliable route — an on-LAN host, the in-cluster operator path, or the loom daemon once its route is stable; flaky access from one automation host is an operational nuisance, not a project blocker). All `[live-unverified]` facts below remain to be confirmed with a `kubectl` probe from a stable vantage, but the cluster itself is live.
 **Supersedes**: the open S1c/S6 ordering question in `.loom/133` (plan DAG).
 **Lineage**: `130-brainstorm` → `131-research` → `132-product-spec` → `133-implementation-plan` → this addendum. Produced via an 8-agent research + design + adversarial-verify workflow; all three verdicts `sound-with-caveats`, every must-change folded in.
-**Implementation status (2026-06-06)**: Layers 1/2/2b shipped — S2 (!649) + S3 (!648) merged to `main`; S2b (!651) rebased clean + auto-merge-armed. S1 in-process kill-test PASSED. Next executable: S0 (port spike) + the §5 AlreadyExists backstop once S2b lands. S1c blocked on cluster connectivity (§4 B1).
+**Implementation status (2026-06-06)**: MERGE-LAYERS **complete** — S2 (!649), S3 (!648), S2b (!651) all merged to `main` (S2b rebased clean off main after a stacked-conflict). S1 in-process kill-test PASSED. **Next executable now: S0** (port spike into the main module) **+ the §5 AlreadyExists backstop** — both buildable on clean main without the cluster. S1c remains the deployed gate (cluster is healthy; see Correction).
 
 > **Facts vs. assumptions.** Code/manifest claims below cite `file:line` and were verified in-repo on 2026-06-06. Claims about the *live cluster* (operator image tag, pod liveness, ConfigMap contents) are **assumptions** until a `kubectl` probe runs — the cluster is currently unreachable (§4, B1). Each such claim is marked **[live-unverified]**.
 
