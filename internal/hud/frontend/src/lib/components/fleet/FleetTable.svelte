@@ -254,24 +254,11 @@
     text-overflow: ellipsis;
   }
 
-  /* Every fleet row is as tall as its multi-line agent cell. DataTable's
-     default `vertical-align: middle` then floats the single-line sibling
-     cells (status dot, evidence, namespace, activity, heartbeat, actions)
-     in the vertical center of that tall row, disconnected from the agent
-     they describe. Top-align every cell in this card and give them the
-     same top padding as the agent cell so all columns share one baseline
-     with the agent id's first line.
-
-     NOTE: the whole selector must live inside :global(). These rules target
-     DataTable's internal <tbody>/<td> DOM, which carries no FleetTable scope
-     hash, so the `:global(...) tbody td` split form (with an unscoped tag
-     combinator outside :global) gets dropped as an unused selector by the
-     Svelte compiler. Anchoring on .fleet-table-card keeps the fully-global
-     rule confined to this table. */
-  :global(.fleet-table-card .data-table.stable-layout tbody td) {
-    vertical-align: top;
-    padding-top: var(--space-2);
-  }
+  /* Per-card vertical-align override removed: DataTable engine now defaults
+     to `vertical-align: top`, so every consumer with mixed-height rows is
+     correct out-of-the-box. The agent-cell rule below is still required to
+     override stable-layout's `white-space: nowrap` and let the multi-line
+     agent id stack wrap. */
 
   /* Agent cell intentionally wraps so its stacked children (id, meta-row,
      hierarchy-pills) read naturally — overriding the stable-layout default

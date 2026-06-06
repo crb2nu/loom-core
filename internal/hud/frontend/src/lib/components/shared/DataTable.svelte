@@ -354,6 +354,12 @@
     color: var(--fg-primary);
   }
 
+  .data-table thead th.sortable:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: -2px;
+    color: var(--fg-primary);
+  }
+
   .data-table-header-label {
     display: inline;
   }
@@ -368,7 +374,7 @@
     padding: var(--space-1) var(--space-2);
     border-bottom: 1px solid var(--border);
     color: var(--fg-secondary);
-    vertical-align: middle;
+    vertical-align: top;
   }
 
   .data-table tbody tr:nth-child(even) td {
@@ -416,7 +422,7 @@
   }
 
   .data-table-skeleton-row td {
-    padding: var(--space-2) var(--space-2);
+    padding: var(--space-1) var(--space-2);
   }
 
   /* Expandable row support */
