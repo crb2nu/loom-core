@@ -3,9 +3,14 @@
    * EmptyState — consistent empty state display with icon, heading,
    * description, and optional action button.
    *
+   * `message` is accepted as a defensive alias for `heading` because
+   * several panels were authored against an earlier prop name and would
+   * otherwise silently drop their text.
+   *
    * @type {{
    *   icon?: string,
    *   heading?: string,
+   *   message?: string,
    *   description?: string,
    *   compact?: boolean,
    *   action?: import('svelte').Snippet,
@@ -13,16 +18,22 @@
    */
   let {
     icon = '\u25A1',
-    heading = 'No data yet',
+    heading = '',
+    message = '',
     description = '',
     compact = false,
     action,
   } = $props();
+
+  // `heading` wins if both are passed; otherwise fall back to `message`,
+  // and finally to the original default so we don't regress callers that
+  // pass neither.
+  const _heading = $derived(heading || message || 'No data yet');
 </script>
 
-<div class="empty" class:compact aria-label={heading}>
+<div class="empty" class:compact aria-label={_heading}>
   <div class="empty-icon">{icon}</div>
-  <div class="empty-heading">{heading}</div>
+  <div class="empty-heading">{_heading}</div>
   {#if description}
     <div class="empty-description">{description}</div>
   {/if}

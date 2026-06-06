@@ -194,6 +194,11 @@
   .squad-name-btn:hover .squad-name {
     color: var(--text-link, #8cc8ff);
   }
+  .squad-name-btn:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
   .squad-toggle {
     color: var(--text-muted, #889);
     font-size: 0.8rem;

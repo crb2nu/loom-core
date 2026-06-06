@@ -184,8 +184,21 @@
         {@const debate = millsStore.debateByRun[r.ID]}
         {@const instant = isSuspiciouslyInstant(r)}
         {@const debateBroken = debate && debate.status === 'error'}
-        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-        <tr class="row-summary" class:row-suspicious={instant || debateBroken} onclick={() => toggle(r.ID)}>
+        <tr
+          class="row-summary"
+          class:row-suspicious={instant || debateBroken}
+          role="button"
+          tabindex="0"
+          aria-expanded={isOpen}
+          aria-label={`Toggle run ${r.ID}`}
+          onclick={() => toggle(r.ID)}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggle(r.ID);
+            }
+          }}
+        >
           <td class="expander">
             <span class="caret" class:open={isOpen} aria-hidden="true">▸</span>
           </td>
@@ -334,6 +347,11 @@
 
   .row-summary { cursor: pointer; }
   .row-summary:hover { background: rgba(255, 255, 255, 0.03); }
+  .row-summary:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
   .row-suspicious td:first-child + td + td + td {
     /* No-op: targeting handled via the badge in the outcome cell. Kept
        as a hook for future row-level tinting if we want it. */

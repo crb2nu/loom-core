@@ -273,6 +273,12 @@
     background: color-mix(in srgb, var(--info) 10%, var(--bg-tertiary));
   }
 
+  .filter-chip:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   /* VirtualList owns the scroll viewport; .trace-list just provides a
      bounded flex slot inside .traces-panel so VirtualList can compute its
      own client height. The inter-row gap is baked into TRACE_ROW_HEIGHT

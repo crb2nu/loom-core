@@ -255,6 +255,12 @@
     flex-wrap: wrap;
   }
 
+  .filter-chip:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   .header-controls {
     display: flex;
     align-items: center;
