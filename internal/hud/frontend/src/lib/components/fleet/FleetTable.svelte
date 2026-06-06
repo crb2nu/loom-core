@@ -46,7 +46,7 @@
     { key: 'evidence', label: 'Evidence', sortable: true, width: '90px' },
     { key: 'namespace', label: 'Namespace', sortable: true, width: '160px' },
     { key: 'activity', label: 'Activity', sortable: false, width: '200px' },
-    { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '80px' },
+    { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '108px' },
     { key: 'actions', label: 'Actions', sortable: false, width: '170px' },
   ];
 
@@ -254,11 +254,29 @@
     text-overflow: ellipsis;
   }
 
-  /* Agent cell intentionally wraps and aligns to the top so its stacked
-     children (id, meta-row, hierarchy-pills) read naturally. The selector
-     is qualified with .data-table.stable-layout to beat the default
-     stable-layout rule which forces nowrap + middle-align on every td. */
-  :global(.data-table.stable-layout) tbody td.agent-cell {
+  /* Every fleet row is as tall as its multi-line agent cell. DataTable's
+     default `vertical-align: middle` then floats the single-line sibling
+     cells (status dot, evidence, namespace, activity, heartbeat, actions)
+     in the vertical center of that tall row, disconnected from the agent
+     they describe. Top-align every cell in this card and give them the
+     same top padding as the agent cell so all columns share one baseline
+     with the agent id's first line.
+
+     NOTE: the whole selector must live inside :global(). These rules target
+     DataTable's internal <tbody>/<td> DOM, which carries no FleetTable scope
+     hash, so the `:global(...) tbody td` split form (with an unscoped tag
+     combinator outside :global) gets dropped as an unused selector by the
+     Svelte compiler. Anchoring on .fleet-table-card keeps the fully-global
+     rule confined to this table. */
+  :global(.fleet-table-card .data-table.stable-layout tbody td) {
+    vertical-align: top;
+    padding-top: var(--space-2);
+  }
+
+  /* Agent cell intentionally wraps so its stacked children (id, meta-row,
+     hierarchy-pills) read naturally — overriding the stable-layout default
+     that forces nowrap on every td. */
+  :global(.fleet-table-card .data-table.stable-layout tbody td.agent-cell) {
     position: relative;
     white-space: normal;
     word-break: break-word;
