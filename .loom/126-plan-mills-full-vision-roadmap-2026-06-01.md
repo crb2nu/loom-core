@@ -192,6 +192,25 @@ exercised live**. A2 re-run readiness + the live procedure:
 `.loom/129-iteration-plan-mills-a2-rerun-readiness-2026-06-05.md`. **Status:
 READY FOR LIVE RE-RUN (human-gated; flips prod `stage_substrate`).**
 
+**Update 2026-06-06 — A2 live re-run RAN and FAILED on a NEW blocker (codex
+model access). North-star still 0.** The re-run executed end-to-end
+(`gitops!230` flip → canary `MILLS-CANARY-A2-20260606-011720` on codex →
+`gitops!231` revert; window ≈6 min, system restored clean — no orphaned
+VMs/pods, no junk MR). The four verified fixes all **worked**: codex had the
+CLI + workspace, did not hang on stdin, authenticated (OAuth `chatgpt`), and
+**started a turn**. It then failed at the *first* spawn (`plan_slice`, on
+k8s — `implement` never reached a VM) with **HTTP 400: "The 'gpt-5.3-codex'
+model is not supported when using Codex with a ChatGPT account."** Root
+cause: `buildAgentCommand` runs `codex exec` with **no `--model`**, so codex
+defaults to `gpt-5.3-codex`, which the mounted ChatGPT-account OAuth does not
+grant. Substrate-independent. The `nonempty_diff` gate **escalated cleanly —
+no 0-commit MR** (the `!598` failure mode is now genuinely closed). Next
+fix (small, needs one live re-run): **run the first canary on `gemini`**
+(clean auth — recommended) or **pin a ChatGPT-supported `--model`** on the
+codex exec. Evidence:
+`.loom/local/handoffs/mills-harvester-vm-slice-a2-killtest-2026-06-05.md`.
+**Phases B/C/D remain correctly gated.**
+
 > This kill-test gates the entire rest of the plan. Phases B, C, D do not
 > start until Phase A produces one real autonomous merge.
 
