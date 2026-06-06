@@ -44,11 +44,10 @@ func TestMigrate_v2_TablesExist(t *testing.T) {
 
 func TestMigrate_v2_Idempotent(t *testing.T) {
 	st := newTestStore(t)
-	// Re-running Migrate must be a no-op for both 001 and 002.
+	// Re-running Migrate must be a no-op for all applied migrations.
 	if err := Migrate(context.Background(), st.DB()); err != nil {
 		t.Fatalf("re-migrate v2: %v", err)
 	}
-	// schema_migrations should have exactly two rows: 1 and 2.
 	rows, err := st.DB().QueryContext(context.Background(),
 		`SELECT version FROM schema_migrations ORDER BY version`)
 	if err != nil {
@@ -63,9 +62,17 @@ func TestMigrate_v2_Idempotent(t *testing.T) {
 		}
 		versions = append(versions, v)
 	}
-	// 003 (research_diff column) lands alongside the v2 migrations.
-	if len(versions) != 3 || versions[0] != 1 || versions[1] != 2 || versions[2] != 3 {
-		t.Errorf("schema_migrations versions: got %v want [1 2 3]", versions)
+	// 001 initial, 002 v2 swarm, 003 research_diff column, 004 workflow steps.
+	want := []int{1, 2, 3, 4}
+	if len(versions) != len(want) {
+		t.Errorf("schema_migrations versions: got %v want %v", versions, want)
+	} else {
+		for i, w := range want {
+			if versions[i] != w {
+				t.Errorf("schema_migrations versions: got %v want %v", versions, want)
+				break
+			}
+		}
 	}
 }
 

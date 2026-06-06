@@ -37,6 +37,11 @@ type Store struct {
 	CrossRepo       *CrossRepoDAO
 	Debate          *DebateDAO
 	PolicyProposals *PolicyProposalDAO
+
+	// Layer-2 durable workflow step/event journal (migration 004). The
+	// imperative runtime that writes it ships in a later slice; legacy 'dag'
+	// runs never touch these tables.
+	Workflow *WorkflowDAO
 }
 
 // Options controls Store creation.
@@ -100,6 +105,9 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	s.CrossRepo = &CrossRepoDAO{db: db}
 	s.Debate = &DebateDAO{db: db}
 	s.PolicyProposals = &PolicyProposalDAO{db: db}
+
+	// Layer-2 durable workflow journal.
+	s.Workflow = &WorkflowDAO{db: db}
 	return s, nil
 }
 

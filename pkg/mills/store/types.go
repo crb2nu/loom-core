@@ -458,3 +458,138 @@ type PolicyProposal struct {
 	RevertDeadline *time.Time
 	CreatedAt      time.Time
 }
+
+// ----- Layer-2 durable workflow step/event journal -------------------------
+//
+// These types back migration 004 (workflow_runs + workflow_steps). They are
+// the stable persistence layer for the Mills durable workflow engine; the
+// imperative runtime that writes them ships in a later slice.
+//
+// DUAL SOURCE-OF-TRUTH: legacy `dag` runs do NOT write workflow_steps; only
+// `imperative` runs do. workflow_steps is the source of truth for imperative
+// resume — the runtime replays the append-only step log. The generic Event
+// log (events table) stays advisory (audit/debug), never used for resume.
+
+// WorkflowEngine is the IMMUTABLE discriminator for how a workflow run
+// executes. It is fixed at creation and must never change for a given run id.
+type WorkflowEngine string
+
+const (
+	// WorkflowEngineDAG is the legacy pipeline DAG. Runs with this engine do
+	// NOT write workflow_steps; they exist for symmetry / cross-reference.
+	WorkflowEngineDAG WorkflowEngine = "dag"
+	// WorkflowEngineImperative is the durable imperative runtime. Only these
+	// runs append to workflow_steps.
+	WorkflowEngineImperative WorkflowEngine = "imperative"
+)
+
+// WorkflowRunState is the lifecycle state of a workflow run.
+type WorkflowRunState string
+
+const (
+	WorkflowRunRunning     WorkflowRunState = "running"
+	WorkflowRunPaused      WorkflowRunState = "paused"
+	WorkflowRunDone        WorkflowRunState = "done"
+	WorkflowRunEscalated   WorkflowRunState = "escalated"
+	WorkflowRunError       WorkflowRunState = "error"
+	WorkflowRunQuarantined WorkflowRunState = "quarantined"
+)
+
+// WorkflowStepStatus is the lifecycle status of one journaled step.
+//
+// Record-before-result invariant: a step is appended Pending BEFORE its
+// effect, then updated to a terminal status (Success/Error/GateFail/Skipped)
+// once the effect resolves.
+type WorkflowStepStatus string
+
+const (
+	WorkflowStepPending  WorkflowStepStatus = "pending"
+	WorkflowStepSuccess  WorkflowStepStatus = "success"
+	WorkflowStepError    WorkflowStepStatus = "error"
+	WorkflowStepGateFail WorkflowStepStatus = "gate_fail"
+	WorkflowStepSkipped  WorkflowStepStatus = "skipped"
+)
+
+// IsTerminal reports whether s is a final (non-pending) step status.
+func (s WorkflowStepStatus) IsTerminal() bool {
+	return s != "" && s != WorkflowStepPending
+}
+
+// WorkflowCostSource records the provenance of a step's cost figure.
+type WorkflowCostSource string
+
+const (
+	WorkflowCostReal        WorkflowCostSource = "real"
+	WorkflowCostEstimated   WorkflowCostSource = "estimated"
+	WorkflowCostUnavailable WorkflowCostSource = "unavailable"
+)
+
+// WorkflowEventType enumerates the kinds of effect/event a journaled step
+// records. The store treats these as opaque strings; the constants exist so
+// the runtime and tests share a single source of truth.
+type WorkflowEventType string
+
+const (
+	WorkflowEventSpawnRequested               WorkflowEventType = "spawn_requested"
+	WorkflowEventSpawnResult                  WorkflowEventType = "spawn_result"
+	WorkflowEventSpawnResumed                 WorkflowEventType = "spawn_resumed"
+	WorkflowEventGateEval                     WorkflowEventType = "gate_eval"
+	WorkflowEventBudgetReserved               WorkflowEventType = "budget_reserved"
+	WorkflowEventBudgetDebit                  WorkflowEventType = "budget_debit"
+	WorkflowEventToolCall                     WorkflowEventType = "tool_call"
+	WorkflowEventCtxNow                       WorkflowEventType = "ctx_now"
+	WorkflowEventCtxUUID                      WorkflowEventType = "ctx_uuid"
+	WorkflowEventParallelBranch               WorkflowEventType = "parallel_branch"
+	WorkflowEventParallelJoin                 WorkflowEventType = "parallel_join"
+	WorkflowEventLoopIter                     WorkflowEventType = "loop_iter"
+	WorkflowEventStepCacheHit                 WorkflowEventType = "step_cache_hit"
+	WorkflowEventStepBudgetExhausted          WorkflowEventType = "step_budget_exhausted"
+	WorkflowEventStepPaused                   WorkflowEventType = "step_paused"
+	WorkflowEventStepResumed                  WorkflowEventType = "step_resumed"
+	WorkflowEventStepNondeterminismQuarantine WorkflowEventType = "step_nondeterminism_quarantine"
+	WorkflowEventWorkflowDone                 WorkflowEventType = "workflow_done"
+)
+
+// WorkflowRun is one execution of a durable workflow. Engine is fixed at
+// creation (see WorkflowEngine). WorkflowParams carries an opaque JSON params
+// blob; the store never parses it.
+type WorkflowRun struct {
+	ID                 string
+	BacklogID          string
+	Engine             WorkflowEngine
+	Template           string
+	TemplateVersion    string
+	InterpreterVersion string
+	WorkflowParams     string // opaque JSON string ("" => NULL)
+	State              WorkflowRunState
+	PausedAt           *time.Time
+	ResumedAt          *time.Time
+	StartedAt          *time.Time
+	EndedAt            *time.Time
+	CostUSD            float64
+	ParentSessionID    string
+}
+
+// WorkflowStep is one append-only journal entry within a workflow run.
+//
+// StepKey is an opaque structured key string minted by the runtime; the store
+// treats it as a bare string and UNIQUE(run_id, step_key) gives idempotent
+// append + replay. CallHash fingerprints the recorded call so a mismatch on an
+// existing step_key (nondeterminism) is detectable by the caller. ResultBlob
+// is an opaque JSON result set on completion ("" => NULL).
+type WorkflowStep struct {
+	ID             int64
+	RunID          string
+	StepKey        string
+	EventType      WorkflowEventType
+	CallHash       string
+	IdempotencyKey string // "" => NULL
+	Status         WorkflowStepStatus
+	SpawnID        string // "" => NULL
+	StartedAt      *time.Time
+	EndedAt        *time.Time
+	ResultBlob     string // opaque JSON ("" => NULL)
+	CostUSD        float64
+	CostSource     WorkflowCostSource // "" => NULL
+	EffectCount    int
+}
