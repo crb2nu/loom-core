@@ -155,6 +155,43 @@ moot when the agent makes no changes. Evidence + next steps:
 spawn-execution path (reopen `.loom/119` against the VM path), not the
 substrate plumbing.
 
+**Update 2026-06-05 — A2 re-run is now code-ready (live run not yet done).**
+All three agent-execution blockers from the 06-02 + 06-04 attempts have
+landed on `main` with regression tests, each peeling back one layer of the
+codex-on-VM execution chain:
+1. **Workspace + CLI absent on the stock VM** → `b4a0485d`
+   (`fix(mills): provision workspace + agent CLI on harvester-vm at Start`).
+   A direct 06-04 canary exited **127 in 176ms** with
+   `cd: /workspace/...: No such file or directory` + `codex: command not
+   found`; `HarvesterVMBackend.Start` now git-clones the repo into the
+   WorkDir and runs a guarded, pinned agent-CLI install over SSH before the
+   agent exec. Tests: `harvester_vm_provision_test.go`, `spawn_cli_install_test.go`.
+2. **codex stdin hang** → `75a89996`
+   (`fix(spawn): codex exec reads from /dev/null to avoid stdin hang`).
+   After (1), the 06-04 re-run `spawn-ced0192f6540` got *further*: codex
+   had the CLI + workspace, **authenticated, and emitted
+   `thread.started`/`turn.started`** — then printed `Reading additional
+   input from stdin...` on stderr and **exit 1** (codex 0.120.0+ inspects
+   stdin even with a prompt arg; the harvester-vm SSH session leaves
+   `session.Stdin` nil). `buildAgentCommand` now appends `< /dev/null`; the
+   redirect binds to the final `codex exec` simple command through the VM's
+   login shell (verified: harvester-vm takes the buffered `be.Exec` path →
+   `execOverSSH` → `session.Run`). Test: `TestBuildAgentCommand`.
+3. **Telemetry-persist blind spot** (`session_id: is required`) → `5fc4dd75`
+   (`fix(hud): persist spawn telemetry under the spawn's session_id`). Spawn
+   turn detail is now captured under a resolvable session, so the next
+   canary debug is not blind. Test: `spawn_telemetry_persist_test.go`.
+
+Plus the defensive backstop `4bb853a7` (`nonempty_diff` gate, `.loom/128`):
+if codex *still* produces no diff, the run **escalates instead of opening a
+0-commit MR** — the `!598`/`!518`/`!520`/`!522` false-positive can no longer
+recur. **Residual risk (live-only):** whether codex, now able to run a full
+turn, produces a *non-empty* diff for the canary task — the genuine A2
+question, unprovable in code. The `< /dev/null` fix has **never been
+exercised live**. A2 re-run readiness + the live procedure:
+`.loom/129-iteration-plan-mills-a2-rerun-readiness-2026-06-05.md`. **Status:
+READY FOR LIVE RE-RUN (human-gated; flips prod `stage_substrate`).**
+
 > This kill-test gates the entire rest of the plan. Phases B, C, D do not
 > start until Phase A produces one real autonomous merge.
 
