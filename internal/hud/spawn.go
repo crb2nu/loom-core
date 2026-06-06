@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -576,6 +577,62 @@ func buildSpawnPodEnv(req SpawnRequest, agentID, spawnID string) map[string]stri
 	return env
 }
 
+// startSpawnPod creates the runtime pod via the substrate backend and applies
+// the exactly-once-across-crash re-attach backstop on a k8s AlreadyExists.
+//
+// THE GAP it closes (.loom/134 §5): keyed spawns derive a deterministic pod
+// name ("spawn-"+spawnID where spawnID == spawn.DeriveSpawnID(key)) and
+// re-attach via the controller's IN-MEMORY map (spawnWithKey). But across an
+// operator/HUD CRASH the in-memory map is empty, so a resume that re-derives
+// the same key re-creates the SAME pod name. On the live k8s create path that
+// surfaces as a real apierrors.AlreadyExists. Without this backstop the
+// orchestrator failSpawns on it, so exactly-once-across-crash does NOT hold:
+// the resume reports failure even though the pod the prior incarnation created
+// is the correct, already-running handle.
+//
+// The backstop: when Start returns AlreadyExists AND the pod name is provably
+// the deterministic name derived from a non-empty idempotency key
+// (spawn.IsDerivedSpawnName), adopt the existing pod as a RE-ATTACH — return a
+// success StartResult pointing at opts.Name (the deterministic, known pod
+// name) and let the rest of runSpawn attach to that pod by name. The
+// downstream steps (config inject, exec) are keyed off the pod name, which is
+// stable across the crash, so adoption is safe.
+//
+// LEGACY PATH UNCHANGED: for a non-keyed spawn (empty IdempotencyKey, random
+// NewSpawnID name) IsDerivedSpawnName returns false, so ANY Start error —
+// including the near-impossible AlreadyExists on a random name — propagates
+// verbatim and runSpawn failSpawns exactly as before. The backstop never
+// changes behavior on the legacy/random-name path.
+func (o *SpawnOrchestrator) startSpawnPod(
+	ctx context.Context,
+	be backend.Backend,
+	req SpawnRequest,
+	spawnID string,
+	opts backend.StartOpts,
+) (*backend.StartResult, error) {
+	res, err := be.Start(ctx, opts)
+	if err == nil {
+		return res, nil
+	}
+
+	// Only treat AlreadyExists as a re-attach when the colliding name is the
+	// deterministic name a keyed spawn derives. The empty-key (legacy) path
+	// fails IsDerivedSpawnName, so its error semantics are preserved exactly.
+	if apierrors.IsAlreadyExists(err) && spawn.IsDerivedSpawnName(opts.Name, req.IdempotencyKey) {
+		o.logger.Info("k8s AlreadyExists on derived spawn name — re-attaching to existing pod (exactly-once-across-crash backstop)",
+			"spawn_id", spawnID,
+			"pod", opts.Name,
+		)
+		// Adopt the existing pod. Its name is deterministic and equals
+		// opts.Name, so the StartResult is reconstructable without another
+		// API round-trip; downstream steps key off this name and Reconcile
+		// will resolve the live phase from the cluster on its next tick.
+		return &backend.StartResult{ContainerID: opts.Name}, nil
+	}
+
+	return nil, err
+}
+
 // runSpawn executes the full spawn lifecycle in a background goroutine.
 func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	ctx, span := o.tracer.Start(context.Background(), "agent.spawn",
@@ -658,7 +715,7 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	o.logger.Info("build completed, starting pod", "spawn_id", spawnID, "image", buildResult.ImageTag)
 	_, podSpan := o.tracer.Start(ctx, "agent.spawn.pod_create")
 	env := buildSpawnPodEnv(req, state.AgentID, spawnID)
-	startResult, err := be.Start(ctx, backend.StartOpts{
+	startResult, err := o.startSpawnPod(ctx, be, req, spawnID, backend.StartOpts{
 		Name:              "spawn-" + spawnID,
 		ImageTag:          buildResult.ImageTag,
 		WorkDir:           podProjectDir,
