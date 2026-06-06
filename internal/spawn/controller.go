@@ -591,3 +591,23 @@ func DeriveSpawnID(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return "spawn-" + hex.EncodeToString(sum[:])[:derivedSpawnIDHexLen]
 }
+
+// IsDerivedSpawnName reports whether podName is the deterministic pod name a
+// keyed spawn produces for the given idempotency key — i.e. it equals
+// "spawn-" + DeriveSpawnID(key). The pod the orchestrator creates is named
+// "spawn-"+spawnID (internal/hud/spawn.go), and for a keyed spawn
+// spawnID == DeriveSpawnID(key), so the derived pod name is
+// "spawn-spawn-"+hex.
+//
+// This is the predicate the live-create AlreadyExists backstop uses to decide
+// whether a k8s AlreadyExists is safe to treat as a RE-ATTACH: it only adopts
+// the existing pod when the colliding name is provably the deterministic name
+// derived from a non-empty idempotency key. An empty key (the legacy /
+// random-name path) always returns false, so the legacy AlreadyExists
+// semantics are preserved untouched. See .loom/134 §5.
+func IsDerivedSpawnName(podName, key string) bool {
+	if key == "" || podName == "" {
+		return false
+	}
+	return podName == "spawn-"+DeriveSpawnID(key)
+}

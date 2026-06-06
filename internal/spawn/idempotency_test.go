@@ -123,6 +123,38 @@ func TestSpawnWithKeyIsDeterministicAndIdempotent(t *testing.T) {
 	}
 }
 
+// TestIsDerivedSpawnName covers the predicate the live-create AlreadyExists
+// backstop uses (.loom/134 §5): a pod name is a re-attach candidate only when
+// it equals "spawn-"+DeriveSpawnID(key) for a non-empty key. The empty-key
+// (legacy/random-name) path must always be false so legacy AlreadyExists
+// semantics stay untouched.
+func TestIsDerivedSpawnName(t *testing.T) {
+	const key = "mills/run-abc/stage-plan"
+	derivedPod := "spawn-" + DeriveSpawnID(key)
+
+	cases := []struct {
+		name    string
+		podName string
+		key     string
+		want    bool
+	}{
+		{"derived name with key matches", derivedPod, key, true},
+		{"empty key never matches (legacy path)", derivedPod, "", false},
+		{"empty pod name never matches", "", key, false},
+		{"random name with key does not match", "spawn-" + NewSpawnID(), key, false},
+		{"wrong key does not match", derivedPod, key + "-x", false},
+		{"both empty", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsDerivedSpawnName(tc.podName, tc.key); got != tc.want {
+				t.Errorf("IsDerivedSpawnName(%q, %q) = %v, want %v",
+					tc.podName, tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSpawnWithKeyRecordBeforeDispatch simulates a crash AFTER the
 // controller records the spawn but BEFORE the orchestrator dispatches the
 // pod-create. The persisted state is recovered into a fresh controller (the
