@@ -153,11 +153,11 @@ func antigravityEventEmitHook(loomCmd, bootstrap, hook, log string, response ...
 	if len(response) > 0 && strings.TrimSpace(response[0]) != "" {
 		hookResponse = strings.TrimSpace(response[0])
 	}
-	payload, _ := json.Marshal(hookResponse + "\n")
+	payload, _ := json.Marshal(hookResponse)
 	return map[string]any{
 		"type": "command",
 		"command": fmt.Sprintf(
-			`INPUT=$(cat); %s; printf '%%s' "$INPUT" | %s agent event-emit --hook %s --platform antigravity --agent-id "$AGENT_ID" --quiet >/dev/null %s || true; printf '%%s' %s`,
+			`INPUT=$(cat); %s; printf '%%s' "$INPUT" | %s agent event-emit --hook %s --platform antigravity --agent-id "$AGENT_ID" --quiet >/dev/null %s || true; printf '%%s\n' %s`,
 			bootstrap, loomCmd, hook, log, string(payload),
 		),
 	}

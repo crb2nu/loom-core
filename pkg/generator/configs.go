@@ -49,6 +49,7 @@ const (
 var (
 	hubWrapperLookPath      = exec.LookPath
 	hubWrapperCommandRunner = exec.CommandContext
+	hubWrapperProbe         = probeHubWrapper
 )
 
 // GenerateConfigs generates MCP client configurations.
