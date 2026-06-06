@@ -66,6 +66,24 @@
     }
   }
 
+  // ariaSortFor returns the WAI-ARIA `aria-sort` token for a header so
+  // screen-reader users can tell which column is sorted and in which
+  // direction. Inactive columns return 'none' rather than null so the
+  // attribute is still emitted (helps test assertions).
+  function ariaSortFor(key) {
+    if (sortKey !== key) return 'none';
+    return sortDir === 'asc' ? 'ascending' : 'descending';
+  }
+
+  // onSortKeydown lets keyboard users invoke a sortable header with
+  // Enter or Space, matching the established BacklogPanel pattern.
+  function onSortKeydown(ev, key) {
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      handleSort(key);
+    }
+  }
+
   function dispatchTo(agentId) {
     presenceActionsStore.onOpenDispatch(agentId);
   }
@@ -131,20 +149,48 @@
         <table class="dispatch-table">
           <thead>
             <tr>
-              <th class="sortable" onclick={() => handleSort('agent_id')}>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('agent_id')}
+                onclick={() => handleSort('agent_id')}
+                onkeydown={(ev) => onSortKeydown(ev, 'agent_id')}
+              >
                 Agent {sortKey === 'agent_id' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
               </th>
               <th>Status</th>
               <th>Namespace</th>
-              <th class="sortable" onclick={() => handleSort('tasks')}>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('tasks')}
+                onclick={() => handleSort('tasks')}
+                onkeydown={(ev) => onSortKeydown(ev, 'tasks')}
+              >
                 Tasks {sortKey === 'tasks' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
               </th>
-              <th class="sortable" onclick={() => handleSort('blockers')}>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('blockers')}
+                onclick={() => handleSort('blockers')}
+                onkeydown={(ev) => onSortKeydown(ev, 'blockers')}
+              >
                 Blockers {sortKey === 'blockers' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
               </th>
               <th>Claims</th>
               <th>Merge</th>
-              <th class="sortable" onclick={() => handleSort('attention')}>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('attention')}
+                onclick={() => handleSort('attention')}
+                onkeydown={(ev) => onSortKeydown(ev, 'attention')}
+              >
                 Attention {sortKey === 'attention' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
               </th>
               <th>Action</th>
@@ -420,6 +466,12 @@
 
   .dispatch-table th.sortable:hover {
     color: var(--fg-primary);
+  }
+
+  .dispatch-table th.sortable:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .dispatch-table td {

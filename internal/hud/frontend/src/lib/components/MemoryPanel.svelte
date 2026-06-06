@@ -859,6 +859,12 @@
     color: var(--fg-primary);
   }
 
+  .tier-tab:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   .active-tab {
     background: var(--bg-secondary) !important;
     color: var(--tab-color, var(--fg-primary)) !important;

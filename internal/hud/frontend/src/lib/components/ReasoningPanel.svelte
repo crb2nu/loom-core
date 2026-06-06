@@ -258,6 +258,12 @@
     background: var(--bg-elevated);
   }
 
+  .chain-header:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   .chain-chevron {
     font-size: var(--text-xs);
     color: var(--fg-muted);

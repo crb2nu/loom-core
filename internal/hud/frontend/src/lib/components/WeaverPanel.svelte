@@ -267,7 +267,7 @@
     <section class="section">
       <h3>Domains</h3>
       {#if domainList.length === 0}
-        <EmptyState message="No domains configured" />
+        <EmptyState heading="No domains configured" />
       {:else}
         <div class="domains-list">
           {#each domainList as domain}
@@ -295,7 +295,7 @@
     <section class="section">
       <h3>Recent Queries</h3>
       {#if entries.length === 0}
-        <EmptyState message="No queries recorded yet" />
+        <EmptyState heading="No queries recorded yet" />
       {:else}
         <div class="history-list">
           {#each entries as entry}
@@ -516,6 +516,12 @@
 
   .domain-header:hover {
     background: var(--bg-elevated);
+  }
+
+  .domain-header:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .domain-expand {

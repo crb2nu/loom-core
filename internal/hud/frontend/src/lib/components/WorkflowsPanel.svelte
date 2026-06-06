@@ -399,6 +399,12 @@
     background: var(--bg-tertiary);
   }
 
+  .wf-item:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   .wf-selected {
     background: var(--info-dim) !important;
     border-left: 3px solid var(--info);
