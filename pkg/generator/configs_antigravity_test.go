@@ -51,6 +51,17 @@ func TestAntigravityHooksConfigShapeAndAutoAllow(t *testing.T) {
 		t.Fatalf("policy hook should read Antigravity CommandLine payloads: %s", policy)
 	}
 
+	eventEmit := findHookCommand(preToolUse, "event-emit --hook pre-tool-use")
+	if eventEmit == "" {
+		t.Fatalf("expected PreToolUse telemetry hook: %#v", preToolUse)
+	}
+	if !strings.Contains(eventEmit, "decision") || !strings.Contains(eventEmit, "allow") {
+		t.Fatalf("PreToolUse telemetry hook must explicitly allow after emitting telemetry: %s", eventEmit)
+	}
+	if strings.Contains(eventEmit, "printf '{}") {
+		t.Fatalf("PreToolUse telemetry hook must not emit an empty decision object: %s", eventEmit)
+	}
+
 	for _, event := range []string{"PreInvocation", "PreToolUse", "PostToolUse", "Stop"} {
 		for _, cmd := range allHookCommands(mustHookBlocks(t, loom, event)) {
 			if strings.Contains(cmd, "systemMessage") {

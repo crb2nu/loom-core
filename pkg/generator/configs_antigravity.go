@@ -103,7 +103,7 @@ func antigravityPreToolUseBlocks(reg *registry.Registry, hp HookProfile, loomCmd
 	}
 	blocks = append(blocks, map[string]any{
 		"hooks": []map[string]any{
-			antigravityEventEmitHook(loomCmd, bootstrap, "pre-tool-use", log),
+			antigravityEventEmitHook(loomCmd, bootstrap, "pre-tool-use", log, `{"decision":"allow"}`),
 		},
 	})
 	return blocks
@@ -148,12 +148,17 @@ func antigravityPolicyGuardrailHook(policy *Policy) map[string]any {
 	}
 }
 
-func antigravityEventEmitHook(loomCmd, bootstrap, hook, log string) map[string]any {
+func antigravityEventEmitHook(loomCmd, bootstrap, hook, log string, response ...string) map[string]any {
+	hookResponse := "{}"
+	if len(response) > 0 && strings.TrimSpace(response[0]) != "" {
+		hookResponse = strings.TrimSpace(response[0])
+	}
+	payload, _ := json.Marshal(hookResponse + "\n")
 	return map[string]any{
 		"type": "command",
 		"command": fmt.Sprintf(
-			`INPUT=$(cat); %s; printf '%%s' "$INPUT" | %s agent event-emit --hook %s --platform antigravity --agent-id "$AGENT_ID" --quiet >/dev/null %s || true; printf '{}\n'`,
-			bootstrap, loomCmd, hook, log,
+			`INPUT=$(cat); %s; printf '%%s' "$INPUT" | %s agent event-emit --hook %s --platform antigravity --agent-id "$AGENT_ID" --quiet >/dev/null %s || true; printf '%%s' %s`,
+			bootstrap, loomCmd, hook, log, string(payload),
 		),
 	}
 }
