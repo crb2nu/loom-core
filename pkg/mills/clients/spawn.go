@@ -152,6 +152,13 @@ type hudSpawnRequestBody struct {
 	// mcp-devbox routes devbox_* calls onto the named substrate.
 	// Slice 2c — see .loom/121-iteration-plan-…-slice2c-2026-05-27.md.
 	Substrate string `json:"substrate,omitempty"`
+	// IdempotencyKey is an OPT-IN deterministic replay key (Slice 2b).
+	// When non-empty, the HUD spawn controller derives a stable spawn id
+	// from it and dedupes a duplicate create into an AlreadyExists
+	// re-attach (no second pod). Omitted (omitempty) when empty, so legacy
+	// requests are byte-identical on the wire to pre-2b behavior and the
+	// server mints the id via crypto/rand.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // hudSpawnAcceptResponse is what POST /spawn returns on success.
@@ -223,6 +230,7 @@ func (c *HUDSpawnClient) Run(ctx context.Context, req pipeline.SpawnRequest) (pi
 		ParentSessionID: req.ParentSessionID,
 		Metadata:        buildSpawnMetadata(req),
 		Substrate:       req.Substrate,
+		IdempotencyKey:  req.IdempotencyKey,
 	}
 
 	spawnID, err := c.startSpawn(ctx, body)

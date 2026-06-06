@@ -22,10 +22,31 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 )
+
+// derivedSpawnIDHexLen is the hex-char width of a derived spawn id body.
+// It MUST stay in sync with internal/spawn.derivedSpawnIDHexLen so the id
+// the worker layer derives for a key matches the one the spawn controller
+// registers under. A parity test (idempotency_test.go) pins both to the
+// same vectors.
+const derivedSpawnIDHexLen = 12
+
+// DeriveSpawnID returns the deterministic spawn id for an idempotency key.
+// It MUST produce the byte-identical result of internal/spawn.deriveSpawnID
+// so that a key sent on a create (idempotency_key) and the same key used to
+// Resume map to the same spawn id. The worker package cannot import
+// internal/spawn (that package drags in k8s client-go and internal/hud
+// deps the harness-neutral operator should not carry), so the algorithm is
+// mirrored here and locked by a shared-vector parity test.
+func DeriveSpawnID(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return "spawn-" + hex.EncodeToString(sum[:])[:derivedSpawnIDHexLen]
+}
 
 // Sentinel errors returned by the spawn adapter.
 var (
@@ -55,9 +76,12 @@ const (
 //
 //   - AgentType is REQUIRED and validated (claude-code|codex|gemini). It
 //     replaces the fragile "infer the harness from the Model string" path.
-//   - IdempotencyKey is plumbing-only for now (may be empty). A future
-//     durable runtime uses it to dedupe/resume a worker invocation via
-//     WorkerResumer; nothing consumes it yet.
+//   - IdempotencyKey is an OPTIONAL replay key (may be empty). As of Slice
+//     2b it maps through pipeline.SpawnRequest to the HUD spawn client's
+//     idempotency_key, so a non-empty key makes a duplicate spawn create a
+//     deterministic AlreadyExists re-attach. A durable runtime also uses it
+//     to resume a worker invocation via WorkerResumer. Empty preserves
+//     legacy server-minted-id behavior.
 type WorkerRequest struct {
 	// ----- Fields reused verbatim from pipeline.SpawnRequest -----
 	Prompt          string
@@ -84,8 +108,12 @@ type WorkerRequest struct {
 
 	// IdempotencyKey is an optional caller-supplied replay key. Empty is
 	// allowed (the common case today). A durable runtime sets it so a
-	// re-driven step can be deduped/resumed; no current code path reads
-	// it, so it is pure plumbing.
+	// re-driven step is deduped/resumed. As of Slice 2b it maps through
+	// pipeline.SpawnRequest -> the HUD spawn client's idempotency_key: a
+	// non-empty key makes the spawn controller derive a deterministic id
+	// and turn a duplicate create into an AlreadyExists re-attach (no
+	// second pod). WorkerResumer.Resume also keys off it. Empty keeps the
+	// legacy server-minted-id path byte-identical.
 	IdempotencyKey string
 }
 

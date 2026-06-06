@@ -55,9 +55,14 @@ type resumableSpawnAdapter struct {
 	*spawnClientAdapter
 }
 
-// Resume satisfies WorkerResumer. The idempotency key is treated as the
-// spawn id to re-attach to — the current HUD spawn client resumes by
-// spawn id, and IdempotencyKey is the Layer-1 handle for that identity.
+// Resume satisfies WorkerResumer. Slice 2b: the argument is an
+// idempotency key, which the spawn controller turns into a deterministic
+// spawn id via the same derivation. We map key -> derived spawn id here
+// (DeriveSpawnID) so the underlying pipeline.SpawnResumeClient.Resume —
+// which re-attaches by spawn id — lands on the exact spawn the matching
+// idempotent create produced. The mapping is a no-op for an empty key
+// (the resumer then errors on the empty id), preserving the prior
+// contract where Resume was only meaningful with a real handle.
 func (a *resumableSpawnAdapter) Resume(ctx context.Context, idempotencyKey string) (WorkerResult, error) {
 	if a == nil || a.client == nil {
 		return WorkerResult{}, errNilClient
@@ -66,15 +71,22 @@ func (a *resumableSpawnAdapter) Resume(ctx context.Context, idempotencyKey strin
 	if !ok {
 		return WorkerResult{}, errNotResumable
 	}
-	resp, err := resumer.Resume(ctx, idempotencyKey)
+	spawnID := idempotencyKey
+	if idempotencyKey != "" {
+		spawnID = DeriveSpawnID(idempotencyKey)
+	}
+	resp, err := resumer.Resume(ctx, spawnID)
 	return spawnResponseToWorkerResult(resp), err
 }
 
 // workerRequestToSpawnRequest maps every reused field one-for-one. The
-// Layer-1-only fields (AgentType, IdempotencyKey) have no SpawnRequest
-// home: AgentType is carried via Model so the existing
-// agentTypeOrDefault path resolves it to the same harness, and
-// IdempotencyKey is plumbing-only with no current consumer.
+// AgentType field has no SpawnRequest home and is carried via Model so the
+// existing agentTypeOrDefault path resolves it to the same harness.
+//
+// IdempotencyKey now has a SpawnRequest home: it is mapped through
+// one-for-one (Slice 2b) so a durable runtime's replay key reaches the HUD
+// spawn client, which forwards it as idempotency_key. Empty stays empty,
+// preserving legacy behavior for every current caller.
 func workerRequestToSpawnRequest(req WorkerRequest) pipeline.SpawnRequest {
 	model := req.Model
 	if model == "" {
@@ -102,6 +114,7 @@ func workerRequestToSpawnRequest(req WorkerRequest) pipeline.SpawnRequest {
 		BaseBranch:      req.BaseBranch,
 		Namespace:       req.Namespace,
 		Substrate:       req.Substrate,
+		IdempotencyKey:  req.IdempotencyKey,
 	}
 }
 
@@ -139,8 +152,8 @@ func (req WorkerRequest) ToSpawnRequest() pipeline.SpawnRequest {
 // pipeline.SpawnRequest. The agent type is resolved from the SpawnRequest
 // Model via the same normalization the spawn client uses, so a
 // WorkerRequest -> SpawnRequest -> WorkerRequest round-trip preserves
-// every reused field. IdempotencyKey has no SpawnRequest home and is left
-// empty (plumbing-only).
+// every reused field — including IdempotencyKey, which now maps through
+// SpawnRequest (Slice 2b).
 func FromSpawnRequest(sr pipeline.SpawnRequest) WorkerRequest {
 	agentType := sr.Model
 	if canon, err := ValidateAgentType(sr.Model); err == nil {
@@ -162,5 +175,6 @@ func FromSpawnRequest(sr pipeline.SpawnRequest) WorkerRequest {
 		Namespace:       sr.Namespace,
 		Substrate:       sr.Substrate,
 		AgentType:       agentType,
+		IdempotencyKey:  sr.IdempotencyKey,
 	}
 }
