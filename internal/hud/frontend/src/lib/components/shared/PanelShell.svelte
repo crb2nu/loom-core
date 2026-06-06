@@ -8,14 +8,18 @@
    *   icon?: string,
    *   count?: number | null,
    *   loading?: boolean,
+   *   error?: string | null,
    *   empty?: boolean,
    *   emptyIcon?: string,
    *   emptyMessage?: string,
    *   emptyHint?: string,
+   *   errorIcon?: string,
+   *   errorHeading?: string,
    *   header?: import('svelte').Snippet,
    *   toolbar?: import('svelte').Snippet,
    *   actions?: import('svelte').Snippet,
    *   emptyAction?: import('svelte').Snippet,
+   *   errorAction?: import('svelte').Snippet,
    *   children: import('svelte').Snippet,
    * }}
    */
@@ -24,14 +28,18 @@
     icon = '',
     count = null,
     loading = false,
+    error = null,
     empty = false,
     emptyIcon = '\u25A1',
     emptyMessage = 'No data yet',
     emptyHint = '',
+    errorIcon = '\u26A0',
+    errorHeading = 'Refresh failed',
     header,
     toolbar,
     actions,
     emptyAction,
+    errorAction,
     children,
   } = $props();
 </script>
@@ -78,7 +86,21 @@
 
   <!-- Content area -->
   <div class="panel-shell-content">
-    {#if empty && !loading}
+    {#if error && !loading}
+      <!-- Error precedes empty: a failed fetch is not the same signal as
+           "no rows". Mirrors the .empty-state shape so empty/error feel
+           like one family with two states. -->
+      <div class="error-state" role="alert" aria-live="polite">
+        <div class="error-state-icon">{errorIcon}</div>
+        <div class="error-state-message">{errorHeading}</div>
+        <div class="error-state-hint">{error}</div>
+        {#if errorAction}
+          <div class="error-state-action">
+            {@render errorAction()}
+          </div>
+        {/if}
+      </div>
+    {:else if empty && !loading}
       <div class="empty-state">
         <div class="empty-state-icon">{emptyIcon}</div>
         <div class="empty-state-message">{emptyMessage}</div>
@@ -223,6 +245,60 @@
   }
 
   .empty-state-action {
+    margin-top: var(--space-2);
+  }
+
+  /* Error state mirrors .empty-state — same paddings, same icon-on-disc
+     shape — so the panel feels like one family with two states. The red
+     border + tinted background (color-mix on var(--error)) lets the
+     operator differentiate at-a-glance from "no rows" without re-reading
+     the message. */
+  .error-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: clamp(40px, 12vh, 96px) var(--space-4);
+    color: var(--fg-primary);
+    text-align: center;
+    gap: var(--space-3);
+    min-height: 260px;
+    border: 1px solid var(--error);
+    border-radius: var(--radius-xl);
+    background:
+      radial-gradient(circle at top, color-mix(in srgb, var(--error) 14%, transparent), transparent 45%),
+      color-mix(in srgb, var(--error) 8%, var(--bg-secondary));
+  }
+
+  .error-state-icon {
+    font-size: 32px;
+    width: 56px;
+    height: 56px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--error) 18%, transparent);
+    border: 1px solid var(--error);
+    color: var(--error);
+    font-weight: 700;
+  }
+
+  .error-state-message {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    color: var(--fg-primary);
+  }
+
+  .error-state-hint {
+    font-size: var(--text-sm);
+    color: var(--fg-secondary);
+    max-width: 480px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+
+  .error-state-action {
     margin-top: var(--space-2);
   }
 </style>

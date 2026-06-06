@@ -1,6 +1,7 @@
 <script>
   import Badge from '../widgets/Badge.svelte';
   import EmptyState from './shared/EmptyState.svelte';
+  import { toastStore } from '../stores/toasts.svelte.ts';
 
   let snapshot = $state(null);
   let policies = $state(null);
@@ -44,7 +45,11 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       policies = await res.json();
     } catch (e) {
-      console.error('Failed to fetch policies:', e);
+      // Surface fetch failures to the operator instead of dropping them
+      // into the dev console — without this, a 5xx on the policies route
+      // left the panel in a "no policies" state with no signal anything
+      // actually went wrong.
+      toastStore.error('Failed to fetch policies: ' + (e?.message ?? e));
     }
   }
 
@@ -110,8 +115,13 @@
       policies = result.policy ?? policyDraft;
       editingPolicies = false;
       policyDraft = null;
+      // A successful policy save was previously a silent state change:
+      // the modal closed and the form reset, but the operator got no
+      // confirmation the write landed. The info-toast is the lightest
+      // weight ack that does not steal focus.
+      toastStore.info('Policies saved');
     } catch (e) {
-      console.error('Failed to save policies:', e);
+      toastStore.error('Failed to save policies: ' + (e?.message ?? e));
     } finally {
       savingPolicy = false;
     }

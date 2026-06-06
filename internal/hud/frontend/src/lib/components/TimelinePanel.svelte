@@ -76,7 +76,13 @@
   </div>
 
   {#if filtered.length === 0}
-    <EmptyState icon={'\u23F0'} heading="No timeline events" compact />
+    {#if timelineStore.error}
+      <!-- A failed /api/timeline fetch previously rendered the same
+           "No timeline events" copy as the empty cold-start. -->
+      <EmptyState icon={'\u26A0'} heading="Timeline unavailable" description={timelineStore.error} compact />
+    {:else}
+      <EmptyState icon={'\u23F0'} heading="No timeline events" compact />
+    {/if}
   {:else}
     <div class="timeline-list">
       {#if scroll.unseenCount > 0 && !scroll.isAtTop}

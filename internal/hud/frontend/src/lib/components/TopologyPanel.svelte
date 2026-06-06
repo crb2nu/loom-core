@@ -5,6 +5,7 @@
   import AgentTopology from '../widgets/AgentTopology.svelte';
   import StatusDot from '../widgets/StatusDot.svelte';
   import Badge from '../widgets/Badge.svelte';
+  import EmptyState from './shared/EmptyState.svelte';
 
   $effect(() => {
     topologyStore.startPolling(30000);
@@ -15,6 +16,16 @@
   let edges = $derived(topologyStore.edges);
   let clusters = $derived(topologyStore.clusters);
   let selected = $derived(topologyStore.selectedNode);
+
+  // Render precedence: error > loading > empty > graph. The graph (and the
+  // detail sidebar) only render when we actually have nodes; otherwise an
+  // EmptyState explains *which* of those three states we're in. Without
+  // this, a /topology fetch failure rendered an indistinguishable blank
+  // canvas — operators could not tell a cold-start error from "no agents
+  // registered yet".
+  let topologyLoading = $derived(topologyStore.loading);
+  let topologyError = $derived(topologyStore.error);
+  let hasTopologyData = $derived(nodes.length > 0);
 
   // Find the selected node details.
   let selectedAgent = $derived.by(() => {
@@ -55,20 +66,28 @@
 </script>
 
 <div class="panel topology-panel">
-  <div class="topology-layout" class:has-sidebar={!!selected}>
+  <div class="topology-layout" class:has-sidebar={!!selected && hasTopologyData}>
     <!-- Graph area -->
     <div class="topology-graph">
-      <AgentTopology
-        {nodes}
-        {edges}
-        {clusters}
-        selectedNode={selected}
-        onselect={(id) => topologyStore.selectNode(id)}
-      />
+      {#if topologyError && !hasTopologyData}
+        <EmptyState icon={'⚠'} heading="Topology unavailable" description={topologyError} />
+      {:else if topologyLoading && !hasTopologyData}
+        <EmptyState icon={'◯'} heading="Loading topology..." compact />
+      {:else if !hasTopologyData}
+        <EmptyState icon={'□'} heading="No agents registered" description="Agents will appear here once they register presence." />
+      {:else}
+        <AgentTopology
+          {nodes}
+          {edges}
+          {clusters}
+          selectedNode={selected}
+          onselect={(id) => topologyStore.selectNode(id)}
+        />
+      {/if}
     </div>
 
     <!-- Detail sidebar (shown when node selected) -->
-    {#if selectedAgent}
+    {#if selectedAgent && hasTopologyData}
       <aside class="topology-sidebar">
         <div class="sidebar-header">
           <h3 class="sidebar-title">{selectedAgent.agent_id}</h3>

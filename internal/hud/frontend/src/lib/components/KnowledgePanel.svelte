@@ -195,6 +195,19 @@
     {/snippet}
   </FilterBar>
 
+  {#if knowledgeStore.error}
+    <!-- Fetch errors on /api/knowledge were previously surfaced only
+         inside an EmptyState (when the table was empty), so a refresh
+         failure on a populated table left stale rows on screen with no
+         signal the data had gone stale. Banner mirrors the CatalogPanel
+         pattern and auto-clears on the next successful fetch (the store
+         resets error to null at fetch start). -->
+    <div class="error-banner" role="alert" aria-live="polite">
+      <span class="error-banner-icon" aria-hidden="true">⚠</span>
+      <span class="error-banner-text">Knowledge refresh failed: {knowledgeStore.error}</span>
+    </div>
+  {/if}
+
   <div class="knowledge-layout">
     <!-- Entry table -->
     <div class="entry-list">
@@ -325,6 +338,32 @@
     flex-direction: column;
     overflow-y: auto;
     gap: var(--space-3);
+  }
+
+  /* Error banner — matches CatalogPanel/MemoryPanel so all three panels
+     surface fetch failures with the same shape. */
+  .error-banner {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-start;
+    padding: 8px var(--space-3);
+    margin-bottom: var(--space-2);
+    background: color-mix(in srgb, var(--error) 18%, var(--bg-secondary));
+    border: 1px solid var(--error);
+    border-radius: var(--radius-md);
+    color: var(--fg-primary);
+    font-size: var(--text-sm);
+  }
+
+  .error-banner-icon {
+    color: var(--error);
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .error-banner-text {
+    flex: 1;
+    word-break: break-word;
   }
 
   .stats-strip {

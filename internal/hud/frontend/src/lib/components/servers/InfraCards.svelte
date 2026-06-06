@@ -8,18 +8,40 @@
   import Badge from '../../widgets/Badge.svelte';
   import { tunnelStateVariant } from '../../utils/serversHelpers';
 
-  let tunnels = $state<any[]>([]);
+  // tunnels starts at null (initial / never-fetched) so we can distinguish
+  // it from an empty array (fetched, none active). Same for an explicit
+  // error path: previously the Tunnels card showed "none / No active
+  // tunnels" identically for the cold-start error and the "infra healthy
+  // but no tunnels configured" case.
+  let tunnels = $state<any[] | null>(null);
   let cacheStats = $state<any>(null);
   let infraLoading = $state(false);
+  let tunnelsError = $state<string | null>(null);
+  let cacheError = $state<string | null>(null);
 
   async function fetchInfraStats() {
     infraLoading = true;
-    const [t, c] = await Promise.all([
-      healthStore.fetchTunnels(),
-      healthStore.fetchCacheStats(),
-    ]);
-    tunnels = t;
-    cacheStats = c;
+    tunnelsError = null;
+    cacheError = null;
+    // healthStore.fetchTunnels/fetchCacheStats swallow errors internally
+    // and return [] / null on failure (writing to healthStore.error).
+    // Snapshot the error around each call so we can attribute a failure
+    // to the right card. The shared healthStore.error sink stays
+    // populated for other consumers; we only consume the delta we caused.
+    healthStore.error = null;
+    const tList = await healthStore.fetchTunnels();
+    if (healthStore.error) {
+      tunnelsError = healthStore.error;
+    } else {
+      tunnels = tList ?? [];
+    }
+    healthStore.error = null;
+    const cStats = await healthStore.fetchCacheStats();
+    if (healthStore.error) {
+      cacheError = healthStore.error;
+    } else {
+      cacheStats = cStats;
+    }
     infraLoading = false;
   }
 
@@ -34,14 +56,24 @@
   <div class="infra-card">
     <div class="infra-card-header">
       <span class="infra-card-title">SSH Tunnels</span>
-      {#if tunnels.length > 0}
+      {#if tunnelsError}
+        <Badge text="error" variant="error" />
+      {:else if tunnels && tunnels.length > 0}
         <Badge text="{tunnels.length} active" variant="info" />
-      {:else}
+      {:else if tunnels}
         <Badge text="none" variant="info" />
       {/if}
     </div>
     <div class="infra-card-body">
-      {#if tunnels.length > 0}
+      {#if tunnelsError}
+        <!-- Mirrors the Cache card's 3-state shape so an /api/tunnels
+             failure is distinguishable from "no tunnels configured". -->
+        <span class="text-xs infra-error" role="alert">
+          <span aria-hidden="true">⚠</span> Tunnels unavailable: {tunnelsError}
+        </span>
+      {:else if tunnels === null && infraLoading}
+        <span class="text-muted text-xs">Loading...</span>
+      {:else if tunnels && tunnels.length > 0}
         <div class="tunnel-list">
           {#each tunnels as tunnel}
             <div class="tunnel-row">
@@ -67,12 +99,18 @@
   <div class="infra-card">
     <div class="infra-card-header">
       <span class="infra-card-title">Response Cache</span>
-      {#if cacheStats}
+      {#if cacheError}
+        <Badge text="error" variant="error" />
+      {:else if cacheStats}
         <Badge text="{cacheStats.entries} entries" variant="info" />
       {/if}
     </div>
     <div class="infra-card-body">
-      {#if cacheStats}
+      {#if cacheError}
+        <span class="text-xs infra-error" role="alert">
+          <span aria-hidden="true">⚠</span> Cache stats unavailable: {cacheError}
+        </span>
+      {:else if cacheStats}
         <div class="cache-grid">
           <div class="cache-stat">
             <span class="cache-stat-value text-mono">{cacheStats.entries}</span>
@@ -139,6 +177,17 @@
 
   .infra-card-body {
     font-size: var(--text-sm);
+  }
+
+  /* In-card error chip — used by both Tunnels and Cache branches so the
+     visual treatment for a /api/tunnels or /api/cache failure is
+     identical to a non-fatal error chip elsewhere. */
+  .infra-error {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--error);
+    word-break: break-word;
   }
 
   .tunnel-list {
