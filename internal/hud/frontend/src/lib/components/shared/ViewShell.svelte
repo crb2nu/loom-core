@@ -99,6 +99,12 @@
     border-color: color-mix(in srgb, var(--border-focus) 72%, transparent);
   }
 
+  .view-tab:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-md);
+  }
+
   .view-tab.active {
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent),
