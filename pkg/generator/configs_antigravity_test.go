@@ -61,6 +61,9 @@ func TestAntigravityHooksConfigShapeAndAutoAllow(t *testing.T) {
 	if strings.Contains(eventEmit, "printf '{}") {
 		t.Fatalf("PreToolUse telemetry hook must not emit an empty decision object: %s", eventEmit)
 	}
+	if !strings.Contains(eventEmit, "printf '%s\\n'") {
+		t.Fatalf("PreToolUse telemetry hook must terminate the decision with a real newline: %s", eventEmit)
+	}
 
 	for _, event := range []string{"PreInvocation", "PreToolUse", "PostToolUse", "Stop"} {
 		for _, cmd := range allHookCommands(mustHookBlocks(t, loom, event)) {

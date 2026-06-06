@@ -154,7 +154,7 @@ func resolveHubWrapper(workspaceRoot string, registryRoot string) (string, error
 			continue
 		}
 
-		if err := probeHubWrapper(resolved); err != nil {
+		if err := hubWrapperProbe(resolved); err != nil {
 			failures = append(failures, fmt.Sprintf("%s (%v)", resolved, err))
 			continue
 		}

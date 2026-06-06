@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/pelletier/go-toml/v2"
@@ -13,6 +14,8 @@ import (
 	"github.com/crb2nu/loom/pkg/registry"
 	"github.com/crb2nu/loom/pkg/validator"
 )
+
+var hubWrapperResolverTestMu sync.Mutex
 
 // testRegistry returns a registry with platform_permissions populated for testing.
 func testRegistry() *registry.Registry {
@@ -1424,6 +1427,14 @@ func TestCodexPreamble_ContainsWorkspaceHash(t *testing.T) {
 }
 
 func TestResolveHubWrapper_PreferenceOrder(t *testing.T) {
+	hubWrapperResolverTestMu.Lock()
+	oldProbe := hubWrapperProbe
+	hubWrapperProbe = func(string) error { return nil }
+	t.Cleanup(func() {
+		hubWrapperProbe = oldProbe
+		hubWrapperResolverTestMu.Unlock()
+	})
+
 	tmp := t.TempDir()
 	workspaceRoot := filepath.Join(tmp, "workspace")
 	registryRoot := filepath.Join(tmp, "registry-root")
