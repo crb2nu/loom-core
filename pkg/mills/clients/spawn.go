@@ -13,6 +13,7 @@ import (
 
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
+	"github.com/crb2nu/loom/pkg/mills/worker"
 )
 
 // HUDSpawnConfig captures the connection settings for the loom HUD's
@@ -176,6 +177,13 @@ type hudSpawnTelemetry struct {
 	FileChanges  []hudFileChange `json:"file_changes,omitempty"`
 	StopReason   string          `json:"stop_reason,omitempty"`
 	LastMessage  string          `json:"last_message,omitempty"`
+	// CostEstimated mirrors bridge.SpawnTelemetry.CostEstimated. The HUD
+	// spawn API already serialises this (cost_estimated) on the spawn
+	// detail wire; the operator's subset historically dropped it, losing
+	// the Codex estimated-cost marker. Decoding it here lets the Layer-1
+	// Worker contract surface CostSource without any change to what the
+	// HUD sends or to TotalCostUSD's value.
+	CostEstimated bool `json:"cost_estimated,omitempty"`
 }
 
 // hudSpawnState mirrors spawn.State — only what the operator reads.
@@ -378,23 +386,25 @@ func decodeHUDResponse(data []byte, out any) error {
 // agentTypeOrDefault returns a valid spawn AgentType. The pipeline
 // model field allows any FlexInfer / frontier id; we map common
 // shorthands to the loom spawn AgentType vocabulary.
+//
+// Behavior preserved from pre-Layer-1: a recognised harness (canonical
+// token or known shorthand) normalises to the canonical AgentType; empty
+// falls through to claude-code (the most common pipeline path); any other
+// non-empty value is passed through unchanged (operators can pin a
+// FlexInfer id this way). The only change is that recognition now routes
+// through worker.ValidateAgentType so the shorthand table lives in one
+// place.
 func agentTypeOrDefault(model string) string {
-	switch strings.ToLower(model) {
-	case "claude", "claude-code", "claude-sonnet", "claude-opus":
-		return "claude-code"
-	case "codex", "openai-codex":
-		return "codex"
-	case "gemini":
-		return "gemini"
-	default:
-		// Unknown / empty falls through to claude-code — the most
-		// common pipeline path. Operators can override per-stage by
-		// setting SpawnWorker.Model.
-		if model == "" {
-			return "claude-code"
-		}
-		return model
+	if canon, err := worker.ValidateAgentType(model); err == nil {
+		return canon
 	}
+	// Unknown / empty falls through to claude-code — the most common
+	// pipeline path. Operators can override per-stage by setting
+	// SpawnWorker.Model.
+	if model == "" {
+		return "claude-code"
+	}
+	return model
 }
 
 // buildSpawnMetadata stuffs the LOOM_MILLS_* env-vars + stage id into
@@ -441,6 +451,7 @@ func mapTelemetryToResponse(state *hudSpawnState) pipeline.SpawnResponse {
 	}
 	tel := state.Telemetry
 	resp.CostUSD = tel.TotalCostUSD
+	resp.CostEstimated = tel.CostEstimated
 	for _, fc := range tel.FileChanges {
 		resp.FilesChanged = append(resp.FilesChanged, fc.Path)
 		resp.LinesAdded += fc.LinesAdded

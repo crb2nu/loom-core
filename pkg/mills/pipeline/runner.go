@@ -127,6 +127,11 @@ type StageOutput struct {
 	// MergedSHA is populated by the merge stage; the runner stores it on
 	// the run row so eval Loop B can attribute outcomes.
 	MergedSHA string
+	// CostEstimated records whether CostUSD is a Loom-side estimate (e.g.
+	// Codex) rather than an authoritative SDK figure. Additive provenance
+	// surfaced from SpawnResponse.CostEstimated; it never changes the
+	// CostUSD value. Defaults false (real or unavailable cost).
+	CostEstimated bool
 }
 
 type stageAcceptRecorderKey struct{}

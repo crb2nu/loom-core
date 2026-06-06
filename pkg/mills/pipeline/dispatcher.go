@@ -180,6 +180,16 @@ type SpawnResponse struct {
 	DiffPatch      []byte
 	CommitMessages []string
 	Artifacts      map[string]any
+
+	// CostEstimated records whether CostUSD is a Loom-side estimate
+	// rather than an authoritative SDK figure. It mirrors
+	// bridge.SpawnTelemetry.CostEstimated, which the HUD spawn API
+	// already serialises on the wire (cost_estimated) but the operator's
+	// telemetry subset historically dropped. Additive provenance only —
+	// it never changes CostUSD's value. Codex spawns set it true; Claude
+	// and Gemini leave it false. The Layer-1 Worker contract derives
+	// CostSource (real|estimated|unavailable) from this plus CostUSD.
+	CostEstimated bool
 }
 
 // SpawnWorker dispatches a stage to the spawn service. Used for
@@ -290,6 +300,7 @@ func spawnResponseToStageOutput(resp SpawnResponse) StageOutput {
 		LinesRemoved:   resp.LinesRemoved,
 		DiffPatch:      resp.DiffPatch,
 		CommitMessages: resp.CommitMessages,
+		CostEstimated:  resp.CostEstimated,
 	}
 }
 
