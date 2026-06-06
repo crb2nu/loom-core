@@ -151,19 +151,33 @@ func (g *Generator) generateBundleSkillMD(skill *Skill, target string) string {
 
 // generateGeminiSkill generates a Gemini CLI skill bundle in .gemini/skills/<name>/.
 func (g *Generator) generateGeminiSkill(skill *Skill) error {
-	baseDir := g.resolveTargetDir("gemini")
+	return g.generateGeminiLikeSkill(skill, "gemini")
+}
+
+// generateAntigravitySkill generates an Antigravity 2.0 skill bundle. The file
+// format matches Gemini's SKILL.md bundle shape, but target-specific registry
+// overrides are resolved against "antigravity".
+func (g *Generator) generateAntigravitySkill(skill *Skill) error {
+	return g.generateGeminiLikeSkill(skill, "antigravity")
+}
+
+func (g *Generator) generateGeminiLikeSkill(skill *Skill, target string) error {
+	baseDir := g.resolveTargetDir(target)
 	if baseDir == "" {
 		baseDir = filepath.Join(g.RepoRoot, ".gemini")
+		if target == "antigravity" {
+			baseDir = filepath.Join(baseDir, "antigravity")
+		}
 	}
 
 	skillDir := filepath.Join(baseDir, "skills", skill.Name)
 
 	if g.Verbose {
-		fmt.Printf("Generating Gemini skill: %s -> %s\n", skill.Name, skillDir)
+		fmt.Printf("Generating %s skill: %s -> %s\n", target, skill.Name, skillDir)
 	}
 
 	if g.DryRun {
-		fmt.Printf("[dry-run] Would create Gemini skill: %s\n", skillDir)
+		fmt.Printf("[dry-run] Would create %s skill: %s\n", target, skillDir)
 		return nil
 	}
 
@@ -173,7 +187,7 @@ func (g *Generator) generateGeminiSkill(skill *Skill) error {
 		}
 	}
 
-	skillMD := g.generateGeminiSkillMD(skill)
+	skillMD := g.generateGeminiLikeSkillMD(skill, target)
 	skillMDPath := filepath.Join(skillDir, "SKILL.md")
 	// Atomic write: see generator_codex_gemini.go:generateCodexSkill for rationale.
 	if err := writeFileAtomic(skillMDPath, []byte(skillMD), 0o644); err != nil {
@@ -219,6 +233,10 @@ func (g *Generator) generateGeminiSkill(skill *Skill) error {
 
 // generateGeminiSkillMD generates the SKILL.md content for a Gemini skill.
 func (g *Generator) generateGeminiSkillMD(skill *Skill) string {
+	return g.generateGeminiLikeSkillMD(skill, "gemini")
+}
+
+func (g *Generator) generateGeminiLikeSkillMD(skill *Skill, target string) string {
 	var sb strings.Builder
 
 	sb.WriteString("---\n")
@@ -233,9 +251,12 @@ func (g *Generator) generateGeminiSkillMD(skill *Skill) string {
 	skillsHome := strings.TrimSpace(g.GeminiSkillsHome)
 	if skillsHome == "" {
 		skillsHome = "$HOME/.gemini/skills"
+		if target == "antigravity" {
+			skillsHome = "$HOME/.gemini/antigravity/skills"
+		}
 	}
-	geminiSkillPath := fmt.Sprintf("%s/%s", strings.TrimRight(skillsHome, "/"), skill.Name)
-	instructions := skill.ResolveInstructions("gemini", g.CodexHome, geminiSkillPath)
+	skillPath := fmt.Sprintf("%s/%s", strings.TrimRight(skillsHome, "/"), skill.Name)
+	instructions := skill.ResolveInstructions(target, g.CodexHome, skillPath)
 	sb.WriteString(instructions)
 
 	hasResources := len(skill.Common.Scripts) > 0 || len(skill.Common.References) > 0 || len(skill.Common.Assets) > 0

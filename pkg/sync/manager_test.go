@@ -347,8 +347,8 @@ func TestAntigravityProfile_UsesAntigravity2Paths(t *testing.T) {
 	if p.HomeExtraGeneratedFiles["hooks.json"] != "config/hooks.json" {
 		t.Fatalf("HomeExtraGeneratedFiles[hooks.json] = %q, want %q", p.HomeExtraGeneratedFiles["hooks.json"], "config/hooks.json")
 	}
-	if p.SkillsTarget != "gemini" {
-		t.Fatalf("SkillsTarget = %q, want %q", p.SkillsTarget, "gemini")
+	if p.SkillsTarget != "antigravity" {
+		t.Fatalf("SkillsTarget = %q, want %q", p.SkillsTarget, "antigravity")
 	}
 	if !p.SkillsDirectToHome {
 		t.Fatal("expected SkillsDirectToHome=true for antigravity")

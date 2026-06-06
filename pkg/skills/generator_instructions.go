@@ -19,7 +19,7 @@ func (g *Generator) generateInstructionsFile(target string, skills []*Skill, bun
 	}
 
 	filename := "instructions.md"
-	if target == "gemini" {
+	if target == "gemini" || target == "antigravity" {
 		filename = "GEMINI.md"
 	}
 
@@ -234,6 +234,14 @@ func (g *Generator) skillHomePath(target string) string {
 		home, err := os.UserHomeDir()
 		if err == nil && home != "" {
 			return filepath.Join(home, ".gemini", "skills")
+		}
+	case "antigravity":
+		if strings.TrimSpace(g.GeminiSkillsHome) != "" {
+			return strings.TrimRight(g.GeminiSkillsHome, "/")
+		}
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			return filepath.Join(home, ".gemini", "antigravity", "skills")
 		}
 	}
 	return ""
