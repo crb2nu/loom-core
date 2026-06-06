@@ -31,7 +31,13 @@ S4 (HUD step-log panel) ◄── S3     │                                    
 
 ---
 
-### S1 — Kill-test spike: deterministic replay-from-journal (in-process)
+### S1 — Kill-test spike: deterministic replay-from-journal (in-process) ✅ DONE (PASS, 2026-06-06)
+
+> **Outcome: PASS.** Branch `feat/mills-workflow-killtest-spike` (commit `0fe0e8d3`), standalone module `pkg/mills/workflow/spike/` (journal.go/host.go/interp.go/spike_test.go, ~1,150 LOC). All 7 in-process scenarios green under `-race`; independently re-run by an adversarial verifier (`honest: true`, `confirmed-pass`) with falsification probes. The Layer-3 imperative-runtime bet is validated in-process. **Carry-forward must-adds for the real engine** (do NOT lose these):
+> - **S3/S6 test suite:** add an explicit **sibling-insert AND sibling-delete drift test** in one scope frame (the 7 spike scenarios catch a *global* flat counter but not a *scope-preserving flat-leaf* counter — only insert/delete-then-replay fully proves drift-tolerance).
+> - **S3:** the **durable cross-process journal is unproven** (only in-memory map exercised) — add a focused SQLite `UNIQUE(run_id,step_key)`+`ON CONFLICT` idempotent `pending→success` upsert spike before wiring the real engine.
+> - **S6:** `call_hash` needs a **recursive arg canonicalizer** (spike uses `.String()` for non-scalars).
+> - Proven API to reuse: `go.starlark.net v0.0.0-20260522144826-ec58d4b459e2`, `ExecFileOptions`+`FileOptions{While:true,TopLevelControl:true}`, `thread.Load=nil`; per-branch fresh `*starlark.Thread`+forked ScopeStack, branch index pre-assigned; `thread.SetLocal` not concurrency-safe.
 
 **Goal:** Prove the Tier-1 replay mechanism in isolation, exercising the HARD cases the verdict requires, before any production wiring.
 **Deliverables:** Throwaway `pkg/mills/workflow/spike/` embedding Starlark-Go; `:memory:` SQLite journal with `StepKey`+`Get`+`Append`; structured drift-tolerant step keys; replay short-circuit with effect-counter. Script: `agent('a'); gate('g'); agent('b')` + 2-child `parallel()` + a `loop_until_dry()`.

@@ -67,7 +67,13 @@ A spike workflow with effects A=`agent()`, G=`gate()`, B=`agent()`, plus a paral
 
 **Failure mode if the assumption is wrong:** We would build a positional-replay runtime that silently consumes the wrong cached result (corrupting an autonomous merge) or mass-aborts every in-flight run on benign control-flow drift or an operator upgrade. If the kill-test fails, fall back to the materialized-DAG resume model (option (b), §7): keep Layers 1–2 (~70% reuse) and drive the runtime declaratively, conceding drivers 2/4.
 
-**Status:** not run.
+**Status:** **Tier-1 in-process: PASSED 2026-06-06.** The S1 spike (`feat/mills-workflow-killtest-spike`, commit `0fe0e8d3`, standalone module `pkg/mills/workflow/spike/`) proves checks **1–6 + capability confinement** — all 7 in-process scenarios green under `-race`, independently re-run by an adversarial verifier (`honest: true`) with falsification probes (a panicking live-fn confirms replay never re-executes; a positive-control confirms the confinement check is non-vacuous). Verified: `go.starlark.net v0.0.0-20260522144826-ec58d4b459e2`, `ExecFileOptions` + `FileOptions{While:true, TopLevelControl:true}`, `thread.Load=nil`; step_key = scope-path (`root` / `loop:<label>#<iter>` / `par:<site>/b<branch>`) + leaf `<primKind>~<callHash[:16]>#<dupOrdinal>`. **Checks 7 (DEPLOYED exactly-once / Slice 1c) and 8 (non-Claude / non-streaming fidelity on real substrates) NOT run** — these remain the gate for Layer 3 (§Plan S6).
+
+Findings to fold into the real engine (from the spike + verifier):
+1. **The real test suite MUST add an explicit sibling-INSERT and sibling-DELETE drift test** in the same scope frame. The spike's scenarios catch a *fully-global* flat counter, but a *scope-preserving flat-leaf* counter would still pass them; only an insert/delete-then-replay test (asserting zero sibling key shift) fully locks down drift-tolerance.
+2. **The durable (cross-process) journal is unproven.** Only the in-memory map was exercised; the SQLite path (`UNIQUE(run_id, step_key)` + `ON CONFLICT` idempotent `pending→success` upsert) needs its own follow-up spike before the real engine (§Plan S3).
+3. **`call_hash` needs a proper recursive arg canonicalizer.** The spike collapses non-scalar Starlark values (list/dict/function) to `.String()`; effects taking structured args require real canonicalization (§Plan S6).
+4. **Concurrency model confirmed:** fresh `*starlark.Thread` + forked ScopeStack per `parallel()` branch, branch index assigned pre-launch in slice order; journal (mutex) + effect-counter (atomic) the only shared mutable state. `thread.SetLocal` must not be called concurrently — hence forked stacks.
 
 ## 4. Architecture: three layers
 
