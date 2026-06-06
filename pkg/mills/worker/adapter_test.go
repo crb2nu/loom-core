@@ -63,8 +63,14 @@ func TestWorkerRequestRoundTripFieldParity(t *testing.T) {
 	sr := orig.ToSpawnRequest()
 	back := FromSpawnRequest(sr)
 
-	// IdempotencyKey has no SpawnRequest home; it is plumbing-only and
-	// does not round-trip. Compare everything else field-by-field.
+	// IdempotencyKey now maps through SpawnRequest (Slice 2b) and must
+	// round-trip alongside every reused field.
+	if back.IdempotencyKey != orig.IdempotencyKey {
+		t.Errorf("IdempotencyKey: got %q want %q", back.IdempotencyKey, orig.IdempotencyKey)
+	}
+	if sr.IdempotencyKey != orig.IdempotencyKey {
+		t.Errorf("SpawnRequest.IdempotencyKey: got %q want %q", sr.IdempotencyKey, orig.IdempotencyKey)
+	}
 	if back.Prompt != orig.Prompt {
 		t.Errorf("Prompt: got %q want %q", back.Prompt, orig.Prompt)
 	}
@@ -169,6 +175,7 @@ func TestRunMapsRequestFieldsByteIdentical(t *testing.T) {
 		BaseBranch:      req.BaseBranch,
 		Namespace:       req.Namespace,
 		Substrate:       req.Substrate,
+		IdempotencyKey:  req.IdempotencyKey,
 	}
 	if !reflect.DeepEqual(fake.gotReq, want) {
 		t.Errorf("forwarded SpawnRequest mismatch:\n got %+v\nwant %+v", fake.gotReq, want)
@@ -318,24 +325,31 @@ func TestRunMapsResponseOnError(t *testing.T) {
 }
 
 // TestResumeWhenClientSupportsIt verifies the adapter promotes a
-// resume-capable client to WorkerResumer and forwards the key.
+// resume-capable client to WorkerResumer and re-attaches by the
+// DETERMINISTIC spawn id derived from the idempotency key (Slice 2b), so
+// Resume(key) lands on the same spawn the matching idempotent create made.
 func TestResumeWhenClientSupportsIt(t *testing.T) {
+	const key = "mills/run-1/stage-implement"
+	wantSpawnID := DeriveSpawnID(key)
+
 	fake := &resumableFakeSpawnClient{
-		fakeSpawnClient: fakeSpawnClient{resp: pipeline.SpawnResponse{SpawnID: "spawn-existing", CostUSD: 0.11}},
+		fakeSpawnClient: fakeSpawnClient{resp: pipeline.SpawnResponse{SpawnID: wantSpawnID, CostUSD: 0.11}},
 	}
 	runner := NewSpawnRunner(fake)
 	resumer, ok := runner.(WorkerResumer)
 	if !ok {
 		t.Fatal("expected runner to implement WorkerResumer")
 	}
-	got, err := resumer.Resume(context.Background(), "spawn-existing")
+	got, err := resumer.Resume(context.Background(), key)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
-	if fake.resumed != "spawn-existing" {
-		t.Errorf("forwarded resume id = %q", fake.resumed)
+	// The underlying spawn-id resumer must receive the DERIVED id, not the
+	// raw key — that's what re-attaches to the idempotent create's spawn.
+	if fake.resumed != wantSpawnID {
+		t.Errorf("forwarded resume id = %q, want derived %q", fake.resumed, wantSpawnID)
 	}
-	if got.SpawnID != "spawn-existing" || got.CostUSD != 0.11 {
+	if got.SpawnID != wantSpawnID || got.CostUSD != 0.11 {
 		t.Errorf("resume result: %+v", got)
 	}
 }

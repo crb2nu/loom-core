@@ -133,6 +133,16 @@ type Request struct {
 	// runs on the named substrate; today the pod still lives on the
 	// orchestrator's single backend.
 	Substrate string `json:"substrate,omitempty"`
+	// IdempotencyKey is an OPT-IN caller-supplied replay key (Slice 2b).
+	// When non-empty, the controller derives a deterministic spawn id from
+	// it and makes registration idempotent: a duplicate create with the
+	// same key re-attaches to the existing spawn (AlreadyExists no-op)
+	// instead of minting a second pod, closing the pre-existing
+	// double-spawn window. Empty (the only case any current caller hits)
+	// preserves legacy behavior exactly — the server mints the id via
+	// crypto/rand NewSpawnID(). Only the future Mills durable workflow
+	// runtime sets this. Spec: .loom/130-133 Mills dynamic workflows.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // AuthMode describes which cluster credential path the spawned agent was

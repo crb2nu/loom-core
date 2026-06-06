@@ -296,6 +296,68 @@ func TestRun_RecordsAcceptedSpawnBeforePolling(t *testing.T) {
 	}
 }
 
+// TestRun_SendsIdempotencyKeyWhenSet proves the OPT-IN path: when
+// SpawnRequest.IdempotencyKey is non-empty, the POST body carries
+// idempotency_key so the HUD controller can derive a deterministic id and
+// dedupe a duplicate create into an AlreadyExists re-attach.
+func TestRun_SendsIdempotencyKeyWhenSet(t *testing.T) {
+	ft := &hudFakeTransport{
+		post: func(_ *http.Request) (int, any) {
+			return 202, hudSpawnAcceptResponse{SpawnID: "spawn-idem", Status: "creating"}
+		},
+		get: func(_ *http.Request) (int, any) {
+			return 200, hudSpawnState{SpawnID: "spawn-idem", Status: "completed"}
+		},
+	}
+	c := newHUDStub(t, ft)
+	req := sampleSpawnReq()
+	req.IdempotencyKey = "mills/run-7/stage-implement"
+
+	if _, err := c.Run(context.Background(), req); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	reqs := ft.recordedRequests()
+	if len(reqs) == 0 || reqs[0].Method != http.MethodPost {
+		t.Fatalf("expected a POST request, got %+v", reqs)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(reqs[0].Body), &body); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if got, _ := body["idempotency_key"].(string); got != req.IdempotencyKey {
+		t.Errorf("idempotency_key in body = %q, want %q (body=%s)", got, req.IdempotencyKey, reqs[0].Body)
+	}
+}
+
+// TestRun_OmitsIdempotencyKeyWhenEmpty proves the legacy path is wire-
+// identical: with no key, the field is omitted (omitempty) entirely so the
+// server mints the id exactly as before.
+func TestRun_OmitsIdempotencyKeyWhenEmpty(t *testing.T) {
+	ft := &hudFakeTransport{
+		post: func(_ *http.Request) (int, any) {
+			return 202, hudSpawnAcceptResponse{SpawnID: "spawn-legacy", Status: "creating"}
+		},
+		get: func(_ *http.Request) (int, any) {
+			return 200, hudSpawnState{SpawnID: "spawn-legacy", Status: "completed"}
+		},
+	}
+	c := newHUDStub(t, ft)
+	req := sampleSpawnReq() // IdempotencyKey left empty
+
+	if _, err := c.Run(context.Background(), req); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	reqs := ft.recordedRequests()
+	if len(reqs) == 0 {
+		t.Fatal("expected at least one request")
+	}
+	if strings.Contains(reqs[0].Body, "idempotency_key") {
+		t.Errorf("legacy request must omit idempotency_key, body=%s", reqs[0].Body)
+	}
+}
+
 func TestRun_AcceptsMobileEnvelopeResponses(t *testing.T) {
 	ft := &hudFakeTransport{
 		post: func(_ *http.Request) (int, any) {

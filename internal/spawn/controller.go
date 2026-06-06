@@ -3,6 +3,7 @@ package spawn
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -108,6 +109,17 @@ func (c *K8sController) Spawn(ctx context.Context, req Request) (string, error) 
 		return "", fmt.Errorf("project is required")
 	}
 
+	// ADDITIVE / OPT-IN: when the caller supplies a non-empty
+	// IdempotencyKey, derive a stable spawn id from it and make
+	// registration idempotent — a duplicate create re-attaches to the
+	// existing spawn (AlreadyExists no-op) instead of minting a second
+	// pod. When the key is empty (the only case any current caller hits),
+	// the id is server-minted via NewSpawnID() exactly as before and the
+	// flow is byte-identical to legacy behavior.
+	if key := req.IdempotencyKey; key != "" {
+		return c.spawnWithKey(ctx, req, key)
+	}
+
 	spawnID := NewSpawnID()
 	agentID := fmt.Sprintf("spawn-%s-%s", req.AgentType, spawnID[6:])
 
@@ -123,6 +135,61 @@ func (c *K8sController) Spawn(ctx context.Context, req Request) (string, error) 
 	c.spawns[spawnID] = state
 	c.mu.Unlock()
 
+	if c.store != nil {
+		if err := c.store.Save(ctx, state); err != nil {
+			c.logger.Warn("failed to persist spawn state",
+				"spawn_id", spawnID, "error", err)
+		}
+	}
+
+	return spawnID, nil
+}
+
+// spawnWithKey is the deterministic, idempotent registration path. It is
+// only reached when the caller supplied a non-empty IdempotencyKey.
+//
+// The spawn id is derived deterministically from the key (deriveSpawnID),
+// so a re-driven create with the same key targets the same id. If a spawn
+// with that id is already registered, the existing state is returned
+// unchanged — modeling an AlreadyExists no-op / re-attach so no second pod
+// is created. This is the prerequisite for exactly-once-across-crash: the
+// future durable runtime supplies a stable key per logical step, and a
+// retry after a crash deterministically lands on the same spawn handle.
+//
+// RECORD-BEFORE-DISPATCH: the id and its Pending state are committed to the
+// in-memory map and persistent store BEFORE this returns — and the caller
+// (the HUD orchestrator) only dispatches the pod-create AFTER Spawn
+// returns. So a crash in the window between record and dispatch leaves a
+// recoverable handle keyed by the deterministic id; resuming with the same
+// key re-attaches rather than double-spawning.
+func (c *K8sController) spawnWithKey(ctx context.Context, req Request, key string) (string, error) {
+	spawnID := DeriveSpawnID(key)
+
+	c.mu.Lock()
+	if existing, ok := c.spawns[spawnID]; ok {
+		// AlreadyExists no-op: re-attach to the existing spawn instead of
+		// creating a second one. Do not mutate the existing state.
+		c.mu.Unlock()
+		c.logger.Info("idempotent spawn re-attach (already exists)",
+			"spawn_id", spawnID, "status", existing.Status)
+		return spawnID, nil
+	}
+
+	agentID := fmt.Sprintf("spawn-%s-%s", req.AgentType, spawnID[6:])
+	state := &State{
+		SpawnID:   spawnID,
+		AgentID:   agentID,
+		Status:    StatusPending,
+		Request:   req,
+		StartedAt: time.Now(),
+	}
+	// Record in-memory under the lock so a concurrent duplicate create with
+	// the same key observes the entry and re-attaches above.
+	c.spawns[spawnID] = state
+	c.mu.Unlock()
+
+	// Persist BEFORE returning (and therefore before the caller dispatches
+	// the pod) so the handle survives a crash in the record→dispatch window.
 	if c.store != nil {
 		if err := c.store.Save(ctx, state); err != nil {
 			c.logger.Warn("failed to persist spawn state",
@@ -501,4 +568,26 @@ func NewSpawnID() string {
 		return fmt.Sprintf("spawn-%d", time.Now().UnixNano())
 	}
 	return "spawn-" + hex.EncodeToString(buf[:])
+}
+
+// derivedSpawnIDHexLen is the number of hex characters of the key digest
+// used in a derived spawn id. It matches the 12 hex chars NewSpawnID emits
+// (6 random bytes) so derived ids are shape-compatible with random ones —
+// same length, same "spawn-"+hex form, same valid-k8s-name guarantees, and
+// the same agentID slice math (spawnID[6:]).
+const derivedSpawnIDHexLen = 12
+
+// DeriveSpawnID returns a deterministic spawn id for a non-empty
+// idempotency key. The same key always yields the same id, which is what
+// makes a duplicate create an AlreadyExists no-op in spawnWithKey. The id
+// is "spawn-" + the first derivedSpawnIDHexLen hex chars of SHA-256(key),
+// keeping it shape-identical to NewSpawnID() output (lowercase hex, safe
+// as a k8s pod-name fragment, and sliceable at [6:] for the agent id).
+//
+// This is the AUTHORITATIVE derivation. The worker package mirrors it as
+// worker.DeriveSpawnID (it cannot import this package without dragging in
+// k8s client-go); a parity test locks the two to identical output.
+func DeriveSpawnID(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return "spawn-" + hex.EncodeToString(sum[:])[:derivedSpawnIDHexLen]
 }

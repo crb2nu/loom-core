@@ -166,6 +166,15 @@ type SpawnRequest struct {
 	// translating it to DEVBOX_BACKEND on the spawn pod's env. Spec:
 	// .loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md
 	Substrate string
+
+	// IdempotencyKey is an OPT-IN caller-supplied replay key threaded from
+	// worker.WorkerRequest.IdempotencyKey. Empty means legacy behavior
+	// (server-minted spawn id). When non-empty, the HUD spawn client sends
+	// it as idempotency_key so the controller derives a deterministic id
+	// and dedupes a duplicate create into an AlreadyExists re-attach.
+	// Only the Mills durable runtime sets it; current callers leave it
+	// empty. Slice 2b — Mills dynamic workflows (.loom/130-133).
+	IdempotencyKey string
 }
 
 // SpawnResponse summarises what the spawn returned. Workers translate
