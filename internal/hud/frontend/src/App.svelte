@@ -412,6 +412,14 @@
                   {:catch}
                     <EmptyState icon="!" heading="Failed to load panel" compact />
                   {/await}
+                {:else if router.subView === 'mills-workflows'}
+                  {#await import('./lib/components/Mills/WorkflowsPanel.svelte')}
+                    <div class="panel-loading"><div class="loading-bar"><div class="loading-bar-inner"></div></div></div>
+                  {:then { default: MillsWorkflowsPanel }}
+                    <MillsWorkflowsPanel />
+                  {:catch}
+                    <EmptyState icon="!" heading="Failed to load panel" compact />
+                  {/await}
                 {:else if router.subView === 'backlog'}
                   {#await import('./lib/components/Mills/BacklogPanel.svelte')}
                     <div class="panel-loading"><div class="loading-bar"><div class="loading-bar-inner"></div></div></div>
