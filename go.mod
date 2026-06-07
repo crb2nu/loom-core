@@ -38,7 +38,7 @@ require (
 	github.com/xuri/excelize/v2 v2.10.1
 	gitlab.flexinfer.ai/libs/fi-accel/go/fiaccel v0.0.0-20260318222621-ce3294e404e0
 	gitlab.flexinfer.ai/libs/fi-mcp-kit v0.2.1-0.20260412164817-1a41094d2496
-	gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260520023524-aa57e61f11bd
+	gitlab.flexinfer.ai/libs/mcp-go v0.2.1-0.20260606235418-cf46de19e009
 	go.mongodb.org/mongo-driver v1.17.8
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.40.0
