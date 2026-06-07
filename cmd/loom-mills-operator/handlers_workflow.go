@@ -17,10 +17,12 @@ import (
 // the run while policy.workflows.enabled=false is harmless — the WorkflowScheduler
 // self-gates and won't advance it until the flag flips (the canary window).
 func (o *operator) handleWorkflowCanaryStart(w http.ResponseWriter, r *http.Request) {
+	// backlog_id is OPTIONAL. workflow_runs.backlog_id is a FK to
+	// backlog_items (ON DELETE SET NULL, foreign_keys=ON); a non-existent id
+	// violates the constraint and 500s. Empty → PutWorkflowRun stores NULL,
+	// which is valid (the canary run has no backing backlog item). A caller
+	// that does pass an id must reference a real item.
 	backlogID := r.URL.Query().Get("backlog_id")
-	if backlogID == "" {
-		backlogID = "mills-canary-s1c"
-	}
 	id := "wf-canary-" + strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	run, err := workflow.CreateImperativeRun(r.Context(), o.store.Workflow, id, backlogID)
 	if err != nil {

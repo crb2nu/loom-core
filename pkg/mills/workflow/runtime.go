@@ -54,6 +54,28 @@ type WorkflowInterpreter struct {
 	runner  worker.WorkerRunner
 	resumer worker.WorkerResumer // optional; nil when the runner can't resume
 	logger  *slog.Logger
+
+	// spawnProject / spawnBaseBranch are the git-routing defaults every
+	// agent() spawn inherits. Unlike the DAG pipeline's SpawnWorker, a
+	// workflow script has no JobContext to derive Project/Branch from, yet
+	// the HUD spawn API hard-requires Project+Branch (pkg/mills/clients/
+	// spawn.go validation). Set via SetSpawnDefaults from operator config so
+	// they match the DAG's SpawnWorker.Project; execAgent falls back to
+	// "loom-core" when spawnProject is unset so a zero-value interpreter
+	// (tests) still builds a valid SpawnRequest shape.
+	spawnProject    string
+	spawnBaseBranch string
+}
+
+// SetSpawnDefaults wires the git-routing context every agent() spawn needs.
+// project is the repo spawns target (the HUD spawn API resolves it to a git
+// remote + worktree base); baseBranch is what spawned worktrees branch off
+// (empty defers to the spawn service default, "main"). The operator wires
+// these from config so they match the DAG pipeline's SpawnWorker.Project.
+// Safe to call on a nil-runner interpreter; it only mutates defaults.
+func (wi *WorkflowInterpreter) SetSpawnDefaults(project, baseBranch string) {
+	wi.spawnProject = project
+	wi.spawnBaseBranch = baseBranch
 }
 
 // NewWorkflowInterpreter builds a runtime over a WorkflowDAO and a runner. If
@@ -177,6 +199,17 @@ func (wi *WorkflowInterpreter) execAgent(ctx context.Context, run *store.Workflo
 		}
 	}
 
+	// Git-routing context. The HUD spawn API hard-requires Project + Branch
+	// (pkg/mills/clients/spawn.go validation); a workflow script has no
+	// JobContext to derive them from, so they come from the interpreter's
+	// configured defaults plus a per-run branch. Project falls back to
+	// "loom-core" to match the DAG SpawnWorker default. BaseBranch empty
+	// defers to the spawn service default ("main").
+	project := wi.spawnProject
+	if project == "" {
+		project = "loom-core"
+	}
+
 	req := worker.WorkerRequest{
 		AgentType:       model,
 		Model:           model,
@@ -184,6 +217,9 @@ func (wi *WorkflowInterpreter) execAgent(ctx context.Context, run *store.Workflo
 		BudgetUSD:       budget,
 		BacklogID:       run.BacklogID,
 		ParentSessionID: run.ParentSessionID,
+		Project:         project,
+		Branch:          wi.spawnBranch(run),
+		BaseBranch:      wi.spawnBaseBranch,
 		Namespace:       "loom-mills",
 		Substrate:       "k8s", // S6-min canary targets k8s only (.loom/134 §S6-min)
 		IdempotencyKey:  idemKey,
@@ -211,6 +247,16 @@ func (wi *WorkflowInterpreter) execGate(_ context.Context, _ *store.WorkflowRun,
 	// Trivial pass evaluator. Returns a structured result so the journal records
 	// a meaningful blob and a future real gate can extend the shape.
 	return EffectResult{Value: fmt.Sprintf("gate:%s=pass", name)}, nil
+}
+
+// spawnBranch derives the per-run feature branch every agent() spawn for this
+// run targets. Deterministic in run.ID so a replay/resume re-derives the same
+// branch and re-attaches to the same worktree. (Exactly-once spawn keys off the
+// IdempotencyKey, not the branch, but a stable branch keeps the worktree
+// identity stable across a resume.) The S6-min canary STOPS at the gate and
+// never merges, so a fresh unique branch per run is safe.
+func (wi *WorkflowInterpreter) spawnBranch(run *store.WorkflowRun) string {
+	return "mills-wf/" + run.ID
 }
 
 // agentPrompt derives a terse prompt for a logical agent step. S6-min keeps it

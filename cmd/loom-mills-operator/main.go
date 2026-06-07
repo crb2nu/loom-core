@@ -431,7 +431,7 @@ func run(cfg Config) error {
 	// the DAG pipeline uses (wrapped as a worker.WorkerRunner) — zero new
 	// pods/services. When the spawn client is unconfigured the scheduler
 	// idles (nil runtime), keeping g.Go balanced.
-	workflowSched := buildWorkflowScheduler(st, pm, hudSpawn, logger)
+	workflowSched := buildWorkflowScheduler(st, pm, hudSpawn, cfg.GitLabProject, logger)
 
 	// Workflow step-log monitor (plan .loom/134 §S4a). Polls the durable
 	// workflow journal in-process and broadcasts a `hud.workflows`-shaped
@@ -1116,7 +1116,7 @@ const workflowMonitorInterval = 15 * time.Second
 // When the spawn client is unconfigured (LOOM_HUD_URL/TOKEN unset) the runner is
 // nil; NewWorkflowScheduler then idles (block-until-cancel) so the operator's
 // g.Go stays balanced and degraded local boots don't error.
-func buildWorkflowScheduler(st *store.Store, pm *mills.PolicyManager, spawn *clients.HUDSpawnClient, logger *slog.Logger) *workflow.WorkflowScheduler {
+func buildWorkflowScheduler(st *store.Store, pm *mills.PolicyManager, spawn *clients.HUDSpawnClient, spawnProject string, logger *slog.Logger) *workflow.WorkflowScheduler {
 	gate := workflow.PolicyGateFunc(func() bool { return pm.Current().WorkflowsEnabled() })
 	if spawn == nil {
 		logger.Warn("imperative workflow runtime disabled (LOOM_HUD_URL/TOKEN unset); scheduler idles")
@@ -1124,7 +1124,15 @@ func buildWorkflowScheduler(st *store.Store, pm *mills.PolicyManager, spawn *cli
 	}
 	runner := worker.NewSpawnRunner(spawn)
 	interp := workflow.NewWorkflowInterpreter(st.Workflow, runner, logger)
-	logger.Info("imperative workflow runtime wired (default-OFF; flips via policy.workflows.enabled)")
+	// Give agent() spawns the same git-routing project the DAG pipeline uses
+	// (SpawnWorker.Project = cfg.GitLabProject, "loom-core" fallback). Without
+	// this every spawn fails the HUD spawn API's required-Project validation.
+	// BaseBranch left empty defers to the spawn service default ("main").
+	if spawnProject == "" {
+		spawnProject = "loom-core"
+	}
+	interp.SetSpawnDefaults(spawnProject, "")
+	logger.Info("imperative workflow runtime wired (default-OFF; flips via policy.workflows.enabled)", "spawn_project", spawnProject)
 	return workflow.NewWorkflowScheduler(st.Workflow, interp, gate, logger)
 }
 

@@ -35,6 +35,7 @@ type fakeRunner struct {
 	runCount    int
 	resumeCount int
 	lastKey     string
+	lastReq     worker.WorkerRequest
 	failNext    bool
 }
 
@@ -43,6 +44,7 @@ func (f *fakeRunner) Run(_ context.Context, req worker.WorkerRequest) (worker.Wo
 	defer f.mu.Unlock()
 	f.runCount++
 	f.lastKey = req.IdempotencyKey
+	f.lastReq = req
 	res := worker.WorkerResult{
 		SpawnID:      worker.DeriveSpawnID(req.IdempotencyKey),
 		CostUSD:      0.5,
@@ -164,6 +166,68 @@ func TestRuntime_CanaryCompletes(t *testing.T) {
 	if agentSteps != 1 {
 		t.Fatalf("expected 1 agent step, got %d", agentSteps)
 	}
+}
+
+// TestRuntime_AgentSpawnContext is the regression test for the S1c blocker:
+// execAgent built a WorkerRequest with no Project/Branch, so the live HUD spawn
+// API (which hard-requires both) rejected every agent() spawn with
+// "SpawnRequest.Project required" and no pod was ever created. The in-process
+// fake runner didn't validate fields, so the bug only surfaced deployed.
+//
+// It asserts (a) the configured default project flows through, (b) a per-run
+// deterministic branch is set, and (c) an unconfigured interpreter still falls
+// back to a non-empty "loom-core" project rather than the empty value that
+// tripped validation.
+func TestRuntime_AgentSpawnContext(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("configured defaults flow to the spawn request", func(t *testing.T) {
+		st := newRuntimeStore(t)
+		fr := &fakeRunner{}
+		seedBacklog(t, st, "backlog-ctx")
+		run, err := CreateImperativeRun(ctx, st.Workflow, "wf-canary-ctx", "backlog-ctx")
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		interp := NewWorkflowInterpreter(st.Workflow, fr, nil)
+		interp.SetSpawnDefaults("services/loom-core", "main")
+		NewWorkflowScheduler(st.Workflow, interp, alwaysOn{}, nil).tick(ctx)
+
+		fr.mu.Lock()
+		req := fr.lastReq
+		fr.mu.Unlock()
+		if req.Project != "services/loom-core" {
+			t.Fatalf("spawn Project = %q, want services/loom-core", req.Project)
+		}
+		if req.BaseBranch != "main" {
+			t.Fatalf("spawn BaseBranch = %q, want main", req.BaseBranch)
+		}
+		if want := "mills-wf/" + run.ID; req.Branch != want {
+			t.Fatalf("spawn Branch = %q, want %q", req.Branch, want)
+		}
+	})
+
+	t.Run("unset project falls back to loom-core (never empty)", func(t *testing.T) {
+		st := newRuntimeStore(t)
+		fr := &fakeRunner{}
+		seedBacklog(t, st, "backlog-fallback")
+		if _, err := CreateImperativeRun(ctx, st.Workflow, "wf-canary-fb", "backlog-fallback"); err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		// No SetSpawnDefaults call: zero-value interpreter.
+		interp := NewWorkflowInterpreter(st.Workflow, fr, nil)
+		NewWorkflowScheduler(st.Workflow, interp, alwaysOn{}, nil).tick(ctx)
+
+		fr.mu.Lock()
+		req := fr.lastReq
+		fr.mu.Unlock()
+		if req.Project != "loom-core" {
+			t.Fatalf("fallback spawn Project = %q, want loom-core", req.Project)
+		}
+		if req.Branch == "" {
+			t.Fatalf("spawn Branch must never be empty (HUD spawn API requires it)")
+		}
+	})
 }
 
 // TestRuntime_CrashResume drives partway (agent step recorded, run interrupted
