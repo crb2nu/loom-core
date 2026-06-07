@@ -185,6 +185,13 @@ func (o *operator) httpMux() *http.ServeMux {
 	mux.HandleFunc("POST /api/mills/pipeline/runs/{id}/escalate", requireAdmin(o.handlePipelineEscalate))
 	mux.HandleFunc("POST /api/mills/pipeline/runs/{id}/subrun", requireAdmin(o.handlePipelineSubrunCreate))
 
+	// Workflow step-log (plan .loom/134 §S4a). Read-only views over the durable
+	// workflow_runs/workflow_steps journal so an operator can observe an
+	// imperative run's step log live (vs. `kubectl exec … sqlite3`). The detail
+	// endpoint nests steps inline, mirroring the pipeline run+stages pattern.
+	mux.HandleFunc("GET /api/mills/workflow/runs", o.handleWorkflowRunsList)
+	mux.HandleFunc("GET /api/mills/workflow/runs/{id}", o.handleWorkflowRunGet)
+
 	// Backlog.
 	mux.HandleFunc("GET /api/mills/backlog", o.handleBacklogList)
 	mux.HandleFunc("GET /api/mills/backlog/{id}", o.handleBacklogGet)

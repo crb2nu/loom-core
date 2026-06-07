@@ -131,6 +131,136 @@ func (d *WorkflowDAO) ListRunningImperativeRuns(ctx context.Context) ([]*Workflo
 	return out, rows.Err()
 }
 
+// ListWorkflowRuns returns the most-recent workflow runs across every engine
+// and state, newest-first, bounded by limit. "Newest" is ordered by
+// COALESCE(started_at, ”) DESC then id DESC so a run with no started_at still
+// sorts deterministically (it sinks to the bottom of the same timestamp bucket).
+// A non-positive limit falls back to a sane default so the list endpoint never
+// returns an unbounded payload. This powers GET /api/mills/workflow/runs (the
+// HUD step-log list), the read-only counterpart to ListRunningImperativeRuns
+// (which the scheduler uses to drive only running imperative work).
+func (d *WorkflowDAO) ListWorkflowRuns(ctx context.Context, limit int) ([]*WorkflowRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+workflowRunColumns+` FROM workflow_runs
+		 ORDER BY COALESCE(started_at, '') DESC, id DESC
+		 LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("workflow list runs: %w", err)
+	}
+	defer rows.Close()
+	var out []*WorkflowRun
+	for rows.Next() {
+		run, err := scanWorkflowRun(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, run)
+	}
+	return out, rows.Err()
+}
+
+// CountRunsByState returns the number of workflow runs currently in the given
+// state, across every engine. Used by the KPI snapshot
+// (workflow_quarantined_runs) and the WorkflowMonitor active-run count. This is
+// a point-in-time count (no time window): run states are mutable, so "how many
+// are quarantined right now" is the meaningful question, not "how many entered
+// quarantine in the last 24h".
+func (d *WorkflowDAO) CountRunsByState(ctx context.Context, state WorkflowRunState) (int, error) {
+	row := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workflow_runs WHERE state = ?`, string(state))
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("workflow count runs by state %s: %w", state, err)
+	}
+	return n, nil
+}
+
+// StepCostRollup is the COST-SOURCE-BRANCHED aggregate of step costs over a
+// time window. It deliberately does NOT expose a single blended total: summing
+// `real` + `estimated` + `unavailable`(=0) as if comparable is the exact error
+// this type exists to prevent. Callers (KPI writer) roll up only the buckets
+// they can defend — by default just `real`.
+type StepCostRollup struct {
+	// RealCostUSD is the sum of cost_usd for steps whose cost_source='real'.
+	RealCostUSD float64
+	// RealSteps is the count of cost_source='real' steps (the denominator for
+	// an honest average cost-per-step). Steps with estimated/unavailable cost
+	// are excluded so the average is not diluted by non-comparable figures.
+	RealSteps int
+	// EstimatedCostUSD is the sum of cost_usd for steps whose
+	// cost_source='estimated'. Surfaced SEPARATELY (never folded into Real) so
+	// an operator can see estimated burn without it contaminating the real
+	// rollup.
+	EstimatedCostUSD float64
+	// EstimatedSteps is the count of cost_source='estimated' steps.
+	EstimatedSteps int
+	// UnavailableSteps is the count of steps with cost_source='unavailable' (or
+	// NULL). Their cost_usd is 0 by contract; the count is kept so the operator
+	// can see how much of the journal has no usable cost figure at all.
+	UnavailableSteps int
+}
+
+// StepCostRollupSince aggregates step costs in the window [since, now), BRANCHED
+// on cost_source. This is the load-bearing primitive behind the
+// CostSource-aware KPI counters: a single GROUP BY over cost_source so the
+// caller can roll up `real`, surface `estimated` separately, and never blend
+// the two. NULL cost_source is treated as 'unavailable' (the schema default
+// intent). The window is keyed on COALESCE(started_at, ended_at) so a step that
+// only carries an ended_at still falls in the right bucket.
+func (d *WorkflowDAO) StepCostRollupSince(ctx context.Context, since time.Time) (StepCostRollup, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT COALESCE(cost_source, 'unavailable') AS src,
+		       COALESCE(SUM(cost_usd), 0) AS total,
+		       COUNT(*) AS n
+		FROM workflow_steps
+		WHERE COALESCE(started_at, ended_at, '') >= ?
+		GROUP BY src
+	`, timeRFC3339(since.UTC()))
+	if err != nil {
+		return StepCostRollup{}, fmt.Errorf("workflow step cost rollup: %w", err)
+	}
+	defer rows.Close()
+	var out StepCostRollup
+	for rows.Next() {
+		var src string
+		var total float64
+		var n int
+		if err := rows.Scan(&src, &total, &n); err != nil {
+			return StepCostRollup{}, fmt.Errorf("workflow step cost rollup scan: %w", err)
+		}
+		switch WorkflowCostSource(src) {
+		case WorkflowCostReal:
+			out.RealCostUSD += total
+			out.RealSteps += n
+		case WorkflowCostEstimated:
+			out.EstimatedCostUSD += total
+			out.EstimatedSteps += n
+		default: // unavailable or any unexpected value: count only.
+			out.UnavailableSteps += n
+		}
+	}
+	return out, rows.Err()
+}
+
+// CountStepsByStatusSince returns the number of steps that reached the given
+// terminal status with an ended_at in [since, now). Drives the
+// workflow_completed_steps / workflow_failed_steps KPI counters. Pending steps
+// have no ended_at and are excluded.
+func (d *WorkflowDAO) CountStepsByStatusSince(ctx context.Context, status WorkflowStepStatus, since time.Time) (int, error) {
+	row := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM workflow_steps
+		WHERE status = ? AND COALESCE(ended_at, '') >= ?
+	`, string(status), timeRFC3339(since.UTC()))
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("workflow count steps by status %s: %w", status, err)
+	}
+	return n, nil
+}
+
 func scanWorkflowRun(scan func(dest ...any) error) (*WorkflowRun, error) {
 	var (
 		run            WorkflowRun
