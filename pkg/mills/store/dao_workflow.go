@@ -102,6 +102,35 @@ func (d *WorkflowDAO) GetWorkflowRun(ctx context.Context, id string) (*WorkflowR
 	return scanWorkflowRun(row.Scan)
 }
 
+// ListRunningImperativeRuns returns every workflow run in state='running' with
+// engine='imperative', oldest first (by rowid via the implicit insertion order
+// of the id PK is not guaranteed; we order by started_at then id for a stable,
+// fairness-preserving scan). This is the WorkflowScheduler's tick query: only
+// imperative runs are driven by the imperative runtime, and only 'running' ones
+// need an advance — paused/done/escalated/quarantined runs are skipped here so
+// the scheduler never touches a stopped run. The dual-source-of-truth invariant
+// holds: legacy 'dag' runs are excluded by the engine predicate.
+func (d *WorkflowDAO) ListRunningImperativeRuns(ctx context.Context) ([]*WorkflowRun, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+workflowRunColumns+` FROM workflow_runs
+		 WHERE state = ? AND engine = ?
+		 ORDER BY COALESCE(started_at, '') ASC, id ASC`,
+		string(WorkflowRunRunning), string(WorkflowEngineImperative))
+	if err != nil {
+		return nil, fmt.Errorf("workflow list running imperative: %w", err)
+	}
+	defer rows.Close()
+	var out []*WorkflowRun
+	for rows.Next() {
+		run, err := scanWorkflowRun(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, run)
+	}
+	return out, rows.Err()
+}
+
 func scanWorkflowRun(scan func(dest ...any) error) (*WorkflowRun, error) {
 	var (
 		run            WorkflowRun
