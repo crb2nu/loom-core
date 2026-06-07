@@ -50,6 +50,13 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	mux.HandleFunc("GET /api/mills/council/runs/{id}/debate", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/pipeline/runs", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/pipeline/runs/{id}", mw(d.handleProxyGet))
+	// Durable workflow step-log (plan .loom/134 §S4). Read-only journal
+	// views proxied through without an admin gate so the HUD's Workflows
+	// panel can poll them; they back the S1c step-timeline observation
+	// surface. Without these the SPA fallback serves HTML to
+	// /workflow/runs, which the frontend then fails to JSON.parse.
+	mux.HandleFunc("GET /api/mills/workflow/runs", mw(d.handleProxyGet))
+	mux.HandleFunc("GET /api/mills/workflow/runs/{id}", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/backlog", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/backlog/{id}", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/eval/scores", mw(d.handleProxyGet))

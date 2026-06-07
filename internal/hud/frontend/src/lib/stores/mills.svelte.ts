@@ -139,6 +139,75 @@ type PipelineDetailLoadState =
   | { status: 'loaded'; detail: PipelineRunDetail }
   | { status: 'error'; message: string };
 
+// --- Durable workflow step-log (plan .loom/134 §S4) -----------------------
+//
+// These mirror the operator's S4a read endpoints (handlers_workflow.go).
+// Unlike the pipeline endpoints (which use Go default PascalCase encoding),
+// the workflow handlers carry explicit snake_case json tags, so the field
+// names here are snake_case to match the wire shape verbatim. The contract
+// is pinned operator-side by handlers_workflow_test.go — if a tag changes
+// there, change it here too.
+
+// WorkflowRun is the flat per-row summary returned by
+// GET /api/mills/workflow/runs (and embedded as `run` in the detail
+// response). step_count is only populated on the detail endpoint, so it's
+// optional. cost_usd is the aggregate spend the runtime attributed to the
+// run; its provenance is per-step (see WorkflowStep.cost_source).
+export interface WorkflowRun {
+  id: string;
+  backlog_id?: string;
+  engine: string;
+  template: string;
+  state: string;
+  started_at?: string;
+  ended_at?: string;
+  cost_usd: number;
+  step_count?: number;
+}
+
+// WorkflowStep is one row of the durable replay log returned by
+// GET /api/mills/workflow/runs/{id}. `badge` is server-derived
+// (deriveStepBadge) so the UI never re-implements the cache-hit heuristic;
+// `cost_source` is the provenance of cost_usd and must NEVER be blended —
+// an "estimated" cost is not a "real" one. effect_count == 0 on a success
+// is what the operator's badge logic reads as a replay (cache_hit).
+export type WorkflowStepBadge =
+  | 'quarantined'
+  | 'cache_hit'
+  | 'live'
+  | 'pending'
+  | 'failed';
+
+export type WorkflowCostSource = 'real' | 'estimated' | 'unavailable' | string;
+
+export interface WorkflowStep {
+  id: number;
+  step_key: string;
+  event_type: string;
+  status: string;
+  spawn_id?: string;
+  call_hash: string;
+  cost_usd: number;
+  cost_source?: WorkflowCostSource;
+  effect_count: number;
+  started_at?: string;
+  ended_at?: string;
+  badge: WorkflowStepBadge | string;
+}
+
+// WorkflowRunDetail is the {run, steps} payload from the detail endpoint —
+// run summary (with step_count) plus the append-ordered step log.
+export interface WorkflowRunDetail {
+  run: WorkflowRun;
+  steps: WorkflowStep[];
+}
+
+type WorkflowDetailLoadState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'loaded'; detail: WorkflowRunDetail }
+  | { status: 'error'; message: string };
+
 export interface CouncilRun {
   ID: string;
   Trigger: string;
@@ -421,6 +490,20 @@ class MillsStore {
   historyLoading = $state(false);
   historyError = $state<string | null>(null);
   historyActive = $state(false);
+
+  // Durable workflow step-log (plan .loom/134 §S4b). The workflow_runs /
+  // workflow_steps journal is a separate surface from the DAG pipeline
+  // runs, so it has its own list + drilldown state and its own loaders
+  // (loadWorkflowRuns / loadWorkflowRunDetail). The Workflows panel owns
+  // the poll cadence; the detail drawer renders off selectedWorkflowID +
+  // workflowDetailByID, mirroring the pipeline drawer pattern. Errors are
+  // local to the workflow surface so a journal hiccup never red-flags the
+  // rest of the Mills tabs.
+  workflowRuns = $state<WorkflowRun[]>([]);
+  workflowLoading = $state(false);
+  workflowError = $state<string | null>(null);
+  selectedWorkflowID = $state<string | null>(null);
+  workflowDetailByID = $state<Record<string, WorkflowDetailLoadState>>({});
 
   // Connection state
   loading = $state(false);
@@ -924,6 +1007,98 @@ class MillsStore {
       `/api/mills/pipeline/runs?mr_iid=${encodeURIComponent(String(mrIID))}`,
     );
     return runs ?? [];
+  }
+
+  // --- Durable workflow step-log loaders (plan .loom/134 §S4b) -----------
+
+  // loadWorkflowRuns pulls the most-recent workflow runs (summary shape),
+  // newest-first, from GET /api/mills/workflow/runs. Bounded by the
+  // operator's own limit (default 50, max 200). A 503 means the operator
+  // is unconfigured — fetchAll already flips `disabled` for that, so we
+  // swallow it here to keep the workflow surface calm rather than red. Any
+  // open detail drawer is refreshed on the same call so it tracks in-flight
+  // steps without a close+reopen.
+  async loadWorkflowRuns(limit = 50): Promise<void> {
+    this.workflowLoading = true;
+    this.workflowError = null;
+    try {
+      const res = await this.getJSON<{ runs: WorkflowRun[] }>(
+        `/api/mills/workflow/runs?limit=${encodeURIComponent(String(limit))}`,
+      );
+      this.workflowRuns = res?.runs ?? [];
+      // Keep an open workflow-detail drawer live on the same cadence.
+      if (this.selectedWorkflowID) {
+        void this.loadWorkflowRunDetail(this.selectedWorkflowID);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('503') || msg.toLowerCase().includes('not configured')) {
+        this.workflowRuns = [];
+        this.workflowError = null;
+      } else {
+        this.workflowError = msg;
+      }
+    } finally {
+      this.workflowLoading = false;
+    }
+  }
+
+  // openWorkflowDetail is the derived load-state for the selected run id;
+  // null when nothing is open so the drawer renders off one signal.
+  get openWorkflowDetail(): WorkflowDetailLoadState | null {
+    if (!this.selectedWorkflowID) return null;
+    return this.workflowDetailByID[this.selectedWorkflowID] ?? { status: 'idle' };
+  }
+
+  // openWorkflowRunDetail opens the step-timeline drawer for a run.
+  // Cache-on-success: re-opening renders instantly from cache while a
+  // fresh fetch refreshes in the background; 'loading' is only set when
+  // there's no cached payload yet, so re-open doesn't flash empty.
+  openWorkflowRunDetail(runID: string): void {
+    if (!runID) return;
+    this.selectedWorkflowID = runID;
+    const cached = this.workflowDetailByID[runID];
+    if (!cached || cached.status === 'idle' || cached.status === 'error') {
+      this.workflowDetailByID = {
+        ...this.workflowDetailByID,
+        [runID]: { status: 'loading' },
+      };
+    }
+    void this.loadWorkflowRunDetail(runID);
+  }
+
+  closeWorkflowDetail(): void {
+    this.selectedWorkflowID = null;
+  }
+
+  // loadWorkflowRunDetail fetches one run + its step log from
+  // GET /api/mills/workflow/runs/{id} (the {run, steps} payload) and caches
+  // it keyed by id. A null body is treated as not-found so the drawer shows
+  // a retry rather than an empty pane.
+  async loadWorkflowRunDetail(runID: string): Promise<void> {
+    if (!runID) return;
+    try {
+      const detail = await this.getJSON<WorkflowRunDetail>(
+        `/api/mills/workflow/runs/${encodeURIComponent(runID)}`,
+      );
+      if (!detail || !detail.run) {
+        this.workflowDetailByID = {
+          ...this.workflowDetailByID,
+          [runID]: { status: 'error', message: 'workflow run not found' },
+        };
+        return;
+      }
+      this.workflowDetailByID = {
+        ...this.workflowDetailByID,
+        [runID]: { status: 'loaded', detail },
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this.workflowDetailByID = {
+        ...this.workflowDetailByID,
+        [runID]: { status: 'error', message },
+      };
+    }
   }
 
   startPolling(intervalMs = 60000): void {
