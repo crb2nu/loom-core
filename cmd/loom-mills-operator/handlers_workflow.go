@@ -7,7 +7,35 @@ import (
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/mills/workflow"
 )
+
+// handleWorkflowCanaryStart launches the S6-min canary imperative run for the
+// S1c deployed dual-crash kill-test. workflow.CreateImperativeRun is otherwise
+// an in-process Go func (S7 council selection does not exist yet), so S1c had
+// no remote way to enqueue an imperative run. Admin-gated + mutating. Creating
+// the run while policy.workflows.enabled=false is harmless — the WorkflowScheduler
+// self-gates and won't advance it until the flag flips (the canary window).
+func (o *operator) handleWorkflowCanaryStart(w http.ResponseWriter, r *http.Request) {
+	backlogID := r.URL.Query().Get("backlog_id")
+	if backlogID == "" {
+		backlogID = "mills-canary-s1c"
+	}
+	id := "wf-canary-" + strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	run, err := workflow.CreateImperativeRun(r.Context(), o.store.Workflow, id, backlogID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         run.ID,
+		"engine":     string(run.Engine),
+		"template":   run.Template,
+		"state":      string(run.State),
+		"backlog_id": run.BacklogID,
+		"started_at": run.StartedAt,
+	})
+}
 
 // Mills durable-workflow step-log HUD backend (plan .loom/134 §S4a). These
 // endpoints make the workflow_runs / workflow_steps journal (migration 004)

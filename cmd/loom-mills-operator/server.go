@@ -191,6 +191,10 @@ func (o *operator) httpMux() *http.ServeMux {
 	// endpoint nests steps inline, mirroring the pipeline run+stages pattern.
 	mux.HandleFunc("GET /api/mills/workflow/runs", o.handleWorkflowRunsList)
 	mux.HandleFunc("GET /api/mills/workflow/runs/{id}", o.handleWorkflowRunGet)
+	// Admin: launch the S6-min canary imperative run (the only remote entrypoint
+	// to enqueue an imperative run until S7 council selection exists). Used by the
+	// S1c deployed kill-test (.loom/135). Mutating -> requireAdmin.
+	mux.HandleFunc("POST /api/mills/workflow/canary", requireAdmin(o.handleWorkflowCanaryStart))
 
 	// Backlog.
 	mux.HandleFunc("GET /api/mills/backlog", o.handleBacklogList)
