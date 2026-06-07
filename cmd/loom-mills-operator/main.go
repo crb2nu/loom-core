@@ -26,6 +26,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/crb2nu/loom/internal/hud/monitor"
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/audit"
 	"github.com/crb2nu/loom/pkg/mills/clients"
@@ -432,6 +433,20 @@ func run(cfg Config) error {
 	// idles (nil runtime), keeping g.Go balanced.
 	workflowSched := buildWorkflowScheduler(st, pm, hudSpawn, logger)
 
+	// Workflow step-log monitor (plan .loom/134 §S4a). Polls the durable
+	// workflow journal in-process and broadcasts a `hud.workflows`-shaped
+	// snapshot via OnRefresh. The operator has no browser SSE hub, so the
+	// callback emits a structured log line — the live SSE delivery lands when
+	// the Mac-side HUD grows a workflows channel (S4b). Wired into the errgroup
+	// like the schedulers; a nil store/DAO makes its refresh a benign no-op.
+	workflowMonitor := monitor.NewMillsWorkflowMonitor(st.Workflow, logger)
+	workflowMonitor.OnRefresh(func(snap monitor.MillsWorkflowSnapshot) {
+		logger.Debug("workflow snapshot refreshed",
+			"active_runs", snap.ActiveRunCount,
+			"quarantined_runs", snap.QuarantinedCount,
+			"recent_steps", len(snap.RecentSteps))
+	})
+
 	g, gctx := errgroup.WithContext(rootCtx)
 	g.Go(func() error { return runListener(gctx, "http", httpSrv, logger) })
 	g.Go(func() error { return runListener(gctx, "metrics", metricsSrv, logger) })
@@ -439,6 +454,16 @@ func run(cfg Config) error {
 	g.Go(func() error { return crossRunSched.Run(gctx) })
 	g.Go(func() error { return councilSched.Run(gctx) })
 	g.Go(func() error { return workflowSched.Run(gctx) })
+
+	// Drive the workflow monitor's poll loop and stop it on shutdown. Start
+	// kicks off an immediate refresh + a ticker; the g.Go blocks until ctx
+	// cancels, then Stop unblocks the loop's select.
+	workflowMonitor.Start(workflowMonitorInterval)
+	g.Go(func() error {
+		<-gctx.Done()
+		workflowMonitor.Stop()
+		return nil
+	})
 
 	// GitLab issue importer (Slice 1a of plan 43). Opt-in via
 	// policy.intake.gitlab.enabled: true. No-op without a configured
@@ -1075,6 +1100,12 @@ func buildHUDSpawnClient(cfg Config, logger *slog.Logger) *clients.HUDSpawnClien
 	}
 	return c
 }
+
+// workflowMonitorInterval is the poll cadence for the workflow step-log monitor
+// (plan .loom/134 §S4a). 15s matches the HUD MillsMonitor cadence — frequent
+// enough to feel live during the S1c crash window, cheap because each poll is an
+// in-process DAO read of a small journal.
+const workflowMonitorInterval = 15 * time.Second
 
 // buildWorkflowScheduler constructs the S6-min imperative workflow scheduler.
 // It wraps the SAME HUD spawn client the DAG pipeline uses (worker.NewSpawnRunner)

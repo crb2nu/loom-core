@@ -213,11 +213,89 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 		metrics["slice_to_merge_p50_seconds"] = p50
 	}
 
+	// Durable-workflow counters (plan .loom/134 §S4a). These give the HUD
+	// step-log panel + the operator status a headline view of the imperative
+	// runtime without a per-run scan. CRITICAL: workflow_avg_cost_per_step_usd
+	// is branched on cost_source — it rolls up ONLY `real` cost over `real`
+	// steps. Summing real + estimated + unavailable(=0) as if comparable would
+	// produce a meaningless blended figure, so estimated cost is surfaced under
+	// a separate key and never folded into the average.
+	if err := w.recordWorkflowMetrics(ctx, metrics, since); err != nil {
+		return nil, err
+	}
+
 	return &store.KPISnapshot{
 		SnapshotAt:    now,
 		WindowSeconds: int(window.Seconds()),
 		Metrics:       metrics,
 	}, nil
+}
+
+// recordWorkflowMetrics adds the durable-workflow KPI counters to metrics.
+// Split out of snapshot() so the CostSource-branching logic has one home and a
+// dedicated test can assert it. Counters:
+//
+//   - workflow_active_runs        — running imperative runs RIGHT NOW (state,
+//     not window: an active run is a present-tense fact).
+//   - workflow_quarantined_runs   — runs in state='quarantined' right now.
+//   - workflow_completed_steps    — steps that reached status='success' with an
+//     ended_at inside the window.
+//   - workflow_failed_steps       — steps that reached status IN (error,
+//     gate_fail) inside the window.
+//   - workflow_avg_cost_per_step_usd — sum(real cost) / count(real steps) over
+//     the window. ONLY the `real` bucket; estimated cost is surfaced separately
+//     and never blended in. Omitted entirely when there are no real-cost steps
+//     (no synthetic 0 that would read as "free").
+//   - workflow_estimated_cost_usd — sum of `estimated`-source step cost in the
+//     window, kept distinct so an operator sees estimated burn without it
+//     contaminating the real average.
+func (w *KPIWriter) recordWorkflowMetrics(ctx context.Context, metrics map[string]any, since time.Time) error {
+	dao := w.Store.Workflow
+	if dao == nil {
+		return nil
+	}
+
+	activeRuns, err := dao.CountRunsByState(ctx, store.WorkflowRunRunning)
+	if err != nil {
+		return err
+	}
+	quarantinedRuns, err := dao.CountRunsByState(ctx, store.WorkflowRunQuarantined)
+	if err != nil {
+		return err
+	}
+	completedSteps, err := dao.CountStepsByStatusSince(ctx, store.WorkflowStepSuccess, since)
+	if err != nil {
+		return err
+	}
+	failedErr, err := dao.CountStepsByStatusSince(ctx, store.WorkflowStepError, since)
+	if err != nil {
+		return err
+	}
+	failedGate, err := dao.CountStepsByStatusSince(ctx, store.WorkflowStepGateFail, since)
+	if err != nil {
+		return err
+	}
+	rollup, err := dao.StepCostRollupSince(ctx, since)
+	if err != nil {
+		return err
+	}
+
+	metrics["workflow_active_runs"] = activeRuns
+	metrics["workflow_quarantined_runs"] = quarantinedRuns
+	metrics["workflow_completed_steps"] = completedSteps
+	metrics["workflow_failed_steps"] = failedErr + failedGate
+
+	// Branch on CostSource: average only over real-cost steps. Never divide a
+	// blended (real+estimated) numerator — that is the precise mistake the
+	// rollup's separate buckets exist to prevent.
+	if rollup.RealSteps > 0 {
+		metrics["workflow_avg_cost_per_step_usd"] = rollup.RealCostUSD / float64(rollup.RealSteps)
+	}
+	// Surface estimated burn separately so it is visible but isolated.
+	if rollup.EstimatedCostUSD > 0 {
+		metrics["workflow_estimated_cost_usd"] = rollup.EstimatedCostUSD
+	}
+	return nil
 }
 
 // mergedRunDurationP50 returns the median (started_at → ended_at)
