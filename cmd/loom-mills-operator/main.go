@@ -38,6 +38,8 @@ import (
 	"github.com/crb2nu/loom/pkg/mills/runner"
 	"github.com/crb2nu/loom/pkg/mills/squads"
 	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/mills/worker"
+	"github.com/crb2nu/loom/pkg/mills/workflow"
 )
 
 var version = "dev"
@@ -206,10 +208,15 @@ func run(cfg Config) error {
 		defer func() { endOperatorSession(hubClient, operatorSession.SessionID(), logger) }()
 	}
 
+	// HUD spawn client: built ONCE here so both the DAG pipeline dispatcher
+	// AND the S6-min imperative workflow runtime share the exact same client
+	// (zero new pods/services). Nil when LOOM_HUD_URL/TOKEN are unset.
+	hudSpawn := buildHUDSpawnClient(cfg, logger)
+
 	// Worker dispatcher: real clients where configured, NoOpDispatcher
 	// for stages whose backing service isn't wired yet. The operator
 	// logs each gap so it's obvious which surfaces are stub vs production.
-	dispatcher, realStages := buildDispatcher(cfg, flexClient, hubClient, st, logger, autoMergeFor(pm), substrateForStage(pm))
+	dispatcher, realStages := buildDispatcher(cfg, flexClient, hubClient, st, logger, autoMergeFor(pm), substrateForStage(pm), hudSpawn)
 	capabilities.DispatcherRealStages = realStages
 	capabilities.BranchContractReady = true
 	capabilities.BranchContractSource = "pkg/mills/pipeline/branch_contract.go"
@@ -416,12 +423,22 @@ func run(cfg Config) error {
 	councilSched := mills.NewCouncilScheduler(councilRunFn, pm)
 	councilSched.Logger = logger
 
+	// S6-min imperative workflow runtime (plan .loom/134 §S6-min). Always
+	// wired into the errgroup but DEFAULT-OFF: the scheduler self-gates on
+	// policy.workflows.enabled inside every tick, so it is inert until the
+	// S1c canary window flips the flag. It reuses the SAME HUD spawn client
+	// the DAG pipeline uses (wrapped as a worker.WorkerRunner) — zero new
+	// pods/services. When the spawn client is unconfigured the scheduler
+	// idles (nil runtime), keeping g.Go balanced.
+	workflowSched := buildWorkflowScheduler(st, pm, hudSpawn, logger)
+
 	g, gctx := errgroup.WithContext(rootCtx)
 	g.Go(func() error { return runListener(gctx, "http", httpSrv, logger) })
 	g.Go(func() error { return runListener(gctx, "metrics", metricsSrv, logger) })
 	g.Go(func() error { return scheduler.Run(gctx) })
 	g.Go(func() error { return crossRunSched.Run(gctx) })
 	g.Go(func() error { return councilSched.Run(gctx) })
+	g.Go(func() error { return workflowSched.Run(gctx) })
 
 	// GitLab issue importer (Slice 1a of plan 43). Opt-in via
 	// policy.intake.gitlab.enabled: true. No-op without a configured
@@ -804,10 +821,9 @@ func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, 
 //   - GitLabWorker (mr/ci_watch/merge/cleanup): GitLab REST API
 //   - DevboxWorker (tests): mcp-devbox via MCP hub
 //   - SpawnWorker (plan_slice/implement/pr_self_review): HUD mobile API
-func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger, autoMerge func(pipeline.JobContext) bool, substrateFor func(stage string) string) (pipeline.WorkerDispatcher, map[string]bool) {
+func buildDispatcher(cfg Config, flex *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger, autoMerge func(pipeline.JobContext) bool, substrateFor func(stage string) string, spawn *clients.HUDSpawnClient) (pipeline.WorkerDispatcher, map[string]bool) {
 	noop := &pipeline.NoOpDispatcher{}
 	gitlab := buildGitLabClient(cfg, logger)
-	spawn := buildHUDSpawnClient(cfg, logger)
 
 	routes := map[string]pipeline.Worker{}
 	realStages := newCapabilityWiring(cfg).DispatcherRealStages
@@ -1058,6 +1074,27 @@ func buildHUDSpawnClient(cfg Config, logger *slog.Logger) *clients.HUDSpawnClien
 		return nil
 	}
 	return c
+}
+
+// buildWorkflowScheduler constructs the S6-min imperative workflow scheduler.
+// It wraps the SAME HUD spawn client the DAG pipeline uses (worker.NewSpawnRunner)
+// as the runtime's WorkerRunner/WorkerResumer — no new pods or services. The
+// scheduler self-gates on policy.workflows.enabled (default OFF) inside every
+// tick, so it is always safe to wire even when the flag is off.
+//
+// When the spawn client is unconfigured (LOOM_HUD_URL/TOKEN unset) the runner is
+// nil; NewWorkflowScheduler then idles (block-until-cancel) so the operator's
+// g.Go stays balanced and degraded local boots don't error.
+func buildWorkflowScheduler(st *store.Store, pm *mills.PolicyManager, spawn *clients.HUDSpawnClient, logger *slog.Logger) *workflow.WorkflowScheduler {
+	gate := workflow.PolicyGateFunc(func() bool { return pm.Current().WorkflowsEnabled() })
+	if spawn == nil {
+		logger.Warn("imperative workflow runtime disabled (LOOM_HUD_URL/TOKEN unset); scheduler idles")
+		return workflow.NewWorkflowScheduler(nil, nil, gate, logger)
+	}
+	runner := worker.NewSpawnRunner(spawn)
+	interp := workflow.NewWorkflowInterpreter(st.Workflow, runner, logger)
+	logger.Info("imperative workflow runtime wired (default-OFF; flips via policy.workflows.enabled)")
+	return workflow.NewWorkflowScheduler(st.Workflow, interp, gate, logger)
 }
 
 // fallbackDispatcher routes stages with a real worker through that

@@ -49,6 +49,26 @@ type Policy struct {
 	AdaptivePolicy AdaptivePolicy     `yaml:"adaptive_policy,omitempty"`
 	Intake         IntakePolicy       `yaml:"intake,omitempty"`
 	Notify         NotifyPolicy       `yaml:"notify,omitempty"`
+	Workflows      WorkflowsPolicy    `yaml:"workflows,omitempty"`
+}
+
+// WorkflowsPolicy gates the durable imperative workflow runtime (Mills
+// dynamic-workflows, plan .loom/134 §S6-min). It is the kill switch for the
+// Layer-3 runtime: the WorkflowScheduler self-gates on Enabled inside every
+// tick, so a default-OFF flag makes the runtime inert even though it is always
+// wired into the operator's errgroup.
+//
+// Default Enabled=false (see Default()) — S6-min merges to main without
+// activating anything; only the S1c canary window flips it on, then reverts.
+// SubstrateK8sOnly pins imperative spawns to the k8s substrate (the S1c canary
+// targets k8s, NOT harvester-vm); reserved for the runtime to consult once
+// substrate selection is wired (S6-full). Mirrors the Intake/Squads optional-
+// section pattern: an omitted YAML `workflows:` block yields the zero value
+// (Enabled=false), so a v1/v2 policy hot-reloaded onto an S6-min binary keeps
+// the runtime off.
+type WorkflowsPolicy struct {
+	Enabled          bool `yaml:"enabled,omitempty"`
+	SubstrateK8sOnly bool `yaml:"substrate_k8s_only,omitempty"`
 }
 
 // NotifyPolicy controls external notification hooks (Slice 3a).
@@ -415,6 +435,15 @@ func Default() *Policy {
 			Enabled:   false,
 			AutoApply: false,
 		},
+		// S6-min: the durable imperative workflow runtime ships default-OFF.
+		// The scheduler is always wired but self-gates on this flag, so the
+		// runtime is inert until the S1c canary window flips it on (then
+		// reverts). SubstrateK8sOnly defaults false; the runtime treats the
+		// canary as k8s explicitly until S6-full wires substrate selection.
+		Workflows: WorkflowsPolicy{
+			Enabled:          false,
+			SubstrateK8sOnly: false,
+		},
 	}
 }
 
@@ -568,6 +597,19 @@ func (p *Policy) AuditAdvisoryOnly() bool {
 		return true
 	}
 	return *p.Audit.AdvisoryOnly
+}
+
+// WorkflowsEnabled reports whether the durable imperative workflow runtime
+// should advance runs. Nil-safe and YAML-omission-safe: returns false on a nil
+// receiver or when the `workflows:` section is omitted, so the runtime fails
+// CLOSED (inert) by default — the S6-min default-OFF contract. The S1c canary
+// flips policy.workflows.enabled=true in the ConfigMap (hot-reloaded) for the
+// canary window only.
+func (p *Policy) WorkflowsEnabled() bool {
+	if p == nil {
+		return false
+	}
+	return p.Workflows.Enabled
 }
 
 // boolPtr is a tiny convenience for constructing the *bool fields on

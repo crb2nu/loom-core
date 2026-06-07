@@ -32,9 +32,17 @@ type DAOJournal struct {
 // NewDAOJournal builds a journal backed by st.Workflow. The context governs all
 // DAO calls.
 func NewDAOJournal(ctx context.Context, st *store.Store) *DAOJournal {
+	return NewDAOJournalFromDAO(ctx, st.Workflow)
+}
+
+// NewDAOJournalFromDAO builds a journal directly over a *store.WorkflowDAO. The
+// Layer-3 runtime (runtime.go) holds a WorkflowDAO rather than the whole Store,
+// so it constructs its per-run journal through this variant. The context
+// governs all DAO calls.
+func NewDAOJournalFromDAO(ctx context.Context, dao *store.WorkflowDAO) *DAOJournal {
 	return &DAOJournal{
 		ctx:     ctx,
-		dao:     st.Workflow,
+		dao:     dao,
 		ensured: map[string]bool{},
 	}
 }
@@ -68,6 +76,13 @@ func (j *DAOJournal) Append(r Record) error {
 		EventType: eventTypeFor(r.PrimName),
 		CallHash:  r.CallHash,
 		Status:    statusFor(r.Status),
+		// Effect provenance (S6-min). spawn_id + cost_source + cost_usd are set
+		// by a real executor on the terminal step; empty/zero for the stub.
+		// AppendStep's updateStep uses COALESCE(?, spawn_id) so a later replay
+		// append that carries no spawn id never clobbers the recorded one.
+		SpawnID:    r.SpawnID,
+		CostSource: store.WorkflowCostSource(r.CostSource),
+		CostUSD:    r.CostUSD,
 	}
 	if len(r.ResultBlob) > 0 {
 		step.ResultBlob = string(r.ResultBlob)
@@ -146,11 +161,14 @@ func (j *DAOJournal) ensureRun(runID string) error {
 // toRecord translates a durable step into the runtime Record the host consumes.
 func toRecord(s *store.WorkflowStep) Record {
 	r := Record{
-		RunID:    s.RunID,
-		StepKey:  s.StepKey,
-		PrimName: string(s.EventType),
-		CallHash: s.CallHash,
-		Status:   runtimeStatus(s.Status),
+		RunID:      s.RunID,
+		StepKey:    s.StepKey,
+		PrimName:   string(s.EventType),
+		CallHash:   s.CallHash,
+		Status:     runtimeStatus(s.Status),
+		SpawnID:    s.SpawnID,
+		CostSource: string(s.CostSource),
+		CostUSD:    s.CostUSD,
 	}
 	if s.ResultBlob != "" {
 		r.ResultBlob = []byte(s.ResultBlob)

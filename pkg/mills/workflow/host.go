@@ -227,6 +227,10 @@ const (
 // non-determinism (a recorded step that re-derives different args). EffectSeq
 // is the success-row ordinal at record time (for audit). InterpreterVersion is
 // pinned on the run and checked at replay start.
+//
+// SpawnID + CostSource + CostUSD carry the provenance a real effect executor
+// (S6-min: a WorkerRunner-backed agent() call) attaches to the terminal step.
+// The default stub leaves them zero, so the legacy path is byte-identical.
 type Record struct {
 	RunID              string
 	StepKey            string
@@ -236,6 +240,15 @@ type Record struct {
 	ResultBlob         []byte
 	EffectSeq          int64
 	InterpreterVersion string
+
+	// SpawnID is the durable spawn handle the effect produced (agent() →
+	// WorkerResult.SpawnID). Empty for non-spawn effects and the stub.
+	SpawnID string
+	// CostSource is the provenance token (real|estimated|unavailable) of
+	// CostUSD. Empty when no cost is known.
+	CostSource string
+	// CostUSD is the effect's reported cost. Zero for the stub.
+	CostUSD float64
 }
 
 // Journal is the durable read-through store the host funnels every effect
@@ -264,6 +277,35 @@ type EffectHost struct {
 	// deterministic result value. Overridable so a test can inject
 	// goroutine-scheduling jitter into branch effects.
 	liveFn func(primKind string, args map[string]any, seq int64) any
+
+	// effectExec, when non-nil, SUPERSEDES liveFn on the LIVE path. It is the
+	// S6-min seam where a real executor (a WorkerRunner-backed agent() / a gate
+	// evaluator) runs the actual side-effect. Unlike liveFn it receives the
+	// derived stepKey (so it can derive a deterministic per-step idempotency
+	// key) and returns an EffectResult carrying both the memoized value and the
+	// provenance (spawn id, cost) the terminal step records. Nil keeps the
+	// default stub path byte-identical with the spike, so existing tests are
+	// untouched.
+	effectExec func(stepKey, primKind string, args map[string]any, seq int64) (EffectResult, error)
+}
+
+// EffectResult is what a real effect executor returns to the host. Value is the
+// memoized result the journal serialises (and replay returns verbatim);
+// SpawnID/CostSource/CostUSD are the provenance recorded on the terminal step.
+type EffectResult struct {
+	Value      any
+	SpawnID    string
+	CostSource string
+	CostUSD    float64
+}
+
+// SetEffectExec installs the real effect executor (S6-min). Passing nil reverts
+// to the default stub (liveFn) path. Defined as an exported setter so the
+// WorkflowInterpreter (runtime.go) can wire agent()/gate() to a WorkerRunner
+// without reaching into unexported fields from another file's perspective —
+// though same-package, this keeps the seam explicit and documented.
+func (h *EffectHost) SetEffectExec(fn func(stepKey, primKind string, args map[string]any, seq int64) (EffectResult, error)) {
+	h.effectExec = fn
 }
 
 // NewEffectHost builds a host bound to the supplied journal. The default stub
@@ -294,12 +336,19 @@ func (h *EffectHost) checkVersion() error {
 // Algorithm (record-before-effect):
 //  1. derive callHash + stepKey (pure, lock-free per goroutine)
 //  2. defensive version recheck
-//  3. journal.Get -> REPLAY if ok, LIVE if !ok
+//  3. journal.Get -> REPLAY (success/quarantined) or RE-RUN (pending) or LIVE (!ok)
 //     REPLAY: hash mismatch => QUARANTINE (freeze step, no exec, no mass-abort);
 //     prior quarantined => stay frozen; success => decode cached blob, no new
 //     success row.
-//     LIVE: append pending BEFORE effect; run liveFn; append success (which
-//     advances the durable success count).
+//     RE-RUN: a recorded but still-PENDING step is an INTERRUPTED effect (the
+//     process crashed after the pending append but before the success append).
+//     It must NOT short-circuit as a cached success — the success blob is empty.
+//     It falls through to the LIVE/executor path so the effect re-runs. This is
+//     exactly-once-safe because the real executor (S6-min) keys the spawn on a
+//     deterministic idempotency key (run+step+args) and re-attaches via Resume,
+//     so the re-run dedupes to the same spawn rather than double-dispatching.
+//     LIVE: append pending BEFORE effect; run executor/liveFn; append success
+//     (which advances the durable success count).
 func (h *EffectHost) readThrough(stack *ScopeStack, primKind string, args map[string]any) (any, error) {
 	if err := h.checkVersion(); err != nil {
 		return nil, err
@@ -312,7 +361,7 @@ func (h *EffectHost) readThrough(stack *ScopeStack, primKind string, args map[st
 		return nil, err
 	}
 	if ok {
-		// REPLAY path -- short-circuit, NO new success row.
+		// Determinism tripwire applies to ANY recorded step (incl. pending).
 		if prior.CallHash != callHash {
 			if aerr := h.Journal.Append(Record{
 				RunID:    h.RunID,
@@ -328,9 +377,16 @@ func (h *EffectHost) readThrough(stack *ScopeStack, primKind string, args map[st
 		if prior.Status == StatusQuarantined {
 			return nil, &QuarantineError{StepKey: stepKey, Want: prior.CallHash, Got: callHash}
 		}
-		var out any
-		_ = json.Unmarshal(prior.ResultBlob, &out)
-		return out, nil
+		if prior.Status == StatusSuccess {
+			// REPLAY -- short-circuit on the durable success blob, NO new row.
+			var out any
+			_ = json.Unmarshal(prior.ResultBlob, &out)
+			return out, nil
+		}
+		// prior.Status == StatusPending: interrupted effect. Fall through to the
+		// LIVE path to RE-RUN it (exactly-once via the executor's resume/keying).
+		// The pending row already exists, so AppendStep below is an idempotent
+		// no-op advance; the success append then completes it.
 	}
 
 	// LIVE path -- record-before-effect.
@@ -351,7 +407,30 @@ func (h *EffectHost) readThrough(stack *ScopeStack, primKind string, args map[st
 		return nil, err
 	}
 	seq++
-	result := h.liveFn(primKind, args, seq)
+
+	// Real-executor seam (S6-min): when effectExec is wired, it runs the live
+	// side-effect (spawn an agent, evaluate a gate) and returns provenance the
+	// terminal step records. A non-nil error from the executor is propagated
+	// WITHOUT a success append — the pending row stays recoverable, so a
+	// transient spawn failure re-runs on the next tick rather than being frozen.
+	var (
+		result              any
+		spawnID, costSource string
+		costUSD             float64
+	)
+	if h.effectExec != nil {
+		er, eerr := h.effectExec(stepKey, primKind, args, seq)
+		if eerr != nil {
+			return nil, eerr
+		}
+		result = er.Value
+		spawnID = er.SpawnID
+		costSource = er.CostSource
+		costUSD = er.CostUSD
+	} else {
+		result = h.liveFn(primKind, args, seq)
+	}
+
 	blob, _ := json.Marshal(result)
 	if err := h.Journal.Append(Record{
 		RunID:              h.RunID,
@@ -362,6 +441,9 @@ func (h *EffectHost) readThrough(stack *ScopeStack, primKind string, args map[st
 		ResultBlob:         blob,
 		EffectSeq:          seq,
 		InterpreterVersion: h.InterpreterVersion,
+		SpawnID:            spawnID,
+		CostSource:         costSource,
+		CostUSD:            costUSD,
 	}); err != nil {
 		return nil, err
 	}
