@@ -10,6 +10,7 @@
 		0034FF0A8F95401700D87E5C /* CompactSparkline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62324BA9DC53973102DF1B85 /* CompactSparkline.swift */; };
 		0154632F64A9B778BD328148 /* HealthSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 258CB4A2EE68D95676AB445E /* HealthSummary.swift */; };
 		040848B887479AF5C3F593F6 /* DashboardInboxHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F174A7BC7D577B63F9B5A61 /* DashboardInboxHeader.swift */; };
+		0579AA80BE3A8C0E4BC771C1 /* RecoveryTelemetryUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12EB071A139AADC165EFD99E /* RecoveryTelemetryUploader.swift */; };
 		0BB6F08961D982D9BF1023F8 /* LoomCompanionKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0965F79DE443186E70D59245 /* LoomCompanionKit.framework */; };
 		0D01D277C24B8DA64CB64C59 /* SessionLiveActivityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABD30CC7930CFA14D3DB2836 /* SessionLiveActivityView.swift */; };
 		0FD22322A54C0DA5ED21C612 /* LoomListRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04FF7B8133D3CCC0DC42AB08 /* LoomListRow.swift */; };
@@ -205,6 +206,7 @@
 		0B2A65F47D87C55A22DF2C6F /* StatusBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBadge.swift; sourceTree = "<group>"; };
 		128A41D03D42222D5284768B /* WorkflowActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkflowActivity.swift; sourceTree = "<group>"; };
 		12B1DCFD032943745B95EAED /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		12EB071A139AADC165EFD99E /* RecoveryTelemetryUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecoveryTelemetryUploader.swift; sourceTree = "<group>"; };
 		13953CDE3FE9EFAF412B840C /* StatusAccentBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusAccentBar.swift; sourceTree = "<group>"; };
 		154FBD88AB4A47A607ED2A12 /* LoomSpacing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoomSpacing.swift; sourceTree = "<group>"; };
 		17A2132D530D3FDF174A39E6 /* OpsPipelinesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpsPipelinesSection.swift; sourceTree = "<group>"; };
@@ -709,6 +711,7 @@
 			children = (
 				9D65752DA1D831C10454937C /* APIClient.swift */,
 				28F7DB448F3181FBEFEA5CFA /* Endpoint.swift */,
+				12EB071A139AADC165EFD99E /* RecoveryTelemetryUploader.swift */,
 				3E658DFA7DF9965AC39ECCB3 /* SSEClient.swift */,
 				6DF3DC44CF14DC2FB3F085E0 /* TokenStore.swift */,
 			);
@@ -1005,6 +1008,7 @@
 				FC1B91C2A4A2028B900412BC /* PipelineActivity.swift in Sources */,
 				F91AF5E5C440230EB88D369A /* PushNotificationsViewModel.swift in Sources */,
 				CEA20399E44A121B9F0A26F1 /* PushRegistration.swift in Sources */,
+				0579AA80BE3A8C0E4BC771C1 /* RecoveryTelemetryUploader.swift in Sources */,
 				CA3E87BA5DCD0F9C63673CCD /* SSEClient.swift in Sources */,
 				DA600382FA8A38A745C7D345 /* SessionActivity.swift in Sources */,
 				48A3D19024FFB62A715E7B38 /* SessionDetail.swift in Sources */,

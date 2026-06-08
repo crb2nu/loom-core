@@ -75,6 +75,13 @@ public final class ConnectionHealthMonitor {
     @ObservationIgnored
     public var onPollRefresh: (() async -> Void)?
 
+    /// Callback fired when a transient outage resolves and a new recovery sample
+    /// is recorded. Receives a snapshot of the rolling window (seconds, newest
+    /// last). Set by the wiring layer to publish recovery telemetry; symmetric
+    /// to `onPollRefresh`.
+    @ObservationIgnored
+    public var onRecovery: (@Sendable ([TimeInterval]) async -> Void)?
+
     public init(now: @escaping () -> Date = { Date() }) {
         self.now = now
     }
@@ -218,6 +225,12 @@ public final class ConnectionHealthMonitor {
         recoverySampleSeconds.append(seconds)
         if recoverySampleSeconds.count > Self.maxRecoverySamples {
             recoverySampleSeconds.removeFirst(recoverySampleSeconds.count - Self.maxRecoverySamples)
+        }
+        // Publish the updated window (telemetry uploader, MBL-5 slice 2). Snapshot
+        // first so the detached task never captures `self`.
+        if let onRecovery {
+            let snapshot = recoverySampleSeconds
+            Task { await onRecovery(snapshot) }
         }
     }
 

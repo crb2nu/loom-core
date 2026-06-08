@@ -827,7 +827,8 @@ Source: `internal/hud/domain/mobile/handler_push.go`
 
 Cross-surface publishing of the in-app SSE disconnect-to-recovered SLO telemetry
 (`ConnectionHealthMonitor`, `.loom/137`) so the HUD can show fleet recovery health.
-Backend ingestion + aggregation is slice 1 of 3; the iOS uploader and HUD tile follow.
+Backend ingestion + aggregation (slice 1) and the iOS uploader (slice 2) are done; the
+HUD recovery-SLO tile is the remaining slice.
 
 #### POST `/api/mobile/v1/telemetry/recovery`
 
@@ -879,6 +880,13 @@ device's snapshot.
 - `401 unauthorized` — invalid bearer token
 - `403 forbidden` — missing `mobile:telemetry` scope
 - `429 rate_limited` — mutation-class rate limit exceeded
+
+**iOS companion client (slice 2, `.loom/139`):** the app's `RecoveryTelemetryUploader`
+posts its rolling `ConnectionHealthMonitor.recoverySampleSeconds` window on each
+transient-outage recovery. Resending the full window is idempotent (the backend
+replaces the device snapshot). The uploader dedups an unchanged window, **stops
+permanently after a 403** (scope off by default), and treats `429`/other errors as
+transient — keeping the write ingress disciplined while the scope remains unenabled.
 
 #### GET `/api/mobile/v1/telemetry/recovery`
 

@@ -51,6 +51,13 @@ public enum Endpoint: Sendable {
     case handoffs(limit: Int? = nil)
     case namespaces
 
+    // MBL-5 slice 2 — recovery-SLO telemetry uploader. POSTs a device's rolling
+    // disconnect-to-recovered window to the slice-1 ingest endpoint. Scope-gated
+    // server-side by `mobile:telemetry` (off by default); the uploader degrades
+    // gracefully when that scope is not granted. Keyed by the X-Device-ID header
+    // that `APIClient` already attaches to every request.
+    case recoveryTelemetryUpload(samples: [Double], sloTargetSeconds: Double)
+
     // Phase 7 slice 7.5 — Mills screen reads. These hit the HUD's
     // /api/mills/* proxy directly (different prefix from /api/mobile/v1/*).
     // Both are read-only and tolerate the operator-not-configured 503 the
@@ -82,7 +89,8 @@ public enum Endpoint: Sendable {
         case .createSession, .endSession, .pushRegister, .pushUnregister,
              .sandboxStart, .sandboxStop, .spawnAgent, .spawnStop,
              .workflowApprove, .workflowReject,
-             .spawnSendMessage, .spawnInterrupt:
+             .spawnSendMessage, .spawnInterrupt,
+             .recoveryTelemetryUpload:
             return "POST"
         }
     }
@@ -185,6 +193,8 @@ public enum Endpoint: Sendable {
             return "/api/mobile/v1/handoffs"
         case .namespaces:
             return "/api/mobile/v1/namespaces"
+        case .recoveryTelemetryUpload:
+            return "/api/mobile/v1/telemetry/recovery"
         case .millsPipelineRuns:
             return "/api/mills/pipeline/runs"
         case .millsKPIs:
@@ -205,7 +215,8 @@ public enum Endpoint: Sendable {
         case .workflowApprove, .workflowReject, .createSession, .endSession,
              .pushRegister, .pushUnregister, .sandboxStart, .sandboxStop,
              .spawnAgent, .spawnStop,
-             .spawnSendMessage, .spawnInterrupt:
+             .spawnSendMessage, .spawnInterrupt,
+             .recoveryTelemetryUpload:
             return true
         default:
             return false
@@ -434,6 +445,14 @@ public enum Endpoint: Sendable {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             var body: [String: Any] = ["step_id": stepId]
             if let reason { body["reason"] = reason }
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        case let .recoveryTelemetryUpload(samples, sloTargetSeconds):
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "samples": samples,
+                "slo_target_seconds": sloTargetSeconds,
+            ]
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         default:
