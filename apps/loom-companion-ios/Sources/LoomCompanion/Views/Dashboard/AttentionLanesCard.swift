@@ -232,16 +232,10 @@ struct AttentionLanesCard: View {
     }
 
     private func laneIcon(_ type: String) -> String {
-        switch type {
-        case "approval", "workflow_approval": return "checkmark.seal"
-        case "degraded_server", "server_health": return "exclamationmark.triangle"
-        case "blocked_task", "blocker": return "hand.raised"
-        case "idle_agent", "stale_heartbeat": return "person.fill.questionmark"
-        case "conflict", "merge_conflict": return "arrow.triangle.merge"
-        case "handoff": return "arrow.right.arrow.left"
-        case "_other": return "ellipsis.circle"
-        default: return "flag.fill"
-        }
+        // Mixed-type "_other" bucket keeps its own glyph; everything else resolves
+        // through the shared Kit classifier so icons match the hero card.
+        if type == "_other" { return "ellipsis.circle" }
+        return AttentionLaneKind(typeKey: type).rowIcon
     }
 
     private func fallbackTitle(_ lane: DashboardAttentionLane) -> String {
@@ -324,14 +318,8 @@ private struct AttentionGroup: Identifiable {
     }
 
     static func typeTitleIfKnown(for type: String) -> String? {
-        switch type {
-        case "approval", "workflow_approval": return "Pending approvals"
-        case "degraded_server", "server_health": return "Degraded servers"
-        case "blocked_task", "blocker": return "Blocked tasks"
-        case "idle_agent", "stale_heartbeat": return "Idle agents"
-        case "conflict", "merge_conflict": return "Merge conflicts"
-        case "handoff": return "Pending handoffs"
-        default: return nil
-        }
+        // Aggregate titles come from the shared Kit classifier, keyed on the raw
+        // lane type so multi-lane groups label consistently with the hero card.
+        AttentionLaneKind(typeKey: type).aggregateTitleIfKnown
     }
 }

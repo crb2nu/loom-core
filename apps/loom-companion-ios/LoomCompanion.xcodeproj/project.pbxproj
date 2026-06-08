@@ -55,6 +55,7 @@
 		512991F4CB017E7CC0B3EBD6 /* LiveSessionEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4391D5260AA7C7A652109E3 /* LiveSessionEvent.swift */; };
 		529481AA1364F008AABB1D7A /* TimelineListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F6913A8C8AD409B9046B8A0 /* TimelineListView.swift */; };
 		5297427D09FA2F13F26C87D8 /* LoomPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FC1E43EB5C7C2F5E3FDD87 /* LoomPill.swift */; };
+		578796F162ACA1E54A1E1E8A /* AttentionLaneKind.swift in Sources */ = {isa = PBXBuildFile; fileRef = 816D0777AD3B1554F09D9B40 /* AttentionLaneKind.swift */; };
 		58BE00777930FB0F87CC784E /* SessionsListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80E9760E8E87921284992C11 /* SessionsListView.swift */; };
 		5B3AC9E61710949784CC61BB /* DashboardData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5336E3C4F0A0451AD7F4F7E /* DashboardData.swift */; };
 		5CBA7A390991726272361590 /* CheckFleetHealthIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41BD976B82B11491D10ECF8C /* CheckFleetHealthIntent.swift */; };
@@ -277,6 +278,7 @@
 		80F942D468E002C7585986BA /* ActiveWorkCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActiveWorkCard.swift; sourceTree = "<group>"; };
 		8128EBBB2219D0A2C14482ED /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
 		8128F09702F53DB3BFF5F227 /* AnyCodable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnyCodable.swift; sourceTree = "<group>"; };
+		816D0777AD3B1554F09D9B40 /* AttentionLaneKind.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttentionLaneKind.swift; sourceTree = "<group>"; };
 		82752FCCDCF879D424041BC0 /* AnimatedCounter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimatedCounter.swift; sourceTree = "<group>"; };
 		85BA181AB53B3242E5EC8440 /* OpsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpsViewModel.swift; sourceTree = "<group>"; };
 		88F2FE450A41EBC1375D96E2 /* LoomCompanionApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoomCompanionApp.swift; sourceTree = "<group>"; };
@@ -626,6 +628,7 @@
 				8128F09702F53DB3BFF5F227 /* AnyCodable.swift */,
 				525058B8CC6610D4C955F604 /* APIEnvelope.swift */,
 				531717108CA193976CD1D2E3 /* APIError.swift */,
+				816D0777AD3B1554F09D9B40 /* AttentionLaneKind.swift */,
 				94B9978DB3F68FA11F46E0EC /* ConnectionProfile.swift */,
 				FF1F234E71EBAD74BAF8F8FB /* ConnectionRemediation.swift */,
 				A5336E3C4F0A0451AD7F4F7E /* DashboardData.swift */,
@@ -983,6 +986,7 @@
 				6AE2B81B2649BD1EAC446ACC /* AlertPolicy.swift in Sources */,
 				DBBAA50C4F34C1B27900C576 /* AlertsViewModel.swift in Sources */,
 				9A9C76AD6340ADB9630542B4 /* AnyCodable.swift in Sources */,
+				578796F162ACA1E54A1E1E8A /* AttentionLaneKind.swift in Sources */,
 				FEEC34A014B3BE76C909FA4C /* ConnectionHealthMonitor.swift in Sources */,
 				BE66E00D6F6C28D7C160AC8B /* ConnectionProfile.swift in Sources */,
 				D072038A27840743FE92BC02 /* ConnectionRemediation.swift in Sources */,

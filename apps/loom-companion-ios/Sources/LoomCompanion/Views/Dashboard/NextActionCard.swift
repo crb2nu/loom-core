@@ -228,7 +228,11 @@ struct NextActionCard: View {
     }
 
     private func actionFromLane(_ lane: DashboardAttentionLane, severity: Severity) -> ResolvedAction {
-        let (icon, titleFallback, navAction) = laneMeta(for: lane)
+        // Icon + last-resort title come from the shared Kit classifier so the
+        // hero and the queue card can never disagree on what a lane type means.
+        let icon = lane.kind.heroIcon
+        let titleFallback = lane.kind.singularTitle
+        let navAction = navAction(for: lane)
 
         // Backend often sends a category label (`"Agent lane"`, `"Work lane"`)
         // plus a generic summary (`"blocked tasks"`). That reads as noise in
@@ -279,9 +283,9 @@ struct NextActionCard: View {
         return false
     }
 
-    /// Whether `lane.type` maps to one of the known descriptive fallbacks in
-    /// `laneMeta`. Unknown types fall through to the generic "Review" title
-    /// which we avoid when we can compose something better from `summary`.
+    /// Whether `lane.type` carries a strong enough descriptive fallback that we
+    /// prefer it over composing a title from `summary`. Untyped lanes (e.g.
+    /// `agent`) keep their summary, which is usually the more specific signal.
     private func isTypedLane(_ type: String) -> Bool {
         switch type {
         case "approval", "workflow_approval",
@@ -313,40 +317,24 @@ struct NextActionCard: View {
         return parts.joined(separator: " · ")
     }
 
-    private func laneMeta(for lane: DashboardAttentionLane)
-        -> (icon: String, title: String, nav: DashboardView.DashboardNavAction)
-    {
-        if lane.isTaskLane {
-            return ("hand.raised.fill", "Unblock stalled task", .work)
-        }
-
-        // Derived route. The backend `route` hint is a sensible default, but
-        // we override it when the *type* has a stronger affinity to a
-        // specific surface — e.g. a blocked task should route to Work even
-        // if the backend tagged the lane as `people`.
-        let backendRoute: DashboardView.DashboardNavAction = {
+    /// Destination tab for a lane. Task-shaped lanes always go to Work; otherwise
+    /// the lane's semantic `kind` decides, with the backend `route` hint as the
+    /// fallback for unclassified lanes.
+    private func navAction(for lane: DashboardAttentionLane) -> DashboardView.DashboardNavAction {
+        if lane.isTaskLane { return .work }
+        switch lane.kind {
+        case .agent, .idleAgent:
+            return .people
+        case .server:
+            return .connection
+        case .work, .merge, .conflict, .approval, .handoff:
+            return .work
+        case .other:
             switch lane.route {
             case "people": return .people
             case "connection": return .connection
             default: return .work
             }
-        }()
-        switch lane.type {
-        case "approval", "workflow_approval":
-            return ("checkmark.seal.fill", "Approve workflow step", .work)
-        case "degraded_server", "server_health":
-            return ("exclamationmark.triangle.fill", "Investigate degraded server", .connection)
-        case "blocked_task", "blocker":
-            // Task work lives in the Work tab.
-            return ("hand.raised.fill", "Unblock stalled task", .work)
-        case "idle_agent", "stale_heartbeat":
-            return ("person.fill.questionmark", "Check idle agent", .people)
-        case "conflict", "merge_conflict":
-            return ("arrow.triangle.merge", "Resolve merge conflict", .work)
-        case "handoff":
-            return ("arrow.right.arrow.left", "Accept pending handoff", .work)
-        default:
-            return ("flag.fill", "Review attention lane", backendRoute)
         }
     }
 }
