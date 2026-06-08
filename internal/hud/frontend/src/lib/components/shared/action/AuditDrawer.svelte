@@ -1,5 +1,6 @@
 <script lang="ts">
   import { actionStore, type ActionEntry } from '../../../stores/action.svelte.ts';
+  import { focusTrap } from '../../../actions/focusTrap';
 
   function formatRelative(t: number): string {
     const diff = Math.floor((Date.now() - t) / 1000);
@@ -38,7 +39,7 @@
 {#if open}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div class="audit-scrim" onclick={() => actionStore.closeDrawer()}></div>
-  <aside class="audit-drawer" role="dialog" aria-label="Recent actions" aria-modal="true">
+  <aside class="audit-drawer" role="dialog" aria-label="Recent actions" aria-modal="true" use:focusTrap>
     <header class="audit-header">
       <div class="audit-title">Recent Actions</div>
       <div class="audit-actions">

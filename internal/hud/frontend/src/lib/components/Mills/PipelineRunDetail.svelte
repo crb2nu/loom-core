@@ -10,6 +10,7 @@
     type GateOutcome,
     type StageResult,
   } from '../../stores/mills.svelte.ts';
+  import { focusTrap } from '../../actions/focusTrap';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import { runAdminAction } from './shared/millsActions.ts';
 
@@ -145,7 +146,7 @@
 {#if open}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div class="run-scrim" onclick={close}></div>
-  <aside class="run-drawer" role="dialog" aria-label="Pipeline run detail" aria-modal="true">
+  <aside class="run-drawer" role="dialog" aria-label="Pipeline run detail" aria-modal="true" use:focusTrap>
     <header class="run-header">
       <div class="run-title">
         <span class="run-kicker">Pipeline Run</span>
