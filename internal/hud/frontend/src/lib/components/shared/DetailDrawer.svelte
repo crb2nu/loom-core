@@ -1,7 +1,10 @@
 <script>
+  import { focusTrap } from '../../actions/focusTrap';
+
   /**
    * DetailDrawer — slide-in panel from the right edge for drill-down detail views.
-   * Traps focus when open, closes on Escape or backdrop click.
+   * Traps focus when open (via the shared focusTrap action), closes on Escape or
+   * backdrop click.
    *
    * @type {{
    *   open?: boolean,
@@ -25,26 +28,6 @@
     children,
   } = $props();
 
-  let drawerEl = $state(null);
-  let previousFocus = $state(null);
-
-  $effect(() => {
-    if (open) {
-      previousFocus = document.activeElement;
-      // Focus first focusable element inside drawer after mount
-      requestAnimationFrame(() => {
-        if (drawerEl) {
-          const first = drawerEl.querySelector('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
-          if (first) first.focus();
-          else drawerEl.focus();
-        }
-      });
-    } else if (previousFocus && typeof previousFocus.focus === 'function') {
-      previousFocus.focus();
-      previousFocus = null;
-    }
-  });
-
   function handleKeydown(e) {
     if (e.key === 'Escape') {
       e.stopPropagation();
@@ -63,12 +46,12 @@
   <aside
     class="drawer"
     style:width={width}
-    bind:this={drawerEl}
     role="dialog"
     aria-modal="true"
     aria-label={title || 'Detail panel'}
     tabindex="-1"
     onkeydown={handleKeydown}
+    use:focusTrap
   >
     <!-- Header -->
     <div class="drawer-header">
