@@ -199,3 +199,82 @@ func TestRecoveryRead_RequiresReadScope(t *testing.T) {
 		t.Fatalf("expected 403 without mobile:read, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestHUDRecoveryAggregate verifies the same-origin operator-UI read: no auth
+// required, and the body is the raw aggregate (no {ok,data,meta} envelope) so
+// the HUD Svelte store can consume it like the other /api/* reads.
+func TestHUDRecoveryAggregate(t *testing.T) {
+	d := New(telemetryTestDeps("mobile:read,mobile:telemetry"))
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/mobile/v1/telemetry/recovery", d.handleMobileRecoveryTelemetryIngest)
+	mux.HandleFunc("GET /api/telemetry/recovery", d.handleHUDRecoveryAggregate)
+
+	// Seed one device through the normal ingest path.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, ingestReq(`{"samples":[5,6,7],"slo_target_seconds":30}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ingest: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// HUD-internal read with NO Authorization header — must still succeed.
+	req := httptest.NewRequest("GET", "/api/telemetry/recovery", nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hud read: expected 200 without auth, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Body must be the raw aggregate, not an envelope.
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, hasEnvelope := raw["ok"]; hasEnvelope {
+		t.Errorf("expected raw aggregate, got enveloped response: %s", rec.Body.String())
+	}
+	if _, hasData := raw["data"]; hasData {
+		t.Errorf("expected raw aggregate, got enveloped response: %s", rec.Body.String())
+	}
+
+	var agg RecoveryAggregate
+	if err := json.Unmarshal(rec.Body.Bytes(), &agg); err != nil {
+		t.Fatalf("aggregate did not decode: %v", err)
+	}
+	if agg.DeviceCount != 1 {
+		t.Errorf("device_count = %d, want 1", agg.DeviceCount)
+	}
+	if agg.TotalSamples != 3 {
+		t.Errorf("total_samples = %d, want 3", agg.TotalSamples)
+	}
+	if !agg.MeetsSLO {
+		t.Errorf("meets_slo = false, want true")
+	}
+}
+
+// TestHUDRecoveryAggregate_EmptyStore verifies the operator tile gets a valid
+// vacuous rollup before any device has reported.
+func TestHUDRecoveryAggregate_EmptyStore(t *testing.T) {
+	d := New(telemetryTestDeps("mobile:read"))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/telemetry/recovery", d.handleHUDRecoveryAggregate)
+
+	req := httptest.NewRequest("GET", "/api/telemetry/recovery", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var agg RecoveryAggregate
+	if err := json.Unmarshal(rec.Body.Bytes(), &agg); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if agg.DeviceCount != 0 {
+		t.Errorf("device_count = %d, want 0", agg.DeviceCount)
+	}
+	if !agg.MeetsSLO {
+		t.Errorf("meets_slo = false, want true (vacuous)")
+	}
+	if agg.Devices == nil {
+		t.Errorf("devices should be an empty array, not null")
+	}
+}

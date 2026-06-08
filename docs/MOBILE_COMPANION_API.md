@@ -827,8 +827,9 @@ Source: `internal/hud/domain/mobile/handler_push.go`
 
 Cross-surface publishing of the in-app SSE disconnect-to-recovered SLO telemetry
 (`ConnectionHealthMonitor`, `.loom/137`) so the HUD can show fleet recovery health.
-Backend ingestion + aggregation (slice 1) and the iOS uploader (slice 2) are done; the
-HUD recovery-SLO tile is the remaining slice.
+All three slices are complete: backend ingestion + aggregation (slice 1, `.loom/138`),
+the iOS uploader (slice 2, `.loom/139`), and the HUD recovery-SLO tile (slice 3,
+`.loom/140`).
 
 #### POST `/api/mobile/v1/telemetry/recovery`
 
@@ -917,7 +918,18 @@ average of per-device summaries. `meets_slo` is `fleet_p95_seconds ≤ slo_targe
 
 **Audit:** Ingestion logs `telemetry_recovery_ingest` with `sample_count`.
 
-Source: `internal/hud/domain/mobile/handler_telemetry.go`, `recovery_telemetry.go`
+#### GET `/api/telemetry/recovery` (HUD operator web UI)
+
+Same fleet rollup as the mobile read endpoint above, but served to the HUD
+operator web UI: **same-origin and session-trusted — no bearer token or scope**
+(the browser has no mobile token). The body is the **raw** `RecoveryAggregate`
+(no `{ok,data,meta}` envelope), matching the HUD-internal `/api/*` convention the
+Svelte stores consume. It reads the identical in-memory store, so the figure
+matches what the companion publishes and the mobile read returns. Consumed by the
+`RecoverySLOCard` tile on the HUD Overview panel (slice 3, `.loom/140`).
+
+Source: `internal/hud/domain/mobile/handler_telemetry.go`, `recovery_telemetry.go`;
+HUD tile `internal/hud/frontend/src/lib/components/RecoverySLOCard.svelte`
 
 ---
 

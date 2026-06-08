@@ -61,3 +61,15 @@ func (d *MobileDomain) handleMobileRecoveryTelemetryRead(w http.ResponseWriter, 
 	}
 	d.writeMobileJSON(w, http.StatusOK, d.recovery.Aggregate())
 }
+
+// handleHUDRecoveryAggregate serves the same fleet recovery-SLO rollup to the
+// HUD operator web UI. Unlike the mobile read endpoint it is same-origin and
+// session-trusted (no bearer/scope gate — the browser has no mobile token), and
+// it writes the aggregate raw (no `{ok,data,meta}` envelope) to match the
+// HUD-internal /api/* JSON convention the Svelte stores consume. It reads the
+// identical in-memory store, so the figure matches what the companion publishes.
+//
+// GET /api/telemetry/recovery
+func (d *MobileDomain) handleHUDRecoveryAggregate(w http.ResponseWriter, _ *http.Request) {
+	d.deps.WriteJSON(w, http.StatusOK, d.recovery.Aggregate())
+}

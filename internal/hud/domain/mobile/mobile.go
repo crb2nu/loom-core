@@ -1,5 +1,7 @@
 // Package mobile implements the mobile domain -- companion app REST API
-// (all /api/mobile/v1/* endpoints).
+// (all /api/mobile/v1/* endpoints), plus one same-origin HUD-internal read
+// alias (GET /api/telemetry/recovery) that surfaces the recovery-SLO aggregate
+// to the operator web UI without the mobile bearer/scope gate.
 package mobile
 
 import (
@@ -53,6 +55,12 @@ func (d *MobileDomain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFu
 	mux.HandleFunc("GET /api/mobile/v1/sandbox", mw(d.handleMobileSandbox))
 	mux.HandleFunc("GET /api/mobile/v1/telemetry/recovery", mw(d.handleMobileRecoveryTelemetryRead))
 	mux.HandleFunc("GET /api/mobile/v1/pipelines", mw(d.handleMobilePipelines))
+
+	// HUD operator web UI (same-origin, session-trusted): the recovery-SLO
+	// aggregate, raw (no envelope), reading the same store as the mobile read
+	// above. The Svelte recovery tile consumes this — the browser has no mobile
+	// bearer token, so it cannot use the /api/mobile/v1 route.
+	mux.HandleFunc("GET /api/telemetry/recovery", mw(d.handleHUDRecoveryAggregate))
 	mux.HandleFunc("GET /api/mobile/v1/handoffs", mw(d.handleMobileHandoffs))
 	mux.HandleFunc("POST /api/mobile/v1/handoffs/{handoff_id}/accept", mw(d.handleMobileHandoffAccept))
 	mux.HandleFunc("POST /api/mobile/v1/handoffs/{handoff_id}/reject", mw(d.handleMobileHandoffReject))
