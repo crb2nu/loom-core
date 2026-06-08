@@ -98,6 +98,7 @@ This section freezes the v1 endpoint allowlist for the `mobile_operator` role. R
 | `/api/mobile/v1/audit` | `GET` | `advanced_read` | allow | `mobile:read` |
 | `/api/mobile/v1/alerts/policy` | `GET` | `core_operator` | allow | `mobile:read` |
 | `/api/mobile/v1/sandbox` | `GET` | `core_operator` | allow | `mobile:read` |
+| `/api/mobile/v1/telemetry/recovery` | `GET` | `core_operator` | allow | `mobile:read` |
 | `/api/mobile/v1/pipelines` | `GET` | `core_operator` | allow | `mobile:read` |
 | `/api/mobile/v1/handoffs` | `GET` | `core_operator` | allow | `mobile:read` |
 | `/api/mobile/v1/handoffs/{handoff_id}/accept` | `POST` | `guarded_mutation` | allow | `mobile:read` |
@@ -115,6 +116,7 @@ This section freezes the v1 endpoint allowlist for the `mobile_operator` role. R
 | `/api/mobile/v1/sessions/{session_id}/end` | `POST` | `guarded_mutation` | allow | `mobile:session:end` |
 | `/api/mobile/v1/push/register` | `POST` | `guarded_mutation` | allow (feature-flagged) | `mobile:push` |
 | `/api/mobile/v1/push/unregister` | `POST` | `guarded_mutation` | allow (feature-flagged) | `mobile:push` |
+| `/api/mobile/v1/telemetry/recovery` | `POST` | `guarded_mutation` | allow (scope-gated, off by default) | `mobile:telemetry` |
 | `/api/mobile/v1/admin/revoke` | `POST` | `guarded_mutation` | allow (admin-gated) | admin token + `mobile:read` |
 | `/api/mobile/v1/sandbox/start` | `POST` | `guarded_mutation` | allow | `mobile:agent:spawn` |
 | `/api/mobile/v1/sandbox/stop` | `POST` | `guarded_mutation` | allow | `mobile:agent:spawn` |
@@ -818,6 +820,96 @@ Revoke a mobile operator token at runtime. Protected by admin token (`X-Admin-To
 **Audit:** Logs `token_revoke` action.
 
 Source: `internal/hud/domain/mobile/handler_push.go`
+
+---
+
+### Recovery SLO Telemetry (MBL-5)
+
+Cross-surface publishing of the in-app SSE disconnect-to-recovered SLO telemetry
+(`ConnectionHealthMonitor`, `.loom/137`) so the HUD can show fleet recovery health.
+Backend ingestion + aggregation is slice 1 of 3; the iOS uploader and HUD tile follow.
+
+#### POST `/api/mobile/v1/telemetry/recovery`
+
+Ingest one device's rolling window of disconnect-to-recovered durations. Scope:
+`mobile:telemetry`. **Off by default** — operators must add `mobile:telemetry` to
+`HUD_MOBILE_OPERATOR_SCOPES` to enable ingestion (mirrors `mobile:agent:spawn`).
+Keyed by the `X-Device-ID` header; rate-limited in the mutation class.
+
+**Request body:**
+
+```json
+{
+  "samples": [5.2, 8.1, 22.3],
+  "slo_target_seconds": 30
+}
+```
+
+- `samples` (required): recovery durations in seconds; each must be positive and
+  finite. Non-finite/≤0 values are dropped; the window is truncated to the most
+  recent 50 (matching the in-app `maxRecoverySamples`).
+- `slo_target_seconds` (optional): the device's p95 SLO target. Defaults to `30`
+  (one poll-fallback cycle); clamped to `(0, 3600]`.
+
+**Response `data`:**
+
+```json
+{
+  "accepted": true,
+  "device": {
+    "device_id": "device-123",
+    "sample_count": 3,
+    "mean_seconds": 11.87,
+    "p95_seconds": 22.3,
+    "slo_target_seconds": 30,
+    "meets_slo": true,
+    "updated_at": "2026-06-08T12:00:00Z"
+  }
+}
+```
+
+Per-device `p95_seconds` uses the same nearest-rank formula as the iOS client
+(`rank = ceil(0.95·n)`, `index = clamp(rank-1)`) so the published figure matches
+what operators see in-app. Re-ingesting from the same `X-Device-ID` replaces that
+device's snapshot.
+
+**Error cases:**
+- `400 bad_request` — invalid JSON, empty `samples`, or no positive finite sample
+- `400 missing_device_id` — `X-Device-ID` header absent
+- `401 unauthorized` — invalid bearer token
+- `403 forbidden` — missing `mobile:telemetry` scope
+- `429 rate_limited` — mutation-class rate limit exceeded
+
+#### GET `/api/mobile/v1/telemetry/recovery`
+
+Fleet recovery-SLO rollup pooled across all reporting devices. Scope: `mobile:read`.
+Returns zeros with `meets_slo: true` when no device has reported yet.
+
+**Response `data`:**
+
+```json
+{
+  "device_count": 2,
+  "total_samples": 6,
+  "fleet_mean_seconds": 7.5,
+  "fleet_p95_seconds": 10,
+  "slo_target_seconds": 30,
+  "devices_meeting_slo": 2,
+  "meets_slo": true,
+  "devices": [
+    {"device_id": "dev-a", "sample_count": 3, "mean_seconds": 6, "p95_seconds": 7, "slo_target_seconds": 30, "meets_slo": true, "updated_at": "2026-06-08T12:00:00Z"}
+  ],
+  "updated_at": "2026-06-08T12:00:01Z"
+}
+```
+
+`fleet_mean_seconds` / `fleet_p95_seconds` are computed over the **pooled** samples
+of all devices (a true nearest-rank percentile of the combined window), not an
+average of per-device summaries. `meets_slo` is `fleet_p95_seconds ≤ slo_target_seconds`.
+
+**Audit:** Ingestion logs `telemetry_recovery_ingest` with `sample_count`.
+
+Source: `internal/hud/domain/mobile/handler_telemetry.go`, `recovery_telemetry.go`
 
 ---
 
