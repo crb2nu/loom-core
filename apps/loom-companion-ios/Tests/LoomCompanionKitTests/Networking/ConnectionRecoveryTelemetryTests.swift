@@ -132,6 +132,24 @@ struct ConnectionRecoveryTelemetryTests {
         #expect(monitor.meetsRecoverySLO == false)
     }
 
+    @Test("onRecovery hook fires with the current window when an outage resolves")
+    func onRecoveryHookFires() async {
+        let clock = MutableClock()
+        let monitor = ConnectionHealthMonitor(now: clock.now)
+        monitor.handleSuccess() // established/healthy
+
+        let received: [TimeInterval] = await withCheckedContinuation { continuation in
+            monitor.onRecovery = { samples in
+                continuation.resume(returning: samples)
+            }
+            monitor.handleSSEStateChange(.disconnected)
+            clock.advance(7)
+            monitor.handleSSEStateChange(.connected) // records recovery -> fires onRecovery
+        }
+
+        #expect(received == [7])
+    }
+
     @Test("Rolling window is capped")
     func rollingWindowCapped() {
         let clock = MutableClock()

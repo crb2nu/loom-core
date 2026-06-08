@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var selectedTab: AppTab = .dashboard
     @State private var sseClient: SSEClient?
     @State private var sseBroadcaster = SSEEventBroadcaster()
+    @State private var recoveryUploader: RecoveryTelemetryUploader?
     @State private var pendingSessionDeepLinkID: String?
     @State private var pendingWorkflowDeepLinkID: String?
     @State private var pendingEndSessionPrefillID: String?
@@ -465,6 +466,18 @@ struct ContentView: View {
             healthMonitor?.handleSSEStateChange(state)
         }
         sseClient = client
+
+        // Publish recovery-SLO telemetry to the backend (MBL-5 slice 2). The
+        // uploader is bound to this connection's authenticated client; on each
+        // transient-outage recovery it resends the rolling window (idempotent —
+        // the backend replaces the device snapshot). Degrades gracefully when
+        // the `mobile:telemetry` scope is not granted.
+        let uploader = RecoveryTelemetryUploader(client: apiClient)
+        recoveryUploader = uploader
+        healthMonitor.onRecovery = { samples in
+            await uploader.upload(samples: samples)
+        }
+
         client.connect()
         sseBroadcaster.start(sseClient: client)
     }
@@ -473,5 +486,7 @@ struct ContentView: View {
         sseBroadcaster.stop()
         sseClient?.disconnect()
         sseClient = nil
+        healthMonitor.onRecovery = nil
+        recoveryUploader = nil
     }
 }
