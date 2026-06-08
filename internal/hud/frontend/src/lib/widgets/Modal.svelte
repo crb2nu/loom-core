@@ -1,4 +1,6 @@
 <script>
+  import { focusTrap } from '../actions/focusTrap';
+
   let { open = false, title = '', onClose = () => {}, children } = $props();
 
   function handleBackdropClick(e) {
@@ -13,20 +15,16 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open}
-  <div
-    class="modal-backdrop"
-    role="button"
-    tabindex="0"
-    aria-label="Close modal"
-    onclick={handleBackdropClick}
-    onkeydown={(e) => {
-      if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') handleBackdropClick(e);
-    }}
-  >
-    <div class="modal" role="dialog" aria-modal="true" aria-label={title}>
+  <!-- Backdrop is presentational: click-outside closes, but keyboard users
+       dismiss via Escape (window handler) or the labelled close button, so the
+       backdrop is not itself a focusable control. -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div class="modal-backdrop" onclick={handleBackdropClick}>
+    <div class="modal" role="dialog" aria-modal="true" aria-label={title} use:focusTrap>
       <div class="modal-header">
         <h3 class="modal-title">{title}</h3>
-        <button class="modal-close" onclick={onClose}>✕</button>
+        <button class="modal-close" aria-label="Close" onclick={onClose}>✕</button>
       </div>
       <div class="modal-body">
         {@render children?.()}

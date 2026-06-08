@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { focusTrap } from '../../actions/focusTrap';
+
   interface Props {
     open: boolean;
     title: string;
@@ -37,7 +39,7 @@
 {#if open}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="confirm-backdrop" onkeydown={handleKeydown} onclick={handleBackdropClick}>
-    <div class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" use:focusTrap>
       <div class="confirm-title" id="confirm-title">{title}</div>
       <div class="confirm-message">{message}</div>
       <div class="confirm-actions">

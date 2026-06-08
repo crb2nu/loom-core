@@ -16,21 +16,20 @@
   };
 </script>
 
-{#if toastStore.items.length > 0}
-  <div class="toast-container">
-    {#each toastStore.items as toast (toast.id)}
-      <div
-        class="toast"
-        style="border-left-color: {typeColors[toast.type]};"
-        role="alert"
-      >
-        <span class="toast-icon" style="color: {typeColors[toast.type]};">{typeIcons[toast.type]}</span>
-        <span class="toast-message">{toast.message}</span>
-        <button class="toast-dismiss" onclick={() => toastStore.dismiss(toast.id)}>✕</button>
-      </div>
-    {/each}
-  </div>
-{/if}
+<!-- Persistent live region: always in the DOM so screen readers announce
+     toasts as they are added (polite, additions only). -->
+<div class="toast-container" role="status" aria-live="polite" aria-atomic="false">
+  {#each toastStore.items as toast (toast.id)}
+    <div
+      class="toast"
+      style="border-left-color: {typeColors[toast.type]};"
+    >
+      <span class="toast-icon" style="color: {typeColors[toast.type]};">{typeIcons[toast.type]}</span>
+      <span class="toast-message">{toast.message}</span>
+      <button class="toast-dismiss" aria-label="Dismiss notification" onclick={() => toastStore.dismiss(toast.id)}>✕</button>
+    </div>
+  {/each}
+</div>
 
 <style>
   .toast-container {
