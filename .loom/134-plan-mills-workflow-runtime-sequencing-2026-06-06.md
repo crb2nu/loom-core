@@ -229,8 +229,4 @@ S1c **cannot start** until all of these clear. Treat this as a **gating pre-slic
 
 ---
 
-<<<<<<< Updated upstream
 **Verdict reconciliation note**: no verdict was `broken`. All three were `sound-with-caveats`; every mustChange is incorporated. The two namespace facts that appeared contradictory across verdicts are both true and now disambiguated (§3.1, §4 B4): the spawn **host** is `mobile-hud` in `loom-hub` (`deployment.yaml:177`); the spawn-**state ConfigMap** that `LoadAll` rehydrates is in `devbox` (`store_test.go:173,206`). The single substantive escalation beyond the original design is promoting the AlreadyExists backstop from a "verify which layer enforces dedupe" risk note to a **required code change before S1c** (§5), justified by the verified gap at `internal/hud/spawn.go:691` (no `IsAlreadyExists` handling on the live Create).
-=======
-**Verdict reconciliation note**: no verdict was `broken`. All three were `sound-with-caveats`; every mustChange is incorporated. The two namespace facts that appeared contradictory across verdicts are both true and now disambiguated (§3.1, §4 B4): the spawn **host** is `mobile-hud` in `loom-hub` (`deployment.yaml:177`); the spawn-**state ConfigMap** that `LoadAll` rehydrates is in `devbox` (`store_test.go:173,206`). The single substantive escalation beyond the original design is promoting the AlreadyExists backstop from a "verify which layer enforces dedupe" risk note to a **required code change before S1c** (§5), justified by the verified gap at `internal/hud/spawn.go:691` (no `IsAlreadyExists` handling on the live Create).
->>>>>>> Stashed changes

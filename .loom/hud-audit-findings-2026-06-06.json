@@ -1304,8 +1304,4 @@
     "[responsive] 17 panel/card files in lib/components/ contain `grid-template-columns` declarations with ZERO `@media` rules. The high-leverage systemic fixes are: (1) migrate the Mills `.mills-table` rollouts (Pipelines, Council, Audit) onto the shared DataTable component so they inherit DataTable.svelte:466-515's \u2264800px stacked-card mode for free \u2014 one shared component change wins three panels at once; (2) patch widgets/Modal.svelte:57-58 so every modal consumer in the app fits on a 360px phone; (3) add the missing per-file `@media` fallbacks for the rigid fixed-track grids (Memory, Council/Audit/Weaver row grids, Context Health). FleetPanel.svelte:171's `@media (max-width: 1400px)` is the exemplar to copy.",
     "[hierarchy-polish] High-volume finding: 184 raw px font-size declarations (font-size: 9-13px) across HUD source, vs 501 token-based \u2014 ~27% of font sizes skip the type scale. Concentrated in chip/label/eyebrow patterns (.kind, .lane-name, .strip-summary-*, .inst-label, etc.) that fall outside --text-2xs/xs/sm/base/lg. Single fix is to ban raw px in svelte <style> blocks via stylelint rule + audit the 9px/12px/13px outliers (90% are 10px/11px in disguise).\n\nSecondary aggregate: 30+ hardcoded GitHub-style hex literals (#14161a/#1c1f24/#262a31/#8a929b/#3fb950/#d29922/#58a6ff/#f85149 + 20+ stand-alone state-pill hex like #4090f0/#48c880/#dc5050/#b48cf0) ship in the main bundle (index-B4EEokjT.css) and the Mills chunk CSS files (PipelinesPanel-*.css, CrossRepoCard-*.css). Verified by grep -oE on dist/assets/*.css. Single fix: define the orphan tokens as theme.css aliases (F1) \u2014 eliminates all of them in one PR with zero per-file source edits."
   ]
-<<<<<<< Updated upstream
 }
-=======
-}
->>>>>>> Stashed changes
