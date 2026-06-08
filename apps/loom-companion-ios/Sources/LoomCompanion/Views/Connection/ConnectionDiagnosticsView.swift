@@ -110,7 +110,31 @@ struct ConnectionDiagnosticsView: View {
                 .font(LoomTypography.caption)
                 .foregroundStyle(LoomColors.fgSecondary)
             }
+
+            if healthMonitor.recoveryStats.count > 0 {
+                let stats = healthMonitor.recoveryStats
+                let overSLO = healthMonitor.meetsRecoverySLO == false
+                Label(
+                    recoverySummary(stats, overSLO: overSLO),
+                    systemImage: "arrow.triangle.2.circlepath"
+                )
+                .font(LoomTypography.caption)
+                .foregroundStyle(overSLO ? LoomColors.statusDegraded : LoomColors.fgSecondary)
+            }
         }
+    }
+
+    /// One-line disconnect-to-recovered telemetry summary (MBL-5 SLO).
+    private func recoverySummary(_ stats: SSERecoveryStats, overSLO: Bool) -> String {
+        func secs(_ value: TimeInterval?) -> String {
+            guard let value else { return "—" }
+            return "\(Int(value.rounded()))s"
+        }
+        var summary = "Stream recovery: p95 \(secs(stats.p95Seconds)) · avg \(secs(stats.meanSeconds)) · \(stats.count) sample\(stats.count == 1 ? "" : "s")"
+        if overSLO {
+            summary += " · over \(Int(ConnectionHealthMonitor.recoveryP95TargetSeconds))s SLO"
+        }
+        return summary
     }
 
     private var actionButtons: some View {

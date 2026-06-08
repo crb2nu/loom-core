@@ -130,9 +130,10 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
 - Checklist:
   - [x] Add reconnect state machine tests
   - [x] Add synthetic network churn test scenarios
-  - [ ] Publish recovery SLO telemetry dashboard
+  - [x] Measure disconnect-to-recovered durations + p95 in-app (2026-06-07, `.loom/137`)
+  - [ ] Publish recovery SLO telemetry to a cross-surface (HUD) dashboard
 - Status:
-  - In progress
+  - In progress (in-app measurement done; HUD-side aggregation pending)
 - Implementation notes:
   - SSEClient wired to UI layer in ContentView: creates client on auth, wires `onStateChange` → `ConnectionHealthMonitor.handleSSEStateChange`, connects/disconnects on login/logout
   - DashboardView consumes SSEClient via `DashboardViewModel.startListening()`: refresh events reload dashboard, notification events forward to AlertsViewModel
@@ -142,6 +143,7 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
   - 4 new tests: event forwarding, cancel-before-restart, stopListening, refresh-triggers-reload
   - SSE reconnect tests already existed (9 tests in SSE Client Reconnect suite)
   - **Synthetic network churn** (8 tests in `SSENetworkChurnTests.swift`): rapid fail/succeed cycling (5 cycles), event preservation across churn, health monitor transitions under churn, polling fallback activation/deactivation, disconnect during reconnecting, backoff reset across churn cycles, full SSE→poll→SSE recovery path, rapid drop no-poll-stacking
+  - **Recovery telemetry** (2026-06-07, `.loom/137`): `ConnectionHealthMonitor` now times each transient outage (healthy → degradedStream/unreachable/rateLimited → healthy) via an injectable clock and exposes `recoveryStats` (count/mean/p95), `lastRecoveryDuration`, `degradedSince`, `currentOutageSeconds()`, and `meetsRecoverySLO`. SLO target defined: **p95 ≤ 30s** (`recoveryP95TargetSeconds`, one poll-fallback cycle). Cold-start failures and non-transient config errors (auth/permission/gateway) are excluded. Surfaced as a one-line summary in `ConnectionDiagnosticsView`. 8 tests in `ConnectionRecoveryTelemetryTests.swift`. Remaining: aggregate/publish to the HUD web dashboard (cross-surface).
 
 ### Issue MBL-6: Notification severity and action policy (M4)
 
