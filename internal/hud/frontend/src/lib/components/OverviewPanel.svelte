@@ -31,6 +31,7 @@
   import { liveSessionsStore } from '../stores/liveSessions.svelte.ts';
   import MillsKPIRow from './Mills/MillsKPIRow.svelte';
   import LiveSessionsCard from './LiveSessionsCard.svelte';
+  import RecoverySLOCard from './RecoverySLOCard.svelte';
   import InstrumentStrip from './overview/InstrumentStrip.svelte';
   import HeroSummary from './overview/HeroSummary.svelte';
   import InboxDeck from './overview/InboxDeck.svelte';
@@ -408,6 +409,8 @@
     </section>
 
     <MillsKPIRow />
+
+    <RecoverySLOCard />
 
     <SupportingStrip surfaces={supportSurfaces} onSelect={navigate} />
   {/if}
