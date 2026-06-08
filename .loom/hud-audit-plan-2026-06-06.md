@@ -134,8 +134,4 @@ Ship 1 → 2 → 3 → 4 in parallel-ish (each is small, low-risk, high-impact).
 - Slice 4 EmptyState aliasing keeps the dormant Alerts/Shuttle dead components alive for future wiring; if the call is to delete them, fold into Slice 4.
 - Slice 10's .btn-dispatch semantic lane (info vs accent) needs a product-taste call before the MR.
 - Slice 11 Overview chrome decision (bordered cards vs borderless sections) needs one taste call upfront.
-<<<<<<< Updated upstream
 ```
-=======
-```
->>>>>>> Stashed changes
