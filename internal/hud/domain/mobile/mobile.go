@@ -8,12 +8,13 @@ import (
 
 // MobileDomain registers the companion mobile API endpoints.
 type MobileDomain struct {
-	deps Deps
+	deps     Deps
+	recovery *recoveryStore
 }
 
 // New creates a new MobileDomain backed by the given Deps implementation.
 func New(deps Deps) *MobileDomain {
-	return &MobileDomain{deps: deps}
+	return &MobileDomain{deps: deps, recovery: newRecoveryStore()}
 }
 
 // Name returns "mobile".
@@ -50,6 +51,7 @@ func (d *MobileDomain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFu
 	mux.HandleFunc("GET /api/mobile/v1/audit", mw(d.handleMobileAudit))
 	mux.HandleFunc("GET /api/mobile/v1/alerts/policy", mw(d.handleMobileAlertsPolicy))
 	mux.HandleFunc("GET /api/mobile/v1/sandbox", mw(d.handleMobileSandbox))
+	mux.HandleFunc("GET /api/mobile/v1/telemetry/recovery", mw(d.handleMobileRecoveryTelemetryRead))
 	mux.HandleFunc("GET /api/mobile/v1/pipelines", mw(d.handleMobilePipelines))
 	mux.HandleFunc("GET /api/mobile/v1/handoffs", mw(d.handleMobileHandoffs))
 	mux.HandleFunc("POST /api/mobile/v1/handoffs/{handoff_id}/accept", mw(d.handleMobileHandoffAccept))
@@ -69,6 +71,7 @@ func (d *MobileDomain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFu
 	mux.HandleFunc("POST /api/mobile/v1/sessions/{session_id}/end", mw(d.handleMobileSessionEnd))
 	mux.HandleFunc("POST /api/mobile/v1/push/register", mw(d.handleMobilePushRegister))
 	mux.HandleFunc("POST /api/mobile/v1/push/unregister", mw(d.handleMobilePushUnregister))
+	mux.HandleFunc("POST /api/mobile/v1/telemetry/recovery", mw(d.handleMobileRecoveryTelemetryIngest))
 	mux.HandleFunc("POST /api/mobile/v1/admin/revoke", mw(d.handleMobileAdminRevoke))
 	mux.HandleFunc("POST /api/mobile/v1/sandbox/start", mw(d.handleMobileSandboxStart))
 	mux.HandleFunc("POST /api/mobile/v1/sandbox/stop", mw(d.handleMobileSandboxStop))

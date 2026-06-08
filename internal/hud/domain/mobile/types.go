@@ -23,6 +23,10 @@ const (
 	ScopeSessionEnd    = "mobile:session:end"
 	ScopePush          = "mobile:push"
 	ScopeAgentSpawn    = "mobile:agent:spawn"
+	// ScopeTelemetry gates mobile self-reported telemetry ingestion
+	// (POST /api/mobile/v1/telemetry/*). Off by default — operators must
+	// opt in explicitly, mirroring ScopeAgentSpawn.
+	ScopeTelemetry = "mobile:telemetry"
 )
 
 // --- Envelope types ---

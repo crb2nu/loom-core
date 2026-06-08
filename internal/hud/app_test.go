@@ -3395,19 +3395,22 @@ func TestMobileContract_AllScopesRequired(t *testing.T) {
 		{"GET", "/api/mobile/v1/events/stream", "", "mobile:read", true}, // SSE blocks; deny-only.
 		{"GET", "/api/mobile/v1/audit", "", "mobile:read", false},
 		{"GET", "/api/mobile/v1/alerts/policy", "", "mobile:read", false},
+		{"GET", "/api/mobile/v1/telemetry/recovery", "", "mobile:read", false},
 		// Mutation endpoints require specific scopes.
 		{"POST", "/api/mobile/v1/sessions", `{"agent_id":"a","namespace":"n"}`, "mobile:session:create", false},
 		{"POST", "/api/mobile/v1/sessions/test-sess/end", `{}`, "mobile:session:end", false},
 		// Push endpoints require mobile:push (feature-flagged).
 		{"POST", "/api/mobile/v1/push/register", `{"token":"tok","platform":"apns"}`, "mobile:push", false},
 		{"POST", "/api/mobile/v1/push/unregister", `{"token":"tok"}`, "mobile:push", false},
+		// Telemetry ingestion requires mobile:telemetry (off by default).
+		{"POST", "/api/mobile/v1/telemetry/recovery", `{"samples":[5]}`, "mobile:telemetry", false},
 	}
 
-	// All four mobile scopes — every scope must be tested for isolation.
-	allScopes := []string{"mobile:read", "mobile:session:create", "mobile:session:end", "mobile:push"}
+	// All mobile scopes covered by the contract — every scope must be tested for isolation.
+	allScopes := []string{"mobile:read", "mobile:session:create", "mobile:session:end", "mobile:push", "mobile:telemetry"}
 
 	// Verify endpoint count matches registered mobile routes (excluding admin/revoke which uses X-Admin-Token).
-	const expectedScopeGatedEndpoints = 27
+	const expectedScopeGatedEndpoints = 29
 	if len(contracts) != expectedScopeGatedEndpoints {
 		t.Fatalf("contract test covers %d endpoints, expected %d — update when adding mobile routes",
 			len(contracts), expectedScopeGatedEndpoints)
