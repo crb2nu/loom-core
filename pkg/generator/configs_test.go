@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1000,6 +1001,67 @@ func TestGeminiHooksConfig_UsesPersistentAgentIdBootstrap(t *testing.T) {
 	t.Fatalf("expected gemini hooks to use persistent AGENT_ID bootstrap and --agent-id \"$AGENT_ID\"")
 }
 
+// collectHookCommands recursively gathers every "command" string from a
+// generated hooks structure (event -> blocks -> hooks -> command).
+func collectHookCommands(node any) []string {
+	var cmds []string
+	switch v := node.(type) {
+	case map[string]any:
+		for key, val := range v {
+			if key == "command" {
+				if cmd, ok := val.(string); ok {
+					cmds = append(cmds, cmd)
+					continue
+				}
+			}
+			cmds = append(cmds, collectHookCommands(val)...)
+		}
+	case []map[string]any:
+		for _, item := range v {
+			cmds = append(cmds, collectHookCommands(item)...)
+		}
+	case []any:
+		for _, item := range v {
+			cmds = append(cmds, collectHookCommands(item)...)
+		}
+	}
+	return cmds
+}
+
+// TestGeminiHooksConfig_NoNestedBraceDefaults guards against Gemini CLI's
+// load-time settings interpolation mangling hook commands. Gemini expands
+// ${VAR} and ${VAR:-default} in settings.json strings with a non-brace-aware
+// regex (resolveEnvVarsInString,
+// https://github.com/google-gemini/gemini-cli/blob/main/packages/cli/src/utils/envVarResolver.ts):
+// a nested default like ${HOME:-${TMPDIR:-/tmp}} matches only up to the first
+// `}`, substituting the outer variable and leaving a stray brace. Observed
+// live on Gemini CLI 0.43.0 (2026-06-09): every hook fire emitted
+// "mkdir: /Users/<user>}: Permission denied" and the agent-id cache file was
+// never written. ${shellvar:-default} is likewise replaced with the default
+// at load time, silently emptying shell-local reads like ${INPUT:-}.
+func TestGeminiHooksConfig_NoNestedBraceDefaults(t *testing.T) {
+	geminiProfile, err := GetPlatformProfile("gemini")
+	if err != nil {
+		t.Fatalf("expected gemini platform profile: %v", err)
+	}
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
+
+	cmds := collectHookCommands(config["hooks"])
+	if len(cmds) == 0 {
+		t.Fatal("expected at least one gemini hook command")
+	}
+
+	nested := regexp.MustCompile(`\$\{[^}]*\$\{`)
+	for _, cmd := range cmds {
+		if loc := nested.FindString(cmd); loc != "" {
+			t.Errorf("gemini hook command contains nested ${...${...}...} (%q) that Gemini CLI's settings loader mangles:\n%s", loc, cmd)
+		}
+		if strings.Contains(cmd, "${INPUT:-") {
+			t.Errorf("gemini hook command uses ${INPUT:-...}; Gemini's settings loader replaces it with the default, emptying hook input:\n%s", cmd)
+		}
+	}
+}
+
 func TestGeminiHooksConfig_IncludesDirtyWorktreeNudge(t *testing.T) {
 	geminiProfile, _ := GetPlatformProfile("gemini")
 	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
@@ -1154,10 +1216,11 @@ func TestHookAgentIDBootstrap_ContainsWorkspaceHash(t *testing.T) {
 		"WS_HASH=",
 		"cksum",
 		"git rev-parse --show-toplevel",
-		"AGENT_CACHE_DIR=",
-		"${HOME:-${TMPDIR:-/tmp}}/.cache/loom",
-		"agent-id-claude-code-${WS_HASH}${SESSION_SCOPE:+-${SESSION_SCOPE}}",
-		`AGENT_ID="claude-code-${WS_HASH}${SESSION_SCOPE:+-${SESSION_SCOPE}}"`,
+		`AGENT_CACHE_BASE="$HOME"`,
+		`[ -n "$AGENT_CACHE_BASE" ] || AGENT_CACHE_BASE="${TMPDIR:-/tmp}"`,
+		`AGENT_CACHE_DIR="$AGENT_CACHE_BASE/.cache/loom"`,
+		"agent-id-claude-code-${WS_HASH}${SESSION_SCOPE}",
+		`AGENT_ID="claude-code-${WS_HASH}${SESSION_SCOPE}"`,
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("hookAgentIDBootstrap output missing %q\ngot: %s", want, output)
@@ -1167,6 +1230,13 @@ func TestHookAgentIDBootstrap_ContainsWorkspaceHash(t *testing.T) {
 	// Verify we no longer rely on a tempdir-only identity file.
 	if strings.Contains(output, `${TMPDIR:-/tmp}/loom-agent-id-claude-code`) {
 		t.Error("expected hook agent id bootstrap to prefer cache-backed identity storage")
+	}
+
+	// Gemini CLI's settings loader replaces ${shellvar:-default} with the
+	// default value before the shell ever runs (envVarResolver.ts), so the
+	// bootstrap must read $INPUT without a brace-default.
+	if strings.Contains(output, "${INPUT:-") {
+		t.Errorf("hookAgentIDBootstrap must not use ${INPUT:-...}; Gemini's settings loader replaces it with the default\ngot: %s", output)
 	}
 }
 

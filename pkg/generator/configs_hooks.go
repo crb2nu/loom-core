@@ -453,26 +453,38 @@ func appendHookBlocks(existing any, hooks ...map[string]any) []map[string]any {
 // When hook JSON includes a session_id, the identity is scoped to that Claude
 // session so subprocesses from the same CLI instance stay grouped together.
 // If hook input is unavailable, we fall back to a workspace-scoped key.
+//
+// Gemini CLI expands ${VAR} and ${VAR:-default} in settings.json strings at
+// load time with a non-brace-aware regex (resolveEnvVarsInString,
+// https://github.com/google-gemini/gemini-cli/blob/main/packages/cli/src/utils/envVarResolver.ts):
+// a nested default like ${HOME:-${TMPDIR:-/tmp}} truncates at the first `}`
+// and leaves a stray brace, and ${shellvar:-default} for variables not in the
+// CLI's environment (e.g. $INPUT) is replaced by the default before the shell
+// ever runs. This snippet must therefore avoid nested ${...${...}...} and
+// avoid ${...:-...} defaults on shell-local variables; only plain $VAR /
+// ${VAR} (preserved when unknown) and ${ENVVAR:-literal} are safe.
 func hookAgentIDBootstrap(agentID string) string {
 	return fmt.Sprintf(
-		`HOOK_INPUT="${INPUT:-}"; `+
+		`HOOK_INPUT="$INPUT"; `+
 			`HOOK_SESSION_ID=""; `+
 			`if [ -n "$HOOK_INPUT" ]; then `+
 			`HOOK_SESSION_ID="$(printf '%%s' "$HOOK_INPUT" | jq -r '.session_id // .conversationId // empty' 2>/dev/null || true)"; `+
 			`fi; `+
 			`SESSION_SCOPE=""; `+
 			`if [ -n "$HOOK_SESSION_ID" ]; then `+
-			`SESSION_SCOPE="$(printf '%%s' "$HOOK_SESSION_ID" | cksum | cut -d' ' -f1)"; `+
+			`SESSION_SCOPE="-$(printf '%%s' "$HOOK_SESSION_ID" | cksum | cut -d' ' -f1)"; `+
 			`fi; `+
 			`WS_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$PWD")"; `+
 			`WS_HASH="$(printf '%%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; `+
-			`AGENT_CACHE_DIR="${HOME:-${TMPDIR:-/tmp}}/.cache/loom"; `+
+			`AGENT_CACHE_BASE="$HOME"; `+
+			`[ -n "$AGENT_CACHE_BASE" ] || AGENT_CACHE_BASE="${TMPDIR:-/tmp}"; `+
+			`AGENT_CACHE_DIR="$AGENT_CACHE_BASE/.cache/loom"; `+
 			`mkdir -p "$AGENT_CACHE_DIR"; `+
-			`AGENT_ID_FILE="${AGENT_CACHE_DIR}/agent-id-%s-${WS_HASH}${SESSION_SCOPE:+-${SESSION_SCOPE}}"; `+
+			`AGENT_ID_FILE="${AGENT_CACHE_DIR}/agent-id-%s-${WS_HASH}${SESSION_SCOPE}"; `+
 			`if [ -s "$AGENT_ID_FILE" ]; then `+
 			`AGENT_ID="$(cat "$AGENT_ID_FILE")"; `+
 			`else `+
-			`AGENT_ID="%s-${WS_HASH}${SESSION_SCOPE:+-${SESSION_SCOPE}}"; `+
+			`AGENT_ID="%s-${WS_HASH}${SESSION_SCOPE}"; `+
 			`printf '%%s' "$AGENT_ID" > "$AGENT_ID_FILE"; `+
 			`fi`,
 		agentID, agentID,
