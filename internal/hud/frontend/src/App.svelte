@@ -14,6 +14,7 @@
   import { millsAuditStore } from './lib/stores/mills_audit.svelte.ts';
   import { millsCrossRepoStore } from './lib/stores/mills_crossrepo.svelte.ts';
   import { formatTime as fmtTime } from './lib/utils/format.ts';
+  import { focusTrap } from './lib/actions/focusTrap';
   import ViewShell from './lib/components/shared/ViewShell.svelte';
   import FleetPanel from './lib/components/FleetPanel.svelte';
   import ServersPanel from './lib/components/ServersPanel.svelte';
@@ -520,9 +521,10 @@
   <!-- Keyboard shortcut help overlay -->
   {#if showKeyboardHelp}
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="keyboard-help-overlay" role="presentation" onclick={() => { showKeyboardHelp = false; }}>
+    <div class="keyboard-help-overlay" onclick={() => { showKeyboardHelp = false; }}>
       <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-      <div class="keyboard-help" role="dialog" aria-label="Keyboard shortcuts" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="keyboard-help" role="dialog" aria-label="Keyboard shortcuts" tabindex="-1" onclick={(e) => e.stopPropagation()} use:focusTrap>
+        <button class="help-close" aria-label="Close" onclick={() => { showKeyboardHelp = false; }}>{'✕'}</button>
         <div class="help-title">Keyboard Shortcuts</div>
         <div class="help-grid">
           <div class="help-section">
@@ -927,6 +929,23 @@
       rgba(0, 200, 255, 0.2) 50%,
       transparent 90%
     );
+  }
+
+  .help-close {
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+    font-size: var(--text-base);
+    color: var(--fg-muted);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-sm);
+    transition: color var(--transition-fast), background var(--transition-fast);
+    z-index: 1;
+  }
+
+  .help-close:hover {
+    color: var(--fg-primary);
+    background: var(--bg-tertiary);
   }
 
   .help-title {

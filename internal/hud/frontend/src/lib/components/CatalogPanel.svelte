@@ -237,7 +237,7 @@
                 </span>
               </td>
               <td class="cell-name">
-                <button class="name-btn" onclick={() => toggleExpand(srv.name)}>
+                <button class="name-btn" aria-expanded={expandedServer === srv.name} onclick={() => toggleExpand(srv.name)}>
                   <span class="expand-icon" class:expanded={expandedServer === srv.name}>{'\u25B8'}</span>
                   {srv.name}
                 </button>

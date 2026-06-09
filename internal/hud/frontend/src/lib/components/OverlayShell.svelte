@@ -281,6 +281,7 @@
       <button
         class="section-header"
         class:expanded={overlayStore.expandedSection === section.id}
+        aria-expanded={overlayStore.expandedSection === section.id}
         onclick={() => overlayStore.toggleSection(section.id)}
       >
         <span class="section-arrow">{overlayStore.expandedSection === section.id ? '\u25BE' : '\u25B8'}</span>
@@ -299,6 +300,7 @@
                 <button
                   class="ns-header"
                   class:ns-active={group.hasActiveWork}
+                  aria-expanded={overlayStore.isNamespaceExpanded(group.project)}
                   onclick={() => overlayStore.toggleNamespace(group.project)}
                 >
                   <span class="ns-chevron">{overlayStore.isNamespaceExpanded(group.project) ? '\u25BE' : '\u25B8'}</span>
@@ -312,6 +314,7 @@
                   {#each group.sessions.slice(0, 4) as session (session.id)}
                     <button
                       class="session-row"
+                      aria-expanded={overlayStore.isSessionExpanded(session.id)}
                       onclick={() => overlayStore.toggleSession(session.id)}
                     >
                       <span class="row-dot-wrap" class:pulsing={overlayStore.activeAgentIds.has(session.agent_id)}><StatusDot status={sessionAgentDotStatus(session)} /></span>
