@@ -88,7 +88,7 @@
   }
 
   .metric-card.clickable:focus-visible {
-    outline: 2px solid var(--border-focus);
+    outline: 2px solid var(--focus-ring);
     outline-offset: -2px;
   }
 

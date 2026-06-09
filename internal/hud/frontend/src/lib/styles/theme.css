@@ -15,17 +15,21 @@
   --bg-elevated:  #1B2B33;
   --bg-surface:   #101C22;
 
-  /* Foreground — high contrast hierarchy */
+  /* Foreground — high contrast hierarchy (all clear WCAG AA 4.5:1 on every --bg-*) */
   --fg-primary:   #D4EEF4;
   --fg-secondary: #8CC0CC;
-  --fg-muted:     #5C8A96;
-  --fg-dim:       #355B66;
+  --fg-muted:     #77B1C0; /* was #5C8A96 — failed AA (3.84:1) on --bg-elevated/tertiary */
+  --fg-dim:       #689BA8; /* was #355B66 — failed AA (1.97:1); kept below --fg-muted to preserve tiering */
 
   /* Borders — layered depth */
   --border:        #1A3038;
   --border-subtle: #12242B;
   --border-focus:  #2F6170;
   --border-active: #4693A6;
+
+  /* Focus indicator — WCAG 2.4.11/1.4.11 non-text contrast >=3:1 on every --bg-*.
+     --border-focus (#2F6170) only reaches 2.1–2.9:1, so focus outlines use this token. */
+  --focus-ring:    var(--info);
 
   /* Semantic */
   --success: #22E076;
@@ -292,7 +296,7 @@ button {
 }
 
 button:focus-visible {
-  outline: 2px solid var(--border-focus);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
   border-radius: inherit;
 }

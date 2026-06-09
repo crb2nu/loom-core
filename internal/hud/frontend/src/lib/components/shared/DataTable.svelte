@@ -355,7 +355,7 @@
   }
 
   .data-table thead th.sortable:focus-visible {
-    outline: 2px solid var(--info);
+    outline: 2px solid var(--focus-ring);
     outline-offset: -2px;
     color: var(--fg-primary);
   }
@@ -407,7 +407,7 @@
   }
 
   .data-table tbody tr.clickable:focus-visible {
-    outline: 2px solid var(--border-focus);
+    outline: 2px solid var(--focus-ring);
     outline-offset: -2px;
   }
 
