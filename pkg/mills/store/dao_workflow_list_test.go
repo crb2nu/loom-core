@@ -47,6 +47,56 @@ func TestListWorkflowRuns_NewestFirstBounded(t *testing.T) {
 	}
 }
 
+// TestCountStepsByRun_BatchAndMissing verifies the batch step counter returns a
+// per-run count keyed by id, omits runs with no steps (caller reads missing as
+// 0), ignores ids that don't appear in the journal, and short-circuits on an
+// empty input.
+func TestCountStepsByRun_BatchAndMissing(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	seedWorkflowRun(t, st, "WF-TWO")
+	seedWorkflowRun(t, st, "WF-ONE")
+	seedWorkflowRun(t, st, "WF-ZERO") // exists but never appends a step
+
+	now := time.Now().UTC()
+	add := func(runID, key string) {
+		if _, err := st.Workflow.AppendStep(ctx, &WorkflowStep{
+			RunID: runID, StepKey: key, EventType: WorkflowEventSpawnResult,
+			CallHash: runID + ":" + key, Status: WorkflowStepSuccess,
+			StartedAt: &now, EndedAt: &now, CostSource: WorkflowCostReal,
+		}); err != nil {
+			t.Fatalf("append %s/%s: %v", runID, key, err)
+		}
+	}
+	add("WF-TWO", "s0")
+	add("WF-TWO", "s1")
+	add("WF-ONE", "s0")
+
+	// Empty input never touches the DB and returns an empty (non-nil) map.
+	if m, err := st.Workflow.CountStepsByRun(ctx, nil); err != nil || len(m) != 0 {
+		t.Fatalf("empty input: map=%v err=%v", m, err)
+	}
+
+	counts, err := st.Workflow.CountStepsByRun(ctx,
+		[]string{"WF-TWO", "WF-ONE", "WF-ZERO", "WF-ABSENT"})
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if counts["WF-TWO"] != 2 {
+		t.Errorf("WF-TWO: want 2, got %d", counts["WF-TWO"])
+	}
+	if counts["WF-ONE"] != 1 {
+		t.Errorf("WF-ONE: want 1, got %d", counts["WF-ONE"])
+	}
+	// Steps-less and unknown ids are absent from the map (read as 0 by callers).
+	if _, ok := counts["WF-ZERO"]; ok {
+		t.Errorf("WF-ZERO should be absent (0 steps), got %d", counts["WF-ZERO"])
+	}
+	if _, ok := counts["WF-ABSENT"]; ok {
+		t.Errorf("WF-ABSENT should be absent, got %d", counts["WF-ABSENT"])
+	}
+}
+
 // TestStepCostRollupSince_BranchesOnCostSource verifies the rollup buckets cost
 // by source and never blends real with estimated/unavailable.
 func TestStepCostRollupSince_BranchesOnCostSource(t *testing.T) {
