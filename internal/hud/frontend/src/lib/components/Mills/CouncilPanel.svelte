@@ -165,6 +165,7 @@
     </button>
   {/snippet}
 
+  <div class="mills-table-wrap">
   <table class="mills-table">
     <thead>
       <tr>
@@ -303,6 +304,7 @@
       {/each}
     </tbody>
   </table>
+  </div>
 </PanelShell>
 
 <ConfirmDialog
@@ -333,6 +335,7 @@
   .mills-action-btn:hover:not(:disabled) { background: var(--bg-hover, #232733); }
   .mills-action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .mills-action-btn.primary { border-color: rgb(90, 140, 220); color: rgb(150, 190, 250); }
+  .mills-table-wrap { overflow-x: auto; }
   .mills-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
   .mills-table th, .mills-table td {
     text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border-subtle, #233);
@@ -428,6 +431,18 @@
     align-items: center;
     gap: 0.5rem;
     font-size: 0.8rem;
+  }
+  /* Phone reflow: the fixed 11rem+5rem rails overflow narrow viewports, so
+     fold each row to two lines — role·backend, then model·status. */
+  @media (max-width: 720px) {
+    .ensemble-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      row-gap: 0.15rem;
+    }
+    .ens-role { grid-row: 1; grid-column: 1; }
+    .ens-backend { grid-row: 1; grid-column: 2; text-align: right; }
+    .ens-model { grid-row: 2; grid-column: 1; }
+    .ens-status { grid-row: 2; grid-column: 2; }
   }
   .ens-role { color: var(--text-muted, #889); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
   .ens-backend { color: var(--text-muted, #889); }

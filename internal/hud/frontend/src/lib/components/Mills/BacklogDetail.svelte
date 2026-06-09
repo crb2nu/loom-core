@@ -322,4 +322,9 @@
   .conf-medium { background: rgba(220, 180, 60, 0.18); color: rgb(230, 200, 110); }
   .conf-high { background: rgba(72, 200, 128, 0.15); color: rgb(150, 220, 170); }
   .capped { font-size: 0.62rem; color: rgb(240, 140, 140); }
+
+  /* Phone reflow: the two-column meta grid gets too cramped to read. */
+  @media (max-width: 480px) {
+    .grid { grid-template-columns: 1fr; }
+  }
 </style>

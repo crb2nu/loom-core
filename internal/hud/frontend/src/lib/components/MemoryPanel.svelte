@@ -983,4 +983,15 @@
     display: flex;
     gap: var(--space-2, 8px);
   }
+
+  /* Phone/tablet reflow (WCAG 1.4.10): the fixed 3-col tier overview and
+     6-col compression strip overflow narrow viewports. */
+  @media (max-width: 800px) {
+    .tier-overview { grid-template-columns: 1fr; }
+    .compression-cards { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 480px) {
+    .compression-cards { grid-template-columns: repeat(2, 1fr); }
+    .compaction-cards { grid-template-columns: 1fr; }
+  }
 </style>

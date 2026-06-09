@@ -786,4 +786,9 @@
     gap: var(--space-2);
     margin-top: var(--space-2);
   }
+
+  /* Phone reflow: the two-column policy view overflows narrow viewports. */
+  @media (max-width: 640px) {
+    .policy-view { grid-template-columns: 1fr; }
+  }
 </style>

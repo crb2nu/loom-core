@@ -100,6 +100,7 @@
     {/if}
   {/snippet}
 
+  <div class="mills-table-wrap">
   <table class="mills-table">
     <thead>
       <tr>
@@ -153,6 +154,7 @@
       {/each}
     </tbody>
   </table>
+  </div>
 </PanelShell>
 
 <!-- Drilldown drawers. BacklogDetail is driven by selectedBacklogID;
@@ -187,6 +189,7 @@
     font-size: 0.78rem;
   }
   .readiness-banner li + li { margin-top: 0.15rem; }
+  .mills-table-wrap { overflow-x: auto; }
   .mills-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
   .mills-table th, .mills-table td {
     text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border-subtle, #233);

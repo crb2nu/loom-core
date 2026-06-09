@@ -308,4 +308,9 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
+
+  /* Phone reflow: the fixed 3-col summary strip overflows narrow viewports. */
+  @media (max-width: 480px) {
+    .summary-metrics { grid-template-columns: 1fr; }
+  }
 </style>
