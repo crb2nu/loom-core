@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -158,6 +159,44 @@ func (d *WorkflowDAO) ListWorkflowRuns(ctx context.Context, limit int) ([]*Workf
 			return nil, err
 		}
 		out = append(out, run)
+	}
+	return out, rows.Err()
+}
+
+// CountStepsByRun returns the number of journaled steps for each given run id,
+// keyed by run_id. A run id with no steps is ABSENT from the returned map (the
+// caller reads a missing key as 0). A nil/empty input returns an empty map
+// without touching the DB. This is the batch companion to ListWorkflowRuns:
+// it powers the step_count column in the run-LIST payload
+// (GET /api/mills/workflow/runs) with a single GROUP BY over the bounded id set
+// the list endpoint already fetched, so the list never fans out into one count
+// query per run (no N+1 scan of the journal).
+func (d *WorkflowDAO) CountStepsByRun(ctx context.Context, runIDs []string) (map[string]int, error) {
+	out := make(map[string]int, len(runIDs))
+	if len(runIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(runIDs))
+	args := make([]any, len(runIDs))
+	for i, id := range runIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT run_id, COUNT(*) FROM workflow_steps
+		WHERE run_id IN (`+strings.Join(placeholders, ",")+`)
+		GROUP BY run_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("workflow count steps by run: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var runID string
+		var n int
+		if err := rows.Scan(&runID, &n); err != nil {
+			return nil, fmt.Errorf("workflow count steps by run scan: %w", err)
+		}
+		out[runID] = n
 	}
 	return out, rows.Err()
 }

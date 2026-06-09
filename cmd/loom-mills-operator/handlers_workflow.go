@@ -69,7 +69,13 @@ type workflowRunSummary struct {
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
 	CostUSD   float64    `json:"cost_usd"`
-	StepCount int        `json:"step_count,omitempty"`
+	// StepCount is the number of journaled steps for the run. It is always
+	// emitted (no omitempty): a run with no steps reports an honest 0 rather
+	// than being indistinguishable from an older operator build that omitted
+	// the field entirely. The HUD list keeps a `?? '—'` fallback so the
+	// rollout window (old image still serving the omitted field) degrades to
+	// the prior em-dash instead of a literal 0.
+	StepCount int `json:"step_count"`
 }
 
 // workflowStepView is one step in the detail response. It carries the raw
@@ -168,6 +174,17 @@ func (o *operator) handleWorkflowRunsList(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Batch the per-run step count so the list carries a real step_count
+	// (instead of the detail-only field) without one count query per row.
+	ids := make([]string, len(runs))
+	for i, run := range runs {
+		ids[i] = run.ID
+	}
+	stepCounts, err := o.store.Workflow.CountStepsByRun(ctx, ids)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	out := make([]workflowRunSummary, 0, len(runs))
 	for _, run := range runs {
 		out = append(out, workflowRunSummary{
@@ -179,6 +196,7 @@ func (o *operator) handleWorkflowRunsList(w http.ResponseWriter, r *http.Request
 			StartedAt: run.StartedAt,
 			EndedAt:   run.EndedAt,
 			CostUSD:   run.CostUSD,
+			StepCount: stepCounts[run.ID],
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": out})

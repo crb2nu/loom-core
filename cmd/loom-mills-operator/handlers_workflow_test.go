@@ -96,15 +96,17 @@ func TestHandleWorkflowRunsList_Shape(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: %d body=%s", rec.Code, rec.Body.String())
 	}
+	type runRow struct {
+		ID        string  `json:"id"`
+		BacklogID string  `json:"backlog_id"`
+		Engine    string  `json:"engine"`
+		Template  string  `json:"template"`
+		State     string  `json:"state"`
+		CostUSD   float64 `json:"cost_usd"`
+		StepCount int     `json:"step_count"`
+	}
 	var body struct {
-		Runs []struct {
-			ID        string  `json:"id"`
-			BacklogID string  `json:"backlog_id"`
-			Engine    string  `json:"engine"`
-			Template  string  `json:"template"`
-			State     string  `json:"state"`
-			CostUSD   float64 `json:"cost_usd"`
-		} `json:"runs"`
+		Runs []runRow `json:"runs"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
@@ -116,26 +118,26 @@ func TestHandleWorkflowRunsList_Shape(t *testing.T) {
 	if body.Runs[0].ID != "WF-QUAR" {
 		t.Errorf("ordering: want WF-QUAR first, got %q", body.Runs[0].ID)
 	}
-	// Summary fields present.
-	var live *struct {
-		ID        string  `json:"id"`
-		BacklogID string  `json:"backlog_id"`
-		Engine    string  `json:"engine"`
-		Template  string  `json:"template"`
-		State     string  `json:"state"`
-		CostUSD   float64 `json:"cost_usd"`
+	byID := map[string]runRow{}
+	for _, r := range body.Runs {
+		byID[r.ID] = r
 	}
-	for i := range body.Runs {
-		if body.Runs[i].ID == "WF-LIVE" {
-			live = &body.Runs[i]
-		}
-	}
-	if live == nil {
+	live, ok := byID["WF-LIVE"]
+	if !ok {
 		t.Fatal("WF-LIVE missing from list")
 	}
 	if live.Engine != "imperative" || live.Template != "workflow-canary" ||
 		live.State != "running" || live.BacklogID != "MILLS-WF-1" || live.CostUSD != 0.42 {
-		t.Errorf("WF-LIVE summary fields wrong: %+v", *live)
+		t.Errorf("WF-LIVE summary fields wrong: %+v", live)
+	}
+	// The list now carries a real per-run step_count (the backend follow-up to
+	// the Work › Workflows fix), so the Mills table renders the count instead
+	// of a permanent "—". WF-LIVE has 2 journaled steps; WF-QUAR has 1.
+	if live.StepCount != 2 {
+		t.Errorf("WF-LIVE step_count: want 2, got %d", live.StepCount)
+	}
+	if quar := byID["WF-QUAR"]; quar.StepCount != 1 {
+		t.Errorf("WF-QUAR step_count: want 1, got %d", quar.StepCount)
 	}
 }
 
