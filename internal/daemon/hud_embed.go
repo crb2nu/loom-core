@@ -14,6 +14,13 @@ import (
 	"github.com/crb2nu/loom/internal/spawn"
 )
 
+// defaultEmbeddedHUDMetricsAddr mirrors loomd's defaultMetricsAddr
+// (cmd/loomd/main.go). loomd always brings up this loopback endpoint when
+// metrics are enabled (it's appended as a compat address even for a custom
+// --metrics-addr), so the embedded HUD can reliably proxy the daemon's
+// /metrics from here for the Request Metrics card.
+const defaultEmbeddedHUDMetricsAddr = "127.0.0.1:9876"
+
 // startEmbeddedHUD initializes and starts the embedded HUD application,
 // mounting its routes on the given HTTP mux. The HUD uses a LocalCaller
 // that dispatches directly to d.handleMessage (in-process, no socket).
@@ -240,8 +247,16 @@ func buildEmbeddedHUDConfig(cfg EmbeddedHUDConfig, registryPath string) hud.Conf
 		SpawnHarvesterDefaultDiskGi:    firstPositiveInt(cfg.SpawnHarvesterDefaultDiskGi, os.Getenv("SPAWN_HARVESTER_DEFAULT_DISK_GI")),
 		SpawnHarvesterSSHUser:          firstNonEmpty(cfg.SpawnHarvesterSSHUser, os.Getenv("SPAWN_HARVESTER_SSH_USER")),
 
-		PipelineProjects:   firstNonEmpty(cfg.PipelineProjects, os.Getenv("HUD_PIPELINE_PROJECTS")),
-		BindAddress:        firstNonEmpty(cfg.BindAddress, os.Getenv("HUD_BIND_ADDRESS")),
+		PipelineProjects: firstNonEmpty(cfg.PipelineProjects, os.Getenv("HUD_PIPELINE_PROJECTS")),
+		BindAddress:      firstNonEmpty(cfg.BindAddress, os.Getenv("HUD_BIND_ADDRESS")),
+		// Without this the embedded HUD's /api/daemon-metrics proxy has no
+		// upstream and always 503s ("daemon metrics address not configured"),
+		// blanking the Request Metrics card. The standalone `loom hud` path
+		// wires MetricsAddr (cmd/loom/hud.go:262) but the embedded path never
+		// did. Default to the loopback metrics endpoint loomd always serves.
+		// Proxy-only: this does NOT start the standalone SSE consumer (that's
+		// Run()-only; the embedded HUD ingests events via IngestDaemonEvent).
+		MetricsAddr:        firstNonEmpty(cfg.MetricsAddr, os.Getenv("LOOM_DAEMON_METRICS_ADDR"), defaultEmbeddedHUDMetricsAddr),
 		FlexInferURL:       firstNonEmpty(cfg.FlexInferURL, os.Getenv("FLEXINFER_URL")),
 		FlexInferProxyURL:  firstNonEmpty(cfg.FlexInferProxyURL, os.Getenv("FLEXINFER_PROXY_URL")),
 		FlexInferKey:       firstNonEmpty(cfg.FlexInferKey, os.Getenv("FLEXINFER_API_KEY")),

@@ -135,8 +135,17 @@ type EmbeddedHUDConfig struct {
 	SpawnHarvesterDefaultDiskGi    int    `yaml:"spawn_harvester_default_disk_gi,omitempty"`
 	SpawnHarvesterSSHUser          string `yaml:"spawn_harvester_ssh_user,omitempty"`
 
-	PipelineProjects  string `yaml:"pipeline_projects,omitempty"`
-	BindAddress       string `yaml:"bind_address,omitempty"`
+	PipelineProjects string `yaml:"pipeline_projects,omitempty"`
+	BindAddress      string `yaml:"bind_address,omitempty"`
+
+	// MetricsAddr is the daemon's Prometheus /metrics + /events host:port
+	// (e.g., "127.0.0.1:9876"), which the embedded HUD proxies for the
+	// Request Metrics card (GET /api/daemon-metrics). loomd serves this at
+	// `--metrics-addr` (default 127.0.0.1:9876, always also exposed as a
+	// compat endpoint). Empty ⇒ buildEmbeddedHUDConfig falls back to
+	// LOOM_DAEMON_METRICS_ADDR, then the 127.0.0.1:9876 default.
+	MetricsAddr string `yaml:"metrics_addr,omitempty"`
+
 	FlexInferURL      string `yaml:"flexinfer_url,omitempty"`
 	FlexInferProxyURL string `yaml:"flexinfer_proxy_url,omitempty"`
 	FlexInferKey      string `yaml:"flexinfer_key,omitempty"`
