@@ -713,4 +713,14 @@
     font-family: var(--font-mono);
     margin: 0 2px;
   }
+
+  /* Phone/tablet reflow: the 200px+220px role rails and the two-column
+     status grid overflow narrow viewports — stack them. */
+  @media (max-width: 720px) {
+    .status-grid { grid-template-columns: 1fr; }
+    .role-row {
+      grid-template-columns: 1fr;
+      gap: 2px;
+    }
+  }
 </style>

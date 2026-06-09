@@ -52,8 +52,10 @@
     -webkit-backdrop-filter: blur(var(--glass-blur));
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-lg);
-    min-width: 380px;
-    max-width: 540px;
+    /* min() keeps the desktop width but never exceeds the viewport on
+       phones — a fixed 380px overflowed a 360px screen (WCAG 1.4.10). */
+    min-width: min(380px, calc(100vw - 32px));
+    max-width: min(540px, calc(100vw - 32px));
     max-height: 80vh;
     display: flex;
     flex-direction: column;

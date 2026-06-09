@@ -726,4 +726,20 @@
   }
   .role-bulk { color: var(--text-default, #eef); }
   .role-escalation { color: var(--warning, #d7a03a); }
+
+  /* Phone reflow: the 6-track audit row (toggle/subject/score/severity/
+     cost/time) overflows narrow viewports; fold to three explicit lines —
+     subject·score, severity·cost, then the timestamp. */
+  @media (max-width: 720px) {
+    .audit-row-btn {
+      grid-template-columns: 1.2rem minmax(0, 1fr) auto;
+      row-gap: 0.25rem;
+    }
+    .audit-toggle { grid-row: 1; grid-column: 1; }
+    .audit-subject { grid-row: 1; grid-column: 2; }
+    .audit-score { grid-row: 1; grid-column: 3; }
+    .audit-sev-wrap { grid-row: 2; grid-column: 2; }
+    .audit-cost { grid-row: 2; grid-column: 3; }
+    .audit-time { grid-row: 3; grid-column: 2 / 4; }
+  }
 </style>

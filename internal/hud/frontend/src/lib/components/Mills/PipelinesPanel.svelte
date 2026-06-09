@@ -201,6 +201,7 @@
     {/if}
   {/snippet}
 
+  <div class="mills-table-wrap">
   <table class="mills-table">
     <thead>
       <tr>
@@ -262,6 +263,7 @@
       {/each}
     </tbody>
   </table>
+  </div>
 </PanelShell>
 
 <PipelineRunDetail />
@@ -346,6 +348,7 @@
     padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem;
     background: var(--bg-subtle, #233); color: var(--text-muted, #aab);
   }
+  .mills-table-wrap { overflow-x: auto; }
   .mills-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
   .mills-table th, .mills-table td {
     text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border-subtle, #233);
