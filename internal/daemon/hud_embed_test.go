@@ -175,6 +175,35 @@ func TestBuildEmbeddedHUDConfig_HarvesterFileConfigWins(t *testing.T) {
 	}
 }
 
+// TestBuildEmbeddedHUDConfig_MetricsAddr guards the daemon-metrics 503 fix:
+// the embedded HUD must learn the daemon's /metrics host:port so its
+// /api/daemon-metrics proxy resolves (otherwise handleDaemonMetrics returns
+// 503 "daemon metrics address not configured" and the Request Metrics card
+// is permanently blank). Precedence: file config > env > loopback default.
+func TestBuildEmbeddedHUDConfig_MetricsAddr(t *testing.T) {
+	t.Run("default loopback when unset", func(t *testing.T) {
+		t.Setenv("LOOM_DAEMON_METRICS_ADDR", "")
+		got := buildEmbeddedHUDConfig(EmbeddedHUDConfig{}, "")
+		if got.MetricsAddr != defaultEmbeddedHUDMetricsAddr {
+			t.Errorf("MetricsAddr = %q, want %q (default)", got.MetricsAddr, defaultEmbeddedHUDMetricsAddr)
+		}
+	})
+	t.Run("env override", func(t *testing.T) {
+		t.Setenv("LOOM_DAEMON_METRICS_ADDR", "127.0.0.1:9999")
+		got := buildEmbeddedHUDConfig(EmbeddedHUDConfig{}, "")
+		if got.MetricsAddr != "127.0.0.1:9999" {
+			t.Errorf("MetricsAddr = %q, want 127.0.0.1:9999 (env)", got.MetricsAddr)
+		}
+	})
+	t.Run("file config wins over env", func(t *testing.T) {
+		t.Setenv("LOOM_DAEMON_METRICS_ADDR", "127.0.0.1:9999")
+		got := buildEmbeddedHUDConfig(EmbeddedHUDConfig{MetricsAddr: "10.0.0.1:9876"}, "")
+		if got.MetricsAddr != "10.0.0.1:9876" {
+			t.Errorf("MetricsAddr = %q, want 10.0.0.1:9876 (file wins)", got.MetricsAddr)
+		}
+	})
+}
+
 func TestWriteEmbeddedHUDPortFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
