@@ -31,6 +31,41 @@
   // KPI cards, so stacking another green pill is just visual noise.
   let showBanner = $derived(health.state !== 'healthy');
 
+  // The KPI snapshot omits derived ratios (gate_pass_rate, cost_per_merged_*)
+  // when their denominator is 0 — the operator only sets them once there's
+  // real activity (kpi_writer.go: `if gateTotal > 0` / `if mergedRuns > 0`).
+  // So a missing ratio means "idle" (no gates/merges in the window), NOT an
+  // error — distinguish that from "no snapshot at all" so an idle Mills never
+  // reads as a broken dashboard.
+  let snapshotLoaded = $derived(!!kpis?.snapshot_at);
+
+  /** {value,color,hint} for a derived-ratio tile, idle/unknown-aware. */
+  function ratioTile(raw, fmt, activeColor, idleHint) {
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      return { value: fmt(raw), color: activeColor(raw), hint: '' };
+    }
+    return snapshotLoaded
+      ? { value: '—', color: 'var(--fg-dim)', hint: idleHint }
+      : { value: '—', color: 'var(--fg-dim)', hint: 'KPI snapshot unavailable — counters will populate after the next operator tick.' };
+  }
+
+  let gateTile = $derived(
+    ratioTile(
+      metrics.gate_pass_rate,
+      fmtPct,
+      (r) => (r < 0.85 ? 'var(--warning)' : 'var(--fg-primary)'),
+      'No gate evaluations in the last 24h (idle, not an error).',
+    ),
+  );
+  let costTile = $derived(
+    ratioTile(
+      metrics.cost_per_merged_change_usd ?? metrics.cost_per_merged_pipeline_usd,
+      fmtUSD,
+      () => 'var(--fg-primary)',
+      'No merges in the last 24h (idle, not an error).',
+    ),
+  );
+
   function goto(subView: string): void {
     router.navigate('mills', subView);
   }
@@ -331,7 +366,8 @@
       />
       <MetricCard
         label="Pipeline runs"
-        value={millsStore.pipelineRuns.length}
+        value={fmtNumber(metrics.pipeline_runs)}
+        hint="Pipeline runs in the last 24h (KPI window)."
         compact
         onclick={() => goto('pipelines')}
       />
@@ -343,14 +379,17 @@
       />
       <MetricCard
         label="Gate pass"
-        value={fmtPct(metrics.gate_pass_rate)}
-        color={(metrics.gate_pass_rate ?? 1) < 0.85 ? 'var(--warning)' : 'var(--fg-primary)'}
+        value={gateTile.value}
+        color={gateTile.color}
+        hint={gateTile.hint}
         compact
         onclick={() => goto('eval')}
       />
       <MetricCard
         label="Cost / merged"
-        value={fmtUSD(metrics.cost_per_merged_change_usd ?? metrics.cost_per_merged_pipeline_usd)}
+        value={costTile.value}
+        color={costTile.color}
+        hint={costTile.hint}
         compact
         onclick={() => goto('pipelines')}
       />

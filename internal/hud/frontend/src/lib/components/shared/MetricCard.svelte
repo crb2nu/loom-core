@@ -13,6 +13,7 @@
    *   compact?: boolean,
    *   proxy?: boolean,
    *   proxyTitle?: string,
+   *   hint?: string,
    *   onclick?: () => void,
    * }}
    */
@@ -29,6 +30,7 @@
     compact = false,
     proxy = false,
     proxyTitle = 'This metric is a proxy — see the Mills plan doc for the canonical definition.',
+    hint = '',
     onclick,
   } = $props();
 </script>
@@ -38,6 +40,7 @@
   class="metric-card"
   class:compact
   class:clickable={!!onclick}
+  title={hint || undefined}
   onclick={onclick}
   onkeydown={(e) => { if (onclick && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onclick(); }}}
   tabindex={onclick ? 0 : undefined}
