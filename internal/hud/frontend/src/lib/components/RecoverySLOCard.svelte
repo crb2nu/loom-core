@@ -4,7 +4,7 @@
   // Reads the same-origin HUD-internal aggregate (GET /api/telemetry/recovery),
   // which the mobile companion publishes per device. Renders the fleet p95 vs
   // the SLO target, a meets/over badge, headline counts, and a per-device
-  // breakdown. Self-contained fetch+poll (mirrors ShuttlePanel) — no store.
+  // breakdown. Self-contained fetch+poll — no store.
 
   import Badge from '../widgets/Badge.svelte';
   import EmptyState from './shared/EmptyState.svelte';
