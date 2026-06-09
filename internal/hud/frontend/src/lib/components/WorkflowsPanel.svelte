@@ -70,6 +70,26 @@
     return (done / wf.steps.length) * 100;
   }
 
+  /**
+   * Label for a list row's progress slot. The SSE summary
+   * (workflows.svelte.ts applySnapshot) carries `progress` + `current_step`
+   * but NOT the `steps[]` array, so stepProgress() would render a misleading
+   * "0/0 steps" for every running workflow. Prefer a real step count when
+   * present (REST detail rows), then the progress %, then the current step —
+   * never imply zero total steps.
+   */
+  function listProgressLabel(wf) {
+    if (wf.steps?.length) {
+      const done = wf.steps.filter(s =>
+        s.status === 'completed' || s.status === 'approved'
+      ).length;
+      return `${done}/${wf.steps.length} steps`;
+    }
+    if (typeof wf.progress === 'number') return `${Math.round(wf.progress * 100)}% complete`;
+    if (wf.current_step) return `@ ${wf.current_step}`;
+    return '';
+  }
+
   function dagSteps(wf) {
     if (!wf.steps) return [];
     return wf.steps.map(s => ({
@@ -172,7 +192,7 @@
               <Badge text={wf.status ?? 'pending'} variant={statusVariant(wf.status)} />
             </div>
             <div class="wf-item-bottom">
-              <span class="wf-progress text-mono text-xs">{stepProgress(wf)} steps</span>
+              <span class="wf-progress text-mono text-xs">{listProgressLabel(wf)}</span>
               <span class="wf-time text-mono text-xs text-muted">{relativeTime(wf.started_at)}</span>
             </div>
             <div class="wf-progress-track">

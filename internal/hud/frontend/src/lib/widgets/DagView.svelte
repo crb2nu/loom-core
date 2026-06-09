@@ -8,7 +8,7 @@
   // Unique ID per instance to avoid SVG marker collisions when multiple DagViews exist.
   const markerId = `arrowhead-${Math.random().toString(36).slice(2, 8)}`;
 
-  const NODE_W = 120;
+  const NODE_W = 148;
   const NODE_H = 36;
   const LAYER_GAP = 60;
   const ROW_GAP = 16;
@@ -146,6 +146,8 @@
       <!-- Nodes -->
       {#each layout.nodes as node}
         <g transform="translate({node.x}, {node.y})">
+          <!-- Full step name on hover; the visible label is width-truncated. -->
+          <title>{node.name}</title>
           <rect
             width={NODE_W}
             height={NODE_H}
@@ -164,7 +166,7 @@
             font-size="11"
             font-family="var(--font-sans)"
           >
-            {node.name.length > 14 ? node.name.slice(0, 13) + '\u2026' : node.name}
+            {node.name.length > 22 ? node.name.slice(0, 21) + '\u2026' : node.name}
           </text>
           <!-- Status indicator bar at bottom -->
           <rect
@@ -194,6 +196,6 @@
 
   .dag-svg {
     display: block;
-    min-width: 100%;
+    margin: 0 auto;
   }
 </style>
