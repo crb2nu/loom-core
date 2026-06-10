@@ -23,6 +23,10 @@ class TimelineStore {
   // events have hit the bus in a long time.
   staleAfter = 120_000;
   get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (this.pollTimer === null) return false;
     return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
   }
 
@@ -49,8 +53,9 @@ class TimelineStore {
     this.stopPolling();
     this.fetch();
 
-    // 30s fallback poll.
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    // Watchdog: poll on SSE-down OR on stale, so a mounted-but-quiet page
+    // self-heals instead of sticking on the stale banner.
+    this.pollTimer = setInterval(() => { if (!eventStore.connected || this.isStale) this.fetch(); }, intervalMs);
 
     // Subscribe to all agent.* SSE events for live updates.
     const agentEvents = [

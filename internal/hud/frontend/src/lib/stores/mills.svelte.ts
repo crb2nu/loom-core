@@ -517,6 +517,10 @@ class MillsStore {
   staleAfter = 90_000;
   get isStale(): boolean {
     if (this.disabled) return false;
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (this.pollTimer === null) return false;
     return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
   }
 
