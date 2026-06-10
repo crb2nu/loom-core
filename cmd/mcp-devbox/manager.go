@@ -73,12 +73,14 @@ type managerConfig struct {
 }
 
 type manager struct {
-	cfg     managerConfig
-	backend backend.Backend
-	store   *state.Store
-	logger  *slog.Logger
-	metrics *metrics
-	events  *eventEmitter
+	cfg            managerConfig
+	backend        backend.Backend
+	backends       map[string]backend.Backend
+	defaultBackend string
+	store          *state.Store
+	logger         *slog.Logger
+	metrics        *metrics
+	events         *eventEmitter
 
 	// Async exec tracking
 	asyncExecs *asyncRegistry
@@ -108,6 +110,39 @@ func checkBackendHealth(ctx context.Context, logger *slog.Logger, health func(co
 	if err := health(healthCtx); err != nil {
 		logger.Warn("backend health check failed", "error", err)
 	}
+}
+
+func canonicalBackendType(backendType string) string {
+	switch strings.TrimSpace(strings.ToLower(backendType)) {
+	case "", "docker":
+		return "docker"
+	case "k8s", "kubernetes":
+		return "k8s"
+	case "harvester-vm":
+		return "harvester-vm"
+	default:
+		return backendType
+	}
+}
+
+func isK8sBackendType(backendType string) bool {
+	return canonicalBackendType(backendType) == "k8s"
+}
+
+func (m *manager) backendFor(name string) backend.Backend {
+	if m == nil {
+		return nil
+	}
+	key := canonicalBackendType(name)
+	if strings.TrimSpace(name) == "" {
+		key = m.defaultBackend
+	}
+	if m.backends != nil {
+		if b := m.backends[key]; b != nil {
+			return b
+		}
+	}
+	return m.backend
 }
 
 // projectLock returns (or creates) a per-project mutex for lifecycle serialization.
@@ -187,71 +222,110 @@ func (m *manager) validateMountPath(hostPath string) error {
 }
 
 func newManager(ctx context.Context, logger *slog.Logger, cfg managerConfig) (*manager, error) {
-	var b backend.Backend
-	switch cfg.backendType {
-	case "docker":
-		db, err := backend.NewDockerBackend()
-		if err != nil {
-			return nil, err
-		}
-		b = db
-	case "k8s", "kubernetes":
-		kb, err := backend.NewK8sBackend(backend.K8sBackendConfig{
-			Kubeconfig:                   cfg.kubeconfig,
-			Namespace:                    cfg.k8sNamespace,
-			Registry:                     cfg.registry,
-			WorkspacePVC:                 cfg.k8sWorkspacePVC,
-			ImagePullSecret:              cfg.k8sImagePullSecret,
-			WorkspaceRoot:                cfg.workspaceRoot,
-			BuilderImage:                 cfg.builderImage,
-			GitCloneImage:                cfg.gitCloneImage,
-			NFSFlush:                     cfg.nfsFlush,
-			GitBaseURL:                   cfg.gitBaseURL,
-			GitSecret:                    cfg.gitSecret,
-			BuildCPURequest:              cfg.buildCPURequest,
-			BuildCPULimit:                cfg.buildCPULimit,
-			BuildMemoryRequest:           cfg.buildMemoryRequest,
-			BuildMemoryLimit:             cfg.buildMemoryLimit,
-			BuildEphemeralStorageRequest: cfg.buildEphemeralStorageRequest,
-			BuildEphemeralStorageLimit:   cfg.buildEphemeralStorageLimit,
-			BuildAvoidNodes:              cfg.buildAvoidNodes,
-			MaxConcurrentBuilds:          cfg.maxConcurrentBuilds,
-			SyncMode:                     cfg.syncMode,
-			SyncExcludes:                 cfg.syncExcludes,
-			MaxSyncSize:                  cfg.maxSyncSize,
-		})
-		if err != nil {
-			return nil, err
-		}
-		b = kb
-	case "harvester-vm":
-		hb, err := backend.NewHarvesterVMBackend(backend.HarvesterVMBackendConfig{
-			KubeconfigPath:       cfg.harvesterKubeconfig,
-			Namespace:            cfg.harvesterNamespace,
-			BaseImageName:        cfg.harvesterBaseImage,
-			StorageClassName:     cfg.harvesterStorageClass,
-			NetworkAttachmentDef: cfg.harvesterNetworkAttachDef,
-			DefaultVCPUs:         cfg.harvesterDefaultVCPUs,
-			DefaultMemMi:         cfg.harvesterDefaultMemMi,
-			DefaultDiskGi:        cfg.harvesterDefaultDiskGi,
-			SSHUser:              cfg.harvesterSSHUser,
-		})
-		if err != nil {
-			return nil, err
-		}
-		b = hb
-	default:
-		return nil, fmt.Errorf("unsupported backend: %s (use 'docker', 'k8s', or 'harvester-vm')", cfg.backendType)
+	backends, defaultBackend, err := initBackends(cfg, logger)
+	if err != nil {
+		return nil, err
 	}
+	cfg.backendType = defaultBackend
+	b := backends[defaultBackend]
 
-	checkBackendHealth(ctx, logger, b.Health)
+	for name, be := range backends {
+		checkBackendHealth(ctx, logger.With("backend", name), be.Health)
+	}
 
 	store, err := state.NewStore(cfg.cacheDir)
 	if err != nil {
 		return nil, fmt.Errorf("init state store: %w", err)
 	}
 
-	return &manager{cfg: cfg, backend: b, store: store, logger: logger}, nil
+	return &manager{
+		cfg:            cfg,
+		backend:        b,
+		backends:       backends,
+		defaultBackend: defaultBackend,
+		store:          store,
+		logger:         logger,
+	}, nil
+}
+
+func initBackends(cfg managerConfig, logger *slog.Logger) (map[string]backend.Backend, string, error) {
+	defaultBackend := canonicalBackendType(cfg.backendType)
+	switch defaultBackend {
+	case "docker":
+		db, err := backend.NewDockerBackend()
+		if err != nil {
+			return nil, "", err
+		}
+		return map[string]backend.Backend{"docker": db}, "docker", nil
+	case "k8s":
+		kb, err := newK8sBackend(cfg)
+		if err != nil {
+			return nil, "", err
+		}
+		return map[string]backend.Backend{"k8s": kb}, "k8s", nil
+	case "harvester-vm":
+		backends := make(map[string]backend.Backend, 2)
+		var resolver backend.SecretResolver
+		if kb, err := newK8sBackend(cfg); err != nil {
+			if logger != nil {
+				logger.Warn("k8s backend unavailable for harvester-vm secret resolver", "error", err)
+			}
+		} else {
+			backends["k8s"] = kb
+			resolver = kb
+		}
+
+		hb, err := newHarvesterVMBackend(cfg, resolver)
+		if err != nil {
+			return nil, "", err
+		}
+		backends["harvester-vm"] = hb
+		return backends, "harvester-vm", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported backend: %s (use 'docker', 'k8s', or 'harvester-vm')", cfg.backendType)
+	}
+}
+
+func newK8sBackend(cfg managerConfig) (*backend.K8sBackend, error) {
+	return backend.NewK8sBackend(backend.K8sBackendConfig{
+		Kubeconfig:                   cfg.kubeconfig,
+		Namespace:                    cfg.k8sNamespace,
+		Registry:                     cfg.registry,
+		WorkspacePVC:                 cfg.k8sWorkspacePVC,
+		ImagePullSecret:              cfg.k8sImagePullSecret,
+		WorkspaceRoot:                cfg.workspaceRoot,
+		BuilderImage:                 cfg.builderImage,
+		GitCloneImage:                cfg.gitCloneImage,
+		NFSFlush:                     cfg.nfsFlush,
+		GitBaseURL:                   cfg.gitBaseURL,
+		GitSecret:                    cfg.gitSecret,
+		BuildCPURequest:              cfg.buildCPURequest,
+		BuildCPULimit:                cfg.buildCPULimit,
+		BuildMemoryRequest:           cfg.buildMemoryRequest,
+		BuildMemoryLimit:             cfg.buildMemoryLimit,
+		BuildEphemeralStorageRequest: cfg.buildEphemeralStorageRequest,
+		BuildEphemeralStorageLimit:   cfg.buildEphemeralStorageLimit,
+		BuildAvoidNodes:              cfg.buildAvoidNodes,
+		MaxConcurrentBuilds:          cfg.maxConcurrentBuilds,
+		SyncMode:                     cfg.syncMode,
+		SyncExcludes:                 cfg.syncExcludes,
+		MaxSyncSize:                  cfg.maxSyncSize,
+	})
+}
+
+func newHarvesterVMBackend(cfg managerConfig, resolver backend.SecretResolver) (*backend.HarvesterVMBackend, error) {
+	return backend.NewHarvesterVMBackend(backend.HarvesterVMBackendConfig{
+		KubeconfigPath:       cfg.harvesterKubeconfig,
+		Namespace:            cfg.harvesterNamespace,
+		BaseImageName:        cfg.harvesterBaseImage,
+		StorageClassName:     cfg.harvesterStorageClass,
+		NetworkAttachmentDef: cfg.harvesterNetworkAttachDef,
+		DefaultVCPUs:         cfg.harvesterDefaultVCPUs,
+		DefaultMemMi:         cfg.harvesterDefaultMemMi,
+		DefaultDiskGi:        cfg.harvesterDefaultDiskGi,
+		SSHUser:              cfg.harvesterSSHUser,
+		SecretResolver:       resolver,
+	})
 }
 
 // resolveProject finds the absolute path for a project name.
@@ -512,7 +586,7 @@ func (m *manager) syncIfNeeded(ctx context.Context, containerID, projectDir stri
 // For K8s backend, returns empty slice — NFS PVC handles workspace mounting.
 func (m *manager) buildMounts(projectDir string) []backend.Mount {
 	// K8s backend uses NFS PVC for workspace; host mounts are not available on cluster nodes.
-	if m.cfg.backendType == "k8s" || m.cfg.backendType == "kubernetes" {
+	if isK8sBackendType(m.cfg.backendType) {
 		return nil
 	}
 
@@ -580,7 +654,7 @@ func (m *manager) reapCompletedBuilds(ctx context.Context) {
 
 // isK8sBackend returns true if the backend is Kubernetes-based.
 func (m *manager) isK8sBackend() bool {
-	return m.cfg.backendType == "k8s" || m.cfg.backendType == "kubernetes"
+	return isK8sBackendType(m.cfg.backendType)
 }
 
 // isWarmProject returns true if the project is in the warm pool list.
