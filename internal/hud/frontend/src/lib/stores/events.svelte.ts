@@ -57,6 +57,21 @@ export const SUPPORTED_HUD_EVENTS: Record<string, string> = {
   'hud.claim.released': 'File claim released (push)',
 };
 
+const CORE_EVENT_TYPES = [
+  'server.health', 'config.reload', 'process.start', 'process.stop', 'workflow.step',
+  'session.start', 'session.end', 'agent.status.change',
+  'tool.call', 'tool.call.start', 'tool.call.end',
+  'agent.session.start', 'agent.session.end', 'agent.session.reaped', 'agent.session.bootstrap',
+  'agent.session.stats.updated', 'agent.heartbeat', 'agent.context.added',
+  'agent.task.update', 'agent.task.dispatched',
+  'agent.spawn.building', 'agent.spawn.running', 'agent.spawn.completed', 'agent.spawn.failed',
+  'agent.spawn.stopped', 'agent.spawn.telemetry.delta',
+  'agent.spawn.message', 'agent.spawn.thinking', 'agent.spawn.reasoning', 'agent.spawn.todo',
+  'agent.spawn.tool_start', 'agent.spawn.tool_complete', 'agent.spawn.file_change',
+  'agent.spawn.result', 'agent.spawn.rate_limit',
+  'access.denied',
+];
+
 class EventStore {
   connected = $state(false);
   lastEvent: SSEEvent | null = $state(null);
@@ -70,6 +85,7 @@ class EventStore {
   private source: EventSource | null = null;
   private listeners: Map<string, EventListener[]> = new Map();
   private anyListeners: EventListener[] = [];
+  private sourceListenerTypes: Set<string> = new Set();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private countdownTimer: ReturnType<typeof setInterval> | null = null;
   private consecutiveErrors = 0;
@@ -95,6 +111,7 @@ class EventStore {
     const list = this.listeners.get(eventType) ?? [];
     list.push(listener);
     this.listeners.set(eventType, list);
+    this.ensureSourceListener(eventType);
     return () => {
       const arr = this.listeners.get(eventType);
       if (arr) {
@@ -118,6 +135,7 @@ class EventStore {
     if (this.source) return;
 
     this.source = new EventSource('/api/events');
+    this.sourceListenerTypes = new Set();
 
     this.source.addEventListener('connected', (e: MessageEvent) => {
       this.connected = true;
@@ -142,40 +160,21 @@ class EventStore {
       this.handleEvent(e.data);
     };
 
-    // Listen for known daemon event types.
-    const knownTypes = [
-      'server.health', 'config.reload', 'process.start', 'process.stop', 'workflow.step',
-      // HUD-specific snapshot events (SSE-first data flow).
-      'hud.fleet', 'hud.health', 'hud.memory', 'hud.workflows', 'hud.stream',
-      'hud.sandbox', 'hud.sandbox.event',
-      // Granular agent lifecycle events (real-time deltas, <100ms latency).
-      'agent.session.start', 'agent.session.end', 'agent.session.reaped', 'agent.session.bootstrap',
-      'agent.heartbeat', 'agent.task.update', 'agent.task.dispatched',
-      'agent.spawn.building', 'agent.spawn.running', 'agent.spawn.completed', 'agent.spawn.failed', 'agent.spawn.stopped',
-      'agent.spawn.telemetry.delta',
-      // Spawn activity events (for live activity feed).
-      'agent.spawn.message', 'agent.spawn.thinking', 'agent.spawn.reasoning', 'agent.spawn.todo',
-      'agent.spawn.tool_start', 'agent.spawn.tool_complete', 'agent.spawn.file_change',
-      'agent.spawn.result', 'agent.spawn.rate_limit',
-      // Proactive notification events.
-      'hud.conflict', 'hud.approval_needed', 'hud.claim.released',
-      // Granular memory mutation events.
-      'hud.memory.add', 'hud.memory.delete', 'hud.memory.promote', 'hud.memory.demote',
-      // Granular workflow/task mutation events.
-      'hud.workflow.approve', 'hud.workflow.reject', 'hud.task.create',
-      // Handoff events.
-      'hud.handoff.created',
-    ];
-    for (const type of knownTypes) {
-      this.source.addEventListener(type, (e: MessageEvent) => {
-        this.handleEvent(e.data, type);
-      });
-    }
+    // EventSource only delivers named SSE events to listeners registered for
+    // that exact name. Register both the documented core set and any store
+    // subscriptions that already exist; later subscriptions attach via on().
+    const eventTypes = new Set([
+      ...CORE_EVENT_TYPES,
+      ...Object.keys(SUPPORTED_HUD_EVENTS),
+      ...this.listeners.keys(),
+    ]);
+    for (const type of eventTypes) this.ensureSourceListener(type);
 
     this.source.onerror = () => {
       this.connected = false;
       this.source?.close();
       this.source = null;
+      this.sourceListenerTypes = new Set();
       this.consecutiveErrors++;
 
       // Circuit breaker: after repeated failures, open circuit with longer cooldown.
@@ -202,8 +201,17 @@ class EventStore {
       this.source.close();
       this.source = null;
     }
+    this.sourceListenerTypes = new Set();
     this.connected = false;
     this.connectionState = 'disconnected';
+  }
+
+  private ensureSourceListener(eventType: string) {
+    if (!this.source || this.sourceListenerTypes.has(eventType)) return;
+    this.source.addEventListener(eventType, (e: MessageEvent) => {
+      this.handleEvent(e.data, eventType);
+    });
+    this.sourceListenerTypes.add(eventType);
   }
 
   /** Start a visual countdown timer for the banner. */
