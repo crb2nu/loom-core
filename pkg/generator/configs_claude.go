@@ -34,6 +34,12 @@ func claudeHooks(reg *registry.Registry, profile *PlatformProfile, loomBinary st
 	// Append extras defined in the profile (e.g. postToolUse_formatters, postToolUse_taskSync).
 	appendHookExtras(hooks, profile.Hooks, loomBinary)
 
+	// Strip event names the installed Claude Code CLI does not accept: one
+	// unknown event key silently disables ALL hooks (see claude_hook_events.go).
+	if dropped, source := validateClaudeHookEvents(hooks); len(dropped) > 0 {
+		fmt.Fprint(os.Stderr, claudeHookEventWarning(dropped, source))
+	}
+
 	return hooks
 }
 
