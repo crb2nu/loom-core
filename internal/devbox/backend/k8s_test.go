@@ -693,6 +693,12 @@ func TestGitCloneInitContainer(t *testing.T) {
 	if !strings.Contains(script, "chown -R 1000:1000") {
 		t.Fatalf("expected `chown -R 1000:1000` after checkout, got: %s", script)
 	}
+	if !strings.Contains(script, `BRANCH="$(git rev-parse --abbrev-ref HEAD)"`) {
+		t.Fatalf("expected branch capture before chown, got: %s", script)
+	}
+	if strings.Contains(script, `on $(git rev-parse --abbrev-ref HEAD)`) {
+		t.Fatalf("git-clone readiness log must not run git after chown, got: %s", script)
+	}
 
 	// Should mount workspace volume
 	if len(ic.VolumeMounts) != 1 || ic.VolumeMounts[0].MountPath != "/workspace" {
