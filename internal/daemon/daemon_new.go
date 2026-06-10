@@ -118,6 +118,7 @@ func New(cfg Config) (*Daemon, error) {
 		if err != nil {
 			return nil, fmt.Errorf("normalize runtime registry: %w", err)
 		}
+		reg = applyCatalogState(reg, logger)
 		logger.Info("loaded registry", "path", registryPath, "servers", len(reg.Servers))
 
 		// If repo_root not set in config, derive from registry path
