@@ -21,14 +21,14 @@ func geminiHooksConfig() map[string]any {
 // lifecycle hooks with auto-approve settings from the registry's
 // platform_permissions.gemini section.
 func geminiHooksConfigFromRegistry(reg *registry.Registry, profile *PlatformProfile, loomBinary string) map[string]any {
+	// NOTE: do not add top-level keys here without verifying them against the
+	// installed Gemini CLI's SETTINGS_SCHEMA (bundle) AND the upstream schema:
+	// https://raw.githubusercontent.com/google-gemini/gemini-cli/main/schemas/settings.schema.json
+	// A previous "agentConfig" key (commit 809562b6) existed in neither and was
+	// silently ignored by the CLI. TestGeminiSettingsNoUnknownTopLevelKeys guards this.
 	config := map[string]any{
 		"hooks":       geminiHooks(reg, profile, loomBinary),
 		"hooksConfig": map[string]any{"enabled": true},
-		"agentConfig": map[string]any{
-			"enabled":             true,
-			"allowParallelSlices": true,
-			"worktreeManagement":  true,
-		},
 	}
 
 	// Merge auto-approve and tool settings from registry.

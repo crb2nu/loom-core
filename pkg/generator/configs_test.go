@@ -217,9 +217,52 @@ func TestGeneratedGeminiSettingsValid(t *testing.T) {
 		t.Errorf("Gemini settings has validation errors: %v", result.Errors)
 	}
 
-	for _, e := range result.Errors {
-		if e.Severity == validator.SeverityWarning {
-			t.Logf("upstream schema warning: %s - %s", e.Field, e.Message)
+	// Warnings are unknown-key (additionalProperties) violations. For config
+	// WE generate they are bugs, not noise: Gemini CLI silently ignores
+	// unknown settings keys, so a typo'd or invented key ships broken with no
+	// runtime signal (same failure class as the hallucinated "agentConfig"
+	// key from commit 809562b6).
+	if result.HasWarnings() {
+		t.Errorf("Gemini settings has upstream schema warnings: %v", result.Errors)
+	}
+}
+
+// TestGeminiSettingsNoUnknownTopLevelKeys is the regression test for the
+// invented "agentConfig" settings key (commit 809562b6). Every top-level key
+// the generator emits must exist in the vendored upstream settings schema
+// (https://raw.githubusercontent.com/google-gemini/gemini-cli/main/schemas/settings.schema.json).
+// Verified against the installed binary, not just docs: gemini-cli 0.43.0's
+// bundled SETTINGS_SCHEMA accepts exactly {admin, advanced, agents, billing,
+// context, contextManagement, experimental, extensions, general, hooks,
+// hooksConfig, ide, mcp, mcpServers, model, modelConfigs, output, privacy,
+// security, skills, telemetry, tools, ui, useWriteTodos} — no "agentConfig".
+// Unknown keys are silently ignored by the CLI (probed 2026-06-09: settings
+// containing agentConfig load with exit 0 and no warning), so this test is
+// the only place such a bug surfaces.
+func TestGeminiSettingsNoUnknownTopLevelKeys(t *testing.T) {
+	schemaBytes, ok := validator.GetEmbeddedSchema("gemini_settings.json")
+	if !ok {
+		t.Fatal("vendored gemini_settings.json schema not found")
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaBytes, &schema); err != nil {
+		t.Fatalf("failed to parse vendored Gemini schema: %v", err)
+	}
+	if len(schema.Properties) == 0 {
+		t.Fatal("vendored Gemini schema has no properties; refresh it from upstream")
+	}
+
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
+
+	if _, present := config["agentConfig"]; present {
+		t.Error(`generated Gemini settings contain "agentConfig": not a Gemini CLI settings key (regression of commit 809562b6)`)
+	}
+	for key := range config {
+		if _, known := schema.Properties[key]; !known {
+			t.Errorf("generated Gemini settings key %q is not in the upstream settings schema; verify it against the installed gemini binary before emitting it", key)
 		}
 	}
 }
