@@ -34,7 +34,7 @@
 <style>
   .toast-container {
     position: fixed;
-    top: 52px;
+    top: var(--header-height);
     right: 16px;
     display: flex;
     flex-direction: column;
