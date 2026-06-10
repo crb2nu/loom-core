@@ -233,6 +233,60 @@ func TestActiveExecs(t *testing.T) {
 	}
 }
 
+func TestCanonicalBackendType(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", "docker"},
+		{"docker", "docker"},
+		{"k8s", "k8s"},
+		{"kubernetes", "k8s"},
+		{"harvester-vm", "harvester-vm"},
+		{"custom", "custom"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.input, func(t *testing.T) {
+			t.Parallel()
+			if got := canonicalBackendType(tt.input); got != tt.want {
+				t.Fatalf("canonicalBackendType(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBackendFor(t *testing.T) {
+	t.Parallel()
+
+	k8sBackend := &fakeBackend{}
+	harvesterBackend := &fakeBackend{}
+	m := &manager{
+		backend:        k8sBackend,
+		defaultBackend: "k8s",
+		backends: map[string]backend.Backend{
+			"k8s":          k8sBackend,
+			"harvester-vm": harvesterBackend,
+		},
+	}
+
+	if got := m.backendFor(""); got != k8sBackend {
+		t.Fatalf("backendFor(empty) = %#v, want default k8s backend", got)
+	}
+	if got := m.backendFor("kubernetes"); got != k8sBackend {
+		t.Fatalf("backendFor(kubernetes) = %#v, want k8s backend", got)
+	}
+	if got := m.backendFor("harvester-vm"); got != harvesterBackend {
+		t.Fatalf("backendFor(harvester-vm) = %#v, want harvester backend", got)
+	}
+	if got := m.backendFor("missing"); got != k8sBackend {
+		t.Fatalf("backendFor(missing) = %#v, want singleton fallback", got)
+	}
+}
+
 func TestGenerateSandboxDockerfile_GitCloneAllowsNoLocalLanguages(t *testing.T) {
 	m := &manager{
 		cfg:    managerConfig{syncMode: "git-clone"},
