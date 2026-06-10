@@ -182,7 +182,9 @@ func TestWaitForPodRunningReturnsWhenPodDeleted(t *testing.T) {
 	k := testK8sBackend()
 	clientset := k8sfake.NewSimpleClientset()
 	podWatch := watch.NewFake()
+	watchStarted := make(chan struct{})
 	clientset.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		close(watchStarted)
 		return true, podWatch, nil
 	})
 	k.clientset = clientset
@@ -192,6 +194,7 @@ func TestWaitForPodRunningReturnsWhenPodDeleted(t *testing.T) {
 		errCh <- k.waitForPodRunning(context.Background(), "spawn-pod", time.Minute)
 	}()
 
+	<-watchStarted
 	podWatch.Delete(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "spawn-pod", Namespace: k.namespace}})
 
 	err := <-errCh
@@ -200,11 +203,25 @@ func TestWaitForPodRunningReturnsWhenPodDeleted(t *testing.T) {
 	}
 }
 
+func TestWaitForPodRunningReturnsImmediatelyForAlreadyRunningPod(t *testing.T) {
+	k := testK8sBackend()
+	k.clientset = k8sfake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "spawn-pod", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	})
+
+	if err := k.waitForPodRunning(context.Background(), "spawn-pod", time.Minute); err != nil {
+		t.Fatalf("waitForPodRunning(already running): %v", err)
+	}
+}
+
 func TestWaitForPodDoneReturnsWhenPodDeleted(t *testing.T) {
 	k := testK8sBackend()
 	clientset := k8sfake.NewSimpleClientset()
 	podWatch := watch.NewFake()
+	watchStarted := make(chan struct{})
 	clientset.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		close(watchStarted)
 		return true, podWatch, nil
 	})
 	k.clientset = clientset
@@ -214,11 +231,56 @@ func TestWaitForPodDoneReturnsWhenPodDeleted(t *testing.T) {
 		errCh <- k.waitForPodDone(context.Background(), "build-pod", time.Minute)
 	}()
 
+	<-watchStarted
 	podWatch.Delete(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "build-pod", Namespace: k.namespace}})
 
 	err := <-errCh
 	if err == nil || !strings.Contains(err.Error(), "deleted before completion") {
 		t.Fatalf("waitForPodDone error = %v, want deleted pod error", err)
+	}
+}
+
+func TestWaitForPodDoneReturnsImmediatelyForAlreadySucceededPod(t *testing.T) {
+	k := testK8sBackend()
+	k.clientset = k8sfake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "build-pod", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	})
+
+	if err := k.waitForPodDone(context.Background(), "build-pod", time.Minute); err != nil {
+		t.Fatalf("waitForPodDone(already succeeded): %v", err)
+	}
+}
+
+func TestWaitForPodDoneFailsOnInitContainerError(t *testing.T) {
+	k := testK8sBackend()
+	k.clientset = k8sfake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "build-pod", Namespace: k.namespace},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "git-clone",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 128,
+							Reason:   "Error",
+							Message:  "fatal: detected dubious ownership",
+						},
+					},
+				},
+			},
+		},
+	})
+
+	err := k.waitForPodDone(context.Background(), "build-pod", time.Minute)
+	if err == nil {
+		t.Fatal("expected init container termination error")
+	}
+	for _, want := range []string{"git-clone", "exit_code=128", "dubious ownership"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err.Error(), want)
+		}
 	}
 }
 

@@ -280,8 +280,9 @@ if [ -n "${SPAWN_BRANCH:-}" ]; then
     git checkout -b "${SPAWN_BRANCH}"
   fi
 fi
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 chown -R 1000:1000 %q
-echo "git-clone: ready %s on $(git rev-parse --abbrev-ref HEAD)"`,
+echo "git-clone: ready %s on ${BRANCH}"`,
 		cloneDest,
 		scheme,
 		hostAndPath,

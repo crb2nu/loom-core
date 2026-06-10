@@ -20,6 +20,15 @@ func (k *K8sBackend) waitForPodRunning(ctx context.Context, name string, timeout
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	if pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+		done, waitErr := podRunningState(pod)
+		if done || waitErr != nil {
+			return waitErr
+		}
+	} else if !isNotFound(err) {
+		return fmt.Errorf("get pod before watch: %w", err)
+	}
+
 	watcher, err := k.clientset.CoreV1().Pods(k.namespace).Watch(ctx, metav1.ListOptions{
 		FieldSelector: "metadata.name=" + name,
 	})
@@ -36,19 +45,9 @@ func (k *K8sBackend) waitForPodRunning(ctx context.Context, name string, timeout
 		if !ok {
 			continue
 		}
-		switch pod.Status.Phase {
-		case corev1.PodRunning:
-			return nil
-		case corev1.PodFailed, corev1.PodSucceeded:
-			return fmt.Errorf("pod entered terminal phase: %s", podFailureReason(pod))
-		}
-		// Early exit on image pull errors
-		for _, cs := range pod.Status.ContainerStatuses {
-			if w := cs.State.Waiting; w != nil {
-				if w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff" {
-					return fmt.Errorf("image pull error: %s — %s", w.Reason, w.Message)
-				}
-			}
+		done, waitErr := podRunningState(pod)
+		if done || waitErr != nil {
+			return waitErr
 		}
 	}
 	return fmt.Errorf("watch closed for pod %s", name)
@@ -81,6 +80,15 @@ func (k *K8sBackend) waitForPodDone(ctx context.Context, name string, timeout ti
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	if pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+		done, waitErr := podDoneState(pod)
+		if done || waitErr != nil {
+			return waitErr
+		}
+	} else if !isNotFound(err) {
+		return fmt.Errorf("get pod before watch: %w", err)
+	}
+
 	watcher, err := k.clientset.CoreV1().Pods(k.namespace).Watch(ctx, metav1.ListOptions{
 		FieldSelector: "metadata.name=" + name,
 	})
@@ -97,22 +105,59 @@ func (k *K8sBackend) waitForPodDone(ctx context.Context, name string, timeout ti
 		if !ok {
 			continue
 		}
-		switch pod.Status.Phase {
-		case corev1.PodSucceeded:
-			return nil
-		case corev1.PodFailed:
-			return fmt.Errorf("build pod failed: %s", podFailureReason(pod))
-		}
-		// Early exit on image pull errors
-		for _, cs := range pod.Status.ContainerStatuses {
-			if w := cs.State.Waiting; w != nil {
-				if w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff" {
-					return fmt.Errorf("image pull error: %s — %s", w.Reason, w.Message)
-				}
-			}
+		done, waitErr := podDoneState(pod)
+		if done || waitErr != nil {
+			return waitErr
 		}
 	}
 	return fmt.Errorf("watch closed for pod %s", name)
+}
+
+func podRunningState(pod *corev1.Pod) (bool, error) {
+	switch pod.Status.Phase {
+	case corev1.PodRunning:
+		return true, nil
+	case corev1.PodFailed, corev1.PodSucceeded:
+		return true, fmt.Errorf("pod entered terminal phase: %s", podFailureReason(pod))
+	}
+	if err := podEarlyContainerError(pod); err != nil {
+		return true, err
+	}
+	return false, nil
+}
+
+func podDoneState(pod *corev1.Pod) (bool, error) {
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded:
+		return true, nil
+	case corev1.PodFailed:
+		return true, fmt.Errorf("build pod failed: %s", podFailureReason(pod))
+	}
+	if err := podEarlyContainerError(pod); err != nil {
+		return true, err
+	}
+	return false, nil
+}
+
+func podEarlyContainerError(pod *corev1.Pod) error {
+	for _, cs := range append(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses...) {
+		if w := cs.State.Waiting; w != nil {
+			if w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff" {
+				return fmt.Errorf("image pull error in %s: %s — %s", cs.Name, w.Reason, w.Message)
+			}
+		}
+		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+			parts := []string{fmt.Sprintf("container %s terminated exit_code=%d", cs.Name, t.ExitCode)}
+			if t.Reason != "" {
+				parts = append(parts, "reason="+t.Reason)
+			}
+			if t.Message != "" {
+				parts = append(parts, "message="+t.Message)
+			}
+			return fmt.Errorf("%s", strings.Join(parts, " "))
+		}
+	}
+	return nil
 }
 
 // getPodLogs reads the last 100 lines from the buildah container.
