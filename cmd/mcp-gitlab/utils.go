@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,24 @@ import (
 
 	"github.com/crb2nu/loom/pkg/mcperror"
 )
+
+// apiStatusCode extracts the HTTP status code from an error produced by
+// mcperror.APIError. Returns 0 for nil, non-API, and malformed errors.
+func apiStatusCode(err error) int {
+	var mcpErr *mcperror.Error
+	if !errors.As(err, &mcpErr) {
+		return 0
+	}
+	details, ok := mcpErr.Details.(map[string]any)
+	if !ok {
+		return 0
+	}
+	n, ok := toInt(details["status_code"])
+	if !ok {
+		return 0
+	}
+	return n
+}
 
 func parseRetryAfter(v string) time.Duration {
 	v = strings.TrimSpace(v)
