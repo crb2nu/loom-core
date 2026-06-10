@@ -2036,6 +2036,11 @@ platform_permissions:
       # Accept edits automatically; Bash is broadly allowed below so
       # the only remaining prompts are the deny-list items.
       default_mode: "acceptEdits"
+      # Render flightdeck live-capture hooks (~/.loom/flightdeck/bin/
+      # flightdeck-capture) as first-class generated hooks so `loom sync
+      # claude --regen` no longer wipes them. Only enable on machines with
+      # the flightdeck edge binary installed.
+      flightdeck_capture: true
       # Host-aware overrides applied at sync time by `loom sync --host <name>`
       # (or $LOOM_HOST). Override REPLACES the matching base field. Used to
       # produce a code-server-correct settings.json without forking the
@@ -2130,6 +2135,11 @@ platform_permissions:
       approval_mode: "auto_edit"
       # Enable checkpointing so /restore can undo file changes.
       checkpointing: true
+      # Render flightdeck live-capture hooks (flightdeck-capture -platform
+      # gemini-cli) as first-class generated hooks so `loom sync gemini
+      # --regen` no longer wipes them. Only enable on machines with the
+      # flightdeck edge binary installed.
+      flightdeck_capture: true
       # Let trusted workspaces persist low-risk command approvals instead of
       # asking every session.
       enable_permanent_tool_approval: true

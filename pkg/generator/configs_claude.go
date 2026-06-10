@@ -34,6 +34,11 @@ func claudeHooks(reg *registry.Registry, profile *PlatformProfile, loomBinary st
 	// Append extras defined in the profile (e.g. postToolUse_formatters, postToolUse_taskSync).
 	appendHookExtras(hooks, profile.Hooks, loomBinary)
 
+	// Append flightdeck live-capture hooks when the registry gate is on, so
+	// regen no longer wipes the entries `flightdeck-capture install` used to
+	// merge out-of-band (see flightdeck_hooks.go).
+	appendFlightdeckCaptureHooks(hooks, reg, "claude")
+
 	// Strip event names the installed Claude Code CLI does not accept: one
 	// unknown event key silently disables ALL hooks (see claude_hook_events.go).
 	if dropped, source := validateClaudeHookEvents(hooks); len(dropped) > 0 {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 )
 
 // ExtractHooksFromSettings parses a settings.json and returns the "hooks"
@@ -145,9 +146,15 @@ func jsonQuote(s string) string {
 
 // MergeSettingsForHome merges repo settings into existing home settings.
 // Non-hook keys (permissions, etc.) are taken from the repo copy.
-// Hooks are taken from the repo copy if present, otherwise preserved from home.
-// This prevents losing hooks when syncing without --regen (repo copy has no hooks
-// because they were stripped to avoid duplicate execution at multiple hierarchy levels).
+//
+// Hooks:
+//   - repo copy has no hooks (sync without --regen; hooks were stripped to
+//     avoid duplicate execution at multiple hierarchy levels): home hooks are
+//     preserved as-is.
+//   - repo copy has hooks (--regen): the canonical repo hooks win, but home
+//     entries loom did not generate (e.g. flightdeck-capture, user-custom
+//     hooks) are preserved per event instead of being wiped wholesale. See
+//     mergeHooksPreservingForeign.
 func MergeSettingsForHome(homeData, repoData []byte) ([]byte, bool, error) {
 	var repoMap map[string]json.RawMessage
 	if err := json.Unmarshal(repoData, &repoMap); err != nil {
@@ -157,12 +164,16 @@ func MergeSettingsForHome(homeData, repoData []byte) ([]byte, bool, error) {
 	// Start with repo settings (latest permissions, etc.)
 	result := repoMap
 
-	// If repo has no hooks but home does, preserve home hooks.
-	if _, hasRepoHooks := repoMap["hooks"]; !hasRepoHooks && len(homeData) > 0 {
+	repoHooks, hasRepoHooks := repoMap["hooks"]
+	if len(homeData) > 0 {
 		var homeMap map[string]json.RawMessage
 		if err := json.Unmarshal(homeData, &homeMap); err == nil {
 			if homeHooks, ok := homeMap["hooks"]; ok {
-				result["hooks"] = homeHooks
+				if !hasRepoHooks {
+					result["hooks"] = homeHooks
+				} else if merged, err := mergeHooksPreservingForeign(repoHooks, homeHooks); err == nil {
+					result["hooks"] = merged
+				}
 			}
 		}
 	}
@@ -174,6 +185,115 @@ func MergeSettingsForHome(homeData, repoData []byte) ([]byte, bool, error) {
 
 	changed := !bytes.Equal(normalizeJSON(homeData), normalizeJSON(out))
 	return out, changed, nil
+}
+
+// loomManagedHookMarkers identify hook commands the loom generator emits (or
+// emitted in past versions). Home entries matching a marker are NOT preserved
+// when the canonical hooks are regenerated: the current canonical block
+// already contains their up-to-date variant, and carrying stale variants
+// forward would duplicate execution on every regen.
+//
+// flightdeck-capture is deliberately NOT a marker: when the registry's
+// flightdeck_capture gate is off, installer-merged capture hooks must survive
+// regen (the 2026-06-10 incident). When the gate is on, the generated entry's
+// command matches the installer's after home-prefix normalization, so the
+// duplicate-command check below drops the installer copy instead.
+var loomManagedHookMarkers = []string{
+	"HOOK_SESSION_ID",                     // telemetry/lifecycle wrappers
+	"loom agent ",                         // direct loom CLI invocations
+	"loom-agent-hooks.log",                // telemetry event-emit sink
+	".tool_input.file_path",               // formatter snippets
+	".tool_input.command",                 // guardrail snippets
+	".tool_input.new_string",              // content guardrail snippets
+	"git rev-parse --is-inside-work-tree", // session-start nudges
+}
+
+// mergeHooksPreservingForeign merges a freshly generated canonical hooks block
+// with the existing home hooks block. Canonical entries are authoritative;
+// home entries are appended per event when they are foreign — i.e. their
+// command neither appears in the canonical block (after home-directory
+// normalization) nor matches a loom-managed marker.
+func mergeHooksPreservingForeign(canonicalRaw, homeRaw json.RawMessage) (json.RawMessage, error) {
+	var canonical map[string][]map[string]any
+	if err := json.Unmarshal(canonicalRaw, &canonical); err != nil {
+		return nil, fmt.Errorf("parse canonical hooks: %w", err)
+	}
+	var home map[string][]map[string]any
+	if err := json.Unmarshal(homeRaw, &home); err != nil {
+		return nil, fmt.Errorf("parse home hooks: %w", err)
+	}
+
+	homeDir, _ := os.UserHomeDir()
+	canonicalCommands := map[string]bool{}
+	for _, entries := range canonical {
+		for _, cmd := range hookEntryCommands(entries) {
+			canonicalCommands[normalizeHookCommand(cmd, homeDir)] = true
+		}
+	}
+
+	events := make([]string, 0, len(home))
+	for event := range home {
+		events = append(events, event)
+	}
+	sort.Strings(events)
+	for _, event := range events {
+		for _, entry := range home[event] {
+			cmds := hookEntryCommands([]map[string]any{entry})
+			if len(cmds) == 0 {
+				continue
+			}
+			foreign := true
+			for _, cmd := range cmds {
+				if canonicalCommands[normalizeHookCommand(cmd, homeDir)] || isLoomManagedHookCommand(cmd) {
+					foreign = false
+					break
+				}
+			}
+			if foreign {
+				canonical[event] = append(canonical[event], entry)
+			}
+		}
+	}
+
+	return json.Marshal(canonical)
+}
+
+// hookEntryCommands extracts every "command" string from the nested hooks
+// arrays of the given entries.
+func hookEntryCommands(entries []map[string]any) []string {
+	var cmds []string
+	for _, entry := range entries {
+		inner, _ := entry["hooks"].([]any)
+		for _, h := range inner {
+			hm, _ := h.(map[string]any)
+			if cmd, ok := hm["command"].(string); ok && cmd != "" {
+				cmds = append(cmds, cmd)
+			}
+		}
+	}
+	return cmds
+}
+
+// normalizeHookCommand maps home-directory prefixes to ~ so a generated
+// "~/.loom/..." command and an installer-written absolute
+// "/Users/x/.loom/..." command compare equal.
+func normalizeHookCommand(cmd, homeDir string) string {
+	cmd = strings.TrimSpace(cmd)
+	if homeDir != "" {
+		cmd = strings.ReplaceAll(cmd, homeDir+"/", "~/")
+	}
+	return strings.ReplaceAll(cmd, "$HOME/", "~/")
+}
+
+// isLoomManagedHookCommand reports whether cmd looks like a loom-generated
+// hook command (current or stale variant).
+func isLoomManagedHookCommand(cmd string) bool {
+	for _, marker := range loomManagedHookMarkers {
+		if strings.Contains(cmd, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // StripHooksFromFile reads a settings.json file, removes the hooks key,

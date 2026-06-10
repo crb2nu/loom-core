@@ -1,6 +1,9 @@
 package generator
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/crb2nu/loom/pkg/registry"
 )
 
@@ -83,5 +86,15 @@ func geminiHooks(reg *registry.Registry, profile *PlatformProfile, loomBinary st
 	appendHookPolicies(hooks, reg, profile.Hooks)
 
 	appendHookExtras(hooks, profile.Hooks, loomBinary)
+
+	// Append flightdeck live-capture hooks when the registry gate is on
+	// (see flightdeck_hooks.go).
+	appendFlightdeckCaptureHooks(hooks, reg, "gemini")
+
+	// Strip event names the Gemini CLI does not accept — same failure class
+	// as Claude Code (see gemini_hook_events.go).
+	if dropped, source := validateGeminiHookEvents(hooks); len(dropped) > 0 {
+		fmt.Fprint(os.Stderr, geminiHookEventWarning(dropped, source))
+	}
 	return hooks
 }
