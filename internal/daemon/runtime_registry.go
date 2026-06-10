@@ -1,6 +1,43 @@
 package daemon
 
-import "github.com/crb2nu/loom/pkg/registry"
+import (
+	"log/slog"
+
+	"github.com/crb2nu/loom/pkg/registry"
+)
+
+// applyCatalogState drops servers the user disabled via `loom catalog
+// disable` (~/.config/loom/catalog-state.yaml) from the daemon's registry
+// view, so disabled servers never spawn and never appear in proxy
+// tools/list responses. Previously only direct per-server config
+// generation honored catalog state, which made `loom catalog disable` a
+// no-op for proxy-connected platforms.
+//
+// Fail-open: a missing or unreadable state file leaves the registry
+// unfiltered (an absent file is the documented all-enabled default —
+// in-cluster hub deployments have no catalog state and are unaffected).
+func applyCatalogState(reg *registry.Registry, logger *slog.Logger) *registry.Registry {
+	if reg == nil {
+		return nil
+	}
+	cs, err := registry.LoadCatalogState()
+	if err != nil {
+		if logger != nil {
+			logger.Warn("catalog state unreadable; serving all registry servers", "error", err)
+		}
+		return reg
+	}
+	if cs == nil || len(cs.DisabledServers) == 0 {
+		return reg
+	}
+	enabled := cs.EnabledServers(reg)
+	if dropped := len(reg.Servers) - len(enabled); dropped > 0 && logger != nil {
+		logger.Info("catalog state filtered registry",
+			"disabled", dropped, "enabled", len(enabled))
+	}
+	reg.Servers = enabled
+	return reg
+}
 
 // runtimeRegistryForTarget normalizes the daemon's registry to a single
 // already-merged target view so concurrent runtime GetServerSpec calls stay

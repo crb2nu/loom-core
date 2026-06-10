@@ -109,6 +109,7 @@ func (d *Daemon) Reload(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("normalize runtime registry: %w", err)
 		}
+		newReg = applyCatalogState(newReg, d.logger)
 
 		// Find servers that were removed
 		oldServers := make(map[string]bool)

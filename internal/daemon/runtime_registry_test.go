@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"os"
 	"testing"
 
 	"github.com/crb2nu/loom/pkg/registry"
@@ -95,5 +96,49 @@ func TestRuntimeRegistryForTarget_ClonesCommonEnv(t *testing.T) {
 	normalized.Servers[0].Common.Env["TOKEN"] = "changed"
 	if got, want := reg.Servers[0].Common.Env["TOKEN"], "abc"; got != want {
 		t.Fatalf("original registry env mutated to %q, want %q", got, want)
+	}
+}
+
+func TestApplyCatalogState_NoStateFileLeavesRegistryUnfiltered(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no catalog-state.yaml under this home
+
+	reg := &registry.Registry{
+		Servers: []*registry.Server{{Name: "tavily"}, {Name: "icc"}},
+	}
+	got := applyCatalogState(reg, nil)
+	if len(got.Servers) != 2 {
+		t.Fatalf("servers = %d, want 2 (absent state file means all enabled)", len(got.Servers))
+	}
+}
+
+func TestApplyCatalogState_DropsDisabledServers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateDir := home + "/.config/loom"
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := "disabled_servers:\n    - icc\n    - grafana\n"
+	if err := os.WriteFile(stateDir+"/catalog-state.yaml", []byte(state), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := &registry.Registry{
+		Servers: []*registry.Server{{Name: "tavily"}, {Name: "icc"}, {Name: "grafana"}, {Name: "gitlab"}},
+	}
+	got := applyCatalogState(reg, nil)
+	names := make([]string, 0, len(got.Servers))
+	for _, s := range got.Servers {
+		names = append(names, s.Name)
+	}
+	want := []string{"tavily", "gitlab"}
+	if len(names) != len(want) || names[0] != want[0] || names[1] != want[1] {
+		t.Fatalf("servers = %v, want %v", names, want)
+	}
+}
+
+func TestApplyCatalogState_NilRegistry(t *testing.T) {
+	if got := applyCatalogState(nil, nil); got != nil {
+		t.Fatalf("nil registry should pass through, got %v", got)
 	}
 }
