@@ -103,6 +103,10 @@ class SandboxStore {
   // Staleness (Slice B3) — see fleet.svelte.ts for the pattern.
   staleAfter = 90_000;
   get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (this.pollTimer === null) return false;
     return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
   }
 
@@ -377,7 +381,9 @@ class SandboxStore {
     this.fetchPolicy();
     // 60s watchdog poll (SSE is the primary data source; this only fires
     // when SSE is disconnected — see Slice B3 of the HUD UX overhaul).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    // Watchdog: poll on SSE-down OR on stale, so a mounted-but-quiet page
+    // self-heals instead of sticking on the stale banner.
+    this.pollTimer = setInterval(() => { if (!eventStore.connected || this.isStale) this.fetch(); }, intervalMs);
     this.execPollTimer = setInterval(() => {
       this.pollActiveExecs().catch(() => { /* best-effort */ });
     }, 3000);

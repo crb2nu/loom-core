@@ -18,6 +18,7 @@
 
 import { eventStore, type SSEEvent } from './events.svelte.ts';
 import { groupSessionsByRootAgent } from '../utils/agents.ts';
+import { sessionsToEnd, type SnapshotSessionLite } from '../utils/sessionReconcile.ts';
 
 /** Maximum tool calls retained per session in the ring buffer. */
 export const RECENT_CALLS_PER_SESSION = 20;
@@ -192,14 +193,21 @@ class LiveSessionsStore {
   }
 
   /**
-   * mergeActiveSessions inserts any status=active sessions not already
-   * tracked into the live-sessions map. Idempotent: existing sessions are
-   * left alone (SSE-sourced entries have richer state we don't want to
-   * clobber). Called from both the one-shot mount seed and the hud.fleet
-   * SSE handler so sessions that appear in fleet after mount still show up.
+   * mergeActiveSessions reconciles the live-sessions map against the
+   * canonical session list from a fleet snapshot, in both directions:
+   *
+   *   - status=active sessions not yet tracked are inserted (existing
+   *     entries are left alone — SSE-sourced entries have richer state we
+   *     don't want to clobber);
+   *   - tracked entries the snapshot reports as ended (or that have gone
+   *     quiet AND dropped out of the snapshot) are marked ended so missed
+   *     session.end SSE events can't leave zombie rows that drift away
+   *     from the fleet-snapshot count the card header displays.
+   *
+   * Called from both the one-shot mount seed and the hud.fleet SSE handler.
    */
   async mergeActiveSessions(sessions: Array<Record<string, unknown>>): Promise<void> {
-    let added = 0;
+    let dirty = 0;
     const backfills: Array<Promise<void>> = [];
     for (const s of sessions) {
       const sid = stringField(s, 'id');
@@ -219,9 +227,24 @@ class LiveSessionsStore {
       };
       this.sessions.set(sid, session);
       backfills.push(this.backfillSessionActivity(session));
-      added++;
+      dirty++;
     }
-    if (added > 0) this.touch();
+
+    const lite: SnapshotSessionLite[] = sessions.map((s) => ({
+      id: stringField(s, 'id'),
+      status: stringField(s, 'status'),
+      ended_at: stringField(s, 'ended_at'),
+    }));
+    const now = Date.now();
+    for (const sid of sessionsToEnd(this.sessions.values(), lite, now)) {
+      const session = this.sessions.get(sid);
+      if (!session) continue;
+      session.ended_at = now;
+      session.last_activity = now;
+      dirty++;
+    }
+
+    if (dirty > 0) this.touch();
     if (backfills.length > 0) {
       await Promise.allSettled(backfills);
     }

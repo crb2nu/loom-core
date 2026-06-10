@@ -2,7 +2,7 @@
 // v2: SSE-first with 30s fallback poll. Applies hud.fleet snapshots directly.
 import { eventStore } from './events.svelte.ts';
 import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
-import { arraysEqualById } from '../utils/diff.ts';
+import { arraysEqualById, arraysEqualByKey } from '../utils/diff.ts';
 import { spawnStore, type SpawnState } from './spawn.svelte.ts';
 import {
   buildUnifiedAgents,
@@ -228,6 +228,10 @@ class FleetStore {
   // up but the daemon stops emitting hud.fleet snapshots.
   staleAfter = 90_000;
   get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (this.pollTimer === null) return false;
     return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
   }
 
@@ -527,7 +531,20 @@ class FleetStore {
       }
     }
     if (data.agents) {
-      this.agents = data.agents as PresenceInfo[];
+      // Hash-gate like sessions/tasks: the monitor re-emits hud.fleet
+      // snapshots on a timer, and an unconditional replace churns identity
+      // through every derived view (unifiedAgents → FleetTable → status bar)
+      // even when nothing changed. Volatile age fields are deliberately
+      // excluded — they advance every snapshot and would defeat the gate;
+      // last_heartbeat changes whenever a real heartbeat lands, which is
+      // when displayed ages need to refresh anyway.
+      const next = data.agents as PresenceInfo[];
+      const keyAgent = (a: PresenceInfo) => a.agent_id;
+      const hashAgent = (a: PresenceInfo) =>
+        `${a.status}|${a.last_heartbeat}|${a.session_id ?? ''}|${a.session_status ?? ''}|${a.current_task}|${a.branch}|${a.telemetry_status ?? ''}`;
+      if (!arraysEqualByKey(this.agents, next, keyAgent, hashAgent)) {
+        this.agents = next;
+      }
     }
     if (data.tasks) {
       const next = data.tasks as TaskInfo[];
@@ -537,7 +554,11 @@ class FleetStore {
       }
     }
     if (data.file_claims) {
-      this.fileClaims = data.file_claims as FileClaimInfo[];
+      const next = data.file_claims as FileClaimInfo[];
+      const hashClaim = (c: FileClaimInfo) => `${c.file_path}|${c.claim_type}|${c.expires_at ?? ''}`;
+      if (!arraysEqualById(this.fileClaims, next, hashClaim)) {
+        this.fileClaims = next;
+      }
     }
     this.lastUpdated = new Date();
     this.error = null;
