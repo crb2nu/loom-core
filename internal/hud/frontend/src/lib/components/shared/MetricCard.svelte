@@ -112,7 +112,7 @@
 
   .metric-card-proxy {
     margin-left: 4px;
-    font-size: 9px;
+    font-size: var(--text-2xs);
     font-weight: 500;
     text-transform: lowercase;
     letter-spacing: 0;
@@ -121,17 +121,17 @@
   }
 
   .metric-card-badge {
-    font-size: 9px;
+    font-size: var(--text-2xs);
     padding: 1px 5px;
     border-radius: var(--radius-lg);
     font-weight: 500;
   }
 
-  .badge-info { background: rgba(1, 135, 153, 0.15); color: var(--info); }
-  .badge-success { background: rgba(34, 178, 85, 0.15); color: var(--success); }
-  .badge-warning { background: rgba(231, 179, 18, 0.15); color: var(--warning); }
-  .badge-error { background: rgba(230, 30, 63, 0.15); color: var(--error); }
-  .badge-accent { background: rgba(233, 93, 116, 0.15); color: var(--accent); }
+  .badge-info { background: var(--info-dim); color: var(--info); }
+  .badge-success { background: var(--success-dim); color: var(--success); }
+  .badge-warning { background: var(--warning-dim); color: var(--warning); }
+  .badge-error { background: var(--error-dim); color: var(--error); }
+  .badge-accent { background: var(--accent-dim); color: var(--accent); }
   .badge-muted { background: var(--bg-tertiary); color: var(--fg-muted); }
 
   .metric-card-value {

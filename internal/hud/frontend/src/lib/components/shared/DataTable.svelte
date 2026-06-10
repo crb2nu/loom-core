@@ -310,7 +310,7 @@
   }
 
   .data-table tbody tr.keyboard-focused td {
-    background: rgba(1, 135, 153, 0.15);
+    background: var(--info-dim);
     color: var(--fg-primary);
     box-shadow: inset 2px 0 0 var(--info);
   }
@@ -378,7 +378,7 @@
   }
 
   .data-table tbody tr:nth-child(even) td {
-    background: rgba(0, 46, 52, 0.2); /* very subtle var(--bg-tertiary) mix */
+    background: color-mix(in srgb, var(--bg-tertiary) 45%, transparent);
   }
 
   .data-table.stable-layout thead th,
@@ -399,7 +399,7 @@
   }
 
   .data-table tbody tr.selected td {
-    background: rgba(1, 135, 153, 0.08);
+    background: color-mix(in srgb, var(--info-dim) 80%, transparent);
   }
 
   .data-table tbody tr.clickable {

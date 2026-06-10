@@ -68,7 +68,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(0, 0, 0, 0.6);
+    background: var(--scrim);
     backdrop-filter: blur(2px);
   }
 
@@ -132,11 +132,11 @@
   }
 
   .confirm-btn:hover {
-    background: rgba(129, 240, 254, 0.1);
+    background: var(--accent-dim);
   }
 
   .confirm-btn.danger {
-    border-color: rgba(255, 61, 113, 0.4);
+    border-color: color-mix(in srgb, var(--error) 40%, var(--border));
     color: var(--error);
   }
 
@@ -146,12 +146,12 @@
   }
 
   .confirm-btn.warn {
-    border-color: rgba(245, 158, 11, 0.4);
-    color: var(--color-warn, #f59e0b);
+    border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+    color: var(--warning);
   }
 
   .confirm-btn.warn:hover {
-    background: rgba(245, 158, 11, 0.1);
-    border-color: var(--color-warn, #f59e0b);
+    background: var(--warning-dim);
+    border-color: var(--warning);
   }
 </style>

@@ -11,7 +11,7 @@
   import Badge from '../../widgets/Badge.svelte';
   import EntityGraph from '../../widgets/EntityGraph.svelte';
   import Modal from '../../widgets/Modal.svelte';
-  import ConfirmDialog from '../../widgets/ConfirmDialog.svelte';
+  import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
   import FilterBar from '../shared/FilterBar.svelte';
   import DetailDrawer from '../shared/DetailDrawer.svelte';
@@ -537,7 +537,7 @@
   title="Delete {deleteType === 'entity' ? 'Entity' : 'Relation'}"
   message={deleteTarget ? `Delete ${deleteType} "${deleteTarget.name ?? deleteTarget.id}"? This cannot be undone.` : ''}
   confirmLabel="Delete"
-  destructive={true}
+  variant="danger"
   onConfirm={executeDelete}
   onCancel={() => { showDeleteConfirm = false; deleteTarget = null; }}
 />

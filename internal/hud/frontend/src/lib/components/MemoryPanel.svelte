@@ -5,7 +5,7 @@
   import Gauge from '../widgets/Gauge.svelte';
   import Badge from '../widgets/Badge.svelte';
   import Modal from '../widgets/Modal.svelte';
-  import ConfirmDialog from '../widgets/ConfirmDialog.svelte';
+  import ConfirmDialog from './shared/ConfirmDialog.svelte';
   import FilterBar from './shared/FilterBar.svelte';
   import EmptyState from './shared/EmptyState.svelte';
   import DataTable from './shared/DataTable.svelte';
@@ -590,7 +590,7 @@
   title="Delete Memory"
   message={deleteTarget ? `Delete "${deleteTarget.title}"? This cannot be undone.` : ''}
   confirmLabel="Delete"
-  destructive={true}
+  variant="danger"
   onConfirm={executeDelete}
   onCancel={cancelDelete}
 />

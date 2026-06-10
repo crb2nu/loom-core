@@ -208,9 +208,9 @@
   .evidence-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .evidence-chip {
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     padding: 1px 7px;
-    font-size: 9px;
+    font-size: var(--text-2xs);
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--fg-muted);
@@ -223,14 +223,14 @@
   }
   .telemetry-chip {
     margin-left: auto;
-    font-size: 9px;
+    font-size: var(--text-2xs);
     color: var(--fg-secondary);
     font-family: var(--font-mono);
     text-transform: uppercase;
     letter-spacing: 0.08em;
     border: 1px solid color-mix(in srgb, var(--agent-color) 28%, var(--border));
     background: color-mix(in srgb, var(--agent-color) 8%, transparent);
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     padding: 1px 7px;
   }
   .telemetry-stale {
@@ -254,21 +254,21 @@
   .detail-icon { font-size: 11px; color: var(--fg-muted); width: 14px; text-align: center; flex-shrink: 0; }
   .detail-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .pr-badge { font-size: 9px; padding: 1px 4px; border-radius: var(--radius-sm); background: rgba(129, 240, 254, 0.1); color: var(--accent); text-decoration: none; border: 1px solid rgba(129, 240, 254, 0.2); flex-shrink: 0; }
-  .pr-badge:hover { background: rgba(129, 240, 254, 0.2); }
+  .pr-badge { font-size: var(--text-2xs); padding: 1px 4px; border-radius: var(--radius-sm); background: var(--info-dim); color: var(--info); text-decoration: none; border: 1px solid color-mix(in srgb, var(--info) 24%, var(--border)); flex-shrink: 0; }
+  .pr-badge:hover { background: color-mix(in srgb, var(--info-dim) 70%, var(--info)); }
 
   .overlap-dots { display: flex; align-items: center; gap: 2px; margin-left: auto; }
   .overlap-dot { width: 8px; height: 8px; border-radius: 50%; }
-  .overlap-more { font-size: 9px; color: var(--fg-muted); font-family: var(--font-mono); }
+  .overlap-more { font-size: var(--text-2xs); color: var(--fg-muted); font-family: var(--font-mono); }
 
   .card-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; padding-top: 4px; border-top: 1px solid var(--border); }
   .btn-xs { padding: 2px 8px; font-size: 11px; }
   .btn-ghost { background: transparent; color: var(--fg-secondary); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
   .btn-ghost:hover { border-color: var(--accent); color: var(--fg-primary); }
-  .btn-nudge { background: rgba(231, 179, 18, 0.1); color: var(--warning); border: 1px solid rgba(231, 179, 18, 0.25); border-radius: var(--radius-sm); cursor: pointer; }
-  .btn-nudge:hover { background: rgba(231, 179, 18, 0.2); }
-  .btn-dispatch { background: rgba(129, 240, 254, 0.1); color: var(--accent); border: 1px solid rgba(129, 240, 254, 0.25); border-radius: var(--radius-sm); cursor: pointer; }
-  .btn-dispatch:hover { background: rgba(129, 240, 254, 0.2); }
+  .btn-nudge { background: var(--warning-dim); color: var(--warning); border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border)); border-radius: var(--radius-sm); cursor: pointer; }
+  .btn-nudge:hover { background: color-mix(in srgb, var(--warning-dim) 70%, var(--warning)); }
+  .btn-dispatch { background: var(--accent-dim); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border)); border-radius: var(--radius-sm); cursor: pointer; }
+  .btn-dispatch:hover { background: color-mix(in srgb, var(--accent-dim) 70%, var(--accent)); }
 
   .file-list { display: flex; flex-direction: column; gap: 1px; padding-top: 4px; border-top: 1px solid var(--border); margin-top: 4px; }
   .file-item { font-size: 10px; color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
