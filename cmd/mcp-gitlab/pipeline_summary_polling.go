@@ -62,19 +62,26 @@ func (g *gitlabServer) handlePipelineSummary(ctx context.Context, args map[strin
 	jobsRes := <-jobsCh
 
 	if pipelineRes.err != nil {
+		if mcperror.IsNotFound(pipelineRes.err) {
+			return mcp.ErrorResult(pipelineNotFoundError(project, pipelineID)), nil
+		}
 		return nil, pipelineRes.err
 	}
-	if jobsRes.err != nil {
-		return nil, jobsRes.err
-	}
-
-	jobSummary := g.summarizeJobs(jobsRes.data, includeFailedJobLogs, ctx, project)
 
 	result := map[string]any{
 		"ok":       true,
 		"pipeline": pipelineRes.data,
-		"jobs":     jobSummary,
 	}
+
+	// The pipeline fetch succeeded, so a jobs failure is partial: return the
+	// pipeline with the jobs error attached instead of failing the whole call.
+	if jobsRes.err != nil {
+		result["partial"] = true
+		result["jobs_error"] = jobsRes.err.Error()
+		return mcp.JSONResult(result)
+	}
+
+	result["jobs"] = g.summarizeJobs(jobsRes.data, includeFailedJobLogs, ctx, project)
 
 	if includeTestReport {
 		testReport, err := g.fetchTestReport(ctx, project, pipelineID, false, 20)
@@ -84,6 +91,20 @@ func (g *gitlabServer) handlePipelineSummary(ctx context.Context, args map[strin
 	}
 
 	return mcp.JSONResult(result)
+}
+
+// pipelineNotFoundError tells the calling agent how to recover from a missing
+// pipeline instead of leaving it to retry pipeline_summary in a loop.
+func pipelineNotFoundError(project string, pipelineID int) error {
+	msg := fmt.Sprintf(
+		"pipeline %d not found in %s: it may not exist yet (pipeline creation can lag the push) or the id may be stale. "+
+			"Do not call pipeline_summary again in a loop with the same id. "+
+			"Call list_pipelines (filter by ref or sha) to find the current pipeline id, then poll_pipeline to wait for it to finish.",
+		pipelineID, project)
+	return mcperror.New("PIPELINE_NOT_FOUND", msg).WithDetails(map[string]any{
+		"project":     project,
+		"pipeline_id": pipelineID,
+	})
 }
 
 func (g *gitlabServer) handleGetTestReport(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {

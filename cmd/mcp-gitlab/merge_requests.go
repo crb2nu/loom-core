@@ -4,12 +4,29 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
+	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcpscaffold"
+	"github.com/crb2nu/loom/pkg/poll"
 	"github.com/crb2nu/loom/pkg/validate"
+)
+
+// GitLab rejects merge/auto-merge requests with 405 (not ready: no head
+// pipeline yet, draft, blocked) or 406 (mergeability check still running, or a
+// real conflict) when they arrive too early after a push. For auto_merge we
+// wait briefly for the head pipeline and retry a bounded number of times
+// instead of surfacing the raw status, which sends agents into blind
+// merge-retry loops. Vars (not consts) so tests can shrink the delays.
+var (
+	autoMergeRetryAttempts    = 2
+	autoMergeHeadPipelineWait = 8 * time.Second
+	autoMergePollInterval     = 2 * time.Second
+	autoMergeRetryBackoffMax  = 4 * time.Second
 )
 
 func registerMergeRequestTools(srv *mcpscaffold.Server, gl *gitlabServer) {
@@ -259,8 +276,94 @@ func (g *gitlabServer) handleMergeMergeRequest(ctx context.Context, args map[str
 	}
 	path := fmt.Sprintf("/projects/%s/merge_requests/%d/merge", encodeProject(project), mergeRequestIID)
 	result, err := g.request(ctx, "PUT", path, body)
-	if err != nil {
+	if err == nil {
+		return mcp.JSONResult(result)
+	}
+	if !autoMerge || !isMergeNotAcceptedError(err) {
 		return nil, err
 	}
-	return mcp.JSONResult(result)
+	return g.retryAutoMerge(ctx, project, mergeRequestIID, path, body, err)
+}
+
+// isMergeNotAcceptedError reports whether err is GitLab's "merge not accepted
+// (yet)" rejection: 405 Method Not Allowed or 406 Not Acceptable.
+func isMergeNotAcceptedError(err error) bool {
+	sc := apiStatusCode(err)
+	return sc == http.StatusMethodNotAllowed || sc == http.StatusNotAcceptable
+}
+
+// retryAutoMerge handles a 405/406 on an auto_merge request: wait for the head
+// pipeline to exist, retry the merge request a bounded number of times, and on
+// persistent rejection return an actionable error instead of the raw status.
+func (g *gitlabServer) retryAutoMerge(ctx context.Context, project string, mergeRequestIID int, path string, body any, firstErr error) (*mcp.CallToolResult, error) {
+	lastErr := firstErr
+	var headPipeline map[string]any
+	for attempt := 0; attempt < autoMergeRetryAttempts; attempt++ {
+		if err := poll.WaitWithContext(ctx, backoffDelay(attempt, autoMergeRetryBackoffMax)); err != nil {
+			return nil, err
+		}
+		headPipeline = g.waitForHeadPipeline(ctx, project, mergeRequestIID, autoMergeHeadPipelineWait)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		result, err := g.request(ctx, "PUT", path, body)
+		if err == nil {
+			return mcp.JSONResult(result)
+		}
+		if !isMergeNotAcceptedError(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return mcp.ErrorResult(autoMergeRejectedError(project, mergeRequestIID, headPipeline, lastErr)), nil
+}
+
+// waitForHeadPipeline polls the merge request until GitLab reports a head
+// pipeline or maxWait elapses. Returns the head pipeline object, or nil.
+func (g *gitlabServer) waitForHeadPipeline(ctx context.Context, project string, mergeRequestIID int, maxWait time.Duration) map[string]any {
+	deadline := time.Now().Add(maxWait)
+	path := fmt.Sprintf("/projects/%s/merge_requests/%d", encodeProject(project), mergeRequestIID)
+	for {
+		mr, err := g.request(ctx, "GET", path, nil)
+		if err == nil {
+			if hp, ok := mr["head_pipeline"].(map[string]any); ok && len(hp) > 0 {
+				return hp
+			}
+		}
+		if time.Now().Add(autoMergePollInterval).After(deadline) {
+			return nil
+		}
+		if poll.WaitWithContext(ctx, autoMergePollInterval) != nil {
+			return nil
+		}
+	}
+}
+
+// autoMergeRejectedError turns a persistent 405/406 into guidance the calling
+// agent can act on, instead of an opaque status it will retry in a loop.
+func autoMergeRejectedError(project string, mergeRequestIID int, headPipeline map[string]any, lastErr error) error {
+	sc := apiStatusCode(lastErr)
+	pipelineHint := "no head pipeline exists yet (pipeline creation can lag the push)"
+	details := map[string]any{
+		"project":           project,
+		"merge_request_iid": mergeRequestIID,
+		"status_code":       sc,
+		"retries_exhausted": true,
+	}
+	if headPipeline != nil {
+		status, _ := headPipeline["status"].(string)
+		if id, ok := toInt(headPipeline["id"]); ok {
+			details["head_pipeline_id"] = id
+			details["head_pipeline_status"] = status
+			pipelineHint = fmt.Sprintf("head pipeline %d is %q", id, status)
+		}
+	}
+	msg := fmt.Sprintf(
+		"GitLab rejected auto-merge for %s!%d after retries (HTTP %d): %s. "+
+			"Do not call merge_merge_request again in a loop. "+
+			"Poll the head pipeline with poll_pipeline (or pipeline_summary) until it succeeds, then request the merge once. "+
+			"A persistent HTTP 406 usually means the source branch conflicts with the target and needs a rebase. "+
+			"Also check the merge request for draft status or unresolved blocking discussions.",
+		project, mergeRequestIID, sc, pipelineHint)
+	return mcperror.New("AUTO_MERGE_NOT_READY", msg).WithDetails(details)
 }
