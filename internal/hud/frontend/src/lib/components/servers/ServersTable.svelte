@@ -25,8 +25,8 @@
     { key: 'consec_fails', label: 'Fails', sortable: true, width: '50px' },
     { key: 'latency', label: 'Latency', sortable: true, width: '80px' },
     { key: 'tool_count', label: 'Tools', sortable: true, width: '60px' },
-    { key: 'transport', label: 'Transport', width: '80px' },
-    { key: 'sparkline', label: 'Sparkline', width: '102px' },
+    { key: 'transport', label: 'Transport', width: '80px', hideBelow: 620 },
+    { key: 'sparkline', label: 'Sparkline', width: '102px', hideBelow: 700 },
   ];
 
   let hasActiveFilters = $derived(
@@ -61,7 +61,7 @@
       onSort={(key, dir) => healthStore.setSort(key, dir)}
       onRowClick={(row) => onSelect(row)}
     >
-      {#snippet row({ row: server })}
+      {#snippet row({ row: server, hiddenColumns })}
         <td class="server-name-cell">
           <span class="text-mono server-name" title={sanitizeText(server.name)}>{sanitizeText(server.name)}</span>
           {#if server.categories?.length > 0}
@@ -74,9 +74,12 @@
         <td class="text-mono" class:fail-warn={server.consec_fails > 0}>{server.consec_fails > 0 ? server.consec_fails : ''}</td>
         <td class="text-mono">{#key server.latency}<span class="data-updated">{formatLatency(server.latency)}</span>{/key}</td>
         <td class="text-mono">{server.tool_count ?? 0}</td>
+        {#if !hiddenColumns.has('transport')}
         <td class="text-mono text-muted transport-cell" title={sanitizeText(server.transport || '---')}>
           {sanitizeText(server.transport || '---')}
         </td>
+        {/if}
+        {#if !hiddenColumns.has('sparkline')}
         <td class="sparkline-cell">
           {#if server.latencyHistory?.length}
             <SparkLine
@@ -89,6 +92,7 @@
             <span class="text-muted text-xs">no data</span>
           {/if}
         </td>
+        {/if}
       {/snippet}
     </DataTable>
   {/if}

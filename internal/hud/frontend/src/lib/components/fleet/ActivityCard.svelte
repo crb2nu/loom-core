@@ -15,8 +15,8 @@
 
   const columns = [
     { key: 'time', label: 'Time', width: '70px' },
-    { key: 'type', label: 'Type', width: '80px' },
-    { key: 'agent', label: 'Agent', width: '90px' },
+    { key: 'type', label: 'Type', width: '80px', hideBelow: 320 },
+    { key: 'agent', label: 'Agent', width: '90px', hideBelow: 380 },
     { key: 'title', label: 'Title' },
   ];
 </script>
@@ -32,10 +32,14 @@
     <EmptyState icon={'○'} heading="No recent activity" compact />
   {:else}
     <DataTable {columns} rows={recentActivity} stableLayout={true} idKey="id">
-      {#snippet row({ row: entry })}
+      {#snippet row({ row: entry, hiddenColumns })}
         <td class="activity-time text-mono">{formatTime(entry.timestamp)}</td>
+        {#if !hiddenColumns.has('type')}
         <td><Badge text={sanitizeText(entry.entry_type ?? 'note')} variant={entryVariant(entry.entry_type)} /></td>
+        {/if}
+        {#if !hiddenColumns.has('agent')}
         <td class="activity-agent text-mono" title={sanitizeText(entry.agent ?? '---')}>{sanitizeText(entry.agent ?? '---')}</td>
+        {/if}
         <td class="activity-title truncate" title={sanitizeText(entry.title ?? entry.content?.slice(0, 120) ?? '---')}>
           {sanitizeText(entry.title ?? entry.content?.slice(0, 60) ?? '---')}
         </td>

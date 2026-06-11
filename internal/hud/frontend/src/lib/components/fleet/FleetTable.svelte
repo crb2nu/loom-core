@@ -39,14 +39,14 @@
 
   // Agent column intentionally has no explicit width: with table-layout: fixed
   // (from DataTable's stable-layout) the unsized column absorbs leftover space.
-  // Low-priority columns are hidden via container queries (see <style>) as the
-  // card narrows, so the agent column never collapses below a readable width.
+  // hideBelow drops low-priority columns as the table narrows, so the agent
+  // column never collapses below a readable width.
   const columns = [
     { key: 'agent', label: 'Agent', sortable: true },
     { key: 'status', label: 'Status', sortable: true, width: '70px' },
-    { key: 'evidence', label: 'Evidence', sortable: true, width: '92px' },
-    { key: 'namespace', label: 'Namespace', sortable: true, width: '150px' },
-    { key: 'activity', label: 'Activity', sortable: false, width: '200px' },
+    { key: 'evidence', label: 'Evidence', sortable: true, width: '92px', hideBelow: 740 },
+    { key: 'namespace', label: 'Namespace', sortable: true, width: '150px', hideBelow: 620 },
+    { key: 'activity', label: 'Activity', sortable: false, width: '200px', hideBelow: 940 },
     { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '96px' },
     { key: 'actions', label: 'Actions', sortable: false, width: '164px' },
   ];
@@ -94,7 +94,7 @@
       onSort={(key, dir) => fleetStore.setSort(key, dir)}
       onRowClick={(row) => onRowClick(row)}
     >
-      {#snippet row({ row, index })}
+      {#snippet row({ row, index, hiddenColumns })}
         {@const agent = row.agent}
         {@const linkedSpawn = spawnByAgentId.get(agent.agent_id)}
         {@const showUngroupedDivider = fleetStore.groupByRootSession && row.ungrouped && index === ungroupedStartIndex && ungroupedStartIndex > 0}
@@ -143,6 +143,7 @@
         <td class="dt-col-status" class:ungrouped-divider={showUngroupedDivider}>
           <StatusDot status={unifiedAgentStatus(agent)} />
         </td>
+        {#if !hiddenColumns.has('evidence')}
         <td class="evidence-cell dt-col-evidence" class:ungrouped-divider={showUngroupedDivider}>
           <div class="evidence-stack">
             {#if agent.has_presence}
@@ -165,12 +166,17 @@
             {/if}
           </div>
         </td>
+        {/if}
+        {#if !hiddenColumns.has('namespace')}
         <td class="text-mono text-muted namespace-cell dt-col-namespace" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.namespace ?? agent.project ?? '---')}>
           {sanitizeText(agent.namespace ?? agent.project ?? '---')}
         </td>
+        {/if}
+        {#if !hiddenColumns.has('activity')}
         <td class="text-muted text-xs description-cell dt-col-activity" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.current_task || agent.description || '')}>
           {sanitizeText(agent.current_task || agent.description || '---')}
         </td>
+        {/if}
         <td class="text-mono text-muted dt-col-heartbeat" class:ungrouped-divider={showUngroupedDivider} title={formatTime(agent.last_heartbeat || agent.session_started_at)}>
           {relativeTime(agent.last_heartbeat || agent.session_started_at)}
         </td>
@@ -215,39 +221,6 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    /* Container for the column-priority queries below: as the card narrows,
-       low-value columns yield their width so the agent column stays readable
-       instead of collapsing under table-layout: fixed. */
-    container-type: inline-size;
-  }
-
-  /* Column priority: hide Activity, then Evidence, then Namespace as the
-     card narrows. Thresholds keep the unsized agent column at ≥~240px.
-     Selectors must be wholly :global() — they target DataTable's DOM, and a
-     split :global(.x) td form is silently dropped by the Svelte compiler.
-     Gated to >800px viewports: below that DataTable switches to stacked-card
-     mode where each cell is a labeled block and must stay visible. */
-  @media (min-width: 801px) {
-    @container (max-width: 960px) {
-      :global(.fleet-table-card th.dt-col-activity),
-      :global(.fleet-table-card td.dt-col-activity) {
-        display: none;
-      }
-    }
-
-    @container (max-width: 760px) {
-      :global(.fleet-table-card th.dt-col-evidence),
-      :global(.fleet-table-card td.dt-col-evidence) {
-        display: none;
-      }
-    }
-
-    @container (max-width: 640px) {
-      :global(.fleet-table-card th.dt-col-namespace),
-      :global(.fleet-table-card td.dt-col-namespace) {
-        display: none;
-      }
-    }
   }
 
   .count-badge {

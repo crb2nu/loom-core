@@ -80,8 +80,8 @@
     { key: 'entry_type', label: 'Type', sortable: true, width: '90px' },
     { key: 'title', label: 'Title', sortable: true },
     { key: 'agent_id', label: 'Agent', sortable: true, width: '110px' },
-    { key: 'file_path', label: 'File', sortable: true, width: '120px' },
-    { key: 'token_count', label: 'Tokens', sortable: true, width: '70px', align: 'right' },
+    { key: 'file_path', label: 'File', sortable: true, width: '120px', hideBelow: 820 },
+    { key: 'token_count', label: 'Tokens', sortable: true, width: '70px', align: 'right', hideBelow: 700 },
     { key: 'timestamp', label: 'Time', sortable: true, width: '80px' },
   ];
 
@@ -230,7 +230,7 @@
           onSort={handleSort}
           onToggleExpand={toggleExpand}
         >
-          {#snippet row({ row: entry, expanded })}
+          {#snippet row({ row: entry, expanded, hiddenColumns })}
             <td style="border-left: 3px solid {entryTypeColor(entry.entry_type)}">
               <Badge text={entry.entry_type} variant={entryTypeVariant(entry.entry_type)} />
             </td>
@@ -239,6 +239,7 @@
               {entry.title ?? '---'}
             </td>
             <td class="text-mono text-xs">{entry.agent_id || '---'}</td>
+            {#if !hiddenColumns.has('file_path')}
             <td class="text-mono text-xs text-muted" title={entry.file_path}>
               {#if entry.file_path}
                 {entry.file_path.split('/').pop()}
@@ -246,7 +247,10 @@
                 ---
               {/if}
             </td>
+            {/if}
+            {#if !hiddenColumns.has('token_count')}
             <td class="text-mono text-xs" style="text-align: right">{formatNumber(entry.token_count ?? 0)}</td>
+            {/if}
             <td class="text-mono text-xs text-muted">{relativeTime(entry.timestamp)}</td>
           {/snippet}
           {#snippet expandedRow({ row: entry })}

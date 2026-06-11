@@ -18,9 +18,9 @@
   const claimColumns = [
     { key: 'file_path', label: 'File' },
     { key: 'agent_id', label: 'Agent', width: '120px' },
-    { key: 'claim_type', label: 'Type', width: '80px' },
-    { key: 'reason', label: 'Reason', width: '220px' },
-    { key: 'created_at', label: 'Since', width: '90px' },
+    { key: 'claim_type', label: 'Type', width: '80px', hideBelow: 620 },
+    { key: 'reason', label: 'Reason', width: '220px', hideBelow: 860 },
+    { key: 'created_at', label: 'Since', width: '90px', hideBelow: 700 },
     { key: 'actions', label: 'Actions', width: '80px' },
   ];
 
@@ -125,12 +125,18 @@
       selectedIds={selectedClaimIds}
       onSelect={handleClaimSelect}
     >
-      {#snippet row({ row: claim })}
+      {#snippet row({ row: claim, hiddenColumns })}
         <td class="text-mono" title={claim.file_path}>{shortPath(claim.file_path)}</td>
         <td class="text-mono">{claim.agent_id}</td>
+        {#if !hiddenColumns.has('claim_type')}
         <td><Badge text={claim.claim_type} variant={claimVariant(claim.claim_type)} /></td>
+        {/if}
+        {#if !hiddenColumns.has('reason')}
         <td class="truncate text-muted" title={claim.reason}>{claim.reason || '---'}</td>
+        {/if}
+        {#if !hiddenColumns.has('created_at')}
         <td class="text-mono text-muted">{formatTime(claim.created_at)}</td>
+        {/if}
         <td>
           <button class="btn btn-xs btn-danger" onclick={() => onReleaseClaim(claim.agent_id, claim.file_path)} title="Force-release this claim">
             Release
