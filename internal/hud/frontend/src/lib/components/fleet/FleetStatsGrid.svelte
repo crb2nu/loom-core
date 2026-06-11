@@ -161,10 +161,15 @@
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
     min-width: 0;
     gap: var(--space-3);
+    /* The fleet grid stretches this card column to the (tall) agent-table
+       row; without this the default align-content: stretch inflates every
+       stat card into a mostly-empty box. Keep cards content-sized at top. */
+    align-content: start;
   }
 
   .stat-card {
     min-width: 0;
+    min-height: 84px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);

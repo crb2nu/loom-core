@@ -38,16 +38,17 @@
   import EmptyState from '../shared/EmptyState.svelte';
 
   // Agent column intentionally has no explicit width: with table-layout: fixed
-  // (from DataTable's stable-layout) the unsized column absorbs leftover space
-  // and prevents the table sum from exceeding the panel width on narrow viewports.
+  // (from DataTable's stable-layout) the unsized column absorbs leftover space.
+  // Low-priority columns are hidden via container queries (see <style>) as the
+  // card narrows, so the agent column never collapses below a readable width.
   const columns = [
     { key: 'agent', label: 'Agent', sortable: true },
-    { key: 'status', label: 'Status', sortable: true, width: '60px' },
-    { key: 'evidence', label: 'Evidence', sortable: true, width: '90px' },
-    { key: 'namespace', label: 'Namespace', sortable: true, width: '160px' },
+    { key: 'status', label: 'Status', sortable: true, width: '70px' },
+    { key: 'evidence', label: 'Evidence', sortable: true, width: '92px' },
+    { key: 'namespace', label: 'Namespace', sortable: true, width: '150px' },
     { key: 'activity', label: 'Activity', sortable: false, width: '200px' },
-    { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '108px' },
-    { key: 'actions', label: 'Actions', sortable: false, width: '170px' },
+    { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '96px' },
+    { key: 'actions', label: 'Actions', sortable: false, width: '164px' },
   ];
 
   function unifiedAgentStatus(agent) {
@@ -104,17 +105,19 @@
           {#if fleetStore.groupByRootSession && row.depth > 0}
             <span class="subagent-indent" aria-hidden="true">└─</span>
           {/if}
-          {sanitizeText(agent.agent_id ?? '---')}
-          {#if linkedSpawn}
-            <button
-              class="spawn-link-icon"
-              title="Spawned agent — click to view spawn detail"
-              onclick={(e) => onSpawnClick(e, linkedSpawn.spawn_id)}
-            >{'⬢'}</button>
-          {/if}
-          {#if expiringClaims.has(agent.agent_id)}
-            <span class="expiring-icon" title={`Expiring: ${expiringClaims.get(agent.agent_id).join(', ')}`}>{'⏰'}</span>
-          {/if}
+          <span class="agent-id-row">
+            <span class="agent-id">{sanitizeText(agent.agent_id ?? '---')}</span>
+            {#if linkedSpawn}
+              <button
+                class="spawn-link-icon"
+                title="Spawned agent — click to view spawn detail"
+                onclick={(e) => onSpawnClick(e, linkedSpawn.spawn_id)}
+              >{'⬢'}</button>
+            {/if}
+            {#if expiringClaims.has(agent.agent_id)}
+              <span class="expiring-icon" title={`Expiring: ${expiringClaims.get(agent.agent_id).join(', ')}`}>{'⏰'}</span>
+            {/if}
+          </span>
           <div class="agent-meta-row">
             <span>{inferAgentType(agent.agent_id, agent.agent_type)}</span>
             <span>{agent.source}</span>
@@ -137,39 +140,42 @@
             </div>
           {/if}
         </td>
-        <td class:ungrouped-divider={showUngroupedDivider}>
+        <td class="dt-col-status" class:ungrouped-divider={showUngroupedDivider}>
           <StatusDot status={unifiedAgentStatus(agent)} />
         </td>
-        <td class="evidence-cell" class:ungrouped-divider={showUngroupedDivider}>
-          {#if agent.has_presence}
-            <span class="evidence-pill evidence-pill-active">presence</span>
-          {/if}
-          {#if agent.has_session}
-            <span class="evidence-pill evidence-pill-active">session</span>
-          {/if}
-          {#if agent.has_spawn}
-            <span class="evidence-pill evidence-pill-active">spawn</span>
-          {/if}
-          {#if agent.is_orphan}
-            <span
-              class="evidence-pill evidence-pill-orphan"
-              title={`Heartbeating without an active session for ${Math.round(agent.orphan_age_seconds / 60)}m. Auto-reaped at 10m.`}
-            >orphan</span>
-          {/if}
-          {#if !agent.has_presence && !agent.has_session && !agent.has_spawn && !agent.is_orphan}
-            <span class="evidence-empty" title="No presence, session, or spawn evidence">—</span>
-          {/if}
+        <td class="evidence-cell dt-col-evidence" class:ungrouped-divider={showUngroupedDivider}>
+          <div class="evidence-stack">
+            {#if agent.has_presence}
+              <span class="evidence-pill evidence-pill-active">presence</span>
+            {/if}
+            {#if agent.has_session}
+              <span class="evidence-pill evidence-pill-active">session</span>
+            {/if}
+            {#if agent.has_spawn}
+              <span class="evidence-pill evidence-pill-active">spawn</span>
+            {/if}
+            {#if agent.is_orphan}
+              <span
+                class="evidence-pill evidence-pill-orphan"
+                title={`Heartbeating without an active session for ${Math.round(agent.orphan_age_seconds / 60)}m. Auto-reaped at 10m.`}
+              >orphan</span>
+            {/if}
+            {#if !agent.has_presence && !agent.has_session && !agent.has_spawn && !agent.is_orphan}
+              <span class="evidence-empty" title="No presence, session, or spawn evidence">—</span>
+            {/if}
+          </div>
         </td>
-        <td class="text-mono text-muted namespace-cell" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.namespace ?? agent.project ?? '---')}>
+        <td class="text-mono text-muted namespace-cell dt-col-namespace" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.namespace ?? agent.project ?? '---')}>
           {sanitizeText(agent.namespace ?? agent.project ?? '---')}
         </td>
-        <td class="text-muted text-xs description-cell" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.current_task || agent.description || '')}>
+        <td class="text-muted text-xs description-cell dt-col-activity" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.current_task || agent.description || '')}>
           {sanitizeText(agent.current_task || agent.description || '---')}
         </td>
-        <td class="text-mono text-muted" class:ungrouped-divider={showUngroupedDivider} title={formatTime(agent.last_heartbeat || agent.session_started_at)}>
+        <td class="text-mono text-muted dt-col-heartbeat" class:ungrouped-divider={showUngroupedDivider} title={formatTime(agent.last_heartbeat || agent.session_started_at)}>
           {relativeTime(agent.last_heartbeat || agent.session_started_at)}
         </td>
-        <td class="actions-cell" class:ungrouped-divider={showUngroupedDivider}>
+        <td class="actions-cell dt-col-actions" class:ungrouped-divider={showUngroupedDivider}>
+          <div class="actions-row">
           {#if agent.session_id}
             <button class="btn btn-xs btn-ghost" onclick={(e) => { e.stopPropagation(); onSessionClick(agent.session_id); }}>
               Session
@@ -192,6 +198,7 @@
           >
             Traces
           </button>
+          </div>
         </td>
       {/snippet}
     </DataTable>
@@ -208,6 +215,39 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
+    /* Container for the column-priority queries below: as the card narrows,
+       low-value columns yield their width so the agent column stays readable
+       instead of collapsing under table-layout: fixed. */
+    container-type: inline-size;
+  }
+
+  /* Column priority: hide Activity, then Evidence, then Namespace as the
+     card narrows. Thresholds keep the unsized agent column at ≥~240px.
+     Selectors must be wholly :global() — they target DataTable's DOM, and a
+     split :global(.x) td form is silently dropped by the Svelte compiler.
+     Gated to >800px viewports: below that DataTable switches to stacked-card
+     mode where each cell is a labeled block and must stay visible. */
+  @media (min-width: 801px) {
+    @container (max-width: 960px) {
+      :global(.fleet-table-card th.dt-col-activity),
+      :global(.fleet-table-card td.dt-col-activity) {
+        display: none;
+      }
+    }
+
+    @container (max-width: 760px) {
+      :global(.fleet-table-card th.dt-col-evidence),
+      :global(.fleet-table-card td.dt-col-evidence) {
+        display: none;
+      }
+    }
+
+    @container (max-width: 640px) {
+      :global(.fleet-table-card th.dt-col-namespace),
+      :global(.fleet-table-card td.dt-col-namespace) {
+        display: none;
+      }
+    }
   }
 
   .count-badge {
@@ -262,14 +302,29 @@
 
   /* Agent cell intentionally wraps so its stacked children (id, meta-row,
      hierarchy-pills) read naturally — overriding the stable-layout default
-     that forces nowrap on every td. */
+     that forces nowrap on every td. No word-break here: the id span below
+     ellipsizes on one line; break-word would shred long agent ids into
+     per-character vertical strings whenever the column gets tight. */
   :global(.fleet-table-card .data-table.stable-layout tbody td.agent-cell) {
     position: relative;
     white-space: normal;
-    word-break: break-word;
     vertical-align: top;
     padding-top: var(--space-2);
     padding-bottom: var(--space-2);
+  }
+
+  .agent-id-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .agent-id {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .namespace-cell {
@@ -284,6 +339,14 @@
     color: var(--fg-muted);
     text-transform: uppercase;
     letter-spacing: 0.06em;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .agent-meta-row span {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .agent-hierarchy-row {
@@ -351,7 +414,10 @@
     white-space: nowrap;
   }
 
-  .evidence-cell {
+  /* Keep the td a real table cell (display: flex on a td drops it out of
+     table layout and lets content float mid-row); flex lives on an inner
+     wrapper instead. */
+  .evidence-stack {
     display: flex;
     gap: 4px;
     flex-wrap: wrap;
@@ -386,7 +452,7 @@
     color: var(--fg-dim);
   }
 
-  .actions-cell {
+  .actions-row {
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
