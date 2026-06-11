@@ -214,6 +214,7 @@
         {#each columns as col}
           <th
             scope="col"
+            class="dt-col-{col.key}"
             class:sortable={col.sortable}
             class:sorted={sortKey === col.key}
             style:width={col.width || 'auto'}
