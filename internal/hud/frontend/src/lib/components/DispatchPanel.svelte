@@ -199,7 +199,7 @@
           <tbody>
             {#each sortedAgents as agent (agent.agent_id)}
               <tr class:attention={agent.needs_attention}>
-                <td class="cell-agent">{agent.agent_id}</td>
+                <td class="cell-agent" title={agent.agent_id}>{agent.agent_id}</td>
                 <td>
                   <span class="status-pill" style="color: {agentStatusColor(agent.status)}">{agent.status}</span>
                 </td>
@@ -495,6 +495,9 @@
     font-weight: 500;
     color: var(--fg-primary);
     white-space: nowrap;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .cell-ns {

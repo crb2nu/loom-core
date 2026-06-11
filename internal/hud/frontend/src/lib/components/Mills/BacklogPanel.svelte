@@ -124,7 +124,7 @@
           onclick={() => openItem(item.ID)}
           onkeydown={(ev) => onRowKeydown(ev, item.ID)}
         >
-          <td class="mono">{item.ID}</td>
+          <td class="mono" title={item.ID}><span class="cell-cap">{item.ID}</span></td>
           <td><span class="state state-{item.State}">{item.State}</span></td>
           <td>{item.Priority}</td>
           <td>{item.Title}</td>
@@ -203,6 +203,15 @@
     box-shadow: inset 3px 0 0 var(--accent, #58a);
   }
   .mono { font-family: ui-monospace, monospace; }
+  .cell-cap {
+    display: inline-block;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+
   .state { padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.75rem; }
   .state-queued    { background: var(--bg-subtle, #233); color: var(--text-muted, #aab); }
   .state-running   { background: rgba(64, 144, 240, 0.15); color: rgb(120, 180, 240); }

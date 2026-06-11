@@ -146,6 +146,7 @@
     <div class="action-error" role="alert">{actionError}</div>
   {/if}
 
+  <div class="runs-table-wrap">
   <table class="runs-table">
     <thead>
       <tr>
@@ -238,6 +239,7 @@
       {/each}
     </tbody>
   </table>
+  </div>
 </PanelShell>
 
 <style>
@@ -275,6 +277,10 @@
   .rate-warn  { color: rgb(240, 220, 120); }
   .rate-bad   { color: rgb(240, 130, 130); }
   .rate-empty { color: var(--text-muted, #889); }
+
+  .runs-table-wrap {
+    overflow-x: auto;
+  }
 
   .runs-table {
     width: 100%;
