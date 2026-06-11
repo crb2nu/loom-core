@@ -18,7 +18,7 @@
     { key: 'to_agent', label: 'To', width: '100px' },
     { key: 'summary', label: 'Summary' },
     { key: 'status', label: 'Status', width: '90px' },
-    { key: 'created_at', label: 'Created', width: '90px' },
+    { key: 'created_at', label: 'Created', width: '90px', hideBelow: 720 },
     { key: 'actions', label: 'Actions', width: '80px' },
   ];
 
@@ -57,12 +57,14 @@
       rows={handoffs}
       stableLayout={true}
     >
-      {#snippet row({ row: handoff })}
+      {#snippet row({ row: handoff, hiddenColumns })}
         <td class="text-mono">{handoff.from_agent || '---'}</td>
         <td class="text-mono">{handoff.target_agent_id || handoff.to_agent || '---'}</td>
         <td class="truncate" title={handoff.summary}>{handoff.summary}</td>
         <td><Badge text={handoff.status} variant={handoffStatusVariant(handoff.status)} /></td>
+        {#if !hiddenColumns.has('created_at')}
         <td class="text-mono text-muted">{formatTime(handoff.created_at)}</td>
+        {/if}
         <td>
           {#if handoff.status === 'pending'}
             <button class="btn btn-xs btn-success" onclick={() => onAcceptHandoff(handoff.id, handoff.target_agent_id || handoff.to_agent || '')}>

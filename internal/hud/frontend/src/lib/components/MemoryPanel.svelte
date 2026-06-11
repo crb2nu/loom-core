@@ -28,10 +28,10 @@
   const memColumns = [
     { key: 'title', label: 'Title', sortable: true },
     { key: 'importance', label: 'Importance', sortable: true, width: '100px' },
-    { key: 'tokens', label: 'Tokens', sortable: true, width: '80px' },
+    { key: 'tokens', label: 'Tokens', sortable: true, width: '80px', hideBelow: 660 },
     { key: 'status', label: 'Status', width: '100px' },
-    { key: 'category', label: 'Category', sortable: true, width: '120px' },
-    { key: 'last_accessed', label: 'Accessed', sortable: true, width: '120px' },
+    { key: 'category', label: 'Category', sortable: true, width: '120px', hideBelow: 780 },
+    { key: 'last_accessed', label: 'Accessed', sortable: true, width: '120px', hideBelow: 900 },
     { key: 'actions', label: '', width: '90px' },
   ];
 
@@ -488,7 +488,7 @@
         onToggleExpand={(item) => toggleExpand(item.id)}
         onRowClick={openItemDrawer}
       >
-        {#snippet row({ row: item, expanded })}
+        {#snippet row({ row: item, expanded, hiddenColumns })}
           <td style="border-left: 3px solid {importanceBorderColor(item.importance)}">
             <span class="expand-icon">{expanded ? '\u25BC' : '\u25B6'}</span>
             {item.title ?? '---'}
@@ -498,12 +498,18 @@
               {item.importance ?? 'medium'}
             </span>
           </td>
+          {#if !hiddenColumns.has('tokens')}
           <td class="text-mono">{formatNumber(item.tokens ?? 0)}</td>
+          {/if}
           <td>
             <Badge text={item.status ?? 'active'} variant={statusVariant(item.status)} />
           </td>
+          {#if !hiddenColumns.has('category')}
           <td class="text-mono text-muted">{item.category ?? '---'}</td>
+          {/if}
+          {#if !hiddenColumns.has('last_accessed')}
           <td class="text-mono text-muted">{relativeTime(item.last_accessed)}</td>
+          {/if}
           <td class="actions-cell">
             {#if activeTier !== 'long_term'}
               <button

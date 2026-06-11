@@ -46,8 +46,8 @@
     { key: 'agent', label: 'Agent' },
     { key: 'priority', label: 'Priority', sortable: true, width: '90px' },
     { key: 'status', label: 'Status', sortable: true, width: '110px' },
-    { key: 'blocked_by', label: 'Blocked By', width: '100px' },
-    { key: 'created_at', label: 'Created', sortable: true, width: '90px' },
+    { key: 'blocked_by', label: 'Blocked By', width: '100px', hideBelow: 660 },
+    { key: 'created_at', label: 'Created', sortable: true, width: '90px', hideBelow: 780 },
     { key: 'actions', label: 'Actions', width: '60px' },
   ];
 </script>
@@ -81,7 +81,7 @@
     {onSort}
     onRowClick={onRowClick}
   >
-    {#snippet row({ row: task })}
+    {#snippet row({ row: task, hiddenColumns })}
       <td class="task-title" title={task.context || task.title}>
         {@html parseIssueRefs(task.title)}
         {#if task.context}
@@ -106,6 +106,7 @@
           {/each}
         </select>
       </td>
+      {#if !hiddenColumns.has('blocked_by')}
       <td class="text-mono">
         <div class="blocked-col">
           {#if task.blocked_by?.length}
@@ -119,7 +120,10 @@
           {/if}
         </div>
       </td>
+      {/if}
+      {#if !hiddenColumns.has('created_at')}
       <td class="text-mono text-muted">{relativeTime(task.created_at)}</td>
+      {/if}
       <td class="actions-col">
         {#if task.status !== 'completed' && task.status !== 'cancelled'}
           <button class="btn-resolve" onclick={(e) => { e.stopPropagation(); onResolve(task); }} title="Resolve task">✓</button>

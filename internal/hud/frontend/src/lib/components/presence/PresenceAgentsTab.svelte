@@ -227,13 +227,15 @@
     return map[status] ?? 'down';
   }
 
+  // current_task is the unsized absorber; hideBelow sheds low-priority
+  // columns as the table narrows so it never collapses (see DataTable).
   const agentColumns = [
     { key: 'agent_id', label: 'Agent', width: '180px' },
     { key: 'status', label: 'Status', width: '100px' },
-    { key: 'agent_type', label: 'Type', width: '90px' },
+    { key: 'agent_type', label: 'Type', width: '90px', hideBelow: 880 },
     { key: 'current_task', label: 'Current Task' },
-    { key: 'branch', label: 'Branch / PR', width: '140px' },
-    { key: 'last_heartbeat', label: 'Heartbeat', width: '90px' },
+    { key: 'branch', label: 'Branch / PR', width: '140px', hideBelow: 1040 },
+    { key: 'last_heartbeat', label: 'Heartbeat', width: '90px', hideBelow: 760 },
     { key: 'actions', label: 'Actions', width: '200px' },
   ];
 </script>
@@ -339,7 +341,7 @@
           idKey="id"
           stableLayout={true}
         >
-          {#snippet row({ row })}
+          {#snippet row({ row, hiddenColumns })}
             {@const agent = row.agent}
             <td class="text-mono" class:subagent-row={row.depth > 0}>
               {#if row.depth > 0}
@@ -358,12 +360,15 @@
               <StatusDot status={presenceStatus(agent.status)} />
               <span class="status-label">{agent.status}</span>
             </td>
+            {#if !hiddenColumns.has('agent_type')}
             <td>
               <span class="agent-type-chip" style:color={agentColor(agent.agent_type)}>
                 {agent.agent_type || '---'}
               </span>
             </td>
+            {/if}
             <td class="truncate" title={agent.current_task}>{agent.current_task || '---'}</td>
+            {#if !hiddenColumns.has('branch')}
             <td class="text-mono text-muted">
               {#if agent.pr_url}
                 <a href={agent.pr_url} target="_blank" rel="noopener" class="pr-link" title={agent.pr_url}>
@@ -372,8 +377,12 @@
               {/if}
               {agent.branch || '---'}
             </td>
+            {/if}
+            {#if !hiddenColumns.has('last_heartbeat')}
             <td class="text-mono text-muted" title={formatTime(agent.last_heartbeat)}>{reactiveRelativeTime(agent.last_heartbeat)}</td>
+            {/if}
             <td class="actions-cell">
+              <div class="actions-row">
               {#if agent.session_id}
                 <button class="btn btn-xs btn-ghost" onclick={() => router.navigate('agents', 'fleet', agent.session_id)} title="Open session detail">
                   Session
@@ -390,6 +399,7 @@
                   Dispatch
                 </button>
               {/if}
+              </div>
             </td>
           {/snippet}
         </DataTable>
@@ -543,9 +553,18 @@
 
   .presence-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    /* The agents table is the primary surface — give it the lion's share;
+       a 50/50 split starved the table below its fixed column widths and
+       collapsed the Current Task column to a sliver. */
+    grid-template-columns: minmax(0, 2.2fr) minmax(240px, 1fr);
     gap: 16px;
     height: 100%;
+  }
+
+  @media (max-width: 1200px) {
+    .presence-grid {
+      grid-template-columns: 1fr;
+    }
   }
 
   .agents-card {
@@ -567,8 +586,11 @@
   .stats-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    grid-template-rows: 1fr 1fr 1fr;
     gap: 12px;
+    /* Content-sized rows pinned to the top: 1fr rows stretched each card to
+       a third of the (tall) agents table, leaving numbers floating in
+       mostly-empty boxes. */
+    align-content: start;
   }
 
   .stat-card {
@@ -580,6 +602,7 @@
     display: flex;
     flex-direction: column;
     justify-content: center;
+    min-height: 84px;
   }
 
   .stat-card .metric-value {
@@ -685,8 +708,12 @@
     text-decoration: none;
   }
 
-  .actions-cell {
+  /* Flex lives on an inner wrapper: display: flex on the td itself drops it
+     out of table layout, and stable-layout's nowrap+hidden clipped the
+     fourth button. */
+  .actions-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 4px;
   }
 

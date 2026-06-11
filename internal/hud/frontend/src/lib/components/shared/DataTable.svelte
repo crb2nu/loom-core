@@ -3,8 +3,16 @@
    * DataTable — sortable, selectable table with sticky header,
    * skeleton loading, expandable rows, and optional row pagination.
    *
+   * Column priority: a column with `hideBelow: <px>` is hidden when the
+   * table wrap is narrower than that many pixels, so the unsized absorber
+   * column never collapses under stable-layout's table-layout: fixed.
+   * The engine hides the th; consumers receive `hiddenColumns` in the row
+   * snippet and must skip the matching td: {#if !hiddenColumns.has('x')}.
+   * Hiding is disabled in the ≤800px stacked-card mode, where every cell
+   * stacks as a labeled block and must stay visible.
+   *
    * @type {{
-   *   columns: Array<{ key: string, label: string, sortable?: boolean, width?: string, align?: 'left'|'center'|'right' }>,
+   *   columns: Array<{ key: string, label: string, sortable?: boolean, width?: string, align?: 'left'|'center'|'right', hideBelow?: number }>,
    *   rows: any[],
    *   sortKey?: string,
    *   sortDir?: 'asc' | 'desc',
@@ -21,7 +29,7 @@
    *   onSelect?: (ids: Set<string>) => void,
    *   onRowClick?: (row: any) => void,
    *   onToggleExpand?: (row: any) => void,
-   *   row: import('svelte').Snippet<[{ row: any, index: number, expanded: boolean }]>,
+   *   row: import('svelte').Snippet<[{ row: any, index: number, expanded: boolean, hiddenColumns: Set<string> }]>,
    *   expandedRow?: import('svelte').Snippet<[{ row: any, index: number }]>,
    * }}
    */
@@ -48,12 +56,44 @@
     expandedRow: expandedRowSnippet,
   } = $props();
 
-  let colSpan = $derived((selectable ? 1 : 0) + columns.length);
-
   // Keyboard navigation focus. -1 means no row is keyboard-focused; the wrap
   // itself can still hold DOM focus for shortcut delivery.
   let wrapEl = $state(null);
   let focusedIndex = $state(-1);
+
+  // Column priority: measure the wrap and hide hideBelow columns when the
+  // table is too narrow for its fixed widths. Stacked-card mode (≤800px
+  // viewports) keeps every column — cells render as labeled blocks there.
+  let wrapWidth = $state(Infinity);
+  let stackedMode = $state(false);
+
+  $effect(() => {
+    if (!wrapEl || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      wrapWidth = entries[0]?.contentRect?.width ?? Infinity;
+    });
+    ro.observe(wrapEl);
+    const mq = globalThis.matchMedia?.('(max-width: 800px)');
+    const onMq = () => { stackedMode = !!mq?.matches; };
+    onMq();
+    mq?.addEventListener('change', onMq);
+    return () => {
+      ro.disconnect();
+      mq?.removeEventListener('change', onMq);
+    };
+  });
+
+  let hiddenColumns = $derived.by(() => {
+    const hidden = new Set();
+    if (stackedMode) return hidden;
+    for (const col of columns) {
+      if (typeof col.hideBelow === 'number' && wrapWidth < col.hideBelow) hidden.add(col.key);
+    }
+    return hidden;
+  });
+
+  let visibleColumns = $derived(columns.filter((c) => !hiddenColumns.has(c.key)));
+  let colSpan = $derived((selectable ? 1 : 0) + visibleColumns.length);
 
   // Restore persisted sort state on mount (keyed by first column label).
   $effect(() => {
@@ -211,7 +251,7 @@
             />
           </th>
         {/if}
-        {#each columns as col}
+        {#each visibleColumns as col (col.key)}
           <th
             scope="col"
             class="dt-col-{col.key}"
@@ -240,7 +280,7 @@
             {#if selectable}
               <td><div class="skeleton skeleton-text" style="width: 16px;"></div></td>
             {/if}
-            {#each columns as col}
+            {#each visibleColumns as col (col.key)}
               <td><div class="skeleton skeleton-text" style="width: {60 + (i * 7) % 40}%;"></div></td>
             {/each}
           </tr>
@@ -270,7 +310,7 @@
                 />
               </td>
             {/if}
-            {@render rowSnippet({ row: rowData, index, expanded: isExpanded })}
+            {@render rowSnippet({ row: rowData, index, expanded: isExpanded, hiddenColumns })}
           </tr>
           {#if isExpanded && expandedRowSnippet}
             <tr class="data-table-expand-row">
@@ -310,7 +350,7 @@
     border-radius: var(--radius-sm);
   }
 
-  .data-table tbody tr.keyboard-focused td {
+  .data-table tbody tr.keyboard-focused :global(td) {
     background: var(--info-dim);
     color: var(--fg-primary);
     box-shadow: inset 2px 0 0 var(--info);
@@ -371,35 +411,35 @@
     opacity: 0.7;
   }
 
-  .data-table tbody td {
+  .data-table tbody :global(td) {
     padding: var(--space-1) var(--space-2);
     border-bottom: 1px solid var(--border);
     color: var(--fg-secondary);
     vertical-align: top;
   }
 
-  .data-table tbody tr:nth-child(even) td {
+  .data-table tbody tr:nth-child(even) :global(td) {
     background: color-mix(in srgb, var(--bg-tertiary) 45%, transparent);
   }
 
   .data-table.stable-layout thead th,
-  .data-table.stable-layout tbody td {
+  .data-table.stable-layout tbody :global(td) {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .data-table tbody tr:hover td {
+  .data-table tbody tr:hover :global(td) {
     background: var(--bg-tertiary);
     color: var(--fg-primary);
   }
 
-  .data-table tbody tr:last-child td {
+  .data-table tbody tr:last-child :global(td) {
     border-bottom: none;
   }
 
-  .data-table tbody tr.selected td {
+  .data-table tbody tr.selected :global(td) {
     background: color-mix(in srgb, var(--info-dim) 80%, transparent);
   }
 
@@ -427,7 +467,7 @@
   }
 
   /* Expandable row support */
-  .data-table tbody tr.expanded-row td {
+  .data-table tbody tr.expanded-row :global(td) {
     border-bottom: none;
   }
 
@@ -483,7 +523,7 @@
     }
     .data-table tbody,
     .data-table tbody tr,
-    .data-table tbody td {
+    .data-table tbody :global(td) {
       display: block;
       width: 100%;
     }
@@ -492,18 +532,18 @@
       border-bottom: 1px solid var(--border);
       background: transparent;
     }
-    .data-table tbody tr:nth-child(even) td,
-    .data-table tbody tr:hover td {
+    .data-table tbody tr:nth-child(even) :global(td),
+    .data-table tbody tr:hover :global(td) {
       background: transparent;
     }
-    .data-table tbody td {
+    .data-table tbody :global(td) {
       padding: 4px var(--space-1);
       border-bottom: none;
       white-space: normal;
       overflow: visible;
       text-overflow: clip;
     }
-    .data-table.stable-layout tbody td {
+    .data-table.stable-layout tbody :global(td) {
       white-space: normal;
       overflow: visible;
       text-overflow: clip;
