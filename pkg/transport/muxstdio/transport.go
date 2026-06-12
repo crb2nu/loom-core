@@ -44,9 +44,10 @@ const notifyChanBuffer = 16
 type Transport struct {
 	inner mcp.Transport
 
-	mu      sync.Mutex
-	pending map[string]chan *mcp.Message
-	closed  bool
+	mu         sync.Mutex
+	pending    map[string]chan *mcp.Message
+	closed     bool
+	closeCause error // first inner.Recv error observed by readLoop; nil on deliberate Close
 
 	notifyCh chan *mcp.Message
 
@@ -101,8 +102,9 @@ func (t *Transport) Send(ctx context.Context, msg *mcp.Message) error {
 
 	t.mu.Lock()
 	if t.closed {
+		err := t.closedErrLocked()
 		t.mu.Unlock()
-		return ErrClosed
+		return err
 	}
 	if _, dup := t.pending[key]; dup {
 		t.mu.Unlock()
@@ -145,14 +147,32 @@ func (t *Transport) Recv(ctx context.Context, id any) (*mcp.Message, error) {
 	select {
 	case msg, open := <-ch:
 		if !open || msg == nil {
-			return nil, ErrClosed
+			return nil, t.closedErr()
 		}
 		return msg, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-t.done:
-		return nil, ErrClosed
+		return nil, t.closedErr()
 	}
+}
+
+// closedErr returns ErrClosed annotated with the underlying read error when
+// the close was caused by the inner transport (e.g. a WebSocket close code),
+// so callers and logs can see WHY the transport died. errors.Is(err, ErrClosed)
+// holds on both paths, and the "transport closed" substring used by the
+// daemon's transport-failure detection is preserved by the %w wrap.
+func (t *Transport) closedErr() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closedErrLocked()
+}
+
+func (t *Transport) closedErrLocked() error {
+	if t.closeCause != nil {
+		return fmt.Errorf("%w (cause: %v)", ErrClosed, t.closeCause)
+	}
+	return ErrClosed
 }
 
 // Call is a convenience wrapper that issues Send and then Recv with the same
@@ -221,15 +241,23 @@ func (t *Transport) readLoop() {
 			// Close.drainPending; if the reader observed err before Close was
 			// called, mark the transport closed so future Sends fail fast.
 			t.mu.Lock()
+			deliberate := t.closed // Close() sets closed before cancelling the reader
 			t.closed = true
-			t.mu.Unlock()
+			if !deliberate && t.closeCause == nil {
+				t.closeCause = err
+			}
+			pendingFailed := len(t.pending)
 			// Wake any waiters now, in case Close is never called.
-			t.mu.Lock()
 			for k, ch := range t.pending {
 				close(ch)
 				delete(t.pending, k)
 			}
 			t.mu.Unlock()
+			if !deliberate {
+				t.logger.Warn("muxstdio: inner transport closed",
+					slog.Any("error", err),
+					slog.Int("pending_failed", pendingFailed))
+			}
 			return
 		}
 		if msg == nil {
