@@ -46,6 +46,17 @@ const (
 	// build failures, test failures, spec-conformance violations.
 	// Default when no other class matches.
 	ClassCode ErrorClass = "code"
+
+	// ClassConfig: a terminal project/MR configuration error that no
+	// amount of retrying the same call can fix — the fix is a human (or
+	// policy) change in GitLab, not in the pipeline. Escalates
+	// immediately without consuming retries. Canonical case: the merge
+	// stage's 405 Method Not Allowed (escalations #148/#150), which
+	// GitLab returns when the MR can't be merged as requested
+	// (merge-when-pipeline-succeeds unavailable, approvals unmet, wrong
+	// merge method). Retrying verbatim burned 3 attempts per run before
+	// escalating with no extra signal.
+	ClassConfig ErrorClass = "config"
 )
 
 // Classify maps an error returned from a stage dispatcher to one of the
@@ -64,6 +75,20 @@ func Classify(err error) ErrorClass {
 	}
 	s := err.Error()
 	lower := strings.ToLower(s)
+
+	// Terminal config errors first — these must never fall through to a
+	// retryable class. "status 405" matches the GitLab client's error
+	// shape ("gitlab: PUT /projects/.../merge: status 405: ...",
+	// pkg/mills/clients/gitlab.go); "method not allowed" catches the
+	// worded form when the body is included.
+	for _, needle := range []string{
+		"status 405",
+		"method not allowed",
+	} {
+		if strings.Contains(lower, needle) {
+			return ClassConfig
+		}
+	}
 
 	// Quota first — a "429" can be embedded inside a transport-shaped
 	// error so check it before the transport patterns.
@@ -154,6 +179,14 @@ func Classify(err error) ErrorClass {
 // Infra + Code count against the budget.
 func IsFreeRetry(c ErrorClass) bool {
 	return c == ClassTransient || c == ClassTransientQuota
+}
+
+// IsTerminal reports whether a class should skip the retry loop
+// entirely and escalate on first sight. Only Config qualifies: the
+// failure is in GitLab project/MR configuration, so an identical retry
+// can only return the identical error.
+func IsTerminal(c ErrorClass) bool {
+	return c == ClassConfig
 }
 
 // quotaBackoff returns an exponential backoff for the n-th attempt of a

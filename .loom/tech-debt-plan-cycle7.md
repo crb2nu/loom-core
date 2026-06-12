@@ -17,7 +17,7 @@
 
 **Failure mode if wrong**: A third intermittent breaker (e.g. flaky test or runner infra) keeps main red and Wave 1 doesn't restore deploys; re-triage from the next failed pipeline's job list before starting Wave 2.
 
-**Status**: not run
+**Status**: passed 2026-06-12 — MR !702 pipeline green; first post-merge `main` pipeline ([13830](https://gitlab.flexinfer.ai/services/loom-core/-/pipelines/13830), sha `41799b93`) green end-to-end: 18/19 jobs success including `build:image:{loom-core,custom-server,loom-mills-operator}`, `test:race`, `test:unit`, `security:gosec`; the single non-success job is `ios:archive-export` (manual deploy gate, expected). No third breaker surfaced. Wave 2 unblocked.
 
 ## Wave 1 — Restore green main (immediate, this week)
 

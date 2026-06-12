@@ -129,6 +129,45 @@ func TestScope_NoSlicesFails(t *testing.T) {
 	}
 }
 
+// TestScope_CanaryHeartbeatAllowedForCanaryItems pins the DEBT-073(c)
+// carve-out: a CanaryLabel item editing the heartbeat fixture passes
+// even though council-emitted slice lists omit the file (escalations
+// #151/#163 fired on every canary run before this).
+func TestScope_CanaryHeartbeatAllowedForCanaryItems(t *testing.T) {
+	g := &Scope{}
+	item := fixtureItem(store.Slice{
+		Name:  "canary",
+		Files: []string{"docs/changelog.md"},
+	})
+	item.Labels = []string{CanaryLabel}
+	in := StageInput{
+		Item:         item,
+		FilesChanged: []string{"testdata/mills-canary/heartbeat.md"},
+	}
+	out, _ := g.Evaluate(context.Background(), in)
+	if !out.Pass {
+		t.Errorf("canary heartbeat edit should be in scope for canary items: %+v", out)
+	}
+}
+
+// TestScope_CanaryHeartbeatStillFailsForNonCanaryItems guards the
+// carve-out's blast radius: a real backlog item touching the canary
+// fixture is still a scope violation.
+func TestScope_CanaryHeartbeatStillFailsForNonCanaryItems(t *testing.T) {
+	g := &Scope{}
+	in := StageInput{
+		Item: fixtureItem(store.Slice{
+			Name:  "core",
+			Files: []string{"pkg/auth/login.go"},
+		}),
+		FilesChanged: []string{"testdata/mills-canary/heartbeat.md"},
+	}
+	out, _ := g.Evaluate(context.Background(), in)
+	if out.Pass {
+		t.Errorf("non-canary item editing the canary fixture should fail scope: %+v", out)
+	}
+}
+
 // ---------- PathPolicy ----------
 
 func TestPathPolicy_NoTouchPasses(t *testing.T) {

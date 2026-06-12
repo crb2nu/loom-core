@@ -999,6 +999,36 @@ func TestRunner_TransientErrorsDoNotConsumeBudget(t *testing.T) {
 	}
 }
 
+// TestRunner_ConfigErrorEscalatesWithoutRetry pins DEBT-073(b): a
+// merge-stage 405 is a terminal config error — the runner escalates on
+// the first occurrence instead of burning MaxAttempts on identical
+// retries (escalations #148/#150 showed 3 verbatim retries per run).
+func TestRunner_ConfigErrorEscalatesWithoutRetry(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &classedFailDispatcher{
+		stage: "merge",
+		errs: []string{
+			`gitlab: PUT /projects/services%2Floom-core/merge_requests/598/merge: status 405: {"message":"405 Method Not Allowed"}`,
+			// Never reached — present so a regression to retrying
+			// surfaces as calls > 1 rather than a pass-by-success.
+			`gitlab: PUT /projects/services%2Floom-core/merge_requests/598/merge: status 405: {"message":"405 Method Not Allowed"}`,
+		},
+	}
+	if err := New(st, newPassingGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != store.PipelineEscalated {
+		t.Errorf("state = %s; want escalated on first config-class error", got.State)
+	}
+	if disp.calls != 1 {
+		t.Errorf("merge called %d times; want 1 (config errors must not retry)", disp.calls)
+	}
+}
+
 // TestRunner_CodeErrorsExhaustBudgetEvenWithTransientHistory pins the
 // other half: a stage that mixes transient and real-code failures
 // escalates after MaxAttempts *code* failures, regardless of how many
