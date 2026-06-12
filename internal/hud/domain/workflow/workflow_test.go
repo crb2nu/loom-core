@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -49,7 +50,7 @@ type mockWorkflowMonitor struct {
 	approveErr   error
 	rejectErr    error
 	cancelErr    error
-	refreshCount int
+	refreshCount atomic.Int64
 }
 
 func (m *mockWorkflowMonitor) Workflows() []WorkflowSummary { return m.workflows }
@@ -59,7 +60,7 @@ func (m *mockWorkflowMonitor) Detail(_ string) (*WorkflowDetail, error) {
 func (m *mockWorkflowMonitor) ApproveStep(_, _ string) error { return m.approveErr }
 func (m *mockWorkflowMonitor) RejectStep(_, _ string) error  { return m.rejectErr }
 func (m *mockWorkflowMonitor) CancelWorkflow(_ string) error { return m.cancelErr }
-func (m *mockWorkflowMonitor) Refresh()                      { m.refreshCount++ }
+func (m *mockWorkflowMonitor) Refresh()                      { m.refreshCount.Add(1) }
 
 func TestWorkflowDomainName(t *testing.T) {
 	d := New(newMockDeps())

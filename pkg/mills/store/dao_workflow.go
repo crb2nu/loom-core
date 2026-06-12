@@ -182,6 +182,7 @@ func (d *WorkflowDAO) CountStepsByRun(ctx context.Context, runIDs []string) (map
 		placeholders[i] = "?"
 		args[i] = id
 	}
+	// #nosec G202 -- IN clause is built from "?" placeholders only; values are bound via args
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT run_id, COUNT(*) FROM workflow_steps
 		WHERE run_id IN (`+strings.Join(placeholders, ",")+`)
