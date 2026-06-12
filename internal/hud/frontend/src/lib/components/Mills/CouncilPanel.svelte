@@ -203,7 +203,7 @@
           <td class="expander">
             <span class="caret" class:open={isOpen} aria-hidden="true">▸</span>
           </td>
-          <td class="mono">{r.ID}</td>
+          <td class="mono" title={r.ID}><span class="cell-cap">{r.ID}</span></td>
           <td>{r.Trigger}</td>
           <td>
             <span class="outcome outcome-{r.Outcome}">{r.Outcome}</span>
@@ -342,6 +342,15 @@
   }
   .mills-table th { font-weight: 600; color: var(--text-muted, #889); }
   .mono { font-family: ui-monospace, monospace; }
+  .cell-cap {
+    display: inline-block;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+
   .outcome { padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.75rem; }
   .outcome-success  { background: rgba(72, 200, 128, 0.15); color: rgb(120, 220, 160); }
   .outcome-partial  { background: rgba(220, 200, 60, 0.15); color: rgb(240, 220, 120); }

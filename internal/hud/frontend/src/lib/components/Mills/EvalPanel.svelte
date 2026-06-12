@@ -127,7 +127,7 @@
         >
           <td><span class="toggle">{isOpen ? '▾' : '▸'}</span><span class="loop loop-{loop}">{loop}</span></td>
           <td class="mono">{s.Rubric}</td>
-          <td class="mono" title={subjectLabel(s)}>{subjectLabel(s)}</td>
+          <td class="mono" title={subjectLabel(s)}><span class="cell-cap">{subjectLabel(s)}</span></td>
           <td>{fmtScore(s.Score)}</td>
           <td class="notes-cell">{s.Notes ?? ''}</td>
           <td>{fmtTime(s.EvaluatedAt)}</td>
@@ -220,6 +220,15 @@
   .full-notes { margin: 0; font-size: 0.82rem; color: var(--fg-secondary, #9ab); overflow-wrap: anywhere; }
   .muted { color: var(--text-muted, #889); }
   .mono { font-family: ui-monospace, monospace; }
+  .cell-cap {
+    display: inline-block;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+
   .loop {
     display: inline-block; min-width: 1.2rem; text-align: center;
     padding: 0.05rem 0.35rem; border-radius: 3px; font-size: 0.75rem;

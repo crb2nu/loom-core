@@ -86,7 +86,7 @@
             {#each filtered.slice(0, 20) as task (task.id)}
               <tr>
                 <td class="cell-task">{task.title}</td>
-                <td class="cell-mono">{task.agent_id || task.agent || '\u2014'}</td>
+                <td class="cell-mono cell-agent" title={task.agent_id || task.agent || ''}>{task.agent_id || task.agent || '\u2014'}</td>
                 <td>
                   <span class="priority-pill" style="color: {priorityColor(task.priority)}">{task.priority}</span>
                 </td>
@@ -179,6 +179,13 @@
   .cell-mono {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
+  }
+
+  .cell-agent {
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .cell-time {

@@ -90,7 +90,7 @@
             <tbody>
               {#each daemonMetricsStore.servers as m (m.name)}
                 <tr class:has-errors={m.error_count > 0}>
-                  <td class="text-mono">{m.name}</td>
+                  <td class="text-mono name-cell" title={m.name}>{m.name}</td>
                   <td class="text-mono">{m.request_count}</td>
                   <td class="text-mono" class:text-error={m.error_count > 0}>{m.error_count || '—'}</td>
                   <td class="text-mono">{formatLatency(m.p50_ms)}</td>
@@ -180,6 +180,12 @@
     border-bottom: 1px solid var(--border-subtle);
     color: var(--fg-secondary);
     white-space: nowrap;
+  }
+
+  .metrics-table td.name-cell {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .metrics-table tr:hover {

@@ -135,9 +135,9 @@
           <tbody>
             {#each sortedReady as candidate (candidate.agent_id + candidate.branch)}
               <tr>
-                <td class="cell-mono">{candidate.agent_id}</td>
-                <td class="cell-mono cell-branch">{candidate.branch}</td>
-                <td class="cell-mono cell-ns">{candidate.namespace || '—'}</td>
+                <td class="cell-mono cell-agent" title={candidate.agent_id}>{candidate.agent_id}</td>
+                <td class="cell-mono cell-branch" title={candidate.branch}>{candidate.branch}</td>
+                <td class="cell-mono cell-ns" title={candidate.namespace || ''}>{candidate.namespace || '—'}</td>
                 <td class="cell-num">{candidate.task_count}</td>
                 <td class="cell-num">
                   {#if candidate.conflict_files > 0}
@@ -200,8 +200,8 @@
           <tbody>
             {#each sortedBlocked as candidate (candidate.agent_id + candidate.branch)}
               <tr>
-                <td class="cell-mono">{candidate.agent_id}</td>
-                <td class="cell-mono cell-branch">{candidate.branch}</td>
+                <td class="cell-mono cell-agent" title={candidate.agent_id}>{candidate.agent_id}</td>
+                <td class="cell-mono cell-branch" title={candidate.branch}>{candidate.branch}</td>
                 <td>
                   {#if candidate.merge_blockers?.length}
                     {#each candidate.merge_blockers as blocker}
@@ -322,6 +322,13 @@
   .cell-mono {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
+  }
+
+  .cell-agent {
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .cell-branch {
