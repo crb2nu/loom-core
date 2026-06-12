@@ -360,14 +360,14 @@ func (ts *TaskSvc) GetActive(ctx context.Context, agentID, sessionID string, lim
 	return tasks, nil
 }
 
-// MarkSessionTasksStale marks pending/in_progress tasks for a session as blocked.
+// MarkSessionTasksStale marks in_progress tasks for a session as blocked.
+// Pending tasks are intentionally left untouched: planning sessions create
+// backlog tasks meant to outlive the session, and auto-blocking them on
+// session end forces manual resets back to pending.
 func (ts *TaskSvc) MarkSessionTasksStale(ctx context.Context, sessionID string) int {
 	filter := FilterMust(
 		Match("session_id", sessionID),
-		FilterShould(
-			Match("status", string(TaskStatusPending)),
-			Match("status", string(TaskStatusInProgress)),
-		),
+		Match("status", string(TaskStatusInProgress)),
 	)
 
 	points, err := ts.qdrant.ScrollPoints(ctx, filter, 500, false)
