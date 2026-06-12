@@ -50,6 +50,16 @@ func (g *Scope) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 		// drift so the operator can re-decompose.
 		return fail("backlog item has no slices; no scope to enforce"), nil
 	}
+	if itemHasCanaryLabel(in.Item) {
+		// Deterministic canaries edit the heartbeat fixture by design;
+		// council-emitted slice lists historically omit it, tripping the
+		// gate on every canary run (escalations #151/#163). The
+		// allowlist applies only to CanaryLabel items so a real backlog
+		// item touching the fixture still violates scope.
+		for _, p := range canaryAllowedPaths {
+			allowed.add(p)
+		}
+	}
 
 	var violations []string
 	for _, f := range in.FilesChanged {
@@ -75,6 +85,14 @@ func (g *Scope) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 		"%d file(s) outside slice scope: %s%s",
 		len(violations), strings.Join(rendered, ", "), suffix,
 	)), nil
+}
+
+// canaryAllowedPaths are the fixture files a deterministic Mills canary
+// (an item carrying CanaryLabel) modifies by design. Kept to exact
+// repo-relative paths — no globs — so the canary carve-out stays as
+// narrow as the canary itself.
+var canaryAllowedPaths = []string{
+	"testdata/mills-canary/heartbeat.md",
 }
 
 // allowedSet keeps the literal allowlisted paths plus any directories

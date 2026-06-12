@@ -166,11 +166,60 @@ func TestIsFreeRetry(t *testing.T) {
 		{ClassTransientQuota, true},
 		{ClassInfra, false},
 		{ClassCode, false},
+		{ClassConfig, false},
 		{"", false},
 	}
 	for _, tc := range cases {
 		if got := IsFreeRetry(tc.c); got != tc.want {
 			t.Errorf("IsFreeRetry(%s) = %v, want %v", tc.c, got, tc.want)
+		}
+	}
+}
+
+// TestClassify_Merge405IsConfig pins the DEBT-073(b) contract: GitLab's
+// 405 Method Not Allowed on the merge stage is a terminal config error
+// (merge method / MWPS / approvals), never a retryable class. The first
+// fixture is the GitLab client's real error shape
+// (pkg/mills/clients/gitlab.go doRequest); escalations #148/#150
+// retried it verbatim 3× before this.
+func TestClassify_Merge405IsConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+	}{
+		{
+			name: "gitlab client status-line shape",
+			msg:  `gitlab: PUT /projects/services%2Floom-core/merge_requests/598/merge: status 405: {"message":"405 Method Not Allowed"}`,
+		},
+		{
+			name: "worded form without status prefix",
+			msg:  "merge mr 598: method not allowed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Classify(errors.New(tc.msg)); got != ClassConfig {
+				t.Errorf("Classify(%q) = %s, want %s", tc.msg, got, ClassConfig)
+			}
+		})
+	}
+}
+
+func TestIsTerminal(t *testing.T) {
+	cases := []struct {
+		c    ErrorClass
+		want bool
+	}{
+		{ClassConfig, true},
+		{ClassTransient, false},
+		{ClassTransientQuota, false},
+		{ClassInfra, false},
+		{ClassCode, false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := IsTerminal(tc.c); got != tc.want {
+			t.Errorf("IsTerminal(%s) = %v, want %v", tc.c, got, tc.want)
 		}
 	}
 }

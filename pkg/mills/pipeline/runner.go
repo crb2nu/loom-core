@@ -407,6 +407,14 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				effectiveAttempts[stage.ID]++
 			}
 
+			// Terminal config errors escalate on first sight — an
+			// identical retry can only return the identical error
+			// (merge 405 burned 3 attempts per run; escalations
+			// #148/#150).
+			if IsTerminal(cls) {
+				return r.escalateWithItem(ctx, run, item, fmt.Sprintf("stage %s terminal config error (not retried) [class=%s]: %v — check the project's merge method, merge-when-pipeline-succeeds availability, and approval rules", stage.ID, cls, err))
+			}
+
 			// Hard cap on total attempts (free + budgeted) so a
 			// permanent transient can't loop forever.
 			if attempts[stage.ID] >= maxAttempts+transientRetryCap {
