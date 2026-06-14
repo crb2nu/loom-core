@@ -49,7 +49,14 @@ const (
 	eventAgentStatusChange = "agent.status.change"
 	eventToolCallStart     = "tool.call.start"
 	eventToolCallEnd       = "tool.call.end"
+	eventChapterMarked     = "chapter.marked"
 )
+
+// chapterToolName is the Claude Code Desktop session MCP tool that marks a
+// chapter. Its PostToolUse hook payload carries tool_input.{title,summary},
+// which we surface as a first-class chapter.marked event rather than an opaque
+// tool.call.end. See .loom/151-plan-hud-chapters-ingestion-2026-06-14.md.
+const chapterToolName = "mcp__ccd_session__mark_chapter"
 
 // emittedEvent is the {type, payload} envelope produced by hook
 // normalization. Sent verbatim to pkg/eventpub.HTTPPublisher.
@@ -141,6 +148,30 @@ func nativeHookToEvent(hook, agentID string, raw map[string]any) (emittedEvent, 
 		toolName := stringField(raw, "tool_name")
 		if toolName == "" {
 			return emittedEvent{}, errors.New("post-tool-use: tool_name is required")
+		}
+		// A mark_chapter call is a session milestone, not opaque tool activity:
+		// surface it as a first-class chapter.marked event carrying the verbatim
+		// title/summary (user-authored labels, not secrets — no redaction). The
+		// HUD groups these by conversation alongside the agent rows.
+		if toolName == chapterToolName {
+			toolInput, _ := raw["tool_input"].(map[string]any)
+			title := strings.TrimSpace(stringField(toolInput, "title"))
+			if title == "" {
+				return emittedEvent{}, errors.New("post-tool-use: mark_chapter requires tool_input.title")
+			}
+			payload := map[string]any{
+				"session_id": sessionID,
+				"agent_id":   agentID,
+				"title":      title,
+				"marked_at":  now,
+			}
+			if summary := strings.TrimSpace(stringField(toolInput, "summary")); summary != "" {
+				payload["summary"] = summary
+			}
+			if tuid := stringField(raw, "tool_use_id"); tuid != "" {
+				payload["tool_use_id"] = tuid
+			}
+			return emittedEvent{Type: eventChapterMarked, Payload: payload}, nil
 		}
 		callID := stringField(raw, "call_id")
 		payload := map[string]any{
@@ -381,7 +412,7 @@ func genericHookToEvent(hook, agentID string, raw map[string]any) (emittedEvent,
 // hook script can't accidentally publish (say) a fake server.health event.
 func isAllowedEmittedType(t string) bool {
 	switch t {
-	case eventSessionStart, eventSessionEnd, eventAgentStatusChange, eventToolCallStart, eventToolCallEnd:
+	case eventSessionStart, eventSessionEnd, eventAgentStatusChange, eventToolCallStart, eventToolCallEnd, eventChapterMarked:
 		return true
 	}
 	return false

@@ -70,6 +70,7 @@ const CORE_EVENT_TYPES = [
   'agent.spawn.tool_start', 'agent.spawn.tool_complete', 'agent.spawn.file_change',
   'agent.spawn.result', 'agent.spawn.rate_limit',
   'access.denied',
+  'chapter.marked',
 ];
 
 class EventStore {
@@ -241,7 +242,12 @@ class EventStore {
       }
       // For HUD and agent events, the data payload is nested inside the event's
       // top-level "data" field. Parse it if it's a string (from json.RawMessage).
-      if ((event.type?.startsWith('hud.') || event.type?.startsWith('agent.')) && typeof event.data === 'string') {
+      if (
+        (event.type?.startsWith('hud.') ||
+          event.type?.startsWith('agent.') ||
+          event.type?.startsWith('chapter.')) &&
+        typeof event.data === 'string'
+      ) {
         try {
           event.data = JSON.parse(event.data as unknown as string);
         } catch { /* keep as-is */ }

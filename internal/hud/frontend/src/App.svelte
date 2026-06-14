@@ -6,6 +6,7 @@
   import { taskStore } from './lib/stores/tasks.svelte.ts';
   import { streamStore } from './lib/stores/stream.svelte.ts';
   import { eventStore } from './lib/stores/events.svelte.ts';
+  import { chaptersStore } from './lib/stores/chapters.svelte.ts';
   import { overlayStore } from './lib/stores/overlay.svelte.ts';
   import { embedConfig } from './lib/stores/embedConfig.svelte.ts';
   import { actionStore } from './lib/stores/action.svelte.ts';
@@ -55,6 +56,7 @@
     embedConfig.load();
     router.init();
     eventStore.connect();
+    chaptersStore.connect();
     fleetStore.fetch();
     healthStore.fetch();
   });

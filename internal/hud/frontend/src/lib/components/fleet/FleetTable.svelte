@@ -31,6 +31,7 @@
   } = $props();
 
   import { fleetStore } from '../../stores/fleet.svelte.ts';
+  import { chaptersStore } from '../../stores/chapters.svelte.ts';
   import { formatTime, relativeTime, sanitizeText, inferAgentType } from '../../utils/format.ts';
   import { VIRTUAL_SCROLL_THRESHOLD } from '../../utils/tokens.ts';
   import StatusDot from '../../widgets/StatusDot.svelte';
@@ -146,6 +147,19 @@
                 <span class="hierarchy-pill">{row.liveChildCount}/{row.totalChildCount} child{row.totalChildCount === 1 ? '' : 'ren'}</span>
               {/if}
             </div>
+            {/if}
+          {/if}
+          {#if row.depth === 0 && !row.conversationSibling}
+            {@const latestChapter = chaptersStore.latestForAgent(agent.agent_id)}
+            {#if latestChapter}
+              {@const chapterCount = chaptersStore.countForAgent(agent.agent_id)}
+              <div class="agent-chapter-row" title={sanitizeText(latestChapter.summary || latestChapter.title)}>
+                <span class="chapter-pill">
+                  <span class="chapter-glyph" aria-hidden="true">▸</span>
+                  <span class="chapter-title">{sanitizeText(latestChapter.title)}</span>
+                  {#if chapterCount > 1}<span class="chapter-count">·&nbsp;{chapterCount}</span>{/if}
+                </span>
+              </div>
             {/if}
           {/if}
         </td>
@@ -356,6 +370,47 @@
   .hierarchy-pill-child {
     border-color: color-mix(in srgb, var(--info) 24%, var(--border));
     background: color-mix(in srgb, var(--info) 8%, transparent);
+  }
+
+  /* Latest session chapter (Claude Code mark_chapter) for this conversation. */
+  .agent-chapter-row {
+    display: flex;
+    margin-top: 6px;
+    min-width: 0;
+  }
+
+  .chapter-pill {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 5px;
+    max-width: 100%;
+    min-width: 0;
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 10px;
+    line-height: 1.3;
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+
+  .chapter-glyph {
+    flex: none;
+    color: var(--accent);
+    font-size: 9px;
+  }
+
+  .chapter-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg-secondary);
+  }
+
+  .chapter-count {
+    flex: none;
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
   }
 
   .subagent-row {
