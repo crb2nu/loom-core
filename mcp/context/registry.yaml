@@ -818,6 +818,11 @@ servers:
         command: "${repo}/services/loom-core/bin/mcp-youtube"
         args: []
   - name: godot_debug
+    # Intent marker (like itchio/release): flightdeck Context Ledger marks this
+    # DEAD WEIGHT (0 calls/30d, claude-code) — local-only, needs a running Godot
+    # instance. Effective trim is enforced via catalog-state (`loom catalog
+    # disable godot_debug`); re-enable for game-dev with `loom catalog enable`.
+    disabled: true
     categories: [game, debugging, local]
     common:
       description: Local-only MCP server for Godot debugging (Go native)

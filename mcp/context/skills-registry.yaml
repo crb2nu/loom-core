@@ -5054,6 +5054,12 @@ skills:
            - GitLab: `gitlab__list_pipelines`, `gitlab__pipeline_summary`, `gitlab__poll_pipeline`
            - GitHub: inspect PR/check status with the configured repo tooling
            - If the repo runs both branch and merge-request pipelines, treat the MR pipeline as merge-deciding.
+           - A `running/pending` pipeline is a non-terminal state, not a failure:
+             wait and re-poll instead of re-spamming `poll_pipeline` /
+             `pipeline_summary`. Flightdeck flags ≥3 consecutive identical GitLab
+             tool failures as a `repeated_tool_failure` stall (p95 ≈ 24 min), so
+             never re-issue the same call more than twice for the same error —
+             space polls with a real wait or fall back to `glab` on a `401`.
         2. **Pick the earliest causal failure**
            - start with the first failed or blocked job in dependency order
            - do not fix downstream noise before the root failure
@@ -5187,6 +5193,36 @@ skills:
         - `gitlab__list_merge_requests` with `source_branch` / `target_branch` filters to reuse an open MR
         - `gitlab__get_merge_request` to poll merged state and detailed merge status
         - `gitlab__merge_merge_request` with `auto_merge=true` and the current `sha` for a safe merge request handoff
+
+        ## GitLab Tool Resilience (avoid repeated_tool_failure stalls)
+
+        Flightdeck telemetry shows the GitLab MCP cluster
+        (`poll_pipeline`, `merge_merge_request`, `list_merge_requests`,
+        `pipeline_summary`, `get_merge_request`) is the dominant driver of the
+        most expensive stall class — `repeated_tool_failure`, p95 ≈ 24 min —
+        almost always from re-issuing the same call against a *non-terminal*
+        state. Do not let that happen:
+
+        - **A non-terminal response is not a failure.** Treat these as "keep
+          waiting," not "retry now":
+          - pipeline `status: running | pending | created` → poll later, do not re-spam
+          - MR `merge_status: checking | unchecked`, or `cannot_be_merged`
+            *while the pipeline is still running* → wait for the pipeline, not the MR
+          - `405 Method Not Allowed` / "merge request is not mergeable" right
+            after arming `auto_merge=true` → the request is already queued;
+            stop calling merge and poll the MR's merged state instead
+        - **Bounded retry rule.** Never re-issue the *same* GitLab call more than
+          twice for the same error — the projector flags ≥3 consecutive identical
+          tool failures as a stall. After the second identical failure, change
+          something: wait, switch tools, or stop and report a precise blocker.
+        - **Space out polls.** Put a real wait between pipeline polls
+          (`poll_pipeline`'s own wait, or `time__wait`) rather than tight-looping
+          `poll_pipeline` / `pipeline_summary`. Prefer delegating the wait to a
+          background task.
+        - **Auth quirk fallback.** The GitLab MCP API token can return `401`
+          while the local git credential helper still works. If MCP GitLab calls
+          401, do not retry them — fall back to `glab` CLI / `git push` for the
+          action and report the MCP auth gap once.
 
         ## GitLab Helper
 
@@ -5427,6 +5463,23 @@ skills:
 
         Do not ask the user before committing, pushing, creating MRs, or merging.
         Only pause on failures, blockers, or when the user explicitly requests a stop.
+
+        ## GitLab Tool Resilience (avoid retry stalls)
+
+        Flightdeck telemetry: GitLab MCP calls against a *non-terminal* state are
+        the top driver of `repeated_tool_failure` stalls (p95 ≈ 24 min). When
+        polling/merging:
+
+        - A pipeline `running/pending` or MR `checking/unchecked` is **not** a
+          failure — wait and re-poll, do not re-spam the same call.
+        - `405 Method Not Allowed` after arming `auto_merge=true` means the merge
+          is already queued — poll merged state instead of re-calling merge.
+        - **Never re-issue the same GitLab call more than twice for the same
+          error** (≥3 identical failures = a stall). After that, wait, switch to
+          `glab` CLI, or report a precise blocker.
+        - Space out polls with a real wait (`poll_pipeline`'s wait or `time__wait`).
+        - If GitLab MCP returns `401`, fall back to `glab` / git credential helper
+          — do not retry the MCP call.
 
         ## Safety
 
