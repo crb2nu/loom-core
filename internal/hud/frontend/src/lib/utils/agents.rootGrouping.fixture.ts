@@ -13,6 +13,7 @@
 
 import {
   rootAgentId,
+  conversationId,
   groupSessionsByRootAgent,
   summarizeUnifiedAgents,
   type RootGroupableSession,
@@ -66,6 +67,47 @@ allOk = expect('empty id is empty root', rootAgentId(''), '') && allOk;
 allOk =
   expect('bare base with no hash is its own root', rootAgentId('claude-code'), 'claude-code') &&
   allOk;
+
+// ── conversationId: <base>-<WS_HASH>-<SESSION_SCOPE> → <base>-<SESSION_SCOPE> ──
+// Drops the WS_HASH, keeps the conversation scope, so one chat that hopped
+// repos groups together (the inverse axis of rootAgentId).
+allOk =
+  expect(
+    'flightdeck member of a cross-repo chat keeps its scope',
+    conversationId('claude-code-3749726816-1105899468'),
+    'claude-code-1105899468',
+  ) && allOk;
+allOk =
+  expect(
+    'gitops member of the SAME chat maps to the same conversation',
+    conversationId('claude-code-401508988-1105899468'),
+    'claude-code-1105899468',
+  ) && allOk;
+allOk =
+  expect(
+    'same-repo but different scope is a different conversation',
+    conversationId('claude-code-552019522-2804496862'),
+    'claude-code-2804496862',
+  ) && allOk;
+allOk =
+  expect(
+    'codex session-scope strips the ws-hash',
+    conversationId('codex-401508988-2992486099'),
+    'codex-2992486099',
+  ) && allOk;
+allOk =
+  expect(
+    'bare ws-hash id (no scope) is its own conversation',
+    conversationId('codex-401508988'),
+    'codex-401508988',
+  ) && allOk;
+allOk =
+  expect(
+    'non-numeric suffix id passes through',
+    conversationId('codex-7b28'),
+    'codex-7b28',
+  ) && allOk;
+allOk = expect('empty id is empty conversation', conversationId(''), '') && allOk;
 
 // ── grouping: the live 6-session fleet collapses to 5 logical agents ──
 const liveSessions: RootGroupableSession[] = [

@@ -415,10 +415,17 @@ func (d *FleetDomain) ensureHeartbeatSession(agentID, namespace, agentType, desc
 		return err
 	}
 	if active != nil {
-		if namespace == "" || strings.TrimSpace(active.Namespace) == namespace {
-			d.deps.CacheSet(cacheKey, true, 30*time.Second)
-			return nil
-		}
+		// A heartbeat must never fork a SECOND active session for an agent that
+		// already has one. The agent_id already encodes the workspace (WS_HASH),
+		// so one agent_id == one conversation in one workspace == at most one
+		// live session. Previously this reused the session only when the incoming
+		// namespace matched; the federation mirror posts heartbeats with a
+		// synthetic `agents/<agent-id>` namespace (mirror.go buildHeartbeatBody)
+		// whenever it can't resolve the source namespace, so the mismatch forked
+		// a duplicate `agents/<id>` twin of every mirrored agent and polluted the
+		// Live Agents table. Reuse the live session regardless of namespace.
+		d.deps.CacheSet(cacheKey, true, 30*time.Second)
+		return nil
 	}
 
 	if namespace == "" {
