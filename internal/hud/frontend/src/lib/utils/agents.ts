@@ -209,9 +209,15 @@ export interface RootGroupableSession {
   last_activity: number;
 }
 
-/** A set of sessions belonging to one workspace-scoped (root) agent. */
+/**
+ * A set of sessions that share one grouping identity. The `root` field holds
+ * the group key — a workspace-scoped root agent id when grouped via
+ * `groupSessionsByRootAgent`, or a conversation id when grouped via
+ * `groupSessionsByConversation`. Both are `<base>-<numeric>` shaped, so the
+ * field doubles as the display label either way.
+ */
 export interface RootAgentSessionGroup<T extends RootGroupableSession> {
-  /** Workspace-scoped root agent id — the group key and display label. */
+  /** Group key + display label (root agent id OR conversation id). */
   root: string;
   /** Member sessions, in their incoming order (callers pre-sort). */
   sessions: T[];
@@ -236,17 +242,17 @@ export function liveStatusRank(status: string | null | undefined): number {
   }
 }
 
-// groupSessionsByRootAgent collapses a list of live sessions into per-agent
-// groups keyed by rootAgentId, so sibling conversations of one workspace agent
-// render together instead of as flat, unrelated rows. Input order is preserved
-// within each group (callers sort by recency first); groups come back ordered
-// by most-recent activity. Pure + rune-free so it is unit-testable.
-export function groupSessionsByRootAgent<T extends RootGroupableSession>(
+// groupSessionsByKey collapses a list of live sessions into groups keyed by an
+// agent_id-derived identity (rootAgentId or conversationId). Input order is
+// preserved within each group (callers sort by recency first); groups come back
+// ordered by most-recent activity. Pure + rune-free so it is unit-testable.
+function groupSessionsByKey<T extends RootGroupableSession>(
   sessions: T[],
+  keyFn: (agentId: string | null | undefined) => string,
 ): RootAgentSessionGroup<T>[] {
   const groups = new Map<string, RootAgentSessionGroup<T>>();
   for (const session of sessions) {
-    const root = rootAgentId(session.agent_id) || session.agent_id || session.session_id;
+    const root = keyFn(session.agent_id) || session.agent_id || session.session_id;
     let group = groups.get(root);
     if (!group) {
       group = { root, sessions: [], status: 'unknown', last_activity: 0 };
@@ -259,6 +265,29 @@ export function groupSessionsByRootAgent<T extends RootGroupableSession>(
     }
   }
   return Array.from(groups.values()).sort((a, b) => b.last_activity - a.last_activity);
+}
+
+// groupSessionsByRootAgent buckets sessions by their workspace-scoped root
+// agent (rootAgentId), so sibling conversations running in the SAME workspace
+// render together. This is the "how many logical agents/CLIs are live" lens —
+// the same one the Active-Agents headline uses. Use it where workspace identity
+// is the right grouping; use groupSessionsByConversation where chat identity is.
+export function groupSessionsByRootAgent<T extends RootGroupableSession>(
+  sessions: T[],
+): RootAgentSessionGroup<T>[] {
+  return groupSessionsByKey(sessions, rootAgentId);
+}
+
+// groupSessionsByConversation buckets sessions by their conversation
+// (conversationId), so one chat that hopped across repos/worktrees — distinct
+// agent_ids sharing a SESSION_SCOPE but differing in WS_HASH — renders as a
+// single group, while distinct chats that merely share a repo stay separate.
+// This is the inverse axis of groupSessionsByRootAgent and matches the Fleet
+// "Live Agents" table's conversation-first grouping (see fleetRows.ts).
+export function groupSessionsByConversation<T extends RootGroupableSession>(
+  sessions: T[],
+): RootAgentSessionGroup<T>[] {
+  return groupSessionsByKey(sessions, conversationId);
 }
 
 export function normalizeUnifiedStatus(raw: string | null | undefined): UnifiedAgentStatus {

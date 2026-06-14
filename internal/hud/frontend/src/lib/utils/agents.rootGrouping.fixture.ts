@@ -15,6 +15,7 @@ import {
   rootAgentId,
   conversationId,
   groupSessionsByRootAgent,
+  groupSessionsByConversation,
   summarizeUnifiedAgents,
   type RootGroupableSession,
   type UnifiedAgent,
@@ -155,6 +156,87 @@ allOk =
     groups.filter((g) => g.sessions.length === 1).length,
     4,
   ) && allOk;
+
+// ── conversation grouping: the inverse axis of root-agent grouping ──
+// The Live Sessions card buckets by conversation (groupSessionsByConversation),
+// matching the Fleet "Live Agents" table. The SAME six sessions group
+// differently under each axis: a cross-repo chat (one SESSION_SCOPE seen under
+// three WS_HASHes) collapses to ONE conversation but SPLITS into three root
+// agents; a same-repo pair (one WS_HASH, two SESSION_SCOPEs) stays TWO
+// conversations but MERGES into one root agent.
+const mixedSessions: RootGroupableSession[] = [
+  // One chat (scope 1105899468) that worked in flightdeck, gitops, and an
+  // agents namespace — three WS_HASHes, one conversation.
+  {
+    session_id: 'aa',
+    agent_id: 'claude-code-3749726816-1105899468',
+    agent_status: 'idle',
+    last_activity: 100,
+  },
+  {
+    session_id: 'bb',
+    agent_id: 'claude-code-401508988-1105899468',
+    agent_status: 'active',
+    last_activity: 800, // most-recent overall → its conversation sorts first
+  },
+  {
+    session_id: 'cc',
+    agent_id: 'claude-code-1305365710-1105899468',
+    agent_status: 'idle',
+    last_activity: 300,
+  },
+  // Two distinct chats in the SAME repo (WS_HASH 552019522, two scopes).
+  {
+    session_id: 'dd',
+    agent_id: 'claude-code-552019522-2804496862',
+    agent_status: 'active',
+    last_activity: 500,
+  },
+  {
+    session_id: 'ee',
+    agent_id: 'claude-code-552019522-3116397616',
+    agent_status: 'idle',
+    last_activity: 400,
+  },
+  // An unrelated singleton.
+  { session_id: 'ff', agent_id: 'codex-7b28', agent_status: 'active', last_activity: 200 },
+];
+
+const convGroups = groupSessionsByConversation(mixedSessions);
+allOk = expect('6 sessions collapse to 4 conversations', convGroups.length, 4) && allOk;
+
+const crossRepoChat = convGroups.find((g) => g.root === 'claude-code-1105899468');
+allOk =
+  expect('cross-repo chat unifies its 3 sessions', crossRepoChat?.sessions.length, 3) && allOk;
+// idle + active + idle across the group → most-live wins.
+allOk = expect('conversation status is the most-live member', crossRepoChat?.status, 'active') && allOk;
+// The conversation holding the most-recent session (800) leads.
+allOk =
+  expect('conversations sort by most-recent activity', convGroups[0]?.root, 'claude-code-1105899468') &&
+  allOk;
+// The same-repo pair are TWO separate conversations here (they MERGE under root).
+allOk =
+  expect(
+    'same-repo distinct chats stay separate conversations',
+    convGroups.filter(
+      (g) => g.root === 'claude-code-2804496862' || g.root === 'claude-code-3116397616',
+    ).length,
+    2,
+  ) && allOk;
+
+// Same data, root-agent axis: cross-repo chat SPLITS to 3, same-repo pair MERGES
+// to 1 → 5 groups. Proves the two groupers are genuine inverses.
+const rootGroups = groupSessionsByRootAgent(mixedSessions);
+allOk = expect('same 6 sessions are 5 root-agent groups', rootGroups.length, 5) && allOk;
+const crossRepoRoots = ['claude-code-3749726816', 'claude-code-401508988', 'claude-code-1305365710'];
+allOk =
+  expect(
+    'cross-repo chat splits into 3 distinct root agents',
+    crossRepoRoots.filter((r) => rootGroups.some((g) => g.root === r && g.sessions.length === 1)).length,
+    3,
+  ) && allOk;
+const sameRepoRoot = rootGroups.find((g) => g.root === 'claude-code-552019522');
+allOk = expect('same-repo pair merges under one root agent', sameRepoRoot?.sessions.length, 2) && allOk;
 
 // ── count dedup: summarizeUnifiedAgents.live_agents counts logical agents ──
 function agent(id: string, status: 'active' | 'idle' | 'offline'): UnifiedAgent {
