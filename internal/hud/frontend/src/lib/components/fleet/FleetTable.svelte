@@ -71,9 +71,9 @@
         class="header-toggle"
         class:header-toggle-active={fleetStore.groupByRootSession}
         onclick={() => fleetStore.toggleGrouping()}
-        title={fleetStore.groupByRootSession ? 'Show hierarchy grouped by root session' : 'Show a flat agent list'}
+        title={fleetStore.groupByRootSession ? 'Grouped by conversation — repos/worktrees of one chat nest under it' : 'Show a flat agent list'}
       >
-        {fleetStore.groupByRootSession ? 'Grouped by root' : 'Flat list'}
+        {fleetStore.groupByRootSession ? 'Grouped by conversation' : 'Flat list'}
       </button>
       <span class="count-badge">{rows.length}</span>
     </div>
@@ -123,21 +123,30 @@
             <span>{agent.source}</span>
           </div>
           {#if row.session}
+            {@const repos = row.conversationMemberCount ?? 0}
+            {@const showRootRef = !!row.rootSession && row.rootSession.id !== row.session.id}
+            {@const showRootSession = row.rootSession?.id === row.session.id && row.totalChildCount > 0}
+            {@const hasHierarchy = row.conversationSibling || !!row.parentSession || showRootSession || repos > 1 || showRootRef || row.totalChildCount > 0}
+            {#if hasHierarchy}
             <div class="agent-hierarchy-row">
-              {#if row.agentRootChild}
-                <span class="hierarchy-pill hierarchy-pill-child">same agent</span>
+              {#if row.conversationSibling}
+                <span class="hierarchy-pill hierarchy-pill-child">same conversation</span>
               {:else if row.parentSession}
                 <span class="hierarchy-pill hierarchy-pill-child">child of {sessionLabel(row.parentSession)}</span>
-              {:else if row.rootSession?.id === row.session.id}
+              {:else if showRootSession}
                 <span class="hierarchy-pill hierarchy-pill-root">root session</span>
               {/if}
-              {#if row.rootSession && row.rootSession.id !== row.session.id}
+              {#if repos > 1}
+                <span class="hierarchy-pill hierarchy-pill-root" title={`This conversation worked across ${repos} repos/worktrees.`}>{repos} repos</span>
+              {/if}
+              {#if showRootRef}
                 <span class="hierarchy-pill">root {sessionLabel(row.rootSession)}</span>
               {/if}
               {#if row.totalChildCount > 0}
                 <span class="hierarchy-pill">{row.liveChildCount}/{row.totalChildCount} child{row.totalChildCount === 1 ? '' : 'ren'}</span>
               {/if}
             </div>
+            {/if}
           {/if}
         </td>
         <td class="dt-col-status" class:ungrouped-divider={showUngroupedDivider}>

@@ -5,7 +5,7 @@
 
 import type { Session, SessionTreeNode } from '../stores/fleet.svelte.ts';
 import type { SpawnState } from '../stores/spawn.svelte.ts';
-import { rootAgentId, type UnifiedAgent } from './agents.ts';
+import { conversationId, liveStatusRank, type UnifiedAgent } from './agents.ts';
 import { sanitizeText } from './format.ts';
 
 export interface FleetRow {
@@ -13,11 +13,15 @@ export interface FleetRow {
   agent: UnifiedAgent;
   depth: number;
   ungrouped: boolean;
-  // True when this row was nested under a lead by *workspace-agent identity*
-  // (rootAgentId) rather than a real session parent/child link — i.e. a
-  // sibling conversation of the same agent. The renderer shows a "same agent"
+  // True when this row was nested under a lead because it is the SAME
+  // conversation (conversationId) in a different repo/worktree — not a real
+  // session parent/child link. The renderer shows a quiet "same conversation"
   // pill instead of the misleading "root session" badge.
-  agentRootChild: boolean;
+  conversationSibling: boolean;
+  // On a conversation's lead row, how many member rows (repos/worktrees) the
+  // conversation spans. Only set (>1) when the chat touched more than one
+  // workspace, so the renderer can show an "N repos" pill. Undefined otherwise.
+  conversationMemberCount?: number;
   session: Session | null;
   parentSession: Session | null;
   rootSession: Session | null;
@@ -109,7 +113,7 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
       agent,
       depth,
       ungrouped,
-      agentRootChild: false,
+      conversationSibling: false,
       session,
       parentSession: parent,
       rootSession: root,
@@ -188,16 +192,17 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
 
   // Flatten each session-tree root into its row list (preserving real
   // subagent depth), then bucket those root-lists by the lead agent's
-  // workspace-scoped identity (rootAgentId). This is what collapses sibling
-  // conversations of one agent — which have NO session parent/root linkage in
-  // production (parent_session_id is null) and so would otherwise each show as
-  // their own "root session" — under a single lead, nested one level in.
+  // CONVERSATION identity (conversationId). This collapses one chat that moved
+  // across repos/worktrees — distinct agent_ids that share a SESSION_SCOPE but
+  // differ in WS_HASH, with NO session parent/root linkage — under a single
+  // lead, nested one level in. (Distinct chats that merely share a repo have
+  // different SESSION_SCOPEs and correctly stay separate.)
   const rootLists: Array<{ key: string; rows: FleetRow[] }> = [];
   for (const root of sortedRoots) {
     const rows = flattenSessionNode(root, agentBySessionId);
     if (rows.length === 0) continue;
     const lead = rows[0].agent;
-    rootLists.push({ key: rootAgentId(lead.agent_id) || lead.agent_id, rows });
+    rootLists.push({ key: conversationId(lead.agent_id) || lead.agent_id, rows });
   }
 
   const bucketsByKey = new Map<string, FleetRow[][]>();
@@ -212,22 +217,53 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
     bucket.push(rl.rows);
   }
 
+  // The most-live member of a conversation should lead it, so the heartbeat
+  // and status shown for the group are the real, freshest ones — not whichever
+  // repo's row happened to sort first. Rank by status (active > idle > …) then
+  // recency (last heartbeat, falling back to session start).
+  function listLiveScore(rows: FleetRow[]): { rank: number; recency: number } {
+    let rank = 0;
+    let recency = 0;
+    for (const row of rows) {
+      rank = Math.max(rank, liveStatusRank(row.agent.status));
+      const ts = new Date(
+        row.agent.last_heartbeat || row.agent.session_started_at || 0,
+      ).getTime();
+      if (Number.isFinite(ts)) recency = Math.max(recency, ts);
+    }
+    return { rank, recency };
+  }
+
   for (const key of bucketOrder) {
     const lists = bucketsByKey.get(key)!;
-    lists.forEach((rows, listIndex) => {
+    // Freshest, most-active member-list leads; the rest nest under it.
+    const ranked = lists
+      .map((rows) => ({ rows, score: listLiveScore(rows) }))
+      .sort((a, b) => b.score.rank - a.score.rank || b.score.recency - a.score.recency);
+    const memberCount = ranked.length;
+    ranked.forEach(({ rows }, listIndex) => {
       if (listIndex === 0) {
-        // The lead root-list keeps its real (session-tree) depths.
-        groupedRows.push(...rows);
+        // The lead member keeps its real (session-tree) depths. Tag its root
+        // row with the conversation's member count so the renderer can show an
+        // "N repos" pill when the chat spanned more than one workspace.
+        rows.forEach((row, rowIndex) => {
+          groupedRows.push(
+            rowIndex === 0 && memberCount > 1
+              ? { ...row, conversationMemberCount: memberCount }
+              : row,
+          );
+        });
       } else {
-        // Subsequent root-lists are sibling conversations of the same agent:
-        // indent one level under the lead. The list's own root row (rowIndex
-        // 0) is flagged agentRootChild so the renderer shows "same agent";
-        // any genuine subagents below it keep their session-child pills.
+        // Subsequent member-lists are the SAME conversation in another
+        // repo/worktree: indent one level under the lead. The list's own root
+        // row (rowIndex 0) is flagged conversationSibling so the renderer shows
+        // "same conversation"; any genuine subagents below it keep their
+        // session-child pills.
         rows.forEach((row, rowIndex) => {
           groupedRows.push({
             ...row,
             depth: row.depth + 1,
-            agentRootChild: rowIndex === 0 ? true : row.agentRootChild,
+            conversationSibling: rowIndex === 0 ? true : row.conversationSibling,
           });
         });
       }
@@ -253,7 +289,7 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
     }
   }
 
-  // One root group per distinct workspace-agent bucket in the grouped section.
+  // One group per distinct conversation bucket in the grouped section.
   const groupKeys = new Set<string>(bucketOrder);
 
   const ungroupedCount = groupedRows.filter((r) => r.ungrouped).length;

@@ -1477,6 +1477,57 @@ func TestHandler_AgentHeartbeat_EnsureSessionFailureDoesNotRegisterBarePresence(
 	}
 }
 
+// TestHandler_AgentHeartbeat_EnsureSessionReusesExistingSessionAcrossNamespace
+// guards the fix for duplicate `agents/<id>` session twins. The federation
+// mirror posts heartbeats with ensure_session=true and a synthetic
+// `agents/<agent-id>` namespace whenever it can't resolve the source namespace
+// (mirror.go buildHeartbeatBody). The agent already has a live session under
+// its real namespace, so the bootstrap must REUSE it — not fork a second
+// active session just because the namespaces differ.
+func TestHandler_AgentHeartbeat_EnsureSessionReusesExistingSessionAcrossNamespace(t *testing.T) {
+	_, mux, handlers := newTestAppWithHandlers(t)
+
+	const agentID = "claude-code-552019522-12350"
+	var sessionStartCalls int
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			// An active session already exists under the agent's REAL namespace.
+			return json.RawMessage(`{"content":[{"type":"text","text":"{\"sessions\":[{\"id\":\"sess-real\",\"agent_id\":\"` + agentID + `\",\"namespace\":\"services/loom-core/main\",\"status\":\"active\"}]}"}]}`), nil
+		case "agent_context__agent_session_start":
+			sessionStartCalls++
+			return json.RawMessage(`{"content":[{"type":"text","text":"{\"session_id\":\"sess-dup\"}"}]}`), nil
+		case "agent_context__agent_presence_heartbeat":
+			return json.RawMessage(`{"content":[{"type":"text","text":"{\"ok\":true,\"last_heartbeat\":\"2026-06-14T18:20:00Z\"}"}]}`), nil
+		default:
+			return json.RawMessage(`{"content":[{"type":"text","text":"{}"}]}`), nil
+		}
+	})
+
+	// Mirror-shaped heartbeat: ensure_session=true with the synthetic
+	// `agents/<agent-id>` namespace, which differs from the live session's.
+	body := `{"agent_id":"` + agentID + `","agent_type":"claude-code","namespace":"agents/` + agentID + `","description":"loom-core federation mirror","status":"active","ensure_session":true}`
+	req := httptest.NewRequest("POST", "/api/agent/heartbeat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if sessionStartCalls != 0 {
+		t.Fatalf("expected NO duplicate session bootstrap when a live session exists, got %d agent_session_start calls", sessionStartCalls)
+	}
+}
+
 func TestHandler_AgentHeartbeat_RegistersBarePresenceWithoutEnsureSession(t *testing.T) {
 	_, mux, handlers := newTestAppWithHandlers(t)
 

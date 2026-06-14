@@ -152,6 +152,55 @@ export function rootAgentId(agentId: string | null | undefined): string {
   return id;
 }
 
+// conversationId collapses a per-(workspace,conversation) agent_id down to the
+// CONVERSATION it belongs to, so one chat that moved across repos/worktrees
+// groups as a single identity. Where rootAgentId keeps the WS_HASH (grouping by
+// workspace), conversationId keeps the SESSION_SCOPE and drops the WS_HASH —
+// grouping by chat. The hooks mint `<base>-<WS_HASH>-<SESSION_SCOPE>`
+// (pkg/generator/configs_hooks.go): `base` is non-numeric (`claude-code`,
+// `codex`, `gemini-cli`), WS_HASH is the FIRST all-numeric segment (the git
+// workspace-root cksum, which changes per repo/worktree), and SESSION_SCOPE is
+// the trailing all-numeric segment (the conversation/session-id cksum, stable
+// for the life of one chat). The conversation identity is `base-SESSION_SCOPE`.
+//
+// Live evidence: scope 1105899468 appears under three WS_HASHes
+// (claude-code-3749726816-…, -401508988-…, -1305365710-…) — one chat that
+// worked in flightdeck, gitops, and an agents namespace. rootAgentId splits it
+// into three; conversationId unifies it.
+//
+// Examples:
+//   claude-code-3749726816-1105899468 → claude-code-1105899468
+//   claude-code-401508988-1105899468  → claude-code-1105899468  (same chat, other repo)
+//   codex-401508988-2992486099        → codex-2992486099
+//   codex-401508988                   → codex-401508988  (no scope: id is its own conversation)
+//   codex-7b28                        → codex-7b28       (no numeric suffix: already a root)
+export function conversationId(agentId: string | null | undefined): string {
+  const id = (agentId ?? '').trim();
+  if (!id) return '';
+  const parts = id.split('-');
+  const isNumeric = (p: string) => p.length > 0 && /^[0-9]+$/.test(p);
+  // WS_HASH is the first all-numeric segment; the base is everything before it.
+  let wsIdx = -1;
+  for (let i = 0; i < parts.length; i += 1) {
+    if (isNumeric(parts[i])) {
+      wsIdx = i;
+      break;
+    }
+  }
+  if (wsIdx < 0) return id; // no numeric suffix — already a conversation root
+  // SESSION_SCOPE is the last all-numeric segment AFTER the WS_HASH.
+  let scope = '';
+  for (let i = parts.length - 1; i > wsIdx; i -= 1) {
+    if (isNumeric(parts[i])) {
+      scope = parts[i];
+      break;
+    }
+  }
+  if (!scope) return id; // base-WSHASH only, no scope — can't separate the chat
+  const base = parts.slice(0, wsIdx).join('-');
+  return base ? `${base}-${scope}` : scope;
+}
+
 /** Minimal shape needed to group live sessions by their owning agent. */
 export interface RootGroupableSession {
   session_id: string;

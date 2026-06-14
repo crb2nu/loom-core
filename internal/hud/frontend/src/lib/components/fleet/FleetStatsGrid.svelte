@@ -91,8 +91,8 @@
       <div class="metric-sub">{agentsWithoutSession} idle between sessions</div>
     {/if}
     {#if fleetStore.groupByRootSession && rootGroupCount > 0}
-      <div class="metric-sub" title="Distinct root sessions (subagents grouped under their parent).">
-        {rootGroupCount} root group{rootGroupCount === 1 ? '' : 's'}{ungroupedCount > 0 ? ` · ${ungroupedCount} ungrouped` : ''}
+      <div class="metric-sub" title="Distinct conversations. One chat that touched several repos/worktrees counts once; its members nest under it.">
+        {rootGroupCount} conversation{rootGroupCount === 1 ? '' : 's'}{ungroupedCount > 0 ? ` · ${ungroupedCount} ungrouped` : ''}
       </div>
     {/if}
   </div>
