@@ -2046,6 +2046,16 @@ platform_permissions:
       # claude --regen` no longer wipes them. Only enable on machines with
       # the flightdeck edge binary installed.
       flightdeck_capture: true
+      # Phase E HUD cutover: drop the `loom agent event-emit` lifecycle hooks.
+      # The flightdeck-hud-bridge daemon (services/loom-flightdeck) tails the
+      # capture spool and republishes session.*/tool.call.*/chapter.marked to
+      # loomd /events/publish, so event-emit would double-publish to the HUD.
+      # Safe only where the bridge runs with event parity (chapter.marked
+      # landed loom-flightdeck!19). Leaves the agent-context presence path
+      # (keepalive/session-end) untouched. Single-host (this laptop) per the
+      # owner; do NOT enable on hosts without the bridge (their HUD would go
+      # dark). See flightdeck_hooks.go telemetryEventEmitEnabled.
+      telemetry_event_emit: false
       # Host-aware overrides applied at sync time by `loom sync --host <name>`
       # (or $LOOM_HOST). Override REPLACES the matching base field. Used to
       # produce a code-server-correct settings.json without forking the
