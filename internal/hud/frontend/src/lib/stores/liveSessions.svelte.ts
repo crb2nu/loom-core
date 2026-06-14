@@ -17,7 +17,7 @@
 // guarantees redaction at TierPublic before publication).
 
 import { eventStore, type SSEEvent } from './events.svelte.ts';
-import { groupSessionsByRootAgent } from '../utils/agents.ts';
+import { groupSessionsByConversation } from '../utils/agents.ts';
 import { sessionsToEnd, type SnapshotSessionLite } from '../utils/sessionReconcile.ts';
 
 /** Maximum tool calls retained per session in the ring buffer. */
@@ -64,14 +64,15 @@ export interface LiveSession {
 }
 
 /**
- * A group of live sessions that belong to one logical (workspace-scoped)
- * agent. The lifecycle hooks mint a distinct agent_id per conversation
- * (`<base>-<WS_HASH>-<SESSION_SCOPE>`), so a single agent running several
- * conversations shows up as several sessions; this collapses them under one
- * header keyed by `rootAgentId`. See `groupedSessions`.
+ * A group of live sessions that belong to one conversation. The lifecycle
+ * hooks mint a distinct agent_id per (workspace, conversation)
+ * (`<base>-<WS_HASH>-<SESSION_SCOPE>`), so one chat that hopped across
+ * repos/worktrees shows up as several sessions with different WS_HASHes; this
+ * collapses them under one header keyed by `conversationId`. See
+ * `groupedSessions`.
  */
 export interface LiveSessionGroup {
-  /** Workspace-scoped root agent id — the group key and display label. */
+  /** Conversation id — the group key and display label. */
   root: string;
   /** Sessions in this group, most-recent activity first. */
   sessions: LiveSession[];
@@ -142,17 +143,19 @@ class LiveSessionsStore {
   }
 
   /**
-   * Visible sessions collapsed into per-agent groups so sibling conversations
-   * of one workspace agent render under a single header instead of as flat,
-   * unrelated rows. Groups and the sessions within them stay sorted by most
-   * recent activity, matching `visibleSessions`.
+   * Visible sessions collapsed into per-conversation groups so one chat that
+   * hopped across repos/worktrees renders under a single header instead of as
+   * flat, unrelated rows (and distinct chats sharing a repo stay separate).
+   * Matches the Fleet "Live Agents" table's conversation-first grouping. Groups
+   * and the sessions within them stay sorted by most recent activity, matching
+   * `visibleSessions`.
    */
   get groupedSessions(): LiveSessionGroup[] {
-    return groupSessionsByRootAgent(this.visibleSessions) as LiveSessionGroup[];
+    return groupSessionsByConversation(this.visibleSessions) as LiveSessionGroup[];
   }
 
-  /** Distinct logical (workspace-scoped) agents among visible sessions. */
-  get agentGroupCount(): number {
+  /** Distinct conversations among visible sessions. */
+  get conversationGroupCount(): number {
     return this.groupedSessions.length;
   }
 

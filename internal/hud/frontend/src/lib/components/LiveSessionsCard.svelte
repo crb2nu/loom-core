@@ -44,10 +44,13 @@
     // panels may also subscribe. Disconnect happens on App teardown.
   });
 
-  // Sessions are grouped by workspace-scoped agent so sibling conversations of
-  // one agent render under a single header instead of as flat, unrelated rows
-  // (the lifecycle hooks mint a distinct agent_id per conversation). agentCount
-  // here is the distinct-agent count derived from the visible groups.
+  // Sessions are grouped by conversation so one chat that hopped across
+  // repos/worktrees renders under a single header instead of as flat, unrelated
+  // rows (the lifecycle hooks mint a distinct agent_id per workspace+conversation),
+  // while distinct chats sharing a repo stay separate. This matches the Fleet
+  // "Live Agents" table's conversation-first grouping. `groupCount` below is the
+  // distinct-conversation count derived from the visible groups; `agentCount`
+  // (a prop) stays the workspace-scoped connected-agent count for the empty state.
   let groups = $derived(liveSessionsStore.groupedSessions);
   // Prefer the canonical fleet-snapshot count; fall back to the SSE store only
   // when this card is mounted standalone without the prop.
@@ -108,8 +111,8 @@
     <h3>Live Sessions</h3>
     <div class="header-meta">
       {#if groupCount > 0 && groupCount !== activeCount}
-        <span class="meta-pill" data-testid="agent-count">
-          <span class="meta-num">{groupCount}</span> agent{groupCount === 1 ? '' : 's'}
+        <span class="meta-pill" data-testid="conversation-count">
+          <span class="meta-num">{groupCount}</span> conversation{groupCount === 1 ? '' : 's'}
         </span>
       {/if}
       <span class="meta-pill" data-testid="active-count">
