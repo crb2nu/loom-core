@@ -32,7 +32,10 @@ func claudeHooks(reg *registry.Registry, profile *PlatformProfile, loomBinary st
 	appendHookPolicies(hooks, reg, profile.Hooks)
 
 	// Append extras defined in the profile (e.g. postToolUse_formatters, postToolUse_taskSync).
-	appendHookExtras(hooks, profile.Hooks, loomBinary)
+	// withEventEmitGate drops the telemetry_eventEmit extra when the registry's
+	// telemetry_event_emit gate is off (Phase E HUD cutover — the flightdeck
+	// bridge republishes lifecycle events instead; see flightdeck_hooks.go).
+	appendHookExtras(hooks, withEventEmitGate(reg, "claude", profile.Hooks), loomBinary)
 
 	// Append flightdeck live-capture hooks when the registry gate is on, so
 	// regen no longer wipes the entries `flightdeck-capture install` used to

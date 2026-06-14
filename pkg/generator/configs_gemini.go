@@ -85,7 +85,9 @@ func geminiHooks(reg *registry.Registry, profile *PlatformProfile, loomBinary st
 	// Append shared policy hooks (Gemini now has native enforcement via policy_refs).
 	appendHookPolicies(hooks, reg, profile.Hooks)
 
-	appendHookExtras(hooks, profile.Hooks, loomBinary)
+	// withEventEmitGate drops telemetry_eventEmit when the registry gate is off
+	// (Phase E HUD cutover; see flightdeck_hooks.go).
+	appendHookExtras(hooks, withEventEmitGate(reg, "gemini", profile.Hooks), loomBinary)
 
 	// Append flightdeck live-capture hooks when the registry gate is on
 	// (see flightdeck_hooks.go).
