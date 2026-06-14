@@ -126,6 +126,52 @@ func TestHookToEvent_ClaudePostToolUseCapturesDuration(t *testing.T) {
 	}
 }
 
+func TestHookToEvent_MarkChapterEmitsChapterMarked(t *testing.T) {
+	raw := mustParse(t, `{
+		"session_id": "s1",
+		"tool_name": "mcp__ccd_session__mark_chapter",
+		"tool_use_id": "toolu_abc",
+		"tool_input": {"title": "Test verification", "summary": "Ran the suite green"}
+	}`)
+
+	ev, err := hookToEvent("post-tool-use", "claude-code", "a1", raw)
+	if err != nil {
+		t.Fatalf("hookToEvent: %v", err)
+	}
+	if ev.Type != eventChapterMarked {
+		t.Fatalf("Type = %q, want %q", ev.Type, eventChapterMarked)
+	}
+	if ev.Payload["title"] != "Test verification" {
+		t.Errorf("title = %v, want \"Test verification\"", ev.Payload["title"])
+	}
+	if ev.Payload["summary"] != "Ran the suite green" {
+		t.Errorf("summary = %v, want \"Ran the suite green\"", ev.Payload["summary"])
+	}
+	if ev.Payload["agent_id"] != "a1" || ev.Payload["session_id"] != "s1" {
+		t.Errorf("agent_id/session_id = %v/%v, want a1/s1", ev.Payload["agent_id"], ev.Payload["session_id"])
+	}
+	if ev.Payload["tool_use_id"] != "toolu_abc" {
+		t.Errorf("tool_use_id = %v, want toolu_abc", ev.Payload["tool_use_id"])
+	}
+	if _, ok := ev.Payload["marked_at"].(string); !ok {
+		t.Errorf("marked_at missing or not a string: %v", ev.Payload["marked_at"])
+	}
+	if !isAllowedEmittedType(ev.Type) {
+		t.Errorf("chapter.marked must be allowlisted for event-emit")
+	}
+}
+
+func TestHookToEvent_MarkChapterRequiresTitle(t *testing.T) {
+	raw := mustParse(t, `{
+		"session_id": "s1",
+		"tool_name": "mcp__ccd_session__mark_chapter",
+		"tool_input": {"summary": "no title here"}
+	}`)
+	if _, err := hookToEvent("post-tool-use", "claude-code", "a1", raw); err == nil {
+		t.Fatal("expected error when mark_chapter has no title")
+	}
+}
+
 func TestHookToEvent_ClaudePostToolUseWithError(t *testing.T) {
 	raw := mustParse(t, `{
 		"session_id": "s1",
