@@ -358,7 +358,14 @@ func buildCodexAgentsBlock(pp *registry.PlatformPermission) *codexAgentsBlock {
 // $1=payload). We pipe `${1:-}` into stdin for both the existing
 // keepalive-wrap session extraction and the new event-emit publish.
 func codexNotifyCommand(loomCmd string, telemetryEmit bool) string {
-	base := fmt.Sprintf(`WS_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$PWD")"; WS_HASH="$(printf '%%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; CACHE_DIR="${HOME}/.cache/loom"; AGENT_ID_FILE="${CACHE_DIR}/agent-id-codex-${WS_HASH}"; KEEPALIVE_STAMP_FILE="${CACHE_DIR}/keepalive-wrap-codex-${WS_HASH}.stamp"; mkdir -p "$CACHE_DIR"; if [ -s "$AGENT_ID_FILE" ]; then AGENT_ID="$(cat "$AGENT_ID_FILE")"; else AGENT_ID="codex-${WS_HASH}"; printf '%%s' "$AGENT_ID" > "$AGENT_ID_FILE"; fi; NOTIFY_PAYLOAD="${INPUT:-${1:-}}"; NOW="$(date +%%s)"; LAST="$(cat "$KEEPALIVE_STAMP_FILE" 2>/dev/null || true)"; case "$LAST" in ''|*[!0-9]*) ;; *) if [ $((NOW - LAST)) -lt 15 ]; then exit 0; fi ;; esac; printf '%%s' "$NOW" > "$KEEPALIVE_STAMP_FILE"; HOOK_SESSION_ID="$(printf '%%s' "$NOTIFY_PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null || true)"; nohup %s agent keepalive-wrap --agent-id "$AGENT_ID" --session-id "$HOOK_SESSION_ID" --status active --ensure-session --infer-namespace --agent-type codex --description "Codex keepalive wrapper session" --quiet </dev/null >/dev/null 2>>"${TMPDIR:-/tmp}/loom-agent-hooks.log" &`, loomCmd)
+	// nsVars computes NS_PROJECT/NS_BRANCH from $WS_ROOT (worktree-aware), the
+	// same way Claude's hooks do. Passed as a %s ARG (not woven into the format
+	// string) so its literal `%%` shell expansions aren't consumed as verbs.
+	// Codex previously passed only --infer-namespace, which re-runs git in the
+	// detached keepalive-wrap process and produced malformed namespaces like
+	// "////main"; an explicit --namespace fixes that at the source.
+	nsVars := hookNamespaceVars()
+	base := fmt.Sprintf(`WS_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$PWD")"; WS_HASH="$(printf '%%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; %s; CACHE_DIR="${HOME}/.cache/loom"; AGENT_ID_FILE="${CACHE_DIR}/agent-id-codex-${WS_HASH}"; KEEPALIVE_STAMP_FILE="${CACHE_DIR}/keepalive-wrap-codex-${WS_HASH}.stamp"; mkdir -p "$CACHE_DIR"; if [ -s "$AGENT_ID_FILE" ]; then AGENT_ID="$(cat "$AGENT_ID_FILE")"; else AGENT_ID="codex-${WS_HASH}"; printf '%%s' "$AGENT_ID" > "$AGENT_ID_FILE"; fi; NOTIFY_PAYLOAD="${INPUT:-${1:-}}"; NOW="$(date +%%s)"; LAST="$(cat "$KEEPALIVE_STAMP_FILE" 2>/dev/null || true)"; case "$LAST" in ''|*[!0-9]*) ;; *) if [ $((NOW - LAST)) -lt 15 ]; then exit 0; fi ;; esac; printf '%%s' "$NOW" > "$KEEPALIVE_STAMP_FILE"; HOOK_SESSION_ID="$(printf '%%s' "$NOTIFY_PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null || true)"; nohup %s agent keepalive-wrap --agent-id "$AGENT_ID" --session-id "$HOOK_SESSION_ID" --namespace "$NS_PROJECT/$NS_BRANCH" --status active --ensure-session --infer-namespace --agent-type codex --description "Codex keepalive wrapper session" --quiet </dev/null >/dev/null 2>>"${TMPDIR:-/tmp}/loom-agent-hooks.log" &`, nsVars, loomCmd)
 	if !telemetryEmit {
 		return base
 	}

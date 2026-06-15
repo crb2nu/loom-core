@@ -407,10 +407,20 @@ func inferGitNamespace() string {
 	repoRoot := strings.TrimSpace(string(toplevel))
 
 	repoRoot = stripWorktreeFromRepoRoot(repoRoot)
+	if repoRoot == "" || repoRoot == "/" {
+		return ""
+	}
 
 	// Use parent/basename for workspace-relative namespacing
 	// (e.g. "services/loom-core" instead of just "loom-core").
-	project := filepath.Base(filepath.Dir(repoRoot)) + "/" + filepath.Base(repoRoot)
+	parent := filepath.Base(filepath.Dir(repoRoot))
+	name := filepath.Base(repoRoot)
+	// Reject degenerate path components (root "/", cwd ".", empty) that would
+	// otherwise yield malformed namespaces like "////main".
+	if isDegeneratePathSegment(parent) || isDegeneratePathSegment(name) {
+		return ""
+	}
+	project := parent + "/" + name
 
 	// Get current branch.
 	branch, err := exec.CommandContext(ctx, "git", "branch", "--show-current").Output()
@@ -423,4 +433,15 @@ func inferGitNamespace() string {
 	}
 
 	return project + "/" + branchName
+}
+
+// isDegeneratePathSegment reports whether a filepath.Base result is a
+// non-meaningful path component ("", "/", ".", "..") that should not be used
+// to build a namespace.
+func isDegeneratePathSegment(s string) bool {
+	switch s {
+	case "", "/", ".", "..":
+		return true
+	}
+	return false
 }

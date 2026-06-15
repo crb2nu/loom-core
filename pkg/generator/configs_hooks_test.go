@@ -1,9 +1,26 @@
 package generator
 
 import (
+	"context"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestCodexNotifyCommand_ShellSyntaxValid guards the codex notify snippet
+// (which now embeds the worktree-aware nsVars + an explicit --namespace)
+// against shell-syntax regressions — `sh -n` parses without executing.
+func TestCodexNotifyCommand_ShellSyntaxValid(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, emit := range []bool{false, true} {
+		cmd := codexNotifyCommand("loom", emit)
+		if out, err := exec.CommandContext(ctx, "sh", "-n", "-c", cmd).CombinedOutput(); err != nil {
+			t.Fatalf("codex notify (telemetry=%v) invalid shell syntax: %v\n%s", emit, err, out)
+		}
+	}
+}
 
 func TestHookNamespaceVars_HandlesClaudeWorktrees(t *testing.T) {
 	got := hookNamespaceVars()
@@ -139,6 +156,26 @@ func TestAppendHookExtras_Retrospective_AppendsToSessionEnd(t *testing.T) {
 	if endAfter <= endBefore {
 		t.Errorf("expected SessionEnd hooks to grow after appending retrospective, before=%d after=%d", endBefore, endAfter)
 	}
+}
+
+func TestBuildPlatformHooks_HeartbeatPassesExplicitNamespace(t *testing.T) {
+	// The heartbeat hook computes NS_PROJECT/NS_BRANCH (nsVars) and must pass
+	// them as an explicit --namespace, not rely on server-side --infer-namespace
+	// whose fallback minted "agents/<agent-id>" phantom sessions.
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "loom")
+
+	assertNativeLifecycleHook(t, hooks, "PostToolUse", "agent heartbeat")
+	assertNativeLifecycleHook(t, hooks, "PostToolUse", `--namespace "$NS_PROJECT/$NS_BRANCH"`)
+	// nsVars must be computed in the same command so $NS_PROJECT/$NS_BRANCH resolve.
+	assertNativeLifecycleHook(t, hooks, "PostToolUse", "NS_PROJECT=")
 }
 
 func TestAppendHookExtras_Retrospective_DoesNotAffectMissingEvent(t *testing.T) {
@@ -386,6 +423,14 @@ func TestVendorLifecycleContract(t *testing.T) {
 			"--session-id",
 			"--agent-type codex",
 			"--infer-namespace",
+			// Codex now passes an explicit namespace (computed from WS_ROOT) so
+			// it stops falling back to the malformed "////main" the detached
+			// keepalive-wrap process produced via git inference. Checked without
+			// surrounding quotes since this `got` is the TOML-serialized config
+			// (inner quotes are escaped to \").
+			"--namespace ",
+			"$NS_PROJECT/$NS_BRANCH",
+			"NS_PROJECT=",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("codex notify command missing %q; full preamble:\n%s", want, got)

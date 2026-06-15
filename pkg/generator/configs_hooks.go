@@ -127,7 +127,7 @@ func buildPlatformHooks(reg *registry.Registry, hp HookProfile, loomBinary strin
 					{
 						"type": "command",
 						"command": fmt.Sprintf(
-							`INPUT=$(cat); %s; %s; %s agent heartbeat --agent-id "$AGENT_ID" --status active --ensure-session --infer-namespace --agent-type %s --description "%s · $NS_PROJECT" --quiet %s || true`,
+							`INPUT=$(cat); %s; %s; %s agent heartbeat --agent-id "$AGENT_ID" --namespace "$NS_PROJECT/$NS_BRANCH" --status active --ensure-session --infer-namespace --agent-type %s --description "%s · $NS_PROJECT" --quiet %s || true`,
 							bootstrap, nsVars, loomCmd, hp.AgentType, descPrefix, log),
 					},
 				},
