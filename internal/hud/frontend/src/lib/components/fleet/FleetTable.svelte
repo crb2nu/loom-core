@@ -32,6 +32,7 @@
 
   import { fleetStore } from '../../stores/fleet.svelte.ts';
   import { chaptersStore } from '../../stores/chapters.svelte.ts';
+  import { parseNamespace } from '../../utils/namespace.ts';
   import { formatTime, relativeTime, sanitizeText, inferAgentType } from '../../utils/format.ts';
   import { VIRTUAL_SCROLL_THRESHOLD } from '../../utils/tokens.ts';
   import StatusDot from '../../widgets/StatusDot.svelte';
@@ -191,8 +192,16 @@
         </td>
         {/if}
         {#if !hiddenColumns.has('namespace')}
-        <td class="text-mono text-muted namespace-cell dt-col-namespace" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.namespace ?? agent.project ?? '---')}>
-          {sanitizeText(agent.namespace ?? agent.project ?? '---')}
+        {@const ns = parseNamespace(agent.namespace ?? agent.project)}
+        <td class="text-mono namespace-cell dt-col-namespace" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.namespace ?? agent.project ?? '---')}>
+          {#if ns.synthetic}
+            <span class="ns-unknown" title="No repository resolved for this session (synthetic/fallback namespace).">—</span>
+          {:else}
+            <div class="ns-repo">{sanitizeText(ns.repo)}</div>
+            {#if ns.branch}
+              <div class="ns-branch" class:ns-branch-default={ns.branch === 'main' || ns.branch === 'master'}>{sanitizeText(ns.branch)}</div>
+            {/if}
+          {/if}
         </td>
         {/if}
         {#if !hiddenColumns.has('activity')}
@@ -288,6 +297,32 @@
   .namespace-cell {
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  /* Namespace split into a primary repo line + a dimmed branch line. */
+  .ns-repo {
+    color: var(--fg-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ns-branch {
+    margin-top: 1px;
+    font-size: 10px;
+    color: var(--fg-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* main/master are the common case — keep them present but extra-subtle. */
+  .ns-branch-default {
+    opacity: 0.6;
+  }
+
+  .ns-unknown {
+    color: var(--fg-dim);
   }
 
   /* Per-card vertical-align override removed: DataTable engine now defaults
