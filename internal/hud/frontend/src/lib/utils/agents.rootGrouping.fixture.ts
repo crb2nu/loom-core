@@ -90,15 +90,17 @@ allOk =
     conversationId('claude-code-552019522-2804496862'),
     'claude-code-2804496862',
   ) && allOk;
+// Codex is workspace-anchored: scoped and scopeless ids of one app fold by
+// WS_HASH (NOT by scope, which would fragment the codex app into many rows).
 allOk =
   expect(
-    'codex session-scope strips the ws-hash',
+    'codex scoped id folds to its workspace anchor',
     conversationId('codex-401508988-2992486099'),
-    'codex-2992486099',
+    'codex-401508988',
   ) && allOk;
 allOk =
   expect(
-    'bare ws-hash id (no scope) is its own conversation',
+    'codex scopeless id folds with the scoped variant above',
     conversationId('codex-401508988'),
     'codex-401508988',
   ) && allOk;

@@ -168,11 +168,17 @@ export function rootAgentId(agentId: string | null | undefined): string {
 // worked in flightdeck, gitops, and an agents namespace. rootAgentId splits it
 // into three; conversationId unifies it.
 //
+// Codex is the exception: its notify hook mints WORKSPACE-anchored ids
+// (`codex-<WS_HASH>`, no scope) and the fleet also sees scoped variants
+// (`codex-<WS_HASH>-<SCOPE>`) for the same app. Codex's "conversation" is the
+// workspace, so for it we KEEP the WS_HASH (folding scopeless + scoped) instead
+// of fragmenting by scope. See WORKSPACE_ANCHORED_BASES.
+//
 // Examples:
 //   claude-code-3749726816-1105899468 → claude-code-1105899468
 //   claude-code-401508988-1105899468  → claude-code-1105899468  (same chat, other repo)
-//   codex-401508988-2992486099        → codex-2992486099
-//   codex-401508988                   → codex-401508988  (no scope: id is its own conversation)
+//   codex-401508988-2992486099        → codex-401508988  (codex: workspace-anchored)
+//   codex-401508988                   → codex-401508988  (folds with the scoped variant above)
 //   codex-7b28                        → codex-7b28       (no numeric suffix: already a root)
 export function conversationId(agentId: string | null | undefined): string {
   const id = (agentId ?? '').trim();
@@ -188,6 +194,12 @@ export function conversationId(agentId: string | null | undefined): string {
     }
   }
   if (wsIdx < 0) return id; // no numeric suffix — already a conversation root
+  const base = parts.slice(0, wsIdx).join('-');
+  // Workspace-anchored vendors (codex): keep the WS_HASH so scopeless and scoped
+  // ids for one app fold into a single conversation.
+  if (WORKSPACE_ANCHORED_BASES.has(base)) {
+    return parts.slice(0, wsIdx + 1).join('-'); // base-WSHASH
+  }
   // SESSION_SCOPE is the last all-numeric segment AFTER the WS_HASH.
   let scope = '';
   for (let i = parts.length - 1; i > wsIdx; i -= 1) {
@@ -197,9 +209,14 @@ export function conversationId(agentId: string | null | undefined): string {
     }
   }
   if (!scope) return id; // base-WSHASH only, no scope — can't separate the chat
-  const base = parts.slice(0, wsIdx).join('-');
   return base ? `${base}-${scope}` : scope;
 }
+
+// Bases whose agent ids are workspace-anchored rather than conversation-scoped:
+// conversationId keeps their WS_HASH. Codex's notify hook mints `codex-<WS_HASH>`
+// (one app per workspace); Claude/Gemini chats instead carry a stable
+// SESSION_SCOPE across repos and are keyed by scope.
+const WORKSPACE_ANCHORED_BASES = new Set<string>(['codex']);
 
 /** Minimal shape needed to group live sessions by their owning agent. */
 export interface RootGroupableSession {
