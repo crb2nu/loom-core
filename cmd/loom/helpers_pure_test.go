@@ -129,6 +129,26 @@ func TestInferGitNamespace(t *testing.T) {
 		t.Errorf("inferGitNamespace() = %q, want at least parent/repo", got)
 	}
 	t.Logf("inferGitNamespace() = %q", got)
+	// A real inferred namespace must never contain empty path segments — that
+	// was the "////main" bug. Each "/"-delimited part should be non-empty.
+	for _, p := range strings.Split(got, "/") {
+		if p == "" {
+			t.Errorf("inferGitNamespace() = %q has an empty path segment", got)
+		}
+	}
+}
+
+func TestIsDegeneratePathSegment(t *testing.T) {
+	for _, s := range []string{"", "/", ".", ".."} {
+		if !isDegeneratePathSegment(s) {
+			t.Errorf("isDegeneratePathSegment(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"loom-core", "services", "main", "feat-x"} {
+		if isDegeneratePathSegment(s) {
+			t.Errorf("isDegeneratePathSegment(%q) = true, want false", s)
+		}
+	}
 }
 
 func TestStripWorktreeFromRepoRoot(t *testing.T) {
