@@ -5,7 +5,7 @@
 
 import type { Session, SessionTreeNode } from '../stores/fleet.svelte.ts';
 import type { SpawnState } from '../stores/spawn.svelte.ts';
-import { conversationId, liveStatusRank, type UnifiedAgent } from './agents.ts';
+import { conversationId, liveStatusRank, rootAgentId, type UnifiedAgent } from './agents.ts';
 import { sanitizeText } from './format.ts';
 
 export interface FleetRow {
@@ -240,8 +240,29 @@ export function buildFleetRows(input: FleetRowsInput): FleetRowsResult {
     const ranked = lists
       .map((rows) => ({ rows, score: listLiveScore(rows) }))
       .sort((a, b) => b.score.rank - a.score.rank || b.score.recency - a.score.recency);
-    const memberCount = ranked.length;
-    ranked.forEach(({ rows }, listIndex) => {
+
+    // Collapse member-lists that resolve to the SAME workspace identity
+    // (rootAgentId = base+WS_HASH). A conversation's "N repos" pill should
+    // count distinct WORKSPACES it touched, not raw member rows.
+    //   - Conversation-scoped vendors (claude/gemini): one chat that hopped
+    //     repos keeps its SESSION_SCOPE but changes WS_HASH per repo, so each
+    //     member has a distinct rootAgentId and survives as a real repo sibling.
+    //   - Workspace-anchored vendors (codex): the scopeless `codex-<WS>` and
+    //     scoped `codex-<WS>-<SCOPE>` ids for one app share a single WS_HASH —
+    //     conversationId folds them into one bucket, but they are the SAME
+    //     agent's duplicate evidence, not two repos. Keeping only the freshest
+    //     per workspace collapses the twin to one row (no bogus "2 repos" pill /
+    //     "same conversation" child). seenAgents (below) still iterates `lists`,
+    //     so the dropped twin id is marked seen and never resurfaces ungrouped.
+    const repsByWorkspace = new Map<string, FleetRow[]>();
+    for (const { rows } of ranked) {
+      const wsKey = rootAgentId(rows[0].agent.agent_id) || rows[0].agent.agent_id;
+      if (!repsByWorkspace.has(wsKey)) repsByWorkspace.set(wsKey, rows);
+    }
+    // Insertion order = ranked (freshest-first) order, so reps[0] still leads.
+    const reps = [...repsByWorkspace.values()];
+    const memberCount = reps.length;
+    reps.forEach((rows, listIndex) => {
       if (listIndex === 0) {
         // The lead member keeps its real (session-tree) depths. Tag its root
         // row with the conversation's member count so the renderer can show an
