@@ -218,6 +218,130 @@ export function conversationId(agentId: string | null | undefined): string {
 // SESSION_SCOPE across repos and are keyed by scope.
 const WORKSPACE_ANCHORED_BASES = new Set<string>(['codex']);
 
+// agentBase returns the non-numeric prefix of an agent id (everything before the
+// first all-numeric segment): `codex-1713039686-2004540290` → `codex`,
+// `claude-code-552019522` → `claude-code`, `codex-7b28` → `codex-7b28`.
+function agentBase(agentId: string): string {
+  const parts = agentId.split('-');
+  for (let i = 0; i < parts.length; i += 1) {
+    if (parts[i].length > 0 && /^[0-9]+$/.test(parts[i])) {
+      return parts.slice(0, i).join('-');
+    }
+  }
+  return agentId;
+}
+
+// mergeWorkspaceAnchoredTwins collapses the duplicate-identity rows that a
+// workspace-anchored vendor (codex) produces for one app. Codex's notify hook
+// mints a scopeless `codex-<WS>` id while session/telemetry can surface a scoped
+// twin `codex-<WS>-<SCOPE>` for the same app in the same workspace; the two are
+// distinct agent_ids but one logical agent. conversationId() already folds them
+// to one key, but it only governs the Fleet table's session-tree grouping, so a
+// twin with NO active session (presence-only) bypassed the fold and rendered as a
+// separate ungrouped row. Merging here — before any grouping or summary — means
+// every consumer (table, Live Sessions card, the live-agent count) sees one row
+// per codex workspace regardless of which evidence each twin carried.
+//
+// Conversation-scoped vendors (claude/gemini) are untouched: their ids encode a
+// SESSION_SCOPE, so two ids sharing a workspace are genuinely different chats and
+// must stay separate.
+function mergeWorkspaceAnchoredTwins(agents: UnifiedAgent[]): UnifiedAgent[] {
+  const groups = new Map<string, UnifiedAgent[]>();
+  const out: UnifiedAgent[] = [];
+  const order: string[] = [];
+  for (const agent of agents) {
+    if (!WORKSPACE_ANCHORED_BASES.has(agentBase(agent.agent_id))) {
+      out.push(agent);
+      continue;
+    }
+    const key = conversationId(agent.agent_id) || agent.agent_id;
+    const group = groups.get(key);
+    if (group) {
+      group.push(agent);
+    } else {
+      groups.set(key, [agent]);
+      order.push(key);
+    }
+  }
+  for (const key of order) {
+    const members = groups.get(key)!;
+    out.push(members.length === 1 ? members[0] : mergeTwinAgents(members));
+  }
+  return out;
+}
+
+// mergeTwinAgents folds a set of same-workspace codex twins into one UnifiedAgent.
+// The representative is the richest member — prefer one with an active session,
+// then most-live status, then freshest heartbeat — and keeps its own agent_id and
+// session linkage. Evidence is OR'd across the set (presence/session/spawn), the
+// freshest heartbeat and most-live status win, and active files are unioned, so
+// the merged row reflects everything known about the app no matter which twin
+// carried it.
+function mergeTwinAgents(members: UnifiedAgent[]): UnifiedAgent {
+  const score = (a: UnifiedAgent): number => {
+    let s = liveStatusRank(a.status) * 2;
+    if (a.has_session) s += 100; // a real session dominates
+    return s;
+  };
+  const heartbeatMs = (a: UnifiedAgent): number => {
+    const ts = a.last_heartbeat || a.session_started_at || a.registered_at;
+    const ms = ts ? new Date(ts).getTime() : 0;
+    return Number.isFinite(ms) ? ms : 0;
+  };
+  const rep = [...members].sort(
+    (a, b) => score(b) - score(a) || heartbeatMs(b) - heartbeatMs(a),
+  )[0];
+  const sessionHolder = members.find((m) => m.has_session) ?? rep;
+
+  const hasPresence = members.some((m) => m.has_presence);
+  const hasSession = members.some((m) => m.has_session);
+  const hasSpawn = members.some((m) => m.has_spawn);
+  const source: UnifiedAgent['source'] = hasPresence && hasSession
+    ? 'presence+session'
+    : hasSession
+      ? 'session'
+      : hasPresence
+        ? 'presence'
+        : rep.source;
+
+  const files = new Set<string>();
+  for (const m of members) for (const f of m.active_files) files.add(f);
+
+  const freshest = members.reduce((a, b) => (heartbeatMs(b) > heartbeatMs(a) ? b : a));
+  const bestStatus = members.reduce((a, b) =>
+    liveStatusRank(b.status) > liveStatusRank(a.status) ? b : a,
+  ).status;
+
+  const spawnHolder = members.find((m) => m.has_spawn);
+  const activeFiles = [...files];
+
+  return {
+    ...rep,
+    status: bestStatus,
+    source,
+    last_heartbeat: freshest.last_heartbeat || rep.last_heartbeat,
+    active_files: activeFiles,
+    active_file_count: activeFiles.length,
+    session_id: sessionHolder.session_id ?? rep.session_id,
+    namespace: sessionHolder.namespace ?? rep.namespace,
+    session_status: sessionHolder.session_status ?? rep.session_status,
+    session_started_at: sessionHolder.session_started_at ?? rep.session_started_at,
+    entry_count: Math.max(...members.map((m) => m.entry_count)),
+    total_tokens: Math.max(...members.map((m) => m.total_tokens)),
+    task_count: Math.max(...members.map((m) => m.task_count)),
+    blocked_tasks: Math.max(...members.map((m) => m.blocked_tasks)),
+    claim_count: Math.max(...members.map((m) => m.claim_count)),
+    has_presence: hasPresence,
+    has_session: hasSession,
+    has_spawn: hasSpawn,
+    spawn_id: spawnHolder?.spawn_id ?? rep.spawn_id,
+    spawn_status: spawnHolder?.spawn_status ?? rep.spawn_status,
+    // A merged agent with any active session is never an orphan.
+    is_orphan: hasSession ? false : rep.is_orphan,
+    orphan_age_seconds: hasSession ? 0 : rep.orphan_age_seconds,
+  };
+}
+
 /** Minimal shape needed to group live sessions by their owning agent. */
 export interface RootGroupableSession {
   session_id: string;
@@ -564,7 +688,7 @@ export function buildUnifiedAgents(input: {
     });
   }
 
-  const unified = [...byAgent.values()];
+  const unified = mergeWorkspaceAnchoredTwins([...byAgent.values()]);
   unified.sort((left, right) => {
     const statusOrder: Record<UnifiedAgentStatus, number> = { active: 0, idle: 1, offline: 2 };
     const statusDelta = statusOrder[left.status] - statusOrder[right.status];
