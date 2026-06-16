@@ -155,3 +155,69 @@ func TestHandleMobileDashboard_SpawnsEmpty(t *testing.T) {
 		t.Errorf("spawns.total = %v, want 0", got)
 	}
 }
+
+func TestHandleMobileDashboard_BlockedSessions(t *testing.T) {
+	deps := newTestMockDeps()
+	deps.monitors = Monitors{Fleet: &monitor.FleetMonitor{}, Health: &monitor.HealthMonitor{}}
+	deps.monitors.Fleet.Update(monitor.FleetSnapshot{DaemonRunning: true})
+	deps.blocked = []BlockedSessionInfo{
+		{SessionID: "s1", AgentID: "claude-code", Reason: "permission", ToolName: "Bash", WaitedSeconds: 42},
+	}
+	d := New(deps)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/mobile/v1/dashboard", d.handleMobileDashboard)
+	req := newAuthRequest("GET", "/api/mobile/v1/dashboard")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+	var env Envelope
+	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	data := env.Data.(map[string]any)
+
+	if got := data["blocked_count"]; got != float64(1) {
+		t.Errorf("blocked_count = %v, want 1", got)
+	}
+	blocked, ok := data["blocked"].([]any)
+	if !ok || len(blocked) != 1 {
+		t.Fatalf("blocked = %v, want one entry", data["blocked"])
+	}
+	row := blocked[0].(map[string]any)
+	if row["session_id"] != "s1" || row["reason"] != "permission" || row["tool_name"] != "Bash" {
+		t.Errorf("blocked[0] = %v", row)
+	}
+	if got := row["waited_seconds"]; got != float64(42) {
+		t.Errorf("waited_seconds = %v, want 42", got)
+	}
+}
+
+// An empty blocked set serializes as [] (not null) with a zero count.
+func TestHandleMobileDashboard_BlockedEmpty(t *testing.T) {
+	deps := newTestMockDeps()
+	deps.monitors = Monitors{Fleet: &monitor.FleetMonitor{}, Health: &monitor.HealthMonitor{}}
+	deps.monitors.Fleet.Update(monitor.FleetSnapshot{DaemonRunning: true})
+	d := New(deps)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/mobile/v1/dashboard", d.handleMobileDashboard)
+	req := newAuthRequest("GET", "/api/mobile/v1/dashboard")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	var env Envelope
+	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	data := env.Data.(map[string]any)
+	if got := data["blocked_count"]; got != float64(0) {
+		t.Errorf("blocked_count = %v, want 0", got)
+	}
+	if blocked, ok := data["blocked"].([]any); !ok || len(blocked) != 0 {
+		t.Errorf("blocked = %v, want []", data["blocked"])
+	}
+}

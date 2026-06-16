@@ -104,6 +104,7 @@ func NewApp(cfg Config, caller bridge.Caller, logger *slog.Logger) (*App, error)
 	app.metrics = NewHUDMetrics()
 	app.agentContextMetrics = NewAgentContextMetrics()
 	app.agentContextLatest = NewAgentContextLatestStore()
+	app.blocked = newBlockedStore()
 
 	return app, nil
 }

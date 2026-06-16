@@ -21,7 +21,8 @@ type Deps interface {
 	MobileConfig() MobileConfig
 	Logger() *slog.Logger
 	SSEHub() SSEHubOps
-	EventLog() EventLogOps             // may be nil
+	EventLog() EventLogOps // may be nil
+	BlockedSessions() []BlockedSessionInfo
 	Spawner() SpawnerOps               // may be nil
 	RateLimiter() RateLimiterOps       // may be nil
 	RevocationList() RevocationListOps // may be nil
@@ -72,6 +73,18 @@ type SSEHubOps interface {
 type EventLogOps interface {
 	All(limit int) []TimelineEntry
 	AllExcluding(limit int, excludeTypes ...string) []TimelineEntry
+}
+
+// BlockedSessionInfo is the dashboard wire shape for a session waiting on a
+// human (a flightdeck-derived permission stall), longest wait first.
+type BlockedSessionInfo struct {
+	SessionID     string `json:"session_id"`
+	AgentID       string `json:"agent_id"`
+	Reason        string `json:"reason"`
+	ToolName      string `json:"tool_name,omitempty"`
+	Cwd           string `json:"cwd,omitempty"`
+	Since         string `json:"since"`
+	WaitedSeconds int    `json:"waited_seconds"`
 }
 
 // SpawnerOps is the interface for the headless agent spawn orchestrator.

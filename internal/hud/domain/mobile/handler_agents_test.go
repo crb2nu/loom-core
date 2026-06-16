@@ -31,6 +31,7 @@ type mockDeps struct {
 	memStats    func(*bridge.MemoryStatsResult) map[string]any
 	trace       func(sessionID, agentID string, limit int) SessionTraceResponse
 	rateLimiter RateLimiterOps
+	blocked     []BlockedSessionInfo
 }
 
 func (m *mockDeps) Agent() *bridge.AgentBridge               { return m.agent }
@@ -39,6 +40,7 @@ func (m *mockDeps) MobileConfig() MobileConfig               { return m.config }
 func (m *mockDeps) Logger() *slog.Logger                     { return m.logger }
 func (m *mockDeps) SSEHub() SSEHubOps                        { return m.sseHub }
 func (m *mockDeps) EventLog() EventLogOps                    { return m.eventLog }
+func (m *mockDeps) BlockedSessions() []BlockedSessionInfo    { return m.blocked }
 func (m *mockDeps) Spawner() SpawnerOps                      { return m.spawner }
 func (m *mockDeps) RateLimiter() RateLimiterOps              { return m.rateLimiter }
 func (m *mockDeps) RevocationList() RevocationListOps        { return nil }

@@ -53,6 +53,13 @@ func (d *MobileDomain) handleMobileDashboard(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// Sessions currently waiting on a human (flightdeck-derived permission
+	// stalls). Drives the dashboard's "N blocked" badge.
+	blocked := d.deps.BlockedSessions()
+	if blocked == nil {
+		blocked = []BlockedSessionInfo{}
+	}
+
 	d.writeMobileJSON(w, http.StatusOK, map[string]any{
 		"daemon_running":  fleetSnap.DaemonRunning,
 		"server_count":    fleetSnap.ServerCount,
@@ -83,6 +90,8 @@ func (d *MobileDomain) handleMobileDashboard(w http.ResponseWriter, r *http.Requ
 		},
 		"recent_timeline": recentTimeline,
 		"last_heartbeat":  lastHeartbeat,
+		"blocked_count":   len(blocked),
+		"blocked":         blocked,
 	})
 }
 
