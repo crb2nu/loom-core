@@ -389,6 +389,7 @@ type namespaceSummary struct {
 
 type unifiedAgent struct {
 	AgentID          string   `json:"agent_id"`
+	ConversationID   string   `json:"conversation_id,omitempty"`
 	AgentType        string   `json:"agent_type"`
 	Status           string   `json:"status"`
 	Source           string   `json:"source"`

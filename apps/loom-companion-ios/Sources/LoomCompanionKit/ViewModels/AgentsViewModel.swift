@@ -176,20 +176,34 @@ public final class AgentsViewModel {
             )
         }
 
-        // Primary: session-hierarchy grouping so subagents cluster under their
-        // spawning root. Mirrors web HUD PresenceAgentsTab.groupKeyFor().
-        if let root = normalized(agent.rootSessionId) ?? normalized(agent.sessionId) {
-            let title = normalized(agent.project)?.components(separatedBy: "/").last
-                ?? normalized(agent.namespace)?.components(separatedBy: "/").last
-                ?? displayAgentType(agent.agentType)
-            let subtitle = normalized(agent.project)
-                ?? normalized(agent.namespace).map { "Namespace \($0)" }
-                ?? normalized(agent.branch).map { "Branch \($0)" }
-                ?? "Session \(String(root.prefix(8)))"
-            return ("session:\(root)", title, subtitle)
+        let title = normalized(agent.project)?.components(separatedBy: "/").last
+            ?? normalized(agent.namespace)?.components(separatedBy: "/").last
+            ?? displayAgentType(agent.agentType)
+        let subtitle = normalized(agent.project)
+            ?? normalized(agent.namespace).map { "Namespace \($0)" }
+            ?? normalized(agent.branch).map { "Branch \($0)" }
+
+        // Real subagents cluster under their spawning root session, so a
+        // fanned-out hierarchy stays together. Only when the root is a DIFFERENT
+        // session than the agent's own (i.e. it was actually spawned by another).
+        if let root = normalized(agent.rootSessionId), root != normalized(agent.sessionId) {
+            return ("session:\(root)", title, subtitle ?? "Session \(String(root.prefix(8)))")
         }
 
-        // Fallbacks for presence-only agents without any session binding.
+        // Primary: group by conversation so one chat that moved across repos
+        // (Claude/Gemini) folds into a single section, mirroring the web HUD
+        // Fleet table. Codex scopeless/scoped twins are already merged
+        // server-side, so they arrive as one row under one conversation.
+        let conversation = agent.conversationId
+        if !conversation.isEmpty {
+            return (
+                "conversation:\(conversation)",
+                title,
+                subtitle ?? "Conversation \(String(conversation.suffix(8)))"
+            )
+        }
+
+        // Last-resort fallbacks for agents with no identity signals at all.
         if let project = normalized(agent.project) {
             return (
                 "project:\(project)",
@@ -232,12 +246,13 @@ public final class AgentsViewModel {
 
     private func groupSortRank(_ id: String) -> Int {
         if id.hasPrefix("session:") { return 0 }
-        if id.hasPrefix("project:") { return 1 }
-        if id.hasPrefix("namespace:") { return 2 }
-        if id.hasPrefix("branch:") { return 3 }
-        if id.hasPrefix("agent:") { return 4 }
-        if id.hasPrefix("codex-infra:") { return 5 }
-        return 6
+        if id.hasPrefix("conversation:") { return 1 }
+        if id.hasPrefix("project:") { return 2 }
+        if id.hasPrefix("namespace:") { return 3 }
+        if id.hasPrefix("branch:") { return 4 }
+        if id.hasPrefix("agent:") { return 5 }
+        if id.hasPrefix("codex-infra:") { return 6 }
+        return 7
     }
 
     private func normalized(_ value: String?) -> String? {
