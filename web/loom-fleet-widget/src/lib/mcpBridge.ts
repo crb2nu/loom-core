@@ -135,6 +135,11 @@ const MOCK_RESPONSES: Record<string, string> = {
     health: { total_servers: 47, healthy_servers: 44, degraded_servers: 2, down_servers: 1, idle_servers: 0 },
     spawns: { active: 1, total: 12 },
     last_heartbeat: { agent_id: "claude-code", timestamp: new Date().toISOString(), count_1h: 142 },
+    blocked_count: 2,
+    blocked: [
+      { session_id: "8f3a1c2d-aaaa", agent_id: "claude-code", reason: "permission", tool_name: "Bash", cwd: "/Users/dev/workspace/services/loom-core", waited_seconds: 312 },
+      { session_id: "1b9e7f04-bbbb", agent_id: "claude-code", reason: "permission", tool_name: "mcp__gitlab__merge_merge_request", waited_seconds: 47 },
+    ],
   }),
   loom_fleet_get_stream: envelope({
     entries: [

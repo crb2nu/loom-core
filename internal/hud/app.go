@@ -213,6 +213,11 @@ type App struct {
 	// Timeline event log — ring buffer for unified activity timeline.
 	eventLog *EventLog
 
+	// blocked tracks sessions currently waiting on a human, folded from the
+	// flightdeck bridge's agent.blocked / agent.unblocked events. Drives the
+	// fleet dashboard's "N blocked" badge.
+	blocked *blockedStore
+
 	// Nudge queue — pending nudges per agent, delivered via heartbeat response.
 	nudgeQueue *NudgeQueue
 

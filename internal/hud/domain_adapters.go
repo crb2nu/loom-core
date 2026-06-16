@@ -203,6 +203,34 @@ func (a *App) Spawner() mobile.SpawnerOps {
 	return &mobileSpawnerAdapter{s: a.spawner}
 }
 
+// BlockedSessions returns the sessions currently waiting on a human (folded
+// from the flightdeck bridge's agent.blocked/unblocked events), longest wait
+// first, for the dashboard's "N blocked" badge.
+func (a *App) BlockedSessions() []mobile.BlockedSessionInfo {
+	if a.blocked == nil {
+		return nil
+	}
+	now := time.Now()
+	rows := a.blocked.list(now)
+	out := make([]mobile.BlockedSessionInfo, 0, len(rows))
+	for _, b := range rows {
+		waited := int(now.Sub(b.Since).Seconds())
+		if waited < 0 {
+			waited = 0
+		}
+		out = append(out, mobile.BlockedSessionInfo{
+			SessionID:     b.SessionID,
+			AgentID:       b.AgentID,
+			Reason:        b.Reason,
+			ToolName:      b.ToolName,
+			Cwd:           b.Cwd,
+			Since:         b.Since.UTC().Format(time.RFC3339Nano),
+			WaitedSeconds: waited,
+		})
+	}
+	return out
+}
+
 func (a *App) BroadcastAgentEvent(eventType string, payload any) {
 	a.broadcastAgentEvent(eventType, payload)
 }

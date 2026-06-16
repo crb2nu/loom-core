@@ -67,6 +67,10 @@ var daemonEventLogTypes = map[string]bool{
 	"tool.call":           true,
 	"tool.call.start":     true,
 	"tool.call.end":       true,
+	// flightdeck "blocked on a human" signal (flightdeck-hud-bridge): retained
+	// so it also shows in the dashboard timeline, not just the live SSE stream.
+	"agent.blocked":   true,
+	"agent.unblocked": true,
 }
 
 // daemonEventFleetRefreshTypes are the subset whose arrival should trigger an
@@ -104,6 +108,16 @@ func (a *App) IngestDaemonEvent(eventType string, ts time.Time, data json.RawMes
 			AgentType: agentType,
 			Data:      data,
 		})
+	}
+
+	// Fold the flightdeck "blocked on a human" signal into the blocked store
+	// that backs the dashboard's "N blocked" badge.
+	switch eventType {
+	case "agent.blocked":
+		a.blocked.block(blockedFromEvent(ts, data), ts)
+	case "agent.unblocked":
+		sid, _ := jsonStringField(data, "session_id")
+		a.blocked.unblock(sid)
 	}
 
 	if a.fleetMonitor != nil && daemonEventFleetRefreshTypes[eventType] {

@@ -22,6 +22,20 @@ export interface Dashboard {
   };
   spawns?: { active?: number; total?: number };
   last_heartbeat?: { agent_id?: string; timestamp?: string; count_1h?: number };
+  blocked_count?: number;
+  blocked?: BlockedSession[];
+}
+
+// BlockedSession is a session waiting on a human (a flightdeck-derived
+// permission stall), as surfaced by the HUD dashboard's `blocked` list.
+export interface BlockedSession {
+  session_id: string;
+  agent_id: string;
+  reason: string;
+  tool_name?: string;
+  cwd?: string;
+  since?: string;
+  waited_seconds?: number;
 }
 
 export interface FleetState {

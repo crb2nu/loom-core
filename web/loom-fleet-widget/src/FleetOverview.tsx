@@ -1,6 +1,6 @@
 import { EventTicker } from "./components/EventTicker";
 import { HandoffInbox } from "./components/HandoffInbox";
-import { useFleet } from "./hooks/useFleet";
+import { useFleet, type BlockedSession } from "./hooks/useFleet";
 import { hostKind } from "./lib/mcpBridge";
 
 // FleetOverview renders the loom fleet dashboard inline. Data flows
@@ -31,6 +31,10 @@ export function FleetOverview() {
           <Row
             label="Agents"
             value={`${data.active_agents} active · ${data.idle_agents} idle · ${data.offline_agents} offline`}
+          />
+          <BlockedPanel
+            count={data.blocked_count ?? 0}
+            sessions={data.blocked ?? []}
           />
           <Row label="MCP servers" value={String(data.server_count)} />
           {data.health && (
@@ -89,4 +93,50 @@ function Row({ label, value }: { label: string; value: string }) {
 
 function Banner({ kind, children }: { kind: "error" | "info"; children: React.ReactNode }) {
   return <div className={`banner banner-${kind}`}>{children}</div>;
+}
+
+// BlockedPanel surfaces sessions waiting on a human (flightdeck-derived
+// permission stalls). It renders nothing when nobody is blocked, so the
+// dashboard stays quiet until an agent actually needs attention.
+function BlockedPanel({
+  count,
+  sessions,
+}: {
+  count: number;
+  sessions: BlockedSession[];
+}) {
+  if (count <= 0) return null;
+  return (
+    <>
+      <div className="row">
+        <span className="label">
+          <span className="dot dot-warn" aria-hidden="true" /> Blocked
+        </span>
+        <span className="value">
+          <strong>{count}</strong> waiting on a human
+        </span>
+      </div>
+      {sessions.map((s) => (
+        <div className="row" key={s.session_id} title={s.cwd || s.session_id}>
+          <span className="label" style={{ paddingLeft: "1rem", opacity: 0.8 }}>
+            {shortId(s.session_id)}
+            {s.tool_name ? ` · ${s.tool_name}` : ""}
+          </span>
+          <span className="value">{fmtWaited(s.waited_seconds)}</span>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function shortId(id: string): string {
+  return id ? id.slice(0, 8) : "—";
+}
+
+function fmtWaited(secs?: number): string {
+  if (secs == null || secs < 0) return "—";
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  if (m < 60) return `${m}m ${secs % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
