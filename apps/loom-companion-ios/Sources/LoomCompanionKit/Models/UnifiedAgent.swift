@@ -3,6 +3,10 @@ import Foundation
 /// Unified agent model merging presence, session, and spawn data.
 public struct UnifiedAgent: Decodable, Identifiable, Sendable {
     public let agentId: String
+    /// Server-provided conversation identity (`conversation_id`). Nil when an
+    /// older server omits it; use `conversationId`, which falls back to a
+    /// client-side computation.
+    public let conversationIdRaw: String?
     public let agentType: String
     public let status: MobilePresenceStatus
     public let source: String
@@ -39,8 +43,44 @@ public struct UnifiedAgent: Decodable, Identifiable, Sendable {
     public var hasSession: Bool { hasSessionEvidence || (sessionId != nil && !(sessionId?.isEmpty ?? true)) }
     public var isSpawned: Bool { spawnId != nil && !(spawnId?.isEmpty ?? true) }
 
+    /// The conversation this agent belongs to — one chat that moved across repos
+    /// (Claude/Gemini) or one app's twins in a workspace (Codex). Prefers the
+    /// server value; falls back to a client-side computation so grouping works
+    /// against servers that predate `conversation_id`.
+    public var conversationId: String {
+        if let raw = conversationIdRaw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            return raw
+        }
+        return UnifiedAgent.conversationId(forAgentId: agentId)
+    }
+
+    private static let workspaceAnchoredBases: Set<String> = ["codex"]
+
+    /// Pure port of `conversationId()` in the web client's agents.ts. Mirrors
+    /// `fleetview.ConversationID` on the Go server.
+    public static func conversationId(forAgentId agentId: String) -> String {
+        let id = agentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if id.isEmpty { return "" }
+        let parts = id.split(separator: "-", omittingEmptySubsequences: false).map(String.init)
+        func isDigits(_ s: String) -> Bool { !s.isEmpty && s.allSatisfy { $0 >= "0" && $0 <= "9" } }
+        guard let wsIdx = parts.firstIndex(where: isDigits) else { return id }
+        let base = parts[0..<wsIdx].joined(separator: "-")
+        if workspaceAnchoredBases.contains(base) {
+            return parts[0...wsIdx].joined(separator: "-")
+        }
+        var scope = ""
+        var i = parts.count - 1
+        while i > wsIdx {
+            if isDigits(parts[i]) { scope = parts[i]; break }
+            i -= 1
+        }
+        if scope.isEmpty { return id }
+        return base.isEmpty ? scope : "\(base)-\(scope)"
+    }
+
     enum CodingKeys: String, CodingKey {
         case agentId = "agent_id"
+        case conversationIdRaw = "conversation_id"
         case agentType = "agent_type"
         case status
         case source
@@ -77,6 +117,7 @@ public struct UnifiedAgent: Decodable, Identifiable, Sendable {
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.agentId = try container.decode(String.self, forKey: .agentId)
+        self.conversationIdRaw = try container.decodeIfPresent(String.self, forKey: .conversationIdRaw)
         self.agentType = try container.decodeIfPresent(String.self, forKey: .agentType) ?? "unknown"
         self.status = try container.decode(MobilePresenceStatus.self, forKey: .status)
         self.source = try container.decodeIfPresent(String.self, forKey: .source) ?? "presence"

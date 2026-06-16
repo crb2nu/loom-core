@@ -368,11 +368,23 @@ func (d *MobileDomain) handleMobileAgents(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Collapse workspace-anchored (codex) twins — the scopeless `codex-<WS>`
+	// notify-hook row and the scoped `codex-<WS>-<SCOPE>` session row are one
+	// app — into a single row before the roster is serialized, so the iOS
+	// roster stops fragmenting one codex into a live row plus a separate
+	// "Orphan without session" row. Mirrors mergeWorkspaceAnchoredTwins in the
+	// web client's agents.ts.
+	mergeMobileWorkspaceAnchoredTwins(agentMap)
+
 	agents := make([]unifiedAgent, 0, len(agentMap))
 	for _, ua := range agentMap {
 		if ua.Project == "" {
 			ua.Project = projectmeta.Canonical(ua.Project, ua.Namespace)
 		}
+		// Stamp the conversation identity so the iOS roster can group by
+		// conversation (one chat across repos / a codex app's twins) the same
+		// way the web HUD does.
+		ua.ConversationID = fleetview.ConversationID(ua.AgentID)
 		if statusFilter != "" && ua.Status != statusFilter {
 			continue
 		}
@@ -683,4 +695,151 @@ func (d *MobileDomain) handleMobileSessionActivity(w http.ResponseWriter, r *htt
 		"task_count":     len(taskDTOs),
 		"pipeline_count": len(pipelines),
 	})
+}
+
+// mergeMobileWorkspaceAnchoredTwins folds same-workspace codex twins (the
+// scopeless `codex-<WS>` row and any scoped `codex-<WS>-<SCOPE>` rows for one
+// app) into a single unifiedAgent. conversationId already keys them together;
+// this collapses them in agentMap so the roster, summary, and orphan lane see
+// one row per codex workspace regardless of which evidence each twin carried.
+// Conversation-scoped vendors (claude/gemini) are untouched.
+func mergeMobileWorkspaceAnchoredTwins(agentMap map[string]*unifiedAgent) {
+	groups := map[string][]*unifiedAgent{}
+	for _, ua := range agentMap {
+		if !fleetview.IsWorkspaceAnchored(ua.AgentID) {
+			continue
+		}
+		key := fleetview.ConversationID(ua.AgentID)
+		if key == "" {
+			key = ua.AgentID
+		}
+		groups[key] = append(groups[key], ua)
+	}
+	for _, members := range groups {
+		if len(members) < 2 {
+			continue
+		}
+		rep := mergeMobileTwinAgents(members)
+		for _, m := range members {
+			if m.AgentID != rep.AgentID {
+				delete(agentMap, m.AgentID)
+			}
+		}
+		agentMap[rep.AgentID] = rep
+	}
+}
+
+func mobileStatusRank(status string) int {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "active":
+		return 3
+	case "idle":
+		return 2
+	case "unknown", "":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// mergeMobileTwinAgents folds a set of same-workspace codex twins into one
+// unifiedAgent. The representative is the richest member — prefer an active
+// session, then most-live status, then freshest heartbeat, with an agent_id
+// tiebreak for determinism — and keeps its own agent_id and session linkage.
+// Evidence is OR'd across the set so the merged row reflects everything known.
+func mergeMobileTwinAgents(members []*unifiedAgent) *unifiedAgent {
+	score := func(a *unifiedAgent) int {
+		s := mobileStatusRank(a.Status) * 2
+		if a.HasSession {
+			s += 100
+		}
+		return s
+	}
+	best := members[0]
+	for _, m := range members[1:] {
+		switch {
+		case score(m) != score(best):
+			if score(m) > score(best) {
+				best = m
+			}
+		case !agentSortTime(*m).Equal(agentSortTime(*best)):
+			if agentSortTime(*m).After(agentSortTime(*best)) {
+				best = m
+			}
+		default:
+			if m.AgentID < best.AgentID {
+				best = m
+			}
+		}
+	}
+
+	merged := *best // copy
+	var sessionHolder *unifiedAgent
+	for _, m := range members {
+		if m.HasPresence {
+			merged.HasPresence = true
+		}
+		if m.HasSession {
+			merged.HasSession = true
+			if sessionHolder == nil {
+				sessionHolder = m
+			}
+		}
+		if agentSortTime(*m).After(agentSortTime(merged)) {
+			merged.LastHeartbeat = m.LastHeartbeat
+		}
+		if mobileStatusRank(m.Status) > mobileStatusRank(merged.Status) {
+			merged.Status = m.Status
+		}
+		if m.SpawnID != "" && merged.SpawnID == "" {
+			merged.SpawnID = m.SpawnID
+			merged.SpawnStatus = m.SpawnStatus
+		}
+		if m.EntryCount > merged.EntryCount {
+			merged.EntryCount = m.EntryCount
+		}
+		if m.TotalTokens > merged.TotalTokens {
+			merged.TotalTokens = m.TotalTokens
+		}
+		if m.TaskCount > merged.TaskCount {
+			merged.TaskCount = m.TaskCount
+		}
+		if m.BlockedTasks > merged.BlockedTasks {
+			merged.BlockedTasks = m.BlockedTasks
+		}
+		if m.ClaimCount > merged.ClaimCount {
+			merged.ClaimCount = m.ClaimCount
+		}
+		if m.ActiveFileCount > merged.ActiveFileCount {
+			merged.ActiveFileCount = m.ActiveFileCount
+		}
+	}
+	if sessionHolder != nil {
+		merged.SessionID = sessionHolder.SessionID
+		merged.SessionStatus = sessionHolder.SessionStatus
+		merged.SessionStarted = sessionHolder.SessionStarted
+		merged.ParentSessionID = sessionHolder.ParentSessionID
+		merged.RootSessionID = sessionHolder.RootSessionID
+		if sessionHolder.Namespace != "" {
+			merged.Namespace = sessionHolder.Namespace
+		}
+		if sessionHolder.Project != "" {
+			merged.Project = sessionHolder.Project
+		}
+	}
+	// Recompute evidence-derived source.
+	switch {
+	case merged.HasPresence && merged.HasSession:
+		merged.Source = "presence+session"
+	case merged.HasSession:
+		merged.Source = "session_only"
+	case merged.HasPresence:
+		merged.Source = "presence"
+	}
+	// A merged agent with any active session is never an orphan.
+	if merged.HasSession {
+		merged.IsOrphan = false
+		merged.OrphanAgeSec = 0
+	}
+	return &merged
 }

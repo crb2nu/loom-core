@@ -14,6 +14,7 @@ import (
 
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/hud/coordination"
+	"github.com/crb2nu/loom/internal/hud/fleetview"
 )
 
 func newRequestID() string {
@@ -325,11 +326,30 @@ func filterMobileNamespaces(namespaces []coordination.NamespaceSummary, tasks []
 
 func buildMobileAttentionLanes(snapshot coordination.Snapshot) []map[string]any {
 	lanes := make([]map[string]any, 0, 6)
+
+	// Conversations that already have a live, session-bearing agent. Used to
+	// suppress a false "orphan without session" lane for a workspace-anchored
+	// (codex) twin whose scoped sibling IS a live session — the merged roster
+	// shows one healthy row, so the orphan lane is a phantom. Built from the full
+	// agent set, not the lane-limited slice.
+	sessionConvos := make(map[string]bool, len(snapshot.Agents))
+	for _, a := range snapshot.Agents {
+		if strings.TrimSpace(a.SessionID) != "" {
+			sessionConvos[fleetview.ConversationID(a.AgentID)] = true
+		}
+	}
+
 	for _, agent := range limitMobileSlice(snapshot.Agents, 3) {
 		if !agent.NeedsAttention {
 			continue
 		}
 		summary := strings.Join(limitMobileSlice(agent.AttentionReasons, 2), " · ")
+		if strings.TrimSpace(agent.SessionID) == "" &&
+			strings.Contains(strings.ToLower(summary), "orphan") &&
+			fleetview.IsWorkspaceAnchored(agent.AgentID) &&
+			sessionConvos[fleetview.ConversationID(agent.AgentID)] {
+			continue
+		}
 		lane := map[string]any{
 			"type":     "agent",
 			"id":       agent.AgentID,
