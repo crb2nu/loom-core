@@ -64,14 +64,23 @@ routing:
 ```
 Restart daemon; run the kill-test above. **This is the riskiest-assumption kill-test.** Document before/after counts here. Tradeoff to verify during the window: nothing on this Mac actually needs hub-side agent_context (cluster agents have their own daemons; mobile-hud runs in-cluster).
 
-### Slice 1 — Close-reason observability (small code, loom-core + libs/mcp-go)
-We still don't know **who** closes the WS (Cloudflare idle/limits, gateway, per-conn process exit, read-limit). Add:
-- muxstdio readLoop: log the underlying `inner.Recv()` error (close code/reason), not just "transport closed".
-- `WebSocketTransport`: log close code from gorilla `CloseError`.
-- Gateway: log client/upstream disconnects with reason.
-Capture one full ~32s cycle with the logging in place; record the verdict in this doc. Gate Slice 2's design on it.
+### Slice 1 — Close-reason observability (small code, loom-core + libs/mcp-go) — [x] DONE
+- [x] muxstdio readLoop: log the underlying `inner.Recv()` error (close code/reason). Shipped `.loom/150`, merge 8b07338b → main.
+- [ ] Gateway client/upstream disconnect-reason logging — deferred (lives in `libs/fi-mcp-kit/pkg/gateway/hub.go`, separate repo; not needed: the gorilla close code already identifies the closer client-side).
 
-### Slice 2 — Transport durability (libs/mcp-go, gated on Slice 1)
+**VERDICT (captured 2026-06-17 from `~/.config/loom/logs/daemon.err`, 29 WARN samples):**
+- Dominant close cause = **`websocket: close 1006 (abnormal closure): unexpected EOF`** (17/29; rest are downstream generic `transport closed`). Code 1006 = no close frame → TCP/WS severed without handshake (Cloudflare idle-timeout or per-conn hub process exit, **not** app-level close).
+- **Idle conns die silently** (2026-06-16 10:37–38 burst: 1006 with `pending_failed=0`).
+- **Shared-WS thundering herd confirmed**: 2026-06-16 10:33:15–16 a single hub WS death failed `prompts/list` across 5 servers (`cloudflare, ops_mcp, server_mgmt, git, qdrant`) within ~1s, identical 1006 cause, each arming a separate +30s prefer-hub backoff.
+- → Slice 2 design (keepalive + liveness gating + singleflight) is **correct and evidence-backed**. Full Slice 2 plan: `.loom/157`.
+- Adjacent non-transport findings (NOT Slice 2): `morph API HTTP 522` embedding-origin outage breaking `agent_context_search`; `local server recv timed out after 900ms` on agent_context. Recorded in `.loom/157` scope-out.
+
+### Slice 2 — Transport durability (libs/mcp-go, gated on Slice 1) — CODE SHIPPED `.loom/157`
+> Gate satisfied (Slice 1 verdict above). Detailed iteration plan + kill-test: `.loom/157`.
+- [x] keepalive ping loop, liveness gating, singleflight reconnect, atomic `initialized`, last-traffic tracking. mcp-go **!7** merged → `origin/main` `18b68e7`; pipeline 14207 green; tier-1 kill-test PASSED `-race`.
+- Design note: current mcp-go `origin/main` already returns a **fresh transport per `Dial`** (the `fix/mcp-core-compat` merge), so the "one shared WS per server" premise (Architecture fact #2 above) no longer holds — the pool keeps independent sockets. Keepalive now runs on every pooled transport; liveness+singleflight cover the cached `GetConnection` path.
+- [ ] **Tier-2 live confirmation** (loom-core go.mod bump → `v0.2.1-0.20260617231926-18b68e7e68f6` + redeploy → 30-min idle-1006 window). Awaiting go-ahead. Failure-mode branch (forced periodic kill) → re-prioritize Slice 3.
+> Exponential backoff is split into **Slice 2b** (loom-core-only: `internal/daemon/routing.go`).
 - Keepalive: background ping loop per cached connection (the unused `Ping()` at `websocket.go:181`), close-and-evict on pong timeout so dead conns are discovered proactively, not at call time.
 - Liveness gating: `GetConnection` pings (or checks last-traffic age) before returning a cached conn idle > ~30s.
 - Singleflight reconnect per server name to kill the thundering herd (`retryHubAfterHubFailure` currently lets all 25 pool conns re-dial concurrently).
