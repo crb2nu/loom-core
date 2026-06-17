@@ -30,4 +30,4 @@
 ## Status
 - [x] implemented
 - [x] tests green
-- [ ] MR merged
+- [x] MR merged (commit 2a2e1e9c, merge 8b07338b → main)

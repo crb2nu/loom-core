@@ -127,12 +127,16 @@ func TestHealthConfig_ToHealthMonitorConfig_Defaults(t *testing.T) {
 	if hmc.RestartCooldown != defaults.RestartCooldown {
 		t.Errorf("RestartCooldown = %v, want %v", hmc.RestartCooldown, defaults.RestartCooldown)
 	}
+	if hmc.DeepProbeTimeout != defaults.DeepProbeTimeout {
+		t.Errorf("DeepProbeTimeout = %v, want %v", hmc.DeepProbeTimeout, defaults.DeepProbeTimeout)
+	}
 }
 
 func TestHealthConfig_ToHealthMonitorConfig_Custom(t *testing.T) {
 	cfg := HealthConfig{
 		CheckIntervalSeconds:     60,
 		DeepProbeIntervalMinutes: 10,
+		DeepProbeTimeoutSeconds:  45,
 		HealthyThreshold:         5,
 		UnhealthyThreshold:       10,
 		RestartThreshold:         8,
@@ -143,6 +147,9 @@ func TestHealthConfig_ToHealthMonitorConfig_Custom(t *testing.T) {
 
 	if hmc.CheckInterval != 60*time.Second {
 		t.Errorf("CheckInterval = %v, want 60s", hmc.CheckInterval)
+	}
+	if hmc.DeepProbeTimeout != 45*time.Second {
+		t.Errorf("DeepProbeTimeout = %v, want 45s", hmc.DeepProbeTimeout)
 	}
 	if hmc.DeepProbeInterval != 10*time.Minute {
 		t.Errorf("DeepProbeInterval = %v, want 10m", hmc.DeepProbeInterval)
