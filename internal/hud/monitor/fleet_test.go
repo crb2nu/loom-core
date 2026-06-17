@@ -912,3 +912,110 @@ func TestFleetMonitor_LivePresenceFilterDowngradesStaleAndOrphanRows(t *testing.
 		t.Errorf("live row count (%d) != ActiveAgents+IdleAgents (%d)", live, wantLive)
 	}
 }
+
+func TestDegradedReason(t *testing.T) {
+	cases := []struct {
+		sessionsOK, presenceOK bool
+		want                   string
+	}{
+		{false, false, "sessions and presence fetch failing"},
+		{false, true, "sessions fetch failing"},
+		{true, false, "presence fetch failing"},
+	}
+	for _, c := range cases {
+		if got := degradedReason(c.sessionsOK, c.presenceOK); got != c.want {
+			t.Errorf("degradedReason(%v,%v) = %q, want %q", c.sessionsOK, c.presenceOK, got, c.want)
+		}
+	}
+}
+
+// TestFleetMonitor_DegradedStateSurfacing drives the refresh degraded-state
+// lifecycle: healthy → degraded (onset stamped) → still degraded (onset
+// persists) → recovered (cleared). A failing presence sub-fetch puts the
+// coupled sessions/presence view into carry-over mode.
+func TestFleetMonitor_DegradedStateSurfacing(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	client, agent := newBridges(t, sockPath)
+
+	var presenceFails atomic.Bool
+
+	handlers.handle("loom/status", func(_ json.RawMessage) (any, error) {
+		return status.DaemonRPCStatus{Running: true, Servers: 1, ActiveConns: 1, Processes: []string{"git"}}, nil
+	})
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			return toolEnvelope(map[string]any{"sessions": []map[string]any{}}), nil
+		case "agent_context__agent_presence_list":
+			if presenceFails.Load() {
+				return nil, fmt.Errorf("presence boom")
+			}
+			return toolEnvelope(map[string]any{"agents": []map[string]any{}}), nil
+		case "agent_context__agent_task_list":
+			return toolEnvelope(map[string]any{"tasks": []map[string]any{}}), nil
+		case "agent_context__agent_memory_stats":
+			return toolEnvelope(map[string]any{"total_items": 0, "total_tokens": 0}), nil
+		case "agent_context__agent_graph_stats":
+			return toolEnvelope(map[string]any{"entity_count": 0, "relation_count": 0}), nil
+		case "agent_context__agent_workflow_list":
+			return toolEnvelope(map[string]any{"workflows": []map[string]any{}}), nil
+		case "agent_context__agent_file_claim_list":
+			return toolEnvelope(map[string]any{"claims": []map[string]any{}}), nil
+		case "agent_context__agent_worktree_list":
+			return toolEnvelope(map[string]any{"worktrees": []map[string]any{}}), nil
+		case "agent_context__agent_handoff_list":
+			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
+		default:
+			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
+		}
+	})
+
+	monitor := NewFleetMonitor(client, agent, nil)
+
+	// 1) Healthy refresh → not degraded.
+	if err := monitor.RefreshForce(); err != nil {
+		t.Fatalf("healthy refresh: %v", err)
+	}
+	if snap := monitor.Snapshot(); snap.Degraded {
+		t.Fatalf("expected not degraded after healthy refresh, got reason=%q", snap.DegradedReason)
+	}
+
+	// 2) Presence sub-fetch fails → degraded, onset stamped.
+	presenceFails.Store(true)
+	if err := monitor.RefreshForce(); err != nil {
+		t.Fatalf("degraded refresh: %v", err)
+	}
+	snap2 := monitor.Snapshot()
+	if !snap2.Degraded || snap2.DegradedReason != "presence fetch failing" {
+		t.Fatalf("expected degraded=presence, got degraded=%v reason=%q", snap2.Degraded, snap2.DegradedReason)
+	}
+	if snap2.DegradedSince.IsZero() {
+		t.Fatal("expected DegradedSince to be stamped on first degraded refresh")
+	}
+
+	// 3) Still failing → onset time persists across the streak.
+	if err := monitor.RefreshForce(); err != nil {
+		t.Fatalf("second degraded refresh: %v", err)
+	}
+	snap3 := monitor.Snapshot()
+	if !snap3.Degraded || !snap3.DegradedSince.Equal(snap2.DegradedSince) {
+		t.Fatalf("expected DegradedSince to persist: was %v now %v (degraded=%v)", snap2.DegradedSince, snap3.DegradedSince, snap3.Degraded)
+	}
+
+	// 4) Recovery → degraded state fully cleared.
+	presenceFails.Store(false)
+	if err := monitor.RefreshForce(); err != nil {
+		t.Fatalf("recovery refresh: %v", err)
+	}
+	snap4 := monitor.Snapshot()
+	if snap4.Degraded || !snap4.DegradedSince.IsZero() || snap4.DegradedReason != "" {
+		t.Fatalf("expected degraded cleared after recovery, got degraded=%v reason=%q since=%v",
+			snap4.Degraded, snap4.DegradedReason, snap4.DegradedSince)
+	}
+}

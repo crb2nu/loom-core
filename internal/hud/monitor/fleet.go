@@ -75,6 +75,18 @@ type FleetSnapshot struct {
 
 	// Metadata
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Degraded marks a refresh whose sessions/presence coupled-view sub-fetch
+	// failed: the agent/session roster and its counts were carried over from the
+	// previous snapshot instead of being recomputed (see refresh). Because
+	// UpdatedAt still advances on each carry-over, the generic staleAfter banner
+	// never fires, so the degradation is otherwise silent. These fields let the
+	// HUD surface an explicit "degraded since HH:MM (reason)" immediately.
+	// DegradedSince holds the onset of the current degraded streak (persisted
+	// across consecutive degraded refreshes); all three reset on recovery.
+	Degraded       bool      `json:"degraded"`
+	DegradedReason string    `json:"degraded_reason,omitempty"`
+	DegradedSince  time.Time `json:"degraded_since,omitempty"`
 }
 
 // SpawnInfo is a flat representation of a spawned agent for fleet aggregation.
@@ -707,9 +719,23 @@ func (m *FleetMonitor) refresh(force bool) error {
 		snap.IdleAgents = prev.IdleAgents
 		snap.OfflineAgents = prev.OfflineAgents
 		snap.OrphanAgents = prev.OrphanAgents
+
+		// Surface the degradation explicitly instead of leaving it to the
+		// frontend's indirect staleness heuristic. Persist the onset time across
+		// a continuing degraded streak so the HUD can show "degraded since HH:MM".
+		snap.Degraded = true
+		snap.DegradedReason = degradedReason(sessionsOK, presenceOK)
+		if prev.Degraded && !prev.DegradedSince.IsZero() {
+			snap.DegradedSince = prev.DegradedSince
+		} else {
+			snap.DegradedSince = snap.UpdatedAt
+		}
+
 		m.Logger.Info("fleet: partial sub-fetch failure; carried over sessions/agents from previous snapshot",
 			"sessions_ok", sessionsOK,
 			"presence_ok", presenceOK,
+			"degraded_reason", snap.DegradedReason,
+			"degraded_since", snap.DegradedSince,
 			"prev_sessions", len(prev.Sessions),
 			"prev_agents", len(prev.Agents))
 	}
@@ -807,6 +833,20 @@ func (m *FleetMonitor) refresh(force bool) error {
 	m.FireOnRefresh(snap)
 
 	return nil
+}
+
+// degradedReason describes which side(s) of the coupled sessions/presence view
+// failed to fetch, for the snapshot's DegradedReason. At least one argument is
+// false by construction (the caller is in the partial-failure branch).
+func degradedReason(sessionsOK, presenceOK bool) string {
+	switch {
+	case !sessionsOK && !presenceOK:
+		return "sessions and presence fetch failing"
+	case !sessionsOK:
+		return "sessions fetch failing"
+	default:
+		return "presence fetch failing"
+	}
 }
 
 // detectConflicts counts the number of files claimed by multiple agents
