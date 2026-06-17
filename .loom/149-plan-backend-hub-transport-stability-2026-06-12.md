@@ -92,7 +92,7 @@ Even with (b) the spawn cost (~1s session restore per conn) goes away under stea
 
 ### Slice 5 — Honest degraded-state surfacing (HUD, lower priority)
 - [x] **5a (backend)**: explicit `Degraded`/`DegradedReason`/`DegradedSince` fields on `FleetSnapshot`, populated in `refresh()`'s partial-failure branch with onset-time hysteresis; flows to the API/SSE payload. `.loom/155`, branch `feat/hud-degraded-state-surfacing`. The carry-over is no longer silent — the degraded state is machine-readable in the snapshot.
-- [ ] **5b (frontend, follow-up)**: `fleet.svelte.ts`/`ConnectionBanner` consume `degraded` to render "degraded since HH:MM (sessions fetch failing)" instead of the generic stale pill; surface circuit-open state. Needs the `go:embed`'d HUD dist rebuild (`make hud-frontend` + commit; CI does not rebuild it).
+- [x] **5b (frontend)**: `fleet.svelte.ts` parses `degraded`/`degraded_reason`/`degraded_since`; `ConnectionBanner` renders an amber "Degraded since HH:MM — <reason>" banner (priority over the generic stale pill, below the connection states); `.connection-degraded` theme rule; `go:embed`'d dist rebuilt. `.loom/156`, branch `feat/hud-degraded-banner`. Build-verified (vite + go embed); the live-banner kill-test (induce a degraded fleet on a connected HUD) is deferred — the local preview can't produce a connected-but-degraded backend. **Circuit-open surfacing** on the monitor side remains an unaddressed Slice 5 stretch (separate from the carry-over path).
 
 ## Sequencing & gates
 1. Slice 0 now (config + restart + kill-test) — restores agent/HUD reliability immediately.

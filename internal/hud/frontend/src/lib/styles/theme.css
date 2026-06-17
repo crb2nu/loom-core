@@ -550,6 +550,16 @@ code, pre {
   color: var(--warning);
 }
 
+/* Slice 5b — shown when SSE is connected but the monitor explicitly reported a
+   sessions/presence sub-fetch failure and carried over the prior roster. The
+   honest, specific form of the generic stale pill; medium prominence since it
+   is a real backend degradation, not a client-side staleness guess. */
+.connection-degraded {
+  background: rgba(255, 184, 48, 0.06);
+  border-bottom: 1px solid rgba(255, 184, 48, 0.15);
+  color: var(--warning);
+}
+
 /* Slice B3 — shown when SSE is connected but one or more decomposed stores
    haven't received a snapshot within their staleAfter window (silent SSE
    failure). Lower-prominence than reconnecting/disconnected. */
