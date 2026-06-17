@@ -34,6 +34,12 @@ func TestDefaultHealthMonitorConfig(t *testing.T) {
 	if cfg.DeepProbeTimeout != 30*time.Second {
 		t.Errorf("DeepProbeTimeout = %v, want 30s", cfg.DeepProbeTimeout)
 	}
+	if cfg.RestartPressureThreshold != 3 {
+		t.Errorf("RestartPressureThreshold = %d, want 3", cfg.RestartPressureThreshold)
+	}
+	if cfg.RestartPressureWindow != 60*time.Second {
+		t.Errorf("RestartPressureWindow = %v, want 60s", cfg.RestartPressureWindow)
+	}
 }
 
 func TestServerHealthStatus_Fields(t *testing.T) {
@@ -325,5 +331,106 @@ func TestNewHealthMonitor_DeepProbeTimeoutWired(t *testing.T) {
 		if h.deepProbeTimeout != defaultDeepProbeTimeout {
 			t.Fatalf("deepProbeTimeout(%v) = %v, want %v fallback", tc, h.deepProbeTimeout, defaultDeepProbeTimeout)
 		}
+	}
+}
+
+func TestNewHealthMonitor_RestartPressureWired(t *testing.T) {
+	d := &Daemon{
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metrics: NewMetrics(),
+	}
+
+	// Explicit values are honored.
+	h := NewHealthMonitor(d, HealthMonitorConfig{
+		RestartPressureThreshold: 5,
+		RestartPressureWindow:    90 * time.Second,
+	})
+	if h.restartPressureThreshold != 5 {
+		t.Fatalf("restartPressureThreshold = %d, want 5", h.restartPressureThreshold)
+	}
+	if h.restartPressureWindow != 90*time.Second {
+		t.Fatalf("restartPressureWindow = %v, want 90s", h.restartPressureWindow)
+	}
+
+	// Threshold 0 (disabled) is passed through verbatim; a zero/negative window
+	// falls back to the 60s default so the signal stays well-defined.
+	for _, tc := range []time.Duration{0, -1} {
+		h := NewHealthMonitor(d, HealthMonitorConfig{RestartPressureThreshold: 0, RestartPressureWindow: tc})
+		if h.restartPressureThreshold != 0 {
+			t.Fatalf("restartPressureThreshold = %d, want 0 (disabled passthrough)", h.restartPressureThreshold)
+		}
+		if h.restartPressureWindow != defaultRestartPressureWindow {
+			t.Fatalf("restartPressureWindow(%v) = %v, want %v fallback", tc, h.restartPressureWindow, defaultRestartPressureWindow)
+		}
+	}
+}
+
+func TestCountRecentlyFailedServers_WindowFiltering(t *testing.T) {
+	now := time.Now()
+	h := &HealthMonitor{
+		restartPressureWindow: 60 * time.Second,
+		statuses: map[string]*ServerHealthStatus{
+			"fresh-a":   {Name: "fresh-a", LastFailure: now.Add(-5 * time.Second)},
+			"fresh-b":   {Name: "fresh-b", LastFailure: now.Add(-59 * time.Second)},
+			"stale":     {Name: "stale", LastFailure: now.Add(-2 * time.Minute)},
+			"never":     {Name: "never"}, // zero-value LastFailure
+			"on-window": {Name: "on-window", LastFailure: now.Add(-60 * time.Second)},
+		},
+	}
+
+	// fresh-a, fresh-b, and on-window (== window boundary) count; stale + never do not.
+	if got := h.countRecentlyFailedServersLocked(now); got != 3 {
+		t.Fatalf("countRecentlyFailedServersLocked = %d, want 3", got)
+	}
+}
+
+func TestCountRecentlyFailedServers_IgnoresZeroValue(t *testing.T) {
+	now := time.Now()
+	h := &HealthMonitor{
+		restartPressureWindow: 60 * time.Second,
+		statuses: map[string]*ServerHealthStatus{
+			"a": {Name: "a"},
+			"b": {Name: "b"},
+		},
+	}
+	if got := h.countRecentlyFailedServersLocked(now); got != 0 {
+		t.Fatalf("countRecentlyFailedServersLocked = %d, want 0 (all zero-value)", got)
+	}
+}
+
+func TestShouldSuppressRestart(t *testing.T) {
+	now := time.Now()
+	mkStatuses := func(n int) map[string]*ServerHealthStatus {
+		m := make(map[string]*ServerHealthStatus, n)
+		for i := 0; i < n; i++ {
+			name := string(rune('a' + i))
+			m[name] = &ServerHealthStatus{Name: name, LastFailure: now.Add(-time.Second)}
+		}
+		return m
+	}
+
+	tests := []struct {
+		name         string
+		threshold    int
+		failing      int
+		wantSuppress bool
+	}{
+		{"disabled threshold never suppresses", 0, 10, false},
+		{"below threshold restarts", 3, 2, false},
+		{"at threshold suppresses", 3, 3, true},
+		{"above threshold suppresses", 3, 5, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &HealthMonitor{
+				restartPressureThreshold: tc.threshold,
+				restartPressureWindow:    60 * time.Second,
+				statuses:                 mkStatuses(tc.failing),
+			}
+			suppress, pressure := h.shouldSuppressRestartLocked(now)
+			if suppress != tc.wantSuppress {
+				t.Fatalf("shouldSuppressRestartLocked suppress = %v, want %v (pressure=%d)", suppress, tc.wantSuppress, pressure)
+			}
+		})
 	}
 }

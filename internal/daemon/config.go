@@ -421,6 +421,16 @@ type HealthConfig struct {
 
 	// RestartCooldownMinutes between restart attempts (default: 5)
 	RestartCooldownMinutes int `yaml:"restart_cooldown_minutes,omitempty"`
+
+	// RestartPressureThreshold is the number of distinct servers failing a probe
+	// within RestartPressureWindowSeconds that suppresses auto-restart as
+	// systemic rather than a single broken process (default: 3). Set to a
+	// negative value to disable hysteresis (always restart on threshold).
+	RestartPressureThreshold int `yaml:"restart_pressure_threshold,omitempty"`
+
+	// RestartPressureWindowSeconds is the rolling window for the systemic
+	// failure-pressure signal (default: 60).
+	RestartPressureWindowSeconds int `yaml:"restart_pressure_window_seconds,omitempty"`
 }
 
 // ToHealthMonitorConfig converts HealthConfig to HealthMonitorConfig,
@@ -455,6 +465,14 @@ func (c *HealthConfig) ToHealthMonitorConfig() HealthMonitorConfig {
 	}
 	if c.DeepProbeTimeoutSeconds > 0 {
 		cfg.DeepProbeTimeout = time.Duration(c.DeepProbeTimeoutSeconds) * time.Second
+	}
+	if c.RestartPressureThreshold > 0 {
+		cfg.RestartPressureThreshold = c.RestartPressureThreshold
+	} else if c.RestartPressureThreshold < 0 {
+		cfg.RestartPressureThreshold = 0 // explicit disable → always restart on threshold
+	}
+	if c.RestartPressureWindowSeconds > 0 {
+		cfg.RestartPressureWindow = time.Duration(c.RestartPressureWindowSeconds) * time.Second
 	}
 	return cfg
 }
