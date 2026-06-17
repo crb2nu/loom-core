@@ -216,6 +216,15 @@ class FleetStore {
   drawerError = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
+  // Degraded-state (Slice 5b) — the monitor sets these on the FleetSnapshot
+  // when a sessions/presence sub-fetch failed and it carried over the prior
+  // roster. Because UpdatedAt still advances, the generic staleAfter pill never
+  // fires, so we surface an explicit "degraded since HH:MM (reason)" banner.
+  // All three reset on a healthy snapshot (degraded serialized as false).
+  degraded = $state(false);
+  degradedReason = $state('');
+  degradedSince = $state<Date | null>(null);
+
   // Per-panel UI state (Slice B1 — moved out of FleetPanel.svelte so the
   // panel becomes a pure composition shell). Components mutate via the
   // setters below and read directly via getters.
@@ -559,6 +568,15 @@ class FleetStore {
       if (!arraysEqualById(this.fileClaims, next, hashClaim)) {
         this.fileClaims = next;
       }
+    }
+    // Explicit degraded-state from the monitor. `degraded` is always present
+    // (serialized without omitempty), so a healthy snapshot clears it; reason
+    // and since are omitempty, present only while degraded.
+    if (data.degraded !== undefined) {
+      this.degraded = data.degraded === true;
+      this.degradedReason = this.degraded ? ((data.degraded_reason as string) ?? '') : '';
+      this.degradedSince =
+        this.degraded && data.degraded_since ? new Date(data.degraded_since as string) : null;
     }
     this.lastUpdated = new Date();
     this.error = null;
