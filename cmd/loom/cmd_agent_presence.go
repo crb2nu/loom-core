@@ -105,7 +105,12 @@ don't have native session-start hooks.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			port := resolvePort(cmd)
 
-			// Infer namespace from git context if requested.
+			// Discard a malformed explicit namespace (e.g. "////main" produced by
+			// the codex notify hook in a detached context) so it isn't stored
+			// verbatim, then infer from git context if requested.
+			if isMalformedNamespace(namespace) {
+				namespace = ""
+			}
 			if inferNamespace && namespace == "" {
 				namespace = inferGitNamespace()
 			}
@@ -225,6 +230,11 @@ running, exits silently. On SIGINT/SIGTERM, sends a final deregister and exits.`
 				return fmt.Errorf("--agent-id is required")
 			}
 
+			// Discard a malformed explicit namespace (e.g. the codex notify hook's
+			// "////main") before storing, then infer from git context if requested.
+			if isMalformedNamespace(namespace) {
+				namespace = ""
+			}
 			if inferNamespace && namespace == "" {
 				namespace = inferGitNamespace()
 			}

@@ -391,22 +391,116 @@ func stripWorktreeFromRepoRoot(repoRoot string) string {
 }
 
 // inferGitNamespace derives a namespace from the current git repository and branch.
-// Returns "parent/repo-name/branch" (workspace-relative) or empty string if git
-// context is unavailable. For worktrees under <repo>/.worktrees/ or
-// <repo>/.claude/worktrees/ (Claude Code tool-managed worktrees), resolves to
-// the parent repo path so namespaces stay consistent across main and worktree
-// checkouts.
+// It prefers the origin remote's "group/repo" identity, which is stable regardless
+// of where the repo is physically checked out (canonical path, worktree, or a
+// hash-named clone/spawn directory), and falls back to the filesystem path when no
+// usable remote is configured. Returns "group/repo/branch", "group/repo", or empty
+// string when git context is unavailable.
+//
+// The remote-first order fixes codex agents running in cloned/spawned workspaces at
+// paths like ".../3ef2/conspiracy-files", where the old path-only derivation leaked
+// the clone-dir hash ("3ef2") as the project's parent segment.
 func inferGitNamespace() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	project := namespaceProjectFromRemote(ctx)
+	if project == "" {
+		project = namespaceProjectFromPath(ctx)
+	}
+	if project == "" {
+		return ""
+	}
+
+	// Get current branch.
+	branch, err := exec.CommandContext(ctx, "git", "branch", "--show-current").Output()
+	if err != nil {
+		return project
+	}
+	branchName := strings.TrimSpace(string(branch))
+	if branchName == "" {
+		return project
+	}
+
+	return project + "/" + branchName
+}
+
+// namespaceProjectFromRemote derives a stable "group/repo" project identity from the
+// origin remote URL. Returns empty when no usable remote is configured.
+func namespaceProjectFromRemote(ctx context.Context) string {
+	out, err := exec.CommandContext(ctx, "git", "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		return ""
+	}
+	return projectFromRemoteURL(strings.TrimSpace(string(out)))
+}
+
+// projectFromRemoteURL parses a git remote URL into a workspace-relative "group/repo"
+// project (the last two non-degenerate path segments, matching the 2-level convention
+// the filesystem-path derivation uses). Handles URL form
+// (https://host[:port]/group/repo.git, ssh://git@host/group/repo.git) and scp-like
+// form (git@host:group/repo.git). Returns empty for an unparseable or pathless URL.
+func projectFromRemoteURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	path := raw
+	if i := strings.Index(path, "://"); i >= 0 {
+		// scheme://[user@]host[:port]/group/repo(.git)
+		rest := path[i+3:]
+		slash := strings.IndexByte(rest, '/')
+		if slash < 0 {
+			return ""
+		}
+		path = rest[slash+1:]
+	} else if at := strings.IndexByte(path, '@'); at >= 0 {
+		// scp-like user@host:group/repo(.git)
+		if colon := strings.IndexByte(path[at:], ':'); colon >= 0 {
+			path = path[at+colon+1:]
+		}
+	} else if colon := strings.IndexByte(path, ':'); colon >= 0 {
+		// host:group/repo(.git) without an explicit user
+		path = path[colon+1:]
+	}
+
+	path = strings.Trim(path, "/")
+	path = strings.TrimSuffix(path, ".git")
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return ""
+	}
+
+	// Keep the last two non-degenerate segments (e.g. "services/loom-core",
+	// or "subgroup/repo" for a nested group).
+	var segs []string
+	for _, s := range strings.Split(path, "/") {
+		if !isDegeneratePathSegment(s) {
+			segs = append(segs, s)
+		}
+	}
+	if len(segs) == 0 {
+		return ""
+	}
+	if len(segs) > 2 {
+		segs = segs[len(segs)-2:]
+	}
+	return strings.Join(segs, "/")
+}
+
+// namespaceProjectFromPath derives a "parent/repo" project from the repository's
+// filesystem location (worktree-aware), used as a fallback when no origin remote is
+// configured. For worktrees under <repo>/.worktrees/ or <repo>/.claude/worktrees/
+// (Claude Code tool-managed worktrees), resolves to the parent repo path so
+// namespaces stay consistent across main and worktree checkouts. Returns empty when
+// git context is unavailable or the path yields degenerate segments.
+func namespaceProjectFromPath(ctx context.Context) string {
 	toplevel, err := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel").Output()
 	if err != nil {
 		return ""
 	}
-	repoRoot := strings.TrimSpace(string(toplevel))
-
-	repoRoot = stripWorktreeFromRepoRoot(repoRoot)
+	repoRoot := stripWorktreeFromRepoRoot(strings.TrimSpace(string(toplevel)))
 	if repoRoot == "" || repoRoot == "/" {
 		return ""
 	}
@@ -420,19 +514,24 @@ func inferGitNamespace() string {
 	if isDegeneratePathSegment(parent) || isDegeneratePathSegment(name) {
 		return ""
 	}
-	project := parent + "/" + name
+	return parent + "/" + name
+}
 
-	// Get current branch.
-	branch, err := exec.CommandContext(ctx, "git", "branch", "--show-current").Output()
-	if err != nil {
-		return project
+// isMalformedNamespace reports whether ns contains empty or degenerate path segments
+// (e.g. "////main", "a//b") that should never be stored verbatim. An empty or
+// whitespace-only namespace is treated as "absent" (not malformed) and reported
+// false, so callers apply their normal infer-or-skip handling instead.
+func isMalformedNamespace(ns string) bool {
+	ns = strings.TrimSpace(ns)
+	if ns == "" {
+		return false
 	}
-	branchName := strings.TrimSpace(string(branch))
-	if branchName == "" {
-		return project
+	for _, seg := range strings.Split(ns, "/") {
+		if isDegeneratePathSegment(seg) {
+			return true
+		}
 	}
-
-	return project + "/" + branchName
+	return false
 }
 
 // isDegeneratePathSegment reports whether a filepath.Base result is a
