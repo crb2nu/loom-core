@@ -138,6 +138,51 @@ func TestInferGitNamespace(t *testing.T) {
 	}
 }
 
+func TestProjectFromRemoteURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"https with .git", "https://gitlab.flexinfer.ai/services/xfiles.git", "services/xfiles"},
+		{"https without .git", "https://gitlab.flexinfer.ai/services/news-analyzer", "services/news-analyzer"},
+		{"https with port", "https://gitlab.flexinfer.ai:8443/services/loom-core.git", "services/loom-core"},
+		{"scp-like", "git@gitlab.flexinfer.ai:services/xfiles.git", "services/xfiles"},
+		{"ssh url", "ssh://git@gitlab.flexinfer.ai/services/loom-core.git", "services/loom-core"},
+		{"ssh url with port", "ssh://git@gitlab.flexinfer.ai:2222/services/loom-core.git", "services/loom-core"},
+		{"nested group keeps last two", "https://gitlab.flexinfer.ai/group/subgroup/repo.git", "subgroup/repo"},
+		{"host without user scp", "gitlab.flexinfer.ai:services/loom-core.git", "services/loom-core"},
+		{"trailing slash", "https://gitlab.flexinfer.ai/services/loom-core/", "services/loom-core"},
+		{"single segment", "https://gitlab.flexinfer.ai/loom-core.git", "loom-core"},
+		{"empty", "", ""},
+		{"pathless url", "https://gitlab.flexinfer.ai", ""},
+		{"whitespace", "   ", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := projectFromRemoteURL(tc.in); got != tc.want {
+				t.Errorf("projectFromRemoteURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsMalformedNamespace(t *testing.T) {
+	malformed := []string{"////main", "///", "a//b", "/services/loom-core", "services/loom-core/", "services//main"}
+	for _, ns := range malformed {
+		if !isMalformedNamespace(ns) {
+			t.Errorf("isMalformedNamespace(%q) = false, want true", ns)
+		}
+	}
+	// Empty/whitespace is "absent", not malformed; well-formed namespaces pass.
+	wellFormed := []string{"", "   ", "services/loom-core", "services/loom-core/main", "3ef2/conspiracy-files", "services/flexinfer/feat/rbac"}
+	for _, ns := range wellFormed {
+		if isMalformedNamespace(ns) {
+			t.Errorf("isMalformedNamespace(%q) = true, want false", ns)
+		}
+	}
+}
+
 func TestIsDegeneratePathSegment(t *testing.T) {
 	for _, s := range []string{"", "/", ".", ".."} {
 		if !isDegeneratePathSegment(s) {
