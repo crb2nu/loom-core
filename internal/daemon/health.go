@@ -40,6 +40,7 @@ type HealthMonitor struct {
 	// Configuration
 	checkInterval      time.Duration
 	deepProbeInterval  time.Duration // interval between full process-spawning probes
+	deepProbeTimeout   time.Duration // timeout for a single deep (process-spawning) probe
 	healthyThreshold   int           // consecutive successes to mark healthy
 	unhealthyThreshold int           // consecutive failures to mark unhealthy
 	restartThreshold   int           // failures before auto-restart
@@ -51,10 +52,16 @@ type HealthMonitor struct {
 	wg   sync.WaitGroup
 }
 
+// defaultDeepProbeTimeout bounds a single deep (process-spawning) health probe.
+// Matches defaultDaemonControlRPCTimeout so a slow subprocess start under load is
+// not clipped at the old hardcoded 10s and mistaken for an unhealthy server.
+const defaultDeepProbeTimeout = 30 * time.Second
+
 // HealthMonitorConfig holds configuration for the health monitor.
 type HealthMonitorConfig struct {
 	CheckInterval      time.Duration
 	DeepProbeInterval  time.Duration // how often to run a full process-spawning probe (0 = every check)
+	DeepProbeTimeout   time.Duration // timeout for a single deep probe (0 = default 30s)
 	HealthyThreshold   int
 	UnhealthyThreshold int
 	RestartThreshold   int
@@ -67,6 +74,7 @@ func DefaultHealthMonitorConfig() HealthMonitorConfig {
 	return HealthMonitorConfig{
 		CheckInterval:      30 * time.Second,
 		DeepProbeInterval:  5 * time.Minute,
+		DeepProbeTimeout:   defaultDeepProbeTimeout,
 		HealthyThreshold:   2,
 		UnhealthyThreshold: 3,
 		RestartThreshold:   3,
@@ -77,12 +85,17 @@ func DefaultHealthMonitorConfig() HealthMonitorConfig {
 
 // NewHealthMonitor creates a new health monitor.
 func NewHealthMonitor(daemon *Daemon, cfg HealthMonitorConfig) *HealthMonitor {
+	deepProbeTimeout := cfg.DeepProbeTimeout
+	if deepProbeTimeout <= 0 {
+		deepProbeTimeout = defaultDeepProbeTimeout
+	}
 	return &HealthMonitor{
 		daemon:             daemon,
 		logger:             daemon.logger.With("component", "health-monitor"),
 		statuses:           make(map[string]*ServerHealthStatus),
 		checkInterval:      cfg.CheckInterval,
 		deepProbeInterval:  cfg.DeepProbeInterval,
+		deepProbeTimeout:   deepProbeTimeout,
 		healthyThreshold:   cfg.HealthyThreshold,
 		unhealthyThreshold: cfg.UnhealthyThreshold,
 		restartThreshold:   cfg.RestartThreshold,
@@ -156,7 +169,15 @@ func (h *HealthMonitor) checkAllServers() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Budget the sweep for the deep probe (the long pole). Pool probes return
+	// fast; only the interval-gated, running-server-only deep probe needs the
+	// full timeout, so a slow subprocess start isn't clipped into a false
+	// unhealthy verdict. Floor at 10s for the legacy minimum.
+	budget := h.deepProbeTimeout
+	if budget < 10*time.Second {
+		budget = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -207,7 +228,7 @@ func (h *HealthMonitor) checkServer(ctx context.Context, serverName string) {
 				h.logger.Debug("pool probe failed, escalating to deep probe",
 					"server", serverName, "error", err)
 				deep = true
-				_, err = h.daemon.fetchServerTools(ctx, serverName)
+				_, err = h.daemon.fetchServerToolsWithTimeout(ctx, serverName, h.deepProbeTimeout)
 			} else {
 				h.logger.Debug("pool probe failed, server not running, skipping deep probe",
 					"server", serverName)
@@ -220,7 +241,7 @@ func (h *HealthMonitor) checkServer(ctx context.Context, serverName string) {
 		if !running {
 			return
 		}
-		_, err = h.daemon.fetchServerTools(ctx, serverName)
+		_, err = h.daemon.fetchServerToolsWithTimeout(ctx, serverName, h.deepProbeTimeout)
 	}
 
 	latencyMs := float64(time.Since(start).Milliseconds())

@@ -86,9 +86,9 @@ Per-WS-connection `mcp-agent-context` instances each start compaction/reaper/rec
 Even with (b) the spawn cost (~1s session restore per conn) goes away under steady state once Slice 2 stops the churn.
 
 ### Slice 4 — Health-monitor hardening (internal/daemon)
-- Make the 10s deep-probe subprocess-start timeout configurable; default 30s (matches `defaultDaemonControlRPCTimeout`).
-- Don't count hub-stage transport failures toward local-server restart decisions (the gitlab restarts were collateral).
-- Add restart hysteresis: skip auto-restart when system-wide retry pressure is high (e.g. >N transport failures in the last minute).
+- [x] Make the 10s deep-probe subprocess-start timeout configurable; default 30s (matches `defaultDaemonControlRPCTimeout`). — Slice 4.1, `.loom/152`, branch `feat/health-deep-probe-timeout` (`HealthConfig.DeepProbeTimeoutSeconds` → `HealthMonitorConfig.DeepProbeTimeout`; `fetchServerToolsWithTimeout`; `checkAllServers` budget widened).
+- [ ] Don't count hub-stage transport failures toward local-server restart decisions (the gitlab restarts were collateral).
+- [ ] Add restart hysteresis: skip auto-restart when system-wide retry pressure is high (e.g. >N transport failures in the last minute).
 
 ### Slice 5 — Honest degraded-state surfacing (HUD, lower priority)
 - Add explicit `partial`/`degraded` fields to monitor snapshots instead of silent carry-over (`fleet.go:692-715`), surface circuit-open state, so the frontend can show "degraded since HH:MM (sessions fetch failing)" instead of a generic stale banner 90s later.

@@ -402,6 +402,11 @@ type HealthConfig struct {
 	// CPU/memory churn. Set to 0 to always use deep probes.
 	DeepProbeIntervalMinutes int `yaml:"deep_probe_interval_minutes,omitempty"`
 
+	// DeepProbeTimeoutSeconds bounds a single deep (process-spawning) probe
+	// (default: 30). A higher value tolerates slow subprocess starts under load
+	// without falsely marking a healthy server unhealthy.
+	DeepProbeTimeoutSeconds int `yaml:"deep_probe_timeout_seconds,omitempty"`
+
 	// HealthyThreshold consecutive successes to mark healthy (default: 2)
 	HealthyThreshold int `yaml:"healthy_threshold,omitempty"`
 
@@ -447,6 +452,9 @@ func (c *HealthConfig) ToHealthMonitorConfig() HealthMonitorConfig {
 		cfg.DeepProbeInterval = time.Duration(c.DeepProbeIntervalMinutes) * time.Minute
 	} else if c.DeepProbeIntervalMinutes < 0 {
 		cfg.DeepProbeInterval = 0 // explicit disable → always deep probe
+	}
+	if c.DeepProbeTimeoutSeconds > 0 {
+		cfg.DeepProbeTimeout = time.Duration(c.DeepProbeTimeoutSeconds) * time.Second
 	}
 	return cfg
 }

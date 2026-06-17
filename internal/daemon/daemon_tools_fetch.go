@@ -11,8 +11,21 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 )
 
-// fetchServerTools gets tools from a single server using its own dedicated process.
+// fetchServerToolsTimeout is the default budget for a single-process
+// tools/list probe. Used by cache warming, which wants to fail fast.
+const fetchServerToolsTimeout = 10 * time.Second
+
+// fetchServerTools gets tools from a single server using its own dedicated
+// process, bounded by the default fast-fail timeout.
 func (d *Daemon) fetchServerTools(ctx context.Context, serverName string) ([]mcp.Tool, error) {
+	return d.fetchServerToolsWithTimeout(ctx, serverName, fetchServerToolsTimeout)
+}
+
+// fetchServerToolsWithTimeout gets tools from a single server using its own
+// dedicated process, bounding the probe with the given timeout. The health
+// monitor passes a longer deep-probe timeout so a slow subprocess start (under
+// retry-storm load) is not mistaken for an unhealthy server and restarted.
+func (d *Daemon) fetchServerToolsWithTimeout(ctx context.Context, serverName string, timeout time.Duration) ([]mcp.Tool, error) {
 	// Get server spec
 	spec, err := d.registry.GetServerSpec(serverName, d.cfg.Target)
 	if err != nil {
@@ -23,8 +36,10 @@ func (d *Daemon) fetchServerTools(ctx context.Context, serverName string) ([]mcp
 		return nil, fmt.Errorf("no command defined")
 	}
 
-	// Create timeout context - use shorter timeout to fail fast
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	if timeout <= 0 {
+		timeout = fetchServerToolsTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Expand variables in command

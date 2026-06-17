@@ -31,6 +31,9 @@ func TestDefaultHealthMonitorConfig(t *testing.T) {
 	if cfg.RestartCooldown != 5*time.Minute {
 		t.Errorf("RestartCooldown = %v, want 5m", cfg.RestartCooldown)
 	}
+	if cfg.DeepProbeTimeout != 30*time.Second {
+		t.Errorf("DeepProbeTimeout = %v, want 30s", cfg.DeepProbeTimeout)
+	}
 }
 
 func TestServerHealthStatus_Fields(t *testing.T) {
@@ -300,5 +303,27 @@ func TestNewHealthMonitor_DeepProbeIntervalWired(t *testing.T) {
 	h := NewHealthMonitor(d, cfg)
 	if h.deepProbeInterval != 10*time.Minute {
 		t.Fatalf("deepProbeInterval = %v, want 10m", h.deepProbeInterval)
+	}
+}
+
+func TestNewHealthMonitor_DeepProbeTimeoutWired(t *testing.T) {
+	d := &Daemon{
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metrics: NewMetrics(),
+	}
+
+	// Explicit timeout is honored.
+	h := NewHealthMonitor(d, HealthMonitorConfig{DeepProbeTimeout: 45 * time.Second})
+	if h.deepProbeTimeout != 45*time.Second {
+		t.Fatalf("deepProbeTimeout = %v, want 45s", h.deepProbeTimeout)
+	}
+
+	// Zero/negative falls back to the 30s default so callers that build a
+	// config literal without the field don't regress to a zero timeout.
+	for _, tc := range []time.Duration{0, -1} {
+		h := NewHealthMonitor(d, HealthMonitorConfig{DeepProbeTimeout: tc})
+		if h.deepProbeTimeout != defaultDeepProbeTimeout {
+			t.Fatalf("deepProbeTimeout(%v) = %v, want %v fallback", tc, h.deepProbeTimeout, defaultDeepProbeTimeout)
+		}
 	}
 }
