@@ -91,7 +91,8 @@ Even with (b) the spawn cost (~1s session restore per conn) goes away under stea
 - [x] Add restart hysteresis: skip auto-restart when system-wide retry pressure is high. — Slice 4.3, `.loom/154`, branch `feat/health-restart-hysteresis`. Signal = count of distinct servers whose last probe failed within `restartPressureWindow` (default 60s); when ≥ `restartPressureThreshold` (default 3) the auto-restart is suppressed (server stays marked unhealthy; next sweep re-evaluates). Config: `health.restart_pressure_threshold` / `health.restart_pressure_window_seconds` (negative threshold disables). Measured entirely inside the monitor — no cross-module coupling.
 
 ### Slice 5 — Honest degraded-state surfacing (HUD, lower priority)
-- Add explicit `partial`/`degraded` fields to monitor snapshots instead of silent carry-over (`fleet.go:692-715`), surface circuit-open state, so the frontend can show "degraded since HH:MM (sessions fetch failing)" instead of a generic stale banner 90s later.
+- [x] **5a (backend)**: explicit `Degraded`/`DegradedReason`/`DegradedSince` fields on `FleetSnapshot`, populated in `refresh()`'s partial-failure branch with onset-time hysteresis; flows to the API/SSE payload. `.loom/155`, branch `feat/hud-degraded-state-surfacing`. The carry-over is no longer silent — the degraded state is machine-readable in the snapshot.
+- [ ] **5b (frontend, follow-up)**: `fleet.svelte.ts`/`ConnectionBanner` consume `degraded` to render "degraded since HH:MM (sessions fetch failing)" instead of the generic stale pill; surface circuit-open state. Needs the `go:embed`'d HUD dist rebuild (`make hud-frontend` + commit; CI does not rebuild it).
 
 ## Sequencing & gates
 1. Slice 0 now (config + restart + kill-test) — restores agent/HUD reliability immediately.
