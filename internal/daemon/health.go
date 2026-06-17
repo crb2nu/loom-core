@@ -28,6 +28,7 @@ type ServerHealthStatus struct {
 	LastRestart       time.Time `json:"last_restart,omitempty"`
 	AutoRestartFailed bool      `json:"auto_restart_failed,omitempty"`
 	LastDeepProbe     time.Time `json:"last_deep_probe,omitempty"`
+	LastFailure       time.Time `json:"last_failure,omitempty"`
 }
 
 // HealthMonitor monitors server health and handles auto-restarts.
@@ -47,6 +48,12 @@ type HealthMonitor struct {
 	maxRestarts        int           // max restarts before giving up
 	restartCooldown    time.Duration
 
+	// Restart hysteresis: when many distinct servers fail probes within a short
+	// window, the failure is systemic (host/hub under load) rather than a single
+	// broken process, so restarting healthy local servers is counterproductive.
+	restartPressureThreshold int           // distinct servers failing in window to suppress restarts (0 = disabled)
+	restartPressureWindow    time.Duration // rolling window for the systemic-pressure signal
+
 	// Control
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -56,6 +63,17 @@ type HealthMonitor struct {
 // Matches defaultDaemonControlRPCTimeout so a slow subprocess start under load is
 // not clipped at the old hardcoded 10s and mistaken for an unhealthy server.
 const defaultDeepProbeTimeout = 30 * time.Second
+
+// defaultRestartPressureThreshold is the number of distinct servers that must
+// fail a probe within defaultRestartPressureWindow before auto-restart is
+// suppressed as systemic. Three distinct servers failing together rarely
+// coincides outside a real host/hub-wide event, so normal single-server
+// failures are unaffected.
+const defaultRestartPressureThreshold = 3
+
+// defaultRestartPressureWindow bounds the rolling window for the systemic
+// failure-pressure signal.
+const defaultRestartPressureWindow = 60 * time.Second
 
 // HealthMonitorConfig holds configuration for the health monitor.
 type HealthMonitorConfig struct {
@@ -67,19 +85,27 @@ type HealthMonitorConfig struct {
 	RestartThreshold   int
 	MaxRestarts        int
 	RestartCooldown    time.Duration
+	// RestartPressureThreshold is the number of distinct servers failing within
+	// RestartPressureWindow that suppresses auto-restart (0 = disabled).
+	RestartPressureThreshold int
+	// RestartPressureWindow is the rolling window for the systemic-pressure
+	// signal (0 = default 60s).
+	RestartPressureWindow time.Duration
 }
 
 // DefaultHealthMonitorConfig returns sensible defaults.
 func DefaultHealthMonitorConfig() HealthMonitorConfig {
 	return HealthMonitorConfig{
-		CheckInterval:      30 * time.Second,
-		DeepProbeInterval:  5 * time.Minute,
-		DeepProbeTimeout:   defaultDeepProbeTimeout,
-		HealthyThreshold:   2,
-		UnhealthyThreshold: 3,
-		RestartThreshold:   3,
-		MaxRestarts:        3,
-		RestartCooldown:    5 * time.Minute,
+		CheckInterval:            30 * time.Second,
+		DeepProbeInterval:        5 * time.Minute,
+		DeepProbeTimeout:         defaultDeepProbeTimeout,
+		HealthyThreshold:         2,
+		UnhealthyThreshold:       3,
+		RestartThreshold:         3,
+		MaxRestarts:              3,
+		RestartCooldown:          5 * time.Minute,
+		RestartPressureThreshold: defaultRestartPressureThreshold,
+		RestartPressureWindow:    defaultRestartPressureWindow,
 	}
 }
 
@@ -89,19 +115,25 @@ func NewHealthMonitor(daemon *Daemon, cfg HealthMonitorConfig) *HealthMonitor {
 	if deepProbeTimeout <= 0 {
 		deepProbeTimeout = defaultDeepProbeTimeout
 	}
+	restartPressureWindow := cfg.RestartPressureWindow
+	if restartPressureWindow <= 0 {
+		restartPressureWindow = defaultRestartPressureWindow
+	}
 	return &HealthMonitor{
-		daemon:             daemon,
-		logger:             daemon.logger.With("component", "health-monitor"),
-		statuses:           make(map[string]*ServerHealthStatus),
-		checkInterval:      cfg.CheckInterval,
-		deepProbeInterval:  cfg.DeepProbeInterval,
-		deepProbeTimeout:   deepProbeTimeout,
-		healthyThreshold:   cfg.HealthyThreshold,
-		unhealthyThreshold: cfg.UnhealthyThreshold,
-		restartThreshold:   cfg.RestartThreshold,
-		maxRestarts:        cfg.MaxRestarts,
-		restartCooldown:    cfg.RestartCooldown,
-		done:               make(chan struct{}),
+		daemon:                   daemon,
+		logger:                   daemon.logger.With("component", "health-monitor"),
+		statuses:                 make(map[string]*ServerHealthStatus),
+		checkInterval:            cfg.CheckInterval,
+		deepProbeInterval:        cfg.DeepProbeInterval,
+		deepProbeTimeout:         deepProbeTimeout,
+		healthyThreshold:         cfg.HealthyThreshold,
+		unhealthyThreshold:       cfg.UnhealthyThreshold,
+		restartThreshold:         cfg.RestartThreshold,
+		maxRestarts:              cfg.MaxRestarts,
+		restartCooldown:          cfg.RestartCooldown,
+		restartPressureThreshold: cfg.RestartPressureThreshold,
+		restartPressureWindow:    restartPressureWindow,
+		done:                     make(chan struct{}),
 	}
 }
 
@@ -275,6 +307,7 @@ func (h *HealthMonitor) checkServer(ctx context.Context, serverName string) {
 		status.ConsecutiveFails++
 		status.TotalFailures++
 		status.LastError = err.Error()
+		status.LastFailure = now
 
 		// Update Prometheus metrics
 		if h.daemon.metrics != nil {
@@ -300,8 +333,29 @@ func (h *HealthMonitor) checkServer(ctx context.Context, serverName string) {
 			}
 		}
 
-		// Check if we should auto-restart
+		// Check if we should auto-restart. Under systemic failure pressure
+		// (many distinct servers failing at once → host/hub overload, not a
+		// single broken process), suppress the restart: the server stays marked
+		// unhealthy for visibility and the next sweep re-evaluates once pressure
+		// subsides. Restarting healthy local servers during a transport storm is
+		// the documented collateral-restart failure mode (.loom/149 Slice 4).
 		if status.ConsecutiveFails >= h.restartThreshold && !status.AutoRestartFailed {
+			if suppress, pressure := h.shouldSuppressRestartLocked(now); suppress {
+				h.logger.Warn("auto-restart suppressed under systemic failure pressure",
+					"server", serverName,
+					"failing_servers", pressure,
+					"pressure_threshold", h.restartPressureThreshold,
+					"window", h.restartPressureWindow)
+				if h.daemon.eventBus != nil {
+					h.daemon.eventBus.Publish(EventServerHealth, map[string]any{
+						"server":             serverName,
+						"healthy":            false,
+						"restart_suppressed": true,
+						"failing_servers":    pressure,
+					})
+				}
+				return
+			}
 			h.handleRestart(serverName, status)
 		}
 	} else {
@@ -339,6 +393,36 @@ func (h *HealthMonitor) checkServer(ctx context.Context, serverName string) {
 			}
 		}
 	}
+}
+
+// countRecentlyFailedServersLocked returns the number of distinct servers whose
+// most recent probe failed within restartPressureWindow of now. It is the
+// systemic failure-pressure signal used to suppress collateral restarts during
+// a host/hub-wide event. Callers must hold h.mu.
+func (h *HealthMonitor) countRecentlyFailedServersLocked(now time.Time) int {
+	count := 0
+	for _, status := range h.statuses {
+		if status.LastFailure.IsZero() {
+			continue
+		}
+		if now.Sub(status.LastFailure) <= h.restartPressureWindow {
+			count++
+		}
+	}
+	return count
+}
+
+// shouldSuppressRestartLocked reports whether auto-restart should be skipped
+// because the failure is systemic (>= restartPressureThreshold distinct servers
+// failing within the window) rather than a single broken process. Returns the
+// current pressure count for logging. Hysteresis is disabled when the threshold
+// is <= 0. Callers must hold h.mu.
+func (h *HealthMonitor) shouldSuppressRestartLocked(now time.Time) (bool, int) {
+	if h.restartPressureThreshold <= 0 {
+		return false, 0
+	}
+	pressure := h.countRecentlyFailedServersLocked(now)
+	return pressure >= h.restartPressureThreshold, pressure
 }
 
 // handleRestart attempts to restart an unhealthy server.

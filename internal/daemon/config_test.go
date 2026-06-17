@@ -134,14 +134,16 @@ func TestHealthConfig_ToHealthMonitorConfig_Defaults(t *testing.T) {
 
 func TestHealthConfig_ToHealthMonitorConfig_Custom(t *testing.T) {
 	cfg := HealthConfig{
-		CheckIntervalSeconds:     60,
-		DeepProbeIntervalMinutes: 10,
-		DeepProbeTimeoutSeconds:  45,
-		HealthyThreshold:         5,
-		UnhealthyThreshold:       10,
-		RestartThreshold:         8,
-		MaxRestarts:              5,
-		RestartCooldownMinutes:   10,
+		CheckIntervalSeconds:         60,
+		DeepProbeIntervalMinutes:     10,
+		DeepProbeTimeoutSeconds:      45,
+		HealthyThreshold:             5,
+		UnhealthyThreshold:           10,
+		RestartThreshold:             8,
+		MaxRestarts:                  5,
+		RestartCooldownMinutes:       10,
+		RestartPressureThreshold:     6,
+		RestartPressureWindowSeconds: 120,
 	}
 	hmc := cfg.ToHealthMonitorConfig()
 
@@ -169,6 +171,12 @@ func TestHealthConfig_ToHealthMonitorConfig_Custom(t *testing.T) {
 	if hmc.RestartCooldown != 10*time.Minute {
 		t.Errorf("RestartCooldown = %v, want 10m", hmc.RestartCooldown)
 	}
+	if hmc.RestartPressureThreshold != 6 {
+		t.Errorf("RestartPressureThreshold = %d, want 6", hmc.RestartPressureThreshold)
+	}
+	if hmc.RestartPressureWindow != 120*time.Second {
+		t.Errorf("RestartPressureWindow = %v, want 120s", hmc.RestartPressureWindow)
+	}
 }
 
 func TestHealthConfig_ToHealthMonitorConfig_NegativeDeepProbeDisables(t *testing.T) {
@@ -176,6 +184,14 @@ func TestHealthConfig_ToHealthMonitorConfig_NegativeDeepProbeDisables(t *testing
 	hmc := cfg.ToHealthMonitorConfig()
 	if hmc.DeepProbeInterval != 0 {
 		t.Errorf("DeepProbeInterval = %v, want 0 (always deep probe)", hmc.DeepProbeInterval)
+	}
+}
+
+func TestHealthConfig_ToHealthMonitorConfig_NegativePressureDisables(t *testing.T) {
+	cfg := HealthConfig{RestartPressureThreshold: -1}
+	hmc := cfg.ToHealthMonitorConfig()
+	if hmc.RestartPressureThreshold != 0 {
+		t.Errorf("RestartPressureThreshold = %d, want 0 (hysteresis disabled)", hmc.RestartPressureThreshold)
 	}
 }
 
