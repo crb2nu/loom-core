@@ -57,7 +57,20 @@ func (cs *ContextSvc) Search(ctx context.Context, args map[string]any) (*mcp.Cal
 	vector, err := cs.embed.EmbedQuery(ctx, query)
 	if err != nil {
 		cs.metrics.EmbeddingErrors.Add(1)
-		return mcp.ErrorResult(fmt.Errorf("embedding query: %w", err)), nil
+		// Embedding provider unavailable — degrade to keyword search so recall
+		// keeps working through provider outages instead of hard-failing.
+		results, ferr := keywordSearch(ctx, cs.qdrant.Get(CollContext), query, filter, limit)
+		if ferr != nil {
+			return mcp.ErrorResult(fmt.Errorf("embedding query: %w (keyword fallback also failed: %v)", err, ferr)), nil
+		}
+		cs.metrics.RecallRequests.Add(1)
+		return mcp.JSONResult(map[string]any{
+			"ok":              true,
+			"results":         results,
+			"count":           len(results),
+			"degraded":        true,
+			"degraded_reason": "embeddings unavailable; keyword fallback",
+		})
 	}
 
 	searchStart := time.Now()
@@ -157,7 +170,19 @@ func (cs *ContextSvc) QueryShared(ctx context.Context, args map[string]any) (*mc
 	vector, err := cs.embed.EmbedQuery(ctx, query)
 	if err != nil {
 		cs.metrics.EmbeddingErrors.Add(1)
-		return mcp.ErrorResult(fmt.Errorf("embedding query: %w", err)), nil
+		// Degrade to keyword search over the same shared/public filter so
+		// cross-agent recall survives an embedding-provider outage.
+		results, ferr := keywordSearch(ctx, cs.qdrant.Get(CollContext), query, filter, limit)
+		if ferr != nil {
+			return mcp.ErrorResult(fmt.Errorf("embedding query: %w (keyword fallback also failed: %v)", err, ferr)), nil
+		}
+		return mcp.JSONResult(map[string]any{
+			"ok":              true,
+			"results":         results,
+			"count":           len(results),
+			"degraded":        true,
+			"degraded_reason": "embeddings unavailable; keyword fallback",
+		})
 	}
 
 	results, err := cs.qdrant.Get(CollContext).Search(ctx, vector, filter, limit, true)

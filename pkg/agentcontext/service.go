@@ -106,6 +106,26 @@ type Service struct {
 	bgCancel            context.CancelFunc
 }
 
+// embedResilientConfigFromEnv builds the embedder circuit-breaker policy,
+// starting from the package defaults and applying optional env overrides:
+//
+//	AGENT_CONTEXT_EMBED_TIMEOUT            Go duration, per-call timeout (default 3s)
+//	AGENT_CONTEXT_EMBED_BREAKER_THRESHOLD  int, consecutive failures to open (default 3)
+//	AGENT_CONTEXT_EMBED_BREAKER_COOLDOWN   Go duration, open duration (default 30s)
+func embedResilientConfigFromEnv() embed.ResilientConfig {
+	c := embed.DefaultResilientConfig()
+	if v := env.Duration("AGENT_CONTEXT_EMBED_TIMEOUT", 0); v > 0 {
+		c.Timeout = v
+	}
+	if v := env.IntWithZero("AGENT_CONTEXT_EMBED_BREAKER_THRESHOLD", 0); v > 0 {
+		c.FailureThreshold = v
+	}
+	if v := env.Duration("AGENT_CONTEXT_EMBED_BREAKER_COOLDOWN", 0); v > 0 {
+		c.Cooldown = v
+	}
+	return c
+}
+
 func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 	cfg, err := LoadConfigFromEnv()
 	if err != nil {
@@ -141,6 +161,15 @@ func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 		embedder = embed.NewDummyEmbedder(1)
 	default:
 		embedder = embed.NewMorphClient(hc, cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
+	}
+
+	// Wrap real providers with a circuit breaker + short per-call timeout so a
+	// stalled/overloaded embedding provider fails fast instead of head-of-line
+	// blocking the single MCP stdio transport (which starves unrelated tools
+	// like session_list / presence_heartbeat). The dummy embedder never fails,
+	// so leave it unwrapped.
+	if _, isDummy := embedder.(*embed.DummyEmbedder); !isDummy {
+		embedder = embed.NewResilientEmbedder(embedder, embedResilientConfigFromEnv())
 	}
 
 	qdrantReg := NewQdrantRegistry(hc, cfg)
