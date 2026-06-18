@@ -33,6 +33,10 @@ type Config struct {
 	EmbedFallbackAPIKey   string
 	EmbedFallbackBaseURL  string
 	EmbedFallbackModel    string
+	// EmbedFallbackTimeout caps each fallback embed call. It defaults higher
+	// than the primary's per-call timeout because the fallback model is often a
+	// cold/serverless lane that needs ~30-60s to activate on first use.
+	EmbedFallbackTimeout time.Duration
 
 	// Batching
 	EmbedBatchSize  int
@@ -167,6 +171,7 @@ func LoadConfigFromEnv() (Config, error) {
 		),
 		EmbedFallbackBaseURL: strings.TrimRight(env.StringChain([]string{"AGENT_CONTEXT_EMBED_FALLBACK_BASE_URL"}, ""), "/"),
 		EmbedFallbackModel:   env.StringChain([]string{"AGENT_CONTEXT_EMBED_FALLBACK_MODEL"}, ""),
+		EmbedFallbackTimeout: env.Duration("AGENT_CONTEXT_EMBED_FALLBACK_TIMEOUT", 60*time.Second),
 
 		EmbedBatchSize:  env.IntWithZero("AGENT_CONTEXT_EMBED_BATCH_SIZE", 64),
 		UpsertBatchSize: env.IntWithZero("AGENT_CONTEXT_UPSERT_BATCH_SIZE", 64),

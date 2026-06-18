@@ -727,6 +727,15 @@ servers:
         - agent_workflow_status
       env:
         AGENT_CONTEXT_EMBED_API_KEY: "${keychain:MORPH_API_KEY}"
+        # Write-path embedding fallback: when hosted Morph embeddings are down,
+        # agent_context_add embeds new entries on the self-hosted flexinfer
+        # gte-Qwen2-1.5B 1536-dim lane (matches the agent_context_v1 dimension)
+        # instead of erroring. Queries never use it (different vector space →
+        # keyword fallback). See loom-core pkg/codebase/embed/fallback.go.
+        AGENT_CONTEXT_EMBED_FALLBACK_PROVIDER: "${env:AGENT_CONTEXT_EMBED_FALLBACK_PROVIDER:-flexinfer}"
+        AGENT_CONTEXT_EMBED_FALLBACK_MODEL: "${env:AGENT_CONTEXT_EMBED_FALLBACK_MODEL:-gte-qwen2-1.5b}"
+        AGENT_CONTEXT_EMBED_FALLBACK_BASE_URL: "${env:AGENT_CONTEXT_EMBED_FALLBACK_BASE_URL:-https://litellm.flexinfer.ai/v1}"
+        AGENT_CONTEXT_EMBED_FALLBACK_API_KEY: "${keychain:LITELLM_API_KEY}"
         QDRANT_URL: "${env:QDRANT_URL:-http://192.168.50.176:6333}"
         QDRANT_API_KEY: "${keychain:QDRANT_API_KEY}"
         AGENT_CONTEXT_QDRANT_COLLECTION: "${env:AGENT_CONTEXT_QDRANT_COLLECTION:-agent_context_v1}"

@@ -185,7 +185,16 @@ func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 	// different vector space → search degrades to keyword instead). The fallback
 	// model MUST emit the same vector dimension as the collection.
 	if cfg.EmbedFallbackProvider != "" {
-		secondary := newResilientEmbedder(buildEmbedder(hc, cfg.EmbedFallbackProvider, cfg.EmbedFallbackBaseURL, cfg.EmbedFallbackAPIKey, cfg.EmbedFallbackModel))
+		secondary := buildEmbedder(hc, cfg.EmbedFallbackProvider, cfg.EmbedFallbackBaseURL, cfg.EmbedFallbackAPIKey, cfg.EmbedFallbackModel)
+		if _, isDummy := secondary.(*embed.DummyEmbedder); !isDummy {
+			// Fallback lanes are often cold/serverless and need a longer per-call
+			// timeout than the primary to tolerate first-call activation.
+			rc := embedResilientConfigFromEnv()
+			if cfg.EmbedFallbackTimeout > 0 {
+				rc.Timeout = cfg.EmbedFallbackTimeout
+			}
+			secondary = embed.NewResilientEmbedder(secondary, rc)
+		}
 		embedder = embed.NewFallbackEmbedder(embedder, secondary)
 	}
 
