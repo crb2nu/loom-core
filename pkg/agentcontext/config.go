@@ -24,6 +24,16 @@ type Config struct {
 	EmbedBaseURL  string
 	EmbedModel    string
 
+	// Write-path embedding fallback. When EmbedFallbackProvider is set, document
+	// (write) embeddings retry on a secondary provider if the primary fails, so
+	// agent_context_add keeps working through a primary outage. The fallback
+	// model MUST emit the same vector dimension as the collection/primary.
+	// Queries never use the fallback (different vector space → keyword fallback).
+	EmbedFallbackProvider string
+	EmbedFallbackAPIKey   string
+	EmbedFallbackBaseURL  string
+	EmbedFallbackModel    string
+
 	// Batching
 	EmbedBatchSize  int
 	UpsertBatchSize int
@@ -149,6 +159,14 @@ func LoadConfigFromEnv() (Config, error) {
 			[]string{"AGENT_CONTEXT_EMBED_MODEL", "CODEBASE_EMBED_MODEL", "MORPH_EMBED_MODEL", "FLEXINFER_EMBED_MODEL"},
 			"morph-embedding-v3",
 		),
+
+		EmbedFallbackProvider: strings.ToLower(env.StringChain([]string{"AGENT_CONTEXT_EMBED_FALLBACK_PROVIDER"}, "")),
+		EmbedFallbackAPIKey: env.StringChain(
+			[]string{"AGENT_CONTEXT_EMBED_FALLBACK_API_KEY", "LITELLM_API_KEY", "FLEXINFER_API_KEY"},
+			"",
+		),
+		EmbedFallbackBaseURL: strings.TrimRight(env.StringChain([]string{"AGENT_CONTEXT_EMBED_FALLBACK_BASE_URL"}, ""), "/"),
+		EmbedFallbackModel:   env.StringChain([]string{"AGENT_CONTEXT_EMBED_FALLBACK_MODEL"}, ""),
 
 		EmbedBatchSize:  env.IntWithZero("AGENT_CONTEXT_EMBED_BATCH_SIZE", 64),
 		UpsertBatchSize: env.IntWithZero("AGENT_CONTEXT_UPSERT_BATCH_SIZE", 64),
