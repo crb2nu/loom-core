@@ -790,7 +790,17 @@ func (h *HarvesterVMBackend) buildProvisionScript(opts StartOpts, gitToken strin
 	// Base tooling. git is required for the clone and is absent from a stock
 	// Ubuntu cloud image; ca-certificates/curl make https work for both the
 	// clone and CLI installers. Guarded so it's a no-op on the curated image.
-	b.WriteString("if ! command -v git >/dev/null 2>&1; then sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates curl; fi\n")
+	//
+	// DPkg::Lock::Timeout makes apt WAIT for the dpkg lock instead of failing
+	// immediately. On first boot cloud-init's own runcmd runs `apt-get install
+	// qemu-guest-agent`, which holds /var/lib/dpkg/lock-frontend; this Start-time
+	// provision SSHes in as soon as the VM reports ready and races that apt. Without
+	// the wait the provision aborts with `exited 100 ... Could not get lock
+	// /var/lib/dpkg/lock-frontend ... held by process N (apt-get)` and the spawn
+	// never reaches the agent exec (Mills A2 probe 2026-06-18). 300s comfortably
+	// covers cloud-init's first-boot apt; on the curated base image the `command -v`
+	// guard skips this entirely.
+	b.WriteString("if ! command -v git >/dev/null 2>&1; then sudo apt-get -o DPkg::Lock::Timeout=300 update && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y git ca-certificates curl; fi\n")
 
 	if cliInstall != "" {
 		b.WriteString(cliInstall)

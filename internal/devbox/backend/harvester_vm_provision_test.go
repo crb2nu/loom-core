@@ -77,6 +77,29 @@ func TestBuildProvisionScript_CloneAndCLI(t *testing.T) {
 	}
 }
 
+// TestBuildProvisionScript_AptWaitsForDpkgLock guards the Mills A2 probe
+// 2026-06-18 regression: the Start-time provision SSHes in the instant the VM
+// reports ready and races cloud-init's first-boot `apt-get install
+// qemu-guest-agent` for /var/lib/dpkg/lock-frontend, aborting with exit 100
+// ("Could not get lock"). The base-tooling apt-get must pass
+// DPkg::Lock::Timeout so it WAITS for the lock instead of failing.
+func TestBuildProvisionScript_AptWaitsForDpkgLock(t *testing.T) {
+	h := provisionBackend("http://192.168.50.218/services", "gitlab-creds")
+	opts := StartOpts{
+		WorkDir: "/workspace/services/loom-core",
+		Branch:  "feat/x",
+	}
+	script, _ := h.buildProvisionScript(opts, "tok")
+	for _, want := range []string{
+		"apt-get -o DPkg::Lock::Timeout=300 update",
+		"apt-get -o DPkg::Lock::Timeout=300 install -y git",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("provision script missing dpkg-lock wait %q\n---\n%s", want, script)
+		}
+	}
+}
+
 // TestBuildProvisionScript_QuotesSpecialChars verifies shellQuote kicks in when
 // the token or branch carries shell-special characters, keeping the
 // clone/checkout lines injection-safe.

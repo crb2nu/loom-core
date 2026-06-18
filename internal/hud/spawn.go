@@ -2192,7 +2192,14 @@ func agentCLIInstallLines(agentType string) string {
 // it uses sudo because the VM's SSH user installs to the system npm prefix.
 // Returns "" for unknown agent types (the VM backend then skips CLI install).
 func agentCLIInstallShell(agentType string) string {
-	const ensureNPM = `if ! command -v npm >/dev/null 2>&1; then sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm; fi`
+	// DPkg::Lock::Timeout makes apt WAIT for the dpkg lock rather than failing
+	// instantly. On the harvester-vm path this snippet runs over SSH at Start,
+	// racing cloud-init's first-boot `apt-get install qemu-guest-agent`, which
+	// holds /var/lib/dpkg/lock-frontend; without the wait the install aborts with
+	// `Could not get lock /var/lib/dpkg/lock-frontend` (Mills A2 probe 2026-06-18).
+	// Harmless on the Dockerfile/k8s path (agentCLIInstallLines has its own
+	// build-isolated ensureNPM with no lock contention).
+	const ensureNPM = `if ! command -v npm >/dev/null 2>&1; then sudo apt-get -o DPkg::Lock::Timeout=300 update && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y nodejs npm; fi`
 	switch agentType {
 	case "claude-code":
 		return fmt.Sprintf(`if ! command -v claude >/dev/null 2>&1; then %s; sudo npm install -g @anthropic-ai/claude-code@%s; fi`, ensureNPM, claudeCodeVersion)
