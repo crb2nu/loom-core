@@ -112,6 +112,45 @@ type Service struct {
 //	AGENT_CONTEXT_EMBED_TIMEOUT            Go duration, per-call timeout (default 3s)
 //	AGENT_CONTEXT_EMBED_BREAKER_THRESHOLD  int, consecutive failures to open (default 3)
 //	AGENT_CONTEXT_EMBED_BREAKER_COOLDOWN   Go duration, open duration (default 30s)
+//
+// buildEmbedder constructs a raw (unwrapped) Embedder for the given provider.
+// Shared by the primary and the optional write-path fallback so both honor the
+// same provider defaults. flexinfer/ollama substitute sensible base URLs and
+// models when the caller left the Morph defaults in place.
+func buildEmbedder(hc *httpclient.Client, provider, baseURL, apiKey, model string) embed.Embedder {
+	switch provider {
+	case "flexinfer":
+		if baseURL == "" || baseURL == "https://api.morphllm.com/v1" {
+			baseURL = env.StringChain([]string{"FLEXINFER_URL"}, "http://localhost:8080") + "/v1"
+		}
+		if model == "" || model == "morph-embedding-v3" {
+			model = "BAAI/bge-large-en-v1.5"
+		}
+		return embed.NewFlexInferClient(hc, baseURL, apiKey, model)
+	case "ollama":
+		if baseURL == "" || baseURL == "https://api.morphllm.com/v1" {
+			baseURL = "http://localhost:11434"
+		}
+		if model == "" || model == "morph-embedding-v3" {
+			model = "nomic-embed-text"
+		}
+		return embed.NewOllamaClient(hc, baseURL, model)
+	case "dummy", "none":
+		return embed.NewDummyEmbedder(1)
+	default:
+		return embed.NewMorphClient(hc, baseURL, apiKey, model)
+	}
+}
+
+// newResilientEmbedder wraps a real provider with the circuit breaker + timeout
+// policy. The dummy embedder never fails, so it is returned unwrapped.
+func newResilientEmbedder(e embed.Embedder) embed.Embedder {
+	if _, isDummy := e.(*embed.DummyEmbedder); isDummy {
+		return e
+	}
+	return embed.NewResilientEmbedder(e, embedResilientConfigFromEnv())
+}
+
 func embedResilientConfigFromEnv() embed.ResilientConfig {
 	c := embed.DefaultResilientConfig()
 	if v := env.Duration("AGENT_CONTEXT_EMBED_TIMEOUT", 0); v > 0 {
@@ -134,42 +173,20 @@ func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 
 	hc := httpclient.NewDefault()
 
-	// Select embedder based on provider configuration
-	var embedder embed.Embedder
-	switch cfg.EmbedProvider {
-	case "flexinfer":
-		baseURL := cfg.EmbedBaseURL
-		if baseURL == "" || baseURL == "https://api.morphllm.com/v1" {
-			baseURL = env.StringChain([]string{"FLEXINFER_URL"}, "http://localhost:8080") + "/v1"
-		}
-		model := cfg.EmbedModel
-		if model == "" || model == "morph-embedding-v3" {
-			model = "BAAI/bge-large-en-v1.5"
-		}
-		embedder = embed.NewFlexInferClient(hc, baseURL, cfg.EmbedAPIKey, model)
-	case "ollama":
-		baseURL := cfg.EmbedBaseURL
-		if baseURL == "" || baseURL == "https://api.morphllm.com/v1" {
-			baseURL = "http://localhost:11434"
-		}
-		model := cfg.EmbedModel
-		if model == "" || model == "morph-embedding-v3" {
-			model = "nomic-embed-text"
-		}
-		embedder = embed.NewOllamaClient(hc, baseURL, model)
-	case "dummy", "none":
-		embedder = embed.NewDummyEmbedder(1)
-	default:
-		embedder = embed.NewMorphClient(hc, cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
-	}
-
-	// Wrap real providers with a circuit breaker + short per-call timeout so a
-	// stalled/overloaded embedding provider fails fast instead of head-of-line
+	// Primary embedder, wrapped with a circuit breaker + short per-call timeout
+	// so a stalled/overloaded provider fails fast instead of head-of-line
 	// blocking the single MCP stdio transport (which starves unrelated tools
-	// like session_list / presence_heartbeat). The dummy embedder never fails,
-	// so leave it unwrapped.
-	if _, isDummy := embedder.(*embed.DummyEmbedder); !isDummy {
-		embedder = embed.NewResilientEmbedder(embedder, embedResilientConfigFromEnv())
+	// like session_list / presence_heartbeat).
+	embedder := newResilientEmbedder(buildEmbedder(hc, cfg.EmbedProvider, cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel))
+
+	// Optional write-path fallback: when configured, document embeddings retry
+	// on a secondary provider if the primary fails, so agent_context_add keeps
+	// working through a primary outage. Queries never use the fallback (it is a
+	// different vector space → search degrades to keyword instead). The fallback
+	// model MUST emit the same vector dimension as the collection.
+	if cfg.EmbedFallbackProvider != "" {
+		secondary := newResilientEmbedder(buildEmbedder(hc, cfg.EmbedFallbackProvider, cfg.EmbedFallbackBaseURL, cfg.EmbedFallbackAPIKey, cfg.EmbedFallbackModel))
+		embedder = embed.NewFallbackEmbedder(embedder, secondary)
 	}
 
 	qdrantReg := NewQdrantRegistry(hc, cfg)
