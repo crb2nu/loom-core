@@ -79,8 +79,8 @@ Restart daemon; run the kill-test above. **This is the riskiest-assumption kill-
 > Gate satisfied (Slice 1 verdict above). Detailed iteration plan + kill-test: `.loom/157`.
 - [x] keepalive ping loop, liveness gating, singleflight reconnect, atomic `initialized`, last-traffic tracking. mcp-go **!7** merged → `origin/main` `18b68e7`; pipeline 14207 green; tier-1 kill-test PASSED `-race`.
 - Design note: current mcp-go `origin/main` already returns a **fresh transport per `Dial`** (the `fix/mcp-core-compat` merge), so the "one shared WS per server" premise (Architecture fact #2 above) no longer holds — the pool keeps independent sockets. Keepalive now runs on every pooled transport; liveness+singleflight cover the cached `GetConnection` path.
-- [ ] **Tier-2 live confirmation** (loom-core go.mod bump → `v0.2.1-0.20260617231926-18b68e7e68f6` + redeploy → 30-min idle-1006 window). Awaiting go-ahead. Failure-mode branch (forced periodic kill) → re-prioritize Slice 3.
-> Exponential backoff is split into **Slice 2b** (loom-core-only: `internal/daemon/routing.go`).
+- [x] **Slice 2b** (loom-core exponential prefer-hub backoff, `internal/daemon/routing.go`) — `!723` merged `ea0e2ec4`.
+- [x] **Tier-2 live confirmation RAN 2026-06-18** (`!724` merged `58fc1d2a`, local daemon rebuilt+restarted). Result: storm materially reduced (herd gone — 0 concurrent-batch failures; ~78% fewer closures; exp backoff arming) **but the riskiest assumption DISPROVEN** — residual close-1006 arrives in synchronized **~17-server bursts every ~8 min** = hub-side **forced periodic kill**, which keepalive can detect but not prevent. **Failure-mode branch triggered → Slice 3 is now the priority lever.** Full evidence: `.loom/157`.
 - Keepalive: background ping loop per cached connection (the unused `Ping()` at `websocket.go:181`), close-and-evict on pong timeout so dead conns are discovered proactively, not at call time.
 - Liveness gating: `GetConnection` pings (or checks last-traffic age) before returning a cached conn idle > ~30s.
 - Singleflight reconnect per server name to kill the thundering herd (`retryHubAfterHubFailure` currently lets all 25 pool conns re-dial concurrently).
@@ -88,7 +88,9 @@ Restart daemon; run the kill-test above. **This is the riskiest-assumption kill-
 - Audit gorilla read limits vs. large `agent_session_list`/TOON payloads.
 Regression tests in libs/mcp-go (fake closing server) + daemon-level test that a hub close fails ≤1 call per pool, not all.
 
-### Slice 3 — Hub-side: stop spawning a server per connection (loom-core hub deployment)
+### Slice 3 — Hub-side: stop spawning a server per connection (loom-core hub deployment) — **NOW PRIORITY**
+> **Promoted by the Slice 2 tier-2 finding (2026-06-18, `.loom/157`)**: the residual close-1006 after keepalive is a synchronized **~17-server forced kill every ~8 min**, i.e. hub-side, not client idle. Client-side levers (Slice 2) can't prevent it. First scoping step before coding: pin the ~8-min cadence source — `kubectl logs -n loom-hub` (gateway + agent-context) around a burst boundary (e.g. 03:05/03:15 on 2026-06-18) to tell Cloudflare max-connection-age vs loom-hub pod/process cycle vs per-conn reaper apart.
+
 Per-WS-connection `mcp-agent-context` instances each start compaction/reaper/reconciler background services — N redials = N reapers racing on shared Qdrant state. Either:
 - (a) single long-lived upstream process, gateway multiplexes WS clients onto it (preferred), or
 - (b) per-conn instances start with background services disabled (env gate), only a designated singleton runs them.

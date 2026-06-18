@@ -60,8 +60,31 @@ real fix** — re-prioritize before investing further in mcp-go keepalive tuning
 
 **Status**: tier-1 **PASSED 2026-06-17** (mcp-go `!7`, merged → `origin/main` `18b68e7`,
 pipeline 14207 green). `go test -race ./` green incl. the new singleflight/keepalive/liveness
-tests and origin's `TestWebSocketClient_DialReturnsFreshTransportPerCall`. Tier-2 (live) pending
-the loom-core bump below.
+tests and origin's `TestWebSocketClient_DialReturnsFreshTransportPerCall`.
+
+**Tier-2 live: RAN 2026-06-18 — assumption DISPROVEN, failure-mode branch triggered.**
+Bumped loom-core (`!724` → `main` `58fc1d2a`), rebuilt local daemon (`make install-core`),
+restarted (`launchctl kickstart`, PID 43583 on the keepalive binary). Two windows from
+`~/.config/loom/logs/daemon.err`:
+- Window-1 (02:02–02:17, fresh conns): 3 close-1006, 0 backoff arms — but this was
+  **restart-freshness**; the periodic kill cycle had not resumed yet.
+- Window-2 (02:18–03:16, ~57min, aged conns): **60 close-1006, 71 hub-transport failures +
+  71 prefer-hub fallbacks (exp backoff arming), 16 agent-visible -32603 over 57min**, BUT
+  **0 concurrent-batch failures** (`pending_failed>0` = 0).
+- **Smoking gun**: hub-transport failures arrive in **synchronized bursts of ~17 servers at
+  once, every ~8 min** (02:49 / 02:57 / 03:05 / 03:15). That is a **periodic forced kill of
+  all connections**, not staggered idle reaping — a 22s keepalive cannot prevent it (it only
+  detects: 11 app-level `hub keepalive: send failed` clears).
+
+**Verdict**: the load-bearing "idle reaping dominates" assumption is **wrong** for the residual.
+Slice 2 still delivered real value — the thundering herd is gone (singleflight: 0 concurrent
+pending_failed batches, was 8–10/burst), exponential backoff arms correctly, and raw closures
+dropped ~78% (74/15min → ~16/15min) — but the dominant residual closer is **hub-side forced
+periodic kills**. Per the failure-mode branch, **Slice 3 (hub stops spawning a server per WS
+connection; or fix max-connection-age / pod cycling) is now the priority lever**, not more
+keepalive tuning. Next scoping step: confirm the ~8-min cadence source on the hub
+(`kubectl logs -n loom-hub` around a burst boundary: Cloudflare max-age vs loom-hub pod/process
+cycle vs gateway reaper).
 
 **Mid-flight design correction**: while rebasing onto current `origin/main` I found the
 `fix/mcp-core-compat` merge had already decoupled `Dial` to return a **fresh transport per call**
