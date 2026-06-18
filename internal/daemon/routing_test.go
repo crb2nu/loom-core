@@ -241,3 +241,54 @@ func TestPreferHubBackoffHelpers(t *testing.T) {
 		t.Fatal("expected backoff to expire")
 	}
 }
+
+func TestPreferHubBackoffExponentialSchedule(t *testing.T) {
+	d := &Daemon{}
+
+	// dur<=0 selects the exponential schedule: base, 2x, 4x, ... capped at max.
+	want := []time.Duration{
+		preferHubBackoffBase,
+		preferHubBackoffBase * 2,
+		preferHubBackoffBase * 4,
+		preferHubBackoffBase * 8,
+	}
+	for i, w := range want {
+		got := d.nextPreferHubBackoff("agent_context")
+		if got != w {
+			t.Fatalf("failure %d: backoff = %v, want %v", i+1, got, w)
+		}
+	}
+
+	// Growth is capped at preferHubBackoffMax no matter how many failures.
+	for i := 0; i < 20; i++ {
+		got := d.nextPreferHubBackoff("agent_context")
+		if got > preferHubBackoffMax {
+			t.Fatalf("backoff %v exceeded cap %v", got, preferHubBackoffMax)
+		}
+	}
+	if got := d.nextPreferHubBackoff("agent_context"); got != preferHubBackoffMax {
+		t.Fatalf("saturated backoff = %v, want cap %v", got, preferHubBackoffMax)
+	}
+
+	// A hub success clears the streak, so the next failure starts from base.
+	d.clearPreferHubBackoff("agent_context")
+	if _, ok := d.preferHubBackoffStreak.Load("agent_context"); ok {
+		t.Fatal("expected streak cleared after success")
+	}
+	if got := d.nextPreferHubBackoff("agent_context"); got != preferHubBackoffBase {
+		t.Fatalf("post-reset backoff = %v, want base %v", got, preferHubBackoffBase)
+	}
+}
+
+func TestSetPreferHubBackoffExplicitDurLeavesStreak(t *testing.T) {
+	d := &Daemon{}
+	// An explicit dur (test override) must not advance the exponential streak.
+	d.setPreferHubBackoff("agent_context", 20*time.Millisecond)
+	if _, ok := d.preferHubBackoffStreak.Load("agent_context"); ok {
+		t.Fatal("explicit-dur backoff should not touch the failure streak")
+	}
+	// The exponential path still starts from base afterwards.
+	if got := d.nextPreferHubBackoff("agent_context"); got != preferHubBackoffBase {
+		t.Fatalf("backoff = %v, want base %v", got, preferHubBackoffBase)
+	}
+}

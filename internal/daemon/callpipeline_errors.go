@@ -166,6 +166,11 @@ func (p *callPipeline) recordSuccessMetrics(duration time.Duration) {
 	p.daemon.router.RecordSuccess(p.serverName, p.target, latencyMs)
 	p.daemon.metrics.RecordServerSuccess(p.serverName, p.targetStr)
 	p.daemon.metrics.RecordRequest(p.serverName, p.method, "success", p.targetStr, duration)
+	// A successful hub call means the hub recovered: reset the exponential
+	// prefer-hub backoff so the next failure starts from the base again.
+	if p.target == router.TargetHub {
+		p.daemon.clearPreferHubBackoff(p.serverName)
+	}
 }
 
 func (p *callPipeline) markLocalActivity() {

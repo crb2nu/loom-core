@@ -377,7 +377,7 @@ func (p *callPipeline) retryLocalAfterHubFailure(stage string, err error, req *m
 		p.daemon.hubClient.CloseConnection(p.serverName)
 	}
 
-	until := p.daemon.setPreferHubBackoff(p.serverName, preferHubBackoffDuration)
+	until := p.daemon.setPreferHubBackoff(p.serverName, 0)
 	p.daemon.logger.Warn("prefer-hub override transport failed; retrying local",
 		"server", p.serverName,
 		"stage", stage,

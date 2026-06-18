@@ -278,7 +278,7 @@ func (p *callPipeline) routeAndConnect() *mcp.Message {
 	if err := p.connectTargetWithTransportRetry(decision.Target, decision.Reason); err != nil {
 		if !p.hubDelegateActive && p.preferHubRetryEligible && !p.localRetryUsed && decision.Target == router.TargetHub && p.daemon.pool != nil {
 			p.localRetryUsed = true
-			until := p.daemon.setPreferHubBackoff(p.serverName, preferHubBackoffDuration)
+			until := p.daemon.setPreferHubBackoff(p.serverName, 0)
 			p.daemon.logger.Warn("prefer-hub override connect failed; retrying local",
 				"server", p.serverName,
 				"error", err,
