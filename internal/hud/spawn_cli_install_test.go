@@ -33,6 +33,25 @@ func TestAgentCLIInstallShell_GuardedAndPinned(t *testing.T) {
 	}
 }
 
+// TestAgentCLIInstallShell_AptWaitsForDpkgLock guards the Mills A2 probe
+// 2026-06-18 regression: on the harvester-vm path this snippet runs over SSH at
+// Start and races cloud-init's first-boot apt for the dpkg lock. The npm
+// bootstrap apt-get must pass DPkg::Lock::Timeout so it waits rather than
+// failing with "Could not get lock /var/lib/dpkg/lock-frontend".
+func TestAgentCLIInstallShell_AptWaitsForDpkgLock(t *testing.T) {
+	for _, agentType := range []string{"codex", "claude-code", "gemini"} {
+		got := agentCLIInstallShell(agentType)
+		for _, want := range []string{
+			"apt-get -o DPkg::Lock::Timeout=300 update",
+			"apt-get -o DPkg::Lock::Timeout=300 install -y nodejs npm",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("snippet for %s missing dpkg-lock wait %q:\n%s", agentType, want, got)
+			}
+		}
+	}
+}
+
 func TestAgentCLIInstallShell_UnknownIsEmpty(t *testing.T) {
 	if got := agentCLIInstallShell("mystery-agent"); got != "" {
 		t.Errorf("unknown agent type returned %q, want empty", got)
