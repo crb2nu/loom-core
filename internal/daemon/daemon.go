@@ -96,50 +96,51 @@ type hudAppStopper interface {
 
 // Daemon is the main Loom daemon.
 type Daemon struct {
-	cfg                 Config
-	fileCfg             FileConfig // File-based configuration
-	registry            *registry.Registry
-	repoRoot            string // Repository root for ${repo} expansion
-	procMgr             *process.Manager
-	pool                *pool.Pool
-	hubPool             *pool.Pool
-	router              *router.Router
-	hubRouter           *hubproto.Router // Domain-multiplexed envelope router for hub WebSocket
-	hubClient           *mcp.WebSocketClient
-	callLocks           gosync.Map // serverName -> *gosync.Mutex (serializes stdio request/response)
-	listener            net.Listener
-	logger              *slog.Logger
-	toolCache           *ToolCache
-	resourceCache       *ResourceCache
-	manifest            *ManifestManager                // Persistent tool cache
-	profiles            *profiles.Manager               // Tool profile manager
-	metadata            *registry.Metadata              // Tool metadata for enhanced descriptions
-	watcher             *sync.Watcher                   // File watcher for hot reload
-	syncManager         *sync.Manager                   // Sync manager for profile operations
-	metrics             *Metrics                        // Prometheus metrics
-	healthMonitor       *HealthMonitor                  // Server health monitoring
-	tunnelMgr           *TunnelManager                  // SSH tunnel management
-	respCache           *ResponseCache                  // Response cache for read-only tools
-	eventBus            *EventBus                       // Event bus for SSE streaming
-	runningServers      gosync.Map                      // serverName -> true; tracks process starts for event emission
-	httpServer          *http.Server                    // Streamable HTTP listener
-	httpStreamable      *mcp.StreamableHTTPServer       // Streamable HTTP transport handler
-	rbac                *RBACEnforcer                   // RBAC enforcer for tool access control
-	policy              *GatewayPolicyEnforcer          // Gateway policy enforcer for request hooks
-	audit               *AuditLogger                    // Structured audit logger
-	cost                *CostTracker                    // Usage tracking and attribution
-	otelMetrics         *DaemonOTelMetrics              // OTel metric instruments
-	oauth               *OAuthServer                    // OAuth 2.1 authorization server
-	authMiddleware      func(http.Handler) http.Handler // Auth middleware for HTTP (Phase 3)
-	routingPreferences  map[string]RoutingPreference    // Per-server routing overrides
-	preferHubBackoff    gosync.Map                      // serverName -> time.Time (temporarily suppresses prefer-hub override)
-	refreshGroup        singleflight.Group              // Deduplicates concurrent tool cache refreshes
-	hubAuthDisabled     bool                            // Auth-gated hub discovery disabled hub fallback
-	hubAuthBackoffUntil time.Time                       // Backoff window for auth-gated hub discovery
-	wg                  gosync.WaitGroup
-	done                chan struct{}
-	stopOnce            gosync.Once
-	stopErr             error
+	cfg                    Config
+	fileCfg                FileConfig // File-based configuration
+	registry               *registry.Registry
+	repoRoot               string // Repository root for ${repo} expansion
+	procMgr                *process.Manager
+	pool                   *pool.Pool
+	hubPool                *pool.Pool
+	router                 *router.Router
+	hubRouter              *hubproto.Router // Domain-multiplexed envelope router for hub WebSocket
+	hubClient              *mcp.WebSocketClient
+	callLocks              gosync.Map // serverName -> *gosync.Mutex (serializes stdio request/response)
+	listener               net.Listener
+	logger                 *slog.Logger
+	toolCache              *ToolCache
+	resourceCache          *ResourceCache
+	manifest               *ManifestManager                // Persistent tool cache
+	profiles               *profiles.Manager               // Tool profile manager
+	metadata               *registry.Metadata              // Tool metadata for enhanced descriptions
+	watcher                *sync.Watcher                   // File watcher for hot reload
+	syncManager            *sync.Manager                   // Sync manager for profile operations
+	metrics                *Metrics                        // Prometheus metrics
+	healthMonitor          *HealthMonitor                  // Server health monitoring
+	tunnelMgr              *TunnelManager                  // SSH tunnel management
+	respCache              *ResponseCache                  // Response cache for read-only tools
+	eventBus               *EventBus                       // Event bus for SSE streaming
+	runningServers         gosync.Map                      // serverName -> true; tracks process starts for event emission
+	httpServer             *http.Server                    // Streamable HTTP listener
+	httpStreamable         *mcp.StreamableHTTPServer       // Streamable HTTP transport handler
+	rbac                   *RBACEnforcer                   // RBAC enforcer for tool access control
+	policy                 *GatewayPolicyEnforcer          // Gateway policy enforcer for request hooks
+	audit                  *AuditLogger                    // Structured audit logger
+	cost                   *CostTracker                    // Usage tracking and attribution
+	otelMetrics            *DaemonOTelMetrics              // OTel metric instruments
+	oauth                  *OAuthServer                    // OAuth 2.1 authorization server
+	authMiddleware         func(http.Handler) http.Handler // Auth middleware for HTTP (Phase 3)
+	routingPreferences     map[string]RoutingPreference    // Per-server routing overrides
+	preferHubBackoff       gosync.Map                      // serverName -> time.Time (temporarily suppresses prefer-hub override)
+	preferHubBackoffStreak gosync.Map                      // serverName -> int (consecutive hub failures; drives exponential backoff)
+	refreshGroup           singleflight.Group              // Deduplicates concurrent tool cache refreshes
+	hubAuthDisabled        bool                            // Auth-gated hub discovery disabled hub fallback
+	hubAuthBackoffUntil    time.Time                       // Backoff window for auth-gated hub discovery
+	wg                     gosync.WaitGroup
+	done                   chan struct{}
+	stopOnce               gosync.Once
+	stopErr                error
 
 	// recentDenied is a ring buffer of the last 50 RBAC-denied calls for HUD visibility.
 	deniedMu     gosync.RWMutex
