@@ -1350,7 +1350,13 @@ servers:
       always_allow:
         - pm_risk_list
       env:
-        QDRANT_URL: "${env:QDRANT_URL:-http://localhost:6333}"
+        # Point at the shared in-cluster Qdrant + Morph embedder using the same
+        # env chain agent-context uses (see pkg/pm/config.go) so risks land in
+        # the store flexdeck reads read-only. mcp-pm reads AGENT_CONTEXT_EMBED_API_KEY
+        # via its embed-key fallback chain.
+        QDRANT_URL: "${env:QDRANT_URL:-http://192.168.50.176:6333}"
+        QDRANT_API_KEY: "${keychain:QDRANT_API_KEY}"
+        AGENT_CONTEXT_EMBED_API_KEY: "${keychain:MORPH_API_KEY}"
         PM_EMBED_PROVIDER: "${env:PM_EMBED_PROVIDER:-}"
         LOG_LEVEL: info
     targets:
@@ -1359,7 +1365,9 @@ servers:
         command: "${repo}/services/loom-core/bin/mcp-pm"
         args: []
         env:
-          QDRANT_URL: "${env:QDRANT_URL:-http://localhost:6333}"
+          QDRANT_URL: "${env:QDRANT_URL:-http://192.168.50.176:6333}"
+          QDRANT_API_KEY: "${env:QDRANT_API_KEY}"
+          AGENT_CONTEXT_EMBED_API_KEY: "${env:MORPH_API_KEY}"
 
   - name: alertmanager
     categories: [monitoring, alerting]
