@@ -92,3 +92,44 @@ make both no-ops on a future curated base image (Phase B1) or reused VM.
 
 Refs: `.loom/126`, `.loom/148`. Probe evidence: operator/mobile-hud logs
 2026-06-18 ~19:54–20:30 (`spawn-535f9751f6dc`, `spawn-b5b17bf8e67e`).
+
+---
+
+## Addendum 2026-06-19 — dpkg fix VERIFIED; A2 pipeline RUNS on k8s; scope-gate path bug fixed
+
+**Deploy + verify:** !728 merged (`9eaa420b`), built+rolled (operator
+`20260618-212510`, mobile-hud `20260618-212507`). Provisioning now reliably
+passes the dpkg race (confirmed across multiple re-probes).
+
+**k8s substrate works** (harvester-vm SSH agent-exec is separately broken for
+BOTH codex+claude — logged in memory; lower priority now). Direct probe
+`spawn-12af9269eabf` (codex, k8s): turn_count=1, real tokens. So the **real A2
+pipeline canary now runs on the default k8s substrate (no gitops flip needed)**.
+
+**Ran `loom mills pipelines canary --force` on k8s** (after freeing the research
+LLM `gemma4-26b-a4b-gptq` from a shared-GPU preemption by whisper — temp
+priority bump, reverted). Result `PIPE-MILLS-CANARY-20260619-142918`:
+`plan_slice ✓ → research ✓ → implement ✓` with a **real non-empty commit**
+(`400e4b5f`, only `testdata/mills-canary/heartbeat.md`) — the empty-MR class is
+gone. **Escalated at the post-implement `scope` gate.**
+
+**NEW BUG FOUND + FIXED (this MR) — scope gate absolute-vs-relative paths:**
+spawn stages report ABSOLUTE changed paths under the in-pod workdir
+(`/workspace/services/loom-core/testdata/mills-canary/heartbeat.md`), but
+`slice.files` + `canaryAllowedPaths` are repo-relative and `run.WorktreePath`
+is empty for spawns, so `isAllowed`'s literal compare never matched → scope
+false-failed on the real heartbeat.md commit → retried → retry made no change →
+`nonempty_diff` failed on the empty retry diff → escalation. DEBT-073 added the
+right allowlist path but in relative form, so it never matched the absolute
+`FilesChanged`. Fix: `pkg/mills/gates/scope.go` `isAllowed` now also matches an
+absolute changed path when it ends with a repo-relative allowed path on a
+segment boundary. Tests: `TestScope_AbsoluteSpawnPathsMatchRepoRelativeAllow`.
+
+**NEXT after this deploys:** re-run `loom mills pipelines canary --force` (k8s).
+Expect plan_slice→research→implement→tests→pr_self_review→mr→ci_watch→**merge**.
+The likely LAST gate is the **merge-405** (GitLab `PUT .../merge` 405 — issues
+#147/#148/#150; the k8s pipeline historically reached `merge`). DEBT-073 made it
+terminal+actionable; the root fix is the loom-core MR merge config (merge
+method / "pipelines must succeed" / approval rules / bot merge permission).
+Latent follow-up: retry-idempotency (a retried implement after a partial commit
+sees an empty diff) — masked once scope passes on attempt 1, but worth a guard.
