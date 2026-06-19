@@ -267,20 +267,56 @@ type mergeBody struct {
 	SHA                       string `json:"sha,omitempty"`
 }
 
+// mergeReadyTimeout bounds how long Merge re-attempts a 405 ("not mergeable
+// yet"). GitLab returns 405 on PUT .../merge while the MR's merge_status is
+// still settling AFTER its pipeline turned green — a TIMING race, not a
+// permanent config block. The operator's old behavior burned 3 verbatim
+// attempts in ~2s (escalations #147/#148/#150) — far too fast for GitLab to
+// flip merge_status to can_be_merged. We poll within the stage instead so the
+// timing-405 resolves to a real merge; a genuinely permanent 405 still
+// surfaces after the window and is escalated by the runner's terminal
+// classification.
+const mergeReadyTimeout = 2 * time.Minute
+
 // Merge implements pipeline.GitLabClient.
 func (c *GitLabClient) Merge(ctx context.Context, req pipeline.MergeRequestArgs) (pipeline.MergeResponse, error) {
 	if req.MRIID == 0 {
 		return pipeline.MergeResponse{}, errors.New("gitlab: MRIID required")
 	}
 	path := fmt.Sprintf("/projects/%s/merge_requests/%d/merge", c.projectPath(), req.MRIID)
-	var got mrResponse
-	if err := c.requestJSON(ctx, http.MethodPut, path, mergeBody{}, &got); err != nil {
-		return pipeline.MergeResponse{}, err
+	deadline := time.Now().Add(mergeReadyTimeout)
+	for {
+		var got mrResponse
+		err := c.requestJSON(ctx, http.MethodPut, path, mergeBody{}, &got)
+		if err == nil {
+			if got.MergeError != "" {
+				return pipeline.MergeResponse{}, fmt.Errorf("gitlab: merge failed: %s", got.MergeError)
+			}
+			return pipeline.MergeResponse{MergedSHA: got.SHA}, nil
+		}
+		// Only the not-mergeable-yet 405 is worth waiting on; any other error
+		// (auth, 409 conflict, etc.) is returned immediately.
+		if !isMergeNotReady(err) || !time.Now().Before(deadline) {
+			return pipeline.MergeResponse{}, err
+		}
+		select {
+		case <-ctx.Done():
+			return pipeline.MergeResponse{}, ctx.Err()
+		case <-time.After(c.cfg.PollInterval):
+		}
 	}
-	if got.MergeError != "" {
-		return pipeline.MergeResponse{}, fmt.Errorf("gitlab: merge failed: %s", got.MergeError)
+}
+
+// isMergeNotReady reports whether a merge error is GitLab's "not mergeable
+// yet" 405. Matched on the GitLab client's error shape ("status 405" /
+// "method not allowed") — deliberately not bare "405", which appears in
+// timestamps/IDs. Mirrors the runner's error_class merge-405 detection.
+func isMergeNotReady(err error) bool {
+	if err == nil {
+		return false
 	}
-	return pipeline.MergeResponse{MergedSHA: got.SHA}, nil
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "status 405") || strings.Contains(s, "method not allowed")
 }
 
 // ----- Cleanup -----
