@@ -134,6 +134,7 @@ type Daemon struct {
 	routingPreferences     map[string]RoutingPreference    // Per-server routing overrides
 	preferHubBackoff       gosync.Map                      // serverName -> time.Time (temporarily suppresses prefer-hub override)
 	preferHubBackoffStreak gosync.Map                      // serverName -> int (consecutive hub failures; drives exponential backoff)
+	localRecvTimeoutStreak gosync.Map                      // serverName -> *atomic.Int64 (consecutive local recv timeouts; trips transport teardown)
 	refreshGroup           singleflight.Group              // Deduplicates concurrent tool cache refreshes
 	hubAuthDisabled        bool                            // Auth-gated hub discovery disabled hub fallback
 	hubAuthBackoffUntil    time.Time                       // Backoff window for auth-gated hub discovery

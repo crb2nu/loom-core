@@ -43,15 +43,34 @@ func (p *callPipeline) transportFailure(stage string, err error, start time.Time
 	// failure or a real EOF/broken-pipe still means the subprocess
 	// channel is dead and must be respawned).
 	if p.target == router.TargetLocal && stage != "send" && isRPCTimeout(err) {
-		p.daemon.logger.Warn("local server recv timed out; subprocess kept alive",
-			"server", p.serverName, "tool", p.toolName, "error", err)
-		p.recordTransportSpanEvent("daemon.server.recv_timeout_no_restart",
+		streak := p.daemon.recordLocalRecvTimeout(p.serverName)
+		threshold := p.daemon.localRecvTimeoutBreakerThreshold()
+		if streak < threshold {
+			p.daemon.logger.Warn("local server recv timed out; subprocess kept alive",
+				"server", p.serverName, "tool", p.toolName, "streak", streak, "threshold", threshold, "error", err)
+			p.recordTransportSpanEvent("daemon.server.recv_timeout_no_restart",
+				attribute.String("server.name", p.serverName),
+				attribute.String("failure.stage", stage),
+				attribute.String("failure.error", err.Error()),
+				attribute.String("target", p.targetStr),
+				attribute.Int64("recv_timeout.streak", streak),
+			)
+			return p.internalError(err)
+		}
+		// Circuit breaker tripped: N consecutive recv timeouts mean the shared
+		// transport is desynced/stalled, not merely busy. Reset the streak and
+		// fall through to the full teardown below so the next request dials a
+		// fresh subprocess instead of hanging on a dead channel forever.
+		p.daemon.resetLocalRecvTimeout(p.serverName)
+		p.daemon.logger.Warn("local server recv timed out repeatedly; tearing down stalled transport",
+			"server", p.serverName, "tool", p.toolName, "streak", streak, "threshold", threshold, "error", err)
+		p.recordTransportSpanEvent("daemon.server.recv_timeout_breaker_tripped",
 			attribute.String("server.name", p.serverName),
 			attribute.String("failure.stage", stage),
 			attribute.String("failure.error", err.Error()),
 			attribute.String("target", p.targetStr),
+			attribute.Int64("recv_timeout.streak", streak),
 		)
-		return p.internalError(err)
 	}
 
 	// muxstdio.ErrDuplicateID means another concurrent caller registered
@@ -170,6 +189,12 @@ func (p *callPipeline) recordSuccessMetrics(duration time.Duration) {
 	// prefer-hub backoff so the next failure starts from the base again.
 	if p.target == router.TargetHub {
 		p.daemon.clearPreferHubBackoff(p.serverName)
+	}
+	// A successful local recv means the shared transport is healthy: clear any
+	// accumulated recv-timeout streak so transient slow calls don't trip the
+	// teardown breaker later.
+	if p.target == router.TargetLocal {
+		p.daemon.resetLocalRecvTimeout(p.serverName)
 	}
 }
 

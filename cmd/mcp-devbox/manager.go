@@ -15,6 +15,7 @@ import (
 	"github.com/crb2nu/loom/internal/devbox/detect"
 	"github.com/crb2nu/loom/internal/devbox/dockerfile"
 	"github.com/crb2nu/loom/internal/devbox/state"
+	"github.com/crb2nu/loom/pkg/env"
 )
 
 type managerConfig struct {
@@ -84,6 +85,19 @@ type manager struct {
 
 	// Async exec tracking
 	asyncExecs *asyncRegistry
+
+	// Async image-build tracking. Cold sandbox builds can take several
+	// minutes; the tracker lets ensureRunning return "build in progress"
+	// immediately instead of blocking the caller until the MCP/proxy
+	// call times out.
+	builds *buildTracker
+
+	// buildWg tracks async build goroutines. Shutdown does NOT wait on it:
+	// the underlying build runs detached cluster-side (the K8s backend
+	// re-derives its own background context), so gating daemon shutdown on a
+	// multi-minute build would stall restarts. The wg exists for test
+	// synchronization and future bounded draining.
+	buildWg sync.WaitGroup
 
 	// Per-project lifecycle lock prevents concurrent ensureRunning races (TOCTOU).
 	projectMu sync.Map // map[string]*sync.Mutex
@@ -245,6 +259,7 @@ func newManager(ctx context.Context, logger *slog.Logger, cfg managerConfig) (*m
 		defaultBackend: defaultBackend,
 		store:          store,
 		logger:         logger,
+		builds:         newBuildTracker(),
 	}, nil
 }
 
@@ -428,21 +443,36 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 		m.logger.Info("restarting stopped sandbox (hash match)", "project", projectName, "agent", agentID)
 		// Skip build, go straight to Start below
 	} else if entry == nil || entry.FingerprintHash != fp.Hash {
-		// Stale or missing: rebuild if hash changed
-		m.logger.Info("building sandbox image", "project", projectName, "hash", fp.Hash[:7])
+		// Stale or missing: image build required (cold start or fingerprint
+		// changed). Cold builds run `go mod download`, apk installs, and an
+		// image push that routinely take several minutes — far longer than
+		// the MCP/proxy call timeout. For the K8s backend (where the build
+		// pod is already detached from the request context) run the build in
+		// a background goroutine and return buildInProgressError so the
+		// caller gets an immediate, actionable "retry shortly" response
+		// instead of a hung call. Synchronous backends (docker, harvester-vm)
+		// keep the original inline build — their builds are fast or no-ops.
+		if m.asyncBuildEnabled() {
+			if id, err := m.ensureAsyncBuild(projectDir, projectName, tag, fp); err != nil || id == "" {
+				return "", err
+			}
+			// Build finished successfully on a prior call — fall through to Start.
+		} else {
+			m.logger.Info("building sandbox image", "project", projectName, "hash", fp.Hash[:7])
 
-		dockerfileContent, err := m.generateSandboxDockerfile(fp)
-		if err != nil {
-			return "", fmt.Errorf("generate dockerfile: %w", err)
-		}
+			dockerfileContent, err := m.generateSandboxDockerfile(fp)
+			if err != nil {
+				return "", fmt.Errorf("generate dockerfile: %w", err)
+			}
 
-		_, err = m.backend.Build(ctx, backend.BuildOpts{
-			Tag:        tag,
-			Dockerfile: dockerfileContent,
-			ContextDir: projectDir,
-		})
-		if err != nil {
-			return "", fmt.Errorf("build image: %w", err)
+			_, err = m.backend.Build(ctx, backend.BuildOpts{
+				Tag:        tag,
+				Dockerfile: dockerfileContent,
+				ContextDir: projectDir,
+			})
+			if err != nil {
+				return "", fmt.Errorf("build image: %w", err)
+			}
 		}
 	}
 
@@ -517,6 +547,61 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 	}
 
 	return containerID, nil
+}
+
+// asyncBuildEnabled reports whether cold image builds should run in a detached
+// goroutine (returning "build in progress" to the caller) rather than blocking.
+// Only the K8s backend benefits: its builds are minutes-long and already
+// detach the build pod from the request context. Docker and harvester-vm keep
+// the synchronous path (fast local builds / no-op builds respectively).
+// Set LOOM_DEVBOX_ASYNC_BUILD=0 to force the legacy synchronous behavior.
+func (m *manager) asyncBuildEnabled() bool {
+	if !env.Bool("LOOM_DEVBOX_ASYNC_BUILD", true) {
+		return false
+	}
+	return m.cfg.backendType == "k8s" || m.cfg.backendType == "kubernetes"
+}
+
+// ensureAsyncBuild drives the asynchronous build state machine for tag.
+//
+//   - Build still running (or just kicked off): returns ("", buildInProgressError).
+//   - Build finished with an error: returns ("", wrapped error) and clears the
+//     entry so the next call retries the build.
+//   - Build finished successfully: clears the entry and returns ("ready", nil)
+//     so the caller falls through to Start.
+func (m *manager) ensureAsyncBuild(projectDir, projectName, tag string, fp *detect.EnvFingerprint) (string, error) {
+	if bi := m.builds.lookup(tag); bi != nil && bi.done {
+		m.builds.clear(tag)
+		if bi.err != nil {
+			return "", fmt.Errorf("sandbox image build failed: %w", bi.err)
+		}
+		m.logger.Info("sandbox image build complete", "project", projectName, "tag", tag)
+		return "ready", nil
+	}
+
+	dockerfileContent, err := m.generateSandboxDockerfile(fp)
+	if err != nil {
+		return "", fmt.Errorf("generate dockerfile: %w", err)
+	}
+
+	bi, started := m.builds.startOrJoin(tag, &m.buildWg, func() error {
+		_, berr := m.backend.Build(context.Background(), backend.BuildOpts{
+			Tag:            tag,
+			Dockerfile:     dockerfileContent,
+			ContextDir:     projectDir,
+			PreferExisting: true,
+		})
+		if berr != nil {
+			m.logger.Warn("sandbox image build failed", "project", projectName, "tag", tag, "error", berr)
+			return berr
+		}
+		m.totalBuilds.Add(1)
+		return nil
+	})
+	if started {
+		m.logger.Info("building sandbox image (async)", "project", projectName, "hash", fp.Hash[:7], "tag", tag)
+	}
+	return "", &buildInProgressError{tag: tag, project: projectName, elapsed: time.Since(bi.startedAt), started: started}
 }
 
 func (m *manager) generateSandboxDockerfile(fp *detect.EnvFingerprint) ([]byte, error) {
@@ -698,7 +783,11 @@ func (m *manager) warmOnce(ctx context.Context) {
 		mu.Lock()
 		_, err = m.ensureRunning(ctx, projectDir, projectName, "")
 		mu.Unlock()
-		if err != nil {
+		if bip, ok := asBuildInProgress(err); ok {
+			// Expected on the warm path: the async build was kicked off (or is
+			// still running). A later tick promotes it to a ready sandbox.
+			m.logger.Info("warm pool: building project image", "project", projectName, "elapsed", bip.elapsed.Round(time.Second))
+		} else if err != nil {
 			m.logger.Warn("warm pool: failed to warm project", "project", projectName, "error", err)
 		} else {
 			m.logger.Info("warm pool: project ready", "project", projectName)

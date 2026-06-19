@@ -49,6 +49,9 @@ func (m *manager) handleExec(ctx context.Context, args map[string]any) (*mcp.Cal
 	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
 	mu.Unlock()
 	if err != nil {
+		if bip, ok := asBuildInProgress(err); ok {
+			return buildingResult(bip)
+		}
 		if m.metrics != nil {
 			m.metrics.errors.WithLabelValues("ensure_running").Inc()
 		}
@@ -335,6 +338,9 @@ func (m *manager) handleReadFile(ctx context.Context, args map[string]any) (*mcp
 	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
 	mu.Unlock()
 	if err != nil {
+		if bip, ok := asBuildInProgress(err); ok {
+			return buildingResult(bip)
+		}
 		return mcp.ErrorResult(fmt.Errorf("ensure sandbox: %w", err)), nil
 	}
 
@@ -396,6 +402,9 @@ func (m *manager) handleWriteFile(ctx context.Context, args map[string]any) (*mc
 	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
 	mu.Unlock()
 	if err != nil {
+		if bip, ok := asBuildInProgress(err); ok {
+			return buildingResult(bip)
+		}
 		return mcp.ErrorResult(fmt.Errorf("ensure sandbox: %w", err)), nil
 	}
 
