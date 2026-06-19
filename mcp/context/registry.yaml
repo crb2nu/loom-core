@@ -1339,6 +1339,28 @@ servers:
           ICC_BASE_URL: "${env:ICC_BASE_URL:-http://localhost:8765}"
           ICC_MCP_WRITE_ENABLED: "${env:ICC_MCP_WRITE_ENABLED:-}"
 
+  - name: pm
+    categories: [pm, workbench, local-only]
+    common:
+      description: Minimal project-management store (risks domain). Risks are keyed by canonical GitLab path_with_namespace (e.g. "services/flexdeck") and persisted in the pm_risks Qdrant collection.
+      hint: Use to track project risks. pm_risk_create/list/update/link. Likelihood/impact = low|medium|high; status = identified|mitigating|accepted|closed. Writes are decoupled from embedding (a risk persists even when the embedder is down).
+      command: "${repo}/services/loom-core/bin/mcp-pm"
+      args: []
+      timeout: 60
+      always_allow:
+        - pm_risk_list
+      env:
+        QDRANT_URL: "${env:QDRANT_URL:-http://localhost:6333}"
+        PM_EMBED_PROVIDER: "${env:PM_EMBED_PROVIDER:-}"
+        LOG_LEVEL: info
+    targets:
+      vscode:
+        type: stdio
+        command: "${repo}/services/loom-core/bin/mcp-pm"
+        args: []
+        env:
+          QDRANT_URL: "${env:QDRANT_URL:-http://localhost:6333}"
+
   - name: alertmanager
     categories: [monitoring, alerting]
     common:
