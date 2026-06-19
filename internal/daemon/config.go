@@ -497,6 +497,22 @@ type ProxyConfig struct {
 
 	// IdleExitSeconds is how long an idle proxy waits for MCP messages before exiting (default: 1800)
 	IdleExitSeconds int `yaml:"idle_exit_seconds,omitempty"`
+
+	// ToolCaps overrides MaxToolResultBytes for specific proxied tools or
+	// whole servers. The most specific match wins: an entry with both
+	// server and tool beats a server-wide entry (Tool empty or "*"), which
+	// beats the global MaxToolResultBytes. Use it to cap a verbose tool
+	// flagged by the flightdeck bench (e.g. gitlab/list_pipeline_jobs)
+	// without lowering the global limit.
+	ToolCaps []ToolCap `yaml:"tool_caps,omitempty"`
+}
+
+// ToolCap caps the text size of a single proxied tool's result, or of all
+// tools on a server when Tool is empty or "*". MaxBytes <= 0 is ignored.
+type ToolCap struct {
+	Server   string `yaml:"server"`
+	Tool     string `yaml:"tool,omitempty"`
+	MaxBytes int    `yaml:"max_bytes"`
 }
 
 // RoutingConfig controls per-server routing preferences.

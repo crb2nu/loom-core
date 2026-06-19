@@ -171,10 +171,13 @@ func handleProxyToolsCall(ctx context.Context, daemon mcp.Transport, msg *mcp.Me
 
 	// Guardrail: prevent oversized tool responses from breaking MCP clients.
 	// Some clients impose line/response size limits; large logs can cause parse failures.
+	// The text cap is per-(server, tool) when a ToolCap override is configured,
+	// else the global limit — this is the lever the flightdeck bench's chatty-tool
+	// candidates feed into (cap a verbose tool, then verify the saving).
 	if resp.Error == nil && len(resp.Result) > 0 {
 		var result mcp.CallToolResult
 		if err := json.Unmarshal(resp.Result, &result); err == nil {
-			if truncateCallToolResult(&result, proxyMaxToolResultBytes(), proxyMaxImageResultBytes()) {
+			if truncateCallToolResult(&result, proxyMaxToolResultBytesFor(serverName, toolName), proxyMaxImageResultBytes()) {
 				return mcp.NewResponse(resp.ID, result)
 			}
 		}
