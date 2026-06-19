@@ -326,6 +326,51 @@ func TestMerge_RequiresMRIID(t *testing.T) {
 	}
 }
 
+// TestMerge_RetriesNotMergeableYet405 guards the Mills A2 north-star regression
+// (escalations #147/#148/#150): GitLab returns 405 on PUT .../merge while the
+// MR's merge_status is still settling after CI turned green — a timing race.
+// Merge must poll past the transient 405 and succeed, not fail on the first hit.
+func TestMerge_RetriesNotMergeableYet405(t *testing.T) {
+	calls := 0
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/7/merge": func(_ *http.Request) (int, any) {
+			calls++
+			if calls < 3 {
+				return 405, map[string]any{"message": "405 Method Not Allowed"}
+			}
+			return 200, mrResponse{IID: 7, SHA: "deadbeef"}
+		},
+	})
+	resp, err := cli.Merge(context.Background(), pipeline.MergeRequestArgs{MRIID: 7})
+	if err != nil {
+		t.Fatalf("merge should succeed after transient 405s: %v", err)
+	}
+	if resp.MergedSHA != "deadbeef" {
+		t.Errorf("sha = %q, want deadbeef", resp.MergedSHA)
+	}
+	if calls != 3 {
+		t.Errorf("expected 3 attempts (2x405 then 200), got %d", calls)
+	}
+}
+
+// TestMerge_NonRetryableErrorReturnsImmediately verifies a non-405 error
+// (e.g. 409 conflict) is NOT swallowed by the merge-readiness poll.
+func TestMerge_NonRetryableErrorReturnsImmediately(t *testing.T) {
+	calls := 0
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/8/merge": func(_ *http.Request) (int, any) {
+			calls++
+			return 409, map[string]any{"message": "409 Conflict"}
+		},
+	})
+	if _, err := cli.Merge(context.Background(), pipeline.MergeRequestArgs{MRIID: 8}); err == nil {
+		t.Error("expected 409 conflict to return an error")
+	}
+	if calls != 1 {
+		t.Errorf("non-405 error should not retry; got %d attempts", calls)
+	}
+}
+
 // ----- Cleanup -----
 
 func TestCleanup_DeletesSourceBranch(t *testing.T) {
