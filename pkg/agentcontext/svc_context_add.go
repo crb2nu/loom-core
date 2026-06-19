@@ -168,6 +168,7 @@ func (cs *ContextSvc) buildContextEntry(session *Session, m map[string]any, titl
 		AgentID:       session.AgentID,
 		SessionID:     session.ID,
 		Namespace:     session.Namespace,
+		Project:       canonicalProject(session.Project, session.Namespace, session.PipelineRef),
 		EntryType:     EntryType(toString(m["entry_type"])),
 		Timestamp:     ts,
 		Title:         title,

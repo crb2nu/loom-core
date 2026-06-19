@@ -136,6 +136,10 @@ type ContextEntry struct {
 	AgentID   string `json:"agent_id"`
 	SessionID string `json:"session_id"`
 	Namespace string `json:"namespace,omitempty"`
+	// Project is the canonical project identifier (= GitLab path_with_namespace),
+	// stamped from the owning session so entries can be filtered per project
+	// (e.g. decisions surfaced in flexdeck's /projects federation).
+	Project string `json:"project,omitempty"`
 
 	// Entry metadata
 	EntryType EntryType `json:"entry_type"`
