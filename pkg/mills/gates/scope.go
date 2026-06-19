@@ -138,6 +138,23 @@ func isAllowed(path string, allowed allowedSet, allowTests bool) bool {
 	if _, ok := allowed.literals[cleaned]; ok {
 		return true
 	}
+	// Spawn-driven stages (k8s pod / harvester-vm) report ABSOLUTE changed
+	// paths under the in-pod/VM workdir (e.g.
+	// /workspace/services/loom-core/testdata/mills-canary/heartbeat.md), but
+	// slice.files + canaryAllowedPaths are repo-relative
+	// (testdata/mills-canary/heartbeat.md) and run.WorktreePath is empty for
+	// spawns, so the literal compare never matches and the gate false-fails on
+	// every spawn implement (Mills A2 canary 2026-06-19: real heartbeat.md
+	// commit flagged "outside slice scope" → retried → empty-diff cascade →
+	// escalation). Match an absolute changed path when it ends with a
+	// repo-relative allowed path on a path-segment boundary.
+	if filepath.IsAbs(cleaned) {
+		for lit := range allowed.literals {
+			if !filepath.IsAbs(lit) && lit != "." && strings.HasSuffix(cleaned, "/"+lit) {
+				return true
+			}
+		}
+	}
 	for _, pat := range allowed.globs {
 		if matched, _ := filepath.Match(pat, cleaned); matched {
 			return true

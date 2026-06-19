@@ -168,6 +168,42 @@ func TestScope_CanaryHeartbeatStillFailsForNonCanaryItems(t *testing.T) {
 	}
 }
 
+// TestScope_AbsoluteSpawnPathsMatchRepoRelativeAllow guards the Mills A2
+// canary 2026-06-19 regression: spawn-driven stages (k8s pod / harvester-vm)
+// report ABSOLUTE changed paths under the in-pod/VM workdir, but slice.files +
+// canaryAllowedPaths are repo-relative and run.WorktreePath is empty for
+// spawns. The gate must match an absolute changed path against a repo-relative
+// allowed path on a segment boundary, or every spawn implement false-fails.
+func TestScope_AbsoluteSpawnPathsMatchRepoRelativeAllow(t *testing.T) {
+	g := &Scope{}
+	// (a) canary fixture, absolute path, canary item → allowed via allowlist.
+	canary := fixtureItem(store.Slice{Name: "canary", Files: []string{"docs/changelog.md"}})
+	canary.Labels = []string{CanaryLabel}
+	out, _ := g.Evaluate(context.Background(), StageInput{
+		Item:         canary,
+		FilesChanged: []string{"/workspace/services/loom-core/testdata/mills-canary/heartbeat.md"},
+	})
+	if !out.Pass {
+		t.Errorf("absolute canary heartbeat path should pass for canary item: %+v", out)
+	}
+	// (b) slice file, absolute path → allowed via slice.files suffix match.
+	out, _ = g.Evaluate(context.Background(), StageInput{
+		Item:         fixtureItem(store.Slice{Name: "core", Files: []string{"pkg/auth/login.go"}}),
+		FilesChanged: []string{"/workspace/services/loom-core/pkg/auth/login.go"},
+	})
+	if !out.Pass {
+		t.Errorf("absolute in-slice path should pass: %+v", out)
+	}
+	// (c) absolute path NOT under any allowed repo-relative path → still fails.
+	out, _ = g.Evaluate(context.Background(), StageInput{
+		Item:         fixtureItem(store.Slice{Name: "core", Files: []string{"pkg/auth/login.go"}}),
+		FilesChanged: []string{"/workspace/services/loom-core/internal/secret/keys.go"},
+	})
+	if out.Pass {
+		t.Errorf("absolute out-of-scope path should still fail: %+v", out)
+	}
+}
+
 // ---------- PathPolicy ----------
 
 func TestPathPolicy_NoTouchPasses(t *testing.T) {
