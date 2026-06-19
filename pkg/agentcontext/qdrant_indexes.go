@@ -18,7 +18,7 @@ import (
 // keywordIndexesByKind lists the payload fields that need keyword indexes per
 // collection kind. The keys are Coll* constants from qdrant_registry.go.
 var keywordIndexesByKind = map[string][]string{
-	CollContext:    {"session_id", "agent_id", "entry_type", "visibility", "file_path", "namespace"},
+	CollContext:    {"session_id", "agent_id", "entry_type", "visibility", "file_path", "namespace", "project"},
 	CollSessions:   {"agent_id", "namespace", "status"},
 	CollTasks:      {"session_id", "agent_id", "status", "namespace", "project", "file_path"},
 	CollWorkflows:  {"status", "agent_id", "session_id"},

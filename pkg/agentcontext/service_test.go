@@ -286,6 +286,7 @@ func TestEntryToPayload(t *testing.T) {
 		AgentID:       "agent-456",
 		SessionID:     "session-789",
 		Namespace:     "test",
+		Project:       "services/flexdeck",
 		EntryType:     EntryTypeFinding,
 		Timestamp:     now,
 		Title:         "Test Finding",
@@ -315,6 +316,9 @@ func TestEntryToPayload(t *testing.T) {
 	if payload["embed_model"] != "text-embedding-ada-002" {
 		t.Errorf("payload embed_model = %v, want text-embedding-ada-002", payload["embed_model"])
 	}
+	if payload["project"] != "services/flexdeck" {
+		t.Errorf("payload project = %v, want services/flexdeck", payload["project"])
+	}
 	if payload["metadata"] == nil {
 		t.Error("payload metadata should not be nil")
 	}
@@ -328,6 +332,7 @@ func TestPayloadToEntry(t *testing.T) {
 		"agent_id":       "agent-456",
 		"session_id":     "session-789",
 		"namespace":      "test",
+		"project":        "services/flexdeck",
 		"entry_type":     "finding",
 		"timestamp":      now.Format(time.RFC3339Nano),
 		"title":          "Test Finding",
@@ -353,6 +358,9 @@ func TestPayloadToEntry(t *testing.T) {
 	}
 	if entry.EntryType != EntryTypeFinding {
 		t.Errorf("entry EntryType = %v, want finding", entry.EntryType)
+	}
+	if entry.Project != "services/flexdeck" {
+		t.Errorf("entry Project = %v, want services/flexdeck", entry.Project)
 	}
 	if entry.Title != "Test Finding" {
 		t.Errorf("entry Title = %v, want Test Finding", entry.Title)
