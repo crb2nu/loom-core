@@ -1788,6 +1788,12 @@ servers:
         DEVBOX_IDLE_TIMEOUT: "30m"
         DEVBOX_DEFAULT_CPU: "2"
         DEVBOX_DEFAULT_MEMORY_MB: "1024"
+        # Warm pool: pre-build these projects' sandbox images at daemon start
+        # (and rebuild in the background when their fingerprint changes) so the
+        # first interactive devbox_exec never pays the multi-minute cold build.
+        # Builds run asynchronously; with PreferExisting a cached image is a
+        # near-instant no-op. Comma-separated; override via env.
+        DEVBOX_WARM_PROJECTS: "${env:DEVBOX_WARM_PROJECTS:-loom-core}"
         # HUD integration (set to enable lifecycle event reporting):
         DEVBOX_HUD_ADDR: "${env:DEVBOX_HUD_ADDR:-localhost:3333}"
         # K8s backend (set DEVBOX_BACKEND=k8s to use):
