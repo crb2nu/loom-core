@@ -46,6 +46,51 @@ func proxyMaxToolResultBytes() int {
 	)
 }
 
+// minToolCapBytes is the floor for a per-tool cap; guards against a
+// pathological tiny cap that would leave no room for real content.
+const minToolCapBytes = 256
+
+// proxyMaxToolResultBytesFor resolves the text cap for a specific proxied
+// (server, tool): a configured ToolCap (most specific match) wins over the
+// global limit, so an explicit per-tool cap holds regardless of the global
+// default. Falls back to proxyMaxToolResultBytes() when nothing matches.
+func proxyMaxToolResultBytesFor(server, tool string) int {
+	if n, ok := lookupToolCap(proxyConfigGlobal.ToolCaps, server, tool); ok {
+		if n < minToolCapBytes {
+			return minToolCapBytes
+		}
+		return n
+	}
+	return proxyMaxToolResultBytes()
+}
+
+// lookupToolCap returns the most specific positive cap for (server, tool):
+// an exact server+tool entry wins over a server-wide entry (Tool "" or "*").
+// Entries with MaxBytes <= 0, or for a different server, are ignored.
+func lookupToolCap(caps []daemon.ToolCap, server, tool string) (int, bool) {
+	if server == "" {
+		return 0, false
+	}
+	serverWide := 0
+	haveServerWide := false
+	for _, c := range caps {
+		if c.MaxBytes <= 0 || c.Server != server {
+			continue
+		}
+		if tool != "" && c.Tool == tool {
+			return c.MaxBytes, true // exact match is most specific
+		}
+		if (c.Tool == "" || c.Tool == "*") && !haveServerWide {
+			serverWide = c.MaxBytes
+			haveServerWide = true
+		}
+	}
+	if haveServerWide {
+		return serverWide, true
+	}
+	return 0, false
+}
+
 func proxyMaxImageResultBytes() int {
 	return resolveProxyLimit(
 		loomProxyMaxImageResultBytesEnv,

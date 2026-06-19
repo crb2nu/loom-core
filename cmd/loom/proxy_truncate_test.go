@@ -168,6 +168,66 @@ func TestProxyMaxToolResultBytes_EnvOverridesConfig(t *testing.T) {
 	}
 }
 
+func TestLookupToolCap_Precedence(t *testing.T) {
+	caps := []daemon.ToolCap{
+		{Server: "gitlab", MaxBytes: 16000},                            // server-wide
+		{Server: "gitlab", Tool: "list_pipeline_jobs", MaxBytes: 8000}, // exact
+		{Server: "k8s_apps_k3s", Tool: "*", MaxBytes: 12000},           // server-wide via "*"
+		{Server: "flux", Tool: "flux_get_kustomizations", MaxBytes: 0}, // ignored (<=0)
+	}
+
+	tests := []struct {
+		name      string
+		server    string
+		tool      string
+		wantBytes int
+		wantOK    bool
+	}{
+		{"exact wins over server-wide", "gitlab", "list_pipeline_jobs", 8000, true},
+		{"server-wide applies when no exact", "gitlab", "other_tool", 16000, true},
+		{"server-wide via star", "k8s_apps_k3s", "k8s_get", 12000, true},
+		{"zero-byte entry ignored", "flux", "flux_get_kustomizations", 0, false},
+		{"unknown server", "prometheus", "query", 0, false},
+		{"empty server", "", "x", 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := lookupToolCap(caps, tc.server, tc.tool)
+			if ok != tc.wantOK || got != tc.wantBytes {
+				t.Errorf("lookupToolCap(%q,%q) = (%d,%v), want (%d,%v)",
+					tc.server, tc.tool, got, ok, tc.wantBytes, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestProxyMaxToolResultBytesFor(t *testing.T) {
+	os.Unsetenv(loomProxyMaxToolResultBytesEnv)
+	saved := proxyConfigGlobal
+	defer func() { proxyConfigGlobal = saved }()
+
+	proxyConfigGlobal = daemon.ProxyConfig{
+		MaxToolResultBytes: 48000,
+		ToolCaps: []daemon.ToolCap{
+			{Server: "gitlab", Tool: "list_pipeline_jobs", MaxBytes: 8192},
+			{Server: "tiny", Tool: "t", MaxBytes: 10}, // below floor
+		},
+	}
+
+	if got := proxyMaxToolResultBytesFor("gitlab", "list_pipeline_jobs"); got != 8192 {
+		t.Errorf("capped tool = %d, want 8192", got)
+	}
+	if got := proxyMaxToolResultBytesFor("gitlab", "uncapped"); got != 48000 {
+		t.Errorf("uncapped tool on capped server = %d, want global 48000", got)
+	}
+	if got := proxyMaxToolResultBytesFor("prometheus", "query"); got != 48000 {
+		t.Errorf("uncapped server = %d, want global 48000", got)
+	}
+	if got := proxyMaxToolResultBytesFor("tiny", "t"); got != minToolCapBytes {
+		t.Errorf("below-floor cap = %d, want floor %d", got, minToolCapBytes)
+	}
+}
+
 func TestProxyToolPageSize_DefaultAndClamp(t *testing.T) {
 	os.Unsetenv(loomProxyToolPageSizeEnv)
 	if got := proxyToolPageSize(); got != defaultToolPageSize {
