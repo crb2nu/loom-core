@@ -1,1 +1,0 @@
-import{K as t}from"./index-D2adXI58.js";async function c(s,e){try{return await s(),t.success(e.success),!0}catch(r){const n=r instanceof Error?r.message:String(r);return t.error(`${e.failurePrefix??"Action failed"}: ${n}`),!1}}export{c as r};
