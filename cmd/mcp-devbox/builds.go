@@ -56,6 +56,10 @@ func (t *buildTracker) startOrJoin(tag string, wg *sync.WaitGroup, run func() er
 	}
 	b := &buildInfo{tag: tag, startedAt: time.Now()}
 	t.builds[tag] = b
+	// Snapshot while still holding the lock and before the goroutine can run.
+	// Copying *b after unlocking races the goroutine's write of b.done/b.err
+	// (caught by -race in TestBuildTracker_DoneTransition/RestartsAfterDone).
+	snapshot := *b
 	t.mu.Unlock()
 
 	wg.Add(1)
@@ -68,8 +72,7 @@ func (t *buildTracker) startOrJoin(tag string, wg *sync.WaitGroup, run func() er
 		t.mu.Unlock()
 	}()
 
-	cp := *b
-	return &cp, true
+	return &snapshot, true
 }
 
 // clear removes a finished build entry so a later fingerprint change rebuilds.
