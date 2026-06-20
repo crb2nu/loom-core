@@ -12,6 +12,39 @@ import (
 	"github.com/crb2nu/loom/pkg/weaver"
 )
 
+// weaverQueryRequestFromParams decodes the JSON params of a
+// loom/weaver/query request into a weaver.QueryRequest. It is the single
+// source of truth for the wire->request mapping so every field forwarded
+// by callers (notably parent_session_id, which the Mills weaver
+// delegator sets to the pipeline run ID for session stitching) survives
+// the hop. Returns an error for malformed JSON or an empty query.
+func weaverQueryRequestFromParams(raw json.RawMessage) (weaver.QueryRequest, error) {
+	var params struct {
+		Query           string   `json:"query"`
+		Domains         []string `json:"domains,omitempty"`
+		MaxTokens       int      `json:"max_tokens,omitempty"`
+		AgentID         string   `json:"agent_id,omitempty"`
+		SessionID       string   `json:"session_id,omitempty"`
+		ParentSessionID string   `json:"parent_session_id,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return weaver.QueryRequest{}, fmt.Errorf("invalid params: %v", err)
+	}
+	if params.Query == "" {
+		return weaver.QueryRequest{}, fmt.Errorf("query is required")
+	}
+	return weaver.QueryRequest{
+		Query:           params.Query,
+		Domains:         params.Domains,
+		MaxTokens:       params.MaxTokens,
+		ParentSessionID: params.ParentSessionID,
+		Identity: openairesponses.ExecutionIdentity{
+			AgentID:   params.AgentID,
+			SessionID: params.SessionID,
+		},
+	}, nil
+}
+
 // handleWeaverQuery handles loom/weaver/query requests.
 func (d *Daemon) handleWeaverQuery(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
 	if d.weaver == nil {
@@ -19,30 +52,9 @@ func (d *Daemon) handleWeaverQuery(ctx context.Context, msg *mcp.Message) (*mcp.
 			"weaver is not enabled", nil), nil
 	}
 
-	var params struct {
-		Query     string   `json:"query"`
-		Domains   []string `json:"domains,omitempty"`
-		MaxTokens int      `json:"max_tokens,omitempty"`
-		AgentID   string   `json:"agent_id,omitempty"`
-		SessionID string   `json:"session_id,omitempty"`
-	}
-	if err := json.Unmarshal(msg.Params, &params); err != nil {
-		return newErrorResponse(msg.ID, mcp.InvalidParams,
-			fmt.Sprintf("invalid params: %v", err), nil), nil
-	}
-	if params.Query == "" {
-		return newErrorResponse(msg.ID, mcp.InvalidParams,
-			"query is required", nil), nil
-	}
-
-	req := weaver.QueryRequest{
-		Query:     params.Query,
-		Domains:   params.Domains,
-		MaxTokens: params.MaxTokens,
-		Identity: openairesponses.ExecutionIdentity{
-			AgentID:   params.AgentID,
-			SessionID: params.SessionID,
-		},
+	req, err := weaverQueryRequestFromParams(msg.Params)
+	if err != nil {
+		return newErrorResponse(msg.ID, mcp.InvalidParams, err.Error(), nil), nil
 	}
 
 	result, err := d.weaver.Query(ctx, req)
