@@ -2,10 +2,19 @@ package projectmeta
 
 import "strings"
 
+// workspaceNamespaceRoots are the top-level buckets a canonical project key is
+// rooted at (matching the workspace layout in AGENTS.md: services/<repo>,
+// libs/<repo>, labs/<repo>, platform/<repo>, private/<repo>; apps/<repo> is
+// retained for back-compat). The lifecycle-hook namespace minting validates
+// against the SAME set (pkg/generator/configs_hooks.go hookNamespaceVars) so a
+// namespace never canonicalizes to a non-workspace path segment like "Users"
+// or "agents".
 var workspaceNamespaceRoots = map[string]struct{}{
 	"apps":     {},
+	"labs":     {},
 	"libs":     {},
 	"platform": {},
+	"private":  {},
 	"services": {},
 }
 

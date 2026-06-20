@@ -2,6 +2,7 @@ package generator
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -37,6 +38,45 @@ func TestHookNamespaceVars_HandlesClaudeWorktrees(t *testing.T) {
 	// Existing standard worktree pattern must still be supported.
 	if !strings.Contains(got, "${WS_ROOT%%/.worktrees/*}") {
 		t.Errorf("hookNamespaceVars() lost standard-worktrees parameter expansion; got: %q", got)
+	}
+}
+
+// TestHookNamespaceVars_WorkspaceRootGuard executes the nsVars snippet across a
+// range of WS_ROOT values and asserts NS_PROJECT. Healthy workspace-rooted paths
+// (incl. worktree layouts) keep their 2-level project; degenerate / non-workspace
+// roots (a detached keepalive with WS_ROOT="/", or an agent running at ~ or
+// ~/workspace) are emptied so they never mint a phantom project ("Users",
+// "cblevins", "5f1b") into the flexdeck /projects federation.
+func TestHookNamespaceVars_WorkspaceRootGuard(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	snippet := hookNamespaceVars() + `; printf '%s' "$NS_PROJECT"`
+
+	cases := []struct {
+		wsRoot string
+		want   string
+	}{
+		{"/home/u/workspace/services/loom-core", "services/loom-core"},
+		{"/home/u/workspace/libs/fi-fhir", "libs/fi-fhir"},
+		{"/home/u/workspace/labs/fractal-agents", "labs/fractal-agents"},
+		{"/home/u/workspace/private/secrets-tool", "private/secrets-tool"},
+		{"/home/u/workspace/services/loom-core/.worktrees/feat-x", "services/loom-core"},
+		{"/home/u/workspace/services/loom-core/.claude/worktrees/agent-x", "services/loom-core"},
+		// Non-workspace / degenerate roots → emptied (no phantom project).
+		{"/Users/cblevins", ""},
+		{"/Users/cblevins/workspace", ""},
+		{"/", ""},
+	}
+	for _, tc := range cases {
+		cmd := exec.CommandContext(ctx, "sh", "-c", snippet)
+		cmd.Env = append(os.Environ(), "WS_ROOT="+tc.wsRoot)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("WS_ROOT=%q: snippet failed: %v", tc.wsRoot, err)
+		}
+		if got := string(out); got != tc.want {
+			t.Errorf("WS_ROOT=%q: NS_PROJECT=%q, want %q", tc.wsRoot, got, tc.want)
+		}
 	}
 }
 
