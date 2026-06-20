@@ -109,7 +109,7 @@ Verified May 2026 against the URLs above plus:
 | session-start | `SessionStart` | `notify` (turn-end keepalive) + `[[hooks.SessionStart]]` (hooks.json, GA 2026-05-07) | `SessionStart` | TS `sessionCreated` | `PreInvocation` | — |
 | session-end | `SessionEnd` *(per-session — was incorrectly `Stop`, fixed 2026-05-12)* | `notify` + keepalive-wrap deregister-on-exit (no `SessionEnd` event exists) | `SessionEnd` | TS `sessionDeleted` | `Stop` only when `fullyIdle=true` | — |
 | heartbeat | `PostToolUse` matcher `Bash\|Task` | `[[hooks.PostToolUse]]` (hooks.json) + `notify` (rate-limited stamp file) | `AfterTool` matcher `run_shell_command` | TS `toolExecuteAfter` | `PostToolUse` matcher `run_command\|manage_task\|invoke_subagent` | — |
-| task-sync | `PostToolUse` matcher `TaskCreate\|TaskUpdate\|TodoWrite` | — (no per-tool granularity) | — | — | — | — |
+| task-sync | `PostToolUse` matcher `TaskCreate\|TaskUpdate\|TodoWrite` | `[[hooks.PostToolUse]]` matcher `update_plan` (hooks.json) → `loom agent task-sync` (bridges Codex's native plan tool; reconciled by session+title) | — | — | — |
 | pre-tool-use telemetry | `PreToolUse` | — (use `[[hooks.PreToolUse]]` once we emit it) | `BeforeTool` | — | `PreToolUse` | — |
 | post-tool-use telemetry | `PostToolUse` (extras) | `notify` (telemetry_eventEmit extra) | `AfterTool` (extras) | TS `toolExecuteAfter` | `PostToolUse` | — |
 | GitOps policy guardrail | `PreToolUse` matcher `Bash` (block kubectl mutations) | — (proxy-enforced) | `BeforeTool` matcher `run_shell_command` | (plugin) | `PreToolUse` matcher `run_command` | (proxy-enforced) |

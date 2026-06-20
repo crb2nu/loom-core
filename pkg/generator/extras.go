@@ -26,6 +26,16 @@ type extraDescriptor struct {
 	// render the hook-block JSON. The template must produce a top-level
 	// JSON array of hook blocks ([{ "matcher": ..., "hooks": [...] }]).
 	templatePath string
+
+	// bootstrap, when true, lets this extra CREATE a target event slot that
+	// is currently empty (the default is append-only — enrich already-built
+	// slots, never bootstrap). Used by tool-matched extras that must run on a
+	// platform which has no built-in hook in that slot — e.g. Codex's
+	// `update_plan` task-sync, where Codex emits no PostToolUse heartbeat so
+	// the slot starts empty. A matched extra (it carries its own `matcher`)
+	// does not reintroduce the per-tool-call fork that an unmatched heartbeat
+	// would.
+	bootstrap bool
 }
 
 // extraDescriptors maps each known extra name to its dispatch metadata.
@@ -42,6 +52,18 @@ var extraDescriptors = map[string]extraDescriptor{
 	"postToolUse_taskSync": {
 		targetEvents: []string{"PostToolUse"},
 		templatePath: "extras/post_tool_use_task_sync.json.tmpl",
+	},
+	// Codex parity for the Claude TodoWrite bridge. Codex's native plan/todo
+	// tool is `update_plan`; a PostToolUse hook matched to it pipes the plan
+	// into `loom agent task-sync` (which the handler reconciles into tasks).
+	// Codex emits no PostToolUse heartbeat, so this must bootstrap the slot.
+	// Must be listed AFTER telemetry_eventEmit in a profile's extras so the
+	// unmatched telemetry walker (which only enriches non-empty slots) does
+	// not also inject into the freshly-bootstrapped PostToolUse.
+	"postToolUse_taskSyncPlan": {
+		targetEvents: []string{"PostToolUse"},
+		templatePath: "extras/post_tool_use_task_sync_plan.json.tmpl",
+		bootstrap:    true,
 	},
 	"postSessionEnd_retrospective": {
 		// Both Stop (Claude) and SessionEnd (Gemini) appear in target

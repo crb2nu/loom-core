@@ -180,6 +180,76 @@ func TestSyncTaskUpdate_ExtractsFields(t *testing.T) {
 	}
 }
 
+func TestMapPlanStatus(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"pending", "pending"},
+		{"in_progress", "in_progress"},
+		{"completed", "completed"},
+		{"done", "completed"},
+		{"", "pending"},
+		{"IN_PROGRESS", "in_progress"},
+		{"weird", "pending"},
+	}
+	for _, tt := range tests {
+		if got := mapPlanStatus(tt.in); got != tt.want {
+			t.Errorf("mapPlanStatus(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestHasTagAndNormalizeTitle(t *testing.T) {
+	if !hasTag([]string{"native-sync", "codex-plan"}, "codex-plan") {
+		t.Error("hasTag should find codex-plan")
+	}
+	if hasTag([]string{"native-sync"}, "codex-plan") {
+		t.Error("hasTag should not find absent tag")
+	}
+	if !hasTag([]string{"Codex-Plan"}, "codex-plan") {
+		t.Error("hasTag should be case-insensitive")
+	}
+	if got := normalizeTitle("  Ship The Widget  "); got != "ship the widget" {
+		t.Errorf("normalizeTitle = %q, want %q", got, "ship the widget")
+	}
+}
+
+func TestSyncUpdatePlan_ParsesPlan(t *testing.T) {
+	// Codex update_plan input: {explanation, plan:[{step,status}]}. Verify the
+	// plan array parses and statuses map as syncUpdatePlan expects (structural,
+	// mirroring TestSyncTodoWrite_ParsesTodos — the concrete AgentBridge can't
+	// be faked here).
+	input := map[string]any{
+		"explanation": "Working through the migration",
+		"plan": []any{
+			map[string]any{"step": "Scaffold the package", "status": "completed"},
+			map[string]any{"step": "Wire the handler", "status": "in_progress"},
+			map[string]any{"step": "Add tests", "status": "pending"},
+		},
+	}
+
+	planRaw, ok := input["plan"].([]any)
+	if !ok {
+		t.Fatal("expected plan []any")
+	}
+	if len(planRaw) != 3 {
+		t.Fatalf("plan length: got %d, want 3", len(planRaw))
+	}
+
+	// New (not-yet-tracked) non-completed steps are the ones that would be
+	// created; completed steps are skipped.
+	var creatable int
+	for _, raw := range planRaw {
+		step := raw.(map[string]any)
+		title := stringFromMap(step, "step")
+		status := mapPlanStatus(stringFromMap(step, "status"))
+		if title != "" && status != "completed" {
+			creatable++
+		}
+	}
+	if creatable != 2 {
+		t.Errorf("creatable steps: got %d, want 2 (in_progress + pending)", creatable)
+	}
+}
+
 func TestSyncTodoWrite_ParsesTodos(t *testing.T) {
 	// Verify the TodoWrite input structure can be parsed.
 	input := map[string]any{

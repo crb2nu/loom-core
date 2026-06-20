@@ -17,9 +17,11 @@ type taskSyncPayload struct {
 }
 
 // newAgentTaskSyncCmd creates the `loom agent task-sync` command.
-// It reads Claude Code PostToolUse hook JSON from stdin and forwards the
-// native task tool invocation to the HUD for bridging into the agent-context
-// task system.
+// It reads a PostToolUse hook payload (tool_name + tool_input) from stdin and
+// forwards the native task-tool invocation to the HUD for bridging into the
+// agent-context task system. Vendor-agnostic: it handles Claude Code's
+// TaskCreate/TaskUpdate/TodoWrite and Codex's update_plan — the HUD switches on
+// tool_name.
 func newAgentTaskSyncCmd() *cobra.Command {
 	var (
 		agentID string
@@ -28,13 +30,14 @@ func newAgentTaskSyncCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "task-sync",
-		Short: "Sync native Claude Code task tools to agent-context tasks",
-		Long: `Read PostToolUse hook JSON from stdin and forward native task tool
-invocations (TaskCreate, TaskUpdate, TodoWrite) to the HUD API for bridging
-into the agent-context task system.
+		Short: "Sync native agent task/plan tools to agent-context tasks",
+		Long: `Read a PostToolUse hook payload from stdin and forward the native
+task-tool invocation to the HUD API for bridging into the agent-context task
+system. Supported tools: Claude Code's TaskCreate / TaskUpdate / TodoWrite and
+Codex's update_plan (the HUD switches on tool_name).
 
-This command is designed to be called from a Claude Code PostToolUse hook.
-The hook pipes the tool invocation JSON to stdin.`,
+This command is designed to be called from a Claude Code or Codex PostToolUse
+hook. The hook pipes the tool invocation JSON to stdin.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			port := resolvePort(cmd)
 

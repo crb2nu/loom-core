@@ -75,6 +75,15 @@ func (d *FleetDomain) handleAgentTaskSync(w http.ResponseWriter, r *http.Request
 		}
 		syncedIDs = ids
 
+	case "update_plan":
+		// Codex's native plan/todo tool (parity with Claude's TodoWrite).
+		ids, err := d.syncUpdatePlan(agent, session.ID, req.ToolInput)
+		if err != nil {
+			d.deps.WriteError(w, http.StatusBadGateway, "failed to sync update_plan", err)
+			return
+		}
+		syncedIDs = ids
+
 	default:
 		d.deps.WriteError(w, http.StatusBadRequest, fmt.Sprintf("unsupported tool_name: %s", req.ToolName), nil)
 		return
@@ -224,4 +233,113 @@ func stringFromMap(m map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(s)
+}
+
+// syncUpdatePlan maps a Codex `update_plan` tool invocation to agent-context
+// tasks — the Codex counterpart of syncTodoWrite. Codex's update_plan input is
+// {explanation, plan:[{step, status}]} with status ∈ pending|in_progress|completed.
+//
+// update_plan resends the WHOLE evolving plan on every call, so this reconciles
+// by (session, normalized title): existing plan-sourced tasks get a status
+// update when it changed, and only genuinely-new steps are created. This avoids
+// the duplicate-per-call explosion the Claude TodoWrite path is prone to (it
+// re-creates every todo on each TodoWrite, and task IDs embed a timestamp so
+// they never collapse).
+func (d *FleetDomain) syncUpdatePlan(agent *bridge.AgentBridge, sessionID string, input map[string]any) ([]string, error) {
+	planRaw, ok := input["plan"].([]any)
+	if !ok {
+		return nil, nil
+	}
+
+	// Index existing plan-sourced tasks for this session by normalized title.
+	existing := map[string]bridge.TaskInfo{}
+	if tasks, err := agent.Tasks(sessionID); err == nil {
+		for _, t := range tasks {
+			if hasTag(t.Tags, "codex-plan") {
+				existing[normalizeTitle(t.Title)] = t
+			}
+		}
+	}
+
+	var syncedIDs []string
+	for _, raw := range planRaw {
+		step, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		title := stringFromMap(step, "step")
+		if title == "" {
+			continue
+		}
+		status := mapPlanStatus(stringFromMap(step, "status"))
+
+		if prev, found := existing[normalizeTitle(title)]; found {
+			if status != "" && !strings.EqualFold(prev.Status, status) {
+				if err := agent.UpdateTask(bridge.UpdateTaskParams{ID: prev.ID, Status: status}); err != nil {
+					d.deps.Logger().Warn("task-sync: update_plan status update failed", "title", title, "error", err)
+					continue
+				}
+			}
+			syncedIDs = append(syncedIDs, prev.ID)
+			continue
+		}
+
+		// A genuinely new step. Skip steps that are already completed — there is
+		// nothing left to track.
+		if status == "completed" {
+			continue
+		}
+		result, err := agent.CreateTask(bridge.CreateTaskParams{
+			SessionID: sessionID,
+			Title:     title,
+			Tags:      []string{"native-sync", "codex-plan"},
+		})
+		if err != nil {
+			d.deps.Logger().Warn("task-sync: update_plan create failed", "title", title, "error", err)
+			continue
+		}
+		if result == nil {
+			continue
+		}
+		syncedIDs = append(syncedIDs, result.TaskIDs...)
+		// CreateTask defaults to pending; promote in-progress steps.
+		if status == "in_progress" {
+			for _, id := range result.TaskIDs {
+				if err := agent.UpdateTask(bridge.UpdateTaskParams{ID: id, Status: "in_progress"}); err != nil {
+					d.deps.Logger().Warn("task-sync: update_plan promote-in-progress failed", "title", title, "error", err)
+				}
+			}
+		}
+	}
+	return syncedIDs, nil
+}
+
+// mapPlanStatus normalizes a Codex update_plan status to an agent-context task
+// status. Codex uses pending|in_progress|completed, which map 1:1.
+func mapPlanStatus(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "in_progress":
+		return "in_progress"
+	case "completed", "done":
+		return "completed"
+	case "pending", "":
+		return "pending"
+	default:
+		return "pending"
+	}
+}
+
+// normalizeTitle lowercases and trims a title for stable reconcile matching.
+func normalizeTitle(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// hasTag reports whether tag is present in tags (case-insensitive).
+func hasTag(tags []string, tag string) bool {
+	for _, t := range tags {
+		if strings.EqualFold(t, tag) {
+			return true
+		}
+	}
+	return false
 }
