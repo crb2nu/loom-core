@@ -25,6 +25,12 @@ type Config struct {
 	QdrantDistance string
 	Collection     string
 
+	// Read-only collections federated by pm_project_status (owned by
+	// agent-context; mcp-pm only scrolls them by `project`). Names default to
+	// and share env with agent-context so both point at the same data.
+	TasksCollection   string
+	ContextCollection string
+
 	// Embeddings (best-effort; reuses the agent-context env chain).
 	EmbedProvider string
 	EmbedAPIKey   string
@@ -48,6 +54,9 @@ func LoadConfigFromEnv() Config {
 		QdrantAPIKey:   env.StringChain([]string{"PM_QDRANT_API_KEY", "AGENT_CONTEXT_QDRANT_API_KEY", "QDRANT_API_KEY"}, ""),
 		QdrantDistance: env.StringChain([]string{"PM_QDRANT_DISTANCE", "AGENT_CONTEXT_QDRANT_DISTANCE"}, "Cosine"),
 		Collection:     env.StringChain([]string{"PM_RISKS_COLLECTION"}, RisksCollection),
+
+		TasksCollection:   env.StringChain([]string{"PM_TASKS_COLLECTION", "AGENT_CONTEXT_TASKS_COLLECTION"}, "agent_tasks_v1"),
+		ContextCollection: env.StringChain([]string{"PM_CONTEXT_COLLECTION", "AGENT_CONTEXT_COLLECTION"}, "agent_context_v1"),
 
 		EmbedProvider: strings.ToLower(env.StringChain(
 			[]string{"PM_EMBED_PROVIDER", "AGENT_CONTEXT_EMBED_PROVIDER", "CODEBASE_EMBED_PROVIDER"},

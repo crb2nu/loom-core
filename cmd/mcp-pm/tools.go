@@ -117,6 +117,32 @@ func registerTools(server *mcp.Server, svc *pm.Service) {
 	})
 
 	// =========================================================================
+	// pm_project_status
+	// =========================================================================
+	server.AddTool(mcp.Tool{
+		Name:        "pm_project_status",
+		Description: "Unified per-project rollup: open agent tasks, open risks, and recent decisions for one project, correlated by the canonical project key (GitLab path_with_namespace). The agent-facing equivalent of the flexdeck /projects view. Each source is error-isolated (one dead source returns empty + partial=true).",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"project": map[string]any{"type": "string", "description": "Canonical project key (GitLab path_with_namespace, e.g. \"services/loom-core\")."},
+			},
+			Required: []string{"project"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		v := validate.NewArgs(args)
+		project := v.Required("project")
+		if err := v.Validate(); err != nil {
+			return mcp.ErrorResult(err), nil
+		}
+		status, err := svc.ProjectStatus(ctx, project)
+		if err != nil {
+			return mcp.ErrorResult(err), nil
+		}
+		return mcp.JSONResult(status)
+	})
+
+	// =========================================================================
 	// pm_risk_link
 	// =========================================================================
 	server.AddTool(mcp.Tool{
