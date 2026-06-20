@@ -458,7 +458,7 @@
            CatalogPanel pattern; auto-clears on the next successful
            fetch (the store resets error to null at fetch start). -->
       <div class="error-banner" role="alert" aria-live="polite">
-        <span class="error-banner-icon" aria-hidden="true">\u26A0</span>
+        <span class="error-banner-icon" aria-hidden="true">{'\u26A0'}</span>
         <span class="error-banner-text">Memory refresh failed: {memoryStore.error}</span>
       </div>
     {/if}

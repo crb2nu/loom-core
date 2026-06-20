@@ -170,7 +170,7 @@
     <div class="catalog-toolbar">
       <FilterBar
         search={catalogStore.searchQuery}
-        placeholder="Search servers by name, description, or category\u2026"
+        placeholder={'Search servers by name, description, or category\u2026'}
         {filters}
         resultCount={sorted.length}
         onSearch={handleSearch}

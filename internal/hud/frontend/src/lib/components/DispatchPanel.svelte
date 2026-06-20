@@ -7,6 +7,7 @@
   import EmptyState from './shared/EmptyState.svelte';
   import MetricCard from './shared/MetricCard.svelte';
   import DispatchTaskModal from './presence/DispatchTaskModal.svelte';
+  import { parseNamespace } from '../utils/namespace.ts';
   import RecommendationsSection from './dispatch/RecommendationsSection.svelte';
   import MergeQueueSection from './dispatch/MergeQueueSection.svelte';
   import FileConflictsSection from './dispatch/FileConflictsSection.svelte';
@@ -198,12 +199,19 @@
           </thead>
           <tbody>
             {#each sortedAgents as agent (agent.agent_id)}
+              {@const ns = parseNamespace(agent.namespace)}
               <tr class:attention={agent.needs_attention}>
                 <td class="cell-agent" title={agent.agent_id}>{agent.agent_id}</td>
                 <td>
                   <span class="status-pill" style="color: {agentStatusColor(agent.status)}">{agent.status}</span>
                 </td>
-                <td class="cell-ns">{agent.namespace || '\u2014'}</td>
+                <td class="cell-ns" title={agent.namespace || 'No repository resolved (synthetic/fallback namespace).'}>
+                  {#if ns.synthetic}
+                    <span class="ns-muted">{'\u2014'}</span>
+                  {:else}
+                    {ns.repo}{#if ns.branch}<span class="ns-branch">/{ns.branch}</span>{/if}
+                  {/if}
+                </td>
                 <td class="cell-num">
                   {agent.task_count}
                   {#if agent.blocked_tasks > 0}
@@ -218,7 +226,7 @@
                     <span class="blocked-badge">{agent.blocked_by_others} blocked by</span>
                   {/if}
                   {#if agent.blocking_others === 0 && agent.blocked_by_others === 0}
-                    \u2014
+                    {'\u2014'}
                   {/if}
                 </td>
                 <td class="cell-num">
@@ -233,7 +241,7 @@
                   {:else if agent.merge_blockers?.length}
                     <span class="merge-blocked-badge">{agent.merge_blockers.length} blocker{agent.merge_blockers.length === 1 ? '' : 's'}</span>
                   {:else}
-                    \u2014
+                    {'\u2014'}
                   {/if}
                 </td>
                 <td>
@@ -508,6 +516,16 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--fg-dim);
+  }
+
+  .ns-muted {
+    color: var(--fg-muted, var(--fg-dim));
+    opacity: 0.6;
+  }
+
+  .ns-branch {
+    color: var(--fg-muted, var(--fg-dim));
+    opacity: 0.7;
   }
 
   .cell-num {
