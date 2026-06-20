@@ -760,11 +760,19 @@ ios:archive-export:
       - build/mobile/export/app-store/*.ipa
       - build/mobile/ExportOptions.app-store.plist
     expire_in: 1 week
+  # allow_failure keeps this manual job non-blocking: an un-triggered iOS
+  # archive must not leave every main pipeline stuck in "blocked/manual".
+  # The server image builds (below) run on_success regardless, but a blocking
+  # manual job prevents the pipeline from ever reaching "success", which
+  # confuses operators and any pipeline-success automation. The job stays
+  # manually triggerable for actual App Store builds.
   rules:
     - if: '$CI_COMMIT_TAG'
       when: manual
+      allow_failure: true
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
+      allow_failure: true
     - when: never
 
 build:image:loom-core:
