@@ -140,9 +140,20 @@ func (k *K8sBackend) pipeTarIntoPod(ctx context.Context, podName string, payload
 		return fmt.Errorf("create sync executor: %w", err)
 	}
 
+	// Stdout MUST be drained. PodExecOptions requests a stdout stream
+	// (Stdout: true), and stdin/stdout share the SPDY connection's
+	// flow-control window. Without a Stdout reader here, the undrained
+	// stdout stream fills the window once the payload exceeds the initial
+	// flow-control budget, which back-pressures the stdin send so `tar xzf`
+	// never receives the full archive, never exits, and StreamWithContext
+	// deadlocks until the context timeout. Small payloads fit in the initial
+	// window and slip through, so the bug only manifests on large workspaces
+	// (e.g. loom-core), presenting as a ~timeout-long hang on otherwise
+	// healthy nodes. io.Discard drains stdout without retaining it.
 	var stderr bytes.Buffer
 	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
 		Stdin:  bytes.NewReader(payload),
+		Stdout: io.Discard,
 		Stderr: &stderr,
 	}); err != nil {
 		return fmt.Errorf("sync workspace: %w (%s)", err, strings.TrimSpace(stderr.String()))
