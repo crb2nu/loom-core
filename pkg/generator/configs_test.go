@@ -539,17 +539,38 @@ func TestGenerateHooksConfig_CodexEmitsHooksJSON(t *testing.T) {
 		t.Error("codex hooks.json must NOT contain SubagentStart (Claude-only event)")
 	}
 
-	// Codex hooks.json must NOT contain a PostToolUse heartbeat. With
-	// heartbeat_matcher = "" (no narrowing), a PostToolUse hook fires
-	// synchronously on every tool call, forking `loom agent heartbeat`
-	// each time — each fork pays for shell bootstrap (git rev-parse +
-	// jq + cksum + file I/O) and a loom binary cold-start, which makes
-	// the codex TUI visibly bounce per tool call. notify + keepalive-wrap
-	// already cover session keepalive in the background. See the codex
-	// profile in platform_profiles.yaml (heartbeat_event: "").
-	if _, found := hooks["PostToolUse"]; found {
-		t.Error("codex hooks.json must NOT contain PostToolUse (per-tool heartbeat causes TUI bounce; notify + keepalive-wrap cover keepalive)")
+	// Codex hooks.json must NOT contain an UNMATCHED PostToolUse heartbeat:
+	// with no narrowing matcher a hook fires synchronously on every tool call,
+	// forking `loom agent heartbeat` each time — each fork pays for a shell
+	// bootstrap (git rev-parse + jq + cksum + file I/O) and a loom binary
+	// cold-start, bouncing the codex TUI per tool call. A TOOL-MATCHED
+	// PostToolUse hook IS allowed (and used): the `update_plan` task-sync
+	// bridge fires only on Codex plan updates (parity with Claude TodoWrite).
+	// So every PostToolUse block must carry a non-empty matcher and none may
+	// fork `agent heartbeat`. See platform_profiles.yaml (heartbeat_event: "")
+	// and the postToolUse_taskSyncPlan extra.
+	if ptu, found := hooks["PostToolUse"]; found {
+		blocks, _ := ptu.([]any)
+		for _, raw := range blocks {
+			b, _ := raw.(map[string]any)
+			if strings.TrimSpace(stringFromAny(b["matcher"])) == "" {
+				t.Error("codex PostToolUse must not contain an unmatched (heartbeat) block — matcher is empty")
+			}
+			inner, _ := b["hooks"].([]any)
+			for _, hraw := range inner {
+				h, _ := hraw.(map[string]any)
+				if cmd := stringFromAny(h["command"]); strings.Contains(cmd, "agent heartbeat") {
+					t.Errorf("codex PostToolUse must not fork `agent heartbeat` (per-tool TUI bounce); cmd=%q", cmd)
+				}
+			}
+		}
 	}
+}
+
+// stringFromAny returns v as a string, or "" if it is not a string.
+func stringFromAny(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func TestGenerateHooksConfig_CodexUsesExplicitLoomBinary(t *testing.T) {

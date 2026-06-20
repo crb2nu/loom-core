@@ -338,8 +338,14 @@ func appendHookExtras(hooks map[string]any, hp HookProfile, loomBinary string) {
 				existing, ok := hooks[evt].([]map[string]any)
 				if !ok || len(existing) == 0 {
 					// Extras only enrich already-built event slots — they
-					// don't bootstrap empty slots. Matches legacy behavior.
-					continue
+					// don't bootstrap empty slots (legacy behavior) — UNLESS
+					// the descriptor opts in via bootstrap (a tool-matched
+					// extra that must run where the platform has no built-in
+					// hook, e.g. Codex update_plan task-sync).
+					if !descriptor.bootstrap {
+						continue
+					}
+					existing = nil
 				}
 				hooks[evt] = append(existing, rendered...)
 			}

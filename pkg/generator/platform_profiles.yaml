@@ -162,7 +162,13 @@ platforms:
       # buildPlatformHooks gates the block on a non-empty event name.
       heartbeat_event: ""
       heartbeat_matcher: ""
-      extras: ["telemetry_eventEmit"]
+      # postToolUse_taskSyncPlan: bridge Codex's native `update_plan` tool into
+      # agent-context tasks (parity with Claude's TodoWrite). Matched to
+      # `update_plan` only, so it fires on plan updates — NOT every tool call —
+      # avoiding the per-tool-call fork that ruled out a PostToolUse heartbeat
+      # here. Listed AFTER telemetry_eventEmit so the unmatched telemetry walker
+      # doesn't also inject into the freshly-bootstrapped PostToolUse slot.
+      extras: ["telemetry_eventEmit", "postToolUse_taskSyncPlan"]
     loom_proxy:
       agent_hint: "codex"
       tool_profile: "llm-core"

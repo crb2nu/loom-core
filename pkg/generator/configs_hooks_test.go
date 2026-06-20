@@ -587,6 +587,77 @@ func hooksConfigContainsRetro(t *testing.T, cfg map[string]any) bool {
 	return false
 }
 
+// TestCodexHooks_UpdatePlanTaskSyncBridge verifies Codex's update_plan task-sync
+// parity (the Codex counterpart of Claude's TodoWrite bridge): the codex
+// hooks.json carries a PostToolUse block matched to `update_plan` that pipes to
+// `loom agent task-sync`, and that block does NOT also carry an unmatched
+// event-emit hook (which would reintroduce the per-tool-call fork the profile
+// deliberately avoids). Also confirms the new hook is covered by a [hooks.state]
+// trust entry so Codex doesn't silently drop it.
+func TestCodexHooks_UpdatePlanTaskSyncBridge(t *testing.T) {
+	profile, err := GetPlatformProfile("codex")
+	if err != nil || profile == nil {
+		t.Fatalf("get codex profile: %v", err)
+	}
+
+	cfg := hooksConfigFromProfile(testRegistry(), profile, "loom")
+	hooks, ok := cfg["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("hooks config missing hooks map: %#v", cfg)
+	}
+	ptu, ok := hooks["PostToolUse"].([]map[string]any)
+	if !ok || len(ptu) == 0 {
+		t.Fatalf("codex PostToolUse missing (update_plan task-sync not bootstrapped); hooks=%v", hooks)
+	}
+
+	var foundUpdatePlan bool
+	for _, b := range ptu {
+		matcher, _ := b["matcher"].(string)
+		cmd := firstHookCommandString(b)
+		if matcher == "update_plan" {
+			foundUpdatePlan = true
+			if !strings.Contains(cmd, "agent task-sync") {
+				t.Errorf("update_plan block must pipe to `agent task-sync`; got: %q", cmd)
+			}
+		}
+		// No block in codex PostToolUse may carry an unmatched per-tool telemetry
+		// fork (the reason a PostToolUse heartbeat was rejected for codex).
+		if strings.Contains(cmd, "event-emit") {
+			t.Errorf("codex PostToolUse must not carry an event-emit hook (per-tool fork); matcher=%q cmd=%q", matcher, cmd)
+		}
+	}
+	if !foundUpdatePlan {
+		t.Errorf("codex PostToolUse missing `update_plan` matcher block; got %d blocks", len(ptu))
+	}
+
+	// The new hook must be self-trusted, else Codex v0.129+ silently drops it.
+	entries, err := ComputeCodexHookTrust("/home/u/.codex/hooks.json", cfg)
+	if err != nil {
+		t.Fatalf("ComputeCodexHookTrust: %v", err)
+	}
+	var trusted bool
+	for _, e := range entries {
+		if strings.Contains(strings.ToLower(e.Key), "post_tool_use") {
+			trusted = true
+			break
+		}
+	}
+	if !trusted {
+		t.Errorf("no [hooks.state] trust entry references PostToolUse; entries=%v", entries)
+	}
+}
+
+// firstHookCommandString returns the command string of a hook block's first
+// hook entry ({matcher, hooks:[{type:command, command:"..."}]}).
+func firstHookCommandString(block map[string]any) string {
+	inner, ok := block["hooks"].([]map[string]any)
+	if !ok || len(inner) == 0 {
+		return ""
+	}
+	cmd, _ := inner[0]["command"].(string)
+	return cmd
+}
+
 // TestHooksConfigFromProfile_RetroOptIn_Claude verifies the
 // postSessionEnd_retrospective extra is opt-in for Claude: absent by default,
 // present when the profile's extras list includes it. This pins the opt-in
