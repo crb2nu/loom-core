@@ -2,6 +2,7 @@
 package hud
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
@@ -100,12 +101,39 @@ func (f *fleetDepsAdapter) SpawnSnapshots() []fleet.SpawnEconomicsSnapshot {
 }
 
 // WeaverMetrics reports weaver counter aggregates plus a reachability flag.
-// The HUD App does not currently hold a weaver client (weaver lives in the
-// daemon), so this returns (zero, false) and the F8 local-utilization ratio
-// renders "weaver_metrics_unreachable" rather than fake data. Threading a
-// weaver fetcher through here is a follow-up slice.
+// Weaver lives in the daemon, so we fetch lifetime metrics over the same
+// daemon IPC bridge the weaver HUD domain uses (loom/weaver/metrics). A
+// successful call — even with zero counters (weaver enabled but quiet) —
+// returns reachable=true so the F8 local-utilization ratio renders
+// "insufficient_data"; a nil bridge or transport error returns
+// reachable=false so it renders "weaver_metrics_unreachable".
 func (f *fleetDepsAdapter) WeaverMetrics() (fleet.WeaverMetricsView, bool) {
-	return fleet.WeaverMetricsView{}, false
+	if f.app.client == nil {
+		return fleet.WeaverMetricsView{}, false
+	}
+	raw, err := f.app.client.Call("loom/weaver/metrics", nil)
+	if err != nil {
+		return fleet.WeaverMetricsView{}, false
+	}
+	return weaverMetricsViewFromJSON(raw)
+}
+
+// weaverMetricsViewFromJSON decodes a loom/weaver/metrics summary
+// (pkg/weaver.Metrics.Summary) into the fleet economics view. Returns
+// reachable=false only when the payload can't be parsed; a well-formed
+// payload with zero counters is still reachable (weaver enabled but quiet).
+func weaverMetricsViewFromJSON(raw json.RawMessage) (fleet.WeaverMetricsView, bool) {
+	var summary struct {
+		TotalQueries int64 `json:"total_queries"`
+		TotalTokens  int64 `json:"total_tokens"`
+	}
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return fleet.WeaverMetricsView{}, false
+	}
+	return fleet.WeaverMetricsView{
+		TotalQueries: int(summary.TotalQueries),
+		TotalTokens:  int(summary.TotalTokens),
+	}, true
 }
 
 // fleetNudgeAdapter wraps *NudgeQueue to satisfy fleet.NudgeQueueOps,
