@@ -64,6 +64,12 @@ func (c *MorphClient) EmbedDocuments(ctx context.Context, texts []string) ([][]f
 	payload := map[string]any{
 		"model": c.model,
 		"input": texts,
+		// Send the OpenAI default explicitly. When omitted, some proxies
+		// (e.g. litellm) forward `encoding_format: null` to the backend, and
+		// llama.cpp's OpenAI-compat server (b8173) rejects a null with
+		// HTTP 500 "type must be string, but is null". An explicit "float"
+		// avoids that across the morph primary and the flexinfer fallback.
+		"encoding_format": "float",
 	}
 	body, _ := json.Marshal(payload)
 

@@ -24,8 +24,9 @@ func TestFlexInferClient_EmbedQuery(t *testing.T) {
 		}
 
 		var req struct {
-			Model string   `json:"model"`
-			Input []string `json:"input"`
+			Model          string   `json:"model"`
+			Input          []string `json:"input"`
+			EncodingFormat string   `json:"encoding_format"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -33,6 +34,9 @@ func TestFlexInferClient_EmbedQuery(t *testing.T) {
 		}
 		if req.Model != "BAAI/bge-large-en-v1.5" {
 			t.Errorf("unexpected model: %s", req.Model)
+		}
+		if req.EncodingFormat != "float" {
+			t.Errorf("expected encoding_format=float, got %q", req.EncodingFormat)
 		}
 
 		resp := map[string]any{
@@ -62,12 +66,16 @@ func TestFlexInferClient_EmbedQuery(t *testing.T) {
 func TestFlexInferClient_EmbedDocuments(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Model string   `json:"model"`
-			Input []string `json:"input"`
+			Model          string   `json:"model"`
+			Input          []string `json:"input"`
+			EncodingFormat string   `json:"encoding_format"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
+		}
+		if req.EncodingFormat != "float" {
+			t.Errorf("expected encoding_format=float, got %q", req.EncodingFormat)
 		}
 
 		data := make([]map[string]any, len(req.Input))
