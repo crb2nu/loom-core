@@ -39,8 +39,19 @@ var defaultSyncExcludes = []string{
 	".pyc",
 	"bin",
 	".loom",
-	".opencode",
 	".worktrees",
+	// Agent/editor tooling state — never a build input, and the worktree
+	// roots under these (e.g. .claude/worktrees, each a full source checkout)
+	// routinely push the tar-pipe payload past the size cap. Excluding them
+	// keeps the sync bounded regardless of how much agent state accumulates.
+	".claude",
+	".opencode",
+	".codex",
+	".gemini",
+	".antigravity",
+	".kilocode",
+	".cursor",
+	".aider.chat.history.md",
 	".swiftpm",
 	"xcuserdata",
 	"dist",

@@ -62,6 +62,50 @@ func TestAddDirToTar(t *testing.T) {
 	}
 }
 
+func TestAddDirToTar_ExcludesAgentState(t *testing.T) {
+	// Agent/editor tooling state (notably .claude/worktrees, each a full
+	// source checkout) must not be synced into a build sandbox — it is never a
+	// build input and routinely pushes the tar payload past the size cap.
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "src"), 0755)
+	os.MkdirAll(filepath.Join(dir, ".claude", "worktrees", "wt-1", "cmd"), 0755)
+	os.MkdirAll(filepath.Join(dir, ".codex"), 0755)
+	os.MkdirAll(filepath.Join(dir, ".gemini"), 0755)
+
+	os.WriteFile(filepath.Join(dir, "src", "main.go"), []byte("package main"), 0644)
+	os.WriteFile(filepath.Join(dir, ".claude", "worktrees", "wt-1", "cmd", "big.go"), []byte("package main // huge checkout"), 0644)
+	os.WriteFile(filepath.Join(dir, ".claude", "settings.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(dir, ".codex", "auth.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(dir, ".gemini", "config.toml"), []byte(""), 0644)
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	var totalBytes int64
+	if err := addDirToTar(tw, dir, "/workspace/services/project", defaultSyncExcludes, &totalBytes, MaxSyncBytes); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+	gw.Close()
+
+	files := extractTarEntries(t, buf.Bytes())
+
+	if _, ok := files["workspace/services/project/src/main.go"]; !ok {
+		t.Error("expected real source src/main.go in tar")
+	}
+	for _, p := range []string{
+		"workspace/services/project/.claude/worktrees/wt-1/cmd/big.go",
+		"workspace/services/project/.claude/settings.json",
+		"workspace/services/project/.codex/auth.json",
+		"workspace/services/project/.gemini/config.toml",
+	} {
+		if _, ok := files[p]; ok {
+			t.Errorf("agent state %q should be excluded from sync", p)
+		}
+	}
+}
+
 func TestAddDirToTar_MaxSizeExceeded(t *testing.T) {
 	dir := t.TempDir()
 
