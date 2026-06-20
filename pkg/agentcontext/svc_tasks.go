@@ -13,6 +13,25 @@ import (
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
+// defaultEmbedVectorSize is the last-resort vector dimension used when a task
+// must be persisted but embedding failed AND no collection size could be
+// discovered. Matches the Morph/agent-context default (agent_tasks_v1 is
+// 1536/Cosine).
+const defaultEmbedVectorSize = 1536
+
+// fallbackEmbedVector returns a deterministic, non-zero unit vector of the given
+// dimension. Used when embedding fails so a task still persists and stays
+// payload-filterable. Qdrant rejects all-zero vectors under cosine distance, so
+// the first component is set to 1.
+func fallbackEmbedVector(size int) []float64 {
+	if size <= 0 {
+		size = defaultEmbedVectorSize
+	}
+	v := make([]float64, size)
+	v[0] = 1
+	return v
+}
+
 // TaskSvc manages task CRUD, embedding, and lifecycle.
 // Tasks are stored exclusively in Qdrant (no in-memory map).
 type TaskSvc struct {
@@ -114,15 +133,26 @@ func (ts *TaskSvc) Add(ctx context.Context, args map[string]any) (*mcp.CallToolR
 		return mcp.ErrorResult(fmt.Errorf("no valid tasks provided")), nil
 	}
 
-	// Generate embeddings
+	// Generate embeddings — best-effort. A failed embedder must NEVER block the
+	// task write: embedding is enrichment for semantic search, not a correctness
+	// gate for persistence. This mirrors the pkg/pm risk store, which persists a
+	// deterministic fallback vector when embedding fails. Without this, an
+	// embedder outage (e.g. gte-qwen2-1.5b HTTP 500) drains agent_tasks_v1 to
+	// empty and blanks the flexdeck /projects task lane for every agent.
+	// See .loom/plan-task-integration-pm-2026-06-20.md (Slice 2a).
 	vectors, err := ts.embedr.EmbedDocuments(ctx, embedTexts)
 	if err != nil {
-		return mcp.ErrorResult(fmt.Errorf("embedding tasks: %w", err)), nil
-	}
-	if len(vectors) != len(tasks) {
-		return mcp.ErrorResult(fmt.Errorf("embedding count mismatch")), nil
+		ts.logger.Warn("task embed failed; persisting with fallback vectors",
+			"error", err, "count", len(tasks))
+		vectors = nil
+	} else if len(vectors) != len(tasks) {
+		ts.logger.Warn("task embed count mismatch; persisting with fallback vectors",
+			"got", len(vectors), "want", len(tasks))
+		vectors = nil
 	}
 
+	// Determine the vector size: a real embedding wins, then the shared
+	// discovered size, then the live collection, then the embedder default.
 	for _, vec := range vectors {
 		if len(vec) > 0 {
 			*ts.vectorSize = len(vec)
@@ -130,19 +160,29 @@ func (ts *TaskSvc) Add(ctx context.Context, args map[string]any) (*mcp.CallToolR
 		}
 	}
 	if *ts.vectorSize <= 0 {
-		return mcp.ErrorResult(fmt.Errorf("unknown vector size")), nil
+		if exists, size, gerr := ts.qdrant.GetCollectionVectorSize(ctx); gerr == nil && exists && size > 0 {
+			*ts.vectorSize = size
+		}
+	}
+	if *ts.vectorSize <= 0 {
+		*ts.vectorSize = defaultEmbedVectorSize
 	}
 
 	if err := ts.qdrant.EnsureCollection(ctx, *ts.vectorSize); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("ensure collection: %w", err)), nil
 	}
 
-	// Build points
+	// Build points. Any task lacking a usable, correctly-sized embedding gets a
+	// deterministic non-zero fallback vector (Qdrant rejects all-zero vectors
+	// under cosine distance) so the task still persists and stays filterable by
+	// payload (project/session/status).
 	points := make([]Point, 0, len(tasks))
 	for i, task := range tasks {
-		vector := vectors[i]
-		if len(vector) == 0 {
-			vector = make([]float64, *ts.vectorSize)
+		var vector []float64
+		if i < len(vectors) && len(vectors[i]) == *ts.vectorSize {
+			vector = vectors[i]
+		} else {
+			vector = fallbackEmbedVector(*ts.vectorSize)
 		}
 		points = append(points, Point{
 			ID:      task.ID,
