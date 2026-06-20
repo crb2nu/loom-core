@@ -21,7 +21,17 @@ type Service struct {
 	embed  embed.Embedder
 	cfg    Config
 	logger *slog.Logger
+
+	// reader federates read-only project data (tasks, decisions) for
+	// pm_project_status. Optional: nil → that rollup reports those sources as
+	// partial rather than failing.
+	reader ProjectReader
 }
+
+// SetProjectReader wires the federated read-only reader used by ProjectStatus.
+// Kept separate from NewService so the risk-domain constructor signature (and
+// its test callers) stay unchanged.
+func (s *Service) SetProjectReader(r ProjectReader) { s.reader = r }
 
 // NewService wires a Service from an explicit Store and Embedder. Used by tests
 // to inject fakes.
@@ -36,7 +46,9 @@ func NewService(store Store, embedder embed.Embedder, cfg Config, logger *slog.L
 func NewServiceFromEnv(logger *slog.Logger) *Service {
 	cfg := LoadConfigFromEnv()
 	hc := httpclient.NewDefault()
-	return NewService(NewQdrantStore(cfg), buildEmbedder(hc, cfg), cfg, logger)
+	svc := NewService(NewQdrantStore(cfg), buildEmbedder(hc, cfg), cfg, logger)
+	svc.SetProjectReader(NewQdrantProjectReader(cfg))
+	return svc
 }
 
 // CreateRiskInput captures the fields accepted by CreateRisk.
