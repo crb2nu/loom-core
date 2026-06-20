@@ -31,6 +31,19 @@ func hookProfileHasEvent(hp HookProfile, event string) bool {
 // standard (<repo>/.worktrees/<branch>) and Claude Code tool-managed
 // (<repo>/.claude/worktrees/<branch>) linked-tree layouts so namespace stays
 // consistent across main and worktree checkouts.
+//
+// The derivation is path-only, so a degenerate WS_ROOT (a detached/keepalive
+// process where `git rev-parse` failed and PWD is "/", or an agent running
+// OUTSIDE a workspace repo like ~ or ~/workspace) would otherwise mint a garbage
+// 2-level value such as "Users/cblevins", "agents/<id>" or "5f1b/fi-fhir". Those
+// then canonicalize to a fake project key ("Users", "agents", "5f1b") and
+// pollute the flexdeck /projects federation with phantom project buckets. The
+// trailing `case` guard keeps NS_PROJECT only when it is rooted at a real
+// workspace bucket (the SAME set as pkg/projectmeta.workspaceNamespaceRoots),
+// otherwise empties it so the namespace becomes an honest project-less
+// "/<branch>" (rendered as a muted "—" by the HUD's parseNamespace and
+// excluded — not mis-bucketed — by the PM view). Healthy workspace-rooted
+// namespaces are untouched.
 func hookNamespaceVars() string {
 	return `if echo "$WS_ROOT" | grep -q '/.claude/worktrees/'; then ` +
 		`_MAIN="${WS_ROOT%%/.claude/worktrees/*}"; ` +
@@ -41,6 +54,7 @@ func hookNamespaceVars() string {
 		`else ` +
 		`NS_PROJECT="$(basename "$(dirname "$WS_ROOT")")/$(basename "$WS_ROOT")"; ` +
 		`fi; ` +
+		`case "$NS_PROJECT" in apps/*|labs/*|libs/*|platform/*|private/*|services/*) ;; *) NS_PROJECT="" ;; esac; ` +
 		`NS_BRANCH="$(git branch --show-current 2>/dev/null || echo main)"`
 }
 

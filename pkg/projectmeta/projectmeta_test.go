@@ -11,9 +11,15 @@ func TestFromNamespace(t *testing.T) {
 		{namespace: "services/loom-core", want: "services/loom-core"},
 		{namespace: "services/loom-core/feat/orchestration", want: "services/loom-core"},
 		{namespace: "platform/gitops/flux", want: "platform/gitops"},
+		// labs/ and private/ are workspace roots (AGENTS.md) — must resolve to
+		// the 2-level project, not the bare root segment.
+		{namespace: "labs/fractal-agents/feat/x", want: "labs/fractal-agents"},
+		{namespace: "private/secrets-tool/main", want: "private/secrets-tool"},
 		{namespace: "loom-core", want: "loom-core"},
 		{namespace: "", want: ""},
 		{namespace: "/broken", want: ""},
+		// Degenerate "////main" (codex detached-keepalive shape) → no project.
+		{namespace: "////main", want: ""},
 	}
 
 	for _, tc := range tests {
