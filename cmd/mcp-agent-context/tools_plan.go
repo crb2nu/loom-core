@@ -172,6 +172,22 @@ func registerPlanTools(server *mcp.Server, svc *agentcontext.Service, _ trace.Tr
 		return svc.HandlePlanLifecycleAdvance(ctx, args)
 	})
 
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_render",
+		Description: "Render a plan's human/MR-reviewable markdown mirror from the store (the store is canonical). With `path`, writes the file atomically and records it as the plan's mirror_path. Always returns the markdown.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"plan_id":         map[string]any{"type": "string"},
+				"path":            map[string]any{"type": "string", "description": "Optional file path to write the mirror to (e.g. .loom/NNN-plan-<slug>-<date>.md). Written atomically."},
+				"set_mirror_path": map[string]any{"type": "boolean", "description": "Record the written path on the plan (default true)."},
+			},
+			Required: []string{"plan_id"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanRender(ctx, args)
+	})
+
 	registerPlanSliceTools(server, svc)
 }
 

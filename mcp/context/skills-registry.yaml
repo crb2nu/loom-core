@@ -65,7 +65,7 @@
 # Sync: loom sync <profile> --regen --hub-mode --all-projects --skip-worktrees
 
 version: 1
-updated: 2026-06-06
+updated: 2026-06-20
 skills:
   - name: flux-gitops-operator
     categories: [kubernetes, gitops, operations]
@@ -618,6 +618,24 @@ skills:
         ## Overview
 
         Create and maintain an evidence-backed "Loom Context Pack" (usually in `.loom/`) so planning, research, specs, and implementation stay consistent, reviewable, and shareable across agents.
+
+        ## Plan Store (canonical, worktree-resilient)
+
+        Plans are now a first-class entity in the agent-context store, NOT just `.loom/*.md` files. This matters because git worktrees freeze a copy of `.loom/` at checkout, so a plan written in one worktree is invisible to a fresh sub-agent in another (or to Codex / a Mills pod) until merged. The store is reachable by `plan_id` from ANY worktree/agent.
+
+        **The store is canonical; the `.loom/*.md` file is a rendered mirror for human/MR review.**
+
+        Workflow:
+        1. Create the plan in the store FIRST:
+           - `agent_plan_create{title, project, namespace, spec_doc, riskiest_assumption, kill_test, success}` -> returns a stable `plan_id` (`plan-<slug>-<short>`).
+           - Add slices: `agent_plan_slice_add{plan_id, name, goal, files, acceptance_criteria}` (or seed them inline on create).
+        2. Render the reviewable mirror from the store:
+           - `agent_plan_render{plan_id, path: ".loom/<NNN>-plan-<slug>-<date>.md"}` — writes the markdown atomically and records `mirror_path`. Re-run after any plan/slice mutation so the committed file stays in sync.
+        3. Edit the plan via the store, then re-render — do NOT hand-edit the mirror:
+           - `agent_plan_update`, `agent_plan_lifecycle_advance{plan_id, to_phase}`, `agent_plan_slice_update`.
+        4. Any agent (fresh sub-agent, Codex, Mills pod) recalls the live plan with `agent_plan_get{plan_id}` / `agent_plan_slice_get{slice_id}` / `agent_plan_search{query}` — never from a stale `.loom/` checkout. Pass `plan_id` (not the full plan) when spawning sub-agents.
+
+        The numbered `.loom/` template docs below remain useful for free-form research/snapshot notes; for the plan/spec itself, prefer the store + `agent_plan_render` mirror. See `docs/PLAN_STORE.md`.
 
         ## Quick Start
 
