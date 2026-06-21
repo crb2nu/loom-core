@@ -398,6 +398,12 @@ type Handoff struct {
 	EntryIDs   []string `json:"entry_ids,omitempty"`
 	TokenCount int      `json:"token_count"`
 
+	// Plan linkage (plan-aware handoff): hand off a known plan/slice scope so the
+	// receiver resumes by id (cross-vendor) instead of reconstructing from loose
+	// entry_ids that may be compacted away.
+	PlanID  string `json:"plan_id,omitempty"`
+	SliceID string `json:"slice_id,omitempty"`
+
 	// Timestamps
 	CreatedAt  time.Time  `json:"created_at"`
 	AcceptedAt *time.Time `json:"accepted_at,omitempty"`

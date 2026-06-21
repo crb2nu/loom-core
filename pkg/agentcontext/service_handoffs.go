@@ -21,6 +21,8 @@ func (s *HandoffSvc) HandleHandoffCreate(ctx context.Context, args map[string]an
 	instructions := v.String("instructions", "")
 	entryIDs := v.StringSlice("entry_ids")
 	tokenBudget := v.Int("token_budget", s.cfg.HandoffMaxTokens)
+	planID := v.String("plan_id", "")
+	sliceID := v.String("slice_id", "")
 
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
@@ -42,6 +44,8 @@ func (s *HandoffSvc) HandleHandoffCreate(ctx context.Context, args map[string]an
 		HandoffType:   handoffType,
 		Status:        HandoffStatusPending,
 		Instructions:  instructions,
+		PlanID:        planID,
+		SliceID:       sliceID,
 		CreatedAt:     now,
 	}
 
@@ -131,6 +135,8 @@ func (s *HandoffSvc) HandleHandoffCreate(ctx context.Context, args map[string]an
 		"token_count": handoff.TokenCount,
 		"entry_count": len(handoff.EntryIDs),
 		"summary":     handoff.Summary,
+		"plan_id":     handoff.PlanID,
+		"slice_id":    handoff.SliceID,
 	})
 }
 
@@ -184,6 +190,15 @@ func (s *HandoffSvc) HandleHandoffAccept(ctx context.Context, args map[string]an
 		"instructions": handoff.Instructions,
 		"summary":      handoff.Summary,
 		"token_count":  handoff.TokenCount,
+	}
+	// Plan-aware: surface the plan/slice so the receiver resumes by id
+	// (agent_plan_get / agent_plan_slice_get) rather than rebuilding context.
+	if handoff.PlanID != "" {
+		result["plan_id"] = handoff.PlanID
+		result["resume_hint"] = "call agent_plan_get{plan_id} to resume the plan"
+	}
+	if handoff.SliceID != "" {
+		result["slice_id"] = handoff.SliceID
 	}
 
 	// Import entries if requested
@@ -268,6 +283,12 @@ func (s *HandoffSvc) HandleHandoffInbox(ctx context.Context, args map[string]any
 			"entry_count":  len(h.EntryIDs),
 			"created_at":   h.CreatedAt.Format(time.RFC3339),
 		}
+		if h.PlanID != "" {
+			entry["plan_id"] = h.PlanID
+		}
+		if h.SliceID != "" {
+			entry["slice_id"] = h.SliceID
+		}
 		if h.ExpiresAt != nil {
 			entry["expires_at"] = h.ExpiresAt.Format(time.RFC3339)
 		}
@@ -348,6 +369,8 @@ func handoffToPayload(h Handoff) map[string]any {
 		"summary":         h.Summary,
 		"entry_ids":       h.EntryIDs,
 		"token_count":     h.TokenCount,
+		"plan_id":         h.PlanID,
+		"slice_id":        h.SliceID,
 		"created_at":      h.CreatedAt.Format(time.RFC3339Nano),
 	}
 	if h.AcceptedAt != nil {
@@ -384,6 +407,8 @@ func payloadToHandoff(payload map[string]any) (*Handoff, error) {
 		Summary:       toString(payload["summary"]),
 		EntryIDs:      toStringSlice(payload["entry_ids"]),
 		TokenCount:    toInt(payload["token_count"]),
+		PlanID:        toString(payload["plan_id"]),
+		SliceID:       toString(payload["slice_id"]),
 	}
 
 	if ts := toString(payload["created_at"]); ts != "" {
