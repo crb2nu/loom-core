@@ -104,6 +104,14 @@ parallel implementers can never collide on a file — a real upgrade over the
 advisory `agent_file_claim_acquire` (which still defaults to report-only; pass
 `enforce: true` for hard rejection).
 
+## Plan-aware handoffs
+
+`agent_handoff_create` accepts optional `plan_id`/`slice_id`. The receiver sees
+them in `agent_handoff_inbox` and `agent_handoff_accept` and resumes the work by
+id (`agent_plan_get` / `agent_plan_slice_get`) — a durable, cross-vendor scope
+(Claude ↔ Codex ↔ Mills) instead of a list of `entry_ids` that may be compacted
+away. Plain handoffs are unchanged (empty plan fields).
+
 ## Markdown mirror (store-canonical)
 
 The Plan in Qdrant is canonical; `agent_plan_render` projects it to a
