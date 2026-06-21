@@ -54,6 +54,7 @@ func (c *ClaimSvc) Acquire(ctx context.Context, args map[string]any) (*mcp.CallT
 	filePath := v.Required("file_path")
 	claimTypeStr := v.String("claim_type", string(ClaimTypeEdit))
 	reason := v.String("reason", "")
+	enforce := v.Bool("enforce", false)
 
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
@@ -101,6 +102,22 @@ func (c *ClaimSvc) Acquire(ctx context.Context, args map[string]any) (*mcp.CallT
 	}
 	c.mu.RUnlock()
 
+	// Hard enforcement (opt-in): when a file is already held by another active
+	// agent, REFUSE the claim instead of acquiring advisorily. This is what makes
+	// parallel slice file-boundaries real (slice files become hard claims) rather
+	// than merely reported. Default remains advisory for backward compatibility.
+	if enforce && len(conflicts) > 0 {
+		return mcp.JSONResult(map[string]any{
+			"ok":            false,
+			"rejected":      true,
+			"enforced":      true,
+			"file_path":     filePath,
+			"agent_id":      agentID,
+			"has_conflicts": true,
+			"conflicts":     conflicts,
+		})
+	}
+
 	c.mu.Lock()
 	if c.claims[filePath] == nil {
 		c.claims[filePath] = make(map[string]*FileClaim)
@@ -126,6 +143,74 @@ func (c *ClaimSvc) Acquire(ctx context.Context, args map[string]any) (*mcp.CallT
 	}
 
 	return mcp.JSONResult(result)
+}
+
+// AcquireEnforced claims each file for agentID with hard enforcement and
+// returns the files that could NOT be claimed (held by another active agent).
+// Files already held by agentID are treated as success (idempotent re-claim).
+// On full success the claims are recorded; on any conflict NOTHING is acquired
+// (all-or-nothing) so a slice never half-claims its file set.
+func (c *ClaimSvc) AcquireEnforced(ctx context.Context, agentID, sessionID, reason string, files []string) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	now := time.Now()
+
+	// First pass: detect conflicts without mutating.
+	var conflicting []string
+	c.mu.RLock()
+	for _, f := range files {
+		if agents, ok := c.claims[f]; ok {
+			for other, oc := range agents {
+				if other == agentID {
+					continue
+				}
+				if oc.ExpiresAt != nil && now.After(*oc.ExpiresAt) {
+					continue
+				}
+				conflicting = append(conflicting, f)
+				break
+			}
+		}
+	}
+	c.mu.RUnlock()
+	if len(conflicting) > 0 {
+		// Emit conflict events for the HUD overlay; acquire nothing.
+		if c.conflictBus != nil {
+			for _, f := range conflicting {
+				c.conflictBus.Publish(ClaimConflictEvent{File: f, Requester: agentID, TS: now})
+			}
+		}
+		return conflicting
+	}
+
+	// Second pass: acquire all.
+	claims := make([]*FileClaim, 0, len(files))
+	c.mu.Lock()
+	for _, f := range files {
+		claim := &FileClaim{
+			ID:        GenerateID(agentID, f, "claim", now),
+			AgentID:   agentID,
+			SessionID: sessionID,
+			FilePath:  f,
+			ClaimType: ClaimTypeEdit,
+			Reason:    reason,
+			CreatedAt: now,
+		}
+		if c.claims[f] == nil {
+			c.claims[f] = make(map[string]*FileClaim)
+		}
+		c.claims[f][agentID] = claim
+		claims = append(claims, claim)
+	}
+	c.mu.Unlock()
+
+	for _, cl := range claims {
+		if err := c.persist(ctx, cl); err != nil {
+			c.logger.Warn("persist enforced claim failed", "file", cl.FilePath, "error", err)
+		}
+	}
+	return nil
 }
 
 // Release releases file claims.

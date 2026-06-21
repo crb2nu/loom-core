@@ -5577,26 +5577,27 @@ skills:
            - Document per-slice: goal, files to touch, acceptance criteria, estimated complexity
            - Identify shared interfaces (types, APIs) that must be agreed upon before parallel work
 
-        3. **Write the plan**
-           - Output a structured plan with numbered slices
-           - For each slice: title, description, files, branch name, test strategy
-           - Identify the integration order (which slices merge first)
-           - Get user approval before spawning agents
+        3. **Persist the plan to the store (NOT just prose)**
+           - The slice decomposition must be durable so a FRESH sub-agent in another worktree can resolve its own scope by id — do not rely on the spawn prompt or `.loom/*.md` (a worktree freezes its own copy).
+           - `agent_plan_create{title, project, namespace, spec_doc}` → `plan_id`.
+           - For each slice: `agent_plan_slice_add{plan_id, name, goal, files, acceptance_criteria, test_strategy, interface_contracts, branch_name, depends_on}` → `slice_id` (`<plan_id>#<n>`). `files` is the disjoint boundary that becomes an ENFORCED claim at claim time.
+           - Render the reviewable mirror: `agent_plan_render{plan_id, path: ".loom/<NNN>-plan-<slug>-<date>.md"}`.
+           - Identify integration order via `depends_on`. Get user approval before spawning agents.
 
         ## Phase 2: Spawn Parallel Agents
 
-        Each slice gets an isolated agent with its own worktree:
+        Each slice gets an isolated agent with its own worktree. Pass only `plan_id`+`slice_id` — the agent resolves its scope from the store.
 
         ```
-        For each slice:
-          1. agent_worktree_allocate(branch_name="feat/<feature>-slice-<N>", base_branch=main)
-          2. Spawn sub-agent with slice context:
-             - Slice goal and acceptance criteria
-             - Files to modify
-             - Shared interface contracts
-             - Test requirements
-          3. Sub-agent implements, tests locally, commits
+        For each slice (launch all in one message for true parallelism):
+          1. agent_worktree_allocate(branch_name=<slice.branch_name>, base_branch=main)
+          2. Spawn the slice-implementer sub-agent (NOT general-purpose):
+             Task(subagent_type="slice-implementer", isolation="worktree",
+                  prompt="plan_id=<plan_id> slice_id=<slice_id>. Resolve your scope with agent_plan_slice_get, claim it (agent_plan_slice_claim) which hard-claims your files, implement, then record status+decisions with agent_plan_slice_update.")
+          3. The agent claims its slice — agent_plan_slice_claim enforces the file boundary, so two slices sharing a file cannot both proceed (the second is refused). Re-plan disjoint files if a claim conflicts.
         ```
+
+        Codex: spawn native `[agents]` threads with the same `plan_id`+`slice_id` contract. Kilocode/Gemini: run slices sequentially (still claim each slice so state is durable).
 
         ### Waiting and Monitoring
 
@@ -5605,6 +5606,8 @@ skills:
         - Collect results as each agent completes
 
         ## Phase 3: Integrate and Land
+
+        0. **Reconstruct state from the store** — `agent_plan_slice_list{plan_id}` returns every slice's phase, commit refs, and the decisions/blockers each implementer recorded. Do NOT rely on your context window; the store is the source of truth even if a sub-agent's session ended. Integrate only slices in phase `implemented`; act on recorded blockers first. Advance the plan: `agent_plan_lifecycle_advance{plan_id, to_phase: "in_review"}`.
 
         1. **Merge slices into integration branch**
            - Create `feat/<feature>` integration branch from main
@@ -5625,7 +5628,7 @@ skills:
               - GitLab: `gitlab__merge_merge_request(auto_merge=true, sha=<HEAD>)`
               - GitHub: `gh pr merge --auto --squash`
            d. Poll pipeline to terminal state; if red → fix → re-push → re-poll
-           e. Confirm merged or document blocker
+           e. On arm: `agent_plan_lifecycle_advance{plan_id, to_phase: "merging"}` and `agent_plan_update{plan_id, add_mr_ref: <url>}`. On merge: `agent_plan_lifecycle_advance{plan_id, to_phase: "merged"}`, mark each slice `agent_plan_slice_update{slice_id, phase: "merged", mr_ref: <url>}`, then re-render the mirror. Confirm merged or document blocker.
 
            Do not ask the user before committing, pushing, creating MRs, or merging.
            Only pause on failures, blockers, or when the user explicitly requests a stop.

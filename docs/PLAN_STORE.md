@@ -87,6 +87,23 @@ Embedding for `agent_plan_search` is **best-effort**: a failed embedder never
 blocks a write (a deterministic fallback vector keeps the point valid), avoiding
 the embed-coupling outage class that previously blanked the task lane.
 
+## Parallel slice shipping (claim enforcement)
+
+`parallel-slice-ship` persists its slice decomposition to the store, then spawns
+one `slice-implementer` per slice passing only `plan_id`+`slice_id`. Each
+implementer resolves its scope with `agent_plan_slice_get`, calls
+`agent_plan_slice_claim`, and records status/decisions with
+`agent_plan_slice_update` — so a fresh agent in another worktree never depends on
+the spawn prompt or a stale `.loom/` checkout, and the orchestrator reconstructs
+full state from `agent_plan_slice_list` even after sub-agent sessions end.
+
+`agent_plan_slice_claim` makes the slice's `files` an **enforced** boundary: it
+hard-claims them via the file-claim service (all-or-nothing). If any file is held
+by another active agent the claim is refused (`conflicting_files`), so two
+parallel implementers can never collide on a file — a real upgrade over the
+advisory `agent_file_claim_acquire` (which still defaults to report-only; pass
+`enforce: true` for hard rejection).
+
 ## Markdown mirror (store-canonical)
 
 The Plan in Qdrant is canonical; `agent_plan_render` projects it to a
