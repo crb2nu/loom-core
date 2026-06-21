@@ -123,6 +123,8 @@ func (ts *TaskSvc) Add(ctx context.Context, args map[string]any) (*mcp.CallToolR
 		}
 		task.PipelineRef = pipelineRefFromValue(m["pipeline_ref"])
 		task.WorkflowID = toString(m["workflow_id"])
+		task.PlanID = toString(m["plan_id"])
+		task.SliceID = toString(m["slice_id"])
 		task.Project = canonicalProject(toString(m["project"]), task.Namespace, task.PipelineRef)
 
 		tasks = append(tasks, task)
@@ -480,6 +482,12 @@ func taskToPayload(t Task) map[string]any {
 	if t.WorkflowID != "" {
 		payload["workflow_id"] = t.WorkflowID
 	}
+	if t.PlanID != "" {
+		payload["plan_id"] = t.PlanID
+	}
+	if t.SliceID != "" {
+		payload["slice_id"] = t.SliceID
+	}
 	if t.CompletedAt != nil {
 		payload["completed_at"] = t.CompletedAt.Format(time.RFC3339Nano)
 	}
@@ -510,6 +518,8 @@ func payloadToTask(payload map[string]any) (*Task, error) {
 		ParentID:    toString(payload["parent_id"]),
 		PipelineRef: pipelineRefFromValue(payload["pipeline_ref"]),
 		WorkflowID:  toString(payload["workflow_id"]),
+		PlanID:      toString(payload["plan_id"]),
+		SliceID:     toString(payload["slice_id"]),
 		TokenCount:  toInt(payload["token_count"]),
 	}
 	task.Project = canonicalProject(task.Project, task.Namespace, task.PipelineRef)

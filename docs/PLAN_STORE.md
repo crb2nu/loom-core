@@ -138,6 +138,21 @@ store (the `agent_plan_*` tools are unknown), the endpoints **degrade** to
 shows a clean "deploy pending" state. The Svelte lifecycle card consumes these
 endpoints and is verified against live data once the daemon ships the tools.
 
+## Convergence: tasks + Mills backlog
+
+The plan is the shared work unit across the platform:
+
+- **Tasks** (`agent_task_add`) accept `plan_id`/`slice_id`, so an agent task is a
+  granular TODO under a plan slice (`plan → slice → task`). Tasks are indexed by
+  `plan_id`/`slice_id` for per-plan rollups in the HUD/flexdeck.
+- **Mills backlog** items carry a `plan_id` (`pkg/mills/store`); when set, the
+  Mills agent prompt instructs the spawned agent to resolve the **live** plan +
+  slices via `agent_plan_get{plan_id}` instead of re-reading a `.loom` SpecDoc —
+  so the factory and interactive sessions operate on the same plan.
+
+Council/importer authoring plans directly + backfilling existing backlog items
+to plans is a follow-up (S7b); this slice establishes the links + read-through.
+
 ## Configuration
 
 | Env | Default | Meaning |
