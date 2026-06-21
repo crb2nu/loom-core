@@ -93,16 +93,174 @@ func registerPlanTools(server *mcp.Server, svc *agentcontext.Service, _ trace.Tr
 
 	server.AddTool(mcp.Tool{
 		Name:        "agent_plan_list",
-		Description: "List plans filtered by project and/or namespace. Cross-agent: NOT filtered by agent_id.",
+		Description: "List plans filtered by project, namespace, and/or phase. Cross-agent: NOT filtered by agent_id.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"project":   map[string]any{"type": "string", "description": "Filter by canonical project id."},
 				"namespace": map[string]any{"type": "string", "description": "Filter by namespace."},
+				"phase":     map[string]any{"type": "string", "description": "Filter by lifecycle phase."},
 				"limit":     map[string]any{"type": "integer", "description": "Max plans to return (default 100)."},
 			},
 		},
 	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		return svc.HandlePlanList(ctx, args)
+	})
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_update",
+		Description: "Patch mutable plan fields (spec_doc, title, success criteria, kill_test_status, mirror_path, mills_backlog_id) and append MR/pipeline/deploy refs. Phase changes must use agent_plan_lifecycle_advance.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"plan_id":          map[string]any{"type": "string", "description": "Plan to update."},
+				"title":            map[string]any{"type": "string"},
+				"spec_doc":         map[string]any{"type": "string"},
+				"spec_anchor":      map[string]any{"type": "string"},
+				"mirror_path":      map[string]any{"type": "string", "description": "Path of the rendered .loom mirror."},
+				"kill_test_status": map[string]any{"type": "string"},
+				"mills_backlog_id": map[string]any{"type": "string"},
+				"add_mr_ref":       map[string]any{"type": "string", "description": "Append an MR ref/URL."},
+				"add_pipeline_ref": map[string]any{"type": "string", "description": "Append a pipeline ref/URL."},
+				"add_deploy_ref":   map[string]any{"type": "string", "description": "Append a deploy ref/URL."},
+				"success": map[string]any{
+					"type":        "object",
+					"description": "Replace success criteria.",
+					"properties": map[string]any{
+						"tests":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"metrics":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"manual_check": map[string]any{"type": "string"},
+					},
+				},
+			},
+			Required: []string{"plan_id"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanUpdate(ctx, args)
+	})
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_search",
+		Description: "Semantic search over plan title+spec, optionally scoped to a project. Falls back to a keyword list if no embedder is available. Cross-agent.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"query":   map[string]any{"type": "string", "description": "Natural-language query."},
+				"project": map[string]any{"type": "string", "description": "Optional project scope."},
+				"limit":   map[string]any{"type": "integer", "description": "Max results (default 20)."},
+			},
+			Required: []string{"query"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanSearch(ctx, args)
+	})
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_lifecycle_advance",
+		Description: "Advance a plan to a new lifecycle phase (draft→planned→in_progress→in_review→merging→merged→deployed→done; abandoned from any). Validates the transition and records it in phase_history.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"plan_id":  map[string]any{"type": "string"},
+				"to_phase": map[string]any{"type": "string", "enum": []string{"draft", "planned", "in_progress", "in_review", "merging", "merged", "deployed", "done", "abandoned"}},
+				"agent_id": map[string]any{"type": "string", "description": "Actor (attribution for the transition)."},
+				"note":     map[string]any{"type": "string", "description": "Why the transition happened."},
+			},
+			Required: []string{"plan_id", "to_phase"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanLifecycleAdvance(ctx, args)
+	})
+
+	registerPlanSliceTools(server, svc)
+}
+
+// registerPlanSliceTools registers the slice-level tools. Slices are their own
+// records so a fresh slice-implementer resolves its work by slice_id (cross-
+// agent, NOT prompt-bound) and records status/decisions back to the shared record.
+func registerPlanSliceTools(server *mcp.Server, svc *agentcontext.Service) {
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_slice_add",
+		Description: "Append a slice to a plan. Returns slice_id <plan_id>#<order>.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"plan_id":             map[string]any{"type": "string"},
+				"name":                map[string]any{"type": "string"},
+				"goal":                map[string]any{"type": "string"},
+				"files":               map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Disjoint file set this slice owns (basis for claim enforcement)."},
+				"acceptance_criteria": map[string]any{"type": "string"},
+				"test_strategy":       map[string]any{"type": "string"},
+				"interface_contracts": map[string]any{"type": "string"},
+				"branch_name":         map[string]any{"type": "string"},
+				"depends_on":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "slice_ids this slice depends on."},
+			},
+			Required: []string{"plan_id", "name"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanSliceAdd(ctx, args)
+	})
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_slice_get",
+		Description: "Fetch one slice by slice_id. This is how a fresh slice-implementer looks up its own scope. Cross-agent: NOT filtered by agent_id.",
+		InputSchema: mcp.InputSchema{
+			Type:       "object",
+			Properties: map[string]any{"slice_id": map[string]any{"type": "string"}},
+			Required:   []string{"slice_id"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanSliceGet(ctx, args)
+	})
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_slice_list",
+		Description: "List all slices for a plan, ordered.",
+		InputSchema: mcp.InputSchema{
+			Type:       "object",
+			Properties: map[string]any{"plan_id": map[string]any{"type": "string"}},
+			Required:   []string{"plan_id"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanSliceList(ctx, args)
+	})
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_slice_update",
+		Description: "Update a slice's phase/refs and APPEND decisions or commit refs. This is where a slice-implementer records status and blockers back to the shared record (instead of losing them to its context window).",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"slice_id":       map[string]any{"type": "string"},
+				"phase":          map[string]any{"type": "string", "enum": []string{"pending", "claimed", "implementing", "implemented", "in_review", "integrated", "merged"}},
+				"mr_ref":         map[string]any{"type": "string"},
+				"branch_name":    map[string]any{"type": "string"},
+				"add_commit_ref": map[string]any{"type": "string"},
+				"add_decision":   map[string]any{"type": "string", "description": "Append a decision/blocker note for the orchestrator."},
+				"files":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			},
+			Required: []string{"slice_id"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanSliceUpdate(ctx, args)
+	})
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_plan_slice_claim",
+		Description: "Claim a slice for an agent (sets assignee + worktree, marks 'claimed'). Returns conflict if another agent holds it unless force=true.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"slice_id":    map[string]any{"type": "string"},
+				"agent_id":    map[string]any{"type": "string"},
+				"session_id":  map[string]any{"type": "string"},
+				"worktree_id": map[string]any{"type": "string"},
+				"branch_name": map[string]any{"type": "string"},
+				"force":       map[string]any{"type": "boolean", "description": "Steal an already-held slice."},
+			},
+			Required: []string{"slice_id", "agent_id"},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandlePlanSliceClaim(ctx, args)
 	})
 }

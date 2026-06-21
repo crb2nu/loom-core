@@ -271,7 +271,7 @@ func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 	svc.claims = NewClaimSvc(qdrantReg.Get(CollFileClaims), svc.logger, svc.metrics)
 	svc.worktrees = NewWorktreeSvc(qdrantReg.Get(CollWorktree), cfg, svc.logger, svc.metrics)
 	svc.tasks = NewTaskSvc(qdrantReg.Get(CollTasks), svc.embed, cfg, svc.logger, &svc.vectorSize)
-	svc.plans = NewPlanSvc(qdrantReg.Get(CollPlans), svc.logger)
+	svc.plans = NewPlanSvc(qdrantReg.Get(CollPlans), qdrantReg.Get(CollPlanSlices), svc.embed, &svc.vectorSize, svc.logger)
 
 	// Wire cross-domain callbacks for presence cleanup
 	svc.presence.releaseClaimsForAgent = func(agentID string) {

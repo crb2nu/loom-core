@@ -175,6 +175,39 @@ func (c *QdrantClient) Search(
 	return results, nil
 }
 
+// SearchRaw runs a vector search and returns raw points (id + payload) without
+// assuming the payload is a ContextEntry. Use for collections (e.g. plans) whose
+// payloads decode to other types.
+func (c *QdrantClient) SearchRaw(ctx context.Context, vector []float64, filter map[string]any, limit int) ([]RawPoint, error) {
+	path := fmt.Sprintf("/collections/%s/points/search", c.collection)
+	body := map[string]any{
+		"vector":       vector,
+		"limit":        limit,
+		"with_payload": true,
+	}
+	if filter != nil {
+		body["filter"] = filter
+	}
+	var resp struct {
+		Result []struct {
+			ID      string         `json:"id"`
+			Score   float64        `json:"score"`
+			Payload map[string]any `json:"payload"`
+		} `json:"result"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, path, body, &resp); err != nil {
+		if errors.Is(err, ErrCollectionNotFound) {
+			return []RawPoint{}, nil
+		}
+		return nil, err
+	}
+	out := make([]RawPoint, 0, len(resp.Result))
+	for _, hit := range resp.Result {
+		out = append(out, RawPoint{ID: hit.ID, Payload: hit.Payload})
+	}
+	return out, nil
+}
+
 func (c *QdrantClient) Scroll(ctx context.Context, filter map[string]any, limit int) ([]ContextEntry, error) {
 	points, err := c.ScrollPoints(ctx, filter, limit, false)
 	if err != nil {

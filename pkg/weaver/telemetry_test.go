@@ -6,9 +6,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/crb2nu/loom/pkg/openairesponses"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/crb2nu/loom/pkg/openairesponses"
 )
 
 func TestNewSubagentTelemetry(t *testing.T) {
@@ -273,6 +274,51 @@ func TestSubagentTelemetry_RecordTurnEnd_ZeroTokensNotRecorded(t *testing.T) {
 	completionVal := counterValue(t, m.TokensTotal, "my-domain", "completion")
 	if completionVal != 0 {
 		t.Errorf("expected TokensTotal completion=0 for zero tokens, got %v", completionVal)
+	}
+}
+
+func TestSubagentTelemetry_RecordToolCall_CountsRawToolTokens(t *testing.T) {
+	t.Parallel()
+
+	m := NewMetrics(nil)
+	tel := NewSubagentTelemetry("my-domain", m)
+
+	// 100-char output -> (100+3)/4 = 25 estimated tokens.
+	output := ""
+	for i := 0; i < 100; i++ {
+		output += "x"
+	}
+	tel.RecordToolCall(
+		context.Background(),
+		openairesponses.ToolCall{CallID: "c1", ToolName: "git__git_status"},
+		openairesponses.ToolResult{CallID: "c1", Output: output},
+		nil,
+		openairesponses.ExecutionIdentity{},
+	)
+
+	if got := m.Summary()["raw_tool_response_tokens"].(int64); got != 25 {
+		t.Errorf("raw_tool_response_tokens = %d, want 25", got)
+	}
+}
+
+// A failed tool call must not count its (likely empty/garbage) output as
+// raw tool tokens — it increments ErrorsTotal and returns early.
+func TestSubagentTelemetry_RecordToolCall_ErrorDoesNotCountTokens(t *testing.T) {
+	t.Parallel()
+
+	m := NewMetrics(nil)
+	tel := NewSubagentTelemetry("my-domain", m)
+
+	tel.RecordToolCall(
+		context.Background(),
+		openairesponses.ToolCall{CallID: "c1"},
+		openairesponses.ToolResult{CallID: "c1", Output: "some partial output"},
+		errors.New("boom"),
+		openairesponses.ExecutionIdentity{},
+	)
+
+	if got := m.Summary()["raw_tool_response_tokens"].(int64); got != 0 {
+		t.Errorf("raw_tool_response_tokens = %d, want 0 on error", got)
 	}
 }
 

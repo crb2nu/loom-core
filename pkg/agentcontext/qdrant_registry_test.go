@@ -29,15 +29,16 @@ func TestNewQdrantRegistry(t *testing.T) {
 		FileClaimsCollection:     "fc_v1",
 		WorktreeCollection:       "wt_v1",
 		PlansCollection:          "plans_v1",
+		PlanSlicesCollection:     "plan_slices_v1",
 	}
 
 	reg := NewQdrantRegistry(hc, cfg)
 
-	// 13 unique map entries: annotations merged into context (same key),
+	// 14 unique map entries: annotations merged into context (same key),
 	// templates removed, plans added.
 	names := reg.Names()
-	if len(names) != 13 {
-		t.Fatalf("Names() returned %d entries, want 13", len(names))
+	if len(names) != 14 {
+		t.Fatalf("Names() returned %d entries, want 14", len(names))
 	}
 }
 
@@ -63,6 +64,7 @@ func TestQdrantRegistry_GetAllCollections(t *testing.T) {
 		FileClaimsCollection:     "fc",
 		WorktreeCollection:       "wt",
 		PlansCollection:          "plans",
+		PlanSlicesCollection:     "plan_slices",
 	}
 
 	reg := NewQdrantRegistry(hc, cfg)
@@ -85,6 +87,7 @@ func TestQdrantRegistry_GetAllCollections(t *testing.T) {
 		{CollFileClaims, true},
 		{CollWorktree, true},
 		{CollPlans, true},
+		{CollPlanSlices, true},
 	}
 
 	for _, tc := range cases {
@@ -142,17 +145,18 @@ func TestQdrantRegistry_NamesStable(t *testing.T) {
 		FileClaimsCollection:     "fc",
 		WorktreeCollection:       "wt",
 		PlansCollection:          "plans",
+		PlanSlicesCollection:     "plan_slices",
 	}
 
 	reg := NewQdrantRegistry(hc, cfg)
 	names := reg.Names()
 	sort.Strings(names)
 
-	// CollAnnotations == CollContext after SIMP-12, so 13 unique keys (plans added).
+	// CollAnnotations == CollContext after SIMP-12, so 14 unique keys (plans + slices added).
 	expected := []string{
 		CollContext, CollFileClaims, CollGraphEntities,
 		CollGraphRelations, CollHandoffs, CollMemory, CollPlans, CollPresence,
-		CollSessions, CollTasks, CollWorktree,
+		CollSessions, CollTasks, CollWorktree, CollPlanSlices,
 		CollWorkflowDefs, CollWorkflows,
 	}
 	sort.Strings(expected)

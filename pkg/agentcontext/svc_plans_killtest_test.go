@@ -36,13 +36,17 @@ func TestPlan_KillTest_CrossProcessQdrant(t *testing.T) {
 	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
 
 	const coll = "agent_plans_killtest"
+	const sliceColl = "agent_plan_slices_killtest"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ctx := context.Background()
 
-	// Producer process: agent A, its own QdrantClient + cache.
+	// Producer process: agent A, its own QdrantClients + cache.
 	producerQ := NewQdrantClient(httpclient.NewDefault(), url, apiKey, coll, "Cosine")
 	producerQ.SetKind(CollPlans)
-	producer := NewPlanSvc(producerQ, logger)
+	producerSlicesQ := NewQdrantClient(httpclient.NewDefault(), url, apiKey, sliceColl, "Cosine")
+	producerSlicesQ.SetKind(CollPlanSlices)
+	vs := 0
+	producer := NewPlanSvc(producerQ, producerSlicesQ, nil, &vs, logger)
 
 	res, err := producer.Create(ctx, map[string]any{
 		"title":     "Kill-test plan " + time.Now().UTC().Format(time.RFC3339Nano),
@@ -64,14 +68,18 @@ func TestPlan_KillTest_CrossProcessQdrant(t *testing.T) {
 	// Best-effort cleanup of the throwaway point.
 	t.Cleanup(func() {
 		_ = producerQ.Delete(context.Background(), []string{planID})
+		_ = producerSlicesQ.Delete(context.Background(), []string{planID + "#1"})
 	})
 
-	// Consumer process: a DIFFERENT QdrantClient + a FRESH PlanSvc with an empty
+	// Consumer process: DIFFERENT QdrantClients + a FRESH PlanSvc with an empty
 	// in-memory cache — models a fresh subagent in another worktree / Codex /
 	// Mills pod. Retrieve with NO agent_id.
 	consumerQ := NewQdrantClient(httpclient.NewDefault(), url, apiKey, coll, "Cosine")
 	consumerQ.SetKind(CollPlans)
-	consumer := NewPlanSvc(consumerQ, logger)
+	consumerSlicesQ := NewQdrantClient(httpclient.NewDefault(), url, apiKey, sliceColl, "Cosine")
+	consumerSlicesQ.SetKind(CollPlanSlices)
+	vs2 := 0
+	consumer := NewPlanSvc(consumerQ, consumerSlicesQ, nil, &vs2, logger)
 
 	res, err = consumer.Get(ctx, map[string]any{"plan_id": planID})
 	got := okJSON(t, res, err)

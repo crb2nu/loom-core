@@ -27,6 +27,14 @@ type Metrics struct {
 	lifetimeErrors    atomic.Int64
 	lifetimeTokens    atomic.Int64
 	lifetimeLatencyMs atomic.Int64
+	// lifetimeRawToolTokens is the cumulative size of raw tool responses
+	// the subagents consumed (pre-compression); lifetimeResponseTokens is
+	// the cumulative size of the compressed answers weaver returned. The
+	// HUD F8 economics card derives compression / token-savings /
+	// context-waste from these two — without them those ratios are
+	// permanently "insufficient_data".
+	lifetimeRawToolTokens  atomic.Int64
+	lifetimeResponseTokens atomic.Int64
 }
 
 // NewMetrics creates and registers weaver Prometheus metrics.
@@ -89,6 +97,24 @@ func (m *Metrics) RecordBackendDispatch(backend, outcome string) {
 	m.BackendDispatchTotal.WithLabelValues(backend, outcome).Inc()
 }
 
+// RecordRawToolTokens adds to the cumulative raw tool-response token
+// counter (pre-compression input the subagents consumed). Nil-safe.
+func (m *Metrics) RecordRawToolTokens(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.lifetimeRawToolTokens.Add(int64(n))
+}
+
+// RecordResponseTokens adds to the cumulative compressed-answer token
+// counter (what weaver returned in place of the raw tool output). Nil-safe.
+func (m *Metrics) RecordResponseTokens(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.lifetimeResponseTokens.Add(int64(n))
+}
+
 // RecordQuery increments lifetime query counters.
 func (m *Metrics) RecordQuery(status string, latencyMs int64, tokens int) {
 	m.lifetimeQueries.Add(1)
@@ -114,11 +140,13 @@ func (m *Metrics) Summary() map[string]any {
 	}
 
 	return map[string]any{
-		"total_queries":  total,
-		"avg_latency_ms": avgLatency,
-		"error_rate":     errorRate,
-		"total_tokens":   tokens,
-		"error_count":    errors,
+		"total_queries":            total,
+		"avg_latency_ms":           avgLatency,
+		"error_rate":               errorRate,
+		"total_tokens":             tokens,
+		"error_count":              errors,
+		"raw_tool_response_tokens": m.lifetimeRawToolTokens.Load(),
+		"weaver_response_tokens":   m.lifetimeResponseTokens.Load(),
 	}
 }
 

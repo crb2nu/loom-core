@@ -61,6 +61,12 @@ type SpawnEconomicsSnapshot struct {
 type WeaverMetricsView struct {
 	TotalQueries int
 	TotalTokens  int
+	// RawToolTokens is the cumulative raw tool-response size weaver
+	// consumed (pre-compression); ResponseTokens is the cumulative
+	// compressed-answer size weaver returned. These drive the compression,
+	// token-savings, and context-waste ratios.
+	RawToolTokens  int
+	ResponseTokens int
 }
 
 // NudgeQueueOps abstracts the nudge queue, returning bridge DTOs to avoid
