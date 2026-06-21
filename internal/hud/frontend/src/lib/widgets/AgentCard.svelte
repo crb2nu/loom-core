@@ -200,7 +200,7 @@
   .header-right { display: flex; align-items: center; gap: 4px; }
   .agent-icon { font-size: 14px; }
   .agent-id { font-size: 13px; font-weight: 600; font-family: var(--font-mono); color: var(--fg-primary); }
-  .status-label { font-size: 10px; font-family: var(--font-mono); color: var(--fg-muted); text-transform: uppercase; }
+  .status-label { font-size: 10px; font-weight: 600; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.06em; }
 
   .card-subheader { display: flex; align-items: center; justify-content: space-between; }
   .agent-type { font-size: 11px; color: var(--fg-secondary); }
@@ -211,10 +211,10 @@
     border-radius: var(--radius-full);
     padding: 1px 7px;
     font-size: var(--text-2xs);
+    font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--fg-muted);
-    font-family: var(--font-mono);
   }
   .evidence-active {
     border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
@@ -224,8 +224,8 @@
   .telemetry-chip {
     margin-left: auto;
     font-size: var(--text-2xs);
+    font-weight: 600;
     color: var(--fg-secondary);
-    font-family: var(--font-mono);
     text-transform: uppercase;
     letter-spacing: 0.08em;
     border: 1px solid color-mix(in srgb, var(--agent-color) 28%, var(--border));

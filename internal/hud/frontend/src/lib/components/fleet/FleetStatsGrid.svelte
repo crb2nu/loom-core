@@ -218,7 +218,7 @@
 
   .metric-sub {
     font-size: var(--text-xs);
-    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
     color: var(--fg-dim);
     margin-top: 2px;
     overflow: hidden;

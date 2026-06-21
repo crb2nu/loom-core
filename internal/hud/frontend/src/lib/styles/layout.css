@@ -95,7 +95,6 @@
 .section-subtitle {
   font-size: var(--text-sm);
   color: var(--fg-muted);
-  font-family: var(--font-mono);
 }
 
 
