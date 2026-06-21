@@ -81,10 +81,22 @@ in_review → integrated → merged`.
 | `agent_plan_slice_list` | List a plan's slices, ordered. |
 | `agent_plan_slice_update` | Update phase/refs; append decisions/commit refs. |
 | `agent_plan_slice_claim` | Claim a slice for an agent (conflict unless `force`). |
+| `agent_plan_render` | Render the plan's markdown mirror from the store; with `path`, write it atomically and record `mirror_path`. |
 
 Embedding for `agent_plan_search` is **best-effort**: a failed embedder never
 blocks a write (a deterministic fallback vector keeps the point valid), avoiding
 the embed-coupling outage class that previously blanked the task lane.
+
+## Markdown mirror (store-canonical)
+
+The Plan in Qdrant is canonical; `agent_plan_render` projects it to a
+human/MR-reviewable `.loom/*.md` file. With a `path`, the file is written
+**atomically** (same-directory tempfile + `os.Rename`) because external watchers
+(codex, gemini, fs inotify) read `.loom/` and a non-atomic `O_TRUNC` write
+exposes a partial-read window. Re-render after any plan/slice mutation so the
+committed file stays in sync; agents always read the **store** by `plan_id`, not
+the file. The `plan-loom-core` skill drives this flow (create in store → render
+mirror → edit via tools → re-render).
 
 ## Configuration
 
