@@ -152,7 +152,7 @@
     font-size: var(--text-sm); font-weight: 600; color: var(--fg-primary);
     text-transform: uppercase; letter-spacing: var(--tracking-wide);
   }
-  .econ-sub { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--fg-muted); }
+  .econ-sub { font-size: var(--text-xs); color: var(--fg-muted); font-variant-numeric: tabular-nums; }
   .econ-error { color: var(--error); }
   .ratio-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
@@ -181,7 +181,7 @@
     font-size: var(--text-sm); font-weight: 600; color: var(--fg-primary);
   }
   .econ-empty-hint {
-    font-size: var(--text-xs); color: var(--fg-muted); font-family: var(--font-mono);
+    font-size: var(--text-xs); color: var(--fg-muted);
   }
   .ratio-card {
     background: var(--bg-primary); border: 1px solid var(--border-subtle);
@@ -195,7 +195,7 @@
     color: var(--fg-primary); line-height: 1.1;
   }
   .ratio-label { font-size: var(--text-xs); color: var(--fg-secondary); }
-  .ratio-hint { font-size: 10px; color: var(--fg-dim); font-family: var(--font-mono); }
+  .ratio-hint { font-size: 10px; color: var(--fg-dim); }
   .ratio-status {
     font-size: 9px; color: var(--warning); text-transform: uppercase;
     letter-spacing: 0.06em; margin-top: 2px;
@@ -203,7 +203,7 @@
   .bar-wrapper { display: flex; flex-direction: column; gap: 4px; }
   .bar-legend {
     display: flex; gap: var(--space-3); font-size: var(--text-xs);
-    color: var(--fg-muted); font-family: var(--font-mono);
+    color: var(--fg-muted); font-variant-numeric: tabular-nums;
   }
   .legend-item { display: flex; align-items: center; gap: 6px; }
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }

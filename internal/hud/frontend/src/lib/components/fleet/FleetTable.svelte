@@ -279,7 +279,7 @@
     border-radius: 999px;
     padding: 4px 10px;
     font-size: 10px;
-    font-family: var(--font-mono);
+    font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     cursor: pointer;
@@ -475,7 +475,7 @@
     width: fit-content;
     margin-bottom: 6px;
     font-size: 9px;
-    font-family: var(--font-mono);
+    font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--warning);
@@ -500,10 +500,10 @@
     border-radius: 999px;
     padding: 1px 6px;
     font-size: 9px;
+    font-weight: 600;
     color: var(--fg-muted);
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    font-family: var(--font-mono);
   }
 
   .evidence-pill.evidence-pill-active {
@@ -519,7 +519,6 @@
   }
 
   .evidence-empty {
-    font-family: var(--font-mono);
     font-size: 11px;
     color: var(--fg-dim);
   }
