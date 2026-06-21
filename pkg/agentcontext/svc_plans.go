@@ -1,4 +1,5 @@
-// svc_plans.go -- PlanSvc: create/get/list for the first-class Plan entity.
+// svc_plans.go -- PlanSvc: plan-level CRUD, semantic search, and validated
+// lifecycle transitions for the first-class Plan entity.
 //
 // SCOPING INVARIANT (the whole point of this entity): plan reads are scoped by
 // plan_id / project / namespace and are NEVER filtered by agent_id. The default
@@ -6,6 +7,10 @@
 // a plan from exactly the parallel + Mills agents that need it. Plans are
 // deliberately cross-agent: any agent may read a project's plans; writes are
 // attributed (created_by) but not gated by identity.
+//
+// Slices live in their own collection (svc_plan_slices.go) so parallel
+// slice-implementers update them independently; Get aggregates them onto the
+// plan for callers.
 package agentcontext
 
 import (
@@ -18,45 +23,69 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/pkg/codebase/embed"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
-// PlanSvc manages Plan records. Qdrant is the source of truth (so plans are
-// visible across processes/worktrees/agents); the in-memory map is a
-// write-through cache and is only consulted as a fallback when Qdrant is
-// unavailable.
+// PlanSvc manages Plan + PlanSlice records. Qdrant is the source of truth (so
+// plans are visible across processes/worktrees/agents); the in-memory maps are
+// a write-through cache consulted only as a fallback when Qdrant is unavailable.
 type PlanSvc struct {
 	mu     sync.RWMutex
 	plans  map[string]*Plan
-	qdrant *QdrantClient // CollPlans
-	logger *slog.Logger
+	slices map[string]*PlanSlice // slice_id -> slice
+
+	plansQ  *QdrantClient // CollPlans
+	slicesQ *QdrantClient // CollPlanSlices
+	embedr  embed.Embedder
+	// vectorSize is the shared discovered embedding dimension (same pointer the
+	// task service uses) so collections stay consistent.
+	vectorSize *int
+	logger     *slog.Logger
 }
 
-// HandlePlanCreate creates a new plan.
-func (s *Service) HandlePlanCreate(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	return s.plans.Create(ctx, args)
-}
-
-// HandlePlanGet returns a plan by id (cross-agent, not agent-scoped).
-func (s *Service) HandlePlanGet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	return s.plans.Get(ctx, args)
-}
-
-// HandlePlanList lists plans by project/namespace (cross-agent, not agent-scoped).
-func (s *Service) HandlePlanList(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	return s.plans.List(ctx, args)
-}
-
-// NewPlanSvc constructs a PlanSvc.
-func NewPlanSvc(qdrant *QdrantClient, logger *slog.Logger) *PlanSvc {
+// NewPlanSvc constructs a PlanSvc. embedr/vectorSize may be nil in tests (embed
+// is then skipped and a deterministic fallback vector is used).
+func NewPlanSvc(plansQ, slicesQ *QdrantClient, embedr embed.Embedder, vectorSize *int, logger *slog.Logger) *PlanSvc {
+	if vectorSize == nil {
+		vs := 0
+		vectorSize = &vs
+	}
 	return &PlanSvc{
-		plans:  make(map[string]*Plan),
-		qdrant: qdrant,
-		logger: logger,
+		plans:      make(map[string]*Plan),
+		slices:     make(map[string]*PlanSlice),
+		plansQ:     plansQ,
+		slicesQ:    slicesQ,
+		embedr:     embedr,
+		vectorSize: vectorSize,
+		logger:     logger,
 	}
 }
 
-// Create persists a new Plan and returns its id.
+// ---- Service delegates -----------------------------------------------------
+
+func (s *Service) HandlePlanCreate(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	return s.plans.Create(ctx, args)
+}
+func (s *Service) HandlePlanGet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	return s.plans.Get(ctx, args)
+}
+func (s *Service) HandlePlanList(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	return s.plans.List(ctx, args)
+}
+func (s *Service) HandlePlanUpdate(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	return s.plans.Update(ctx, args)
+}
+func (s *Service) HandlePlanSearch(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	return s.plans.Search(ctx, args)
+}
+func (s *Service) HandlePlanLifecycleAdvance(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	return s.plans.LifecycleAdvance(ctx, args)
+}
+
+// ---- Create ----------------------------------------------------------------
+
+// Create persists a new Plan (and any seed slices) and returns its id.
 func (ps *PlanSvc) Create(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	title := v.Required("title")
@@ -66,26 +95,46 @@ func (ps *PlanSvc) Create(ctx context.Context, args map[string]any) (*mcp.CallTo
 
 	now := time.Now().UTC()
 	phase := v.String("phase", PlanPhaseDraft)
+	if !planPhaseValid(phase) {
+		return mcp.ErrorResult(fmt.Errorf("invalid phase %q", phase)), nil
+	}
 	plan := &Plan{
-		ID:            v.String("id", ""),
-		Title:         title,
-		Project:       v.String("project", ""),
-		Namespace:     v.String("namespace", ""),
-		Phase:         phase,
-		SpecDoc:       v.String("spec_doc", ""),
-		CreatedBy:     v.String("agent_id", ""),
-		SourceSession: v.String("session_id", ""),
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:                 v.String("id", ""),
+		Title:              title,
+		Project:            v.String("project", ""),
+		Namespace:          v.String("namespace", ""),
+		Phase:              phase,
+		SpecDoc:            v.String("spec_doc", ""),
+		SpecAnchor:         v.String("spec_anchor", ""),
+		CreatedBy:          v.String("agent_id", ""),
+		SourceSession:      v.String("session_id", ""),
+		Budget:             v.String("budget", ""),
+		RiskiestAssumption: v.String("riskiest_assumption", ""),
+		KillTest:           v.String("kill_test", ""),
+		KillTestStatus:     v.String("kill_test_status", ""),
+		Dependencies:       v.StringSlice("dependencies"),
+		MillsBacklogID:     v.String("mills_backlog_id", ""),
+		GitLabIssueIID:     v.Int("gitlab_issue_iid", 0),
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if plan.ID == "" {
 		plan.ID = GeneratePlanID(title, plan.Namespace, now)
 	}
 	plan.Slug = planSlug(title)
-	plan.Slices = parsePlanSlicesArg(args["slices"], plan.ID)
+	plan.Success = parseSuccessArg(args["success"])
 
 	if err := ps.persist(ctx, plan); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("persist plan: %w", err)), nil
+	}
+
+	// Seed slices (own collection).
+	seeded := parsePlanSlicesArg(args["slices"], plan.ID, now)
+	for _, sl := range seeded {
+		s := sl
+		if err := ps.persistSlice(ctx, &s); err != nil {
+			ps.logger.Warn("persist seed slice failed", "plan_id", plan.ID, "slice", s.ID, "error", err)
+		}
 	}
 
 	ps.mu.Lock()
@@ -97,12 +146,14 @@ func (ps *PlanSvc) Create(ctx context.Context, args map[string]any) (*mcp.CallTo
 		"plan_id":     plan.ID,
 		"slug":        plan.Slug,
 		"phase":       plan.Phase,
-		"slice_count": len(plan.Slices),
+		"slice_count": len(seeded),
 	})
 }
 
-// Get returns a Plan by id. Reads Qdrant first (cross-process source of truth),
-// falling back to the in-memory cache only if Qdrant errors. NOT agent-scoped.
+// ---- Get -------------------------------------------------------------------
+
+// Get returns a Plan (with aggregated slices) by id. Qdrant-first, cache
+// fallback. NOT agent-scoped.
 func (ps *PlanSvc) Get(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	planID := v.Required("plan_id")
@@ -117,13 +168,14 @@ func (ps *PlanSvc) Get(ctx context.Context, args map[string]any) (*mcp.CallToolR
 	if plan == nil {
 		return mcp.ErrorResult(fmt.Errorf("plan %q not found", planID)), nil
 	}
+	plan.Slices = ps.slicesForPlan(ctx, planID)
 	return mcp.JSONResult(map[string]any{"ok": true, "plan": plan})
 }
 
 // fetch resolves a plan by id, Qdrant-first.
 func (ps *PlanSvc) fetch(ctx context.Context, planID string) (*Plan, error) {
-	if ps.qdrant != nil {
-		raw, err := ps.qdrant.GetPoint(ctx, planID, false)
+	if ps.plansQ != nil {
+		raw, err := ps.plansQ.GetPoint(ctx, planID, false)
 		switch {
 		case err == nil:
 			if p := payloadToPlan(raw.Payload); p != nil {
@@ -133,41 +185,141 @@ func (ps *PlanSvc) fetch(ctx context.Context, planID string) (*Plan, error) {
 				return p, nil
 			}
 		case errors.Is(err, ErrCollectionNotFound):
-			// collection not yet created → no plans persisted
 		default:
-			// Qdrant transport/HTTP error (incl. 404 for a missing point).
-			// Fall through to the cache below rather than hard-failing.
 			ps.logger.Debug("plan fetch from qdrant failed; trying cache", "plan_id", planID, "error", err)
 		}
 	}
-
 	ps.mu.RLock()
 	cached := ps.plans[planID]
 	ps.mu.RUnlock()
 	return cached, nil
 }
 
+// ---- Update ----------------------------------------------------------------
+
+// Update patches mutable plan fields (spec, title, refs, links). Phase changes
+// must go through LifecycleAdvance.
+func (ps *PlanSvc) Update(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	planID := v.Required("plan_id")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	plan, err := ps.fetch(ctx, planID)
+	if err != nil || plan == nil {
+		return mcp.ErrorResult(fmt.Errorf("plan %q not found", planID)), nil
+	}
+
+	if title, ok := args["title"]; ok {
+		plan.Title = toString(title)
+		plan.Slug = planSlug(plan.Title)
+	}
+	if _, ok := args["spec_doc"]; ok {
+		plan.SpecDoc = toString(args["spec_doc"])
+	}
+	if _, ok := args["spec_anchor"]; ok {
+		plan.SpecAnchor = toString(args["spec_anchor"])
+	}
+	if _, ok := args["mirror_path"]; ok {
+		plan.MirrorPath = toString(args["mirror_path"])
+	}
+	if _, ok := args["kill_test_status"]; ok {
+		plan.KillTestStatus = toString(args["kill_test_status"])
+	}
+	if _, ok := args["mills_backlog_id"]; ok {
+		plan.MillsBacklogID = toString(args["mills_backlog_id"])
+	}
+	if _, ok := args["add_mr_ref"]; ok {
+		plan.MRRefs = appendUnique(plan.MRRefs, toString(args["add_mr_ref"]))
+	}
+	if _, ok := args["add_pipeline_ref"]; ok {
+		plan.PipelineRefs = appendUnique(plan.PipelineRefs, toString(args["add_pipeline_ref"]))
+	}
+	if _, ok := args["add_deploy_ref"]; ok {
+		plan.DeployRefs = appendUnique(plan.DeployRefs, toString(args["add_deploy_ref"]))
+	}
+	if s, ok := args["success"]; ok {
+		plan.Success = parseSuccessArg(s)
+	}
+	plan.UpdatedAt = time.Now().UTC()
+
+	if err := ps.persist(ctx, plan); err != nil {
+		return mcp.ErrorResult(fmt.Errorf("persist plan: %w", err)), nil
+	}
+	ps.mu.Lock()
+	ps.plans[plan.ID] = plan
+	ps.mu.Unlock()
+	return mcp.JSONResult(map[string]any{"ok": true, "plan_id": plan.ID, "phase": plan.Phase})
+}
+
+// ---- Lifecycle -------------------------------------------------------------
+
+// LifecycleAdvance transitions a plan to a new phase if the DAG allows it, and
+// records the hop in phase_history for HUD/audit rendering.
+func (ps *PlanSvc) LifecycleAdvance(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	planID := v.Required("plan_id")
+	to := v.Required("to_phase")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if !planPhaseValid(to) {
+		return mcp.ErrorResult(fmt.Errorf("invalid to_phase %q", to)), nil
+	}
+	plan, err := ps.fetch(ctx, planID)
+	if err != nil || plan == nil {
+		return mcp.ErrorResult(fmt.Errorf("plan %q not found", planID)), nil
+	}
+	from := plan.Phase
+	if !planPhaseCanTransition(from, to) {
+		return mcp.ErrorResult(fmt.Errorf("illegal transition %s -> %s (allowed: %v)", from, to, planPhaseTransitions[from])), nil
+	}
+	now := time.Now().UTC()
+	if from != to {
+		plan.PhaseHistory = append(plan.PhaseHistory, PhaseTransition{
+			From:  from,
+			To:    to,
+			At:    now,
+			Actor: v.String("agent_id", ""),
+			Note:  v.String("note", ""),
+		})
+		plan.Phase = to
+		plan.UpdatedAt = now
+	}
+	if err := ps.persist(ctx, plan); err != nil {
+		return mcp.ErrorResult(fmt.Errorf("persist plan: %w", err)), nil
+	}
+	ps.mu.Lock()
+	ps.plans[plan.ID] = plan
+	ps.mu.Unlock()
+	return mcp.JSONResult(map[string]any{
+		"ok":         true,
+		"plan_id":    plan.ID,
+		"from_phase": from,
+		"to_phase":   plan.Phase,
+	})
+}
+
+// ---- List / Search ---------------------------------------------------------
+
 // List returns plans filtered by project and/or namespace. NOT agent-scoped.
 func (ps *PlanSvc) List(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	project := v.String("project", "")
 	namespace := v.String("namespace", "")
+	phase := v.String("phase", "")
 	limit := v.Int("limit", 100)
 
-	plans, err := ps.list(ctx, project, namespace, limit)
+	plans, err := ps.list(ctx, project, namespace, phase, limit)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("list plans: %w", err)), nil
 	}
-	return mcp.JSONResult(map[string]any{
-		"ok":    true,
-		"count": len(plans),
-		"plans": plans,
-	})
+	return mcp.JSONResult(map[string]any{"ok": true, "count": len(plans), "plans": plans})
 }
 
-func (ps *PlanSvc) list(ctx context.Context, project, namespace string, limit int) ([]*Plan, error) {
-	if ps.qdrant == nil {
-		return ps.listFromCache(project, namespace), nil
+func (ps *PlanSvc) list(ctx context.Context, project, namespace, phase string, limit int) ([]*Plan, error) {
+	if ps.plansQ == nil {
+		return ps.listFromCache(project, namespace, phase), nil
 	}
 	var conds []any
 	if project != "" {
@@ -176,13 +328,16 @@ func (ps *PlanSvc) list(ctx context.Context, project, namespace string, limit in
 	if namespace != "" {
 		conds = append(conds, Match("namespace", namespace))
 	}
+	if phase != "" {
+		conds = append(conds, Match("status", phase))
+	}
 	var filter map[string]any
 	if len(conds) > 0 {
 		filter = FilterMust(conds...)
 	}
-	points, err := ps.qdrant.ScrollPoints(ctx, filter, limit, false)
+	points, err := ps.plansQ.ScrollPoints(ctx, filter, limit, false)
 	if err != nil {
-		return ps.listFromCache(project, namespace), nil
+		return ps.listFromCache(project, namespace, phase), nil
 	}
 	out := make([]*Plan, 0, len(points))
 	for _, p := range points {
@@ -193,7 +348,7 @@ func (ps *PlanSvc) list(ctx context.Context, project, namespace string, limit in
 	return out, nil
 }
 
-func (ps *PlanSvc) listFromCache(project, namespace string) []*Plan {
+func (ps *PlanSvc) listFromCache(project, namespace, phase string) []*Plan {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 	out := make([]*Plan, 0, len(ps.plans))
@@ -204,30 +359,124 @@ func (ps *PlanSvc) listFromCache(project, namespace string) []*Plan {
 		if namespace != "" && p.Namespace != namespace {
 			continue
 		}
+		if phase != "" && p.Phase != phase {
+			continue
+		}
 		out = append(out, p)
 	}
 	return out
 }
 
-// persist writes a plan to Qdrant (zero vector for the non-semantic MVP).
-func (ps *PlanSvc) persist(ctx context.Context, p *Plan) error {
-	if ps.qdrant == nil {
-		return nil
+// Search runs a semantic search over plan title+spec, optionally scoped to a
+// project. Falls back to a keyword list when no embedder/Qdrant is available.
+func (ps *PlanSvc) Search(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	query := v.Required("query")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
 	}
-	if err := ps.qdrant.EnsureCollection(ctx, sessionsVectorSize); err != nil {
-		return err
+	project := v.String("project", "")
+	limit := v.Int("limit", 20)
+
+	if ps.plansQ == nil || ps.embedr == nil {
+		plans, _ := ps.list(ctx, project, "", "", limit)
+		return mcp.JSONResult(map[string]any{"ok": true, "count": len(plans), "plans": plans, "mode": "fallback-list"})
 	}
-	point := Point{
-		ID:      p.ID,
-		Vector:  make([]float64, sessionsVectorSize),
-		Payload: planToPayload(p),
+	vec, err := ps.embedr.EmbedQuery(ctx, query)
+	if err != nil || len(vec) == 0 {
+		ps.logger.Warn("plan search embed failed; falling back to list", "error", err)
+		plans, _ := ps.list(ctx, project, "", "", limit)
+		return mcp.JSONResult(map[string]any{"ok": true, "count": len(plans), "plans": plans, "mode": "fallback-list"})
 	}
-	return ps.qdrant.Upsert(ctx, []Point{point}, true)
+	var filter map[string]any
+	if project != "" {
+		filter = FilterMust(Match("project", project))
+	}
+	points, err := ps.plansQ.SearchRaw(ctx, vec, filter, limit)
+	if err != nil {
+		return mcp.ErrorResult(fmt.Errorf("plan search: %w", err)), nil
+	}
+	out := make([]*Plan, 0, len(points))
+	for _, p := range points {
+		if plan := payloadToPlan(p.Payload); plan != nil {
+			out = append(out, plan)
+		}
+	}
+	return mcp.JSONResult(map[string]any{"ok": true, "count": len(out), "plans": out, "mode": "semantic"})
 }
 
-// parsePlanSlicesArg normalizes the optional "slices" argument into PlanSlices,
+// ---- persistence -----------------------------------------------------------
+
+// persist writes a plan to Qdrant, embedding title+spec best-effort (a failed
+// embedder must NEVER block the write — embedding is enrichment, not a
+// correctness gate; a deterministic fallback vector keeps the point valid under
+// cosine distance).
+func (ps *PlanSvc) persist(ctx context.Context, p *Plan) error {
+	if ps.plansQ == nil {
+		return nil
+	}
+	vec := ps.embedText(ctx, p.Title+" "+p.SpecDoc)
+	size := ps.resolveVectorSize(ctx, vec, ps.plansQ)
+	if err := ps.plansQ.EnsureCollection(ctx, size); err != nil {
+		return err
+	}
+	if len(vec) != size {
+		vec = fallbackEmbedVector(size)
+	}
+	return ps.plansQ.Upsert(ctx, []Point{{ID: p.ID, Vector: vec, Payload: planToPayload(p)}}, true)
+}
+
+// embedText returns an embedding for text, or nil on any failure / no embedder.
+func (ps *PlanSvc) embedText(ctx context.Context, text string) []float64 {
+	if ps.embedr == nil {
+		return nil
+	}
+	vecs, err := ps.embedr.EmbedDocuments(ctx, []string{text})
+	if err != nil || len(vecs) != 1 || len(vecs[0]) == 0 {
+		ps.logger.Warn("plan embed failed; using fallback vector", "error", err)
+		return nil
+	}
+	return vecs[0]
+}
+
+// resolveVectorSize picks the embedding dimension: a real vector wins, then the
+// shared discovered size, then the live collection, then the embedder default.
+func (ps *PlanSvc) resolveVectorSize(ctx context.Context, vec []float64, q *QdrantClient) int {
+	if len(vec) > 0 {
+		*ps.vectorSize = len(vec)
+	}
+	if *ps.vectorSize <= 0 {
+		if exists, size, err := q.GetCollectionVectorSize(ctx); err == nil && exists && size > 0 {
+			*ps.vectorSize = size
+		}
+	}
+	if *ps.vectorSize <= 0 {
+		*ps.vectorSize = defaultEmbedVectorSize
+	}
+	return *ps.vectorSize
+}
+
+// ---- arg parsing -----------------------------------------------------------
+
+func parseSuccessArg(raw any) *SuccessCriteria {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	sc := &SuccessCriteria{
+		Tests:       toStringSlice(m["tests"]),
+		Metrics:     toStringSlice(m["metrics"]),
+		ManualCheck: toString(m["manual_check"]),
+	}
+	if len(sc.Tests) == 0 && len(sc.Metrics) == 0 && sc.ManualCheck == "" {
+		return nil
+	}
+	return sc
+}
+
+// parsePlanSlicesArg normalizes the optional "slices" arg into PlanSlices,
 // stamping each with a stable id (<plan_id>#<n>) and a default phase.
-func parsePlanSlicesArg(raw any, planID string) []PlanSlice {
+func parsePlanSlicesArg(raw any, planID string, now time.Time) []PlanSlice {
 	arr, ok := raw.([]any)
 	if !ok {
 		return nil
@@ -238,15 +487,34 @@ func parsePlanSlicesArg(raw any, planID string) []PlanSlice {
 		if !ok {
 			continue
 		}
-		s := PlanSlice{
-			ID:    fmt.Sprintf("%s#%d", planID, i+1),
-			Order: i + 1,
-			Name:  toString(m["name"]),
-			Goal:  toString(m["goal"]),
-			Files: toStringSlice(m["files"]),
-			Phase: SlicePhasePending,
-		}
-		out = append(out, s)
+		out = append(out, PlanSlice{
+			ID:                 fmt.Sprintf("%s#%d", planID, i+1),
+			PlanID:             planID,
+			Order:              i + 1,
+			Name:               toString(m["name"]),
+			Goal:               toString(m["goal"]),
+			Files:              toStringSlice(m["files"]),
+			AcceptanceCriteria: toString(m["acceptance_criteria"]),
+			TestStrategy:       toString(m["test_strategy"]),
+			InterfaceContracts: toString(m["interface_contracts"]),
+			BranchName:         toString(m["branch_name"]),
+			DependsOn:          toStringSlice(m["depends_on"]),
+			Phase:              SlicePhasePending,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		})
 	}
 	return out
+}
+
+func appendUnique(list []string, v string) []string {
+	if v == "" {
+		return list
+	}
+	for _, e := range list {
+		if e == v {
+			return list
+		}
+	}
+	return append(list, v)
 }

@@ -93,7 +93,8 @@ type Config struct {
 	FileClaimsCollection string
 
 	// Plans (first-class, worktree-resilient plan store)
-	PlansCollection string
+	PlansCollection      string
+	PlanSlicesCollection string
 
 	// Git worktree integration
 	WorktreeCollection      string
@@ -219,7 +220,8 @@ func LoadConfigFromEnv() (Config, error) {
 		FileClaimsCollection: env.StringChain([]string{"AGENT_CONTEXT_FILE_CLAIMS_COLLECTION"}, "agent_file_claims_v1"),
 
 		// Plans
-		PlansCollection: env.StringChain([]string{"AGENT_CONTEXT_PLANS_COLLECTION"}, "agent_plans_v1"),
+		PlansCollection:      env.StringChain([]string{"AGENT_CONTEXT_PLANS_COLLECTION"}, "agent_plans_v1"),
+		PlanSlicesCollection: env.StringChain([]string{"AGENT_CONTEXT_PLAN_SLICES_COLLECTION"}, "agent_plan_slices_v1"),
 
 		// Git worktree
 		WorktreeCollection:      env.StringChain([]string{"AGENT_CONTEXT_WORKTREE_COLLECTION"}, "agent_worktrees_v1"),

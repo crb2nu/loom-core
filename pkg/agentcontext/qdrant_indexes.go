@@ -27,6 +27,7 @@ var keywordIndexesByKind = map[string][]string{
 	CollPresence:   {"agent_id", "status"},
 	CollFileClaims: {"agent_id", "status", "file_path"},
 	CollPlans:      {"id", "project", "namespace", "status", "slug", "created_by"},
+	CollPlanSlices: {"id", "plan_id", "status", "assigned_agent_id"},
 }
 
 // datetimeIndexesByKind lists payload fields stored as RFC3339 strings that

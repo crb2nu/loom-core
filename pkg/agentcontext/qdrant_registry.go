@@ -21,6 +21,7 @@ const (
 	CollFileClaims     = "fileClaims"
 	CollWorktree       = "worktree"
 	CollPlans          = "plans"
+	CollPlanSlices     = "planSlices"
 
 	// CollAnnotations is an alias for CollContext.
 	// Annotations now share the context collection with a _record_type discriminator.
@@ -59,6 +60,7 @@ func NewQdrantRegistry(hc *httpclient.Client, cfg Config) *QdrantRegistry {
 			CollFileClaims:     mk(CollFileClaims, cfg.FileClaimsCollection),
 			CollWorktree:       mk(CollWorktree, cfg.WorktreeCollection),
 			CollPlans:          mk(CollPlans, cfg.PlansCollection),
+			CollPlanSlices:     mk(CollPlanSlices, cfg.PlanSlicesCollection),
 		},
 	}
 }
