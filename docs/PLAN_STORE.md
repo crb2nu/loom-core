@@ -123,6 +123,21 @@ committed file stays in sync; agents always read the **store** by `plan_id`, not
 the file. The `plan-loom-core` skill drives this flow (create in store → render
 mirror → edit via tools → re-render).
 
+## HUD lifecycle view
+
+The HUD exposes the plan store read-only so you can review each plan/slice across
+`plan→implement→review→merge→deploy`:
+
+- `GET /api/plans?project=&namespace=&phase=` — list plans (with phase, MR/pipeline/deploy refs, phase_history).
+- `GET /api/plans/{id}` — one plan with its slices.
+
+Served by the `plans` HUD domain (`internal/hud/domain/plans`) via the
+`AgentBridge.Plans`/`Plan` read methods. If the running daemon predates the plan
+store (the `agent_plan_*` tools are unknown), the endpoints **degrade** to
+`{available:false}` + an empty list (HTTP 200) rather than erroring, so the view
+shows a clean "deploy pending" state. The Svelte lifecycle card consumes these
+endpoints and is verified against live data once the daemon ships the tools.
+
 ## Configuration
 
 | Env | Default | Meaning |

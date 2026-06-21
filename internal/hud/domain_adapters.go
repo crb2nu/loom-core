@@ -23,6 +23,7 @@ import (
 	domainmerge "github.com/crb2nu/loom/internal/hud/domain/merge"
 	domainmills "github.com/crb2nu/loom/internal/hud/domain/mills"
 	"github.com/crb2nu/loom/internal/hud/domain/mobile"
+	"github.com/crb2nu/loom/internal/hud/domain/plans"
 	"github.com/crb2nu/loom/internal/hud/domain/sandbox"
 	domainshuttle "github.com/crb2nu/loom/internal/hud/domain/shuttle"
 	domainspawn "github.com/crb2nu/loom/internal/hud/domain/spawn"
@@ -59,6 +60,7 @@ func (a *App) initDomainRegistry() {
 	register("workflow", workflow.New(&workflowDepsAdapter{app: a}))
 	register("memory", memory.New(&memoryDepsAdapter{app: a}))
 	register("handoff", handoff.New(&handoffDepsAdapter{app: a}))
+	register("plans", plans.New(&plansDepsAdapter{app: a}))
 	register("mills", domainmills.New(&millsDepsAdapter{app: a}))
 	register("merge", domainmerge.New(&mergeDepsAdapter{app: a}))
 	register("shuttle", domainshuttle.New(&shuttleDepsAdapter{app: a}))
