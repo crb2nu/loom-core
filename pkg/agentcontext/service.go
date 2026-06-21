@@ -80,6 +80,7 @@ type Service struct {
 	worktrees *WorktreeSvc
 	tasks     *TaskSvc
 	sess      *SessionSvc
+	plans     *PlanSvc
 
 	// Context operations (entries, annotations, recall, search, summaries)
 	ctxSvc *ContextSvc
@@ -270,6 +271,7 @@ func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 	svc.claims = NewClaimSvc(qdrantReg.Get(CollFileClaims), svc.logger, svc.metrics)
 	svc.worktrees = NewWorktreeSvc(qdrantReg.Get(CollWorktree), cfg, svc.logger, svc.metrics)
 	svc.tasks = NewTaskSvc(qdrantReg.Get(CollTasks), svc.embed, cfg, svc.logger, &svc.vectorSize)
+	svc.plans = NewPlanSvc(qdrantReg.Get(CollPlans), svc.logger)
 
 	// Wire cross-domain callbacks for presence cleanup
 	svc.presence.releaseClaimsForAgent = func(agentID string) {
