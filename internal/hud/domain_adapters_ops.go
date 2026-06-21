@@ -90,6 +90,24 @@ func (h *handoffDepsAdapter) BroadcastAgentEvent(eventType string, payload any) 
 	h.app.BroadcastAgentEvent(eventType, payload)
 }
 
+// --- Plans domain Deps adapter ---
+
+type plansDepsAdapter struct {
+	app *App
+}
+
+func (p *plansDepsAdapter) WriteJSON(w http.ResponseWriter, status int, v any) {
+	p.app.WriteJSON(w, status, v)
+}
+
+func (p *plansDepsAdapter) WriteError(w http.ResponseWriter, status int, msg string, err error) {
+	p.app.WriteError(w, status, msg, err)
+}
+
+func (p *plansDepsAdapter) Logger() *slog.Logger { return p.app.Logger() }
+
+func (p *plansDepsAdapter) Agent() *bridge.AgentBridge { return p.app.Agent() }
+
 // --- Mills domain Deps adapter ---
 
 type millsDepsAdapter struct {
