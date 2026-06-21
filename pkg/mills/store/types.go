@@ -68,9 +68,13 @@ type BacklogItem struct {
 	Slices         []Slice
 	Dependencies   []string
 	CouncilRunID   *string
-	CreatedBy      string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// PlanID links this backlog item to a first-class Plan in the agent-context
+	// store (plan store convergence). When set, the Mills agent resolves the
+	// live plan + slices via agent_plan_get rather than re-reading SpecDoc.
+	PlanID    string
+	CreatedBy string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // CouncilTrigger identifies what caused a council run.

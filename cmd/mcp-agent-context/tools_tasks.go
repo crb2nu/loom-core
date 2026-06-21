@@ -80,6 +80,14 @@ func registerTaskTools(server *mcp.Server, svc *agentcontext.Service, tracer tra
 								"type":        "string",
 								"description": "Optional workflow instance linked to the task.",
 							},
+							"plan_id": map[string]any{
+								"type":        "string",
+								"description": "Optional plan this task belongs to (plan store convergence).",
+							},
+							"slice_id": map[string]any{
+								"type":        "string",
+								"description": "Optional plan slice this task is a TODO under.",
+							},
 						},
 						"required": []string{"title"},
 					},

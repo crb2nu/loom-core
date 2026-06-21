@@ -62,8 +62,9 @@ func TestMigrate_v2_Idempotent(t *testing.T) {
 		}
 		versions = append(versions, v)
 	}
-	// 001 initial, 002 v2 swarm, 003 research_diff column, 004 workflow steps.
-	want := []int{1, 2, 3, 4}
+	// 001 initial, 002 v2 swarm, 003 research_diff column, 004 workflow steps,
+	// 005 backlog plan_id.
+	want := []int{1, 2, 3, 4, 5}
 	if len(versions) != len(want) {
 		t.Errorf("schema_migrations versions: got %v want %v", versions, want)
 	} else {

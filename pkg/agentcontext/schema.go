@@ -335,6 +335,12 @@ type Task struct {
 	PipelineRef *PipelineRef `json:"pipeline_ref,omitempty"`
 	WorkflowID  string       `json:"workflow_id,omitempty"`
 
+	// Plan linking (plan store convergence): a task is a granular TODO under a
+	// plan slice. PlanID/SliceID tie it to the first-class Plan entity so the
+	// HUD/flexdeck and Mills share one work hierarchy (plan → slice → task).
+	PlanID  string `json:"plan_id,omitempty"`
+	SliceID string `json:"slice_id,omitempty"`
+
 	// Timestamps
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`

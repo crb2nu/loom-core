@@ -20,7 +20,7 @@ import (
 var keywordIndexesByKind = map[string][]string{
 	CollContext:    {"session_id", "agent_id", "entry_type", "visibility", "file_path", "namespace", "project"},
 	CollSessions:   {"agent_id", "namespace", "status"},
-	CollTasks:      {"session_id", "agent_id", "status", "namespace", "project", "file_path"},
+	CollTasks:      {"session_id", "agent_id", "status", "namespace", "project", "file_path", "plan_id", "slice_id"},
 	CollWorkflows:  {"status", "agent_id", "session_id"},
 	CollHandoffs:   {"target_agent_id", "agent_id", "status"},
 	CollMemory:     {"agent_id", "namespace", "tier"},

@@ -74,6 +74,25 @@ func TestTaskToPayload(t *testing.T) {
 	}
 }
 
+func TestTaskPlanLinkageRoundTrip(t *testing.T) {
+	task := Task{
+		ID: "task-p1", SessionID: "s", AgentID: "a", Title: "TODO under a slice",
+		Priority: TaskPriorityMedium, Status: TaskStatusPending,
+		PlanID: "plan-demo-abc123", SliceID: "plan-demo-abc123#2",
+	}
+	payload := taskToPayload(task)
+	if payload["plan_id"] != "plan-demo-abc123" || payload["slice_id"] != "plan-demo-abc123#2" {
+		t.Fatalf("plan linkage not in payload: %v / %v", payload["plan_id"], payload["slice_id"])
+	}
+	got, err := payloadToTask(payload)
+	if err != nil {
+		t.Fatalf("payloadToTask: %v", err)
+	}
+	if got.PlanID != task.PlanID || got.SliceID != task.SliceID {
+		t.Fatalf("plan linkage lost: plan_id=%q slice_id=%q", got.PlanID, got.SliceID)
+	}
+}
+
 func TestPayloadToTask(t *testing.T) {
 	now := time.Now()
 	payload := map[string]any{

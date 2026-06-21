@@ -988,6 +988,9 @@ func backlogPromptContext(item *store.BacklogItem) string {
 	}
 	var b strings.Builder
 	b.WriteString("Backlog context:\n")
+	if item.PlanID != "" {
+		fmt.Fprintf(&b, "- Plan: %s — resolve the live plan + slices with agent_plan_get{plan_id:\"%s\"} (the store is canonical; do NOT rely on stale .loom files).\n", item.PlanID, item.PlanID)
+	}
 	if len(item.Labels) > 0 {
 		fmt.Fprintf(&b, "- Labels: %s\n", strings.Join(item.Labels, ", "))
 	}

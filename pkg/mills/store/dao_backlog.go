@@ -18,7 +18,7 @@ type BacklogDAO struct {
 
 const backlogColumns = `id, gitlab_issue_iid, title, labels_json, state, priority,
 		spec_doc, spec_anchor, success_json, budget_json, policy_json, slices_json,
-		dependencies_json, council_run_id, created_by, created_at, updated_at`
+		dependencies_json, council_run_id, created_by, created_at, updated_at, plan_id`
 
 // Put inserts or replaces a backlog item. CreatedAt is preserved if the row
 // already exists; UpdatedAt is always set to now.
@@ -68,7 +68,7 @@ func (d *BacklogDAO) Put(ctx context.Context, item *BacklogItem) error {
 
 	_, err = d.db.ExecContext(ctx, `
 		INSERT INTO backlog_items (`+backlogColumns+`)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			gitlab_issue_iid = excluded.gitlab_issue_iid,
 			title            = excluded.title,
@@ -84,11 +84,13 @@ func (d *BacklogDAO) Put(ctx context.Context, item *BacklogItem) error {
 			dependencies_json= excluded.dependencies_json,
 			council_run_id   = excluded.council_run_id,
 			created_by       = excluded.created_by,
-			updated_at       = excluded.updated_at
+			updated_at       = excluded.updated_at,
+			plan_id          = excluded.plan_id
 	`,
 		item.ID, iid, item.Title, labels, string(item.State), string(item.Priority),
 		nullStr(item.SpecDoc), nullStr(item.SpecAnchor), success, budget, policy, slices,
 		deps, council, item.CreatedBy, timeRFC3339(item.CreatedAt), timeRFC3339(item.UpdatedAt),
+		nullStr(item.PlanID),
 	)
 	if err != nil {
 		return fmt.Errorf("backlog put %s: %w", item.ID, err)
@@ -162,11 +164,12 @@ func scanBacklog(s scanner) (*BacklogItem, error) {
 		slicesJSON, deps string
 		createdAt        string
 		updatedAt        string
+		planID           sql.NullString
 	)
 	err := s.Scan(
 		&item.ID, &iid, &item.Title, &labels, &item.State, &item.Priority,
 		&specDoc, &specAnchor, &success, &budget, &policy, &slicesJSON,
-		&deps, &council, &item.CreatedBy, &createdAt, &updatedAt,
+		&deps, &council, &item.CreatedBy, &createdAt, &updatedAt, &planID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -176,6 +179,9 @@ func scanBacklog(s scanner) (*BacklogItem, error) {
 	}
 	item.GitLabIssueIID = nullableInt64(iid)
 	item.CouncilRunID = nullableString(council)
+	if planID.Valid {
+		item.PlanID = planID.String
+	}
 	if specDoc.Valid {
 		item.SpecDoc = specDoc.String
 	}

@@ -83,6 +83,7 @@ func TestBacklog_RoundTrip(t *testing.T) {
 		}},
 		Dependencies: []string{"MILLS-2026-04-25-000"},
 		CouncilRunID: &council,
+		PlanID:       "plan-spawnpanel-ab12cd",
 		CreatedBy:    "council",
 	}
 	if err := st.Backlog.Put(ctx, item); err != nil {
@@ -112,6 +113,9 @@ func TestBacklog_RoundTrip(t *testing.T) {
 	}
 	if got.CouncilRunID == nil || *got.CouncilRunID != council {
 		t.Errorf("council ref: got %v", got.CouncilRunID)
+	}
+	if got.PlanID != "plan-spawnpanel-ab12cd" {
+		t.Errorf("plan_id: got %q want plan-spawnpanel-ab12cd", got.PlanID)
 	}
 
 	// Update flow: change state and re-Put; CreatedAt must be preserved.
