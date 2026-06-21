@@ -176,8 +176,26 @@ func (ps *PlanSvc) SliceClaim(ctx context.Context, args map[string]any) (*mcp.Ca
 			"hint":       "another agent holds this slice; pass force=true to steal",
 		})
 	}
+
+	sessionID := v.String("session_id", s.SessionID)
+
+	// Enforce the slice's file boundary: hard-claim its files for this agent.
+	// If any file is held by another active agent, refuse the slice claim
+	// (all-or-nothing) so two parallel implementers never collide on a file.
+	if ps.claimFiles != nil && len(s.Files) > 0 {
+		if conflicting := ps.claimFiles(ctx, agentID, sessionID, "slice "+s.ID, s.Files); len(conflicting) > 0 {
+			return mcp.JSONResult(map[string]any{
+				"ok":                false,
+				"conflict":          true,
+				"slice_id":          s.ID,
+				"conflicting_files": conflicting,
+				"hint":              "one or more of this slice's files are claimed by another agent",
+			})
+		}
+	}
+
 	s.AssignedAgentID = agentID
-	s.SessionID = v.String("session_id", s.SessionID)
+	s.SessionID = sessionID
 	s.WorktreeID = v.String("worktree_id", s.WorktreeID)
 	if v.String("branch_name", "") != "" {
 		s.BranchName = v.String("branch_name", "")

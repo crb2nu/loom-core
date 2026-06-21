@@ -272,6 +272,10 @@ func NewServiceFromEnv(opts ...ServiceOption) (*Service, error) {
 	svc.worktrees = NewWorktreeSvc(qdrantReg.Get(CollWorktree), cfg, svc.logger, svc.metrics)
 	svc.tasks = NewTaskSvc(qdrantReg.Get(CollTasks), svc.embed, cfg, svc.logger, &svc.vectorSize)
 	svc.plans = NewPlanSvc(qdrantReg.Get(CollPlans), qdrantReg.Get(CollPlanSlices), svc.embed, &svc.vectorSize, svc.logger)
+	// Slice claims enforce the file boundary via the file-claim service.
+	svc.plans.claimFiles = func(ctx context.Context, agentID, sessionID, reason string, files []string) []string {
+		return svc.claims.AcquireEnforced(ctx, agentID, sessionID, reason, files)
+	}
 
 	// Wire cross-domain callbacks for presence cleanup
 	svc.presence.releaseClaimsForAgent = func(agentID string) {

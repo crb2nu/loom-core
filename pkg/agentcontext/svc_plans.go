@@ -42,6 +42,11 @@ type PlanSvc struct {
 	// task service uses) so collections stay consistent.
 	vectorSize *int
 	logger     *slog.Logger
+
+	// claimFiles, when wired (service.go), hard-claims a slice's files for the
+	// claiming agent and returns any files held by another active agent (empty =
+	// all acquired). This makes a slice's file boundary enforced, not advisory.
+	claimFiles func(ctx context.Context, agentID, sessionID, reason string, files []string) []string
 }
 
 // NewPlanSvc constructs a PlanSvc. embedr/vectorSize may be nil in tests (embed

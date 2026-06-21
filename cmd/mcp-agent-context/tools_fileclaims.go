@@ -42,6 +42,10 @@ func registerFileClaimTools(server *mcp.Server, svc *agentcontext.Service, trace
 					"type":        "string",
 					"description": "Why this file is being claimed.",
 				},
+				"enforce": map[string]any{
+					"type":        "boolean",
+					"description": "Hard enforcement: refuse (ok:false) instead of acquiring if another active agent holds the file. Default false (advisory).",
+				},
 			},
 			Required: []string{"agent_id", "session_id", "file_path"},
 		},
