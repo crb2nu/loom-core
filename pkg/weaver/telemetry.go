@@ -2,6 +2,7 @@ package weaver
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/crb2nu/loom/pkg/openairesponses"
 )
@@ -39,15 +40,40 @@ func (t *SubagentTelemetry) RecordTurnEnd(_ context.Context, resp openairesponse
 	}
 }
 
-func (t *SubagentTelemetry) RecordToolCall(_ context.Context, call openairesponses.ToolCall, _ openairesponses.ToolResult, err error, _ openairesponses.ExecutionIdentity) {
+func (t *SubagentTelemetry) RecordToolCall(_ context.Context, _ openairesponses.ToolCall, result openairesponses.ToolResult, err error, _ openairesponses.ExecutionIdentity) {
 	if t.metrics == nil {
 		return
 	}
-	status := "ok"
 	if err != nil {
-		status = "error"
 		t.metrics.ErrorsTotal.WithLabelValues(t.domain).Inc()
+		return
 	}
-	_ = status
-	_ = call
+	// Count the raw tool-response size weaver consumed (pre-compression).
+	// This feeds the F8 economics card's compression / token-savings /
+	// context-waste ratios against the compressed answer recorded per query.
+	if text := toolResultText(result); text != "" {
+		t.metrics.RecordRawToolTokens(estimateTokens(text))
+	}
+}
+
+// toolResultText extracts the textual payload of a tool result. The weaver
+// executor sets Output to a string, but the contract type is `any`, so we
+// defensively handle the common alternatives.
+func toolResultText(r openairesponses.ToolResult) string {
+	switch v := r.Output.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case json.RawMessage:
+		return string(v)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
 }

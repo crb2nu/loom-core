@@ -124,15 +124,19 @@ func (f *fleetDepsAdapter) WeaverMetrics() (fleet.WeaverMetricsView, bool) {
 // payload with zero counters is still reachable (weaver enabled but quiet).
 func weaverMetricsViewFromJSON(raw json.RawMessage) (fleet.WeaverMetricsView, bool) {
 	var summary struct {
-		TotalQueries int64 `json:"total_queries"`
-		TotalTokens  int64 `json:"total_tokens"`
+		TotalQueries   int64 `json:"total_queries"`
+		TotalTokens    int64 `json:"total_tokens"`
+		RawToolTokens  int64 `json:"raw_tool_response_tokens"`
+		ResponseTokens int64 `json:"weaver_response_tokens"`
 	}
 	if err := json.Unmarshal(raw, &summary); err != nil {
 		return fleet.WeaverMetricsView{}, false
 	}
 	return fleet.WeaverMetricsView{
-		TotalQueries: int(summary.TotalQueries),
-		TotalTokens:  int(summary.TotalTokens),
+		TotalQueries:   int(summary.TotalQueries),
+		TotalTokens:    int(summary.TotalTokens),
+		RawToolTokens:  int(summary.RawToolTokens),
+		ResponseTokens: int(summary.ResponseTokens),
 	}, true
 }
 

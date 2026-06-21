@@ -222,6 +222,7 @@ func (r *Router) Query(ctx context.Context, req QueryRequest) (QueryResult, erro
 			}
 			result.LatencyMs = time.Since(start).Milliseconds()
 			r.recordQuery(start, "ok")
+			r.metrics.RecordResponseTokens(estimateTokens(result.Answer))
 			r.recordHistory(QueryHistoryEntry{
 				Timestamp: start, QueryID: queryID, Query: req.Query,
 				Domains: result.DomainsUsed, Status: "ok",
@@ -255,6 +256,7 @@ func (r *Router) Query(ctx context.Context, req QueryRequest) (QueryResult, erro
 
 	result.LatencyMs = time.Since(start).Milliseconds()
 	r.recordQuery(start, "ok")
+	r.metrics.RecordResponseTokens(estimateTokens(result.Answer))
 	r.recordHistory(QueryHistoryEntry{
 		Timestamp: start, QueryID: queryID, Query: req.Query, Domains: domains,
 		Status: "ok", LatencyMs: result.LatencyMs, TotalTokens: result.TotalTokens,

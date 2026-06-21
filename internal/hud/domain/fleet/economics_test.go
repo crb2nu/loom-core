@@ -130,6 +130,68 @@ func TestComputeEconomicsSnapshot_MixedInputs(t *testing.T) {
 	}
 }
 
+// TestBuildEconomicsInputs_WiresWeaverToolAndResponseTokens proves the raw
+// tool-response and compressed-answer counts now flow from WeaverMetrics
+// into the economics inputs — the wiring that lets the compression,
+// token-savings, and context-waste ratios populate instead of sitting at
+// "insufficient_data" forever.
+func TestBuildEconomicsInputs_WiresWeaverToolAndResponseTokens(t *testing.T) {
+	now := time.Now().UTC()
+	deps := &mockDeps{
+		spawnSnapshots: []SpawnEconomicsSnapshot{
+			{StartedAt: now.Add(-time.Hour), InputTokens: 10_000, OutputTokens: 2_000},
+		},
+		weaverMetrics: WeaverMetricsView{
+			TotalQueries:   5,
+			TotalTokens:    50_000,
+			RawToolTokens:  40_000,
+			ResponseTokens: 2_000,
+		},
+		weaverIsReachable: true,
+	}
+
+	in := buildEconomicsInputs(deps, now, 7*24*time.Hour)
+	if in.ToolResponseTokens != 40_000 {
+		t.Errorf("ToolResponseTokens = %d, want 40000", in.ToolResponseTokens)
+	}
+	if in.WeaverResponseTokens != 2_000 {
+		t.Errorf("WeaverResponseTokens = %d, want 2000", in.WeaverResponseTokens)
+	}
+
+	snap := ComputeEconomicsSnapshot(in, "7d", now)
+	// compression = 40000/2000 = 20, token_savings = 1 - 2000/40000 = 0.95,
+	// context_waste = 40000/10000 = 4.0 — all "ok", none "insufficient_data".
+	for _, c := range []struct {
+		name string
+		r    *Ratio
+	}{
+		{"token_savings", snap.Ratios.TokenSavings},
+		{"compression", snap.Ratios.Compression},
+		{"context_waste", snap.Ratios.ContextWaste},
+	} {
+		if c.r == nil || c.r.Value == nil || c.r.Status != "ok" {
+			t.Errorf("%s: expected populated ok ratio, got %+v", c.name, c.r)
+		}
+	}
+}
+
+// TestComputeContextWaste_InsufficientWhenNoToolTokens guards the fix for the
+// misleading "0.00" the card showed: with no raw tool-response tokens but a
+// positive frontier-input denominator, context_waste must report
+// insufficient_data, not a fake zero.
+func TestComputeContextWaste_InsufficientWhenNoToolTokens(t *testing.T) {
+	snap := ComputeEconomicsSnapshot(EconomicsInputs{
+		FrontierInputTokens:    10_000,
+		ToolResponseTokens:     0,
+		WeaverMetricsReachable: true,
+	}, "7d", time.Now().UTC())
+
+	r := snap.Ratios.ContextWaste
+	if r == nil || r.Value != nil || r.Status != "insufficient_data" {
+		t.Errorf("context_waste: expected insufficient_data with nil value, got %+v", r)
+	}
+}
+
 // TestComputeEconomicsSnapshot_DivideByZeroGuards exercises every divide-by
 // zero branch so a single missing counter cannot panic or return ±Inf.
 func TestComputeEconomicsSnapshot_DivideByZeroGuards(t *testing.T) {

@@ -57,6 +57,15 @@ func (d *Daemon) startEmbeddedWeaver(ctx context.Context) error {
 
 	router := weaver.NewRouter(cfg, client, executor, lister, d.logger)
 
+	// Wire metrics. Without this the Router's lifetime counters stay nil,
+	// so loom/weaver/metrics (and the HUD F8 token-economics card) report
+	// all zeros even after weaver has run queries. nil registerer mirrors
+	// the standalone cmd/mcp-weaver: the lifetime atomics that feed
+	// MetricsSummary() work regardless of Prometheus registration, and a
+	// nil registerer avoids double-registration against the daemon's own
+	// default registry.
+	router.SetMetrics(weaver.NewMetrics(nil))
+
 	// Load YAML domain overrides.
 	yamlPath := weaver.DefaultDomainsPath()
 	if err := weaver.MergeDomainsIntoRegistry(router.Registry(), yamlPath); err != nil {

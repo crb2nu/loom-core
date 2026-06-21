@@ -29,6 +29,41 @@ func TestMetrics_Summary(t *testing.T) {
 	}
 }
 
+func TestMetrics_Summary_ToolAndResponseTokens(t *testing.T) {
+	m := NewMetrics(nil)
+	m.RecordRawToolTokens(1000)
+	m.RecordRawToolTokens(500)
+	m.RecordResponseTokens(120)
+
+	s := m.Summary()
+	if got := s["raw_tool_response_tokens"].(int64); got != 1500 {
+		t.Errorf("raw_tool_response_tokens = %d, want 1500", got)
+	}
+	if got := s["weaver_response_tokens"].(int64); got != 120 {
+		t.Errorf("weaver_response_tokens = %d, want 120", got)
+	}
+}
+
+// Record methods must be nil-safe (Router.metrics may be unset) and ignore
+// non-positive counts.
+func TestMetrics_RecordTokens_NilAndZeroSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordRawToolTokens(10)  // nil receiver: must not panic
+	m.RecordResponseTokens(10) // nil receiver: must not panic
+
+	live := NewMetrics(nil)
+	live.RecordRawToolTokens(0)
+	live.RecordRawToolTokens(-5)
+	live.RecordResponseTokens(0)
+	s := live.Summary()
+	if got := s["raw_tool_response_tokens"].(int64); got != 0 {
+		t.Errorf("raw_tool_response_tokens = %d, want 0 (non-positive ignored)", got)
+	}
+	if got := s["weaver_response_tokens"].(int64); got != 0 {
+		t.Errorf("weaver_response_tokens = %d, want 0", got)
+	}
+}
+
 func TestMetrics_Summary_Empty(t *testing.T) {
 	m := NewMetrics(nil)
 	s := m.Summary()

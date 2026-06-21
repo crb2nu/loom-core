@@ -18,7 +18,9 @@ func TestWeaverMetricsViewFromJSON(t *testing.T) {
 		"avg_latency_ms": 1234.5,
 		"error_rate": 0.1,
 		"total_tokens": 98765,
-		"error_count": 4
+		"error_count": 4,
+		"raw_tool_response_tokens": 50000,
+		"weaver_response_tokens": 2500
 	}`)
 
 	view, reachable := weaverMetricsViewFromJSON(raw)
@@ -30,6 +32,12 @@ func TestWeaverMetricsViewFromJSON(t *testing.T) {
 	}
 	if view.TotalTokens != 98765 {
 		t.Errorf("TotalTokens = %d, want 98765", view.TotalTokens)
+	}
+	if view.RawToolTokens != 50000 {
+		t.Errorf("RawToolTokens = %d, want 50000", view.RawToolTokens)
+	}
+	if view.ResponseTokens != 2500 {
+		t.Errorf("ResponseTokens = %d, want 2500", view.ResponseTokens)
 	}
 }
 

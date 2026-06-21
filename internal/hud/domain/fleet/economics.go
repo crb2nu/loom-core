@@ -141,6 +141,8 @@ func buildEconomicsInputs(deps Deps, now time.Time, window time.Duration) Econom
 	if reachable {
 		in.WeaverToolCalls = weaver.TotalQueries
 		in.WeaverTokensTotal = weaver.TotalTokens
+		in.ToolResponseTokens = weaver.RawToolTokens
+		in.WeaverResponseTokens = weaver.ResponseTokens
 	}
 	return in
 }
@@ -247,7 +249,14 @@ func computeCostRatio(in EconomicsInputs, localCost float64) *Ratio {
 }
 
 func computeContextWaste(in EconomicsInputs) *Ratio {
-	// total_tool_response_tokens / total_frontier_input_tokens
+	// total_tool_response_tokens / total_frontier_input_tokens.
+	// Guard on the numerator: when raw tool-response tokens haven't been
+	// recorded yet, safeRatio would return a misleading "ok" 0.00 (0 over a
+	// positive denominator). Surface "insufficient_data" instead so the card
+	// doesn't claim zero context waste before weaver telemetry exists.
+	if in.ToolResponseTokens <= 0 {
+		return &Ratio{Value: nil, Status: "insufficient_data"}
+	}
 	return safeRatio(
 		float64(in.ToolResponseTokens),
 		float64(in.FrontierInputTokens),
