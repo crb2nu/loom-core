@@ -82,3 +82,69 @@ func (a *AgentBridge) Plan(planID string) (*PlanInfo, error) {
 	}
 	return &result.Plan, nil
 }
+
+// PlanCreateParams holds the fields for creating a plan from the HUD.
+type PlanCreateParams struct {
+	Title     string
+	Project   string
+	Namespace string
+	Phase     string
+	SpecDoc   string
+	AgentID   string
+}
+
+// PlanCreateResult is the agent_plan_create response.
+type PlanCreateResult struct {
+	PlanID     string `json:"plan_id"`
+	Slug       string `json:"slug"`
+	Phase      string `json:"phase"`
+	SliceCount int    `json:"slice_count"`
+}
+
+// PlanCreate creates a plan via the store.
+func (a *AgentBridge) PlanCreate(p PlanCreateParams) (*PlanCreateResult, error) {
+	args := map[string]any{"title": p.Title}
+	if p.Project != "" {
+		args["project"] = p.Project
+	}
+	if p.Namespace != "" {
+		args["namespace"] = p.Namespace
+	}
+	if p.Phase != "" {
+		args["phase"] = p.Phase
+	}
+	if p.SpecDoc != "" {
+		args["spec_doc"] = p.SpecDoc
+	}
+	if p.AgentID != "" {
+		args["agent_id"] = p.AgentID
+	}
+	var res PlanCreateResult
+	if err := a.callAgentTool("agent_plan_create", args, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// PlanAdvanceResult is the agent_plan_lifecycle_advance response.
+type PlanAdvanceResult struct {
+	PlanID    string `json:"plan_id"`
+	FromPhase string `json:"from_phase"`
+	ToPhase   string `json:"to_phase"`
+}
+
+// PlanAdvance transitions a plan to a new lifecycle phase.
+func (a *AgentBridge) PlanAdvance(planID, toPhase, agentID, note string) (*PlanAdvanceResult, error) {
+	args := map[string]any{"plan_id": planID, "to_phase": toPhase}
+	if agentID != "" {
+		args["agent_id"] = agentID
+	}
+	if note != "" {
+		args["note"] = note
+	}
+	var res PlanAdvanceResult
+	if err := a.callAgentTool("agent_plan_lifecycle_advance", args, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}

@@ -57,6 +57,7 @@ export const views: ViewDef[] = [
     subViews: [
       { id: 'tasks',     label: 'Tasks',     key: 'a' },
       { id: 'workflows', label: 'Workflows', key: 'b' },
+      { id: 'plans',     label: 'Plans',     key: 'c' },
     ],
   },
   {
