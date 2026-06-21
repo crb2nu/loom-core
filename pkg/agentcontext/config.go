@@ -92,6 +92,9 @@ type Config struct {
 	// File claims
 	FileClaimsCollection string
 
+	// Plans (first-class, worktree-resilient plan store)
+	PlansCollection string
+
 	// Git worktree integration
 	WorktreeCollection      string
 	GitRepoPath             string
@@ -214,6 +217,9 @@ func LoadConfigFromEnv() (Config, error) {
 
 		// File claims
 		FileClaimsCollection: env.StringChain([]string{"AGENT_CONTEXT_FILE_CLAIMS_COLLECTION"}, "agent_file_claims_v1"),
+
+		// Plans
+		PlansCollection: env.StringChain([]string{"AGENT_CONTEXT_PLANS_COLLECTION"}, "agent_plans_v1"),
 
 		// Git worktree
 		WorktreeCollection:      env.StringChain([]string{"AGENT_CONTEXT_WORKTREE_COLLECTION"}, "agent_worktrees_v1"),
