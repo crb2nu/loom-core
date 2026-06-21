@@ -20,6 +20,7 @@
   import FleetPanel from './lib/components/FleetPanel.svelte';
   import ServersPanel from './lib/components/ServersPanel.svelte';
   import TasksPanel from './lib/components/TasksPanel.svelte';
+  import PlansPanel from './lib/components/PlansPanel.svelte';
   import WorkflowsPanel from './lib/components/WorkflowsPanel.svelte';
   import MemoryPanel from './lib/components/MemoryPanel.svelte';
   import StreamPanel from './lib/components/StreamPanel.svelte';
@@ -353,6 +354,8 @@
                   <TasksPanel />
                 {:else if router.subView === 'workflows'}
                   <WorkflowsPanel />
+                {:else if router.subView === 'plans'}
+                  <PlansPanel />
                 {:else if router.subView === 'feed'}
                   <KnowledgePanel />
                 {:else if router.subView === 'memory'}

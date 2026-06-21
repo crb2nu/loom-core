@@ -121,6 +121,72 @@ func TestPlanList_RealErrorIsBadGateway(t *testing.T) {
 	}
 }
 
+var errIllegal = fmt.Errorf("illegal transition in_progress -> merged")
+
+func TestPlanCreate_Success(t *testing.T) {
+	var gotName string
+	var gotArgs map[string]any
+	d := newDomain(func(name string, args map[string]any) (json.RawMessage, error) {
+		gotName, gotArgs = name, args
+		return json.RawMessage(`{"ok":true,"plan_id":"plan-new-1","phase":"draft","slice_count":0}`), nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/plans", strings.NewReader(`{"title":"New plan","project":"p/x"}`))
+	rec := httptest.NewRecorder()
+	d.handlePlanCreate(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.HasSuffix(gotName, "agent_plan_create") || gotArgs["title"] != "New plan" || gotArgs["project"] != "p/x" {
+		t.Fatalf("create call wrong: %s %v", gotName, gotArgs)
+	}
+	var resp struct {
+		PlanID string `json:"plan_id"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &resp) //nolint:errcheck
+	if resp.PlanID != "plan-new-1" {
+		t.Fatalf("plan_id = %q", resp.PlanID)
+	}
+}
+
+func TestPlanCreate_RequiresTitle(t *testing.T) {
+	d := newDomain(func(string, map[string]any) (json.RawMessage, error) {
+		t.Fatal("should not call tool without title")
+		return nil, nil
+	})
+	rec := httptest.NewRecorder()
+	d.handlePlanCreate(rec, httptest.NewRequest(http.MethodPost, "/api/plans", strings.NewReader(`{"title":"  "}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty title should be 400, got %d", rec.Code)
+	}
+}
+
+func TestPlanAdvance_SuccessAndIllegal(t *testing.T) {
+	d := newDomain(func(name string, args map[string]any) (json.RawMessage, error) {
+		if !strings.HasSuffix(name, "agent_plan_lifecycle_advance") || args["to_phase"] != "in_review" {
+			t.Fatalf("advance call wrong: %s %v", name, args)
+		}
+		return json.RawMessage(`{"ok":true,"plan_id":"plan-a-1","from_phase":"in_progress","to_phase":"in_review"}`), nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/plans/plan-a-1/advance", strings.NewReader(`{"to_phase":"in_review"}`))
+	req.SetPathValue("id", "plan-a-1")
+	rec := httptest.NewRecorder()
+	d.handlePlanAdvance(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	d2 := newDomain(func(string, map[string]any) (json.RawMessage, error) {
+		return nil, errIllegal
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/api/plans/plan-a-1/advance", strings.NewReader(`{"to_phase":"merged"}`))
+	req2.SetPathValue("id", "plan-a-1")
+	rec2 := httptest.NewRecorder()
+	d2.handlePlanAdvance(rec2, req2)
+	if rec2.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("illegal transition should be 422, got %d", rec2.Code)
+	}
+}
+
 func TestPlanGet_SuccessAndMissingID(t *testing.T) {
 	d := newDomain(func(name string, args map[string]any) (json.RawMessage, error) {
 		if args["plan_id"] != "plan-a-1" {
