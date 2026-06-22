@@ -128,24 +128,41 @@ spec:
             readOnlyRootFilesystem: false
           volumeMounts:
             # Workspace mount so the indexer can read codebases on disk
-            # (e.g. /workspace/services/loom-core). This was backed by the
+            # (e.g. /workspace/services/loom-core). Backed by the Longhorn PVC
+            # `loom-hub-workspace` (storageClass loom-ws-1r), staged with the
+            # workspace repos and already consumed by mobile-hud. Replaces the
             # `loom-hub-workspace-nfs` export on storage-vm-linux-nas-pilot
-            # (192.168.50.211), but that NFS was halted during the 2026-06-21
-            # storage-fault incident (two dying SAS disks). The server is down
-            # (port 2049 unreachable) and a `hard` NFS mount against it hangs
-            # the pod on mount — which left this Deployment's prior PVC volume
-            # invalid and blocked the whole `loom-hub-servers` Flux
-            # Kustomization from reconciling (so mobile-hud could not roll).
-            # Reverted to an emptyDir (matching the live pod) so reconciliation
-            # resumes; the indexer reads an empty workspace until it is
-            # repointed at a healthy Longhorn workspace volume — follow-up,
-            # cf. mobile-hud's `loom-hub-workspace` (loom-ws-1r) migration.
+            # (192.168.50.211), halted during the 2026-06-21 storage-fault
+            # incident (two dying SAS disks). Mounted read-only — the indexer
+            # only reads codebases here, never writes.
+            #
+            # The prior emptyDir was an incident stopgap that kept the server
+            # online but left the index empty; this restores real indexing.
+            # `loom-hub-workspace` is ReadWriteOnce, so it attaches to a single
+            # node at a time. The podAffinity below pins this pod to mobile-hud's
+            # node (the primary consumer) so both share the volume without a
+            # multi-attach error — RWO permits multiple pods on the attached node.
             - name: workspace
               mountPath: /workspace
               readOnly: true
+      # Co-locate with mobile-hud so this pod lands on the node holding the
+      # ReadWriteOnce `loom-hub-workspace` attachment (see the workspace volume
+      # above). Required, not preferred: a pod on any other node cannot attach
+      # the RWO volume and would fail with a multi-attach error. Composes with
+      # the services-core nodeAffinity injected by the gitops `loom-hub-servers`
+      # patch (different affinity sub-key, so the strategic merge keeps both).
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mobile-hud
+              topologyKey: kubernetes.io/hostname
       volumes:
         - name: workspace
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: loom-hub-workspace
+            readOnly: true
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
