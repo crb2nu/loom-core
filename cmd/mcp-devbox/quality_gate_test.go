@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -405,4 +406,75 @@ func TestTruncateOutput(t *testing.T) {
 	if len(truncated) > 20 { // 15 + "..." prefix
 		t.Errorf("truncated output too long: %d bytes", len(truncated))
 	}
+}
+
+// TestAwaitSandboxBuild covers the quality gate's behavior of polling past the
+// async builder's "build in progress" signal instead of failing instantly
+// (the root cause of the Mills canary tests stage recording `0 checks`).
+func TestAwaitSandboxBuild(t *testing.T) {
+	building := &buildInProgressError{tag: "t", project: "p"}
+
+	t.Run("returns once build completes", func(t *testing.T) {
+		calls := 0
+		ensure := func() (string, error) {
+			calls++
+			if calls < 3 {
+				return "", building
+			}
+			return "container-123", nil
+		}
+		id, err := awaitSandboxBuild(context.Background(), time.Second, time.Millisecond, ensure)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id != "container-123" {
+			t.Fatalf("id = %q, want container-123", id)
+		}
+		if calls != 3 {
+			t.Fatalf("ensure called %d times, want 3", calls)
+		}
+	})
+
+	t.Run("passes through non-building errors immediately", func(t *testing.T) {
+		calls := 0
+		boom := errors.New("boom")
+		ensure := func() (string, error) {
+			calls++
+			return "", boom
+		}
+		_, err := awaitSandboxBuild(context.Background(), time.Second, time.Millisecond, ensure)
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want boom", err)
+		}
+		if calls != 1 {
+			t.Fatalf("ensure called %d times, want 1 (no retry on non-building error)", calls)
+		}
+	})
+
+	t.Run("times out while still building", func(t *testing.T) {
+		ensure := func() (string, error) { return "", building }
+		_, err := awaitSandboxBuild(context.Background(), 20*time.Millisecond, time.Millisecond, ensure)
+		if err == nil || !strings.Contains(err.Error(), "still building") {
+			t.Fatalf("err = %v, want 'still building' timeout", err)
+		}
+		if _, ok := asBuildInProgress(err); !ok {
+			t.Fatalf("timeout error should wrap buildInProgressError, got %v", err)
+		}
+	})
+
+	t.Run("honors context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		ensure := func() (string, error) {
+			calls++
+			if calls == 1 {
+				cancel()
+			}
+			return "", building
+		}
+		_, err := awaitSandboxBuild(ctx, time.Minute, 5*time.Millisecond, ensure)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
 }
