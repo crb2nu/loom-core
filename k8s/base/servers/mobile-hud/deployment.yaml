@@ -245,6 +245,18 @@ spec:
             - name: harvester-kubeconfig
               mountPath: /etc/harvester
               readOnly: true
+            # Read-only mount of the shared NFS workspace so the spawn
+            # orchestrator's project resolver (internal/hud/spawn.go →
+            # resolveProjectPath, wsRoot=$HOME/workspace=/home/mcp/workspace)
+            # can find services/loom-core etc. on disk to fingerprint +
+            # generate the Dockerfile before kicking off a git-clone spawn
+            # pod. Same NFS export devbox + codebase-memory already mount;
+            # this namespace's PVC is `loom-hub-workspace-nfs` (see
+            # platform/gitops/k3s/loom-hub/workspace-pvc.yaml, created
+            # explicitly for this resolver). Orchestrator never writes here.
+            - name: workspace
+              mountPath: /home/mcp/workspace
+              readOnly: true
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
@@ -259,3 +271,7 @@ spec:
             items:
               - key: kubeconfig
                 path: kubeconfig
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: loom-hub-workspace-nfs
+            readOnly: true
