@@ -127,21 +127,25 @@ spec:
                 - ALL
             readOnlyRootFilesystem: false
           volumeMounts:
-            # Read-only mount of the shared NFS workspace so the
-            # indexer can read codebases on disk (e.g.
-            # /workspace/core). The same NFS export the devbox and
-            # ICC namespaces already mount; this namespace's PVC is
-            # `loom-hub-workspace-nfs` (see
-            # platform/gitops/k3s/loom-hub/workspace-pvc.yaml).
-            # Indexer never writes here.
+            # Workspace mount so the indexer can read codebases on disk
+            # (e.g. /workspace/services/loom-core). This was backed by the
+            # `loom-hub-workspace-nfs` export on storage-vm-linux-nas-pilot
+            # (192.168.50.211), but that NFS was halted during the 2026-06-21
+            # storage-fault incident (two dying SAS disks). The server is down
+            # (port 2049 unreachable) and a `hard` NFS mount against it hangs
+            # the pod on mount — which left this Deployment's prior PVC volume
+            # invalid and blocked the whole `loom-hub-servers` Flux
+            # Kustomization from reconciling (so mobile-hud could not roll).
+            # Reverted to an emptyDir (matching the live pod) so reconciliation
+            # resumes; the indexer reads an empty workspace until it is
+            # repointed at a healthy Longhorn workspace volume — follow-up,
+            # cf. mobile-hud's `loom-hub-workspace` (loom-ws-1r) migration.
             - name: workspace
               mountPath: /workspace
               readOnly: true
       volumes:
         - name: workspace
-          persistentVolumeClaim:
-            claimName: loom-hub-workspace-nfs
-            readOnly: true
+          emptyDir: {}
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
