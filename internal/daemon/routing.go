@@ -79,6 +79,35 @@ func ValidateRoutingPreferences(prefs map[string]string) error {
 	return nil
 }
 
+// applyOffLANRouting upgrades anti-LAN routing pins to prefer-hub for hub-capable
+// servers, returning the number of servers changed. It is called when the daemon
+// detects it is off the home LAN: local backends that depend on LAN-only services
+// (qdrant, *.lan, k8s) are then unreachable, so servers pinned local-only or
+// prefer-local (e.g. the .loom/149 anti-storm pins on agent_context / gitlab)
+// must route through the Cloudflare-tunnel hub instead.
+//
+// Only explicit pins are upgraded — servers with no preference keep their
+// health-based default, whose existing local→hub fallback already covers off-LAN.
+// hubCapable[name] must be false for registry local-only servers that can never
+// run on the hub (e.g. godot, browserkit); those are never upgraded.
+func applyOffLANRouting(prefs map[string]RoutingPreference, hubCapable map[string]bool) int {
+	changed := 0
+	for name, capable := range hubCapable {
+		if !capable {
+			continue
+		}
+		cur, ok := prefs[name]
+		if !ok {
+			continue
+		}
+		if cur == RoutingLocalOnly || cur == RoutingPreferLocal {
+			prefs[name] = RoutingPreferHub
+			changed++
+		}
+	}
+	return changed
+}
+
 // applyRoutingPreference overrides a route decision based on per-server config.
 // Returns the (possibly modified) target and whether the decision was overridden.
 func applyRoutingPreference(pref RoutingPreference, original router.Target, hasHub bool) (router.Target, bool) {
