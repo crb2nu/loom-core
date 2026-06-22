@@ -21,11 +21,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// defaultMillsOperatorURL is the cluster-internal address used when the user
-// hasn't overridden via flag/env. Setting LOOM_MILLS_OPERATOR_URL to the public
-// ingress (e.g. https://mills.flexinfer.ai) is the recommended setup once the
-// service is exposed; localhost is for `kubectl port-forward` workflows.
-const defaultMillsOperatorURL = "http://localhost:8090"
+// defaultMillsOperatorURL is the public ingress, which reaches the in-cluster
+// operator through the cloudflared tunnel both on- and off-LAN (the operator
+// Service is ClusterIP-only, so there is no LAN-direct path from the Mac). The
+// host is gated by Cloudflare Access at the edge, so the CLI injects a service
+// token (see millsCFAccessHeaders). Override with LOOM_MILLS_OPERATOR_URL or
+// --operator-url=http://localhost:8090 for `kubectl port-forward` workflows.
+const defaultMillsOperatorURL = "https://mills.flexinfer.ai"
 
 // newMillsCmd returns the `loom mills` command group.
 func newMillsCmd() *cobra.Command {
@@ -57,9 +59,11 @@ Set LOOM_MILLS_TOKEN for admin-token-gated endpoints once they ship.`,
 // millsClient resolves the operator URL + admin token from flags/env and
 // returns an HTTP client tuned for the mills surface.
 type millsClient struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	baseURL  string
+	token    string
+	cfID     string
+	cfSecret string
+	http     *http.Client
 }
 
 func resolveMillsClient(cmd *cobra.Command) (*millsClient, error) {
@@ -74,11 +78,32 @@ func resolveMillsClient(cmd *cobra.Command) (*millsClient, error) {
 		base = defaultMillsOperatorURL
 	}
 	base = strings.TrimRight(base, "/")
+	cfID, cfSecret := millsCFAccessHeaders()
 	return &millsClient{
-		baseURL: base,
-		token:   strings.TrimSpace(os.Getenv("LOOM_MILLS_TOKEN")),
-		http:    &http.Client{Timeout: timeout},
+		baseURL:  base,
+		token:    strings.TrimSpace(os.Getenv("LOOM_MILLS_TOKEN")),
+		cfID:     cfID,
+		cfSecret: cfSecret,
+		http:     &http.Client{Timeout: timeout},
 	}, nil
+}
+
+// millsCFAccessHeaders resolves the Cloudflare Access service-token credentials
+// used to pass the edge gate on the public operator ingress.
+//
+// Priority: LOOM_MILLS_CF_ACCESS_ID/SECRET > CF_ACCESS_CLIENT_ID/SECRET env >
+// the shared loom config (~/.config/loom/config.yaml hub.cf_access_*, via
+// loadHUDConfig). The same Cloudflare Access application gates every
+// *.flexinfer.ai host, so the hub service token also authenticates mills.
+func millsCFAccessHeaders() (cfID, cfSecret string) {
+	if id := strings.TrimSpace(os.Getenv("LOOM_MILLS_CF_ACCESS_ID")); id != "" {
+		return id, strings.TrimSpace(os.Getenv("LOOM_MILLS_CF_ACCESS_SECRET"))
+	}
+	if id := strings.TrimSpace(os.Getenv("CF_ACCESS_CLIENT_ID")); id != "" {
+		return id, strings.TrimSpace(os.Getenv("CF_ACCESS_CLIENT_SECRET"))
+	}
+	_, configID, configSecret := loadHUDConfig()
+	return configID, configSecret
 }
 
 // get performs an authenticated GET against path (relative to the operator
@@ -112,6 +137,13 @@ func (c *millsClient) do(ctx context.Context, method, path string, body, out any
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	// Pass the Cloudflare Access edge gate on the public ingress. Skipped for
+	// loopback targets (port-forward) so the service token never leaks to a
+	// local endpoint.
+	if c.cfID != "" && c.cfSecret != "" && !isLocalHUDURL(c.baseURL) {
+		req.Header.Set("CF-Access-Client-Id", c.cfID)
+		req.Header.Set("CF-Access-Client-Secret", c.cfSecret)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
