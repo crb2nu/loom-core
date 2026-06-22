@@ -20,6 +20,7 @@ import (
 	"github.com/crb2nu/loom/internal/process"
 	"github.com/crb2nu/loom/internal/router"
 	"github.com/crb2nu/loom/pkg/mcpotel"
+	"github.com/crb2nu/loom/pkg/netmode"
 	"github.com/crb2nu/loom/pkg/profiles"
 	"github.com/crb2nu/loom/pkg/registry"
 	"github.com/crb2nu/loom/pkg/sync"
@@ -304,6 +305,24 @@ func New(cfg Config) (*Daemon, error) {
 			}
 		}
 		logger.Info("hub prefer enabled via legacy flag, converted to per-server prefer-hub")
+	}
+
+	// Off-LAN routing: when the laptop is off the home LAN, local backends that
+	// depend on LAN-only services (qdrant, *.lan, k8s) are unreachable, so flip
+	// the local-only / prefer-local pins to prefer-hub for hub-capable servers.
+	// The hub (wss://mcp.flexinfer.ai/ws) runs those backends cluster-side and is
+	// reachable through Cloudflare Access from anywhere. Gated on a configured hub.
+	if hubClient != nil && cfg.HubFallback && netmode.Resolve() == netmode.Tunnel {
+		hubCapable := make(map[string]bool, len(reg.Servers))
+		for _, srv := range reg.Servers {
+			if srv == nil {
+				continue
+			}
+			hubCapable[srv.Name] = !srv.IsLocalOnly()
+		}
+		if n := applyOffLANRouting(routingPrefs, hubCapable); n > 0 {
+			logger.Info("off-LAN detected: routed LAN-pinned servers via hub", "upgraded", n)
+		}
 	}
 
 	if len(routingPrefs) > 0 {
