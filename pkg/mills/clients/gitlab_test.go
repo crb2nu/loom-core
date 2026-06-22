@@ -233,15 +233,21 @@ func TestPollPipeline_TerminatesOnSuccess(t *testing.T) {
 	var pollCount int32
 	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
 		"GET /api/v4/projects/services%2Floom-core/merge_requests/42": func(_ *http.Request) (int, any) {
-			return 200, mrResponse{IID: 42, HeadPipeline: mrHeadPipe{ID: 1234, Status: "running"}}
+			return 200, mrResponse{IID: 42, SHA: "abc123"}
 		},
-		"GET /api/v4/projects/services%2Floom-core/pipelines/1234": func(_ *http.Request) (int, any) {
+		// Branch pipeline list for the SHA. A spurious merge_request_event
+		// placeholder is listed first and MUST be ignored — polling must
+		// track the push pipeline (1234) instead.
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(_ *http.Request) (int, any) {
 			n := atomic.AddInt32(&pollCount, 1)
 			status := "running"
 			if n >= 2 {
 				status = "success"
 			}
-			return 200, map[string]any{"id": 1234, "status": status}
+			return 200, []map[string]any{
+				{"id": 999, "status": "failed", "source": "merge_request_event"},
+				{"id": 1234, "status": status, "source": "push"},
+			}
 		},
 	})
 	resp, err := cli.PollPipeline(context.Background(), pipeline.PollPipelineRequest{MRIID: 42})
@@ -249,10 +255,10 @@ func TestPollPipeline_TerminatesOnSuccess(t *testing.T) {
 		t.Fatalf("poll: %v", err)
 	}
 	if resp.Status != "success" {
-		t.Errorf("status = %q, want success", resp.Status)
+		t.Errorf("status = %q, want success (must ignore the failed merge_request_event placeholder)", resp.Status)
 	}
-	if !strings.Contains(resp.LogTail, "status=success") {
-		t.Errorf("log tail missing terminal status: %q", resp.LogTail)
+	if !strings.Contains(resp.LogTail, "pipeline 1234 (push) status=success") {
+		t.Errorf("log tail should track the push pipeline, not the placeholder: %q", resp.LogTail)
 	}
 	if atomic.LoadInt32(&pollCount) < 2 {
 		t.Errorf("expected at least 2 poll calls, got %d", pollCount)
@@ -262,10 +268,10 @@ func TestPollPipeline_TerminatesOnSuccess(t *testing.T) {
 func TestPollPipeline_FailedTerminal(t *testing.T) {
 	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
 		"GET /api/v4/projects/services%2Floom-core/merge_requests/77": func(_ *http.Request) (int, any) {
-			return 200, mrResponse{IID: 77, HeadPipeline: mrHeadPipe{ID: 99, Status: "failed"}}
+			return 200, mrResponse{IID: 77, SHA: "deadbeef"}
 		},
-		"GET /api/v4/projects/services%2Floom-core/pipelines/99": func(_ *http.Request) (int, any) {
-			return 200, map[string]any{"id": 99, "status": "failed"}
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(_ *http.Request) (int, any) {
+			return 200, []map[string]any{{"id": 99, "status": "failed", "source": "push"}}
 		},
 	})
 	resp, err := cli.PollPipeline(context.Background(), pipeline.PollPipelineRequest{MRIID: 77})
@@ -277,10 +283,35 @@ func TestPollPipeline_FailedTerminal(t *testing.T) {
 	}
 }
 
-func TestPollPipeline_TimeoutWhenNoHeadPipeline(t *testing.T) {
+// TestPollPipeline_IgnoresMergeRequestEventPlaceholder is the core regression
+// guard for the autonomous-merge blocker: when ONLY the spurious
+// merge_request_event pipeline exists for the SHA, the poll must NOT report it
+// as a terminal `failed` — it keeps waiting for the branch pipeline (here it
+// never appears, so it times out rather than falsely failing).
+func TestPollPipeline_IgnoresMergeRequestEventPlaceholder(t *testing.T) {
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/88": func(_ *http.Request) (int, any) {
+			return 200, mrResponse{IID: 88, SHA: "cafef00d"}
+		},
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(_ *http.Request) (int, any) {
+			return 200, []map[string]any{{"id": 1, "status": "failed", "source": "merge_request_event"}}
+		},
+	})
+	cli.cfg.PollDeadline = 50 * time.Millisecond
+	cli.cfg.PollInterval = 10 * time.Millisecond
+	resp, err := cli.PollPipeline(context.Background(), pipeline.PollPipelineRequest{MRIID: 88})
+	if err == nil {
+		t.Error("expected timeout, not a terminal failed from the placeholder")
+	}
+	if resp.Status != "timeout" {
+		t.Errorf("status = %q, want timeout", resp.Status)
+	}
+}
+
+func TestPollPipeline_TimeoutWhenNoSHA(t *testing.T) {
 	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
 		"GET /api/v4/projects/services%2Floom-core/merge_requests/55": func(_ *http.Request) (int, any) {
-			return 200, mrResponse{IID: 55} // never gets a head_pipeline.id
+			return 200, mrResponse{IID: 55} // never gets a head sha
 		},
 	})
 	cli.cfg.PollDeadline = 50 * time.Millisecond

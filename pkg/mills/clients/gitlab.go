@@ -207,10 +207,24 @@ func (c *GitLabClient) CreateMR(ctx context.Context, req pipeline.CreateMRReques
 
 // ----- PollPipeline -----
 
-// PollPipeline implements pipeline.GitLabClient. It looks up the MR's
-// head pipeline and polls its state until terminal. The contract is
-// blocking: the worker calls and the integration loops itself, so
-// upstream code doesn't need its own polling state.
+// shaPipeline is one entry of GET /projects/:id/pipelines?sha=.
+type shaPipeline struct {
+	ID     int64  `json:"id"`
+	Status string `json:"status"`
+	Source string `json:"source"`
+}
+
+// PollPipeline implements pipeline.GitLabClient. It resolves the *branch*
+// pipeline for the MR's head SHA and polls its state until terminal.
+//
+// It deliberately does NOT poll mr.head_pipeline: when an MR is opened on a
+// repo whose `workflow.rules` block merge_request_event pipelines (loom-core
+// runs branch pipelines), GitLab briefly attaches a spurious, 0-job
+// `merge_request_event` pipeline as the head and immediately fails it (then
+// usually deletes it). The previous head-pipeline poll raced that transient
+// and reported `failed` — the long-standing autonomous-merge blocker
+// (#147/#148/#150). Polling the push/branch pipeline for the SHA ignores the
+// merge_request_event placeholder entirely. The contract stays blocking.
 func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipelineRequest) (pipeline.PollPipelineResponse, error) {
 	if req.MRIID == 0 {
 		return pipeline.PollPipelineResponse{}, errors.New("gitlab: MRIID required")
@@ -221,38 +235,37 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 	terminal := map[string]bool{
 		"success": true, "failed": true, "canceled": true, "skipped": true,
 	}
+	timeoutResp := func() (pipeline.PollPipelineResponse, error) {
+		return pipeline.PollPipelineResponse{Status: "timeout", LogTail: logTail.String()},
+			fmt.Errorf("gitlab: pipeline poll timed out after %s", c.cfg.PollDeadline)
+	}
 	for {
-		if err := pollCtx.Err(); err != nil {
-			return pipeline.PollPipelineResponse{
-				Status:  "timeout",
-				LogTail: logTail.String(),
-			}, fmt.Errorf("gitlab: pipeline poll timed out after %s", c.cfg.PollDeadline)
+		if pollCtx.Err() != nil {
+			return timeoutResp()
 		}
 
 		mrPath := fmt.Sprintf("/projects/%s/merge_requests/%d", c.projectPath(), req.MRIID)
 		var mr mrResponse
 		if err := c.requestJSON(pollCtx, http.MethodGet, mrPath, nil, &mr); err != nil {
 			if pollCtx.Err() != nil {
-				return pipeline.PollPipelineResponse{Status: "timeout", LogTail: logTail.String()}, fmt.Errorf("gitlab: pipeline poll timed out after %s", c.cfg.PollDeadline)
+				return timeoutResp()
 			}
 			return pipeline.PollPipelineResponse{}, err
 		}
-		if mr.HeadPipeline.ID == 0 {
-			fmt.Fprintf(&logTail, "[%s] MR %d head pipeline pending\n", time.Now().Format(time.RFC3339), req.MRIID)
+
+		if mr.SHA == "" {
+			fmt.Fprintf(&logTail, "[%s] MR %d head sha pending\n", time.Now().Format(time.RFC3339), req.MRIID)
+		} else if pipe, ok, err := c.branchPipelineForSHA(pollCtx, mr.SHA); err != nil {
+			if pollCtx.Err() != nil {
+				return timeoutResp()
+			}
+			return pipeline.PollPipelineResponse{}, err
+		} else if !ok {
+			// Only the spurious merge_request_event pipeline (or none) exists so
+			// far — keep polling until the branch pipeline appears.
+			fmt.Fprintf(&logTail, "[%s] MR %d branch pipeline pending for %s\n", time.Now().Format(time.RFC3339), req.MRIID, shortSHA(mr.SHA))
 		} else {
-			pipePath := fmt.Sprintf("/projects/%s/pipelines/%d", c.projectPath(), mr.HeadPipeline.ID)
-			var pipe struct {
-				ID     int64  `json:"id"`
-				Status string `json:"status"`
-				WebURL string `json:"web_url"`
-			}
-			if err := c.requestJSON(pollCtx, http.MethodGet, pipePath, nil, &pipe); err != nil {
-				if pollCtx.Err() != nil {
-					return pipeline.PollPipelineResponse{Status: "timeout", LogTail: logTail.String()}, fmt.Errorf("gitlab: pipeline poll timed out after %s", c.cfg.PollDeadline)
-				}
-				return pipeline.PollPipelineResponse{}, err
-			}
-			fmt.Fprintf(&logTail, "[%s] pipeline %d status=%s\n", time.Now().Format(time.RFC3339), pipe.ID, pipe.Status)
+			fmt.Fprintf(&logTail, "[%s] pipeline %d (%s) status=%s\n", time.Now().Format(time.RFC3339), pipe.ID, pipe.Source, pipe.Status)
 			if terminal[pipe.Status] {
 				return pipeline.PollPipelineResponse{
 					Status:  pipe.Status,
@@ -263,10 +276,35 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 
 		select {
 		case <-pollCtx.Done():
-			return pipeline.PollPipelineResponse{Status: "timeout", LogTail: logTail.String()}, fmt.Errorf("gitlab: pipeline poll timed out after %s", c.cfg.PollDeadline)
+			return timeoutResp()
 		case <-time.After(c.cfg.PollInterval):
 		}
 	}
+}
+
+// branchPipelineForSHA returns the most recent non-merge_request_event pipeline
+// for sha (the push/branch pipeline that actually gates the merge). ok=false
+// when only a merge_request_event placeholder — or nothing — exists yet.
+func (c *GitLabClient) branchPipelineForSHA(ctx context.Context, sha string) (shaPipeline, bool, error) {
+	path := fmt.Sprintf("/projects/%s/pipelines?sha=%s&order_by=id&sort=desc&per_page=20",
+		c.projectPath(), url.QueryEscape(sha))
+	var pipes []shaPipeline
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &pipes); err != nil {
+		return shaPipeline{}, false, err
+	}
+	for _, p := range pipes {
+		if p.Source != "merge_request_event" {
+			return p, true, nil
+		}
+	}
+	return shaPipeline{}, false, nil
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // ----- Merge -----
