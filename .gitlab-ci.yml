@@ -613,7 +613,14 @@ test:race:
 
       go test -race -short "${PKGS[@]}"
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # NB: do NOT add `if: $CI_PIPELINE_SOURCE == "merge_request_event"` here.
+    # The top-level `workflow.rules` blocks all merge_request_event pipelines
+    # (this repo runs branch pipelines), so that rule never actually runs this
+    # job — but its mere presence makes GitLab spawn a *merge request pipeline*
+    # on MR open, which the workflow then empties into a `failed` 0-job pipeline.
+    # That empty pipeline becomes the MR's head_pipeline and blocks merge with a
+    # 405 under `only_allow_merge_if_pipeline_succeeds` (the Mills autonomous-merge
+    # north-star blocker; the green branch pipeline is ignored). Branch-only here.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 # Benchmark tests - run on demand
