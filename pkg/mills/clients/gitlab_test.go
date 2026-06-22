@@ -162,7 +162,14 @@ func TestCreateMR_PostsAndPropagatesIID(t *testing.T) {
 	}
 }
 
-func TestCreateMR_AutoMergeSetsMergeWhenPipelineSucceeds(t *testing.T) {
+// TestCreateMR_AutoMergeDoesNotArmMWPSOnCreate guards the fix for the
+// long-standing Mills autonomous-merge 405 (#147/#148/#150): arming
+// merge_when_pipeline_succeeds at MR-create time triggers a detached
+// merge-request pipeline that this repo's `workflow.rules` empty into a
+// `failed` head pipeline, blocking the merge. Even with AutoMerge=true, the
+// create body must NOT carry merge_when_pipeline_succeeds; the operator's
+// explicit `merge` stage performs the autonomous merge after `ci_watch`.
+func TestCreateMR_AutoMergeDoesNotArmMWPSOnCreate(t *testing.T) {
 	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
 		"POST /api/v4/projects/services%2Floom-core/merge_requests": func(_ *http.Request) (int, any) {
 			return 201, mrResponse{IID: 100, WebURL: "https://gitlab/-/merge_requests/100"}
@@ -181,8 +188,11 @@ func TestCreateMR_AutoMergeSetsMergeWhenPipelineSucceeds(t *testing.T) {
 	if err := json.Unmarshal([]byte(rt.requests[0].Body), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !body.MergeWhenPipelineSucceeds {
-		t.Errorf("merge_when_pipeline_succeeds = false, want true (AutoMerge was true)")
+	if body.MergeWhenPipelineSucceeds {
+		t.Errorf("merge_when_pipeline_succeeds = true on create; must be false to avoid the empty MR pipeline (AutoMerge is honored by the merge stage)")
+	}
+	if strings.Contains(rt.requests[0].Body, "merge_when_pipeline_succeeds") {
+		t.Errorf("create body must omit merge_when_pipeline_succeeds even when AutoMerge=true: %s", rt.requests[0].Body)
 	}
 }
 
