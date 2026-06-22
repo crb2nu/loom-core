@@ -117,12 +117,15 @@ func (m *manager) handleQualityGate(ctx context.Context, args map[string]any) (*
 		return mcp.ErrorResult(err), nil
 	}
 
-	// Ensure sandbox is running
+	// Ensure sandbox is running. On the K8s backend a cold/stale sandbox
+	// triggers an async image build that returns a "build in progress"
+	// signal immediately (so quick exec calls aren't hung). The quality
+	// gate, however, is a CI step with a multi-minute budget: returning the
+	// build-in-progress error here surfaces to the operator's tests stage as
+	// an opaque `0 checks` failure that it retries within milliseconds —
+	// never giving the build time to finish. Await the build instead.
 	key := storeKey(projectName, agentID)
-	mu := m.projectLock(key)
-	mu.Lock()
-	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
-	mu.Unlock()
+	containerID, err := m.ensureRunningAwaitBuild(ctx, projectDir, projectName, agentID)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("ensure sandbox: %w", err)), nil
 	}
@@ -280,6 +283,73 @@ func (m *manager) handleQualityGate(ctx context.Context, args map[string]any) (*
 	}
 
 	return mcp.JSONResult(gateResult)
+}
+
+// ensureRunningAwaitBuild calls ensureRunning, and when the K8s async
+// builder reports the sandbox image is still building, polls (with bounded
+// backoff) until the build completes instead of bubbling up an immediate
+// "build in progress" error.
+//
+// Rationale: the quality gate is a CI step with a multi-minute budget. The
+// async build exists so quick exec calls don't hang, but for the gate the
+// build-in-progress signal otherwise reaches the Mills operator as an opaque
+// `devbox quality gate failed: 0 checks` that it retries within milliseconds
+// — exhausting its attempts long before a cold build (go mod download, apk
+// installs, image push) can finish. Awaiting the build here lets the very
+// first gate call run real checks. The per-iteration lock acquire/release
+// keeps other project operations unblocked during the wait, and a context
+// cancellation or the maxBuildWait ceiling still bounds the call.
+// maxBuildWait bounds how long the quality gate blocks awaiting a cold
+// sandbox image build before giving up; initialBuildBackoff is the first
+// poll interval (it grows to maxBuildBackoff).
+const (
+	maxBuildWait        = 8 * time.Minute
+	initialBuildBackoff = 3 * time.Second
+	maxBuildBackoff     = 15 * time.Second
+)
+
+func (m *manager) ensureRunningAwaitBuild(ctx context.Context, projectDir, projectName, agentID string) (string, error) {
+	key := storeKey(projectName, agentID)
+	return awaitSandboxBuild(ctx, maxBuildWait, initialBuildBackoff, func() (string, error) {
+		mu := m.projectLock(key)
+		mu.Lock()
+		defer mu.Unlock()
+		return m.ensureRunning(ctx, projectDir, projectName, agentID)
+	})
+}
+
+// awaitSandboxBuild repeatedly invokes ensure until it returns success, a
+// non-build-in-progress error, the context is cancelled, or maxWait elapses.
+// A buildInProgressError is the async builder's "retry shortly" signal, so it
+// is polled (with bounded exponential backoff) rather than surfaced. Extracted
+// from ensureRunningAwaitBuild so the wait/backoff/timeout logic is unit
+// testable without a full sandbox backend.
+func awaitSandboxBuild(ctx context.Context, maxWait, initialBackoff time.Duration, ensure func() (string, error)) (string, error) {
+	deadline := time.Now().Add(maxWait)
+	backoff := initialBackoff
+	for {
+		id, err := ensure()
+		if err == nil {
+			return id, nil
+		}
+		if _, building := asBuildInProgress(err); !building {
+			return "", err
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("sandbox image still building after %s: %w", maxWait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < maxBuildBackoff {
+			backoff += initialBackoff
+			if backoff > maxBuildBackoff {
+				backoff = maxBuildBackoff
+			}
+		}
+	}
 }
 
 // detectSandboxLanguage probes the running sandbox for a language marker.
