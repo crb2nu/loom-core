@@ -7,6 +7,11 @@ metadata:
   name: mobile-hud
 spec:
   replicas: 1
+  # Recreate (not RollingUpdate): the workspace volume below is a
+  # ReadWriteOnce Longhorn volume, so the old pod must release it before
+  # the new one attaches — a surge pod would deadlock on the RWO mount.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: mobile-hud
@@ -245,15 +250,16 @@ spec:
             - name: harvester-kubeconfig
               mountPath: /etc/harvester
               readOnly: true
-            # Read-only mount of the shared NFS workspace so the spawn
+            # Read-only mount of the agent workspace so the spawn
             # orchestrator's project resolver (internal/hud/spawn.go →
             # resolveProjectPath, wsRoot=$HOME/workspace=/home/mcp/workspace)
             # can find services/loom-core etc. on disk to fingerprint +
             # generate the Dockerfile before kicking off a git-clone spawn
-            # pod. Same NFS export devbox + codebase-memory already mount;
-            # this namespace's PVC is `loom-hub-workspace-nfs` (see
-            # platform/gitops/k3s/loom-hub/workspace-pvc.yaml, created
-            # explicitly for this resolver). Orchestrator never writes here.
+            # pod. Backed by the healthy Longhorn PVC `loom-hub-workspace`
+            # (storageClass loom-ws-1r). Replaces the prior NFS export on
+            # `storage-vm-linux-nas-pilot`, which was halted during the
+            # 2026-06-21 storage-fault incident (two dying SAS disks).
+            # Orchestrator never writes here.
             - name: workspace
               mountPath: /home/mcp/workspace
               readOnly: true
@@ -273,5 +279,5 @@ spec:
                 path: kubeconfig
         - name: workspace
           persistentVolumeClaim:
-            claimName: loom-hub-workspace-nfs
+            claimName: loom-hub-workspace
             readOnly: true
