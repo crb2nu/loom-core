@@ -151,11 +151,16 @@ type createMRBody struct {
 	Description        string `json:"description,omitempty"`
 	RemoveSourceBranch bool   `json:"remove_source_branch"`
 	Squash             bool   `json:"squash"`
-	// MWPS, when true, asks GitLab to auto-merge the MR once its head
-	// pipeline succeeds. Belt-and-suspenders against operator downtime —
-	// Mills still polls + calls Merge separately, but GitLab will close
-	// the MR even if the operator restarts. Per-item gated upstream by
-	// GitLabWorker.computeAutoMerge.
+	// MergeWhenPipelineSucceeds is DELIBERATELY NOT SET on create — see CreateMR.
+	// Opening an MR with merge_when_pipeline_succeeds=true makes GitLab spin up a
+	// detached merge-request pipeline; on a repo whose `workflow.rules` block
+	// merge_request_event pipelines (loom-core runs branch pipelines), that
+	// pipeline is emptied into a `failed`, 0-job placeholder which becomes the
+	// MR head_pipeline and blocks merge with HTTP 405 under
+	// only_allow_merge_if_pipeline_succeeds — the long-standing Mills
+	// autonomous-merge blocker (#147/#148/#150). Plain MRs (no MWPS) keep the
+	// branch push pipeline as head; the operator's explicit `merge` stage then
+	// merges once `ci_watch` confirms it green.
 	MergeWhenPipelineSucceeds bool `json:"merge_when_pipeline_succeeds,omitempty"`
 }
 
@@ -175,14 +180,19 @@ type mrHeadPipe struct {
 
 // CreateMR implements pipeline.GitLabClient.
 func (c *GitLabClient) CreateMR(ctx context.Context, req pipeline.CreateMRRequest) (pipeline.CreateMRResponse, error) {
+	// NB: req.AutoMerge is intentionally NOT mapped to MergeWhenPipelineSucceeds
+	// here. Arming MWPS at create time triggers a detached merge-request pipeline
+	// that this repo's workflow rules empty into a `failed` head pipeline,
+	// blocking the merge (see createMRBody.MergeWhenPipelineSucceeds). The
+	// autonomous merge is performed by the operator's explicit `merge` stage
+	// (runMerge → Merge) after `ci_watch` confirms the branch pipeline is green.
 	body := createMRBody{
-		SourceBranch:              req.SourceBranch,
-		TargetBranch:              req.TargetBranch,
-		Title:                     req.Title,
-		Description:               req.Description,
-		RemoveSourceBranch:        true,
-		Squash:                    false,
-		MergeWhenPipelineSucceeds: req.AutoMerge,
+		SourceBranch:       req.SourceBranch,
+		TargetBranch:       req.TargetBranch,
+		Title:              req.Title,
+		Description:        req.Description,
+		RemoveSourceBranch: true,
+		Squash:             false,
 	}
 	var got mrResponse
 	path := fmt.Sprintf("/projects/%s/merge_requests", c.projectPath())
