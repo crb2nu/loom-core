@@ -412,6 +412,104 @@ func TestMerge_NonRetryableErrorReturnsImmediately(t *testing.T) {
 	}
 }
 
+// TestMerge_RecoversDetachedHeadOn405 pins the autonomous-merge recovery: when
+// the persistent 405 is caused by the spurious failed merge_request_event
+// placeholder pinned as the MR head_pipeline, Merge deletes that pipeline,
+// close+reopens the MR (re-pointing head to the green push pipeline), and
+// retries to success. Verified live on !770 (2026-06-23): close+reopen ALONE
+// re-attaches the same failed pipeline; the delete is the load-bearing step.
+func TestMerge_RecoversDetachedHeadOn405(t *testing.T) {
+	mergeCalls := 0
+	stateCalls := 0
+	deletedID := int64(0)
+	reopened := false
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		// One PUT route for both .../merge and .../<state_event>; dispatch on suffix.
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/9": func(req *http.Request) (int, any) {
+			if strings.HasSuffix(req.URL.Path, "/merge") {
+				mergeCalls++
+				if reopened {
+					return 200, mrResponse{IID: 9, SHA: "feedface"}
+				}
+				return 405, map[string]any{"message": "405 Method Not Allowed"}
+			}
+			stateCalls++
+			if stateCalls >= 2 { // close then reopen
+				reopened = true
+			}
+			return 200, mrResponse{IID: 9}
+		},
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/9": func(_ *http.Request) (int, any) {
+			src := "merge_request_event"
+			if reopened {
+				src = "push"
+			}
+			return 200, mrResponse{IID: 9, SHA: "feedface", HeadPipeline: mrHeadPipe{ID: 9001, Status: "failed", Source: src}}
+		},
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(_ *http.Request) (int, any) {
+			return 200, []shaPipeline{
+				{ID: 9001, Source: "merge_request_event", Status: "failed"},
+				{ID: 9000, Source: "push", Status: "success"},
+			}
+		},
+		"DELETE /api/v4/projects/services%2Floom-core/pipelines/9001": func(_ *http.Request) (int, any) {
+			deletedID = 9001
+			return 200, map[string]any{}
+		},
+	})
+	resp, err := cli.Merge(context.Background(), pipeline.MergeRequestArgs{MRIID: 9})
+	if err != nil {
+		t.Fatalf("merge should succeed after detached-head recovery: %v", err)
+	}
+	if resp.MergedSHA != "feedface" {
+		t.Errorf("sha = %q, want feedface", resp.MergedSHA)
+	}
+	if deletedID != 9001 {
+		t.Errorf("detached pipeline 9001 should have been deleted; deletedID=%d", deletedID)
+	}
+	if stateCalls != 2 {
+		t.Errorf("expected close+reopen (2 state PUTs), got %d", stateCalls)
+	}
+	if mergeCalls != 2 {
+		t.Errorf("expected 2 merge PUTs (405 probe, then 200 after recovery), got %d", mergeCalls)
+	}
+}
+
+// TestMerge_BenignTiming405DoesNotCloseReopen guards against over-eager
+// recovery: a 405 whose head_pipeline is a normal (non-merge_request_event)
+// pipeline still settling must be polled away, NOT close+reopened.
+func TestMerge_BenignTiming405DoesNotCloseReopen(t *testing.T) {
+	mergeCalls := 0
+	stateCalls := 0
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/4": func(req *http.Request) (int, any) {
+			if strings.HasSuffix(req.URL.Path, "/merge") {
+				mergeCalls++
+				if mergeCalls >= 2 {
+					return 200, mrResponse{IID: 4, SHA: "cafebabe"}
+				}
+				return 405, map[string]any{"message": "405 Method Not Allowed"}
+			}
+			stateCalls++
+			return 200, mrResponse{IID: 4}
+		},
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/4": func(_ *http.Request) (int, any) {
+			// Head is a real push pipeline that's merely settling — not detached.
+			return 200, mrResponse{IID: 4, SHA: "cafebabe", HeadPipeline: mrHeadPipe{ID: 4000, Status: "success", Source: "push"}}
+		},
+	})
+	resp, err := cli.Merge(context.Background(), pipeline.MergeRequestArgs{MRIID: 4})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if resp.MergedSHA != "cafebabe" {
+		t.Errorf("sha = %q, want cafebabe", resp.MergedSHA)
+	}
+	if stateCalls != 0 {
+		t.Errorf("benign timing 405 must not close/reopen; got %d state PUTs", stateCalls)
+	}
+}
+
 // ----- Cleanup -----
 
 func TestCleanup_DeletesSourceBranch(t *testing.T) {

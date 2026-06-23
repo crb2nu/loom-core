@@ -176,6 +176,7 @@ type mrResponse struct {
 type mrHeadPipe struct {
 	ID     int64  `json:"id"`
 	Status string `json:"status"`
+	Source string `json:"source"`
 }
 
 // CreateMR implements pipeline.GitLabClient.
@@ -327,20 +328,67 @@ type mergeBody struct {
 const mergeReadyTimeout = 2 * time.Minute
 
 // Merge implements pipeline.GitLabClient.
+//
+// The merge faces two distinct 405s:
+//
+//  1. A benign TIMING 405 while GitLab settles merge_status right after the
+//     branch pipeline turns green. attemptMerge polls this away.
+//  2. A PERSISTENT 405 from the spurious failed `merge_request_event`
+//     placeholder pipeline. GitLab attaches it as the MR head_pipeline on
+//     MR-open EVEN with `workflow.rules: merge_request_event → never` and no
+//     merge_when_pipeline_succeeds — the rule suppresses the jobs but GitLab
+//     still records a 0-job `failed` pipeline and pins it as head. Under
+//     only_allow_merge_if_pipeline_succeeds that failed head blocks merge
+//     forever (detailed_merge_status=ci_must_pass). Verified live on !770
+//     (2026-06-23): the no-MWPS + branch-poll fixes reached a green ci_watch
+//     yet merge still 405'd. The recovery — delete the detached pipeline, then
+//     close+reopen — re-points head to the green push pipeline and flips
+//     merge_status to mergeable. (close+reopen ALONE re-attaches the same
+//     failed pipeline; the delete is the load-bearing precondition.)
 func (c *GitLabClient) Merge(ctx context.Context, req pipeline.MergeRequestArgs) (pipeline.MergeResponse, error) {
 	if req.MRIID == 0 {
 		return pipeline.MergeResponse{}, errors.New("gitlab: MRIID required")
 	}
-	path := fmt.Sprintf("/projects/%s/merge_requests/%d/merge", c.projectPath(), req.MRIID)
+	// Probe once. A clean merge or a non-405 error (auth, 409 conflict) is final.
+	resp, err := c.mergeOnce(ctx, req.MRIID)
+	if err == nil || !isMergeNotReady(err) {
+		return resp, err
+	}
+	// 405. Distinguish the persistent detached-head case from a benign timing
+	// race by inspecting the MR head_pipeline directly — no need to burn the
+	// full timing-poll window before recovering. When the head is the spurious
+	// merge_request_event placeholder, clear it (delete + close/reopen) so the
+	// retry sees the green push pipeline as head.
+	if detached, derr := c.hasDetachedHead(ctx, req.MRIID); derr == nil && detached {
+		if rerr := c.recoverDetachedHead(ctx, req.MRIID); rerr != nil {
+			return pipeline.MergeResponse{}, fmt.Errorf("gitlab: merge 405 detached-head recovery failed: %w (original merge error: %v)", rerr, err)
+		}
+	}
+	// Poll the (possibly post-recovery) timing window to its conclusion.
+	return c.attemptMerge(ctx, req.MRIID)
+}
+
+// mergeOnce PUTs .../merge a single time and maps the response.
+func (c *GitLabClient) mergeOnce(ctx context.Context, mrIID int64) (pipeline.MergeResponse, error) {
+	path := fmt.Sprintf("/projects/%s/merge_requests/%d/merge", c.projectPath(), mrIID)
+	var got mrResponse
+	if err := c.requestJSON(ctx, http.MethodPut, path, mergeBody{}, &got); err != nil {
+		return pipeline.MergeResponse{}, err
+	}
+	if got.MergeError != "" {
+		return pipeline.MergeResponse{}, fmt.Errorf("gitlab: merge failed: %s", got.MergeError)
+	}
+	return pipeline.MergeResponse{MergedSHA: got.SHA}, nil
+}
+
+// attemptMerge polls the benign timing 405 away within mergeReadyTimeout. Any
+// other error (auth, 409 conflict, persistent 405) surfaces to the caller.
+func (c *GitLabClient) attemptMerge(ctx context.Context, mrIID int64) (pipeline.MergeResponse, error) {
 	deadline := time.Now().Add(mergeReadyTimeout)
 	for {
-		var got mrResponse
-		err := c.requestJSON(ctx, http.MethodPut, path, mergeBody{}, &got)
+		resp, err := c.mergeOnce(ctx, mrIID)
 		if err == nil {
-			if got.MergeError != "" {
-				return pipeline.MergeResponse{}, fmt.Errorf("gitlab: merge failed: %s", got.MergeError)
-			}
-			return pipeline.MergeResponse{MergedSHA: got.SHA}, nil
+			return resp, nil
 		}
 		// Only the not-mergeable-yet 405 is worth waiting on; any other error
 		// (auth, 409 conflict, etc.) is returned immediately.
@@ -353,6 +401,86 @@ func (c *GitLabClient) Merge(ctx context.Context, req pipeline.MergeRequestArgs)
 		case <-time.After(c.cfg.PollInterval):
 		}
 	}
+}
+
+// hasDetachedHead reports whether the MR's head_pipeline is the spurious
+// merge_request_event placeholder that blocks merge with a persistent 405.
+func (c *GitLabClient) hasDetachedHead(ctx context.Context, mrIID int64) (bool, error) {
+	mrPath := fmt.Sprintf("/projects/%s/merge_requests/%d", c.projectPath(), mrIID)
+	var mr mrResponse
+	if err := c.requestJSON(ctx, http.MethodGet, mrPath, nil, &mr); err != nil {
+		return false, err
+	}
+	return mr.HeadPipeline.Source == "merge_request_event", nil
+}
+
+// recoverDetachedHead clears the spurious failed merge_request_event head
+// pipeline that blocks the merge with a persistent 405 (see Merge). It deletes
+// the detached pipeline for the MR head SHA, then close+reopens the MR so
+// GitLab re-points head_pipeline to the green push pipeline. Idempotent: a
+// missing detached pipeline is skipped, not an error.
+func (c *GitLabClient) recoverDetachedHead(ctx context.Context, mrIID int64) error {
+	mrPath := fmt.Sprintf("/projects/%s/merge_requests/%d", c.projectPath(), mrIID)
+	var mr mrResponse
+	if err := c.requestJSON(ctx, http.MethodGet, mrPath, nil, &mr); err != nil {
+		return fmt.Errorf("get mr: %w", err)
+	}
+	if mr.SHA == "" {
+		return fmt.Errorf("mr %d has no head sha", mrIID)
+	}
+	if pid, ok, err := c.detachedPipelineForSHA(ctx, mr.SHA); err != nil {
+		return fmt.Errorf("find detached pipeline: %w", err)
+	} else if ok {
+		if err := c.deletePipeline(ctx, pid); err != nil {
+			return fmt.Errorf("delete detached pipeline %d: %w", pid, err)
+		}
+	}
+	if err := c.setMRState(ctx, mrIID, "close"); err != nil {
+		return fmt.Errorf("close mr: %w", err)
+	}
+	if err := c.setMRState(ctx, mrIID, "reopen"); err != nil {
+		return fmt.Errorf("reopen mr: %w", err)
+	}
+	// Give GitLab a beat to recompute head_pipeline + merge_status before the
+	// caller retries; attemptMerge's poll window absorbs any remaining lag.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(c.cfg.PollInterval):
+	}
+	return nil
+}
+
+// detachedPipelineForSHA returns the id of the merge_request_event placeholder
+// pipeline for sha, if one exists. This is the inverse of branchPipelineForSHA.
+func (c *GitLabClient) detachedPipelineForSHA(ctx context.Context, sha string) (int64, bool, error) {
+	path := fmt.Sprintf("/projects/%s/pipelines?sha=%s&order_by=id&sort=desc&per_page=20",
+		c.projectPath(), url.QueryEscape(sha))
+	var pipes []shaPipeline
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &pipes); err != nil {
+		return 0, false, err
+	}
+	for _, p := range pipes {
+		if p.Source == "merge_request_event" {
+			return p.ID, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// deletePipeline removes a pipeline by id (used to clear the detached head).
+func (c *GitLabClient) deletePipeline(ctx context.Context, id int64) error {
+	path := fmt.Sprintf("/projects/%s/pipelines/%d", c.projectPath(), id)
+	return c.requestJSON(ctx, http.MethodDelete, path, nil, nil)
+}
+
+// setMRState transitions an MR via state_event ("close" | "reopen").
+func (c *GitLabClient) setMRState(ctx context.Context, mrIID int64, event string) error {
+	path := fmt.Sprintf("/projects/%s/merge_requests/%d", c.projectPath(), mrIID)
+	body := struct {
+		StateEvent string `json:"state_event"`
+	}{StateEvent: event}
+	return c.requestJSON(ctx, http.MethodPut, path, body, nil)
 }
 
 // isMergeNotReady reports whether a merge error is GitLab's "not mergeable
