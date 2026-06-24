@@ -219,6 +219,37 @@ func TestResolveProxyIdentity_CodexMatchesKeepaliveWorkspaceID(t *testing.T) {
 	}
 }
 
+// TestWorkspaceProxyAgentIDFor_CodexFoldsWorktree proves the proxy side of the
+// codex cross-worktree fix: codex's `codex-<WS_HASH>` folds all worktrees of one
+// repo to the same id (matching the canonicalized notify mint), while
+// conversation-scoped vendors stay worktree-specific so they keep matching their
+// unchanged shell bootstrap.
+func TestWorkspaceProxyAgentIDFor_CodexFoldsWorktree(t *testing.T) {
+	const main = "/home/u/workspace/services/loom-core"
+	mainID := workspaceProxyAgentIDFor("codex", main)
+	for _, wt := range []string{
+		main + "/.worktrees/feat-x",
+		main + "/.claude/worktrees/agent-7",
+		main + "/.worktrees/fix/nested-branch",
+	} {
+		if got := workspaceProxyAgentIDFor("codex", wt); got != mainID {
+			t.Errorf("codex worktree %q → %q, want %q (must fold to main repo)", wt, got, mainID)
+		}
+	}
+	// A different repo must not collide.
+	if other := workspaceProxyAgentIDFor("codex", "/home/u/workspace/services/flexinfer"); other == mainID {
+		t.Errorf("distinct repo collided with codex main id %q", mainID)
+	}
+	// Conversation-scoped vendors must NOT fold worktrees.
+	for _, typ := range []string{"claude-code", "gemini-cli"} {
+		base := workspaceProxyAgentIDFor(typ, main)
+		wt := workspaceProxyAgentIDFor(typ, main+"/.worktrees/feat-x")
+		if base == wt {
+			t.Errorf("%s must NOT fold worktrees: main=%q wt=%q", typ, base, wt)
+		}
+	}
+}
+
 func TestPosixCKSumStringMatchesSystemCKSumExamples(t *testing.T) {
 	tests := []struct {
 		input string

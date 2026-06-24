@@ -80,6 +80,60 @@ func TestHookNamespaceVars_WorkspaceRootGuard(t *testing.T) {
 	}
 }
 
+// TestWorktreeCanonRootShell_StableHashAcrossWorktrees proves the codex identity
+// fix: hashing $WS_ROOT after worktreeCanonRootShell yields the SAME WS_HASH for
+// a repo's main checkout and its linked worktrees, so codex's workspace-anchored
+// `codex-<WS_HASH>` id stops orphaning one app into a row per worktree.
+func TestWorktreeCanonRootShell_StableHashAcrossWorktrees(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Mirrors the codex notify mint: canonicalize WS_ROOT, then cksum it.
+	hashOf := func(wsRoot string) string {
+		snippet := worktreeCanonRootShell() +
+			`; WS_HASH="$(printf '%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; printf '%s' "$WS_HASH"`
+		cmd := exec.CommandContext(ctx, "sh", "-c", snippet)
+		cmd.Env = append(os.Environ(), "WS_ROOT="+wsRoot)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("WS_ROOT=%q: snippet failed: %v", wsRoot, err)
+		}
+		return string(out)
+	}
+
+	const main = "/home/u/workspace/services/loom-core"
+	want := hashOf(main)
+	for _, wt := range []string{
+		main,
+		main + "/.worktrees/feat-x",
+		main + "/.claude/worktrees/agent-7",
+		main + "/.worktrees/fix/nested-branch",
+	} {
+		if got := hashOf(wt); got != want {
+			t.Errorf("WS_ROOT=%q: WS_HASH=%q, want %q (must fold to main repo)", wt, got, want)
+		}
+	}
+	// A genuinely different repo must NOT collide.
+	if other := hashOf("/home/u/workspace/services/flexinfer"); other == want {
+		t.Errorf("distinct repo collided with main repo hash %q", want)
+	}
+}
+
+// TestCodexNotifyCommand_CanonicalizesWorktreeRoot guards that the notify snippet
+// strips worktree segments from $WS_ROOT BEFORE the WS_HASH cksum, so the wiring
+// (arg order in the Sprintf) cannot silently regress.
+func TestCodexNotifyCommand_CanonicalizesWorktreeRoot(t *testing.T) {
+	cmd := codexNotifyCommand("loom", true)
+	if !strings.Contains(cmd, "${WS_ROOT%%/.worktrees/*}") ||
+		!strings.Contains(cmd, "${WS_ROOT%%/.claude/worktrees/*}") {
+		t.Errorf("codex notify must canonicalize WS_ROOT before hashing; got: %q", cmd)
+	}
+	canonIdx := strings.Index(cmd, "/.worktrees/*}")
+	hashIdx := strings.Index(cmd, "WS_HASH=")
+	if canonIdx < 0 || hashIdx < 0 || canonIdx > hashIdx {
+		t.Errorf("WS_ROOT canonicalization must precede WS_HASH; canonIdx=%d hashIdx=%d", canonIdx, hashIdx)
+	}
+}
+
 func TestSessionEndRetroHooks_ReturnsNonEmpty(t *testing.T) {
 	hooks := sessionEndRetroHooks("")
 	if len(hooks) == 0 {

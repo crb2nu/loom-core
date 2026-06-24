@@ -58,6 +58,30 @@ func hookNamespaceVars() string {
 		`NS_BRANCH="$(git branch --show-current 2>/dev/null || echo main)"`
 }
 
+// worktreeCanonRootShell returns a shell snippet that rewrites $WS_ROOT in place
+// to the MAIN repo root, collapsing both workspace-standard
+// (<repo>/.worktrees/<branch>) and Claude Code tool-managed
+// (<repo>/.claude/worktrees/<branch>) linked-tree layouts back to <repo>.
+//
+// Workspace-anchored vendors (codex) mint their agent_id as `codex-<WS_HASH>`
+// where WS_HASH is the cksum of $WS_ROOT and there is no per-conversation
+// SESSION_SCOPE to fall back on. Hashing the raw `git rev-parse --show-toplevel`
+// (the worktree path) therefore yields a DIFFERENT id per worktree, so one codex
+// app working across worktrees of the same repo fragments into orphaned rows in
+// the HUD — conversationId keeps the WS_HASH for codex (see
+// WORKSPACE_ANCHORED_BASES in agents.ts), so it cannot recover the shared repo
+// from the opaque hash. Canonicalizing $WS_ROOT before hashing makes the id
+// stable across worktrees. hookNamespaceVars already collapses the same two
+// layouts, so identity and namespace agree on "the repo". Mirrors the Go helper
+// stripWorktreeFromRepoRoot (cmd/loom/cmd_agent_session.go). Returned as a plain
+// string (not a format template) so its `%%` parameter-expansions stay literal.
+func worktreeCanonRootShell() string {
+	return `case "$WS_ROOT" in ` +
+		`*/.claude/worktrees/*) WS_ROOT="${WS_ROOT%%/.claude/worktrees/*}" ;; ` +
+		`*/.worktrees/*) WS_ROOT="${WS_ROOT%%/.worktrees/*}" ;; ` +
+		`esac`
+}
+
 // buildPlatformHooks generates the shared SessionStart / session-end / heartbeat
 // hooks for any platform that supports lifecycle hooks. Platform-specific extras
 // (e.g. policy-driven PreToolUse guardrails) are appended by the caller.
