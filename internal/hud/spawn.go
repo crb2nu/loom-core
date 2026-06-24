@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -83,6 +84,10 @@ type SpawnOrchestrator struct {
 	defaultTimeout time.Duration
 	defaultMemory  int
 	defaultCPUs    float64
+	// livenessStallTimeout bounds how long a streaming spawn may run without
+	// any agent output before the liveness watchdog fails it. See
+	// SpawnOrchestratorConfig.LivenessStallTimeout.
+	livenessStallTimeout time.Duration
 
 	// workspaceRoot is the local path to the workspace mount (for project detection).
 	workspaceRoot string
@@ -149,7 +154,30 @@ type SpawnOrchestratorConfig struct {
 	DefaultCPUs         float64
 	WorkspaceRoot       string   // local path to workspace mount (for project detection)
 	Projects            []string // available projects for spawn picker (from SPAWN_PROJECTS env)
+	// LivenessStallTimeout bounds how long a streaming (K8s) spawn may run
+	// without producing any agent output before the orchestrator declares it
+	// stalled and fails it. Guards against the zombie-pod wedge: a container
+	// stuck in Phase=Running while the codex process inside is dead never goes
+	// terminal, so the Mills operator's poll loop waits out its full deadline
+	// and only an operator restart re-spawns. Zero falls back to
+	// defaultLivenessStallTimeout. The buffered (harvester-vm) path is not
+	// watched — it has no mid-flight telemetry, so its TimeoutSec bounds it.
+	LivenessStallTimeout time.Duration
 }
+
+// defaultLivenessStallTimeout is the fallback stall window for the spawn
+// liveness watchdog when none is configured. 15 minutes is comfortably longer
+// than any healthy implement spawn's gap between streamed JSONL lines, while
+// recovering a zombie pod far sooner than the 30-minute operator poll deadline
+// that previously required a manual restart. Override per deployment via
+// LOOM_SPAWN_LIVENESS_STALL_TIMEOUT (a Go duration, e.g. "20m").
+const defaultLivenessStallTimeout = 15 * time.Minute
+
+// errSpawnStalled is the cancellation cause attached to a spawn's exec context
+// when the liveness watchdog trips. The finalize path reads it via
+// context.Cause to fail the spawn with a precise, diagnosable reason instead
+// of a generic "context canceled".
+var errSpawnStalled = errors.New("liveness watchdog: agent produced no output within stall timeout")
 
 // DefaultSpawnConfig returns sensible defaults.
 func DefaultSpawnConfig() SpawnOrchestratorConfig {
@@ -158,12 +186,13 @@ func DefaultSpawnConfig() SpawnOrchestratorConfig {
 		wsRoot = home + "/workspace"
 	}
 	return SpawnOrchestratorConfig{
-		MaxConcurrent:       3,
-		MaxConcurrentBuilds: 1,
-		DefaultTimeout:      60 * time.Minute,
-		DefaultMemory:       4096,
-		DefaultCPUs:         2.0,
-		WorkspaceRoot:       wsRoot,
+		MaxConcurrent:        3,
+		MaxConcurrentBuilds:  1,
+		DefaultTimeout:       60 * time.Minute,
+		DefaultMemory:        4096,
+		DefaultCPUs:          2.0,
+		WorkspaceRoot:        wsRoot,
+		LivenessStallTimeout: defaultLivenessStallTimeout,
 	}
 }
 
@@ -239,22 +268,42 @@ func NewSpawnOrchestrator(
 		spawnLogger.Warn("failed to recover spawn state from store", "error", err)
 	}
 
+	// Resolve the liveness stall timeout: explicit config wins, else the
+	// 15-minute default, with an env escape hatch so the watchdog can be
+	// retuned (or disabled with a large value) without a code redeploy on the
+	// freshly-working autonomous-merge path.
+	livenessStall := cfg.LivenessStallTimeout
+	if livenessStall <= 0 {
+		livenessStall = defaultLivenessStallTimeout
+	}
+	if env := strings.TrimSpace(os.Getenv("LOOM_SPAWN_LIVENESS_STALL_TIMEOUT")); env != "" {
+		if d, err := time.ParseDuration(env); err == nil && d > 0 {
+			livenessStall = d
+			spawnLogger.Info("liveness stall timeout overridden via env",
+				"timeout", livenessStall)
+		} else {
+			spawnLogger.Warn("ignoring invalid LOOM_SPAWN_LIVENESS_STALL_TIMEOUT",
+				"value", env, "error", err)
+		}
+	}
+
 	o := &SpawnOrchestrator{
-		backends:         bs,
-		defaultSubstrate: defaultSubstrate,
-		agentBridge:      agentBridge,
-		sseHub:           sseHub,
-		tracer:           tracer,
-		metrics:          metrics,
-		logger:           spawnLogger,
-		ctrl:             ctrl,
-		maxConcurrent:    cfg.MaxConcurrent,
-		buildSlots:       newBuildSlots(cfg.MaxConcurrentBuilds),
-		defaultTimeout:   cfg.DefaultTimeout,
-		defaultMemory:    cfg.DefaultMemory,
-		defaultCPUs:      cfg.DefaultCPUs,
-		workspaceRoot:    wsRoot,
-		projects:         cfg.Projects,
+		backends:             bs,
+		defaultSubstrate:     defaultSubstrate,
+		agentBridge:          agentBridge,
+		sseHub:               sseHub,
+		tracer:               tracer,
+		metrics:              metrics,
+		logger:               spawnLogger,
+		ctrl:                 ctrl,
+		maxConcurrent:        cfg.MaxConcurrent,
+		buildSlots:           newBuildSlots(cfg.MaxConcurrentBuilds),
+		defaultTimeout:       cfg.DefaultTimeout,
+		defaultMemory:        cfg.DefaultMemory,
+		defaultCPUs:          cfg.DefaultCPUs,
+		workspaceRoot:        wsRoot,
+		projects:             cfg.Projects,
+		livenessStallTimeout: livenessStall,
 	}
 	registered := make([]string, 0, len(bs))
 	for k := range bs {
@@ -867,9 +916,12 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 	var execErr error
 	usedStreaming := false
 
-	// Cancellable exec context so the budget watcher can abort the run when
-	// MaxCostUSD or MaxTurns is exceeded.
-	execCtx, execCancel := context.WithCancel(ctx)
+	// Cancellable exec context so the budget + liveness watchers can abort the
+	// run. WithCancelCause lets the liveness watchdog attach errSpawnStalled so
+	// the finalize path can distinguish a stalled-zombie cancellation from a
+	// normal one (first cancel call wins, so the cleanup cancel(nil) below
+	// never clobbers the watchdog's cause).
+	execCtx, execCancel := context.WithCancelCause(ctx)
 
 	// Budget watcher: polls the telemetry accumulator every 5s and cancels the
 	// exec context when a configured budget is exceeded. The watcher terminates
@@ -879,6 +931,24 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 		go o.runBudgetWatcher(execCtx, spawnID, req, acc, execCancel, watcherDone)
 	} else {
 		close(watcherDone)
+	}
+
+	// Liveness watchdog: streaming (K8s) path only. A zombie pod stuck in
+	// Phase=Running with a dead agent process emits no further JSONL lines, so
+	// acc.LastActivity() stops advancing. When it goes stale beyond the stall
+	// timeout the watcher cancels exec with errSpawnStalled → failSpawn cleans
+	// the pod → the Mills operator's poll sees a terminal failure and
+	// auto-retries, instead of waiting out its 30-minute deadline pending a
+	// manual operator restart. The buffered (harvester-vm) path is excluded:
+	// it has no mid-flight telemetry, so freshness is not a valid signal there;
+	// its Exec TimeoutSec bounds the run instead.
+	_, streamCapable := be.(streamExecCapable)
+	runLiveness := streamCapable && parser != nil && o.livenessStallTimeout > 0
+	livenessDone := make(chan struct{})
+	if runLiveness {
+		go o.runLivenessWatcher(execCtx, spawnID, acc, o.livenessStallTimeout, execCancel, livenessDone)
+	} else {
+		close(livenessDone)
 	}
 
 	// Use streaming exec if the substrate's backend supports it (K8s only)
@@ -895,6 +965,11 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 				WorkDir:     podProjectDir,
 				TimeoutSec:  req.TimeoutMinutes * 60,
 				OnLine: func(line []byte) {
+					// Stamp liveness on every streamed line: receiving output
+					// proves the agent process is alive, which the parser's
+					// telemetry mutations alone would not capture for lines that
+					// carry no structured telemetry.
+					acc.Touch()
 					parser.HandleLine(line)
 				},
 			},
@@ -914,11 +989,16 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 			TimeoutSec:  req.TimeoutMinutes * 60,
 		})
 	}
-	// Stop the watcher and release the exec context.
+	// Stop the watchers and release the exec context. cancel(nil) is a no-op
+	// if a watcher already cancelled with a cause (first call wins), so the
+	// liveness watchdog's errSpawnStalled survives for the finalize path.
 	if req.MaxCostUSD > 0 || req.MaxTurns > 0 {
 		close(watcherDone)
 	}
-	execCancel()
+	if runLiveness {
+		close(livenessDone)
+	}
+	execCancel(nil)
 	execSpan.End()
 	heartbeatCancel()
 
@@ -973,7 +1053,15 @@ func (o *SpawnOrchestrator) runSpawn(spawnID string, req SpawnRequest) {
 
 	// Step 7: Finalize based on exec result.
 	if execErr != nil {
-		o.failSpawn(ctx, state, fmt.Sprintf("agent execution failed: %v", execErr))
+		// Prefer the cancellation cause when the liveness watchdog tripped, so
+		// the failure reads as a diagnosable stall rather than a generic
+		// "context canceled" (the streaming exec surfaces watchdog cancellation
+		// as a context error).
+		reason := fmt.Sprintf("agent execution failed: %v", execErr)
+		if cause := context.Cause(execCtx); cause != nil && errors.Is(cause, errSpawnStalled) {
+			reason = cause.Error()
+		}
+		o.failSpawn(ctx, state, reason)
 		return
 	}
 	// A nonzero exit from the agent CLI is a failure even though Backend.Exec
@@ -1846,7 +1934,7 @@ func (o *SpawnOrchestrator) runBudgetWatcher(
 	spawnID string,
 	req SpawnRequest,
 	acc *bridge.SpawnTelemetryAccumulator,
-	cancelExec context.CancelFunc,
+	cancelExec context.CancelCauseFunc,
 	done <-chan struct{},
 ) {
 	ticker := time.NewTicker(5 * time.Second)
@@ -1866,7 +1954,7 @@ func (o *SpawnOrchestrator) runBudgetWatcher(
 				acc.AddError("max_budget", msg)
 				o.logger.Warn("spawn budget exceeded, canceling exec",
 					"spawn_id", spawnID, "cost_usd", snap.TotalCostUSD, "max_cost_usd", req.MaxCostUSD)
-				cancelExec()
+				cancelExec(context.Canceled)
 				return
 			}
 			if req.MaxTurns > 0 && snap.TurnCount >= req.MaxTurns {
@@ -1875,12 +1963,69 @@ func (o *SpawnOrchestrator) runBudgetWatcher(
 				acc.AddError("max_turns", msg)
 				o.logger.Warn("spawn turn budget exceeded, canceling exec",
 					"spawn_id", spawnID, "turns", snap.TurnCount, "max_turns", req.MaxTurns)
-				cancelExec()
+				cancelExec(context.Canceled)
 				return
 			}
 			// F5 / Slice C1: auto-handoff triggers. Nil-safe — skipped when the
 			// hook is not installed or not enabled.
 			o.evalAutoHandoff(ctx, spawnID, req, snap)
+		}
+	}
+}
+
+// runLivenessWatcher cancels the exec context when a streaming spawn produces
+// no agent output for longer than stallTimeout — the zombie-pod guard. A
+// healthy agent continuously emits JSONL lines (each Touch()es the
+// accumulator), so a stalled lastActivity means the container is Running but
+// the process inside is dead. On trip it records a structured "stalled" error
+// on the accumulator for persisted telemetry and cancels exec with
+// errSpawnStalled as the cause, which the finalize path reads to fail the
+// spawn with a precise reason (→ pod cleanup → Mills operator auto-retry).
+//
+// The poll cadence is derived from stallTimeout (~1/8th, clamped to
+// [100ms, 30s]) so production's 15-minute timeout polls at the cheap 30s
+// ceiling while short override/test timeouts still trip promptly.
+// The watcher exits when its ctx is canceled (exec returned / parent canceled)
+// or when done is closed by the caller after the exec returns.
+func (o *SpawnOrchestrator) runLivenessWatcher(
+	ctx context.Context,
+	spawnID string,
+	acc *bridge.SpawnTelemetryAccumulator,
+	stallTimeout time.Duration,
+	cancelExec context.CancelCauseFunc,
+	done <-chan struct{},
+) {
+	if stallTimeout <= 0 {
+		return
+	}
+	poll := stallTimeout / 8
+	if poll > 30*time.Second {
+		poll = 30 * time.Second
+	}
+	if poll < 100*time.Millisecond {
+		poll = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			idle := time.Since(acc.LastActivity())
+			if idle < stallTimeout {
+				continue
+			}
+			msg := fmt.Sprintf("spawn %s stalled: no agent output for %s (>= %s stall timeout)",
+				spawnID, idle.Round(time.Second), stallTimeout)
+			acc.AddError("stalled", msg)
+			o.logger.Warn("spawn liveness watchdog tripped, canceling exec",
+				"spawn_id", spawnID, "idle", idle.Round(time.Second), "stall_timeout", stallTimeout)
+			cancelExec(fmt.Errorf("%w: %s", errSpawnStalled, msg))
+			return
 		}
 	}
 }
