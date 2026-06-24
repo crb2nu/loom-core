@@ -134,6 +134,36 @@ func TestCodexNotifyCommand_CanonicalizesWorktreeRoot(t *testing.T) {
 	}
 }
 
+// TestHookAgentIDBootstrap_CodexCanonicalizesWorktreeRoot guards the SECOND
+// codex mint path (the shared bootstrap used by codex's hooks.json events): it
+// must canonicalize $WS_ROOT before the WS_HASH cksum so the scoped hooks.json id
+// agrees with the scopeless notify id and folds across worktrees. Conversation-
+// scoped vendors stay byte-for-byte unchanged (and never receive the canon
+// snippet, which is unsafe for Gemini's settings.json ${...} interpolator).
+func TestHookAgentIDBootstrap_CodexCanonicalizesWorktreeRoot(t *testing.T) {
+	codex := hookAgentIDBootstrap("codex")
+	if !strings.Contains(codex, "${WS_ROOT%%/.worktrees/*}") ||
+		!strings.Contains(codex, "${WS_ROOT%%/.claude/worktrees/*}") {
+		t.Errorf("codex bootstrap must canonicalize WS_ROOT; got: %q", codex)
+	}
+	canonIdx := strings.Index(codex, "/.worktrees/*}")
+	hashIdx := strings.Index(codex, "WS_HASH=")
+	if canonIdx < 0 || hashIdx < 0 || canonIdx > hashIdx {
+		t.Errorf("WS_ROOT canon must precede WS_HASH; canonIdx=%d hashIdx=%d", canonIdx, hashIdx)
+	}
+	for _, id := range []string{"claude-code", "gemini-cli"} {
+		if b := hookAgentIDBootstrap(id); strings.Contains(b, "/.worktrees/*}") {
+			t.Errorf("%s bootstrap must NOT canonicalize WS_ROOT; got: %q", id, b)
+		}
+	}
+	// The codex bootstrap must still be valid shell.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "sh", "-n", "-c", codex).CombinedOutput(); err != nil {
+		t.Fatalf("codex bootstrap invalid shell syntax: %v\n%s", err, out)
+	}
+}
+
 func TestSessionEndRetroHooks_ReturnsNonEmpty(t *testing.T) {
 	hooks := sessionEndRetroHooks("")
 	if len(hooks) == 0 {
