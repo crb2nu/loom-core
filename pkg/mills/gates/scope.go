@@ -44,21 +44,25 @@ func (g *Scope) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 		return pass(), nil
 	}
 	allowed := buildAllowedSet(in.Item.Slices, g.AllowTests || true)
-	if allowed.empty() {
-		// No slices => no scope can be enforced. Don't pass silently —
-		// the council should always emit at least one slice; flag the
-		// drift so the operator can re-decompose.
-		return fail("backlog item has no slices; no scope to enforce"), nil
-	}
 	if itemHasCanaryLabel(in.Item) {
 		// Deterministic canaries edit the heartbeat fixture by design;
 		// council-emitted slice lists historically omit it, tripping the
-		// gate on every canary run (escalations #151/#163). The
-		// allowlist applies only to CanaryLabel items so a real backlog
-		// item touching the fixture still violates scope.
+		// gate on every canary run (escalations #151/#163), and a canary
+		// may carry NO slices at all when plan_slice fails to persist one
+		// (escalation 2026-06-23, PIPE-MILLS-CANARY-20260623-235142). Seed
+		// the canary carve-out BEFORE the empty check so a slice-less
+		// canary still enforces the narrow fixture allowlist instead of
+		// escalating. The allowlist applies only to CanaryLabel items so a
+		// real backlog item touching the fixture still violates scope.
 		for _, p := range canaryAllowedPaths {
 			allowed.add(p)
 		}
+	}
+	if allowed.empty() {
+		// No slices and not a canary => no scope can be enforced. Don't
+		// pass silently — the council should always emit at least one
+		// slice; flag the drift so the operator can re-decompose.
+		return fail("backlog item has no slices; no scope to enforce"), nil
 	}
 
 	var violations []string
