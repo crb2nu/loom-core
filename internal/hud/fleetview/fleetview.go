@@ -69,10 +69,16 @@ func Join(presences []presence.PresenceInfo, sessions []bridge.SessionInfo, now 
 			row.AgentType = InferAgentType(agentID)
 		}
 
-		// Join: SessionID first (most precise), then AgentID.
+		// Join: SessionID first (most precise), then exact AgentID, then a
+		// directional workspace-base match. The base match reconciles a
+		// scopeless proxy/mirror presence ("<type>-<WS_HASH>") to the scoped
+		// session the CLI hooks own ("<type>-<WS_HASH>-<SCOPE>") so the
+		// background-heartbeat identity stops surfacing as a bogus orphan.
 		if s, ok := liveByID[agent.SessionID]; ok {
 			applySession(&row, s, now)
 		} else if s, ok := liveByAgent[agentID]; ok {
+			applySession(&row, s, now)
+		} else if s, ok := baseMatchSession(agentID, sessions); ok {
 			applySession(&row, s, now)
 		}
 
@@ -107,6 +113,30 @@ func Join(presences []presence.PresenceInfo, sessions []bridge.SessionInfo, now 
 	}
 
 	return result
+}
+
+// baseMatchSession returns the most-recently-started ACTIVE session whose
+// agent_id is a scoped extension of the given workspace-base agentID (e.g.
+// presence "codex-4188162495" -> session "codex-4188162495-2303882182"). Exact
+// matches are intentionally excluded — those are handled by the liveByAgent
+// lookup before this is reached. Returns false when nothing extends the base.
+func baseMatchSession(agentID string, sessions []bridge.SessionInfo) (bridge.SessionInfo, bool) {
+	var best bridge.SessionInfo
+	found := false
+	for _, s := range sessions {
+		if !sessionIsActive(s) {
+			continue
+		}
+		sid := strings.TrimSpace(s.AgentID)
+		if sid == agentID || !IsBaseOf(agentID, sid) {
+			continue
+		}
+		if !found || parseTime(s.StartedAt).After(parseTime(best.StartedAt)) {
+			best = s
+			found = true
+		}
+	}
+	return best, found
 }
 
 // OrphanStaleAfter is the age past which a heartbeating presence with no

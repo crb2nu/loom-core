@@ -56,7 +56,12 @@
     return (traceStore.entries ?? []).filter((entry) => (entry.agent_id ?? '') === agentId).slice(0, 5);
   });
   let traceError = $derived(traceStore.error);
-  let traceLoading = $derived(traceStore.loading);
+  // Loading is driven ONLY by the per-session trace fetch (loadSessionTrace),
+  // never the global traceStore poll. Previously this was `traceStore.loading`,
+  // so when the session fetch returned zero traces while the global poll was
+  // (re)loading, the drawer stayed pinned on "Loading recent traces..." forever
+  // instead of falling through to "No recent traces for this agent yet."
+  let traceLoading = $derived(loadingEntries);
 
   async function loadSessionTrace(id, limit = 100) {
     loadingEntries = true;

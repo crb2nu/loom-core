@@ -66,3 +66,33 @@ func TestIsWorkspaceAnchored(t *testing.T) {
 		t.Error("claude-code should not be workspace-anchored")
 	}
 }
+
+func TestIsBaseOf(t *testing.T) {
+	cases := []struct {
+		base, full string
+		want       bool
+	}{
+		// Scopeless proxy/mirror base reconciles to the scoped hook session.
+		{"codex-4188162495", "codex-4188162495-2303882182", true},
+		{"claude-code-552019522", "claude-code-552019522-3625843611", true},
+		// Exact match counts.
+		{"codex-4188162495", "codex-4188162495", true},
+		// Directional: a fully scoped id is NOT a base of a different scoped
+		// sibling in the same workspace (must not merge two conversations).
+		{"claude-code-552019522-2804496862", "claude-code-552019522-3116397616", false},
+		// Different WS_HASH (worktree divergence) must not reconcile.
+		{"codex-4095021609", "codex-1713039686-1588666389", false},
+		// Different agent type must not reconcile.
+		{"claude-code-552019522", "codex-552019522-1", false},
+		// Reverse direction is rejected (base must be the shorter id).
+		{"codex-4188162495-2303882182", "codex-4188162495", false},
+		// Empty inputs.
+		{"", "codex-1", false},
+		{"codex-1", "", false},
+	}
+	for _, c := range cases {
+		if got := IsBaseOf(c.base, c.full); got != c.want {
+			t.Errorf("IsBaseOf(%q, %q) = %v, want %v", c.base, c.full, got, c.want)
+		}
+	}
+}

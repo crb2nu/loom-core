@@ -73,6 +73,30 @@ func RootAgentID(agentID string) string {
 	return id
 }
 
+// IsBaseOf reports whether base is the workspace base of full: either an exact
+// match, or full == base + "-<suffix>". It is DIRECTIONAL on purpose — base
+// must be the shorter, scopeless identity.
+//
+// Interactive-agent proxies and the federation mirror emit a workspace-scoped
+// base "<type>-<WS_HASH>" (they cannot know the per-conversation SESSION_SCOPE
+// suffix the CLI hooks append — no session_id is exposed to MCP servers), while
+// the roster session carries the full "<type>-<WS_HASH>-<SESSION_SCOPE>". This
+// lets a background heartbeat or an orphan presence row reconcile to the real
+// conversation session instead of forking an "agents/<id>" twin.
+//
+// The directionality is what keeps it safe: it never merges two distinct scoped
+// conversations of the same type in one workspace (e.g.
+// claude-code-552019522-AAAA and claude-code-552019522-BBBB) the way bare
+// RootAgentID equality would. A fully scoped id is a base only of itself.
+func IsBaseOf(base, full string) bool {
+	base = strings.TrimSpace(base)
+	full = strings.TrimSpace(full)
+	if base == "" || full == "" {
+		return false
+	}
+	return base == full || strings.HasPrefix(full, base+"-")
+}
+
 // ConversationID collapses a per-(workspace,conversation) agent_id down to the
 // conversation it belongs to. For conversation-scoped vendors (claude/gemini) it
 // keeps the SESSION_SCOPE and drops the WS_HASH, so one chat that moved across

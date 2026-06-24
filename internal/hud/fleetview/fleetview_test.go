@@ -367,3 +367,79 @@ func TestInferAgentType(t *testing.T) {
 		}
 	}
 }
+
+func TestJoin_ProxyBaseReconcilesToScopedSession(t *testing.T) {
+	// The background proxy/mirror heartbeat registers a scopeless workspace base
+	// ("codex-4188162495") while the CLI hooks own the scoped session
+	// ("codex-4188162495-2303882182"). The base presence must reconcile to that
+	// session instead of being flagged a bogus orphan.
+	now, _ := time.Parse(time.RFC3339, "2026-04-21T12:00:00Z")
+	presences := []presence.PresenceInfo{
+		{
+			AgentID:       "codex-4188162495",
+			Status:        "active",
+			AgentType:     "codex",
+			RegisteredAt:  mustTime(t, "2026-04-21T11:50:00Z"), // >120s old: would orphan if unmatched
+			LastHeartbeat: mustTime(t, "2026-04-21T11:59:55Z"),
+		},
+	}
+	sessions := []bridge.SessionInfo{
+		{ID: "sess-1", AgentID: "codex-4188162495-2303882182", Status: "active", StartedAt: mustTime(t, "2026-04-21T11:58:00Z")},
+	}
+	rows := Join(presences, sessions, now)
+
+	var proxy *presence.PresenceInfo
+	for i := range rows {
+		if rows[i].AgentID == "codex-4188162495" {
+			proxy = &rows[i]
+		}
+	}
+	if proxy == nil {
+		t.Fatalf("proxy base row missing; got %+v", rows)
+	}
+	if !proxy.HasSession {
+		t.Fatalf("proxy base presence must reconcile to scoped session; got %+v", *proxy)
+	}
+	if proxy.IsOrphan {
+		t.Fatalf("reconciled presence must not be an orphan; got %+v", *proxy)
+	}
+	if proxy.SessionID != "sess-1" {
+		t.Fatalf("want SessionID=sess-1, got %q", proxy.SessionID)
+	}
+}
+
+func TestJoin_DifferentWSHashStaysOrphan(t *testing.T) {
+	// Worktree divergence: the proxy resolved a different git toplevel than the
+	// hooks, so the WS_HASH segments differ. There is no shared sub-id to link
+	// them, so the base presence must NOT be reconciled to an unrelated session.
+	now, _ := time.Parse(time.RFC3339, "2026-04-21T12:00:00Z")
+	presences := []presence.PresenceInfo{
+		{
+			AgentID:       "codex-4095021609",
+			Status:        "active",
+			AgentType:     "codex",
+			RegisteredAt:  mustTime(t, "2026-04-21T11:50:00Z"),
+			LastHeartbeat: mustTime(t, "2026-04-21T11:59:55Z"),
+		},
+	}
+	sessions := []bridge.SessionInfo{
+		{ID: "sess-other", AgentID: "codex-1713039686-1588666389", Status: "active", StartedAt: mustTime(t, "2026-04-21T11:58:00Z")},
+	}
+	rows := Join(presences, sessions, now)
+
+	var proxy *presence.PresenceInfo
+	for i := range rows {
+		if rows[i].AgentID == "codex-4095021609" {
+			proxy = &rows[i]
+		}
+	}
+	if proxy == nil {
+		t.Fatalf("proxy base row missing; got %+v", rows)
+	}
+	if proxy.HasSession {
+		t.Fatalf("must not reconcile across WS_HASH; got %+v", *proxy)
+	}
+	if !proxy.IsOrphan {
+		t.Fatalf("unmatched stale presence should be an orphan; got %+v", *proxy)
+	}
+}

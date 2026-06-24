@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/crb2nu/loom/internal/hud/bridge"
+	"github.com/crb2nu/loom/internal/hud/fleetview"
 )
 
 // handleAgentSessionStart creates a new agent session (idempotent).
@@ -414,6 +415,17 @@ func (d *FleetDomain) ensureHeartbeatSession(agentID, namespace, agentType, desc
 	if err != nil {
 		return err
 	}
+	if active == nil {
+		// Reconcile to the real conversation session before bootstrapping.
+		// The proxy/mirror background heartbeat carries a workspace-scoped base
+		// id ("<type>-<WS_HASH>"); the CLI hooks own a scoped session
+		// ("<type>-<WS_HASH>-<SCOPE>") that exact GetActiveSession can't see.
+		// Without this, ensure_session forks a phantom "agents/<id>" twin —
+		// a background wakeup of the wrong session. Attach to the existing
+		// scoped session instead; only truly hook-less agents fall through to
+		// the bootstrap below.
+		active = d.baseMatchActiveSession(agentID)
+	}
 	if active != nil {
 		// A heartbeat must never fork a SECOND active session for an agent that
 		// already has one. The agent_id already encodes the workspace (WS_HASH),
@@ -459,6 +471,31 @@ func (d *FleetDomain) ensureHeartbeatSession(agentID, namespace, agentType, desc
 		})
 	}
 
+	return nil
+}
+
+// baseMatchActiveSession finds an active session owned by the conversation that
+// the given workspace-base agentID belongs to. The proxy/mirror background
+// heartbeat uses a scopeless "<type>-<WS_HASH>" id while the CLI hooks own a
+// scoped "<type>-<WS_HASH>-<SCOPE>" session; exact GetActiveSession misses that.
+// Returns the first active base-extension match (nil if none), so ensure_session
+// reuses the real session instead of forking an "agents/<id>" twin.
+func (d *FleetDomain) baseMatchActiveSession(agentID string) *bridge.SessionInfo {
+	sessions, err := d.deps.Agent().ActiveSessions()
+	if err != nil {
+		return nil
+	}
+	for i := range sessions {
+		s := &sessions[i]
+		if !strings.EqualFold(strings.TrimSpace(s.Status), "active") {
+			continue
+		}
+		sid := strings.TrimSpace(s.AgentID)
+		if sid == agentID || !fleetview.IsBaseOf(agentID, sid) {
+			continue
+		}
+		return s
+	}
 	return nil
 }
 
