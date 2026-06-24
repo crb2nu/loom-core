@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- JSON marshal/unmarshal round-trip tests ---
@@ -868,5 +869,32 @@ func TestSpawnAccumulator_SetPublisher_NilSafe(t *testing.T) {
 	acc.CompleteToolCallWithResult(id2, "z", 0, "")
 	if got := len(pub.byType(EventTypeToolCallStart)); got != 1 {
 		t.Errorf("after detach, expected still 1 start event, got %d", got)
+	}
+}
+
+// --- liveness freshness (lastActivity) tests ---
+
+// TestSpawnTelemetryAccumulator_LastActivityInitialised verifies a fresh
+// accumulator reports a recent lastActivity so the spawn liveness watchdog has
+// a sane baseline before the agent emits anything.
+func TestSpawnTelemetryAccumulator_LastActivityInitialised(t *testing.T) {
+	acc := NewSpawnTelemetryAccumulator()
+	if since := time.Since(acc.LastActivity()); since < 0 || since > time.Second {
+		t.Fatalf("fresh accumulator LastActivity %v ago, want ~now", since)
+	}
+}
+
+// TestSpawnTelemetryAccumulator_TouchAdvancesLastActivity is the regression
+// guard for the zombie-pod liveness signal: Touch() (called per streamed JSONL
+// line) must move lastActivity forward so a talking agent stays "alive" while a
+// dead one lets it go stale.
+func TestSpawnTelemetryAccumulator_TouchAdvancesLastActivity(t *testing.T) {
+	acc := NewSpawnTelemetryAccumulator()
+	before := acc.LastActivity()
+	time.Sleep(2 * time.Millisecond)
+	acc.Touch()
+	after := acc.LastActivity()
+	if !after.After(before) {
+		t.Fatalf("Touch did not advance LastActivity: before=%v after=%v", before, after)
 	}
 }

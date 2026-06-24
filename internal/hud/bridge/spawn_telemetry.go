@@ -153,6 +153,14 @@ type SpawnTelemetryAccumulator struct {
 	mu        sync.Mutex
 	data      SpawnTelemetry
 	toolStart map[string]time.Time // tool_use_id -> start time
+	// lastActivity is the wall-clock time of the most recent observed agent
+	// activity — a streamed JSONL line or any telemetry mutation. The spawn
+	// orchestrator's liveness watchdog reads it via LastActivity() to detect
+	// a zombie pod: a container stuck in Phase=Running while the agent process
+	// inside it is dead emits no further activity, so lastActivity stops
+	// advancing. Initialised to construction time so a spawn that never emits
+	// anything still trips the watchdog after the stall window.
+	lastActivity time.Time
 	// toolMeta records the metadata captured at start time so the matching
 	// end event can echo tool name + session identity without the caller
 	// having to thread it back through.
@@ -181,12 +189,33 @@ type toolCallMeta struct {
 // wire in a real event sink.
 func NewSpawnTelemetryAccumulator() *SpawnTelemetryAccumulator {
 	return &SpawnTelemetryAccumulator{
-		toolStart: make(map[string]time.Time),
-		toolMeta:  make(map[string]toolCallMeta),
+		toolStart:    make(map[string]time.Time),
+		toolMeta:     make(map[string]toolCallMeta),
+		lastActivity: time.Now(),
 		data: SpawnTelemetry{
 			ModelUsage: make(map[string]ModelUse),
 		},
 	}
+}
+
+// Touch records that the agent produced observable activity right now (e.g.
+// a streamed JSONL line). The spawn orchestrator's liveness watchdog calls
+// this from the per-line stream callback so a healthy, talking agent keeps
+// lastActivity fresh while a zombie pod (Running container, dead process)
+// lets it go stale. Cheap and lock-guarded; safe to call per line.
+func (a *SpawnTelemetryAccumulator) Touch() {
+	a.mu.Lock()
+	a.lastActivity = time.Now()
+	a.mu.Unlock()
+}
+
+// LastActivity returns the time of the most recent Touch (or construction if
+// the agent has produced nothing yet). The liveness watchdog compares
+// time.Since(LastActivity()) against the stall timeout.
+func (a *SpawnTelemetryAccumulator) LastActivity() time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastActivity
 }
 
 // NewSpawnTelemetryAccumulatorWithPublisher creates an accumulator wired to
