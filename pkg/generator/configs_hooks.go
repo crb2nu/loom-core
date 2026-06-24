@@ -508,6 +508,21 @@ func appendHookBlocks(existing any, hooks ...map[string]any) []map[string]any {
 // avoid ${...:-...} defaults on shell-local variables; only plain $VAR /
 // ${VAR} (preserved when unknown) and ${ENVVAR:-literal} are safe.
 func hookAgentIDBootstrap(agentID string) string {
+	// Workspace-anchored vendors (codex) must hash the CANONICAL main-repo root so
+	// their WS_HASH is stable across worktrees and folds with the scopeless notify
+	// mint (see worktreeCanonRootShell + codexNotifyCommand) — codex's
+	// conversationId keeps the WS_HASH, so every codex mint path must agree on it
+	// or one app splits into a row per worktree (and the scoped hooks.json id would
+	// even split from the scopeless notify id WITHIN one worktree). Conversation-
+	// scoped vendors (claude/gemini) keep the raw worktree root: their
+	// conversationId drops the WS_HASH and their proxy base-matches the
+	// worktree-scoped session. Injected (not always-on) so non-codex hook output is
+	// byte-for-byte unchanged — and the canon snippet is never emitted into
+	// Gemini's settings.json, which has a brittle ${...} interpolator.
+	wsCanon := ""
+	if agentID == "codex" {
+		wsCanon = worktreeCanonRootShell() + "; "
+	}
 	return fmt.Sprintf(
 		`HOOK_INPUT="$INPUT"; `+
 			`HOOK_SESSION_ID=""; `+
@@ -519,6 +534,7 @@ func hookAgentIDBootstrap(agentID string) string {
 			`SESSION_SCOPE="-$(printf '%%s' "$HOOK_SESSION_ID" | cksum | cut -d' ' -f1)"; `+
 			`fi; `+
 			`WS_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$PWD")"; `+
+			`%s`+
 			`WS_HASH="$(printf '%%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; `+
 			`AGENT_CACHE_BASE="$HOME"; `+
 			`[ -n "$AGENT_CACHE_BASE" ] || AGENT_CACHE_BASE="${TMPDIR:-/tmp}"; `+
@@ -531,7 +547,7 @@ func hookAgentIDBootstrap(agentID string) string {
 			`AGENT_ID="%s-${WS_HASH}${SESSION_SCOPE}"; `+
 			`printf '%%s' "$AGENT_ID" > "$AGENT_ID_FILE"; `+
 			`fi`,
-		agentID, agentID,
+		wsCanon, agentID, agentID,
 	)
 }
 
