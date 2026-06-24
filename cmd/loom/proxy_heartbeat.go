@@ -128,7 +128,25 @@ func stableWorkspaceProxyAgentID(agentType string) (string, bool) {
 		}
 		root = wd
 	}
-	return fmt.Sprintf("%s-%d", agentType, posixCKSumString(root)), true
+	return workspaceProxyAgentIDFor(agentType, root), true
+}
+
+// workspaceProxyAgentIDFor formats the workspace-scoped proxy id `<type>-<cksum>`
+// for a given agent type and git root.
+//
+// Codex is workspace-anchored: its session id is `codex-<WS_HASH>` with no
+// SESSION_SCOPE, so conversationId keeps the WS_HASH (see WORKSPACE_ANCHORED_BASES
+// in agents.ts) and the notify hook now hashes the CANONICAL main-repo root (see
+// worktreeCanonRootShell). We canonicalize here too so the proxy's
+// `codex-<WS_HASH>` base reconciles to the session across worktrees instead of
+// forking a per-worktree id. Conversation-scoped vendors (claude/gemini) still
+// hash the raw worktree root — their shell bootstrap is unchanged and their proxy
+// base must keep matching it.
+func workspaceProxyAgentIDFor(agentType, root string) string {
+	if strings.TrimSpace(agentType) == "codex" {
+		root = stripWorktreeFromRepoRoot(root)
+	}
+	return fmt.Sprintf("%s-%d", agentType, posixCKSumString(root))
 }
 
 func inferGitTopLevel() string {
