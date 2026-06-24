@@ -150,6 +150,26 @@ func TestScope_CanaryHeartbeatAllowedForCanaryItems(t *testing.T) {
 	}
 }
 
+// TestScope_CanaryNoSlicesHeartbeatAllowed pins the 2026-06-23 fix: a
+// CanaryLabel item carrying NO slices (plan_slice failed to persist one,
+// PIPE-MILLS-CANARY-20260623-235142) that edits only the heartbeat fixture
+// must PASS via the canary carve-out instead of failing the empty-slices
+// check and escalating. Before the fix the empty-slices guard fired before
+// the carve-out seeded canaryAllowedPaths.
+func TestScope_CanaryNoSlicesHeartbeatAllowed(t *testing.T) {
+	g := &Scope{}
+	item := fixtureItem() // no slices, as a slice-less canary
+	item.Labels = []string{CanaryLabel}
+	in := StageInput{
+		Item:         item,
+		FilesChanged: []string{"testdata/mills-canary/heartbeat.md"},
+	}
+	out, _ := g.Evaluate(context.Background(), in)
+	if !out.Pass {
+		t.Errorf("slice-less canary heartbeat edit should pass scope, got: %+v", out)
+	}
+}
+
 // TestScope_CanaryHeartbeatStillFailsForNonCanaryItems guards the
 // carve-out's blast radius: a real backlog item touching the canary
 // fixture is still a scope violation.
