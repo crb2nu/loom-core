@@ -509,6 +509,25 @@ func (r *Reconciler) pickupInFlightRuns(ctx context.Context) (int, int) {
 	return started, errored
 }
 
+// nextPipelineAttempt returns the attempt number to use for a fresh
+// pipeline_run for backlogID: max(existing attempts) + 1, or 1 when no
+// runs exist yet. This keeps the pipeline_runs UNIQUE(backlog_id, attempts)
+// invariant satisfied when an item is re-queued by the escalation
+// auto-retry path, which leaves prior (escalated) runs in place.
+func (r *Reconciler) nextPipelineAttempt(ctx context.Context, backlogID string) (int, error) {
+	runs, err := r.Store.Pipeline.ListByBacklog(ctx, backlogID)
+	if err != nil {
+		return 0, err
+	}
+	maxAttempt := 0
+	for _, pr := range runs {
+		if pr.Attempts > maxAttempt {
+			maxAttempt = pr.Attempts
+		}
+	}
+	return maxAttempt + 1, nil
+}
+
 // derefString safely dereferences a *string for log payloads.
 func derefString(s *string) string {
 	if s == nil {
@@ -608,12 +627,28 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 	// Instantiate a pipeline run row + transition the backlog item to
 	// running. State changes are persisted before we hand off to the
 	// Starter so a starter crash can't leave us in a half-state.
+	//
+	// Attempts must be the next free attempt number for this backlog id,
+	// NOT a hardcoded 1. The escalation auto-retry path (Runner.maybeAutoRetry)
+	// marks a transiently-escalated run escalated but leaves the backlog
+	// item queued so this reconciler spins up a fresh pipeline_run. That
+	// fresh run collides with the prior run on the pipeline_runs
+	// UNIQUE(backlog_id, attempts) constraint unless we increment past the
+	// existing attempts — otherwise PutRun fails every tick and the item
+	// is wedged queued forever (observed: stale canaries erroring on every
+	// reconciler tick for days). The retry ceiling is enforced upstream in
+	// maybeAutoRetry (EscalationAutoRetryCap), so this only ever produces a
+	// bounded sequence of attempt numbers.
+	attempt, err := r.nextPipelineAttempt(ctx, item.ID)
+	if err != nil {
+		return decisionDeferred, nil, fmt.Errorf("next attempt: %w", err)
+	}
 	run := &store.PipelineRun{
 		ID:        newPipelineRunID(item.ID, r.now()),
 		BacklogID: item.ID,
 		Template:  policy.Pipeline.DefaultTemplate,
 		State:     store.PipelineQueued,
-		Attempts:  1,
+		Attempts:  attempt,
 		StartedAt: r.now(),
 	}
 	if err := r.Store.Pipeline.PutRun(ctx, run); err != nil {

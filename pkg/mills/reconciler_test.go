@@ -200,6 +200,74 @@ func TestReconciler_StartsQueuedItem(t *testing.T) {
 	}
 }
 
+// TestReconciler_RequeuedItemStartsNextAttempt pins the escalation
+// auto-retry contract: when a transiently-escalated run is left in place
+// and the backlog item is re-queued, the next reconciler tick must spin
+// up a fresh pipeline_run with an incremented attempt number rather than
+// colliding on the pipeline_runs UNIQUE(backlog_id, attempts) constraint.
+//
+// Regression: tryStart previously hardcoded Attempts=1, so the fresh run
+// failed PutRun every tick and the item wedged queued forever (errored
+// ticks, never started).
+func TestReconciler_RequeuedItemStartsNextAttempt(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+
+	item := &store.BacklogItem{
+		ID:        "MILLS-REQUEUE",
+		Title:     "re-queued after transient escalation",
+		State:     store.BacklogQueued,
+		Priority:  store.P2,
+		Slices:    []store.Slice{{Name: "x", Files: []string{"a.go"}}},
+		Budget:    store.Budget{MaxCostUSD: 1.0, MaxTurns: 30},
+		CreatedBy: "test",
+	}
+	if err := env.store.Backlog.Put(ctx, item); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	// Simulate the post-auto-retry state: a prior run at attempts=1 sits
+	// escalated while the backlog item is back in the queued state.
+	prior := &store.PipelineRun{
+		ID:        "PIPE-MILLS-REQUEUE-1",
+		BacklogID: item.ID,
+		Template:  "mills-default-pipeline",
+		State:     store.PipelineEscalated,
+		Attempts:  1,
+		StartedAt: env.now.Add(-time.Hour),
+	}
+	if err := env.store.Pipeline.PutRun(ctx, prior); err != nil {
+		t.Fatalf("seed prior run: %v", err)
+	}
+
+	res, err := env.rec.Tick(ctx)
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if res.Started != 1 || res.Errored != 0 {
+		t.Fatalf("expected started=1 errored=0, got %+v", res)
+	}
+	if env.starter.calls() != 1 {
+		t.Fatalf("starter not invoked: calls=%d", env.starter.calls())
+	}
+
+	runs, err := env.store.Pipeline.ListByBacklog(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("read runs: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("expected 2 runs (prior + fresh), got %d", len(runs))
+	}
+	// ListByBacklog orders by attempts ASC; the fresh run must be attempt 2.
+	if got := runs[len(runs)-1].Attempts; got != 2 {
+		t.Fatalf("fresh run attempt: got %d want 2", got)
+	}
+	got, _ := env.store.Backlog.Get(ctx, item.ID)
+	if got.State != store.BacklogRunning {
+		t.Fatalf("backlog item not transitioned: %v", got.State)
+	}
+}
+
 func TestReconciler_DefersOnUnmetDependency(t *testing.T) {
 	env := newRecEnv(t, nil)
 	ctx := context.Background()
