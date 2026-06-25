@@ -34,6 +34,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 **Files**: `CLAUDE.md`, `.gitignore`, `mcp/context/skills-registry.yaml`, tracked `.loom/*` removals.
 **Verify**: `git check-ignore` + `git ls-files .loom/` match the documented policy.
 
+**Status 2026-06-24 — DONE.** Repo `.gitignore` now carries the `.loom/local/`, `.loom/archive/`, `00-workspace-snapshot.md`, `50-worklog.md` rules (resolves the false `AGENTS.md:29` claim that they already existed). `git rm --cached` untracked the 2 auto-gen files + all 22 `.loom/archive/roadmap-reconciliations/*` files (kept on disk, history retained — policy marks `.loom/archive/*` local-only). `templates/40-decisions.md` added to the `plan-loom-core` skills-registry `assets:` block (the template file already existed on disk but was unlisted). Verified: `git check-ignore` reports all 4 paths ignored; `git ls-files .loom/archive` empty.
+
 ---
 
 ## Slice 1 — Plan entity MVP + kill-test (GATE)
