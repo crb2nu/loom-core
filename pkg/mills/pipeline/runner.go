@@ -221,6 +221,12 @@ type Runner struct {
 	// for the next scheduled reconciler tick.
 	OnAutoRetry func(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem) error
 	active      sync.Map
+	// wg tracks the detached Drive goroutines launched by Start (and the
+	// fan-out goroutines launched by RunnerStarter, which register here
+	// too). Wait blocks until they all exit — used by tests to avoid
+	// leaking goroutines past the store's teardown, and available to
+	// operators for a clean shutdown.
+	wg sync.WaitGroup
 	// CrossRepoIntegrator, when set, switches the runner into the
 	// cross-repo path for any backlog item that has an open
 	// cross_repo_run row. Unset means single-repo behaviour for every
@@ -271,7 +277,9 @@ func (r *Runner) Start(ctx context.Context, run *store.PipelineRun, item *store.
 		r.logger().Warn("pipeline start skipped; run already active in this operator", "run", run.ID)
 		return nil
 	}
+	r.wg.Add(1)
 	go func() {
+		defer r.wg.Done()
 		defer r.active.Delete(run.ID)
 		// Drive uses a detached context; a reconciler tick that returns
 		// must not cancel an in-flight run.
@@ -284,6 +292,19 @@ func (r *Runner) Start(ctx context.Context, run *store.PipelineRun, item *store.
 		}
 	}()
 	return nil
+}
+
+// Wait blocks until every detached Drive goroutine launched by Start (and
+// the fan-out goroutines launched by RunnerStarter) has exited. It is the
+// deterministic stop barrier tests use before closing the store so a
+// still-running drive loop can't write to a torn-down DB or race shared
+// state. Safe to call when nothing is in flight (returns immediately) and
+// safe to call repeatedly.
+func (r *Runner) Wait() {
+	if r == nil {
+		return
+	}
+	r.wg.Wait()
 }
 
 // Drive runs the state machine synchronously to a terminal state. It is

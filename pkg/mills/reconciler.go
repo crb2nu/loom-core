@@ -179,9 +179,19 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 	}
 	r.refreshActiveGauges(ctx)
 
+	// startedThisTick records run IDs already started earlier in this same
+	// tick (queued-item launches + queued subruns). pickupInFlightRuns must
+	// skip them: a run created by tryStart is non-terminal, so the in-flight
+	// re-driver would otherwise re-invoke Starter.Start on it in the SAME
+	// tick — double-counting res.Started (and churning a redundant Start the
+	// runner's active-guard then no-ops). It looked like a double-start
+	// (DEBT-079 #176); the active-guard always prevented an actual second
+	// drive, but the count was wrong and flaky under the race scheduler.
+	startedThisTick := make(map[string]bool)
+
 	res := TickResult{Inspected: len(queued)}
 	for _, item := range queued {
-		decision, _, err := r.tryStart(ctx, item, policy)
+		decision, run, err := r.tryStart(ctx, item, policy)
 		if err != nil {
 			r.append(ctx, "reconciler.start_failed", "error", map[string]any{
 				"item": item.ID, "error": err.Error(),
@@ -192,6 +202,9 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 		switch decision {
 		case decisionStarted:
 			res.Started++
+			if run != nil {
+				startedThisTick[run.ID] = true
+			}
 		case decisionDeferred:
 			res.Deferred++
 		case decisionSkipped:
@@ -205,7 +218,7 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 	// state=queued with parent_run_id != NULL. The Starter knows
 	// how to drive an existing run row forward, so the same
 	// PipelineStarter wired for backlog-item launches is reused.
-	subStarted, subErrs := r.pickupQueuedSubruns(ctx)
+	subStarted, subErrs := r.pickupQueuedSubruns(ctx, startedThisTick)
 	res.Started += subStarted
 	res.Errored += subErrs
 
@@ -221,7 +234,7 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 	//
 	// Stays inside Tick's existing policy + autonomy gates above, so a
 	// paused operator does not re-drive anything.
-	inflightStarted, inflightErrs := r.pickupInFlightRuns(ctx)
+	inflightStarted, inflightErrs := r.pickupInFlightRuns(ctx, startedThisTick)
 	res.Started += inflightStarted
 	res.Errored += inflightErrs
 
@@ -422,7 +435,9 @@ func isTerminalPipelineState(state store.PipelineState) bool {
 // per-row and counted into the tick result; one failure does not
 // block the rest. Returns (started, errored) so Tick can roll the
 // counters into TickResult.
-func (r *Reconciler) pickupQueuedSubruns(ctx context.Context) (int, int) {
+// startedThisTick, when non-nil, records the run IDs started here so a
+// later pickupInFlightRuns in the same tick skips them.
+func (r *Reconciler) pickupQueuedSubruns(ctx context.Context, startedThisTick map[string]bool) (int, int) {
 	if r.Store == nil || r.Starter == nil {
 		return 0, 0
 	}
@@ -452,6 +467,9 @@ func (r *Reconciler) pickupQueuedSubruns(ctx context.Context) (int, int) {
 			errored++
 			continue
 		}
+		if startedThisTick != nil {
+			startedThisTick[run.ID] = true
+		}
 		r.append(ctx, "reconciler.subrun_started", "ok", map[string]any{
 			"run": run.ID, "backlog": run.BacklogID, "depth": run.Depth,
 			"parent_run": derefString(run.ParentRunID),
@@ -474,7 +492,13 @@ func (r *Reconciler) pickupQueuedSubruns(ctx context.Context) (int, int) {
 //
 // Errors are logged per-row and counted into the tick result; one failure
 // does not block the rest. Returns (started, errored).
-func (r *Reconciler) pickupInFlightRuns(ctx context.Context) (int, int) {
+//
+// skip names run IDs already started earlier in this same tick (queued
+// launches + subruns). They are non-terminal so ListInFlight returns them,
+// but re-invoking Start in the same tick only double-counts and churns a
+// redundant call the runner's active-guard no-ops (DEBT-079). They are
+// re-driven on the NEXT tick if their goroutine has since exited.
+func (r *Reconciler) pickupInFlightRuns(ctx context.Context, skip map[string]bool) (int, int) {
 	if r.Store == nil || r.Starter == nil {
 		return 0, 0
 	}
@@ -485,6 +509,9 @@ func (r *Reconciler) pickupInFlightRuns(ctx context.Context) (int, int) {
 	}
 	var started, errored int
 	for _, run := range runs {
+		if skip[run.ID] {
+			continue
+		}
 		item, lerr := r.Store.Backlog.Get(ctx, run.BacklogID)
 		if lerr != nil {
 			r.append(ctx, "reconciler.inflight_pickup_failed", "error", map[string]any{

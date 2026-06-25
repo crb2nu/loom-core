@@ -43,14 +43,7 @@ func TestRunnerStarter_RoutesSingleSliceToRunner(t *testing.T) {
 	if err := starter.Start(context.Background(), run, item); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
-		if got != nil && (got.State == store.PipelineDone || got.State == store.PipelineEscalated) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	starter.Wait() // deterministic: drive goroutine has exited
 	got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
 	if got.State != store.PipelineDone {
 		t.Errorf("state = %s, want done", got.State)
@@ -105,15 +98,11 @@ func TestRunnerStarter_RoutesParallelSlicesThroughIntegrator(t *testing.T) {
 	if err := starter.Start(context.Background(), run, item); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
-		if got != nil && (got.State == store.PipelineDone || got.State == store.PipelineEscalated) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Wait deterministically for the fan-out goroutine to finish before
+	// reading the shared run/merger/allocator state. The goroutine does
+	// `*run = parentRun` (integrator.go) — a poll loop touching `run`
+	// concurrently is a data race (DEBT-079).
+	starter.Wait()
 	got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
 	if got.State != store.PipelineDone {
 		t.Errorf("state = %s, want done after integrator+runner", got.State)
@@ -164,14 +153,7 @@ func TestRunnerStarter_ResumesPostFanoutRunThroughRunner(t *testing.T) {
 	if err := starter.Start(context.Background(), run, item); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
-		if got != nil && (got.State == store.PipelineDone || got.State == store.PipelineEscalated) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	starter.Wait() // deterministic join before reading shared run/merger state
 	got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
 	if got.State != store.PipelineDone {
 		t.Errorf("state = %s, want done", got.State)

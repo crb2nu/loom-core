@@ -581,14 +581,12 @@ test:race:
     - |
       mapfile -t PKGS < <(go list ./...)
 
-      # Quarantined from -race pending a fix (DEBT-079, issue #174):
-      # pkg/mills/pipeline
-      # tests leak runner goroutines and cross-contaminate under the race
-      # scheduler (~75% package-level failure rate locally; double-start +
-      # "database is closed" symptoms). It had no race coverage before this
-      # exclusion was computed, so this preserves the status quo for the
-      # package while the rest of pkg/ gains coverage.
-      mapfile -t PKGS < <(printf '%s\n' "${PKGS[@]}" | grep -Fvx 'github.com/crb2nu/loom/pkg/mills/pipeline')
+      # NOTE: pkg/mills/pipeline was previously quarantined here (DEBT-079,
+      # issue #176) for leaking runner goroutines under the race scheduler
+      # (double-start + "database is closed" symptoms). Fixed by
+      # Runner.Wait()/RunnerStarter.Wait() deterministic joins + the
+      # reconciler same-tick double-count fix; the package now carries race
+      # coverage like the rest of pkg/.
 
       # Some packages transitively require fi-accel FFI (cgo) and cannot
       # compile without the native header. On runners where the library is
