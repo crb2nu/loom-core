@@ -157,6 +157,19 @@ func selectCoreDeveloperTools(tools []mcp.Tool, limit int) []mcp.Tool {
 		"agent_context__agent_presence_register",
 		"agent_context__agent_presence_heartbeat",
 		"agent_context__agent_session_end",
+		// Plan store: worktree-resilient, cross-vendor plan/slice resolution.
+		// Without these in the core profile, profile-limited clients (codex,
+		// antigravity) cannot resolve plans via agent_plan_get and silently
+		// fall back to fuzzy context recall — see the 2026-06-24 kill-test.
+		"agent_context__agent_plan_get",
+		"agent_context__agent_plan_list",
+		"agent_context__agent_plan_create",
+		"agent_context__agent_plan_update",
+		"agent_context__agent_plan_lifecycle_advance",
+		"agent_context__agent_plan_slice_get",
+		"agent_context__agent_plan_slice_list",
+		"agent_context__agent_plan_slice_update",
+		"agent_context__agent_plan_slice_claim",
 		"tavily__search",
 		"tavily__search_news",
 		"tavily__extract",
