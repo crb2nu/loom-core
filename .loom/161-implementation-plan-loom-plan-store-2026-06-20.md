@@ -1,9 +1,29 @@
 # Implementation Plan — Loom Plan Store
 
-- **Status**: Draft
-- **Date**: 2026-06-20
+- **Status**: Shipped — S0–S7 merged to `main`; S8 (cross-platform sync) propagated; S7b (council/importer plan authoring + backlog backfill) is the one deferred functional follow-up. Reconciled 2026-06-25.
+- **Date**: 2026-06-20 (status reconciled 2026-06-25)
 - **Spec**: [160-product-spec-loom-plan-store-2026-06-20.md](160-product-spec-loom-plan-store-2026-06-20.md)
 - **Sequencing rule**: Slice 1 is the riskiest-assumption kill-test and **gates everything**. No unification work (Slice 7) commits until Slices 1–2 are proven and Slice 6 lands the lifecycle view.
+
+## Shipped status (reconciled 2026-06-25)
+
+The epic is functionally complete; the riskiest-assumption kill-test **PASSED live**. Per-slice landings:
+
+| Slice | Status | Evidence |
+|-------|--------|----------|
+| S0 — `.loom` hygiene | ✅ merged | `6fab24c5` |
+| S1 — Plan entity MVP + kill-test (GATE) | ✅ merged; gate PASSED | `81d50941` (data-model 2026-06-20); live legs proven by `69768b7e`/`feba82e5` |
+| S2 — Full schema + tools + events | ✅ merged | `ee090396` |
+| S3 — `.md` mirror + plan-skill rewire | ✅ merged | `9aa8bddd` |
+| S4 — parallel-slice-ship rewire + claim enforce | ✅ merged | `461ee317` |
+| S5 — Plan-aware handoffs | ✅ merged | `75329f2c` |
+| S6 — Lifecycle + HUD | ✅ merged | `ab26f64a` (read API) + `1bb052a9` (HUD Plans panel) |
+| S7 — Mills unification (links + read-through) | ✅ merged | `4578ec3b`; **S7b** (council/importer *write* plans + backlog backfill) deferred |
+| S8 — Cross-platform sync | ✅ propagated | registry plan-aware (S3/S4); `platform/gitops` mirror in sync; HOME skills for claude/codex/gemini/kilocode carry the plan-store-aware `plan-loom-core` + `parallel-slice-ship` (verified 2026-06-25) |
+
+**Cross-vendor reachability hardening** (beyond the original slice list, required to make S1's live legs pass): proxy `llm-core`/`antigravity-core` profiles now expose `agent_plan_*` (`69768b7e`, [!785]); Mills spawn pods reach the store via `loom proxy --ws-backend` + bundled `loom` binary (`feba82e5`, [!786]); mobile-hud spawn orchestrator wires `SPAWN_LOOM_IMAGE` + plan-store (`b01d16ae`).
+
+**Remaining (next loops):** S7b council/importer plan authoring + backlog backfill (highest blast radius — dual-write + canary one backlog item before flipping writers); end-to-end in-pod deploy verification of a real Mills codex calling `agent_plan_get` after the loom-core image rebuild + operator redeploy.
 
 ## Dependency graph
 
@@ -67,6 +87,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 
 **Files**: `pkg/agentcontext/schema_plan.go`, `svc_plans.go`, `svc_plan_slices.go`, `tools_plan.go`, `*_test.go`.
 
+**Status — SHIPPED** (`ee090396`). Rich schema aligned with Mills `BacklogItem`; slices promoted to `agent_plan_slices_v1`; validated lifecycle transitions in `phase_history`; best-effort `agent_plan_search` (deterministic fallback vector so a failed embedder never blocks a write). Live cross-process kill-test re-run PASS with the slice collection.
+
 ---
 
 ## Slice 3 — `.md` mirror + plan-skill rewrite (parallel after S2)
@@ -78,6 +100,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 - Migrate `research`, `brainstorm`, `decision-journal` skills to record into the plan/slice store.
 
 **Files**: `pkg/agentcontext/svc_plan_render.go`, `mcp/skills/plan-loom-core/*`, `mcp/context/skills-registry.yaml`.
+
+**Status — SHIPPED** (`9aa8bddd`). `agent_plan_render{plan_id, path}` projects the canonical store to a reviewable `.loom/*.md` mirror via `writeFileAtomic` (no partial reads for fs watchers), records `mirror_path`; pure `renderPlanMarkdown` is unit-tested. `plan-loom-core` skill rewritten store-first (create/render/edit/recall by `plan_id`).
 
 ---
 
@@ -92,6 +116,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 
 **Files**: `mcp/context/skills-registry.yaml` (parallel-slice-ship), `.claude/agents/slice-implementer.md`, `pkg/agentcontext/svc_claims.go`, `svc_plan_slices.go`.
 
+**Status — SHIPPED** (`461ee317`). `agent_file_claim_acquire` gains `enforce` (default false = unchanged advisory); `ClaimSvc.AcquireEnforced` claims a file set all-or-nothing; `agent_plan_slice_claim` hard-claims the slice's `files` so two slices sharing a file cannot both proceed (second refused with `conflicting_files`, no half-claim). `slice-implementer` agent + `parallel-slice-ship` skill rewritten store-first (spawn with only `plan_id`+`slice_id`).
+
 ---
 
 ## Slice 5 — Plan-aware handoffs (parallel after S2)
@@ -103,6 +129,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 
 **Files**: `pkg/agentcontext/service_handoffs.go`, `schema.go` (Handoff), `tools` handoff registration.
 
+**Status — SHIPPED** (`75329f2c`). `agent_handoff_create` accepts optional `plan_id`/`slice_id`; round-tripped on the payload and surfaced by `agent_handoff_accept` (with `resume_hint`) + `agent_handoff_inbox` so the receiver resumes a known plan scope by id (cross-vendor Claude ↔ Codex ↔ Mills). Plain handoffs unchanged (backward compatible).
+
 ---
 
 ## Slice 6 — Lifecycle + HUD (parallel after S2; gates S7)
@@ -113,6 +141,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 - HUD "Plans" card (`internal/hud/`): each plan/slice across all phases, tied to root-session; remember HUD `dist` is `go:embed`'d → `make hud-frontend` + commit.
 
 **Files**: `internal/hud/domain/plans/*`, `internal/hud/frontend/src/lib/components/Plans/*`, `internal/hud/app_routes_*.go`, `pkg/agentcontext/svc_plans.go` (event emit).
+
+**Status — SHIPPED** (`ab26f64a` read API + `1bb052a9` management panel). `GET /api/plans` + `GET /api/plans/{id}` (deliberately not agent-scoped) expose the lifecycle with MR/pipeline/deploy refs + `phase_history`; `POST /api/plans` + `POST /api/plans/{id}/advance` (illegal transition → 422, undeployed daemon → 503). HUD **Work → Plans** Svelte board groups plans by phase with create form, per-plan advance, and slice detail drawer; degrades cleanly to a "deploy pending" state on an older daemon. Verified live after a loomd rebuild+restart.
 
 ---
 
@@ -128,6 +158,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 **Files**: `pkg/mills/store/*`, `cmd/loom-mills-operator/main.go`, `pkg/mills/council/backlog_mutator.go`, `pkg/mills/intake/gitlab_importer.go`, `pkg/agentcontext/schema.go` (Task).
 **Risk**: highest blast radius — dual-write + canary one backlog item end-to-end before flipping council/importer writers.
 
+**Status — PARTIALLY SHIPPED** (`4578ec3b`). Links + read-through landed: `agent_task` gains `plan_id`/`slice_id` (Qdrant payload + keyword-indexed) so `plan → slice → task`; Mills `BacklogItem` gains a `plan_id` column (migration `005_backlog_plan_id.sql`); when set, `backlogPromptContext` instructs the spawned agent to resolve the **live** plan + slices via `agent_plan_get{plan_id}` instead of a stale `.loom` SpecDoc. **Deferred → S7b**: council `backlog_mutator.go` + `gitlab_importer.go` *writing* plans, and backfilling existing `backlog_items` → Plans (dual-write/verify window before cutover). Deferred deliberately to avoid destabilizing the freshly-working autonomous Mills merge pipeline; deserves its own canary'd loop.
+
 ---
 
 ## Slice 8 — Cross-platform sync
@@ -138,6 +170,8 @@ S3 / S4 / S5 / S6 are mutually independent once S2 lands → good `parallel-slic
 - Verify Codex `[agents]` parallel path + Mills harness all resolve plans by id.
 
 **Files**: `mcp/context/skills-registry.yaml`, generated configs, `platform/gitops/mcp/context/*`.
+
+**Status — SHIPPED / propagated** (verified 2026-06-25). The source `skills-registry.yaml` is plan-aware (rewritten in S3/S4); the `platform/gitops/mcp/context/skills-registry.yaml` mirror is byte-identical (`diff -q` clean). HOME skills for **claude, codex, gemini, kilocode** all carry the plan-store-aware `plan-loom-core` + `parallel-slice-ship`, so a fresh session on any vendor resolves plans by id. Cross-vendor resolution proven live (codex `agent_plan_get` byte-identical after `69768b7e`/[!785]; Mills-pod WS transport via `feba82e5`/[!786]). Note: repo-local generated skill files (`.claude/commands/`, `.kilocode/rules/`) are gitignored, home-only artifacts and are *not* refreshed by `loom sync skills --repo-only`; the consuming path is HOME, which is current.
 
 ---
 

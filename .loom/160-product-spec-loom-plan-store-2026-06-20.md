@@ -1,7 +1,7 @@
 # Product Spec — Loom Plan Store (first-class, worktree-resilient, cross-agent)
 
-- **Status**: Draft
-- **Date**: 2026-06-20
+- **Status**: Shipped — epic complete through S7 (S8 cross-platform sync propagated); riskiest-assumption kill-test PASSED live. S7b (council/importer write-path + backlog backfill) deferred. Reconciled 2026-06-25; per-slice landings tracked in [161](161-implementation-plan-loom-plan-store-2026-06-20.md#shipped-status-reconciled-2026-06-25).
+- **Date**: 2026-06-20 (status reconciled 2026-06-25)
 - **Author**: Cody Blevins (via plan-loom-core)
 - **Implementation plan**: [161-implementation-plan-loom-plan-store-2026-06-20.md](161-implementation-plan-loom-plan-store-2026-06-20.md)
 - **Decisions locked** (operator, 2026-06-20):
@@ -43,6 +43,8 @@ This is risky because today's recall path filters by `agent_id` by default and d
 **Failure mode if wrong**: if Mills pods can't reach the proxy/Qdrant, or `agent_id` scoping hides the plan, we'd ship a store only the originating conversation can read — fixing nothing for the parallel + Mills cases, which are the whole point.
 
 **Status**: data-model + non-agent-scoping legs **PASSED 2026-06-20**. Evidence: `pkg/agentcontext/svc_plans_killtest_test.go` (`TestPlan_KillTest_CrossProcessQdrant`) creates a plan via one `PlanSvc`/`QdrantClient` against the **real shared Qdrant** (`192.168.50.176:6333`) and retrieves it byte-identical from a *separate* `PlanSvc` with a fresh in-memory cache using only `plan_id` — no `agent_id`. Cross-worktree and cross-vendor (Codex) are the same "separate process → same Qdrant" shape, so both are covered. **Remaining live legs (require deploying the new binary to the shared daemon + restarting it — operator-gated):** (a) MCP callers see `agent_plan_*` through the loom proxy, (b) a Codex session round-trips it live, (c) a Mills-spawned **pod** reaches `192.168.50.176:6333` (the only genuinely unproven leg; the Mills *operator* already reaches agent-context for worktree/handoff).
+
+**Update 2026-06-24/25 — all live legs PASSED.** (a) Proxy: `69768b7e` ([!785]) added `agent_plan_*` to the `llm-core`/`antigravity-core` `requiredPatterns` allowlist so profile-limited vendors (codex/antigravity) see the plan tools through the loom proxy. (b) Codex: re-ran the codex leg after the binary refresh — `loom/agent_context__agent_plan_get` resolves byte-identical (`TITLE=Plan Store live kill-test 2026-06-24`). (c) Mills pod: `feba82e5` ([!786]) added `loom proxy --ws-backend` (the store speaks MCP over WebSocket at `/ws`, not HTTP) + bundled the `loom` binary into spawn pods; the load-bearing transport assumption **PASSED** live against the deployed `mcp-agent-context` (marker `KILLTEST-20260624`, plan id `plan-plan-store-live-kill-test-2026-06-24-c5d64f`) via both the raw mcp-go WS transport and the built `loom proxy --ws-backend`. The only outstanding item is end-to-end in-pod verification (a real Mills codex calling `agent_plan_get`), which follows the loom-core image rebuild + operator redeploy.
 
 ## Goals
 
