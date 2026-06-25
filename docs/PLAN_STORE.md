@@ -159,9 +159,17 @@ one best-effort pass (`intake.PlanBackfiller` → `clients.PlanClient.AuthorPlan
 plan id is deterministic (`plan-mills-<backlog-id>`) so a re-run upserts rather
 than duplicating. Failures are logged, never fatal — the reconciler proceeds.
 
-Council/importer authoring plans *inline at create time* (so new backlog is born
-linked, not backfilled) remains a follow-up (S7b-β at `council.persistOne` +
-`intake.GitLabImporter.Tick`).
+**Born-linked import (S7b-β, default-off).** The GitLab importer can author a
+Plan for each newly imported item *at create time* so it is born linked rather
+than waiting for the next boot backfill. Set `LOOM_MILLS_PLAN_AUTHORING=1` (and a
+reachable MCP hub): `GitLabImporter.Tick` authors a Plan before the item's first
+`Put`, stamping `plan_id` in one write. Best-effort — an authoring failure leaves
+the item unlinked and it still imports (the backfill links it later), so plan
+authoring never blocks intake.
+
+Council authoring plans inline (`council.persistOne`, the other create site)
+remains a follow-up (S7b-γ); it shares the same `clients.PlanClient` +
+`LOOM_MILLS_PLAN_AUTHORING` gate.
 
 ## Configuration
 
@@ -170,6 +178,7 @@ linked, not backfilled) remains a follow-up (S7b-β at `council.persistOne` +
 | `AGENT_CONTEXT_PLANS_COLLECTION` | `agent_plans_v1` | Qdrant collection for plans. |
 | `AGENT_CONTEXT_PLAN_SLICES_COLLECTION` | `agent_plan_slices_v1` | Qdrant collection for slices. |
 | `LOOM_MILLS_PLAN_BACKFILL` | _(unset)_ | When set (e.g. `1`) and the MCP hub is reachable, the Mills operator runs one boot-time pass authoring Plans for un-linked backlog items (S7b-α). Default-off; best-effort. |
+| `LOOM_MILLS_PLAN_AUTHORING` | _(unset)_ | When set (e.g. `1`) and the MCP hub is reachable, the GitLab importer authors a Plan for each newly imported item so it is born linked (S7b-β). Default-off; best-effort. |
 
 ## Verifying cross-process reach (kill-test)
 

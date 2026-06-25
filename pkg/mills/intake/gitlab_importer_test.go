@@ -237,3 +237,54 @@ func TestTick_PropagatesListError(t *testing.T) {
 		t.Fatal("expected error from failed list")
 	}
 }
+
+func TestTick_BornLinked_AuthorsPlan(t *testing.T) {
+	client := &stubClient{issues: []clients.IssueListItem{
+		{IID: 1, ProjectID: 47, Title: "A", State: "opened",
+			Labels: []string{"mills-eligible"}},
+	}}
+	st := newStubStore()
+	im := NewGitLabImporter(client, st, GitLabImporterConfig{}, nil)
+	im.PlanAuthor = &stubPlanAuthor{}
+	im.Project = "services/loom-core"
+
+	imported, err := im.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if imported != 1 {
+		t.Errorf("imported = %d, want 1", imported)
+	}
+	got, err := st.Get(context.Background(), "gl-47-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.PlanID != "plan-mills-gl-47-1" {
+		t.Errorf("PlanID = %q, want plan-mills-gl-47-1 (born linked)", got.PlanID)
+	}
+}
+
+func TestTick_AuthorError_StillImportsUnlinked(t *testing.T) {
+	client := &stubClient{issues: []clients.IssueListItem{
+		{IID: 9, ProjectID: 47, Title: "B", State: "opened",
+			Labels: []string{"mills-eligible"}},
+	}}
+	st := newStubStore()
+	im := NewGitLabImporter(client, st, GitLabImporterConfig{}, nil)
+	im.PlanAuthor = &stubPlanAuthor{errs: map[string]error{"gl-47-9": errors.New("hub down")}}
+
+	imported, err := im.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if imported != 1 {
+		t.Errorf("imported = %d, want 1 (author failure must not block import)", imported)
+	}
+	got, err := st.Get(context.Background(), "gl-47-9")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.PlanID != "" {
+		t.Errorf("PlanID = %q, want empty when authoring failed", got.PlanID)
+	}
+}

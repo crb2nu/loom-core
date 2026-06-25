@@ -73,6 +73,15 @@ type GitLabImporter struct {
 	store  BacklogStore
 	cfg    GitLabImporterConfig
 	logger *slog.Logger
+	// PlanAuthor, when set, authors a first-class Plan for each newly
+	// imported item and stamps its plan_id so the item is born linked
+	// (plan store S7b-β), instead of waiting for the boot-time backfill.
+	// Nil = disabled (the default); the backfill still links items later.
+	// Set by the operator when LOOM_MILLS_PLAN_AUTHORING is enabled and
+	// the MCP hub is reachable.
+	PlanAuthor PlanAuthor
+	// Project scopes authored plans (canonical GitLab path).
+	Project string
 }
 
 // NewGitLabImporter wires a client + store + config. Defaults are
@@ -148,6 +157,11 @@ func (im *GitLabImporter) Tick(ctx context.Context) (int, error) {
 				"id", item.ID, "err", getErr)
 			continue
 		}
+		// Born-linked: author a Plan before the first Put when inline
+		// authoring is enabled, so the persisted item already carries a
+		// plan_id. Best-effort — a failure leaves the item unlinked and
+		// it still imports (the backfill links it later).
+		im.maybeAuthorPlan(ctx, item)
 		if err := im.store.Put(ctx, item); err != nil {
 			im.logger.Warn("gitlab importer put failed",
 				"id", item.ID, "iid", issue.IID, "err", err)
@@ -159,6 +173,27 @@ func (im *GitLabImporter) Tick(ctx context.Context) (int, error) {
 			"priority", item.Priority)
 	}
 	return imported, nil
+}
+
+// maybeAuthorPlan authors a Plan for item and stamps item.PlanID when an
+// inline PlanAuthor is configured. Best-effort: a nil author or any
+// failure is a no-op (the item still imports; the boot backfill can link
+// it later), so plan authoring never blocks intake.
+func (im *GitLabImporter) maybeAuthorPlan(ctx context.Context, item *store.BacklogItem) {
+	if im.PlanAuthor == nil || item == nil || item.PlanID != "" {
+		return
+	}
+	planID, err := im.PlanAuthor.AuthorPlan(ctx, item, im.Project)
+	if err != nil {
+		im.logger.Warn("gitlab importer plan authoring failed",
+			"id", item.ID, "err", err)
+		return
+	}
+	if planID != "" {
+		item.PlanID = planID
+		im.logger.Info("gitlab importer authored plan for item",
+			"id", item.ID, "plan_id", planID)
+	}
 }
 
 // issueToBacklog converts a GitLab issue into a BacklogItem with the
