@@ -428,28 +428,30 @@ type DevboxWorker struct {
 	AgentID string
 }
 
-// canaryTestsScope is the gate selector for the safe-fixture canary
-// path. The deterministic Mills canary only modifies a single Markdown
-// fixture, so running `go vet ./...` or `go test ./...` on the entire
-// codebase exercises infrastructure unrelated to the canary's intent
-// (and historically failed in git-clone sandboxes where module cache
-// wasn't pre-populated). Scoping to fmt keeps the canary deterministic
-// while still validating the worktree was modified cleanly.
-var canaryTestsScope = []string{"fmt"}
+// gitCloneTestsScope is the devbox quality-gate selector for every Mills
+// item. The hub-spawned devbox sandbox clones ONLY services/loom-core, but
+// loom-core's go.work `use`s sibling repos (../../libs/fi-accel/go/fiaccel,
+// fi-mcp-kit, mcp-go) and fi-accel is cgo. So whole-module `go vet ./...` /
+// `go test ./...` fail immediately in the sandbox (~79ms,
+// "directory ../../libs/... does not exist") regardless of the change.
+// `gofmt -l .` needs no build and runs cleanly.
+//
+// The authoritative lint/vet/test/build runs in GitLab CI, which the
+// ci_watch stage gates before merge, so scoping this pre-flight to fmt loses
+// no merge safety. This scope was originally applied only to mills-canary
+// items (which touch a single Markdown fixture); the first real (non-canary)
+// Go change — MILLS-DEBT-TICKLABEL-20260624 — escalated at exactly this gate
+// ("PASS fmt / FAIL lint (79ms)"), proving the sandbox limitation is
+// universal, so the scope is now applied to all items. A richer pre-flight
+// that runs the changed packages with GOWORK=off is tracked as a follow-up.
+var gitCloneTestsScope = []string{"fmt"}
 
-// devboxScopeFor returns the Checks selector for a given backlog item.
-// Canary items (Labels contains "mills-canary") get the narrowed scope;
-// everything else uses the gate's defaults (fmt + lint + test).
-func devboxScopeFor(item *store.BacklogItem) []string {
-	if item == nil {
-		return nil
-	}
-	for _, lbl := range item.Labels {
-		if lbl == "mills-canary" {
-			return canaryTestsScope
-		}
-	}
-	return nil
+// devboxScopeFor returns the quality-gate Checks selector for a backlog item.
+// All items use the sandbox-safe scope (see gitCloneTestsScope); GitLab CI,
+// enforced by the ci_watch stage, remains the authoritative lint/test/build
+// gate before merge.
+func devboxScopeFor(_ *store.BacklogItem) []string {
+	return gitCloneTestsScope
 }
 
 // Run satisfies Worker.
