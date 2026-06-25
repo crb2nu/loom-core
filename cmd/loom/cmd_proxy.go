@@ -1,6 +1,11 @@
 package main
 
-import "github.com/spf13/cobra"
+import (
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+)
 
 func newProxyCmd(socketPath string) *cobra.Command {
 	cmd := &cobra.Command{
@@ -23,6 +28,17 @@ Example config.toml:
 Example mcp.json:
   {"mcpServers":{"loom":{"command":"loom","args":["proxy"]}}}`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Direct single-backend WebSocket pass-through (e.g. Mills spawn
+			// pods reaching ws://mcp-agent-context.loom-hub:8080/ws). Bypasses
+			// the daemon/aggregation path entirely. Takes precedence when set.
+			wsBackend, _ := cmd.Flags().GetString("ws-backend")
+			if wsBackend == "" {
+				wsBackend = os.Getenv("LOOM_WS_BACKEND")
+			}
+			if strings.TrimSpace(wsBackend) != "" {
+				return runWSBackendProxy(wsBackend)
+			}
+
 			agentHint, _ := cmd.Flags().GetString("agent-hint")
 			remoteURL, _ := cmd.Flags().GetString("remote")
 			remoteToken, _ := cmd.Flags().GetString("remote-token")
@@ -40,5 +56,6 @@ Example mcp.json:
 	cmd.Flags().Int("max-tools", 0, "Maximum number of tools exposed by proxy (0 = unlimited)")
 	cmd.Flags().String("remote", "", "Remote daemon URL for Streamable HTTP (e.g., https://host:8088/mcp)")
 	cmd.Flags().String("remote-token", "", "Bearer token for remote daemon (or set LOOM_REMOTE_TOKEN env var)")
+	cmd.Flags().String("ws-backend", "", "Direct single-backend MCP WebSocket URL (e.g. ws://mcp-agent-context.loom-hub:8080/ws); bypasses the daemon. Or set LOOM_WS_BACKEND env var.")
 	return cmd
 }

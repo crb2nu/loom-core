@@ -1110,6 +1110,12 @@ func (o *SpawnOrchestrator) generateDockerfile(projectDir, agentType string) ([]
 		o.logger.Warn("project detection failed; using generic agent runtime image", "dir", projectDir, "error", err)
 	}
 	df := agentRuntimeDockerfile()
+	// Bundle the loom binary so the spawned agent can reach the in-cluster
+	// Plan Store via `loom proxy --ws-backend`. COPY --from runs as root,
+	// before the USER agent switch. Skipped when plan-store wiring is disabled.
+	if loomLines := loomBinaryCopyLines(); loomLines != "" {
+		df = append(df, []byte("\n"+loomLines+"\n")...)
+	}
 	if cliLines := agentCLIInstallLines(agentType); cliLines != "" {
 		df = append(df, []byte("\n"+cliLines+"\n")...)
 	}
@@ -1149,6 +1155,56 @@ CMD ["sleep", "infinity"]
 // CLI install layer (which needs root for `npm install -g`).
 func agentRuntimeUserSuffix() string {
 	return "USER agent\nENV HOME=/home/agent\n"
+}
+
+// loomBinaryCopyLines returns the Dockerfile COPY layer that bundles the loom
+// binary from the loom-core image into the spawn-runtime image. The binary
+// powers the `loom proxy --ws-backend` bridge that injectAgentConfig wires the
+// spawned agent's MCP client to. Returns "" when plan-store wiring is disabled
+// (SPAWN_PLAN_STORE_WS_URL=disabled), so the loom image is not pulled at build
+// time when the feature is off.
+func loomBinaryCopyLines() string {
+	if resolvePlanStoreWSURL() == "" {
+		return ""
+	}
+	return fmt.Sprintf("COPY --from=%s /usr/local/bin/loom /usr/local/bin/loom", resolveSpawnLoomImage())
+}
+
+// loomMCPProxyArgs is the argv the spawned agent's MCP client launches to bridge
+// to the in-cluster Plan Store: `loom proxy --ws-backend <ws-url>`.
+func loomMCPProxyArgs(wsURL string) []string {
+	return []string{"proxy", "--ws-backend", wsURL}
+}
+
+// loomMCPServerTOML renders the codex config.toml [mcp_servers.loom] stanza.
+// Values are JSON-marshaled so the (controlled) URL is always validly quoted.
+func loomMCPServerTOML(wsURL string) string {
+	args, _ := json.Marshal(loomMCPProxyArgs(wsURL))
+	var b strings.Builder
+	b.WriteString("[mcp_servers.loom]\n")
+	b.WriteString("command = \"loom\"\n")
+	b.WriteString(fmt.Sprintf("args = %s\n", string(args)))
+	b.WriteString("startup_timeout_sec = 30\n")
+	return b.String()
+}
+
+// loomMCPServerJSONInner renders the `"mcpServers":{...}` fragment (no outer
+// braces) for embedding into an existing JSON settings object (e.g. gemini).
+func loomMCPServerJSONInner(wsURL string) string {
+	server := map[string]any{
+		"loom": map[string]any{
+			"command": "loom",
+			"args":    loomMCPProxyArgs(wsURL),
+		},
+	}
+	inner, _ := json.Marshal(server)
+	return `"mcpServers":` + string(inner)
+}
+
+// loomMCPServerJSON renders a complete `{"mcpServers":{...}}` document
+// (e.g. claude-code project .mcp.json).
+func loomMCPServerJSON(wsURL string) string {
+	return "{" + loomMCPServerJSONInner(wsURL) + "}"
 }
 
 func agentRuntimeBuildTag(agentType string, dockerfile []byte) string {
@@ -1201,6 +1257,13 @@ func (o *SpawnOrchestrator) injectAgentConfig(ctx context.Context, be backend.Ba
 		return err
 	}
 
+	// Plan Store MCP wiring: spawn pods have no loom daemon, but they can reach
+	// the in-cluster agent-context WebSocket endpoint. The bundled loom binary
+	// (loomBinaryCopyLines) runs `loom proxy --ws-backend <url>` as a stdio MCP
+	// server so the spawned agent can call agent_plan_* (and the rest of
+	// agent-context) directly against the Plan Store. Empty url ⇒ feature off.
+	planStoreWSURL := resolvePlanStoreWSURL()
+
 	switch agentType {
 	case "claude-code":
 		// Claude Code reads project-level .claude/settings.json for permissions.
@@ -1210,9 +1273,19 @@ func (o *SpawnOrchestrator) injectAgentConfig(ctx context.Context, be backend.Ba
 		// the mount is absent or the key is missing, python fails silently
 		// and the helper falls back to ANTHROPIC_API_KEY from
 		// cluster-agent-api-keys.
-		settings := `{"permissions":{"allow":["Bash","Read","Write","Edit","Glob","Grep"]},"apiKeyHelper":"python3 -c \"import json,sys; d=json.load(open('` + AgentHomeDir + `/.claude.auth/oauth.json')); print(d['claudeAiOauth']['accessToken'])\" 2>/dev/null || echo $ANTHROPIC_API_KEY"}`
+		// enableAllProjectMcpServers trusts the project .mcp.json below without
+		// an interactive approval prompt (headless spawn).
+		settings := `{"permissions":{"allow":["Bash","Read","Write","Edit","Glob","Grep"]},"enableAllProjectMcpServers":true,"apiKeyHelper":"python3 -c \"import json,sys; d=json.load(open('` + AgentHomeDir + `/.claude.auth/oauth.json')); print(d['claudeAiOauth']['accessToken'])\" 2>/dev/null || echo $ANTHROPIC_API_KEY"}`
 		if err := writeCmd(projectDir+"/.claude", "settings.json", settings); err != nil {
 			return fmt.Errorf("write claude settings: %w", err)
+		}
+		// Project-root .mcp.json is auto-loaded by claude-code; the loom proxy
+		// bridges to the in-cluster Plan Store over WebSocket.
+		if planStoreWSURL != "" {
+			mcpJSON := loomMCPServerJSON(planStoreWSURL)
+			if err := writeCmd(projectDir, ".mcp.json", mcpJSON); err != nil {
+				return fmt.Errorf("write claude .mcp.json: %w", err)
+			}
 		}
 	case "codex":
 		// Codex reads ~/.codex/config.toml for sandbox + multi-agent features
@@ -1224,13 +1297,11 @@ func (o *SpawnOrchestrator) injectAgentConfig(ctx context.Context, be backend.Ba
 		// secret updates (e.g., refreshed OAuth tokens written by
 		// mcp-auth-refresher).
 		//
-		// TODO(spawn): add MCP proxy section once the loom binary is available
-		// in spawned pods. Currently agentCLIInstallLines only installs the
-		// agent CLI via npm; adding a `COPY --from=loom-builder` stage or an
-		// npm-published loom package would enable:
-		//   [mcp_servers.loom]
-		//   command = "loom"
-		//   args = ["proxy", "--stdio"]
+		// The loom binary is bundled into the spawn image (loomBinaryCopyLines),
+		// so the [mcp_servers.loom] block below gives the codex agent a stdio
+		// MCP server that bridges to the in-cluster Plan Store over WebSocket —
+		// closing the long-standing TODO. `loom proxy --ws-backend` exposes
+		// agent_plan_* (and the rest of agent-context) with un-namespaced names.
 		config := `[agent]
 approval = "auto-edit"
 
@@ -1243,6 +1314,9 @@ multi_agent = true
 collaboration_modes = true
 unified_exec = true
 `
+		if planStoreWSURL != "" {
+			config += "\n" + loomMCPServerTOML(planStoreWSURL)
+		}
 		if err := writeCmd(AgentHomeDir+"/.codex", "config.toml", config); err != nil {
 			return fmt.Errorf("write codex config: %w", err)
 		}
@@ -1263,12 +1337,61 @@ unified_exec = true
 		// service-account JSON mounted from the cluster secret. If the SA
 		// JSON key is absent, the file is missing and Gemini falls back to
 		// GEMINI_API_KEY env.
+		// Gemini reads ~/.gemini/settings.json mcpServers for MCP servers; the
+		// loom proxy bridges to the in-cluster Plan Store over WebSocket.
 		settings := `{"permissions":{"allow_all":true}}`
+		if planStoreWSURL != "" {
+			settings = `{"permissions":{"allow_all":true},` + loomMCPServerJSONInner(planStoreWSURL) + `}`
+		}
 		if err := writeCmd(AgentHomeDir+"/.gemini", "settings.json", settings); err != nil {
 			return fmt.Errorf("write gemini settings: %w", err)
 		}
 	}
 	return nil
+}
+
+// defaultPlanStoreWSURL is the in-cluster WebSocket MCP endpoint of the
+// agent-context server (the Loom Plan Store backend). Spawn pods have no local
+// loom daemon and no Unix socket, but they CAN reach this ClusterIP service.
+// The agent-context server speaks plain MCP over WebSocket at /ws (the
+// deployment sets MCP_TRANSPORT=websocket on :8080); a `loom proxy
+// --ws-backend <url>` bridge in the pod exposes its tools (incl. agent_plan_*)
+// to the spawned agent over stdio. Overridable via SPAWN_PLAN_STORE_WS_URL so
+// a cluster/namespace move is an env flip, not a rebuild.
+const defaultPlanStoreWSURL = "ws://mcp-agent-context.loom-hub.svc.cluster.local:8080/ws"
+
+// defaultSpawnLoomImage is the image the generated spawn Dockerfile copies the
+// `loom` binary from (loom-core ships it at /usr/local/bin/loom). It is a
+// build-time COPY --from source for the ephemeral spawn-runtime image, NOT a
+// running workload, so the `:latest` fallback here is acceptable; the operator
+// deployment SHOULD set SPAWN_LOOM_IMAGE to its own Flux-pinned loom-core tag
+// (e.g. registry.harbor.lan/mcp/loom-core:20260625-013914) so the bundled loom
+// stays version-aligned with the daemon.
+const defaultSpawnLoomImage = "registry.harbor.lan/mcp/loom-core:latest"
+
+// resolvePlanStoreWSURL returns the agent-context WebSocket MCP URL injected
+// into spawn agent configs. Empty SPAWN_PLAN_STORE_WS_URL falls back to the
+// in-cluster default; an explicit value of "disabled" (case-insensitive)
+// suppresses plan-store MCP wiring entirely (returns "").
+func resolvePlanStoreWSURL() string {
+	v := strings.TrimSpace(os.Getenv("SPAWN_PLAN_STORE_WS_URL"))
+	if v == "" {
+		return defaultPlanStoreWSURL
+	}
+	if strings.EqualFold(v, "disabled") || strings.EqualFold(v, "off") {
+		return ""
+	}
+	return v
+}
+
+// resolveSpawnLoomImage returns the image to COPY the `loom` binary from when
+// building the spawn-runtime image. SPAWN_LOOM_IMAGE overrides the default so
+// the operator can pin its own loom-core tag without a code change.
+func resolveSpawnLoomImage() string {
+	if v := strings.TrimSpace(os.Getenv("SPAWN_LOOM_IMAGE")); v != "" {
+		return v
+	}
+	return defaultSpawnLoomImage
 }
 
 // defaultCodexModel is the codex model used for spawn exec when
