@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -532,7 +533,14 @@ func TestRun_PollDeadlineExceeded(t *testing.T) {
 	c.cfg.PollInterval = 5 * time.Millisecond
 	_, err := c.Run(context.Background(), sampleSpawnReq())
 	if err == nil {
-		t.Error("expected timeout error")
+		t.Fatal("expected timeout error")
+	}
+	// The error MUST wrap pipeline.ErrSpawnPollTimeout: the Mills runner
+	// relies on errors.Is to tell a stalled-but-alive spawn apart from a
+	// transient poll interruption and convert a recurring stall into a
+	// failed attempt instead of looping the stage pending forever.
+	if !errors.Is(err, pipeline.ErrSpawnPollTimeout) {
+		t.Errorf("err = %v; want wrapped pipeline.ErrSpawnPollTimeout", err)
 	}
 }
 
