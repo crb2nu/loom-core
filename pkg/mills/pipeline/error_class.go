@@ -69,6 +69,15 @@ func Classify(err error) ErrorClass {
 	if err == nil {
 		return ""
 	}
+	// A spawn that exhausted its poll deadline without reaching a terminal
+	// status is transient: a fresh re-spawn frequently lands on a healthy
+	// pod (the prior one was hung-but-alive). Free retry — does not burn the
+	// MaxAttempts budget — but every attempt still counts toward the
+	// transient hard cap so a persistently hung substrate escalates instead
+	// of looping pending forever. See Runner.runStage's stall conversion.
+	if errors.Is(err, ErrSpawnPollTimeout) {
+		return ClassTransient
+	}
 	// Net layer eofs always wrap up to a transport class.
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return ClassTransient

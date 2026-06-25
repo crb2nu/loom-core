@@ -606,22 +606,36 @@ func (r *Runner) runStage(
 		out.SpawnID = acceptedSpawnID
 	}
 	if derr != nil && out.SpawnID != "" && !hasTerminalSpawnStatus(out) {
-		pendingTail := buildFailureLogTail(out.LogTail, derr, stage.ID, attempt, out.SpawnID)
-		if perr := r.Store.Pipeline.PutStage(ctx, &store.StageResult{
-			PipelineRunID: run.ID,
-			Stage:         stage.ID,
-			Attempt:       attempt,
-			StartedAt:     now,
-			SpawnID:       out.SpawnID,
-			Artifacts:     map[string]any{"stage_id": stage.ID},
-			LogTail:       pendingTail,
-		}); perr != nil {
-			return out, fmt.Errorf("persist pending stage: %w", perr)
+		// A spawn that was accepted but whose poll did not reach a terminal
+		// status is normally parked "pending" so the reconciler re-attaches
+		// on the next tick (resume-safe across operator restarts).
+		//
+		// The dangerous exception is a spawn that keeps timing out at the
+		// client's PollDeadline while its pod stays alive-but-hung: the
+		// operator re-attaches (resumeSpawnID), re-polls, times out, and
+		// re-parks pending every tick, never burning the retry budget — so
+		// the run loops pending forever (observed 2026-06-25: a run sat
+		// pending@implement ~13h on a hung spawn until the orphan pod was
+		// deleted by hand). For poll-timeout errors we count consecutive
+		// timeouts on this attempt and, once they reach the stall
+		// tolerance, fall through to the error path so the attempt is
+		// recorded errored and Drive's retry/escalation logic re-dispatches
+		// a fresh spawn and ultimately escalates.
+		if !errors.Is(derr, ErrSpawnPollTimeout) {
+			// Non-timeout interruption (operator restart mid-poll, a
+			// transient GET error): preserve resume-safe pending behavior.
+			return r.parkPendingSpawn(ctx, run, stage, attempt, now, out, derr, pendingPollTimeouts(pending))
 		}
-		r.event(ctx, "pipeline.stage.pending", "ok", map[string]any{
-			"run": run.ID, "stage": stage.ID, "attempt": attempt, "spawn_id": out.SpawnID, "error": derr.Error(),
-		})
-		return out, errStagePending
+		timeouts := pendingPollTimeouts(pending) + 1
+		if timeouts < maxConsecutiveSpawnPollTimeouts {
+			// Still within tolerance: a legitimately slow-but-progressing
+			// spawn gets another tick to terminate.
+			return r.parkPendingSpawn(ctx, run, stage, attempt, now, out, derr, timeouts)
+		}
+		r.logger().Warn("pipeline spawn stalled; converting pending to errored attempt",
+			"run", run.ID, "stage", stage.ID, "attempt", attempt,
+			"spawn_id", out.SpawnID, "consecutive_poll_timeouts", timeouts)
+		// fall through to the error-path persistence below.
 	}
 	endedAt := r.now()
 
@@ -710,6 +724,80 @@ func buildFailureLogTail(existing string, err error, stageID string, attempt int
 		return tail
 	}
 	return prefix + ": " + tail
+}
+
+// spawnPollTimeoutsArtifactKey records, on a pending stage_results row, how
+// many consecutive PollDeadline timeouts a single spawn attempt has
+// accumulated. Persisted in artifacts_json so the count survives operator
+// restarts (the reconciler re-drives from the persisted pending row).
+const spawnPollTimeoutsArtifactKey = "spawn_poll_timeouts"
+
+// maxConsecutiveSpawnPollTimeouts bounds how many times the runner re-attaches
+// to a non-terminal spawn that keeps timing out at the client's PollDeadline
+// before giving up on that spawn and recording the attempt as errored. With
+// the default 30m PollDeadline, a value of 2 tolerates a legitimately
+// slow-but-progressing spawn for one extra tick (~2×PollDeadline of grace)
+// while still converting a genuinely hung-but-alive pod into a failed,
+// transient-class attempt that burns the retry budget. Below this we keep the
+// resume-safe "check again next tick" behavior; at/above it the stall
+// converts so the run eventually re-spawns and escalates instead of looping.
+const maxConsecutiveSpawnPollTimeouts = 2
+
+// pendingPollTimeouts reads the consecutive-poll-timeout counter off a pending
+// stage_results row. Returns 0 when absent. Artifacts round-trip through JSON
+// (sqlite artifacts_json), so an int stored on one Drive comes back as float64
+// on the next — both are handled.
+func pendingPollTimeouts(pending *store.StageResult) int {
+	if pending == nil || pending.Artifacts == nil {
+		return 0
+	}
+	switch v := pending.Artifacts[spawnPollTimeoutsArtifactKey].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+// parkPendingSpawn persists a stage attempt that accepted a spawn but did not
+// reach a terminal status, leaving outcome NULL so the reconciler re-attaches
+// next tick. pollTimeouts carries the running consecutive-poll-timeout count
+// forward so a recurring stall can be detected across re-drives. It returns
+// errStagePending so Drive stops without burning the retry budget.
+func (r *Runner) parkPendingSpawn(
+	ctx context.Context,
+	run *store.PipelineRun,
+	stage Stage,
+	attempt int,
+	startedAt time.Time,
+	out StageOutput,
+	derr error,
+	pollTimeouts int,
+) (StageOutput, error) {
+	pendingTail := buildFailureLogTail(out.LogTail, derr, stage.ID, attempt, out.SpawnID)
+	art := map[string]any{"stage_id": stage.ID}
+	if pollTimeouts > 0 {
+		art[spawnPollTimeoutsArtifactKey] = pollTimeouts
+	}
+	if perr := r.Store.Pipeline.PutStage(ctx, &store.StageResult{
+		PipelineRunID: run.ID,
+		Stage:         stage.ID,
+		Attempt:       attempt,
+		StartedAt:     startedAt,
+		SpawnID:       out.SpawnID,
+		Artifacts:     art,
+		LogTail:       pendingTail,
+	}); perr != nil {
+		return out, fmt.Errorf("persist pending stage: %w", perr)
+	}
+	r.event(ctx, "pipeline.stage.pending", "ok", map[string]any{
+		"run": run.ID, "stage": stage.ID, "attempt": attempt,
+		"spawn_id": out.SpawnID, "error": derr.Error(), "poll_timeouts": pollTimeouts,
+	})
+	return out, errStagePending
 }
 
 func hasTerminalSpawnStatus(out StageOutput) bool {

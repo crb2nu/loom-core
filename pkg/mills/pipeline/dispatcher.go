@@ -122,6 +122,17 @@ func BuildMillsEnv(run *store.PipelineRun, item *store.BacklogItem, stage Stage)
 // concrete network glue lives in slice 4.7's main.go wiring; slice 4.2
 // ships the contract surfaces and a fallback no-op.
 
+// ErrSpawnPollTimeout is returned (wrapped) by a SpawnClient when polling
+// an accepted spawn exceeds its poll deadline without the spawn reaching a
+// terminal status. Spawn backends MUST wrap it
+// (fmt.Errorf("...: %w", ErrSpawnPollTimeout)) so the runner can tell a
+// stalled-but-alive spawn apart from a transient poll interruption: repeated
+// poll timeouts on the SAME spawn attempt are converted into a failed
+// (transient-class) attempt that burns the retry budget, instead of parking
+// the stage pending forever and re-attaching to the same dead spawn on every
+// reconciler tick. See clients.HUDSpawnClient.pollSpawn and Runner.runStage.
+var ErrSpawnPollTimeout = errors.New("spawn: poll deadline exceeded")
+
 // SpawnClient is the operator-facing facade over the spawn HTTP service.
 // Implementations live outside this package; tests use a fake.
 type SpawnClient interface {

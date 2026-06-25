@@ -274,12 +274,12 @@ func (c *HUDSpawnClient) pollSpawn(ctx context.Context, spawnID, workingDir, bas
 			return pipeline.SpawnResponse{
 				SpawnID: spawnID,
 				LogTail: fmt.Sprintf("hud spawn poll deadline (%s) exceeded", c.cfg.PollDeadline),
-			}, fmt.Errorf("hud spawn: poll timeout after %s", c.cfg.PollDeadline)
+			}, fmt.Errorf("hud spawn: poll timeout after %s: %w", c.cfg.PollDeadline, pipeline.ErrSpawnPollTimeout)
 		}
 		state, err := c.getSpawnState(pollCtx, spawnID)
 		if err != nil {
 			if pollCtx.Err() != nil {
-				return pipeline.SpawnResponse{SpawnID: spawnID}, fmt.Errorf("hud spawn: poll cancelled: %w", err)
+				return pipeline.SpawnResponse{SpawnID: spawnID}, fmt.Errorf("hud spawn: poll cancelled after %s: %w: %w", c.cfg.PollDeadline, pipeline.ErrSpawnPollTimeout, err)
 			}
 			return pipeline.SpawnResponse{SpawnID: spawnID}, fmt.Errorf("hud spawn %s: %w", spawnID, err)
 		}
@@ -293,7 +293,7 @@ func (c *HUDSpawnClient) pollSpawn(ctx context.Context, spawnID, workingDir, bas
 		}
 		select {
 		case <-pollCtx.Done():
-			return pipeline.SpawnResponse{SpawnID: spawnID}, fmt.Errorf("hud spawn: poll timeout after %s", c.cfg.PollDeadline)
+			return pipeline.SpawnResponse{SpawnID: spawnID}, fmt.Errorf("hud spawn: poll timeout after %s: %w", c.cfg.PollDeadline, pipeline.ErrSpawnPollTimeout)
 		case <-time.After(c.cfg.PollInterval):
 		}
 	}

@@ -668,6 +668,148 @@ func TestRunner_KeepsAcceptedSpawnPendingOnInterruptedPoll(t *testing.T) {
 	}
 }
 
+// stalledSpawnDispatcher models a spawn whose pod stays alive but never
+// reaches a terminal status, so every poll exhausts the client PollDeadline
+// and returns ErrSpawnPollTimeout with the (accepted) spawn id set. On a
+// resume it re-attaches to the supplied spawn id; on a fresh dispatch it mints
+// a new id and records it via the accept recorder, mirroring HUDSpawnClient.
+type stalledSpawnDispatcher struct {
+	mu          sync.Mutex
+	stage       string
+	calls       int
+	freshSpawns int
+	spawnIDs    map[string]bool
+}
+
+func (d *stalledSpawnDispatcher) Dispatch(ctx context.Context, _ *store.PipelineRun, _ *store.BacklogItem, stage Stage, _ map[string]StageOutput) (StageOutput, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if stage.ID != d.stage {
+		return StageOutput{CostUSD: 0.01}, nil
+	}
+	d.calls++
+	spawnID := resumeSpawnIDFromContext(ctx)
+	if spawnID == "" {
+		d.freshSpawns++
+		spawnID = fmt.Sprintf("spawn-hung-%d", d.freshSpawns)
+		if rec := stageAcceptRecorderFromContext(ctx); rec != nil {
+			if err := rec(spawnID); err != nil {
+				return StageOutput{}, err
+			}
+		}
+	}
+	if d.spawnIDs == nil {
+		d.spawnIDs = map[string]bool{}
+	}
+	d.spawnIDs[spawnID] = true
+	// Non-terminal poll that ran out the client deadline (hung-but-alive pod).
+	return StageOutput{SpawnID: spawnID},
+		fmt.Errorf("hud spawn: poll timeout after 30m0s: %w", ErrSpawnPollTimeout)
+}
+
+func (d *stalledSpawnDispatcher) snapshot() (calls, fresh, distinct int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls, d.freshSpawns, len(d.spawnIDs)
+}
+
+// TestRunner_StalledSpawnEscalatesInsteadOfLoopingPending pins the 2026-06-25
+// regression: a spawn that keeps timing out at its PollDeadline while its pod
+// stays alive used to re-park the stage pending on every reconciler re-drive,
+// never burning the retry budget — the run looped pending forever (~13h
+// observed) until the orphan pod was deleted by hand. The fix converts a
+// recurring poll-timeout into a failed (transient-class) attempt so a fresh
+// spawn is re-dispatched and the run ultimately escalates.
+func TestRunner_StalledSpawnEscalatesInsteadOfLoopingPending(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &stalledSpawnDispatcher{stage: "plan_slice"}
+	r := New(st, nil, disp, nil)
+	r.Stages = []Stage{{ID: "plan_slice", Type: "llm", State: store.PipelinePlanning}}
+	// Disable auto-retry so the transient hard cap escalates the item
+	// directly (deterministic terminal state for the assertion).
+	r.Policy = newPolicyMgrWithRetryCap(t, 0)
+
+	// Simulate the reconciler re-driving the in-flight run each tick.
+	const maxTicks = 100
+	escalated := false
+	ticks := 0
+	for ; ticks < maxTicks; ticks++ {
+		if err := r.Drive(context.Background(), run, item); err != nil {
+			t.Fatalf("drive tick %d: %v", ticks, err)
+		}
+		got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+		if err != nil {
+			t.Fatalf("get run tick %d: %v", ticks, err)
+		}
+		if got.State == store.PipelineEscalated {
+			escalated = true
+			break
+		}
+		if got.State != store.PipelinePlanning {
+			t.Fatalf("tick %d: unexpected run state %s", ticks, got.State)
+		}
+	}
+	if !escalated {
+		t.Fatalf("run never escalated after %d re-drives; stalled spawn looped pending (the bug)", maxTicks)
+	}
+
+	gotItem, err := st.Backlog.Get(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("get backlog: %v", err)
+	}
+	if gotItem.State != store.BacklogEscalated {
+		t.Errorf("backlog state = %s, want escalated", gotItem.State)
+	}
+
+	calls, fresh, distinct := disp.snapshot()
+	// The stall must trigger fresh re-spawns, not just re-attach the same
+	// dead spawn forever. With maxAttempts=3 + default transientRetryCap=5
+	// the hard cap is 8 attempts, each a distinct fresh spawn.
+	if fresh < 2 {
+		t.Errorf("fresh spawns = %d; want >=2 (stall should re-dispatch, not only re-attach)", fresh)
+	}
+	if distinct < 2 {
+		t.Errorf("distinct spawn ids = %d; want >=2", distinct)
+	}
+	t.Logf("escalated after %d ticks: %d dispatch calls, %d fresh spawns, %d distinct ids", ticks+1, calls, fresh, distinct)
+}
+
+// TestRunner_SinglePollTimeoutStillParksPending guards the other side: one
+// poll-timeout (a spawn that may simply be slow-but-progressing) must keep the
+// existing resume-safe "check again next tick" behavior — it parks pending and
+// does NOT burn the retry budget or escalate.
+func TestRunner_SinglePollTimeoutStillParksPending(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &stalledSpawnDispatcher{stage: "plan_slice"}
+	r := New(st, nil, disp, nil)
+	r.Stages = []Stage{{ID: "plan_slice", Type: "llm", State: store.PipelinePlanning}}
+
+	if err := r.Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.State != store.PipelinePlanning {
+		t.Fatalf("run state = %s; want planning (single timeout must not escalate)", got.State)
+	}
+	stages, err := st.Pipeline.ListStages(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if len(stages) != 1 {
+		t.Fatalf("stage rows = %d, want one pending row", len(stages))
+	}
+	if stages[0].Outcome != nil || stages[0].EndedAt != nil {
+		t.Fatalf("stage should remain pending, got outcome=%v ended=%v", stages[0].Outcome, stages[0].EndedAt)
+	}
+	if n := pendingPollTimeouts(stages[0]); n != 1 {
+		t.Errorf("pending poll-timeout counter = %d, want 1", n)
+	}
+}
+
 func TestRunner_StartGoroutineReachesTerminal(t *testing.T) {
 	st, run, item := newRunnerEnv(t)
 	disp := &fakeDispatcher{}
