@@ -1,6 +1,6 @@
 # Project Roadmap
 
-> Last Updated: May 7, 2026
+> Last Updated: June 25, 2026
 
 ## Current Status
 
@@ -32,6 +32,13 @@ MCP is now the de facto standard for AI-tool integration (8M+ downloads, 5,800+ 
 - Cost tracking and audit trails (compliance and visibility)
 
 ## Recently Shipped (post `v0.9.7`)
+
+- ✅ **Loom Plan Store — first-class, worktree-resilient, cross-agent Plan entity (S0 → S8, 2026-06-20 → 2026-06-24)**
+  - Spec/plan: [`.loom/160`](.loom/160-product-spec-loom-plan-store-2026-06-20.md) / [`.loom/161`](.loom/161-implementation-plan-loom-plan-store-2026-06-20.md); docs `docs/PLAN_STORE.md`.
+  - **Problem**: plans lived only as git-tracked `.loom/*.md`, so `git worktree add` froze a copy at HEAD and a fresh sub-agent (or Codex, or a Mills pod) could not find the plan it was implementing. A first-class `Plan` entity now lives in the shared global Qdrant (the store backing sessions/tasks/handoffs), addressable by a stable `plan_id` and read **never** by `agent_id`.
+  - **Riskiest assumption PASSED live**: a `plan_id`-addressed plan resolves byte-identical from a fresh Claude worktree, a Codex session, and a Mills-spawned pod. Data-model leg `81d50941` (2026-06-20); codex/proxy leg `69768b7e` ([!785]); Mills-pod WS-backend transport `feba82e5` ([!786], marker `KILLTEST-20260624`).
+  - **Slices**: S0 hygiene `6fab24c5`; S1 Plan MVP + kill-test `81d50941`; S2 full schema/slices/lifecycle/search `ee090396`; S3 atomic `.md` mirror + store-first `plan-loom-core` `9aa8bddd`; S4 enforced slice file-claims + store-driven `parallel-slice-ship` `461ee317`; S5 plan-aware handoffs `75329f2c`; S6 lifecycle read API + HUD **Work → Plans** panel `ab26f64a`/`1bb052a9`; S7 Mills `BacklogItem`↔`agent_task`↔Plan links + read-through `4578ec3b`; S8 cross-platform sync (registry plan-aware, gitops mirror in sync, HOME skills propagated to claude/codex/gemini/kilocode).
+  - **Remaining (next loops)**: S7b — council `backlog_mutator.go` + `gitlab_importer.go` *writing* Plans + backfilling existing backlog (dual-write + canary before flipping writers); end-to-end in-pod deploy verification after the loom-core image rebuild + operator redeploy.
 
 - 🚧 **Mills harvester-vm substrate (Slices 0 → 2e, 2026-05-25 → 2026-06-10)**
   - Spec: `.loom/45-product-spec-mills-harvester-vm-substrate-2026-05-25.md`.
