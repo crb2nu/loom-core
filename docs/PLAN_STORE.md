@@ -150,8 +150,18 @@ The plan is the shared work unit across the platform:
   slices via `agent_plan_get{plan_id}` instead of re-reading a `.loom` SpecDoc —
   so the factory and interactive sessions operate on the same plan.
 
-Council/importer authoring plans directly + backfilling existing backlog items
-to plans is a follow-up (S7b); this slice establishes the links + read-through.
+**Backfill (S7b-α, default-off).** The Mills operator can author a first-class
+Plan for every backlog item that has no `plan_id` yet and stamp the returned id
+back onto the item, so existing backlog (which predates the store) converges with
+plans. Set `LOOM_MILLS_PLAN_BACKFILL=1` and restart the operator: at boot it runs
+one best-effort pass (`intake.PlanBackfiller` → `clients.PlanClient.AuthorPlan` →
+`agent_plan_create` over the MCP hub), skipping already-linked items. The authored
+plan id is deterministic (`plan-mills-<backlog-id>`) so a re-run upserts rather
+than duplicating. Failures are logged, never fatal — the reconciler proceeds.
+
+Council/importer authoring plans *inline at create time* (so new backlog is born
+linked, not backfilled) remains a follow-up (S7b-β at `council.persistOne` +
+`intake.GitLabImporter.Tick`).
 
 ## Configuration
 
@@ -159,6 +169,7 @@ to plans is a follow-up (S7b); this slice establishes the links + read-through.
 |-----|---------|---------|
 | `AGENT_CONTEXT_PLANS_COLLECTION` | `agent_plans_v1` | Qdrant collection for plans. |
 | `AGENT_CONTEXT_PLAN_SLICES_COLLECTION` | `agent_plan_slices_v1` | Qdrant collection for slices. |
+| `LOOM_MILLS_PLAN_BACKFILL` | _(unset)_ | When set (e.g. `1`) and the MCP hub is reachable, the Mills operator runs one boot-time pass authoring Plans for un-linked backlog items (S7b-α). Default-off; best-effort. |
 
 ## Verifying cross-process reach (kill-test)
 

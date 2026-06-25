@@ -305,6 +305,33 @@ func run(cfg Config) error {
 		logger.Warn("escalator disabled; failures will transition to escalated state without issue/handoff publication")
 	}
 
+	// Plan backfill (plan store S7b): one-shot, default-OFF. When
+	// LOOM_MILLS_PLAN_BACKFILL is set and the MCP hub is reachable, author
+	// a first-class Plan for every backlog item that has no plan_id yet
+	// and stamp the returned id back onto the item, so a spawned agent
+	// resolves the live plan via agent_plan_get instead of a stale .loom
+	// SpecDoc (S7 added the link + read-through; this populates it).
+	// Best-effort: failures are logged, never fatal; the reconciler runs
+	// regardless. Re-running is safe (already-linked items are skipped and
+	// the authored plan id is deterministic, so a retry upserts).
+	if os.Getenv("LOOM_MILLS_PLAN_BACKFILL") != "" {
+		if hubClient != nil {
+			backfiller := &intake.PlanBackfiller{
+				Store:   st.Backlog,
+				Author:  clients.NewPlanClient(hubClient, "loom-mills-operator"),
+				Project: cfg.GitLabProject,
+				Logger:  logger,
+			}
+			if n, err := backfiller.Run(rootCtx); err != nil {
+				logger.Warn("plan backfill failed", "error", err)
+			} else {
+				logger.Info("plan backfill pass complete", "linked", n)
+			}
+		} else {
+			logger.Warn("plan backfill requested (LOOM_MILLS_PLAN_BACKFILL) but MCP hub unavailable; skipping")
+		}
+	}
+
 	// Audit follow-up writer (Phase 3 slice 3.6). When the audit
 	// subsystem and a GitLab client are both wired, low-survival
 	// findings auto-open advisory issues. Without GitLab, audits still
