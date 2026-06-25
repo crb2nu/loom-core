@@ -147,12 +147,17 @@ spec:
             # [mcp_servers.loom] launching `loom proxy --ws-backend <url>` so it
             # can call agent_plan_* against the agent-context Plan Store.
             #
-            # SPAWN_LOOM_IMAGE: code default is loom-core:latest. The `:latest`
-            # here is a placeholder (same convention as the loomd `image:` above);
-            # the platform/gitops Kustomization (kustomization-loom-hub-servers.yaml)
-            # pins it to the resolved loom-core tag via a `replacements:` block so
-            # the bundled loom stays byte-identical to this daemon's own image —
-            # never a floating `:latest` on the actual spawn.
+            # SPAWN_LOOM_IMAGE: code default is loom-core:latest, kept here. This
+            # is a build-time `COPY --from` source, NOT a running workload — the
+            # spawn POD runs an immutable content-hashed spawn-runtime image, so
+            # `:latest` is acceptable (it never reaches a live pod tag). It also
+            # tracks the newest loom-core, i.e. the same image this daemon's
+            # loomd resolves to via its gitops `images:` newTag, giving the best
+            # day-to-day version-alignment. A static pin was evaluated and
+            # rejected (platform/gitops 2026-06-25): Flux Kustomization has no
+            # `replacements:` field and $imagepolicy markers are invisible inside
+            # `patch:` block scalars, so any pin is static and drifts OLDER than
+            # the daemon on every loom-core build — worse than :latest.
             - name: SPAWN_LOOM_IMAGE
               value: registry.harbor.lan/mcp/loom-core:latest
             # SPAWN_PLAN_STORE_WS_URL: agent-context Plan Store, plain MCP over
