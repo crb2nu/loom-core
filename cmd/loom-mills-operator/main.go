@@ -496,6 +496,15 @@ func run(cfg Config) error {
 	// policy.intake.gitlab.enabled: true. No-op without a configured
 	// GitLab client.
 	if gitlabImporter := buildGitLabImporter(pm, gitlabClient, st, logger); gitlabImporter != nil {
+		// Inline plan authoring (plan store S7b-β): when enabled and the
+		// MCP hub is reachable, the importer authors a Plan for each newly
+		// imported item so it is born linked (vs. waiting for the boot
+		// backfill). Default-off; best-effort, off the reconciler path.
+		if os.Getenv("LOOM_MILLS_PLAN_AUTHORING") != "" && hubClient != nil {
+			gitlabImporter.PlanAuthor = clients.NewPlanClient(hubClient, "loom-mills-operator")
+			gitlabImporter.Project = cfg.GitLabProject
+			logger.Info("gitlab importer inline plan authoring enabled")
+		}
 		g.Go(func() error { return gitlabImporter.Run(gctx) })
 	}
 
