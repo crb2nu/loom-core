@@ -720,6 +720,7 @@ skills:
         - templates/10-research.md
         - templates/20-product-spec.md
         - templates/30-implementation-plan.md
+        - templates/40-decisions.md
         - templates/50-worklog.md
       always_allow:
         # init_loom_context.py is safe: skips existing files by default,
