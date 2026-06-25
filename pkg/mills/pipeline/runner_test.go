@@ -817,18 +817,14 @@ func TestRunner_StartGoroutineReachesTerminal(t *testing.T) {
 	if err := r.Start(context.Background(), run, item); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		got, err := st.Pipeline.GetRun(context.Background(), run.ID)
-		if err != nil {
-			t.Fatalf("getrun: %v", err)
-		}
-		if got.State == store.PipelineDone || got.State == store.PipelineEscalated {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	r.Wait() // deterministic join — no polling, no leaked goroutine
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("getrun: %v", err)
 	}
-	t.Fatalf("Start: run did not reach terminal state in time")
+	if got.State != store.PipelineDone && got.State != store.PipelineEscalated {
+		t.Fatalf("Start: run did not reach terminal state, got %s", got.State)
+	}
 }
 
 func TestRunner_StartSuppressesDuplicateActiveRun(t *testing.T) {
@@ -851,17 +847,14 @@ func TestRunner_StartSuppressesDuplicateActiveRun(t *testing.T) {
 		t.Fatalf("duplicate start: %v", err)
 	}
 	close(disp.release)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if got, err := st.Pipeline.GetRun(context.Background(), run.ID); err == nil && got.State == store.PipelineDone {
-			if calls := disp.callCount(); calls != 1 {
-				t.Fatalf("dispatch calls = %d, want 1", calls)
-			}
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	r.Wait() // join the single live drive goroutine deterministically
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil || got.State != store.PipelineDone {
+		t.Fatalf("run did not finish after releasing dispatcher: state=%v err=%v", got.State, err)
 	}
-	t.Fatal("run did not finish after releasing dispatcher")
+	if calls := disp.callCount(); calls != 1 {
+		t.Fatalf("dispatch calls = %d, want 1 (duplicate Start must be suppressed)", calls)
+	}
 }
 
 func TestRunner_StartEscalatesFatalDriveError(t *testing.T) {
@@ -876,19 +869,14 @@ func TestRunner_StartEscalatesFatalDriveError(t *testing.T) {
 	if err := r.Start(context.Background(), run, item); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		got, err := st.Pipeline.GetRun(context.Background(), run.ID)
-		if err != nil {
-			t.Fatalf("getrun: %v", err)
-		}
-		if got.State == store.PipelineEscalated {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	r.Wait() // deterministic join — the fatal drive error escalates in-goroutine
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("getrun: %v", err)
 	}
-	got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
-	t.Fatalf("state = %s, want escalated", got.State)
+	if got.State != store.PipelineEscalated {
+		t.Fatalf("state = %s, want escalated", got.State)
+	}
 }
 
 func TestRunner_StartRejectsBadConfig(t *testing.T) {

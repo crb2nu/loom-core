@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/eval"
@@ -102,23 +101,21 @@ func TestPipeline_E2E_QueuedItemMergesWithEvalRow(t *testing.T) {
 		t.Fatalf("expected 1 started, got %+v", res)
 	}
 
-	// Wait for the runner goroutine to drive the pipeline to terminal state.
-	deadline := time.Now().Add(5 * time.Second)
-	var donePR *store.PipelineRun
-	for time.Now().Before(deadline) {
-		runs, err := st.Pipeline.ListByBacklog(context.Background(), item.ID)
-		if err != nil {
-			t.Fatalf("list runs: %v", err)
-		}
-		if len(runs) > 0 && (runs[0].State == store.PipelineDone || runs[0].State == store.PipelineEscalated) {
-			donePR = runs[0]
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	// Wait deterministically for the runner goroutine to drive the pipeline
+	// to a terminal state. markDone (and its synchronous OnMerged eval
+	// insert) runs inside that goroutine, so after Wait both the run row and
+	// the eval row are settled — no polling, no leaked goroutine past the
+	// store teardown (DEBT-079).
+	runner.Wait()
+
+	runs, err := st.Pipeline.ListByBacklog(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
 	}
-	if donePR == nil {
-		t.Fatalf("pipeline run did not reach terminal state in time")
+	if len(runs) == 0 {
+		t.Fatalf("pipeline run not recorded")
 	}
+	donePR := runs[0]
 	if donePR.State != store.PipelineDone {
 		t.Fatalf("pipeline state = %s, want done", donePR.State)
 	}
@@ -126,22 +123,9 @@ func TestPipeline_E2E_QueuedItemMergesWithEvalRow(t *testing.T) {
 		t.Errorf("mr_iid = %v, want 4242 (from NoOpDispatcher)", donePR.MRIID)
 	}
 
-	// Eval row is written by the OnMerged hook synchronously inside
-	// markDone — but markDone runs in a goroutine spawned by
-	// Runner.Start, so there's a small window between the
-	// pipeline_runs.state→done write and the eval_scores insert. Poll
-	// briefly for the row before asserting.
-	var scores []*store.EvalScore
-	evalDeadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(evalDeadline) {
-		scores, err = st.Eval.LatestPerSubject(context.Background(), store.EvalSubjectPipelineRun, donePR.ID)
-		if err != nil {
-			t.Fatalf("read eval: %v", err)
-		}
-		if len(scores) > 0 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	scores, err := st.Eval.LatestPerSubject(context.Background(), store.EvalSubjectPipelineRun, donePR.ID)
+	if err != nil {
+		t.Fatalf("read eval: %v", err)
 	}
 	if len(scores) != 1 {
 		t.Fatalf("expected 1 eval row, got %d", len(scores))

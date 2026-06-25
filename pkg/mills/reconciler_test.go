@@ -824,6 +824,38 @@ func TestReconciler_TickReDriveIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestReconciler_TickDoesNotDoubleStartFreshlyQueuedItem pins DEBT-079's
+// root cause: a queued item started by the queued-loop in a tick is
+// non-terminal, so the same tick's pickupInFlightRuns used to re-invoke
+// Start on it and re-count it (res.Started==2). The recordingStarter does
+// not drive the run forward, so the run stays non-terminal after Start —
+// exactly the window that exposed the double-count. With the same-tick skip
+// set, the item is started (and counted) exactly once.
+func TestReconciler_TickDoesNotDoubleStartFreshlyQueuedItem(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+
+	item := &store.BacklogItem{
+		ID: "BACK-FRESH", Title: "fresh queued", State: store.BacklogQueued,
+		Priority: store.P2, CreatedBy: "test",
+		Budget: store.Budget{MaxCostUSD: 1.0, MaxPipelineMinutes: 60},
+	}
+	if err := env.store.Backlog.Put(ctx, item); err != nil {
+		t.Fatalf("seed backlog: %v", err)
+	}
+
+	res, err := env.rec.Tick(ctx)
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if res.Started != 1 {
+		t.Fatalf("res.Started = %d, want 1 (same-tick pickup must not re-count the just-started run)", res.Started)
+	}
+	if got := env.starter.calls(); got != 1 {
+		t.Fatalf("starter calls = %d, want 1 (no same-tick re-dispatch)", got)
+	}
+}
+
 // TestReconciler_TickReDriveSkipsWhenAutonomyBlocked pins that the new
 // in-flight pickup honors the same autonomy gate the backlog pickup
 // already does. A paused operator must stay paused — no re-drive bursts.

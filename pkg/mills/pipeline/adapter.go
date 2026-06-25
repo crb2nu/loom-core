@@ -47,10 +47,27 @@ func (s *RunnerStarter) Start(ctx context.Context, run *store.PipelineRun, item 
 		return errors.New("pipeline: item.ID required")
 	}
 	if ShouldFanOut(item) && s.Integrator != nil && shouldStartFanOut(run) {
-		go s.driveFanOut(run, item)
+		// Register on the Runner's waitgroup so Runner.Wait (and our own
+		// Wait) covers fan-out goroutines too. Add before launching so a
+		// concurrent Wait can't miss it.
+		s.Runner.wg.Add(1)
+		go func() {
+			defer s.Runner.wg.Done()
+			s.driveFanOut(run, item)
+		}()
 		return nil
 	}
 	return s.Runner.Start(ctx, run, item)
+}
+
+// Wait blocks until every goroutine this starter launched (fan-out drives
+// and Runner.Start drives) has exited. Delegates to the shared Runner
+// waitgroup. Tests call this before closing the store.
+func (s *RunnerStarter) Wait() {
+	if s == nil || s.Runner == nil {
+		return
+	}
+	s.Runner.Wait()
 }
 
 func shouldStartFanOut(run *store.PipelineRun) bool {
