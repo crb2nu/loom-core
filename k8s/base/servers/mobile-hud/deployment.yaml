@@ -137,6 +137,31 @@ spec:
               value: 40Gi
             - name: SPAWN_BUILD_AVOID_NODES
               value: k3s-w-7,k3s-w-11
+            # Plan Store MCP wiring for spawned agent pods (loom-core MR !786).
+            # The spawn orchestrator (internal/hud/spawn.go) runs IN THIS
+            # process, so resolveSpawnLoomImage / resolvePlanStoreWSURL read
+            # THESE env vars (not the Mills operator's — the operator only POSTs
+            # a spawn request over HTTP). The generated spawn-runtime Dockerfile
+            # does `COPY --from=$SPAWN_LOOM_IMAGE /usr/local/bin/loom ...` to
+            # bundle the loom binary, and the codex/claude agent gets an injected
+            # [mcp_servers.loom] launching `loom proxy --ws-backend <url>` so it
+            # can call agent_plan_* against the agent-context Plan Store.
+            #
+            # SPAWN_LOOM_IMAGE: code default is loom-core:latest. The `:latest`
+            # here is a placeholder (same convention as the loomd `image:` above);
+            # the platform/gitops Kustomization (kustomization-loom-hub-servers.yaml)
+            # pins it to the resolved loom-core tag via a `replacements:` block so
+            # the bundled loom stays byte-identical to this daemon's own image —
+            # never a floating `:latest` on the actual spawn.
+            - name: SPAWN_LOOM_IMAGE
+              value: registry.harbor.lan/mcp/loom-core:latest
+            # SPAWN_PLAN_STORE_WS_URL: agent-context Plan Store, plain MCP over
+            # WebSocket at /ws (the mcp-agent-context Deployment sets
+            # MCP_TRANSPORT=websocket on :8080). This equals the in-code default
+            # (resolvePlanStoreWSURL); set explicitly for self-documentation.
+            # Set to "disabled" to turn plan-store MCP wiring off entirely.
+            - name: SPAWN_PLAN_STORE_WS_URL
+              value: ws://mcp-agent-context.loom-hub.svc.cluster.local:8080/ws
             # harvester-vm spawn substrate (Mills roadmap Slice A1). Registers
             # the harvester-vm backend so Mills can route implement+tests of
             # mills-canary-harvester-vm items to KubeVirt VMs. Empty kubeconfig
