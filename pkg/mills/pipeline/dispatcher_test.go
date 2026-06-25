@@ -256,11 +256,14 @@ func TestDevboxWorker_CanaryScopesChecks(t *testing.T) {
 	}
 }
 
-// TestDevboxWorker_NonCanaryLeavesDefaults asserts that a non-canary
-// backlog item sends Checks=nil so mcp-devbox's default selector
-// (fmt+lint+test) still runs for real work.
-func TestDevboxWorker_NonCanaryLeavesDefaults(t *testing.T) {
-	db := &fakeDevbox{resp: DevboxResponse{Passed: true, Checks: []DevboxCheck{{Name: "test", Passed: true}}}}
+// TestDevboxWorker_NonCanaryScopesToFmt asserts that a non-canary backlog
+// item ALSO sends the sandbox-safe Checks=[fmt] scope. Whole-module
+// go vet/test can't run in the loom-core-only git-clone sandbox (go.work
+// siblings + fi-accel cgo); GitLab CI via ci_watch is the authoritative
+// lint/test/build gate. Regression for MILLS-DEBT-TICKLABEL-20260624, which
+// escalated at the tests stage on "FAIL lint (79ms)".
+func TestDevboxWorker_NonCanaryScopesToFmt(t *testing.T) {
+	db := &fakeDevbox{resp: DevboxResponse{Passed: true, Checks: []DevboxCheck{{Name: "fmt", Passed: true}}}}
 	w := &DevboxWorker{Client: db, Project: "loom-core", AgentID: "claude-code"}
 	jc := sampleJobContext("tests", func(jc *JobContext) {
 		jc.Item.Labels = []string{"feature", "p1"}
@@ -268,8 +271,9 @@ func TestDevboxWorker_NonCanaryLeavesDefaults(t *testing.T) {
 	if _, err := w.Run(context.Background(), jc); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if len(db.calls[0].Checks) != 0 {
-		t.Fatalf("non-canary should send no Checks override, got %v", db.calls[0].Checks)
+	got := db.calls[0].Checks
+	if len(got) != 1 || got[0] != "fmt" {
+		t.Fatalf("non-canary checks = %v, want [fmt]", got)
 	}
 }
 
