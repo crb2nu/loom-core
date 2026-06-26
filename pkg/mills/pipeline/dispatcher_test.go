@@ -701,3 +701,39 @@ func TestDefaultRoutes_PropagatesSubstrateForToSpawnWorkers(t *testing.T) {
 		}
 	}
 }
+
+// TestDevboxScopeFor_FmtOnly is a regression guard for the fix that resolved the
+// MILLS-DEBT-TICKLABEL-20260624-191214 escalation (mills A3 / W1.2). That run's
+// in-pod tests stage ran `go vet ./...` in the devbox sandbox, which false-
+// failed across 3 attempts ("PASS fmt / FAIL lint (79ms)", exit 0 yet not
+// passed) and escalated a backlog item whose code was actually correct — the
+// identical task merged unchanged the next day once the gate was scoped to
+// `fmt`. The fix (gitCloneTestsScope) restricts the sandbox gate to `fmt` for
+// ALL items; GitLab CI, enforced by the ci_watch stage, remains the
+// authoritative lint/test/build gate before merge. If a future change widens
+// the sandbox scope back to lint/test, this test fails before the flaky
+// escalation can recur.
+func TestDevboxScopeFor_FmtOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		item *store.BacklogItem
+	}{
+		{"nil item", nil},
+		{"canary fixture", &store.BacklogItem{ID: "MILLS-CANARY-X", Labels: []string{"mills-canary", "safe-fixture"}}},
+		{"debt code item", &store.BacklogItem{ID: "MILLS-DEBT-X", Labels: []string{"debt"}}},
+		{"unlabeled item", &store.BacklogItem{ID: "ITEM-X"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := devboxScopeFor(tc.item)
+			if len(got) != 1 || got[0] != "fmt" {
+				t.Fatalf("devboxScopeFor(%s) = %v, want [fmt] — the sandbox lint/test gate false-fails; CI is the authoritative gate", tc.name, got)
+			}
+		})
+	}
+	// Lock the underlying constant so widening the scope is a deliberate,
+	// reviewed edit rather than an accidental regression.
+	if len(gitCloneTestsScope) != 1 || gitCloneTestsScope[0] != "fmt" {
+		t.Fatalf("gitCloneTestsScope = %v, want [fmt]", gitCloneTestsScope)
+	}
+}
