@@ -245,6 +245,19 @@ func run(cfg Config) error {
 		logger.Info("notify webhook hook enabled")
 	}
 
+	// Handoff-inbox notifier (.loom/126 Next waves W2.1). When
+	// policy.notify.handoff_inbox is set, every merge posts a "Mills merged
+	// X" record to the agent_context handoff inbox over the MCP hub — the
+	// in-cluster alternative to the webhook. Late-bound like tick-on-merge
+	// below: the handoff client is constructed further down (with the
+	// escalator), so we append a closure now and assign the hook once the
+	// client exists. The closure is nil-safe (HandoffHook.OnMerged guards a
+	// nil receiver), so an unset/disabled hook is a no-op.
+	var handoffNotify *notify.HandoffHook
+	mergedHooks = append(mergedHooks, func(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem) error {
+		return handoffNotify.OnMerged(ctx, run, item)
+	})
+
 	// Tick-on-merge (Slice 3b of plan 43). After a merge lands the
 	// scheduler picks up the next backlog item within ~1s instead of
 	// waiting up to 60s for the regularly-scheduled tick. The wire-up
@@ -295,6 +308,13 @@ func run(cfg Config) error {
 		logger.Info("escalator handoff configured (mcp-agent-context)")
 	} else {
 		logger.Warn("escalator handoff disabled (no MCP hub or operator session)")
+	}
+	// Assign the late-bound handoff-inbox merge notifier now that the handoff
+	// client exists. Gated on policy.notify.handoff_inbox + a reachable hub;
+	// reuses the same handoffClient the escalator uses.
+	if pol := pm.Current(); pol != nil && pol.Notify.HandoffInbox && handoffClient != nil {
+		handoffNotify = notify.NewHandoffHook(handoffClient, pol.Notify.HandoffTarget, pol.Notify.MRBaseURL, logger)
+		logger.Info("notify handoff-inbox hook enabled", "target", handoffNotify.Target())
 	}
 	if gitlabClient != nil || handoffClient != nil {
 		escalator := pipeline.NewEscalator(st, gitlabClient, handoffClient)
