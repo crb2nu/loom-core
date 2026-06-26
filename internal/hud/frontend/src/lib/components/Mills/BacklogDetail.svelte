@@ -7,6 +7,7 @@
   // the cost estimate, and cross-links to the runs executing the item (plus
   // a Start-pipeline action when none exist yet).
   import { millsStore } from '../../stores/mills.svelte.ts';
+  import { router } from '../../stores/router.svelte.ts';
   import DetailDrawer from '../shared/DetailDrawer.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import { runAdminAction } from './shared/millsActions.ts';
@@ -39,6 +40,13 @@
 
   function openRun(id: string): void {
     millsStore.openRunDetail(id);
+  }
+
+  // Deep-link the born-linked plan into Work → Plans. PlanID is authoritative
+  // (set when the council/import born-links the item or the boot backfill runs).
+  function openPlan(id: string): void {
+    millsStore.closeBacklogDetail();
+    router.navigate('tasks', 'plans', id);
   }
 
   async function doStart(): Promise<void> {
@@ -111,6 +119,16 @@
         <span class="k">Council run</span>
         <span class="v mono">
           {#if detail.CouncilRunID}{detail.CouncilRunID}{:else}—{/if}
+        </span>
+      </div>
+      <div class="cell">
+        <span class="k">Plan</span>
+        <span class="v mono">
+          {#if detail.PlanID}
+            <button type="button" class="plan-link" onclick={() => openPlan(detail.PlanID)} title="Open the born-linked plan in Work → Plans">
+              ◈ {detail.PlanID}
+            </button>
+          {:else}—{/if}
         </span>
       </div>
       <div class="cell">
@@ -285,6 +303,14 @@
     color: var(--fg-secondary, #9ab); font-family: ui-monospace, monospace;
   }
   .mr { color: rgb(150, 190, 250); font-family: ui-monospace, monospace; font-size: 0.72rem; }
+  .plan-link {
+    display: inline-block; padding: 0.02rem 0.4rem; border-radius: 4px; cursor: pointer;
+    font-family: ui-monospace, monospace; font-size: 0.78rem;
+    background: color-mix(in srgb, var(--accent, #58a) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent, #58a) 40%, var(--border-subtle, #233));
+    color: rgb(150, 190, 250);
+  }
+  .plan-link:hover { background: color-mix(in srgb, var(--accent, #58a) 26%, transparent); }
   .when { margin-left: auto; color: var(--text-muted, #889); font-size: 0.72rem; }
   .slices li {
     display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem;
