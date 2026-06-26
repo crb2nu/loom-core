@@ -177,13 +177,25 @@ func run(cfg Config) error {
 	capabilities.CouncilConfigured = councilRunner != nil
 	capabilities.CouncilUsesFakeAgents = councilUsesFakeAgents
 
-	// Workspace-signals council brief (W3.1, .loom/126 Next waves). When a
-	// Loki endpoint is configured, feed recent error clusters into the
-	// council brief so it proposes grounded work over synthetic canaries.
-	// Plain HTTP read (no hub); a nil client just omits the brief section.
-	if lokiClient := clients.NewLokiClient(cfg.LokiURL, logger); lokiClient != nil && councilRunner != nil {
-		councilRunner.Signals = lokiClient
-		logger.Info("council brief workspace-signals enabled (Loki)", "url", cfg.LokiURL)
+	// Workspace-signals council brief (W3.1, .loom/126 Next waves). Feed real
+	// failures into the council brief so it proposes grounded work over
+	// synthetic canaries: Loki error clusters + recent FAILED GitLab CI
+	// pipelines, merged via a composite source. Both are plain HTTP reads (no
+	// hub); each is best-effort, so a nil/unconfigured source just drops out.
+	// The GitLab client here is a dedicated read instance (cheap to construct;
+	// the pipeline-stage client is built separately below).
+	if councilRunner != nil {
+		var sigSources []council.WorkspaceSignalSource
+		if loki := clients.NewLokiClient(cfg.LokiURL, logger); loki != nil {
+			sigSources = append(sigSources, loki)
+		}
+		if ci := buildGitLabClient(cfg, logger); ci != nil {
+			sigSources = append(sigSources, ci)
+		}
+		if signals := council.NewCompositeSignals(sigSources...); signals != nil {
+			councilRunner.Signals = signals
+			logger.Info("council brief workspace-signals enabled", "sources", len(sigSources))
+		}
 	}
 
 	// GitOps-scoped GitLab client for the autonomy kill-switch auto-PR
