@@ -25,6 +25,17 @@
   // load-bearing cross-link: "why is this escalated?" → open its run.
   let runs = $derived(selectedID ? millsStore.pipelineRunsForBacklog(selectedID) : []);
 
+  // Escalation attention: when the item (or its newest run) is escalated/failed,
+  // surface the most-likely culprit run + stage at the top so an operator
+  // triaging at scale sees "where to look" without drilling run → stage → log.
+  const ATTENTION_STATES = new Set(['escalated', 'failed']);
+  let attentionRun = $derived(
+    runs.find((r) => ATTENTION_STATES.has((r.State ?? '').toLowerCase())) ?? null,
+  );
+  let needsAttention = $derived(
+    !!detail && (ATTENTION_STATES.has((detail.State ?? '').toLowerCase()) || !!attentionRun),
+  );
+
   // Start is offered only when the item has no run yet and isn't terminal —
   // re-starting a merged item or one already mid-flight would be confusing.
   const TERMINAL_STATES = new Set(['merged', 'done', 'closed']);
@@ -104,6 +115,21 @@
       </button>
     </div>
   {:else if detail}
+    {#if needsAttention}
+      <section class="attention" role="alert">
+        <span class="attention-icon" aria-hidden="true">⚠</span>
+        <div class="attention-body">
+          <strong>Needs attention — {detail.State}</strong>
+          {#if attentionRun}
+            <button type="button" class="attention-link" onclick={() => openRun(attentionRun.ID)}>
+              {attentionRun.State}{#if attentionRun.CurrentStage} at <span class="mono">{attentionRun.CurrentStage}</span>{/if} · open run {shortRun(attentionRun.ID)} →
+            </button>
+          {:else}
+            <span class="muted">No run linked yet — check the council decision and dependencies.</span>
+          {/if}
+        </div>
+      </section>
+    {/if}
     <!-- Cost + linkouts -->
     <section class="grid">
       <div class="cell">
@@ -260,6 +286,20 @@
 <style>
   .muted { color: var(--text-muted, #889); }
   .mono { font-family: ui-monospace, monospace; }
+  .attention {
+    display: flex; gap: 0.6rem; align-items: flex-start;
+    margin: 0 0 0.75rem; padding: 0.6rem 0.7rem; border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--error, #d55) 45%, var(--border-subtle, #233));
+    background: color-mix(in srgb, var(--error, #d55) 9%, transparent);
+  }
+  .attention-icon { color: rgb(240, 150, 100); font-size: 0.95rem; line-height: 1.2; }
+  .attention-body { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; }
+  .attention-body strong { color: rgb(240, 170, 120); font-size: 0.82rem; }
+  .attention-link {
+    background: none; border: none; padding: 0; text-align: left; cursor: pointer;
+    color: rgb(150, 190, 250); font-size: 0.78rem;
+  }
+  .attention-link:hover { text-decoration: underline; }
   .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
   .prio { font-size: 0.72rem; color: var(--text-muted, #889); }
   .label {
