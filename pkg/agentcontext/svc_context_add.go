@@ -189,14 +189,35 @@ func (cs *ContextSvc) buildContextEntry(session *Session, m map[string]any, titl
 }
 
 func (cs *ContextSvc) storeContextEntries(ctx context.Context, entries []ContextEntry, embedTexts []string) ([]string, error) {
+	coll := cs.qdrant.Get(CollContext)
+
+	// Generate embeddings — best-effort. A failed embedder must NEVER block the
+	// context write: embedding is enrichment for semantic search, not a
+	// correctness gate for persistence. This mirrors pkg/agentcontext/svc_tasks.go
+	// and the pkg/pm risk store, which persist a deterministic fallback vector on
+	// embed failure. Without this, an embedder outage (Morph 522 /
+	// gte-qwen2-1.5b HTTP 500 / circuit breaker open) hard-fails agent_context_add
+	// and agents lose the ability to record any decision or finding.
 	vectors, err := cs.embed.EmbedDocuments(ctx, embedTexts)
 	if err != nil {
-		return nil, fmt.Errorf("embedding entries: %w", err)
-	}
-	if len(vectors) != len(entries) {
-		return nil, fmt.Errorf("embedding count mismatch: got %d want %d", len(vectors), len(entries))
+		if cs.metrics != nil {
+			cs.metrics.EmbeddingErrors.Add(1)
+		}
+		if cs.logger != nil {
+			cs.logger.Warn("context embed failed; persisting with fallback vectors",
+				"error", err, "count", len(entries))
+		}
+		vectors = nil
+	} else if len(vectors) != len(entries) {
+		if cs.logger != nil {
+			cs.logger.Warn("context embed count mismatch; persisting with fallback vectors",
+				"got", len(vectors), "want", len(entries))
+		}
+		vectors = nil
 	}
 
+	// Determine the vector size: a real embedding wins, then the shared
+	// discovered size, then the live collection, then the embedder default.
 	for _, v := range vectors {
 		if len(v) > 0 {
 			*cs.vectorSize = len(v)
@@ -204,21 +225,29 @@ func (cs *ContextSvc) storeContextEntries(ctx context.Context, entries []Context
 		}
 	}
 	if *cs.vectorSize <= 0 {
-		return nil, fmt.Errorf("unknown vector size (empty embeddings)")
+		if exists, size, gerr := coll.GetCollectionVectorSize(ctx); gerr == nil && exists && size > 0 {
+			*cs.vectorSize = size
+		}
+	}
+	if *cs.vectorSize <= 0 {
+		*cs.vectorSize = defaultEmbedVectorSize
 	}
 
-	if err := cs.qdrant.Get(CollContext).EnsureCollection(ctx, *cs.vectorSize); err != nil {
+	if err := coll.EnsureCollection(ctx, *cs.vectorSize); err != nil {
 		return nil, fmt.Errorf("ensure collection: %w", err)
 	}
 
+	// Build points. Any entry lacking a usable, correctly-sized embedding gets a
+	// deterministic non-zero fallback vector (Qdrant rejects all-zero vectors
+	// under cosine distance) so the entry still persists and stays filterable by
+	// payload (project/session/entry_type).
 	points := make([]Point, 0, len(entries))
 	for i, entry := range entries {
-		vector := vectors[i]
-		if len(vector) > 0 && len(vector) != *cs.vectorSize {
-			return nil, fmt.Errorf("embedding vector size mismatch: got %d want %d", len(vector), *cs.vectorSize)
-		}
-		if len(vector) == 0 {
-			vector = make([]float64, *cs.vectorSize)
+		var vector []float64
+		if i < len(vectors) && len(vectors[i]) == *cs.vectorSize {
+			vector = vectors[i]
+		} else {
+			vector = fallbackEmbedVector(*cs.vectorSize)
 		}
 		points = append(points, Point{
 			ID:      entry.ID,
@@ -227,7 +256,7 @@ func (cs *ContextSvc) storeContextEntries(ctx context.Context, entries []Context
 		})
 	}
 
-	if err := cs.upsertBatched(ctx, cs.qdrant.Get(CollContext), points); err != nil {
+	if err := cs.upsertBatched(ctx, coll, points); err != nil {
 		return nil, fmt.Errorf("upsert entries: %w", err)
 	}
 
@@ -236,6 +265,41 @@ func (cs *ContextSvc) storeContextEntries(ctx context.Context, entries []Context
 		ids[i] = e.ID
 	}
 	return ids, nil
+}
+
+// embedQueryBestEffort returns an embedding for text, falling back to a
+// deterministic non-zero vector when the embedder fails or returns a
+// wrong-sized result. A failed embedder must never block a context/annotation
+// write — embedding is enrichment for semantic search, not a correctness gate
+// for persistence (mirrors storeContextEntries and pkg/agentcontext/svc_tasks.go).
+// The shared *cs.vectorSize is updated as a side effect; the returned vector is
+// always correctly sized for coll.
+func (cs *ContextSvc) embedQueryBestEffort(ctx context.Context, text string, coll *QdrantClient) []float64 {
+	vector, err := cs.embed.EmbedQuery(ctx, text)
+	if err != nil {
+		if cs.metrics != nil {
+			cs.metrics.EmbeddingErrors.Add(1)
+		}
+		if cs.logger != nil {
+			cs.logger.Warn("context embed failed; using fallback vector", "error", err)
+		}
+		vector = nil
+	}
+	if len(vector) > 0 {
+		*cs.vectorSize = len(vector)
+	}
+	if *cs.vectorSize <= 0 {
+		if exists, size, gerr := coll.GetCollectionVectorSize(ctx); gerr == nil && exists && size > 0 {
+			*cs.vectorSize = size
+		}
+	}
+	if *cs.vectorSize <= 0 {
+		*cs.vectorSize = defaultEmbedVectorSize
+	}
+	if len(vector) != *cs.vectorSize {
+		vector = fallbackEmbedVector(*cs.vectorSize)
+	}
+	return vector
 }
 
 func (cs *ContextSvc) routeToMemory(ctx context.Context, session *Session, m map[string]any, title, content string) (string, error) {
