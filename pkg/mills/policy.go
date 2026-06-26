@@ -71,14 +71,23 @@ type WorkflowsPolicy struct {
 	SubstrateK8sOnly bool `yaml:"substrate_k8s_only,omitempty"`
 }
 
-// NotifyPolicy controls external notification hooks (Slice 3a).
-// Currently the only sink is a generic JSON webhook (Slack-compatible).
-// Disabled by default — set webhook_url to opt in.
+// NotifyPolicy controls external notification hooks (Slice 3a / .loom/126 W2.1).
+// Two independent sinks, both disabled by default and both fired on merge:
+//   - a generic JSON webhook (Slack-compatible) — set webhook_url to opt in;
+//   - the in-cluster agent_context handoff inbox — set handoff_inbox: true.
 type NotifyPolicy struct {
 	WebhookURL        string `yaml:"webhook_url,omitempty"`
 	WebhookTimeoutSec int    `yaml:"webhook_timeout_seconds,omitempty"` // default 10
 	MRBaseURL         string `yaml:"mr_base_url,omitempty"`             // optional MR link prefix
 	OnlyAutonomous    bool   `yaml:"only_autonomous,omitempty"`         // future: gate on no-human-touch
+	// HandoffInbox, when true, posts a "Mills merged X" record to the
+	// agent_context handoff inbox on every merge (agent_handoff_create over
+	// the MCP hub) — the in-cluster alternative to webhook_url, no external
+	// dependency. Requires the operator's MCP hub to be reachable.
+	HandoffInbox bool `yaml:"handoff_inbox,omitempty"`
+	// HandoffTarget is the target_agent_id the merge handoff is addressed to
+	// (recalled via agent_handoff_inbox{agent_id}). Default "mills-merges".
+	HandoffTarget string `yaml:"handoff_target,omitempty"`
 }
 
 // IntakePolicy controls external backlog sources. v1 ships only the
