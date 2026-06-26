@@ -108,6 +108,22 @@ var (
 		Name: "mills_pipeline_cost_usd_total",
 		Help: "Cumulative pipeline run cost in USD, by terminal state.",
 	}, []string{"state"})
+
+	// AutonomousMerges is a RESTART-DURABLE gauge of autonomous merges
+	// (pipeline runs that reached state=done) within a rolling window,
+	// recomputed from the SQLite store by the KPI writer at startup
+	// (SeedDurableGauges) and on each tick (Record). Unlike
+	// PipelineRunsTotal — an in-memory counter that resets to 0 on every
+	// operator pod roll — this survives restarts because it is re-derived
+	// from durable storage. window="1d" is the north-star
+	// autonomous_merges_24h. The two are complementary: the counter shows
+	// merges since process start; this gauge shows the true rolling window
+	// regardless of how often the operator rolls (which it does on every
+	// loom-core image build via Flux image automation).
+	AutonomousMerges = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "mills_autonomous_merges",
+		Help: "Autonomous merges (pipeline runs reaching state=done) within a rolling window, recomputed from the durable store so it survives operator restarts. Label window: 1d/7d/30d (1d is the north-star autonomous_merges_24h).",
+	}, []string{"window"})
 )
 
 // ----- Gate metrics -----

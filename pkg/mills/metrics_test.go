@@ -26,6 +26,7 @@ func TestMetricsRegistered(t *testing.T) {
 		{"mills_pipeline_stage_attempts_total", PipelineStageAttemptsTotal},
 		{"mills_pipeline_stage_duration_seconds", PipelineStageDurationSeconds},
 		{"mills_pipeline_cost_usd_total", PipelineCostUSDTotal},
+		{"mills_autonomous_merges", AutonomousMerges},
 		{"mills_gate_evaluations_total", GateEvaluationsTotal},
 		{"mills_escalations_total", EscalationsTotal},
 		{"mills_escalation_issues_created_total", EscalationIssueCreatedTotal},
@@ -61,6 +62,7 @@ func TestCounterVecLabelsAccept(t *testing.T) {
 	PipelineStageAttemptsTotal.WithLabelValues("implement", "success").Inc()
 	PipelineStageDurationSeconds.WithLabelValues("tests").Observe(180.0)
 	PipelineCostUSDTotal.WithLabelValues("done").Add(1.25)
+	AutonomousMerges.WithLabelValues("1d").Set(2)
 
 	GateEvaluationsTotal.WithLabelValues("diff_size", "pass").Inc()
 	EscalationsTotal.WithLabelValues("retry_cap_exceeded").Inc()
@@ -94,6 +96,7 @@ func TestGatherableExposesMillsMetrics(t *testing.T) {
 		"mills_council_runs_total":            false,
 		"mills_pipeline_runs_total":           false,
 		"mills_pipeline_active":               false,
+		"mills_autonomous_merges":             false,
 		"mills_gate_evaluations_total":        false,
 		"mills_escalations_total":             false,
 		"mills_reconciler_ticks_total":        false,
