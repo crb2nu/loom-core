@@ -256,12 +256,101 @@ codex exec. Evidence:
 `.loom/local/handoffs/mills-harvester-vm-slice-a2-killtest-2026-06-05.md`.
 **Phases B/C/D remain correctly gated.**
 
-> This kill-test gates the entire rest of the plan. Phases B, C, D do not
-> start until Phase A produces one real autonomous merge.
+> **✅ RESOLVED 2026-06-24 — kill-test PASSED** (supersedes the 06-02/06-06
+> FAILED status above). The first unattended merge closed the loop on the
+> **default k8s substrate** via the spawn-execution + pipeline-orchestration fix
+> chain (`resolveCodexModel` pinned a supported model; `!762`…`!791`) — **not**
+> via the harvester-vm path this section's kill-test was scoped to. The gating
+> rule below is satisfied; the Phase A/B/C/D framing it protected is now
+> superseded by the re-sequenced **Next waves** section. Original note, kept for
+> lineage:
+>
+> > This kill-test gates the entire rest of the plan. Phases B, C, D do not
+> > start until Phase A produces one real autonomous merge.
 
 ---
 
-## The phased roadmap
+## Next waves (re-sequenced 2026-06-26 — supersedes "The phased roadmap" below)
+
+> **Why re-sequenced:** the STATUS RECONCILED banner records that A2 passed —
+> but on the **default k8s substrate**, not the harvester-vm bet that Phase
+> A→B→D1 below was organized around. The original critical path (*wire
+> harvester-vm → flip defaults to harvester-vm*) is therefore obsolete. The loop
+> works on k8s; the job now is to make it **reliable** (Wave 1), **observable**
+> (Wave 2), then **scale demand/quality and repos** (Waves 3–4). Harvester-vm
+> drops to an optional, non-blocking hardening track.
+
+**Done — no longer the frontier:** A1 (substrate wiring), A2 (first unattended
+merge on k8s, 2026-06-24). **Plan Store unification (S7b)** — Mills backlog items
+now born-link to first-class Plans via `agent_plan_create` over the hub —
+**closed out + live-verified 2026-06-26**
+([gitops!291](https://gitlab.flexinfer.ai/platform/gitops/-/merge_requests/291);
+loom-core `.loom/161`).
+
+### Wave 1 — A3 sustain: make the k8s loop reliable 🔴 CURRENT FRONTIER
+The loop merges intermittently (06-24 ×3, 06-25 ×1, 06-26 ×0) with occasional
+escalations. Wave 1 carries the 06-19→06-25 reliability-fix cadence to a
+**7-consecutive-green-day** bar (the original A3 gate).
+- **W1.1 — Durable north-star metric (do FIRST).** `mills_pipeline_runs_total{state="done"}`
+  resets to 0 on every operator roll — the counter-trap that mis-framed this
+  doc as 0/56. Persist it (DB-backed gauge, or recompute from backlog
+  `State=merged` + GitLab `merge_user=bot`) so A3 is measurable without manually
+  cross-checking two sources. **Done when:** a Grafana panel shows an
+  `autonomous_merges_24h` that survives an operator restart.
+- **W1.2 — Escalation burndown.** Each live escalation → one regression-tested
+  fix (continuing merge-stage-405 recovery, zombie-spawn watchdog, scope-gate,
+  stalled-spawn re-spawn, pipeline-race deflake). **Done when:** a 7-day window
+  shows ≥7 unattended merges, 0 regressions, escalation rate trending down.
+
+### Wave 2 — Observability & notify (parallel with W1; cheap, high-ratio)
+- **W2.1 — Notify webhook (`.loom/43` 3a; code complete, inert).** Prod policy
+  `notify.webhook_url` is still `""`. Set it (Slack incoming webhook or the
+  `agent_context` handoff inbox). **Done when:** a real unattended merge posts a
+  webhook within 30s.
+- **W2.2 — Autonomy dashboard** on W1.1's durable metric: merges/day, escalation
+  rate, slice→merge p50, broken out by repo + agent.
+
+### Wave 3 — Demand & quality (old Phase C; substrate-agnostic, still valid)
+- **W3.1 — Workspace-signals council brief (`.loom/43` 1b):** feed last-24h Loki
+  errors + GitLab CI failure clusters into the council brief so it proposes items
+  grounded in real workspace pain instead of synthetic canaries.
+- **W3.2 — LLM-ranked dispatch + outcome feedback (`.loom/43` 1c+3c):** rank
+  queued items by expected merge probability; FIFO fallback on ranker outage;
+  outcome writeback the ranker reads.
+
+### Wave 4 — Scale across repos (the v2 swarm flips, now Plan-backed)
+Prod policy state: **squads ON, audit advisory ON, debate incident-only ON**
+(Phase-8.3 steps 1–3 done); **cross_repo OFF, adaptive_policy OFF** (steps 4–5
+pending). S7b makes work units repo-addressed Plans, so cross-repo is now
+tractable.
+- **W4.1 — `cross_repo.enabled`** flip after ≥3 dogfood successes, one repo at a
+  time, `MILLS_V2_ROLLBACK.md` ready.
+- **W4.2 — `audit.advisory_only: false`** once audit survival rate >0.85.
+- **W4.3 — `adaptive_policy`** manual-apply. Each flip: one/week, soak + rollback,
+  per `docs/MILLS.md` §"v2 acceptance".
+
+### Decoupled track — harvester-vm substrate (NO LONGER critical path)
+The empty-MR gap closed on k8s, so harvester-vm is now **optional** hardening
+(stronger isolation / heavier workloads), not a gate. Slice 2 acceptance remains
+open (ROADMAP.md "Mills harvester-vm substrate"). **Reversed from the original
+plan:** old **Phase B1/B2** (curated base image, warm pool) and **Phase D1**
+(flip defaults *to* harvester-vm) are **demoted / cancelled** — k8s is the
+working default; do not flip away from it. Resume this track only if a concrete
+k8s isolation limit actually bites.
+
+### Sequencing (re-sequenced)
+```
+Wave 1 (A3 reliability) ── W1.1 durable metric ─┬─► W1.2 escalation burndown ─► 7 green days
+                                                 └─► Wave 2 (notify + dashboard) ‖ parallel
+   │ 7 green days
+   ▼
+Wave 3 (demand/quality)  ─────────────────────────►  Wave 4 (cross_repo → adaptive flips)
+Harvester-vm: optional, off the critical path — no wave depends on it.
+```
+
+---
+
+## The phased roadmap (2026-06-01 original — SUPERSEDED by "Next waves" above; kept for lineage)
 
 ### Phase A — Close the loop ONCE (the convergence milestone) 🔴 CRITICAL PATH
 
