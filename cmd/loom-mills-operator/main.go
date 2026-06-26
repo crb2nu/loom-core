@@ -332,6 +332,21 @@ func run(cfg Config) error {
 		}
 	}
 
+	// Council inline plan authoring (plan store S7b-γ): when enabled and
+	// the MCP hub is reachable, the council's backlog mutator authors a
+	// Plan for each newly created item so it is born linked (vs. waiting
+	// for the boot backfill), matching the GitLab importer (S7b-β).
+	// Default-off; best-effort, never blocks council item creation. Reached
+	// in via councilRunner.Mutator because buildCouncilRunner runs before
+	// the hub is established.
+	if os.Getenv("LOOM_MILLS_PLAN_AUTHORING") != "" && hubClient != nil &&
+		councilRunner != nil && councilRunner.Mutator != nil {
+		councilRunner.Mutator.PlanAuthor = clients.NewPlanClient(hubClient, "loom-mills-operator")
+		councilRunner.Mutator.Project = cfg.GitLabProject
+		councilRunner.Mutator.Logger = logger
+		logger.Info("council inline plan authoring enabled")
+	}
+
 	// Audit follow-up writer (Phase 3 slice 3.6). When the audit
 	// subsystem and a GitLab client are both wired, low-survival
 	// findings auto-open advisory issues. Without GitLab, audits still
