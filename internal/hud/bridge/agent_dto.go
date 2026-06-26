@@ -50,8 +50,14 @@ type TaskInfo struct {
 	BlockedBy   []string     `json:"blocked_by,omitempty"`
 	PipelineRef *PipelineRef `json:"pipeline_ref,omitempty"`
 	WorkflowID  string       `json:"workflow_id,omitempty"`
-	CreatedAt   string       `json:"created_at"`
-	UpdatedAt   string       `json:"updated_at"`
+	// Plan Store linkage (S7b convergence): a task is a granular TODO under a
+	// plan slice. PlanID/SliceID tie it to the first-class Plan entity so the
+	// HUD can render one work hierarchy (plan → slice → task) and deep-link
+	// tasks to their plan. Passed through verbatim from agent_task_list.
+	PlanID    string `json:"plan_id,omitempty"`
+	SliceID   string `json:"slice_id,omitempty"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 // UnmarshalJSON backfills Project for older payloads that only carry namespace

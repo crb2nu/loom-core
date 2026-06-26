@@ -7,6 +7,7 @@
    */
   import Badge from '../widgets/Badge.svelte';
   import { toastStore } from '../stores/toasts.svelte.ts';
+  import { router } from '../stores/router.svelte.ts';
 
   type Slice = { id: string; name: string; phase: string; assigned_agent_id?: string; mr_ref?: string };
   type Plan = {
@@ -58,12 +59,19 @@
 
   async function openDetail(plan: Plan) {
     if (selected?.id === plan.id) { selected = null; return; }
+    await openById(plan.id, plan);
+  }
+
+  // Open a plan by id, fetching the full record (with slices). Used by both
+  // card clicks and router deep-links (e.g. a task's "Plan" chip in TasksPanel
+  // navigates here with the plan id as the route detail segment).
+  async function openById(id: string, fallback?: Plan) {
     try {
-      const res = await fetch(`/api/plans/${encodeURIComponent(plan.id)}`);
+      const res = await fetch(`/api/plans/${encodeURIComponent(id)}`);
       const data = await res.json();
-      selected = data.plan ?? plan;
+      selected = data.plan ?? fallback ?? plans.find((p) => p.id === id) ?? null;
     } catch {
-      selected = plan;
+      selected = fallback ?? plans.find((p) => p.id === id) ?? null;
     }
   }
 
@@ -114,6 +122,14 @@
     load();
     const t = setInterval(load, 30000);
     return () => clearInterval(t);
+  });
+
+  // Honor router deep-links: when navigated to #tasks/plans/<plan-id> (e.g. from
+  // a task's Plan chip), auto-open that plan once it resolves.
+  $effect(() => {
+    const wantId = router.detail;
+    if (!wantId || selected?.id === wantId) return;
+    void openById(wantId);
   });
 </script>
 

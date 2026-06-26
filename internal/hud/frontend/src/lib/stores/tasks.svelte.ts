@@ -24,6 +24,10 @@ export interface Task {
   status: 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';
   tags: string[];
   blocked_by: string[];
+  // Plan Store linkage (S7b): a task is a granular TODO under a plan slice.
+  // plan_id/slice_id deep-link a task to its first-class Plan in the Work view.
+  plan_id?: string;
+  slice_id?: string;
   created_at: string;
   updated_at: string;
 }
