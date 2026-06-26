@@ -76,8 +76,11 @@ generated/
 # Claude Desktop app config (local)
 claude_desktop_config/
 
-# Frontend dependencies (HUD Svelte app)
-node_modules/
+# Frontend dependencies (HUD Svelte app).
+# No trailing slash: also ignore a stray `node_modules` *symlink* — a
+# self-referential one slipped past the dir-only pattern, got committed, and
+# ELOOPed `pnpm install` whenever the checkout path matched the symlink target.
+node_modules
 .pnpm-store/
 
 # Xcode build artifacts (iOS companion)
