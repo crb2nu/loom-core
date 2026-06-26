@@ -62,18 +62,11 @@ func (cs *ContextSvc) LinkCodebase(ctx context.Context, args map[string]any) (*m
 	}
 
 	cs.metrics.EmbeddingRequests.Add(1)
-	vector, err := cs.embed.EmbedQuery(ctx, entry.Title+" "+entry.Content)
-	if err != nil {
-		cs.metrics.EmbeddingErrors.Add(1)
-		return mcp.ErrorResult(fmt.Errorf("embedding: %w", err)), nil
-	}
-	if len(vector) > 0 {
-		*cs.vectorSize = len(vector)
-	}
-	if *cs.vectorSize <= 0 {
-		return mcp.ErrorResult(fmt.Errorf("unknown vector size")), nil
-	}
-	if err := cs.qdrant.Get(CollContext).EnsureCollection(ctx, *cs.vectorSize); err != nil {
+	coll := cs.qdrant.Get(CollContext)
+	// Best-effort embed: a failed embedder must not block the write. The error
+	// metric is incremented inside embedQueryBestEffort.
+	vector := cs.embedQueryBestEffort(ctx, entry.Title+" "+entry.Content, coll)
+	if err := coll.EnsureCollection(ctx, *cs.vectorSize); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("ensure collection: %w", err)), nil
 	}
 
@@ -83,7 +76,7 @@ func (cs *ContextSvc) LinkCodebase(ctx context.Context, args map[string]any) (*m
 		Payload: EntryToPayload(entry, cs.cfg.EmbedModel),
 	}
 
-	if err := cs.qdrant.Get(CollContext).Upsert(ctx, []Point{point}, true); err != nil {
+	if err := coll.Upsert(ctx, []Point{point}, true); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("upsert: %w", err)), nil
 	}
 
@@ -135,18 +128,11 @@ func (cs *ContextSvc) AnnotationAdd(ctx context.Context, args map[string]any) (*
 		TokenCount:     EstimateTokens(content),
 	}
 
-	vector, err := cs.embed.EmbedQuery(ctx, annotation.Content)
-	if err != nil {
-		return mcp.ErrorResult(fmt.Errorf("embedding: %w", err)), nil
-	}
-	if len(vector) > 0 {
-		*cs.vectorSize = len(vector)
-	}
-	if *cs.vectorSize <= 0 {
-		return mcp.ErrorResult(fmt.Errorf("unknown vector size")), nil
-	}
+	coll := cs.qdrant.Get(CollAnnotations)
+	// Best-effort embed: a failed embedder must not block the annotation write.
+	vector := cs.embedQueryBestEffort(ctx, annotation.Content, coll)
 
-	if err := cs.qdrant.Get(CollAnnotations).EnsureCollection(ctx, *cs.vectorSize); err != nil {
+	if err := coll.EnsureCollection(ctx, *cs.vectorSize); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("ensure collection: %w", err)), nil
 	}
 
@@ -156,7 +142,7 @@ func (cs *ContextSvc) AnnotationAdd(ctx context.Context, args map[string]any) (*
 		Payload: annotationToPayload(annotation),
 	}
 
-	if err := cs.qdrant.Get(CollAnnotations).Upsert(ctx, []Point{point}, true); err != nil {
+	if err := coll.Upsert(ctx, []Point{point}, true); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("upsert annotation: %w", err)), nil
 	}
 
