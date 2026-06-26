@@ -24,6 +24,45 @@ quality, across repos.**
 
 ---
 
+> ## ⟳ STATUS RECONCILED — 2026-06-26 (supersedes the "Current value: 0" snapshot below)
+>
+> **The north-star has ticked. The empty-MR gap is CLOSED.** Verified live
+> against the persisted operator backlog (`GET /api/mills/backlog`, port 8090)
+> and the GitLab MR record: the mills bot has autonomously authored **and
+> merged** non-empty MRs **fully unattended** (`merge_user` = pipeline service
+> account `project_47_bot_*`, i.e. `merged_via=auto`, no human in the loop):
+>
+> | Date | MR(s) | Change | Diff | merge_user |
+> |------|-------|--------|------|-----------|
+> | 2026-06-24 | [!774](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/774), [!779](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/779), [!780](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/780) | `testdata/mills-canary/heartbeat.md` | non-empty | **bot** (unattended) |
+> | 2026-06-25 | [!788](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/788) | **`pkg/mills/tick_outcome_label_test.go`** — a real Go test, not a fixture | non-empty | **bot** (unattended) |
+>
+> Preceding bot-authored canary MRs on 2026-06-22 ([!768](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/768)) and
+> 2026-06-23 ([!770](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/770)) merged with `merge_user=root` —
+> human-**assisted**, during the operator-hardening push.
+>
+> **First fully-unattended merge: !774 @ 2026-06-24T01:00Z. First unattended
+> _real-code_ merge: !788 @ 2026-06-25.** ⇒ the load-bearing assumption below
+> ("a real canary produces a non-empty MR that auto-merges unattended") is
+> **PROVEN** — but it was closed on the **default (k8s) substrate** via the
+> spawn-execution + pipeline-orchestration fix chain
+> (!762/!764/!766/!769/!773/!777/!790/!791), **not** via the harvester-vm bet
+> this plan was organized around. The harvester-vm path remains a separate,
+> still-open hardening track (see ROADMAP.md "Mills harvester-vm substrate",
+> Slice 2 acceptance still pending).
+>
+> **Phase status reconciled**: **A2 (first autonomous merge) PASSED 2026-06-24.**
+> **A3 (sustain ≥7 consecutive green/day) NOT yet met** — cadence was 06-24 ×3,
+> 06-25 ×1, 06-26 ×0 (intermittent; one debt item escalated:
+> `MILLS-DEBT-TICKLABEL-20260624-191214`, retried green 06-25 as !788). **The
+> frontier is now A3 reliability hardening, not A1/A2.**
+>
+> _Caveat for future loops_: the Prometheus counter
+> `mills_pipeline_runs_total{state="done"}` reads **0** — but only because the
+> operator pod resets it on every roll (last roll 2026-06-26T13:51Z). The
+> persisted backlog + the GitLab MR record (above) are the authoritative
+> source; do **not** trust the live counter alone for the north-star.
+
 ## North-star metric (unchanged from `.loom/43`)
 
 ```
@@ -35,11 +74,13 @@ autonomous_merges_24h = count(pipeline_runs WHERE
   AND last_24h)
 ```
 
-**Current value: 0. It has been 0 every day since at least 2026-05-17**
-(`.loom/44` §kill-test: 0 of 56 runs ever reached `done`). Every other
-metric (auto_merge_rate, escalation_rate, slice-to-merge p50) is a drag
-term on this one. This plan is organized strictly by leverage on this
-number.
+**Current value (as written 2026-06-01 — now SUPERSEDED, see the STATUS
+RECONCILED banner above): 0.** It had been 0 every day since at least
+2026-05-17 (`.loom/44` §kill-test: 0 of 56 runs ever reached `done`). **As of
+2026-06-24 the metric ticks ≥1 on merge days** (06-24 ×3, 06-25 ×1; 06-26 ×0
+so far). Every other metric (auto_merge_rate, escalation_rate, slice-to-merge
+p50) is a drag term on this one. This plan is organized strictly by leverage on
+this number.
 
 ---
 
@@ -70,7 +111,11 @@ What is **built and proven**:
 
 What is **NOT done** (verified 2026-06-01):
 
-1. **No mills canary has ever merged through harvester-vm.** Prod policy
+1. **No mills canary has ever merged through harvester-vm.** _(Reconciled
+   2026-06-26: still true for **harvester-vm specifically** — but canaries DO
+   now merge unattended on the **default k8s substrate** as of 2026-06-24; see
+   the STATUS RECONCILED banner. The harvester-vm path itself remains
+   unproven.)_ Prod policy
    `platform/gitops/k3s/mills/configmap-policy.yaml:104` is
    `stage_substrate: {}` (k8s default). A per-item `mills-canary-
    harvester-vm` label exists to route one canary, and the inline

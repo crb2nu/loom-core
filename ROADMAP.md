@@ -1,6 +1,6 @@
 # Project Roadmap
 
-> Last Updated: June 25, 2026
+> Last Updated: June 26, 2026
 
 ## Current Status
 
@@ -32,6 +32,11 @@ MCP is now the de facto standard for AI-tool integration (8M+ downloads, 5,800+ 
 - Cost tracking and audit trails (compliance and visibility)
 
 ## Recently Shipped (post `v0.9.7`)
+
+- 🎯 **Mills autonomy — first fully-unattended non-empty merges (north-star ticked, 2026-06-24)**
+  - Roadmap: [`.loom/126`](.loom/126-plan-mills-full-vision-roadmap-2026-06-01.md) (STATUS RECONCILED 2026-06-26). The empty-MR gap that blocked all 56 historical runs is **CLOSED**: the mills bot (`project_47_bot_*`) autonomously authored **and merged** non-empty MRs with no human in the loop (`merge_user`=bot, `merged_via=auto`) — **06-24** [!774](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/774)/[!779](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/779)/[!780](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/780) (heartbeat fixture) and **06-25** [!788](https://gitlab.flexinfer.ai/services/loom-core/-/merge_requests/788) (**a real Go test**, `pkg/mills/tick_outcome_label_test.go`).
+  - Closed on the **default k8s substrate** via the spawn-execution + pipeline-orchestration fix chain (!762/!764/!766/!769/!773/!777/!790/!791) — **not** the harvester-vm bet `.loom/126` was organized around (that path remains open below).
+  - **Phase status**: A2 (first autonomous merge) PASSED 2026-06-24; **A3 (sustain ≥7 consecutive green/day) NOT yet met** — cadence 06-24 ×3, 06-25 ×1, 06-26 ×0; one debt item escalated then retried green. **Frontier = A3 reliability hardening.**
 
 - ✅ **Loom Plan Store — first-class, worktree-resilient, cross-agent Plan entity (S0 → S8, 2026-06-20 → 2026-06-24)**
   - Spec/plan: [`.loom/160`](.loom/160-product-spec-loom-plan-store-2026-06-20.md) / [`.loom/161`](.loom/161-implementation-plan-loom-plan-store-2026-06-20.md); docs `docs/PLAN_STORE.md`.
