@@ -1,7 +1,7 @@
 # Implementation Plan — Loom Plan Store
 
-- **Status**: Shipped — S0–S8 merged to `main`; S7b (council/importer plan authoring + backlog backfill) **complete**: S7b-α backfill + S7b-β importer born-link + S7b-γ council born-link all landed (live operator-gated canary pending). Reconciled 2026-06-25.
-- **Date**: 2026-06-20 (status reconciled 2026-06-25)
+- **Status**: ✅ **DONE** — S0–S8 merged to `main`; S7b (council/importer plan authoring + backlog backfill) **complete and live-verified**: S7b-α backfill + S7b-β importer born-link + S7b-γ council born-link all landed; the **live operator-gated canary PASSED 2026-06-26** ([gitops!291](https://gitlab.flexinfer.ai/platform/gitops/-/merge_requests/291)). Reconciled 2026-06-26.
+- **Date**: 2026-06-20 (status reconciled 2026-06-26)
 - **Spec**: [160-product-spec-loom-plan-store-2026-06-20.md](160-product-spec-loom-plan-store-2026-06-20.md)
 - **Sequencing rule**: Slice 1 is the riskiest-assumption kill-test and **gates everything**. No unification work (Slice 7) commits until Slices 1–2 are proven and Slice 6 lands the lifecycle view.
 
@@ -18,12 +18,18 @@ The epic is functionally complete; the riskiest-assumption kill-test **PASSED li
 | S4 — parallel-slice-ship rewire + claim enforce | ✅ merged | `461ee317` |
 | S5 — Plan-aware handoffs | ✅ merged | `75329f2c` |
 | S6 — Lifecycle + HUD | ✅ merged | `ab26f64a` (read API) + `1bb052a9` (HUD Plans panel) |
-| S7 — Mills unification (links + read-through) | ✅ merged | `4578ec3b`; **S7b complete** — α backfill + β importer born-link + γ council born-link all shipped 2026-06-25 (live operator-gated canary pending) |
+| S7 — Mills unification (links + read-through) | ✅ merged; **live-verified** | `4578ec3b`; **S7b complete** — α backfill + β importer born-link + γ council born-link all shipped 2026-06-25; **live canary PASSED 2026-06-26** ([gitops!291](https://gitlab.flexinfer.ai/platform/gitops/-/merge_requests/291)) |
 | S8 — Cross-platform sync | ✅ propagated | registry plan-aware (S3/S4); `platform/gitops` mirror in sync; HOME skills for claude/codex/gemini/kilocode carry the plan-store-aware `plan-loom-core` + `parallel-slice-ship` (verified 2026-06-25) |
 
 **Cross-vendor reachability hardening** (beyond the original slice list, required to make S1's live legs pass): proxy `llm-core`/`antigravity-core` profiles now expose `agent_plan_*` (`69768b7e`, [!785]); Mills spawn pods reach the store via `loom proxy --ws-backend` + bundled `loom` binary (`feba82e5`, [!786]); mobile-hud spawn orchestrator wires `SPAWN_LOOM_IMAGE` + plan-store (`b01d16ae`).
 
-**Remaining (next loops):** S7b code complete (α backfill + β/γ born-link); the **live operator-gated canary** is the one open item — set `LOOM_MILLS_PLAN_AUTHORING` (+ `LOOM_MILLS_PLAN_BACKFILL` for the historical pass), restart the operator with the MCP hub reachable, drive a council pass + a GitLab import, and verify `plan_id` is stamped + the Plan is resolvable via `agent_plan_get`. Pairs with the end-to-end in-pod verification of a real Mills codex calling `agent_plan_get` after the loom-core image rebuild + operator redeploy.
+**Remaining: NONE — epic closed out.** The final open item, the live operator-gated canary, **PASSED 2026-06-26**. [gitops!291](https://gitlab.flexinfer.ai/platform/gitops/-/merge_requests/291) set `LOOM_MILLS_PLAN_AUTHORING=1` + `LOOM_MILLS_PLAN_BACKFILL=1` on the `loom-mills-operator` Deployment; Flux rolled the pod (`...568567bd7c`, boot 13:51Z). Verified live:
+- **5/5 backfill links** succeeded over the hub (`plan backfill complete linked=5 scanned=5`); the operator authored each Plan via `agent_plan_create` with `?server=agent_context`.
+- `GET /api/mills/backlog` now shows **5/5 items carrying `PlanID`** (0 empty).
+- Cross-process resolution proven: the in-cluster operator authored, and a separate **claude-code** session resolved `agent_plan_get{plan-mills-mills-debt-ticklabel-20260625-005042}` → full Plan (phase, spec_doc, `created_by=loom-mills-operator`, `mills_backlog_id` round-trip, 1 slice).
+- `council inline plan authoring enabled` + `gitlab importer inline plan authoring enabled` → all new backlog now born-links forward.
+
+**Key finding (corrected a wrong assumption):** the `agent_plan_*` tools are absent from every `always_allow` list (canonical registry, gitops mirror, gateway configmap), but this is **harmless** — the operator pins `?server=agent_context`, and the fi-mcp-gateway client path (`pkg/gateway/hub.go`) relays `tools/call` verbatim to that host with **no per-tool filter**. `always_allow` is a downstream-client auto-approve concept, not a hub forwarding gate for `server=`-pinned clients. No registry/configmap change was needed — only the operator flag flip. (`LOOM_MILLS_PLAN_BACKFILL` is idempotent — skips already-linked — so it is safe to leave set; the one-time historical pass is done.)
 
 ## Dependency graph
 
