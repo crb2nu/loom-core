@@ -73,8 +73,61 @@ func (w *KPIWriter) Record(ctx context.Context) error {
 		if err := w.Store.KPI.RecordSnapshot(ctx, snap); err != nil {
 			return err
 		}
+		// Mirror the durable merged-run count into the restart-safe
+		// AutonomousMerges gauge (snapshot() already computed it from the
+		// store for this window). This refreshes the gauge each tick so it
+		// decays correctly as merges age out of the window.
+		if merged, ok := snap.Metrics["pipeline_merged_runs"].(int); ok {
+			AutonomousMerges.WithLabelValues(windowLabel(window)).Set(float64(merged))
+		}
 	}
 	return nil
+}
+
+// SeedDurableGauges recomputes the AutonomousMerges gauge for every configured
+// window directly from the store and publishes it, WITHOUT writing a KPI
+// snapshot. The operator calls this once at startup so mills_autonomous_merges
+// is correct the instant /metrics is first scraped after a pod roll — the
+// scheduler's first Record (which also refreshes the gauge) can be up to
+// IdleInterval (default 5min) away. This is the fix for the counter-reset trap
+// where mills_pipeline_runs_total{state="done"} reads 0 after every restart and
+// mis-frames the north-star as 0 (see .loom/126 STATUS RECONCILED banner).
+func (w *KPIWriter) SeedDurableGauges(ctx context.Context) error {
+	if w == nil || w.Store == nil {
+		return fmt.Errorf("kpi writer: store not configured")
+	}
+	now := w.now().UTC()
+	windows := w.Windows
+	if len(windows) == 0 {
+		windows = []time.Duration{kpiWindow1d, kpiWindow7d, kpiWindow30d}
+	}
+	for _, window := range windows {
+		if window <= 0 {
+			continue
+		}
+		merged, err := countPipelineStateSince(ctx, w.Store, store.PipelineDone, now.Add(-window))
+		if err != nil {
+			return err
+		}
+		AutonomousMerges.WithLabelValues(windowLabel(window)).Set(float64(merged))
+	}
+	return nil
+}
+
+// windowLabel maps a KPI window duration to the stable Prometheus label used by
+// AutonomousMerges. Unknown windows fall back to Duration.String() so a custom
+// Windows config still produces a (less pretty but valid) series.
+func windowLabel(d time.Duration) string {
+	switch d {
+	case kpiWindow1d:
+		return "1d"
+	case kpiWindow7d:
+		return "7d"
+	case kpiWindow30d:
+		return "30d"
+	default:
+		return d.String()
+	}
 }
 
 func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Duration) (*store.KPISnapshot, error) {

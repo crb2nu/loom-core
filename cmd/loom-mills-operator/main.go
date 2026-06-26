@@ -433,6 +433,16 @@ func run(cfg Config) error {
 		logger.Info("pipeline startup resume complete",
 			"inspected", resumed.Inspected, "resumed", resumed.Resumed, "errored", resumed.Errored)
 	}
+	// Seed the restart-durable autonomous-merge gauge from the store so the
+	// north-star (mills_autonomous_merges{window="1d"}) is correct the instant
+	// /metrics is first scraped after this roll — not 0 until the first
+	// scheduler tick. The in-memory mills_pipeline_runs_total counter reset to
+	// 0 on this restart; this gauge does not. (W1.1, .loom/126 Next waves.)
+	if err := kpiWriter.SeedDurableGauges(rootCtx); err != nil {
+		logger.Warn("durable KPI gauge seeding failed", "error", err)
+	} else {
+		logger.Info("durable KPI gauges seeded from store")
+	}
 	scheduler := mills.NewScheduler(reconciler)
 	scheduler.Logger = logger
 	scheduler.KPIRecorder = kpiWriter

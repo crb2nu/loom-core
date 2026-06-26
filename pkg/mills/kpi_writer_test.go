@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -441,5 +443,57 @@ func assertMetricCloseTo(t *testing.T, metrics map[string]any, key string, want,
 	}
 	if diff := got - want; diff < -tol || diff > tol {
 		t.Fatalf("%s = %v, want within %v of %v", key, got, tol, want)
+	}
+}
+
+// TestKPIWriter_SeedDurableGauges_RecomputesFromStore is the W1.1 restart-
+// durability proof: a FRESH KPIWriter (simulating the operator process after a
+// pod roll, with all in-memory counters reset) must publish the correct
+// mills_autonomous_merges gauge by re-deriving it from the durable store alone.
+// This is the guarantee that the north-star survives the constant operator
+// rolls that reset mills_pipeline_runs_total{state="done"} to 0.
+func TestKPIWriter_SeedDurableGauges_RecomputesFromStore(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := env.now
+
+	// pipeline_runs.backlog_id has a FOREIGN KEY to backlog_items, so seed a
+	// backlog item per run before the run.
+	seedRun := func(id string, state store.PipelineState, started time.Time) {
+		if err := env.store.Backlog.Put(ctx, &store.BacklogItem{
+			ID: id, Title: id, State: store.BacklogMerged,
+			Priority: store.P2, CreatedBy: "test",
+		}); err != nil {
+			t.Fatalf("seed backlog %s: %v", id, err)
+		}
+		if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: id, Template: "mills-default",
+			State: state, StartedAt: started, CostUSD: 1,
+		}); err != nil {
+			t.Fatalf("seed run %s: %v", id, err)
+		}
+	}
+	// Two merges inside the 24h window, one older (inside 7d, outside 1d).
+	seedRun("PIPE-RECENT-1", store.PipelineDone, now.Add(-2*time.Hour))
+	seedRun("PIPE-RECENT-2", store.PipelineDone, now.Add(-10*time.Hour))
+	seedRun("PIPE-OLD", store.PipelineDone, now.Add(-3*24*time.Hour))
+	// An escalated run inside 24h must NOT count toward autonomous merges.
+	seedRun("PIPE-ESC", store.PipelineEscalated, now.Add(-1*time.Hour))
+
+	AutonomousMerges.Reset()
+
+	writer := NewKPIWriter(env.store, env.policy)
+	writer.Clock = func() time.Time { return now }
+	writer.Windows = []time.Duration{kpiWindow1d, kpiWindow7d}
+
+	if err := writer.SeedDurableGauges(ctx); err != nil {
+		t.Fatalf("seed durable gauges: %v", err)
+	}
+
+	if got := testutil.ToFloat64(AutonomousMerges.WithLabelValues("1d")); got != 2 {
+		t.Errorf("mills_autonomous_merges{window=1d} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(AutonomousMerges.WithLabelValues("7d")); got != 3 {
+		t.Errorf("mills_autonomous_merges{window=7d} = %v, want 3", got)
 	}
 }
