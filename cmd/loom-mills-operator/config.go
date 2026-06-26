@@ -126,6 +126,12 @@ type Config struct {
 	// the endpoint sits behind the HUD's withCORS middleware (no
 	// token required); the field is plumbed for future hardening.
 	WeaverToken string
+
+	// LokiURL is the in-cluster Loki base for the council brief's
+	// workspace-signals section (W3.1 of .loom/126). Defaults to the
+	// logging-namespace service; empty disables the signals fetch so the
+	// brief simply omits the section.
+	LokiURL string
 }
 
 // DefaultConfig returns the values used when neither flag nor env supplies one.
@@ -137,6 +143,7 @@ func DefaultConfig() Config {
 		HTTPAddr:    ":8090",
 		MetricsAddr: ":9090",
 		RepoRoot:    "/workspace/loom-core",
+		LokiURL:     "http://loki.logging.svc.cluster.local:3100",
 	}
 }
 
@@ -145,6 +152,9 @@ func DefaultConfig() Config {
 func (c *Config) ApplyEnv() {
 	if v := strings.TrimSpace(os.Getenv("LOOM_MILLS_DB_PATH")); v != "" {
 		c.DBPath = v
+	}
+	if v := strings.TrimSpace(os.Getenv("LOKI_URL")); v != "" {
+		c.LokiURL = v
 	}
 	if v := strings.TrimSpace(os.Getenv("LOOM_MILLS_POLICY_PATH")); v != "" {
 		c.PolicyPath = v

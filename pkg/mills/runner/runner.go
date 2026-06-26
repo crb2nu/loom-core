@@ -49,6 +49,13 @@ type Runner struct {
 	RepoRoot  string
 	Logger    *slog.Logger
 
+	// Signals, when set, feeds recent workspace pain (Loki error clusters)
+	// into the council brief so proposals are grounded in real failures
+	// (W3.1 of .loom/126). Optional — nil omits the workspace-signals
+	// section. SignalWindow defaults to 24h when zero.
+	Signals      council.WorkspaceSignalSource
+	SignalWindow time.Duration
+
 	// Now is injectable for deterministic IDs in tests + dryrun. Defaults
 	// to time.Now.
 	Now func() time.Time
@@ -125,7 +132,7 @@ func (r *Runner) Run(ctx context.Context, in RunInput) (*RunResult, error) {
 	r.logf("council run starting", "run_id", res.RunID, "trigger", in.Trigger, "dryrun", in.Dryrun)
 
 	// ----- Brief -----
-	brief, err := council.Compile(ctx, council.BriefSources{Store: r.Store, RepoRoot: r.RepoRoot, Now: r.Now})
+	brief, err := council.Compile(ctx, council.BriefSources{Store: r.Store, RepoRoot: r.RepoRoot, Now: r.Now, Signals: r.Signals, SignalWindow: r.SignalWindow})
 	if err != nil {
 		return res, fmt.Errorf("brief: %w", err)
 	}

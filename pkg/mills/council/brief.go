@@ -39,7 +39,36 @@ type BriefSources struct {
 	// Now is injectable for deterministic test snapshots. Defaults to
 	// time.Now.
 	Now func() time.Time
+
+	// Signals, when set, supplies recent workspace pain (Loki error
+	// clusters) so the council proposes items grounded in real failures
+	// instead of synthetic canaries (W3.1 of .loom/126). Optional: a nil
+	// source, an error, or an empty result omits the section.
+	Signals WorkspaceSignalSource
+
+	// SignalWindow is how far back Signals reaches. Zero falls back to
+	// workspaceSignalDefaultWindow (24h).
+	SignalWindow time.Duration
 }
+
+// WorkspaceSignal is one clustered real-world failure surfaced into the council
+// brief — e.g. "logging/auth-service: 142 error lines, sample: ...".
+type WorkspaceSignal struct {
+	Source  string // origin of the signal, e.g. "loki"
+	Service string // namespace/app (or job) the signal is attributed to
+	Count   int    // occurrences in the window
+	Sample  string // a representative line, truncated
+}
+
+// WorkspaceSignalSource fetches recent workspace signals for the brief. The
+// Loki client (pkg/mills/clients) implements it; tests use a stub. Declared on
+// the consumer side so the brief stays decoupled from the concrete client.
+type WorkspaceSignalSource interface {
+	RecentErrorClusters(ctx context.Context, since time.Time) ([]WorkspaceSignal, error)
+}
+
+// workspaceSignalDefaultWindow is how far back the brief reaches for signals.
+const workspaceSignalDefaultWindow = 24 * time.Hour
 
 // briefDefaultMaxBytes is roughly 4k tokens at 4 chars/token. Generous
 // for a planning brief; we'll tighten if reviewers consistently hit it.
@@ -72,6 +101,7 @@ type BriefSourceCounts struct {
 	KPISnapshot      bool
 	IndexBytes       int
 	CrossRunFindings int // number of Loop C eval rows surfaced
+	WorkspaceSignals int // number of Loki/CI error clusters surfaced (W3.1)
 	TruncatedTo      int // final byte length after truncation, equal to MaxBytes if we hit the cap
 }
 
@@ -131,6 +161,23 @@ func Compile(ctx context.Context, src BriefSources) (*Brief, error) {
 	})
 	b.SourceCounts.BacklogQueued = len(queued)
 	b.SourceCounts.BacklogActive = active
+
+	// Workspace signals (W3.1): recent real failures so the council proposes
+	// grounded work. Best-effort — a source error or empty result just omits
+	// the section; it never fails the brief.
+	if src.Signals != nil {
+		window := src.SignalWindow
+		if window <= 0 {
+			window = workspaceSignalDefaultWindow
+		}
+		if sigs, serr := src.Signals.RecentErrorClusters(ctx, now.Add(-window)); serr == nil && len(sigs) > 0 {
+			b.Sections = append(b.Sections, BriefSection{
+				Heading: "Workspace signals (recent errors)",
+				Body:    renderSignals(sigs, window),
+			})
+			b.SourceCounts.WorkspaceSignals = len(sigs)
+		}
+	}
 
 	if src.RepoRoot != "" {
 		if body, n := readBriefFile(filepath.Join(src.RepoRoot, ".loom/00-index.md"), 8*1024); body != "" {
@@ -223,6 +270,18 @@ func renderBacklog(queued []*store.BacklogItem, active int) string {
 	b.WriteString("\nQueued items:\n")
 	for _, item := range queued {
 		fmt.Fprintf(&b, "- `%s` %s — %s\n", item.ID, item.Priority, item.Title)
+	}
+	return b.String()
+}
+
+// renderSignals formats workspace signals (W3.1) — the top recent error
+// clusters — so the council can propose grounded fixes. One line per cluster:
+// service, occurrence count, source, and a representative sample.
+func renderSignals(sigs []WorkspaceSignal, window time.Duration) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Top error clusters in the last %s (from workspace logs — propose fixes for these over synthetic work):\n\n", window.Round(time.Hour))
+	for _, s := range sigs {
+		fmt.Fprintf(&b, "- **%s** — %d occurrence(s) [%s]: `%s`\n", s.Service, s.Count, s.Source, s.Sample)
 	}
 	return b.String()
 }
