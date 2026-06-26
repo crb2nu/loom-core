@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,14 @@ import (
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
+
+// PlanAuthor authors a first-class Plan for a backlog item and returns
+// its plan_id. Declared locally (not imported from intake) so the
+// council package stays decoupled from the importer; *clients.PlanClient
+// satisfies both structurally. Implemented by *clients.PlanClient.
+type PlanAuthor interface {
+	AuthorPlan(ctx context.Context, item *store.BacklogItem, project string) (string, error)
+}
 
 // BacklogProposal is the editor's structured ask for one new backlog
 // item. The mutator translates one proposal → one canonical
@@ -109,6 +118,18 @@ type BacklogMutator struct {
 	Store *store.Store
 	// Now is injectable for deterministic IDs.
 	Now func() time.Time
+	// PlanAuthor, when set, authors a first-class Plan for each created
+	// item and stamps its plan_id so the item is born linked (plan store
+	// S7b-γ), instead of waiting for the boot-time backfill. Nil =
+	// disabled (the default); the backfill still links items later. Set by
+	// the operator when LOOM_MILLS_PLAN_AUTHORING is enabled and the MCP
+	// hub is reachable.
+	PlanAuthor PlanAuthor
+	// Project scopes authored plans (canonical GitLab path).
+	Project string
+	// Logger is used for best-effort plan-authoring diagnostics. Nil falls
+	// back to slog.Default().
+	Logger *slog.Logger
 }
 
 // Apply persists every accepted proposal into the canonical store, then
@@ -346,10 +367,39 @@ func (m *BacklogMutator) persistOne(ctx context.Context, runID string, now time.
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+	// Born-linked: author a Plan before the first Put when inline authoring
+	// is enabled, so the persisted item already carries a plan_id. Best-
+	// effort — a failure leaves the item unlinked and it still persists
+	// (the boot backfill links it later), so plan authoring never blocks
+	// the council from creating backlog items.
+	m.maybeAuthorPlan(ctx, item)
 	if err := m.Store.Backlog.Put(ctx, item); err != nil {
 		return nil, err
 	}
 	return item, nil
+}
+
+// maybeAuthorPlan authors a Plan for item and stamps item.PlanID when an
+// inline PlanAuthor is configured. Best-effort: a nil author or any
+// failure is a no-op (the item still persists; the boot backfill can link
+// it later), mirroring the GitLab importer's resilience.
+func (m *BacklogMutator) maybeAuthorPlan(ctx context.Context, item *store.BacklogItem) {
+	if m.PlanAuthor == nil || item == nil || item.PlanID != "" {
+		return
+	}
+	logger := m.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	planID, err := m.PlanAuthor.AuthorPlan(ctx, item, m.Project)
+	if err != nil {
+		logger.Warn("council plan authoring failed", "id", item.ID, "err", err)
+		return
+	}
+	if planID != "" {
+		item.PlanID = planID
+		logger.Info("council authored plan for item", "id", item.ID, "plan_id", planID)
+	}
 }
 
 // backlogYAML is the on-disk shape of one .loom/backlog/<id>.yaml

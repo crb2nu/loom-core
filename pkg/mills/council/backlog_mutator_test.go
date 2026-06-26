@@ -2,6 +2,7 @@ package council
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -466,4 +467,117 @@ func abs(x float64) float64 {
 		return -x
 	}
 	return x
+}
+
+// stubPlanAuthor records AuthorPlan calls and returns a canned id/err so
+// the S7b-γ inline-authoring tests can assert born-linked behaviour
+// without standing up the MCP hub.
+type stubPlanAuthor struct {
+	planID  string
+	err     error
+	calls   int
+	gotIDs  []string
+	project string
+}
+
+func (s *stubPlanAuthor) AuthorPlan(_ context.Context, item *store.BacklogItem, project string) (string, error) {
+	s.calls++
+	s.gotIDs = append(s.gotIDs, item.ID)
+	s.project = project
+	return s.planID, s.err
+}
+
+// TestApply_InlinePlanAuthoring_BornLinked: with a PlanAuthor set, each
+// created item is stamped with the returned plan_id and the canonical
+// store reflects the link (born linked, single write).
+func TestApply_InlinePlanAuthoring_BornLinked(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	author := &stubPlanAuthor{planID: "plan-mills-x"}
+	m.PlanAuthor = author
+	m.Project = "services/loom-core"
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(2)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if author.calls != 2 {
+		t.Fatalf("author calls: got %d want 2", author.calls)
+	}
+	if author.project != "services/loom-core" {
+		t.Errorf("project: got %q want services/loom-core", author.project)
+	}
+	for _, item := range res.CreatedItems {
+		if item.PlanID != "plan-mills-x" {
+			t.Errorf("item %s PlanID: got %q want plan-mills-x", item.ID, item.PlanID)
+		}
+		// Persisted row carries the link too (born linked).
+		got, gErr := st.Backlog.Get(context.Background(), item.ID)
+		if gErr != nil {
+			t.Fatalf("get %s: %v", item.ID, gErr)
+		}
+		if got.PlanID != "plan-mills-x" {
+			t.Errorf("stored %s PlanID: got %q want plan-mills-x", item.ID, got.PlanID)
+		}
+	}
+}
+
+// TestApply_InlinePlanAuthoring_NilAuthorNoop: without a PlanAuthor the
+// mutator behaves exactly as before (no PlanID, items still created) —
+// proving the flag-off path is zero behaviour change.
+func TestApply_InlinePlanAuthoring_NilAuthorNoop(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(1)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 1 {
+		t.Fatalf("created: got %d want 1", len(res.CreatedItems))
+	}
+	if res.CreatedItems[0].PlanID != "" {
+		t.Errorf("PlanID: got %q want empty", res.CreatedItems[0].PlanID)
+	}
+}
+
+// TestApply_InlinePlanAuthoring_AuthorErrorStillPersists: an author
+// failure is best-effort — the item still persists, just unlinked (the
+// boot backfill links it later). Authoring must never block creation.
+func TestApply_InlinePlanAuthoring_AuthorErrorStillPersists(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	m.PlanAuthor = &stubPlanAuthor{err: errors.New("hub unreachable")}
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(1)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 1 {
+		t.Fatalf("created: got %d want 1", len(res.CreatedItems))
+	}
+	item := res.CreatedItems[0]
+	if item.PlanID != "" {
+		t.Errorf("PlanID: got %q want empty (author failed)", item.PlanID)
+	}
+	if _, gErr := st.Backlog.Get(context.Background(), item.ID); gErr != nil {
+		t.Errorf("item not persisted after author error: %v", gErr)
+	}
+}
+
+// TestApply_InlinePlanAuthoring_EmptyPlanIDLeavesUnlinked: an author that
+// returns ("", nil) leaves the item unlinked rather than stamping an
+// empty id.
+func TestApply_InlinePlanAuthoring_EmptyPlanIDLeavesUnlinked(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	m.PlanAuthor = &stubPlanAuthor{planID: ""}
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(1)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.CreatedItems[0].PlanID != "" {
+		t.Errorf("PlanID: got %q want empty", res.CreatedItems[0].PlanID)
+	}
 }
