@@ -356,6 +356,14 @@
                   <WorkflowsPanel />
                 {:else if router.subView === 'plans'}
                   <PlansPanel />
+                {:else if router.subView === 'projects'}
+                  {#await import('./lib/components/ProjectsPanel.svelte')}
+                    <div class="panel-loading"><div class="loading-bar"><div class="loading-bar-inner"></div></div></div>
+                  {:then { default: ProjectsPanel }}
+                    <ProjectsPanel />
+                  {:catch}
+                    <EmptyState icon="!" heading="Failed to load panel" compact />
+                  {/await}
                 {:else if router.subView === 'feed'}
                   <KnowledgePanel />
                 {:else if router.subView === 'memory'}
