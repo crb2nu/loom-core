@@ -30,6 +30,7 @@ export interface Plan {
   mills_backlog_id?: string;
   kill_test_status?: string;
   slices?: PlanSlice[];
+  slice_summary?: Record<string, number>;
   updated_at?: string;
 }
 
@@ -80,6 +81,14 @@ export function gitlabMrUrl(ref: string, project?: string): string {
   const m = r.match(/(\d+)\s*$/);
   if (!m) return '';
   return `${GITLAB_BASE}/${projectPath(project)}/-/merge_requests/${m[1]}`;
+}
+
+// Build a GitLab branch (tree) URL for a slice's working branch.
+export function gitlabBranchUrl(branch: string, project?: string): string {
+  const b = (branch ?? '').trim();
+  if (!b) return '';
+  if (/^https?:\/\//.test(b)) return b;
+  return `${GITLAB_BASE}/${projectPath(project)}/-/tree/${encodeURIComponent(b)}`;
 }
 
 export function gitlabPipelineUrl(ref: string, project?: string): string {
@@ -159,6 +168,54 @@ export function filterPlans(
     result = result.filter((p) => p.phase === phaseFilter);
   }
   return result;
+}
+
+// --- Slice progress (board cards + drawer) ---------------------------------
+// Slice lifecycle order; drives the segmented progress bar.
+export const SLICE_PHASES = [
+  'pending', 'claimed', 'implementing', 'implemented', 'in_review', 'integrated', 'merged',
+] as const;
+
+// CSS color for a slice phase segment. Cool→warm→green as a slice advances.
+export function slicePhaseColor(phase: string): string {
+  switch (phase) {
+    case 'merged':
+    case 'integrated':
+      return 'var(--success, #4c8)';
+    case 'in_review':
+      return 'var(--warning, #db4)';
+    case 'implementing':
+    case 'implemented':
+    case 'claimed':
+      return 'var(--info, #4af)';
+    default: // pending / unknown
+      return 'var(--fg-dim, #678)';
+  }
+}
+
+export interface SliceProgress {
+  total: number;
+  merged: number;
+  segments: Array<{ phase: string; count: number; color: string }>;
+}
+
+// Build an ordered, colored segment list from a phase->count summary. Returns
+// null when there's nothing to show, so callers can omit the bar entirely.
+export function sliceProgress(summary?: Record<string, number> | null): SliceProgress | null {
+  if (!summary) return null;
+  const total = Object.values(summary).reduce((a, b) => a + (b || 0), 0);
+  if (total <= 0) return null;
+  const segments: SliceProgress['segments'] = [];
+  for (const phase of SLICE_PHASES) {
+    const count = summary[phase];
+    if (count) segments.push({ phase, count, color: slicePhaseColor(phase) });
+  }
+  // Surface any non-canonical phases at the end so nothing is silently dropped.
+  const known = new Set<string>(SLICE_PHASES);
+  for (const [phase, count] of Object.entries(summary)) {
+    if (!known.has(phase) && count) segments.push({ phase, count, color: slicePhaseColor(phase) });
+  }
+  return { total, merged: summary['merged'] ?? 0, segments };
 }
 
 export function projectOptionsFrom(plans: Plan[]): Array<{ value: string; label: string }> {
