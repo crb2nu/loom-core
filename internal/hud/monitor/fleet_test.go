@@ -1019,3 +1019,23 @@ func TestFleetMonitor_DegradedStateSurfacing(t *testing.T) {
 			snap4.Degraded, snap4.DegradedReason, snap4.DegradedSince)
 	}
 }
+
+func TestCountSessionsStartedToday(t *testing.T) {
+	now := time.Date(2026, 6, 27, 9, 26, 0, 0, time.Local)
+	mk := func(offset time.Duration) bridge.SessionInfo {
+		return bridge.SessionInfo{StartedAt: now.Add(offset).Format(time.RFC3339)}
+	}
+	sessions := []bridge.SessionInfo{
+		mk(-2 * time.Hour),        // earlier today
+		mk(-1 * time.Minute),      // today
+		mk(-30 * time.Hour),       // a prior day — excluded
+		{StartedAt: ""},           // no timestamp — excluded
+		{StartedAt: "not-a-time"}, // unparseable — excluded
+	}
+	if got := countSessionsStartedToday(sessions, now); got != 2 {
+		t.Fatalf("countSessionsStartedToday = %d, want 2", got)
+	}
+	if got := countSessionsStartedToday(nil, now); got != 0 {
+		t.Fatalf("empty list = %d, want 0", got)
+	}
+}
