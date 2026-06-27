@@ -22,6 +22,7 @@
     planPhaseVariant,
     gitlabMrUrl,
     gitlabPipelineUrl,
+    gitlabBranchUrl,
     refLabel,
     groupPlansByPhase,
     groupPlansByProject,
@@ -118,6 +119,10 @@
 
   function openBacklog(backlogId: string) {
     router.navigate('mills', 'backlog', backlogId);
+  }
+  // Jump to the agent working a slice in the Fleet view.
+  function openAgent(_agentId: string) {
+    router.navigate('agents', 'fleet');
   }
 
   let filtered = $derived(filterPlans(plans, search, projectFilter, phaseFilter));
@@ -367,14 +372,33 @@
             <div class="slice-head">
               <Badge text={s.phase} variant={planPhaseVariant(s.phase)} />
               <span class="slice-name">{s.name}</span>
-              {#if s.assigned_agent_id}<span class="dim small"> · {s.assigned_agent_id}</span>{/if}
+              {#if s.assigned_agent_id}
+                <button class="slice-agent" onclick={() => openAgent(s.assigned_agent_id)} title="Open {s.assigned_agent_id} in Fleet">{s.assigned_agent_id}</button>
+              {/if}
               {#if s.mr_ref}
                 {@const surl = gitlabMrUrl(s.mr_ref, selected.project)}
                 {#if surl}<a class="ref-link small" href={surl} target="_blank" rel="noopener">{refLabel(s.mr_ref, 'mr')}</a>{/if}
               {/if}
               <span class="slice-tcount dim small">{stasks.length ? `${stasks.length} task${stasks.length !== 1 ? 's' : ''}` : 'no tasks'}</span>
             </div>
-            {#if s.branch_name}<div class="dim text-mono small">⎇ {s.branch_name}</div>{/if}
+            {#if s.branch_name}
+              {@const burl = gitlabBranchUrl(s.branch_name, selected.project)}
+              <div class="slice-sub">
+                {#if burl}
+                  <a class="branch-link" href={burl} target="_blank" rel="noopener" title="Open branch on GitLab">⎇ {s.branch_name}</a>
+                {:else}
+                  <span class="dim text-mono small">⎇ {s.branch_name}</span>
+                {/if}
+              </div>
+            {/if}
+            {#if s.files?.length}
+              <div class="slice-files dim small text-mono" title={s.files.join('\n')}>📄 {s.files.slice(0, 4).join(', ')}{#if s.files.length > 4} +{s.files.length - 4}{/if}</div>
+            {/if}
+            {#if s.decisions?.length}
+              <ul class="slice-decisions">
+                {#each s.decisions as d}<li>{d}</li>{/each}
+              </ul>
+            {/if}
             {#if stasks.length}
               <ul class="task-rollup">
                 {#each stasks as t}
@@ -482,6 +506,23 @@
   .slice-head { display: flex; align-items: center; gap: 6px; font-size: var(--text-sm); flex-wrap: wrap; }
   .slice-name { color: var(--fg-primary); }
   .slice-tcount { margin-left: auto; }
+  .slice-agent {
+    background: none; border: 1px solid var(--border-subtle); color: var(--fg-secondary);
+    border-radius: var(--radius-sm); padding: 0 6px; font-size: var(--text-xs);
+    font-family: var(--font-mono); cursor: pointer;
+  }
+  .slice-agent:hover { border-color: var(--accent, #2af); color: var(--accent, #2af); }
+  .slice-sub { margin-top: 1px; }
+  .branch-link {
+    font-family: var(--font-mono); font-size: var(--text-xs); color: var(--fg-secondary);
+    text-decoration: none; border-bottom: 1px dotted var(--border);
+  }
+  .branch-link:hover { color: var(--accent, #2af); border-bottom-color: var(--accent, #2af); }
+  .slice-files { margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slice-decisions {
+    list-style: disc; margin: 2px 0 0; padding-left: var(--space-4);
+    font-size: var(--text-xs); color: var(--fg-secondary);
+  }
   .task-rollup { list-style: none; margin: 2px 0 0; padding: 0 0 0 var(--space-3); display: flex; flex-direction: column; gap: 2px; border-left: 1px solid var(--border-subtle); }
   .task-row { display: flex; align-items: center; gap: 6px; font-size: var(--text-xs); min-width: 0; }
   .task-title { color: var(--fg-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -83,6 +83,14 @@ export function gitlabMrUrl(ref: string, project?: string): string {
   return `${GITLAB_BASE}/${projectPath(project)}/-/merge_requests/${m[1]}`;
 }
 
+// Build a GitLab branch (tree) URL for a slice's working branch.
+export function gitlabBranchUrl(branch: string, project?: string): string {
+  const b = (branch ?? '').trim();
+  if (!b) return '';
+  if (/^https?:\/\//.test(b)) return b;
+  return `${GITLAB_BASE}/${projectPath(project)}/-/tree/${encodeURIComponent(b)}`;
+}
+
 export function gitlabPipelineUrl(ref: string, project?: string): string {
   const r = (ref ?? '').trim();
   if (!r) return '';
