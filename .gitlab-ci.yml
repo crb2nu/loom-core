@@ -389,12 +389,44 @@ lint:mcp-godot:
 # Build binaries before tests to enable integration testing
 # =============================================================================
 
+# Build the Svelte HUD frontend bundle (vite). The bundle is embedded into the
+# loom/loomd binaries via //go:embed all:frontend/dist but is NOT committed to
+# git (its content-hashed filenames churned on every build, conflicting on every
+# concurrent HUD MR). Every Go build job that embeds it pulls this job's `dist/`
+# artifact; the Docker image builds the bundle in its own frontend stage.
+build:frontend:
+  image: docker.io/library/node:20
+  stage: lint
+  variables:
+    # Global GIT_STRATEGY is "none"; this job needs the frontend sources.
+    GIT_STRATEGY: fetch
+  before_script: []
+  cache:
+    key: hud-frontend-pnpm-${CI_COMMIT_REF_SLUG}
+    paths:
+      - internal/hud/frontend/node_modules/
+  script:
+    # pnpm 10 — the frontend's pnpm-workspace.yaml uses pnpm-10 settings semantics
+    # (ignoredBuiltDependencies, no `packages:` field); pnpm 9 rejects it.
+    - npm install -g pnpm@10
+    - cd internal/hud/frontend
+    - pnpm install --frozen-lockfile
+    - pnpm build
+    - test -s dist/index.html
+    - echo "HUD bundle built:" && ls -la dist dist/assets | head -20
+  artifacts:
+    paths:
+      - internal/hud/frontend/dist/
+    expire_in: 1 day
+
 build:binaries:
   <<: *go-template
   stage: build
   needs:
     - job: prepare:go-cache
       artifacts: false
+    - job: build:frontend
+      artifacts: true
   variables:
     GO_WARM_MOD_CACHE: "false"
     # Keep generous limits, but lower requests so bursty branch pipelines fit
@@ -425,6 +457,14 @@ build:binaries:
 
       echo "Building all binaries..."
       mkdir -p bin
+
+      # The HUD bundle is embedded into cmd/loom via //go:embed and arrives as the
+      # build:frontend artifact (it is not committed). Fail loudly if it is missing
+      # rather than silently shipping a stub HUD.
+      if [ ! -s internal/hud/frontend/dist/index.html ]; then
+        echo "ERROR: internal/hud/frontend/dist/index.html missing — build:frontend artifact not present" >&2
+        exit 1
+      fi
 
       # Build main binaries
       go build -ldflags="$LDFLAGS" -o bin/loom ./cmd/loom
@@ -654,7 +694,10 @@ build:linux-amd64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-linux-amd64 ./cmd/loom
   artifacts:
     paths:
@@ -668,7 +711,10 @@ build:linux-arm64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-linux-arm64 ./cmd/loom
   artifacts:
     paths:
@@ -682,7 +728,10 @@ build:darwin-amd64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-darwin-amd64 ./cmd/loom
   artifacts:
     paths:
@@ -696,7 +745,10 @@ build:darwin-arm64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-darwin-arm64 ./cmd/loom
   artifacts:
     paths:

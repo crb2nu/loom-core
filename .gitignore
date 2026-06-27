@@ -8,6 +8,13 @@ bin/
 *.exe
 *.test
 
+# Built HUD frontend bundle (vite output) — generated, not committed.
+# Committing the content-hashed dist caused a merge conflict on every concurrent
+# HUD MR. Built by `make hud-frontend`, CI `build:frontend`, and the Docker
+# frontend builder stage. The .gitkeep is kept so //go:embed stays valid.
+internal/hud/frontend/dist/*
+!internal/hud/frontend/dist/.gitkeep
+
 # Test and coverage
 *.out
 coverage.html
