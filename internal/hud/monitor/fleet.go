@@ -356,6 +356,27 @@ func (m *FleetMonitor) KPIs() KPICounters {
 	return m.kpis
 }
 
+// countSessionsStartedToday counts sessions whose StartedAt falls on the
+// current local day. It backs the durable SessionsToday recompute in refresh()
+// so the count survives daemon/pod restarts (unlike the in-memory increment).
+func countSessionsStartedToday(sessions []bridge.SessionInfo, now time.Time) int {
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	n := 0
+	for _, s := range sessions {
+		if s.StartedAt == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, s.StartedAt)
+		if err != nil {
+			continue
+		}
+		if !t.Local().Before(midnight) {
+			n++
+		}
+	}
+	return n
+}
+
 // IncrementKPI atomically increments a specific KPI counter.
 func (m *FleetMonitor) IncrementKPI(field string, delta int) {
 	m.Lock()
@@ -517,6 +538,27 @@ func (m *FleetMonitor) refresh(force bool) error {
 					snap.Sessions = append(snap.Sessions, s)
 				}
 			}
+		}
+	}
+
+	// Durable "sessions today": recompute from the fetched session list
+	// (which includes ended/summarized rows) rather than trusting the
+	// in-memory SessionsToday counter, which resets to 0 on every daemon
+	// restart — and the cluster mobile-hud pod rolls on each loom-core image
+	// build, so the Now-page "TODAY · N sessions" chronically read 0 right
+	// after a roll. max() so a transient truncated/active-only fetch can
+	// never regress the day's count.
+	if sessionsOK {
+		if today := countSessionsStartedToday(snap.Sessions, time.Now()); today > 0 {
+			m.Lock()
+			dayKey := time.Now().Format("2006-01-02")
+			if m.kpis.resetDate != dayKey {
+				m.kpis = KPICounters{resetDate: dayKey}
+			}
+			if today > m.kpis.SessionsToday {
+				m.kpis.SessionsToday = today
+			}
+			m.Unlock()
 		}
 	}
 

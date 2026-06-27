@@ -36,6 +36,13 @@
     return `${(v * 100).toFixed(1)}%`;
   }
 
+  // Integer count: shows "0" (a real, meaningful value) rather than "—" so the
+  // north-star merge count reads as data even when the derived ratios are idle.
+  function fmtCount(v: number | undefined): string {
+    if (v === undefined || !Number.isFinite(v)) return '—';
+    return `${Math.round(v)}`;
+  }
+
   // Trend direction relative to the first sample in history. Used to
   // pick the sparkline color so an "↓ trend" KPI like cost-per-merge
   // colors green on a downward trend, red on upward.
@@ -85,6 +92,15 @@
       badgeVariant?: BadgeVariant;
       proxy?: boolean;
     }> = [
+      {
+        // North-star: autonomous merges in the window. Always a real number
+        // (incl. 0), so the row leads with signal even when the derived ratios
+        // are idle/"—".
+        label: 'Merges 24h',
+        value: fmtCount(m.pipeline_merged_runs),
+        trend: millsStore.metricSeries('pipeline_merged_runs'),
+        trendColor: trendColor(millsStore.metricSeries('pipeline_merged_runs'), 'higher-better'),
+      },
       {
         label: 'Cost / merged',
         value: fmtUSD(costPerMerged),
