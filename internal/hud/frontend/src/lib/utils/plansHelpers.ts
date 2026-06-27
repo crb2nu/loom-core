@@ -83,12 +83,37 @@ export function gitlabMrUrl(ref: string, project?: string): string {
   return `${GITLAB_BASE}/${projectPath(project)}/-/merge_requests/${m[1]}`;
 }
 
-// Build a GitLab branch (tree) URL for a slice's working branch.
+// Build a GitLab branch (tree) URL for a slice's working branch. Encode each
+// path segment but keep the slashes literal: GitLab's tree route 404s on a
+// percent-encoded slash (`feat%2Ffoo`), and its own UI links branches as
+// `…/-/tree/feat/foo`. encodeURIComponent('feat/foo') would yield the broken
+// form, so split on '/' and encode the segments instead.
 export function gitlabBranchUrl(branch: string, project?: string): string {
   const b = (branch ?? '').trim();
   if (!b) return '';
   if (/^https?:\/\//.test(b)) return b;
-  return `${GITLAB_BASE}/${projectPath(project)}/-/tree/${encodeURIComponent(b)}`;
+  const ref = b.split('/').map(encodeURIComponent).join('/');
+  return `${GITLAB_BASE}/${projectPath(project)}/-/tree/${ref}`;
+}
+
+// Build the instructions body for handing a plan (or a single slice) off to an
+// existing agent via POST /api/handoffs. It's a self-contained brief the
+// receiving agent reads from its inbox — mirrors the spawn task_description but
+// stands alone, and always points back at the live Plan store so the agent
+// pulls the authoritative spec rather than trusting this snapshot.
+export function dispatchInstructions(plan: Plan, slice?: PlanSlice): string {
+  const lines: string[] = [];
+  if (slice) {
+    lines.push(`Work slice "${slice.name}" of plan "${plan.title}" (${plan.id}).`);
+    if (slice.branch_name) lines.push(`Branch: ${slice.branch_name}`);
+    if (slice.files?.length) lines.push(`Files: ${slice.files.join(', ')}`);
+  } else {
+    lines.push(`Work on plan "${plan.title}" (${plan.id}).`);
+  }
+  if (plan.project) lines.push(`Project: ${plan.project}`);
+  if (plan.mirror_path) lines.push(`Spec: ${plan.mirror_path}`);
+  lines.push(`Fetch the live spec + slices from the agent-context Plan store (plan_id=${plan.id}) before starting.`);
+  return lines.join('\n');
 }
 
 export function gitlabPipelineUrl(ref: string, project?: string): string {

@@ -13,14 +13,18 @@
   import FilterBar from './shared/FilterBar.svelte';
   import DetailDrawer from './shared/DetailDrawer.svelte';
   import ConfirmDialog from './shared/ConfirmDialog.svelte';
+  import PlanDispatchDialog from './shared/PlanDispatchDialog.svelte';
   import { toastStore } from '../stores/toasts.svelte.ts';
   import { router } from '../stores/router.svelte.ts';
   import { taskStore } from '../stores/tasks.svelte.ts';
   import { millsStore } from '../stores/mills.svelte.ts';
   import { spawnStore } from '../stores/spawn.svelte.ts';
+  import { fleetStore } from '../stores/fleet.svelte.ts';
+  import { createHandoff } from '../clients/presenceActions.ts';
   import { relativeTime } from '../utils/format.ts';
   import {
     type Plan,
+    type PlanSlice,
     PLAN_ADVANCE_TARGETS,
     planPhaseVariant,
     gitlabMrUrl,
@@ -32,6 +36,7 @@
     filterPlans,
     projectOptionsFrom,
     sliceProgress,
+    dispatchInstructions,
   } from '../utils/plansHelpers';
 
   let plans = $state<Plan[]>([]);
@@ -139,14 +144,32 @@
     router.navigate('agents', 'fleet');
   }
 
-  // --- Kick a plan/slice off to a session or to Mills ----------------------
+  // --- Hand a plan/slice off to a session, an agent, or Mills --------------
+  // One "Hand off" affordance per plan and per slice opens a chooser dialog;
+  // every destination routes through here. `dispatchTarget` is the plan (and
+  // optional slice) being dispatched; `confirmMillsTarget` defers the autonomous
+  // Mills path behind a second confirm because it spends budget + may merge.
   let busy = $state(false);
-  let confirmMills = $state(false);
+  let dispatchOpen = $state(false);
+  let dispatchTarget = $state<{ plan: Plan; slice?: PlanSlice } | null>(null);
+  let confirmMillsTarget = $state<{ plan: Plan; slice?: PlanSlice } | null>(null);
+
+  function openDispatch(plan: Plan, slice?: PlanSlice) {
+    dispatchTarget = { plan, slice };
+    dispatchOpen = true;
+    // Refresh the live-agent list so the "hand to existing agent" picker is
+    // current even when the Fleet panel was never mounted this session.
+    void fleetStore.fetch();
+  }
+  function closeDispatch() {
+    dispatchOpen = false;
+    dispatchTarget = null;
+  }
 
   // Spawn an agent session to work a plan (or a specific slice). Runs on the
   // connected daemon's spawn substrate; the plan/slice ids ride in metadata so
   // the session is traceable and the spawned agent can fetch the live spec.
-  async function spawnSession(plan: Plan, slice?: { id: string; name: string; branch_name?: string }) {
+  async function spawnSession(plan: Plan, slice?: PlanSlice) {
     if (busy) return;
     busy = true;
     const meta: Record<string, string> = { plan_id: plan.id, source: 'hud-plans' };
@@ -168,22 +191,68 @@
     }
   }
 
-  // Run the selected plan in Mills: start its born-linked backlog item, or
-  // create one from the plan (deterministic id => idempotent) then start it.
-  async function runInMills() {
-    confirmMills = false;
-    if (!selected || busy) return;
+  // Dispatch-dialog → spawn a fresh session for the chosen target.
+  async function dispatchSpawn() {
+    const t = dispatchTarget;
+    if (!t) return;
+    closeDispatch();
+    await spawnSession(t.plan, t.slice);
+  }
+
+  // Dispatch-dialog → hand the target off to an existing agent's inbox. The
+  // backend auto-provisions a source dispatch session, so we only need the
+  // target agent + a self-contained brief.
+  async function dispatchHandoff(targetAgentId: string) {
+    const t = dispatchTarget;
+    if (!t || busy) return;
     busy = true;
     try {
-      let backlogId = selected.mills_backlog_id;
+      await createHandoff({
+        target_agent_id: targetAgentId,
+        instructions: dispatchInstructions(t.plan, t.slice),
+        handoff_type: 'summary_only',
+      });
+      toastStore.success(`Handed off to ${targetAgentId}`);
+      closeDispatch();
+      router.navigate('agents', 'fleet');
+    } catch (e) {
+      toastStore.error(`Handoff failed: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Dispatch-dialog → Mills. Hand off to the confirm gate (autonomous + spendy).
+  function dispatchMills() {
+    if (!dispatchTarget) return;
+    confirmMillsTarget = dispatchTarget;
+    closeDispatch();
+  }
+
+  // Run a plan (or a single slice) in Mills: for a whole plan, start its
+  // born-linked backlog item or create one from the plan; for a slice, always
+  // create a slice-scoped backlog item. Deterministic ids keep both idempotent.
+  async function runInMills() {
+    const t = confirmMillsTarget;
+    confirmMillsTarget = null;
+    if (!t || busy) return;
+    const { plan, slice } = t;
+    busy = true;
+    try {
+      // A slice runs as its own backlog item; only a whole-plan run can reuse
+      // the plan's born-linked backlog id.
+      let backlogId = slice ? '' : (plan.mills_backlog_id ?? '');
       if (!backlogId) {
+        const slices = slice
+          ? [{ name: slice.name, files: slice.files || [] }]
+          : (plan.slices || []).map((s) => ({ name: s.name, files: s.files || [] }));
         const item: Record<string, unknown> = {
-          id: `bl-${selected.slug || selected.id}`,
-          title: selected.title,
-          plan_id: selected.id,
+          id: slice ? `bl-${plan.slug || plan.id}-${slice.id}` : `bl-${plan.slug || plan.id}`,
+          title: slice ? `${plan.title} — ${slice.name}` : plan.title,
+          plan_id: plan.id,
           state: 'queued',
-          spec_doc: selected.mirror_path || '',
-          slices: (selected.slices || []).map((s) => ({ name: s.name, files: s.files || [] })),
+          spec_doc: plan.mirror_path || '',
+          slices,
           created_by: 'hud-user',
         };
         const created = await millsStore.createBacklog(item);
@@ -404,11 +473,8 @@
   {#snippet footer()}
     {#if selected}
       <div class="drawer-actions">
-        <button class="btn btn-ghost" disabled={busy} onclick={() => spawnSession(selected!)} title="Spawn an agent session to work this plan">
-          ⟳ Spawn session
-        </button>
-        <button class="btn btn-success" disabled={busy} onclick={() => (confirmMills = true)} title="Create/queue a Mills backlog item and start an autonomous pipeline">
-          ❖ Run in Mills
+        <button class="btn btn-success" disabled={busy} onclick={() => openDispatch(selected!)} title="Hand this plan off to a session, an existing agent, or Mills">
+          ⤳ Hand off…
         </button>
       </div>
     {/if}
@@ -472,7 +538,7 @@
                 {#if surl}<a class="ref-link small" href={surl} target="_blank" rel="noopener">{refLabel(s.mr_ref, 'mr')}</a>{/if}
               {/if}
               <span class="slice-tcount dim small">{stasks.length ? `${stasks.length} task${stasks.length !== 1 ? 's' : ''}` : 'no tasks'}</span>
-              <button class="slice-spawn" disabled={busy} onclick={() => spawnSession(selected!, s)} title="Spawn a session to work this slice">⟳ spawn</button>
+              <button class="slice-spawn" disabled={busy} onclick={() => openDispatch(selected!, s)} title="Hand this slice off to a session, an agent, or Mills">⤳ hand off</button>
             </div>
             {#if s.branch_name}
               {@const burl = gitlabBranchUrl(s.branch_name, selected.project)}
@@ -526,13 +592,24 @@
   {/if}
 </DetailDrawer>
 
+<PlanDispatchDialog
+  open={dispatchOpen}
+  target={dispatchTarget}
+  agents={fleetStore.liveAgents}
+  {busy}
+  onSpawn={dispatchSpawn}
+  onHandoff={dispatchHandoff}
+  onMills={dispatchMills}
+  onClose={closeDispatch}
+/>
+
 <ConfirmDialog
-  open={confirmMills}
+  open={!!confirmMillsTarget}
   title="Run in Mills?"
-  message={`Create/queue a Mills backlog item for "${selected?.title ?? ''}" and start an autonomous pipeline. This spends budget and may open and merge a merge request.`}
+  message={`Create/queue a Mills backlog item for "${confirmMillsTarget?.slice?.name ?? confirmMillsTarget?.plan.title ?? ''}" and start an autonomous pipeline. This spends budget and may open and merge a merge request.`}
   confirmLabel="Run in Mills"
   onConfirm={runInMills}
-  onCancel={() => (confirmMills = false)}
+  onCancel={() => (confirmMillsTarget = null)}
 />
 
 <style>
