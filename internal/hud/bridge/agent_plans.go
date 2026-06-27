@@ -46,8 +46,11 @@ type PlanInfo struct {
 	KillTestStatus string                `json:"kill_test_status,omitempty"`
 	PhaseHistory   []PlanPhaseTransition `json:"phase_history,omitempty"`
 	Slices         []PlanSliceInfo       `json:"slices,omitempty"`
-	CreatedAt      string                `json:"created_at,omitempty"`
-	UpdatedAt      string                `json:"updated_at,omitempty"`
+	// SliceSummary is a phase->count rollup the plan store computes on list so
+	// the board can show per-plan slice progress without a detail fetch.
+	SliceSummary map[string]int `json:"slice_summary,omitempty"`
+	CreatedAt    string         `json:"created_at,omitempty"`
+	UpdatedAt    string         `json:"updated_at,omitempty"`
 }
 
 // Plans lists plans, optionally filtered by project / namespace / phase.

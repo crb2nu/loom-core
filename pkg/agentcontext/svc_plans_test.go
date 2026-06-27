@@ -106,6 +106,54 @@ func TestPlan_ListByProject(t *testing.T) {
 	}
 }
 
+// TestPlan_ListSliceSummary covers the board slice-progress enrichment: List
+// must attach a per-plan slice_summary (phase->count) so the HUD can draw a
+// progress bar without a detail fetch per card.
+func TestPlan_ListSliceSummary(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	ps := newTestPlanSvc()
+	ctx := context.Background()
+
+	res, err := ps.Create(ctx, map[string]any{
+		"title":   "Sliced",
+		"project": "proj/s",
+		"slices": []any{
+			map[string]any{"name": "s1", "files": []any{"a.go"}},
+			map[string]any{"name": "s2", "files": []any{"b.go"}},
+		},
+	})
+	okJSON(t, res, err)
+	// A second, slice-less plan must NOT get a summary (omitempty).
+	res, err = ps.Create(ctx, map[string]any{"title": "Bare", "project": "proj/s"})
+	okJSON(t, res, err)
+
+	res, err = ps.List(ctx, map[string]any{"project": "proj/s"})
+	got := okJSON(t, res, err)
+	plans, _ := got["plans"].([]any)
+	if len(plans) != 2 {
+		t.Fatalf("want 2 plans, got %d", len(plans))
+	}
+	var summarized int
+	for _, raw := range plans {
+		p := raw.(map[string]any)
+		ss, ok := p["slice_summary"].(map[string]any)
+		if !ok {
+			continue
+		}
+		summarized++
+		total := 0
+		for _, v := range ss {
+			total += int(v.(float64))
+		}
+		if total != 2 {
+			t.Fatalf("plan %v slice_summary total = %d, want 2 (%v)", p["title"], total, ss)
+		}
+	}
+	if summarized != 1 {
+		t.Fatalf("exactly one plan should carry a slice_summary, got %d", summarized)
+	}
+}
+
 func TestPlan_PayloadRoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := &Plan{

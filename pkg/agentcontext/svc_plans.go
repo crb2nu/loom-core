@@ -319,7 +319,59 @@ func (ps *PlanSvc) List(ctx context.Context, args map[string]any) (*mcp.CallTool
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("list plans: %w", err)), nil
 	}
+	ps.attachSliceSummaries(ctx, plans)
 	return mcp.JSONResult(map[string]any{"ok": true, "count": len(plans), "plans": plans})
+}
+
+// attachSliceSummaries fills each plan's SliceSummary (phase -> count) with ONE
+// batched scroll of the slice collection (grouped in memory by plan_id), so the
+// HUD board can render per-plan slice progress without a detail fetch per card.
+// Best-effort: on any error or empty store it leaves summaries unset and the
+// cards simply omit the progress bar.
+func (ps *PlanSvc) attachSliceSummaries(ctx context.Context, plans []*Plan) {
+	if len(plans) == 0 {
+		return
+	}
+	byPlan := make(map[string]map[string]int)
+	add := func(planID, phase string) {
+		if planID == "" {
+			return
+		}
+		m := byPlan[planID]
+		if m == nil {
+			m = make(map[string]int)
+			byPlan[planID] = m
+		}
+		m[phase]++
+	}
+
+	if ps.slicesQ != nil {
+		if points, err := ps.slicesQ.ScrollPoints(ctx, nil, 2000, false); err == nil {
+			for _, pt := range points {
+				if s := payloadToSlice(pt.Payload); s != nil {
+					add(s.PlanID, s.Phase)
+				}
+			}
+		} else {
+			ps.logger.Debug("slice-summary scroll failed; using cache", "error", err)
+		}
+	}
+	// Fall back to the in-memory cache when Qdrant is absent (tests) or empty.
+	if len(byPlan) == 0 {
+		ps.mu.RLock()
+		for _, s := range ps.slices {
+			if s != nil {
+				add(s.PlanID, s.Phase)
+			}
+		}
+		ps.mu.RUnlock()
+	}
+
+	for _, p := range plans {
+		if m, ok := byPlan[p.ID]; ok && len(m) > 0 {
+			p.SliceSummary = m
+		}
+	}
 }
 
 func (ps *PlanSvc) list(ctx context.Context, project, namespace, phase string, limit int) ([]*Plan, error) {

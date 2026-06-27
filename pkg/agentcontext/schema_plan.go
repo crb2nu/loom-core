@@ -131,6 +131,11 @@ type Plan struct {
 	// NOT stored on the plan payload (slices are their own records).
 	Slices []PlanSlice `json:"slices,omitempty"`
 
+	// SliceSummary is a phase->count rollup computed on List (one batched scroll
+	// of the slice collection) so the HUD can render a per-plan slice-progress
+	// bar without N detail fetches. Computed-only; never stored.
+	SliceSummary map[string]int `json:"slice_summary,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
