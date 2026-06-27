@@ -7,9 +7,12 @@
    *   task: any | null,
    *   onClose: () => void,
    *   onResolve: (task: any) => void,
+   *   onOpenPlan?: (planId: string) => void,
+   *   onSelectTask?: (taskId: string) => void,
+   *   lookupTask?: (taskId: string) => { id: string, title: string, status?: string } | undefined,
    * }}
    */
-  let { task, onClose, onResolve } = $props();
+  let { task, onClose, onResolve, onOpenPlan, onSelectTask, lookupTask } = $props();
 
   import { coordinationStore } from '../../stores/coordination.svelte.ts';
   import { relativeTime, statusVariant, priorityVariant } from '../../utils/format.ts';
@@ -50,6 +53,24 @@
   {/snippet}
 
   {#if task}
+    {#if task.plan_id}
+      <div class="section">
+        <div class="section-title text-xs uppercase text-muted">Plan</div>
+        <div class="plan-links">
+          <button
+            type="button"
+            class="plan-link"
+            title="Open plan {task.plan_id}"
+            onclick={() => onOpenPlan?.(task.plan_id)}
+          >
+            ◈ {task.plan_id}
+          </button>
+          {#if task.slice_id}
+            <span class="slice-chip" title="Plan slice">slice {task.slice_id}</span>
+          {/if}
+        </div>
+      </div>
+    {/if}
     {#if task.context}
       <div class="section">
         <div class="section-title text-xs uppercase text-muted">Context</div>
@@ -77,9 +98,22 @@
         <div class="section-title text-xs uppercase text-muted">Blocked By</div>
         <div class="dep-list">
           {#each task.blocked_by as depId}
-            <span class="blocked-id" class:resolved={task.resolved_deps?.includes(depId)}>
-              {depId.slice(0, 12)}
-            </span>
+            {@const dep = lookupTask?.(depId)}
+            {#if dep && onSelectTask}
+              <button
+                type="button"
+                class="blocked-id blocked-link"
+                class:resolved={task.resolved_deps?.includes(depId)}
+                title="Open blocking task: {dep.title}"
+                onclick={() => onSelectTask(depId)}
+              >
+                {dep.title}
+              </button>
+            {:else}
+              <span class="blocked-id" class:resolved={task.resolved_deps?.includes(depId)}>
+                {depId.slice(0, 12)}
+              </span>
+            {/if}
           {/each}
         </div>
       </div>
@@ -131,6 +165,27 @@
     color: var(--fg-secondary);
     border: 1px solid var(--border-subtle);
   }
+  .plan-links { display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center; }
+  .plan-link {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    padding: 2px 8px;
+    background: color-mix(in srgb, var(--accent, #2af) 12%, var(--bg-tertiary));
+    border: 1px solid color-mix(in srgb, var(--accent, #2af) 35%, var(--border));
+    border-radius: var(--radius-sm);
+    color: var(--accent, #2af);
+    cursor: pointer;
+  }
+  .plan-link:hover { background: color-mix(in srgb, var(--accent, #2af) 22%, var(--bg-tertiary)); }
+  .slice-chip {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    padding: 2px 6px;
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-subtle);
+  }
   .dep-list { display: flex; gap: var(--space-1); flex-wrap: wrap; }
   .blocked-id {
     font-size: var(--text-xs);
@@ -140,6 +195,8 @@
     color: var(--fg-secondary);
     border: 1px solid var(--border-subtle);
   }
+  .blocked-link { cursor: pointer; color: var(--fg-primary); }
+  .blocked-link:hover { border-color: var(--accent, #2af); color: var(--accent, #2af); }
   .blocked-id.resolved { opacity: 0.4; text-decoration: line-through; }
   .relation-cards { display: flex; flex-direction: column; gap: var(--space-2); }
   .relation-card {

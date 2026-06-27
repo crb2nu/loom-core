@@ -7,6 +7,7 @@
   // the cost estimate, and cross-links to the runs executing the item (plus
   // a Start-pipeline action when none exist yet).
   import { millsStore } from '../../stores/mills.svelte.ts';
+  import { router } from '../../stores/router.svelte.ts';
   import DetailDrawer from '../shared/DetailDrawer.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import { runAdminAction } from './shared/millsActions.ts';
@@ -24,6 +25,17 @@
   // load-bearing cross-link: "why is this escalated?" → open its run.
   let runs = $derived(selectedID ? millsStore.pipelineRunsForBacklog(selectedID) : []);
 
+  // Escalation attention: when the item (or its newest run) is escalated/failed,
+  // surface the most-likely culprit run + stage at the top so an operator
+  // triaging at scale sees "where to look" without drilling run → stage → log.
+  const ATTENTION_STATES = new Set(['escalated', 'failed']);
+  let attentionRun = $derived(
+    runs.find((r) => ATTENTION_STATES.has((r.State ?? '').toLowerCase())) ?? null,
+  );
+  let needsAttention = $derived(
+    !!detail && (ATTENTION_STATES.has((detail.State ?? '').toLowerCase()) || !!attentionRun),
+  );
+
   // Start is offered only when the item has no run yet and isn't terminal —
   // re-starting a merged item or one already mid-flight would be confusing.
   const TERMINAL_STATES = new Set(['merged', 'done', 'closed']);
@@ -39,6 +51,13 @@
 
   function openRun(id: string): void {
     millsStore.openRunDetail(id);
+  }
+
+  // Deep-link the born-linked plan into Work → Plans. PlanID is authoritative
+  // (set when the council/import born-links the item or the boot backfill runs).
+  function openPlan(id: string): void {
+    millsStore.closeBacklogDetail();
+    router.navigate('tasks', 'plans', id);
   }
 
   async function doStart(): Promise<void> {
@@ -96,6 +115,21 @@
       </button>
     </div>
   {:else if detail}
+    {#if needsAttention}
+      <section class="attention" role="alert">
+        <span class="attention-icon" aria-hidden="true">⚠</span>
+        <div class="attention-body">
+          <strong>Needs attention — {detail.State}</strong>
+          {#if attentionRun}
+            <button type="button" class="attention-link" onclick={() => openRun(attentionRun.ID)}>
+              {attentionRun.State}{#if attentionRun.CurrentStage} at <span class="mono">{attentionRun.CurrentStage}</span>{/if} · open run {shortRun(attentionRun.ID)} →
+            </button>
+          {:else}
+            <span class="muted">No run linked yet — check the council decision and dependencies.</span>
+          {/if}
+        </div>
+      </section>
+    {/if}
     <!-- Cost + linkouts -->
     <section class="grid">
       <div class="cell">
@@ -111,6 +145,16 @@
         <span class="k">Council run</span>
         <span class="v mono">
           {#if detail.CouncilRunID}{detail.CouncilRunID}{:else}—{/if}
+        </span>
+      </div>
+      <div class="cell">
+        <span class="k">Plan</span>
+        <span class="v mono">
+          {#if detail.PlanID}
+            <button type="button" class="plan-link" onclick={() => openPlan(detail.PlanID)} title="Open the born-linked plan in Work → Plans">
+              ◈ {detail.PlanID}
+            </button>
+          {:else}—{/if}
         </span>
       </div>
       <div class="cell">
@@ -242,6 +286,20 @@
 <style>
   .muted { color: var(--text-muted, #889); }
   .mono { font-family: ui-monospace, monospace; }
+  .attention {
+    display: flex; gap: 0.6rem; align-items: flex-start;
+    margin: 0 0 0.75rem; padding: 0.6rem 0.7rem; border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--error, #d55) 45%, var(--border-subtle, #233));
+    background: color-mix(in srgb, var(--error, #d55) 9%, transparent);
+  }
+  .attention-icon { color: rgb(240, 150, 100); font-size: 0.95rem; line-height: 1.2; }
+  .attention-body { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; }
+  .attention-body strong { color: rgb(240, 170, 120); font-size: 0.82rem; }
+  .attention-link {
+    background: none; border: none; padding: 0; text-align: left; cursor: pointer;
+    color: rgb(150, 190, 250); font-size: 0.78rem;
+  }
+  .attention-link:hover { text-decoration: underline; }
   .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
   .prio { font-size: 0.72rem; color: var(--text-muted, #889); }
   .label {
@@ -285,6 +343,14 @@
     color: var(--fg-secondary, #9ab); font-family: ui-monospace, monospace;
   }
   .mr { color: rgb(150, 190, 250); font-family: ui-monospace, monospace; font-size: 0.72rem; }
+  .plan-link {
+    display: inline-block; padding: 0.02rem 0.4rem; border-radius: 4px; cursor: pointer;
+    font-family: ui-monospace, monospace; font-size: 0.78rem;
+    background: color-mix(in srgb, var(--accent, #58a) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent, #58a) 40%, var(--border-subtle, #233));
+    color: rgb(150, 190, 250);
+  }
+  .plan-link:hover { background: color-mix(in srgb, var(--accent, #58a) 26%, transparent); }
   .when { margin-left: auto; color: var(--text-muted, #889); font-size: 0.72rem; }
   .slices li {
     display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem;

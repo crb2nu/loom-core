@@ -5,6 +5,7 @@
    * `lib/utils/tasksHelpers.ts` per the panel decomposition pattern
    * (`docs/HUD_PANEL_DECOMP.md`).
    */
+  import { router } from '../stores/router.svelte.ts';
   import { taskStore } from '../stores/tasks.svelte.ts';
   import { agentStore } from '../stores/agents.svelte.ts';
   import { coordinationStore } from '../stores/coordination.svelte.ts';
@@ -137,6 +138,20 @@
   function selectTask(task: any) {
     selectedTask = selectedTask?.id === task.id ? null : task;
   }
+  // Select a task by id (used by in-drawer cross-links); switches to the
+  // target rather than toggling, so following a blocked-by chain works.
+  function selectTaskById(taskId: string) {
+    const next = tasks.find((t) => t.id === taskId);
+    if (next) selectedTask = next;
+  }
+  function lookupTask(taskId: string) {
+    return tasks.find((t) => t.id === taskId);
+  }
+  // Deep-link a task to its Plan Store plan in the Work → Plans sub-view.
+  function openPlan(planId: string) {
+    selectedTask = null;
+    router.navigate('tasks', 'plans', planId);
+  }
 
   function reportBulk(verb: string, total: number, failures: number) {
     const ok = total - failures;
@@ -248,7 +263,14 @@
 
 <CreateTaskModal open={showCreateModal} onClose={() => showCreateModal = false} />
 <ResolveTaskModal open={showResolveModal} taskId={resolveTaskId} taskTitle={resolveTaskTitle} onClose={() => showResolveModal = false} />
-<TaskDetail task={selectedTask} onClose={() => selectedTask = null} onResolve={openResolve} />
+<TaskDetail
+  task={selectedTask}
+  onClose={() => selectedTask = null}
+  onResolve={openResolve}
+  onOpenPlan={openPlan}
+  onSelectTask={selectTaskById}
+  {lookupTask}
+/>
 
 <style>
   .tasks-panel { display: flex; flex-direction: column; overflow: hidden; }

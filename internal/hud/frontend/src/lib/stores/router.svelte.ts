@@ -115,6 +115,16 @@ export const views: ViewDef[] = [
       { id: 'policy',    label: 'Policy',    key: 'i' },
     ],
   },
+  {
+    id: 'projects',
+    label: 'Projects',
+    icon: '▦', // SQUARE WITH HORIZONTAL FILL — per-project rollup lens
+    key: '8',
+    default: 'projects',
+    subViews: [
+      { id: 'projects', label: 'Projects', key: 'a' },
+    ],
+  },
 ];
 
 // Overview is standalone (no sub-views)

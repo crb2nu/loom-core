@@ -24,6 +24,7 @@
   let disabled = $derived(millsStore.disabled);
   let error = $derived(millsStore.error);
   let blockers = $derived(millsStore.autonomyBlockers);
+  let isStale = $derived(millsStore.isStale && !disabled);
   let metrics = $derived(kpis?.metrics ?? {});
   let health = $derived(millsStore.systemHealth);
   // Suppress the banner only when everything is genuinely fine — green
@@ -324,6 +325,10 @@
         Required caps {requiredGreen}/{requiredTotal || 0}
         <span class="meta-divider"></span>
         Updated {fmtTime(status?.time)}
+        {#if isStale}
+          <span class="meta-divider"></span>
+          <span class="stale-chip" title="No fresh data in over 90s — the operator may be unreachable.">⚠ stale</span>
+        {/if}
       </div>
       <button
         type="button"
@@ -739,6 +744,12 @@
     width: 1px;
     height: 14px;
     background: var(--border);
+  }
+
+  .stale-chip {
+    color: var(--warning);
+    font-weight: 700;
+    letter-spacing: var(--tracking-wide);
   }
 
   .overview-layout {
