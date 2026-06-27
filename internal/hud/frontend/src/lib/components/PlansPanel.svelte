@@ -64,13 +64,24 @@
     }
   }
 
-  async function openDetail(plan: Plan) {
-    if (selected?.id === plan.id) { selected = null; return; }
-    await openById(plan.id, plan);
-    void taskStore.fetch();
+  // Selection is route-driven: open/close mutate router.detail and the $effect
+  // below loads/clears `selected` to match. This keeps a single source of truth
+  // so closing the drawer can't be undone by the deep-link effect re-opening it
+  // (the bug: onClose cleared `selected` but router.detail stayed set, so the
+  // effect immediately re-opened — an infinite popup).
+  function openDetail(plan: Plan) {
+    if (selected?.id === plan.id) { closeDetail(); return; }
+    router.navigateDetail(plan.id);
+  }
+
+  function closeDetail() {
+    if (selected) selected = null;
+    if (router.detail) router.navigateDetail(null);
   }
 
   async function openById(id: string, fallback?: Plan) {
+    // Show the cached row immediately, then enrich with the full record (slices).
+    if (fallback && selected?.id !== id) selected = fallback;
     try {
       const res = await fetch(`/api/plans/${encodeURIComponent(id)}`);
       const data = await res.json();
@@ -178,11 +189,16 @@
     return () => clearInterval(t);
   });
 
-  // Honor router deep-links: #tasks/plans/<plan-id> auto-opens that plan.
+  // Single source of truth: keep `selected` in sync with router.detail. Drives
+  // card clicks, deep-links (#tasks/plans/<id>), and close — all just change
+  // router.detail. Clears selection when the detail segment is gone so the
+  // drawer stays closed (no reopen loop).
   $effect(() => {
     const wantId = router.detail;
-    if (!wantId || selected?.id === wantId) return;
-    void openById(wantId);
+    if (!wantId) { if (selected) selected = null; return; }
+    if (selected?.id === wantId) return;
+    void openById(wantId, plans.find((p) => p.id === wantId));
+    void taskStore.fetch();
   });
 </script>
 
@@ -310,7 +326,7 @@
   open={!!selected}
   title={selected?.title ?? ''}
   subtitle={selected?.id ?? ''}
-  onClose={() => selected = null}
+  onClose={closeDetail}
 >
   {#snippet header()}
     {#if selected}
