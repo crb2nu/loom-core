@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **ci: feature-branch image builds no longer auto-deploy to the prod HUD** (`scripts/ci/buildkit-build.sh`): the loom-hub `ImagePolicy` filter (`^[0-9]{8}-[0-9]{6}$`) is branch-agnostic and selects the newest timestamp tag, while `build:image:*` runs on feature branches too — so an unmerged feature-branch image could win the newest-tag race and deploy to `hud.flexinfer.ai` before merge (observed 2026-06-27). The Flux-deployable `:YYYYMMDD-HHMMSS` tag is now minted only on the default branch and release tags; feature branches still publish `:<short-sha>` for validation/manual pulls but never a deployable tag. Applies to the `loom-core` and `custom-server` images built by this script.
+
 ### Added
 - **hud: Work/Mills UX — Plan Store linking, Project lens & Mills polish** (`internal/hud/bridge/agent_dto.go`, `internal/hud/frontend/src/lib/components/{TasksPanel,PlansPanel}.svelte`, `internal/hud/frontend/src/lib/components/tasks/TaskDetail.svelte`, `internal/hud/frontend/src/lib/utils/plansHelpers.ts`, `internal/hud/frontend/src/lib/stores/tasks.svelte.ts`): makes the new Plan Store (S7b) usable and visible in the HUD instead of a set of disconnected lists. Plan doc: `.loom/plan-hud-work-mills-ux-2026-06-26.md`.
   - **Slice 1 — task↔plan linking**: `TaskInfo` now passes `plan_id`/`slice_id` through to the frontend (covers `/api/tasks`, the `hud.fleet` SSE snapshot, and mobile handlers). `TaskDetail` gains a "Plan" section that deep-links a task to its plan, and `blocked_by` chips become buttons that open the blocking task. `PlansPanel` honors `#tasks/plans/<plan-id>` route deep-links.

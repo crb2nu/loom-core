@@ -104,8 +104,19 @@ for REGISTRY in $REGISTRY_CANDIDATES; do
 
   IMAGE="$REGISTRY/$IMAGE_REPO"
   CACHE_REF="$REGISTRY/library/build-cache/$CACHE_NAME"
-  IMAGE_NAMES="$IMAGE:$CI_COMMIT_SHORT_SHA,$IMAGE:$TIMESTAMP_TAG"
-  if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+  # Always publish the commit-SHA tag — traceability + manual pulls of any build.
+  IMAGE_NAMES="$IMAGE:$CI_COMMIT_SHORT_SHA"
+  # Only the default branch and release tags publish the Flux-deployable
+  # `:YYYYMMDD-HHMMSS` tag. The loom-hub ImagePolicy filter
+  # (`^[0-9]{8}-[0-9]{6}$`) is branch-agnostic and selects the newest such tag,
+  # so without this guard a *feature-branch* image build would auto-deploy to
+  # the prod HUD before its MR merged (observed 2026-06-27: an unmerged build
+  # served on hud.flexinfer.ai). Feature branches still build + push `:SHA` for
+  # validation and manual testing; they just don't mint a deployable tag.
+  if [ "${CI_COMMIT_BRANCH:-}" = "$CI_DEFAULT_BRANCH" ] || [ -n "${CI_COMMIT_TAG:-}" ]; then
+    IMAGE_NAMES="$IMAGE_NAMES,$IMAGE:$TIMESTAMP_TAG"
+  fi
+  if [ "${CI_COMMIT_BRANCH:-}" = "$CI_DEFAULT_BRANCH" ]; then
     IMAGE_NAMES="$IMAGE_NAMES,$IMAGE:latest"
   fi
   if [ -n "${CI_COMMIT_TAG:-}" ]; then
