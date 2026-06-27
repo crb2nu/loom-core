@@ -115,6 +115,91 @@ func TestStoreContextEntries_EmbedFailureStillPersists(t *testing.T) {
 	}
 }
 
+// TestGenerateSummary_EmbedFailureStillPersists is the regression guard for the
+// session-summary write path (agent_context_summarize / agent_session_end
+// --summarize / auto-summarize). GenerateSummary used to `return err` straight
+// from the embedder, so a provider outage (Morph 429 / flexinfer 503 / breaker
+// open) hard-failed summarization — surfacing as an error to codex on
+// agent_context_summarize. The summary MUST still persist with a fallback vector.
+func TestGenerateSummary_EmbedFailureStillPersists(t *testing.T) {
+	// Seed one source entry the summary rolls up (an empty scroll early-returns
+	// before the embed call, so without a seed the path is never exercised).
+	seed := ContextEntry{
+		ID:        "src-1",
+		AgentID:   "codex-test",
+		SessionID: "s1",
+		Namespace: "services/loom-core/fix/x",
+		EntryType: EntryTypeFinding,
+		Title:     "Found the bug",
+		Content:   "embedder outage must not block summary",
+	}
+	seedPayload := EntryToPayload(seed, "")
+
+	var captured []capturedUpsert
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/collections/context/points/scroll":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
+				"points":           []map[string]any{{"id": seed.ID, "payload": seedPayload}},
+				"next_page_offset": nil,
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/collections/context":
+			// Collection does not exist yet → drives the default-size fallback.
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/collections/context/points":
+			body, _ := io.ReadAll(r.Body)
+			var cu capturedUpsert
+			if err := json.Unmarshal(body, &cu); err != nil {
+				t.Fatalf("decode upsert body: %v", err)
+			}
+			captured = append(captured, cu)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","result":{"status":"acknowledged"}}`))
+		case r.Method == http.MethodPut:
+			// Collection create + registered payload indexes — idempotent ack.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","result":true}`))
+		default:
+			t.Fatalf("unexpected qdrant request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cfg := Config{
+		QdrantURL:         server.URL,
+		QdrantDistance:    "Cosine",
+		ContextCollection: "context",
+	}
+	vectorSize := 0
+	metrics := NewMetrics()
+	cs := &ContextSvc{
+		qdrant:     NewQdrantRegistry(httpclient.NewDefault(), cfg),
+		embed:      failingEmbedder{},
+		vectorSize: &vectorSize,
+		cfg:        cfg,
+		metrics:    metrics,
+		logger:     slog.Default(),
+	}
+
+	if err := cs.GenerateSummary(context.Background(), &Session{
+		ID:        "s1",
+		AgentID:   "codex-test",
+		Namespace: "services/loom-core/fix/x",
+	}); err != nil {
+		t.Fatalf("GenerateSummary returned error despite best-effort embed: %v", err)
+	}
+
+	if len(captured) != 1 || len(captured[0].Points) != 1 {
+		t.Fatalf("captured upserts = %+v, want 1 summary point persisted", captured)
+	}
+	assertNonZeroFallback(t, captured[0].Points[0].Vector)
+
+	if got := metrics.EmbeddingErrors.Load(); got != 1 {
+		t.Errorf("EmbeddingErrors = %d, want 1", got)
+	}
+}
+
 // TestAnnotationAdd_EmbedFailureStillPersists is the regression guard for the
 // annotation write path (agent_code_annotate / annotations): an annotation MUST
 // still persist with a fallback vector when the embedder is down.

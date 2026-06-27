@@ -38,7 +38,8 @@ func (cs *ContextSvc) Summarize(ctx context.Context, args map[string]any) (*mcp.
 }
 
 func (cs *ContextSvc) GenerateSummary(ctx context.Context, session *Session) error {
-	entries, err := cs.qdrant.Get(CollContext).Scroll(ctx, FilterMust(
+	coll := cs.qdrant.Get(CollContext)
+	entries, err := coll.Scroll(ctx, FilterMust(
 		Match("session_id", session.ID),
 	), 1000)
 	if err != nil {
@@ -113,18 +114,13 @@ func (cs *ContextSvc) GenerateSummary(ctx context.Context, session *Session) err
 	}
 
 	cs.metrics.EmbeddingRequests.Add(1)
-	vector, err := cs.embed.EmbedQuery(ctx, summaryEntry.Title+" "+summaryEntry.Content)
-	if err != nil {
-		cs.metrics.EmbeddingErrors.Add(1)
-		return err
-	}
-	if len(vector) > 0 {
-		*cs.vectorSize = len(vector)
-	}
-	if *cs.vectorSize <= 0 {
-		return fmt.Errorf("unknown vector size")
-	}
-	if err := cs.qdrant.Get(CollContext).EnsureCollection(ctx, *cs.vectorSize); err != nil {
+	// Best-effort embedding: an embedder outage (Morph 429 / flexinfer 503 /
+	// circuit breaker open) must NEVER block summary persistence. Embedding is
+	// enrichment for semantic search, not a correctness gate. embedQueryBestEffort
+	// returns a deterministic, correctly-sized fallback vector and increments the
+	// error metric on failure (mirrors storeContextEntries / AnnotationAdd).
+	vector := cs.embedQueryBestEffort(ctx, summaryEntry.Title+" "+summaryEntry.Content, coll)
+	if err := coll.EnsureCollection(ctx, *cs.vectorSize); err != nil {
 		return err
 	}
 
@@ -134,7 +130,7 @@ func (cs *ContextSvc) GenerateSummary(ctx context.Context, session *Session) err
 		Payload: EntryToPayload(summaryEntry, cs.cfg.EmbedModel),
 	}
 
-	if err := cs.qdrant.Get(CollContext).Upsert(ctx, []Point{point}, true); err != nil {
+	if err := coll.Upsert(ctx, []Point{point}, true); err != nil {
 		return err
 	}
 
