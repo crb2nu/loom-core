@@ -1,6 +1,23 @@
 # syntax=docker/dockerfile:1.7
-# Build stage
 ARG PUBLIC_BASE_REGISTRY=docker.io
+
+# Frontend stage: build the Svelte HUD bundle with vite. The built dist is NOT
+# committed to git (its content-hashed filenames churn on every build, which
+# conflicted on every concurrent HUD MR), so it must be produced here and copied
+# into the Go build context before `go build` embeds it via
+# //go:embed all:frontend/dist (internal/hud/app.go).
+FROM ${PUBLIC_BASE_REGISTRY}/library/node:20-alpine AS frontend
+WORKDIR /frontend
+# pnpm 10 — the frontend's pnpm-workspace.yaml uses pnpm-10 settings semantics
+# (ignoredBuiltDependencies, no `packages:` field); pnpm 9 rejects it.
+RUN npm install -g pnpm@10
+# Copy manifests first so the dependency layer caches across source-only changes.
+COPY internal/hud/frontend/package.json internal/hud/frontend/pnpm-lock.yaml internal/hud/frontend/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY internal/hud/frontend/ ./
+RUN pnpm build && test -s dist/index.html
+
+# Build stage
 FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.25.11-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
@@ -34,6 +51,10 @@ RUN --mount=type=secret,id=ci_job_token,required=false \
 
 # Copy source
 COPY . .
+
+# Overlay the freshly built HUD bundle (the checked-out tree carries only the
+# .gitkeep placeholder) so //go:embed all:frontend/dist embeds the real assets.
+COPY --from=frontend /frontend/dist ./internal/hud/frontend/dist
 
 # Build all binaries in a single layer to share build cache and parallelise MCP servers.
 # The secret mount is repeated here because /go/pkg/mod is a cache mount (sharing=shared

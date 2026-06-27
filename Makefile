@@ -833,6 +833,8 @@ HUD_FRONTEND := internal/hud/frontend
 
 # Build the Svelte frontend (requires pnpm)
 # Always cleans dist/ first so stale assets never leak into the embed.
+# The built dist/ is gitignored (not committed) — only dist/.gitkeep is tracked,
+# so it is restored after the build to keep //go:embed all:frontend/dist valid.
 hud-frontend:
 	@echo "Building HUD frontend..."
 	@if ! command -v pnpm >/dev/null 2>&1; then \
@@ -845,6 +847,7 @@ hud-frontend:
 	fi
 	rm -rf $(HUD_FRONTEND)/dist
 	cd $(HUD_FRONTEND) && pnpm build
+	@git checkout -q -- $(HUD_FRONTEND)/dist/.gitkeep 2>/dev/null || touch $(HUD_FRONTEND)/dist/.gitkeep
 	@echo "✓ Frontend built to $(HUD_FRONTEND)/dist/"
 
 # Build frontend + Go binary with HUD embedded.
@@ -911,15 +914,16 @@ hud-dev: loom loomd
 	cd $(HUD_FRONTEND) && pnpm dev & \
 	wait
 
-# Verify committed dist/ matches a fresh build.
-# Use locally before committing or in CI (requires pnpm/node).
+# Verify the HUD frontend builds and produces an embeddable bundle.
+# The bundle is gitignored (built in CI/Docker, not committed), so this checks
+# that vite succeeds and emits a non-empty index.html — the same invariant the
+# CI build:frontend job and the Docker frontend stage assert.
 hud-dist-check: hud-frontend
-	@echo "Checking HUD dist freshness..."
-	@if git diff --quiet $(HUD_FRONTEND)/dist/ 2>/dev/null; then \
-		echo "✓ HUD dist is up-to-date"; \
+	@echo "Checking HUD bundle built..."
+	@if [ -s $(HUD_FRONTEND)/dist/index.html ]; then \
+		echo "✓ HUD bundle built ($(HUD_FRONTEND)/dist/index.html present)"; \
 	else \
-		echo "ERROR: HUD dist is stale. Run 'make hud-frontend' and commit the result."; \
-		git diff --stat $(HUD_FRONTEND)/dist/; \
+		echo "ERROR: HUD bundle missing — 'make hud-frontend' did not produce dist/index.html."; \
 		exit 1; \
 	fi
 
