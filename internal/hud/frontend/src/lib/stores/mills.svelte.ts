@@ -975,6 +975,16 @@ class MillsStore {
     return true;
   }
 
+  // createBacklog upserts a backlog item via POST /api/mills/backlog. Used to
+  // run a Plan in Mills when it isn't already born-linked to a backlog item:
+  // the HUD builds an item from the plan (deterministic id => idempotent upsert)
+  // and then starts its pipeline. Returns the persisted item (carrying its id).
+  async createBacklog(item: Record<string, unknown>): Promise<{ id?: string } | null> {
+    const res = await this.postJSON<{ id?: string }>('/api/mills/backlog', item);
+    await this.fetchAll();
+    return res;
+  }
+
   // fetchPipelineHistory loads finished runs (done / escalated / paused),
   // newest-first, for the Pipelines "History" view via
   // GET /api/mills/pipeline/runs?state=terminal. Separate from the live

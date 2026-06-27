@@ -12,9 +12,12 @@
   import Badge from '../widgets/Badge.svelte';
   import FilterBar from './shared/FilterBar.svelte';
   import DetailDrawer from './shared/DetailDrawer.svelte';
+  import ConfirmDialog from './shared/ConfirmDialog.svelte';
   import { toastStore } from '../stores/toasts.svelte.ts';
   import { router } from '../stores/router.svelte.ts';
   import { taskStore } from '../stores/tasks.svelte.ts';
+  import { millsStore } from '../stores/mills.svelte.ts';
+  import { spawnStore } from '../stores/spawn.svelte.ts';
   import { relativeTime } from '../utils/format.ts';
   import {
     type Plan,
@@ -134,6 +137,66 @@
   // Jump to the agent working a slice in the Fleet view.
   function openAgent(_agentId: string) {
     router.navigate('agents', 'fleet');
+  }
+
+  // --- Kick a plan/slice off to a session or to Mills ----------------------
+  let busy = $state(false);
+  let confirmMills = $state(false);
+
+  // Spawn an agent session to work a plan (or a specific slice). Runs on the
+  // connected daemon's spawn substrate; the plan/slice ids ride in metadata so
+  // the session is traceable and the spawned agent can fetch the live spec.
+  async function spawnSession(plan: Plan, slice?: { id: string; name: string; branch_name?: string }) {
+    if (busy) return;
+    busy = true;
+    const meta: Record<string, string> = { plan_id: plan.id, source: 'hud-plans' };
+    if (slice) meta.slice_id = slice.id;
+    const branch = slice?.branch_name || plan.slices?.[0]?.branch_name;
+    const res = await spawnStore.spawn({
+      agent_type: 'claude-code',
+      project: plan.project || 'loom-core',
+      task_description: slice ? `Work plan "${plan.title}" — slice: ${slice.name}` : `Work on plan: ${plan.title}`,
+      ...(branch ? { branch } : {}),
+      metadata: meta,
+    });
+    busy = false;
+    if (res?.spawn_id) {
+      toastStore.success(`Spawned ${res.spawn_id}`);
+      router.navigate('sandbox', 'spawn', res.spawn_id);
+    } else {
+      toastStore.error('Spawn failed (admin token required?)');
+    }
+  }
+
+  // Run the selected plan in Mills: start its born-linked backlog item, or
+  // create one from the plan (deterministic id => idempotent) then start it.
+  async function runInMills() {
+    confirmMills = false;
+    if (!selected || busy) return;
+    busy = true;
+    try {
+      let backlogId = selected.mills_backlog_id;
+      if (!backlogId) {
+        const item: Record<string, unknown> = {
+          id: `bl-${selected.slug || selected.id}`,
+          title: selected.title,
+          plan_id: selected.id,
+          state: 'queued',
+          spec_doc: selected.mirror_path || '',
+          slices: (selected.slices || []).map((s) => ({ name: s.name, files: s.files || [] })),
+          created_by: 'hud-user',
+        };
+        const created = await millsStore.createBacklog(item);
+        backlogId = created?.id || (item.id as string);
+      }
+      await millsStore.startPipeline(backlogId);
+      toastStore.success(`Running in Mills: ${backlogId}`);
+      router.navigate('mills', 'pipelines');
+    } catch (e) {
+      toastStore.error(`Mills run failed: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      busy = false;
+    }
   }
 
   let filtered = $derived(filterPlans(plans, search, projectFilter, phaseFilter));
@@ -338,6 +401,19 @@
     {/if}
   {/snippet}
 
+  {#snippet footer()}
+    {#if selected}
+      <div class="drawer-actions">
+        <button class="btn btn-ghost" disabled={busy} onclick={() => spawnSession(selected!)} title="Spawn an agent session to work this plan">
+          ⟳ Spawn session
+        </button>
+        <button class="btn btn-success" disabled={busy} onclick={() => (confirmMills = true)} title="Create/queue a Mills backlog item and start an autonomous pipeline">
+          ❖ Run in Mills
+        </button>
+      </div>
+    {/if}
+  {/snippet}
+
   {#if selected}
     <div class="d-row">
       <label class="dim" for="adv">Advance to</label>
@@ -396,6 +472,7 @@
                 {#if surl}<a class="ref-link small" href={surl} target="_blank" rel="noopener">{refLabel(s.mr_ref, 'mr')}</a>{/if}
               {/if}
               <span class="slice-tcount dim small">{stasks.length ? `${stasks.length} task${stasks.length !== 1 ? 's' : ''}` : 'no tasks'}</span>
+              <button class="slice-spawn" disabled={busy} onclick={() => spawnSession(selected!, s)} title="Spawn a session to work this slice">⟳ spawn</button>
             </div>
             {#if s.branch_name}
               {@const burl = gitlabBranchUrl(s.branch_name, selected.project)}
@@ -448,6 +525,15 @@
     {/if}
   {/if}
 </DetailDrawer>
+
+<ConfirmDialog
+  open={confirmMills}
+  title="Run in Mills?"
+  message={`Create/queue a Mills backlog item for "${selected?.title ?? ''}" and start an autonomous pipeline. This spends budget and may open and merge a merge request.`}
+  confirmLabel="Run in Mills"
+  onConfirm={runInMills}
+  onCancel={() => (confirmMills = false)}
+/>
 
 <style>
   .plans-panel { display: flex; flex-direction: column; overflow: hidden; gap: var(--space-2); }
@@ -522,6 +608,13 @@
   .slice-head { display: flex; align-items: center; gap: 6px; font-size: var(--text-sm); flex-wrap: wrap; }
   .slice-name { color: var(--fg-primary); }
   .slice-tcount { margin-left: auto; }
+  .slice-spawn {
+    background: none; border: 1px solid var(--border-subtle); color: var(--fg-secondary);
+    border-radius: var(--radius-sm); padding: 0 6px; font-size: var(--text-xs); cursor: pointer;
+  }
+  .slice-spawn:hover:not(:disabled) { border-color: var(--accent, #2af); color: var(--accent, #2af); }
+  .slice-spawn:disabled { opacity: 0.5; cursor: default; }
+  .drawer-actions { display: flex; gap: var(--space-2); justify-content: flex-end; width: 100%; }
   .slice-agent {
     background: none; border: 1px solid var(--border-subtle); color: var(--fg-secondary);
     border-radius: var(--radius-sm); padding: 0 6px; font-size: var(--text-xs);

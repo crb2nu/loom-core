@@ -1,1 +1,0 @@
-import{P as t}from"./index-BlajSdW8.js";async function c(s,e){try{return await s(),t.success(e.success),!0}catch(r){const n=r instanceof Error?r.message:String(r);return t.error(`${e.failurePrefix??"Action failed"}: ${n}`),!1}}export{c as r};
