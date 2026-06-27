@@ -36,6 +36,12 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	// API routes — agent list (from fleet monitor).
 	mux.HandleFunc("GET /api/agents", a.withCORS(a.handleAgents))
 
+	// API route — sessions currently blocked on a human (flightdeck-derived
+	// permission/idle stalls). Desktop-readable counterpart of the mobile
+	// dashboard's "blocked" array, so the VS Code extension's Flightdeck view
+	// can poll it without a mobile-operator token.
+	mux.HandleFunc("GET /api/blocked", a.withCORS(a.handleBlocked))
+
 	// API routes — direct bridge calls (parameterized queries).
 	mux.HandleFunc("GET /api/sessions", a.withCORS(a.handleSessions))
 	mux.HandleFunc("GET /api/sessions/{id}/entries", a.withCORS(a.handleSessionEntries))
