@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **hud: Plans drawer can't be closed (infinite re-open)** (`internal/hud/frontend/src/lib/components/PlansPanel.svelte`): when a plan was opened via a deep-link (or with a stale `#tasks/plans/<id>` hash), closing the detail drawer cleared `selected` but left `router.detail` set, so the deep-link `$effect` immediately re-opened it — an infinite popup (and a retry loop if the id failed to resolve). Selection is now route-driven: open/close mutate `router.detail` and a single effect syncs `selected` to it (clearing it when the detail segment is gone). Card clicks, deep-links, and close now share one source of truth, so the drawer closes and stays closed; opens also reflect in the URL (shareable).
 - **ci: feature-branch image builds no longer auto-deploy to the prod HUD** (`scripts/ci/buildkit-build.sh`): the loom-hub `ImagePolicy` filter (`^[0-9]{8}-[0-9]{6}$`) is branch-agnostic and selects the newest timestamp tag, while `build:image:*` runs on feature branches too — so an unmerged feature-branch image could win the newest-tag race and deploy to `hud.flexinfer.ai` before merge (observed 2026-06-27). The Flux-deployable `:YYYYMMDD-HHMMSS` tag is now minted only on the default branch and release tags; feature branches still publish `:<short-sha>` for validation/manual pulls but never a deployable tag. Applies to the `loom-core` and `custom-server` images built by this script.
 
 ### Added
