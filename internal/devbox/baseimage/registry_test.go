@@ -10,6 +10,8 @@ func TestLookup_KnownVersions(t *testing.T) {
 		{"go", "1.24", "registry.harbor.lan/mcp/devbox-base/go:1.24"},
 		{"go", "1.25", "registry.harbor.lan/mcp/devbox-base/go:1.25"},
 		{"go", "1.25.10", "registry.harbor.lan/mcp/devbox-base/go:1.25"},
+		{"go", "1.26.0", "registry.harbor.lan/mcp/devbox-base/go:1.26"},
+		{"go", "1.26.6", "registry.harbor.lan/mcp/devbox-base/go:1.26"},
 		{"python", "3.12", "registry.harbor.lan/mcp/devbox-base/python:3.12"},
 		{"python", "3.12.13", "registry.harbor.lan/mcp/devbox-base/python:3.12"},
 		{"python", "3.13", "registry.harbor.lan/mcp/devbox-base/python:3.13"},
@@ -42,7 +44,7 @@ func TestLookup_CaseInsensitive(t *testing.T) {
 
 func TestLanguages(t *testing.T) {
 	langs := Languages()
-	if len(langs) != 6 {
-		t.Errorf("expected 6 registered base images, got %d", len(langs))
+	if len(langs) != 7 {
+		t.Errorf("expected 7 registered base images, got %d", len(langs))
 	}
 }

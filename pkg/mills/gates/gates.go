@@ -225,6 +225,7 @@ func Default() *Registry {
 		telemetry.DefaultGateFailureCollector(),
 	})
 	r.Register(&NonEmptyDiff{})
+	r.Register(&BranchPushed{})
 	r.Register(&DiffSize{})
 	r.Register(&Scope{})
 	r.Register(&FabricatedSlice{})
@@ -483,6 +484,14 @@ func inputDigestForGate(gateID string, in StageInput) string {
 			HasFiles bool `json:"has_files"`
 			HasDiff  bool `json:"has_diff"`
 		}{len(in.FilesChanged) != 0, len(in.DiffPatch) != 0}
+	case "branch_pushed":
+		semanticInput = struct {
+			CaptureUnavailable  bool `json:"capture_unavailable"`
+			MissingRefSignature bool `json:"missing_ref_signature"`
+		}{
+			CaptureUnavailable:  gitCaptureUnavailable(in.GitCaptureStatus),
+			MissingRefSignature: in.GitCaptureStatus == "fetch_failed" && strings.Contains(in.GitCaptureReason, missingRemoteRefSignature),
+		}
 	case "docs_guardrail":
 		semanticInput = struct {
 			FilesChanged   []string `json:"files_changed"`

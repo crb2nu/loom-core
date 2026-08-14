@@ -2296,6 +2296,17 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 	// until the blocking run leaves state=running; the on-merge KickNow
 	// picks the deferred item up within ~1s of the blocker landing.
 	if policy.Pipeline.SerializeOverlappingScopesEnabled() {
+		fairness := policy.Pipeline.ScopeFairness
+		if fairness.IsEnabled() {
+			blocker, witness, err := r.scopeReservationBlocker(ctx, item, fairness.Hold())
+			if err != nil {
+				return decisionDeferred, nil, "", fmt.Errorf("scope reservation check: %w", err)
+			}
+			if blocker != "" {
+				r.append(ctx, "reconciler.deferred", "scope_reservation", map[string]any{"item": item.ID, "blocked_by": blocker, "witness": witness})
+				return decisionDeferred, nil, fmt.Sprintf("scope reserved by starved item %s (shared scope: %s)", blocker, witness), nil
+			}
+		}
 		blocker, witness, err := r.scopeOverlapBlocker(ctx, item)
 		if err != nil {
 			return decisionDeferred, nil, "", fmt.Errorf("scope overlap check: %w", err)
@@ -2304,6 +2315,18 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 			r.append(ctx, "reconciler.deferred", "scope_overlap", map[string]any{
 				"item": item.ID, "blocked_by": blocker, "witness": witness,
 			})
+			if fairness.IsEnabled() {
+				state, tripped, ferr := r.Store.Backlog.RecordScopeDeferral(ctx, item.ID, r.now(), fairness.Deferrals(), fairness.Age())
+				if ferr != nil {
+					return decisionDeferred, nil, "", fmt.Errorf("record scope deferral: %w", ferr)
+				}
+				ScopeDeferralCount.WithLabelValues(item.ID).Set(float64(state.DeferralCount))
+				ScopeQueueAgeSeconds.WithLabelValues(item.ID).Set(r.now().Sub(state.FirstDeferredAt).Seconds())
+				if tripped {
+					ScopeStarvationTotal.Inc()
+					r.append(ctx, "reconciler.scope_starvation", "reserved", map[string]any{"item": item.ID, "deferral_count": state.DeferralCount, "first_deferred_at": state.FirstDeferredAt, "blocked_by": blocker, "witness": witness})
+				}
+			}
 			return decisionDeferred, nil, fmt.Sprintf(
 				"scope overlap with running item %s (shared scope: %s)", blocker, witness), nil
 		}
@@ -2402,6 +2425,7 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 		ExpectedClaimVersion:       item.ClaimVersion,
 		ExpectedRevision:           item.Revision,
 		SerializeOverlappingScopes: policy.Pipeline.SerializeOverlappingScopesEnabled(),
+		EnforceScopeReservations:   policy.Pipeline.ScopeFairness.IsEnabled(),
 		HomeProject:                r.HomeProject,
 		Template:                   policy.Pipeline.DefaultTemplate,
 		EstimateUSD:                estimate,
@@ -2425,6 +2449,19 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 				"expected_revision": item.Revision,
 			})
 			return decisionSkipped, nil, "already claimed by another reconciler", nil
+		case errors.Is(err, store.ErrScopeReservationConflict):
+			var conflict *store.ScopeReservationConflictError
+			if !errors.As(err, &conflict) {
+				return decisionSkipped, nil, "scope reservation conflict", err
+			}
+			PipelineStartClaimsTotal.WithLabelValues("conflict").Inc()
+			r.append(ctx, "reconciler.deferred", "scope_reservation_transaction", map[string]any{
+				"item": item.ID, "blocked_by": conflict.BlockerID,
+				"witness": conflict.Witness,
+			})
+			return decisionDeferred, nil, fmt.Sprintf(
+				"scope reserved by queued item %s (shared scope: %s)",
+				conflict.BlockerID, conflict.Witness), nil
 		default:
 			var scopeConflict *store.ScopeConflictError
 			if errors.As(err, &scopeConflict) {
@@ -2452,6 +2489,8 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 		}
 	}
 	PipelineStartClaimsTotal.WithLabelValues("committed").Inc()
+	ScopeDeferralCount.DeleteLabelValues(item.ID)
+	ScopeQueueAgeSeconds.DeleteLabelValues(item.ID)
 	if claim == nil || claim.Run == nil || claim.Backlog == nil || claim.Dispatch == nil {
 		return decisionStarted, nil, "", errors.New("claim pipeline start: incomplete committed result")
 	}

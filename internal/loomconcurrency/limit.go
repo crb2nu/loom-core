@@ -98,6 +98,19 @@ func ApplyValue(s limiter, limit int) {
 	s.SetConcurrencyLimit(clamp(limit))
 }
 
+// ApplyValidated applies an explicit limit only when it is within the
+// supported range. Validation happens before SetConcurrencyLimit so a rejected
+// policy value cannot partially mutate the limiter.
+func ApplyValidated(s limiter, limit int) error {
+	if err := Validate(limit); err != nil {
+		return err
+	}
+	if s != nil {
+		s.SetConcurrencyLimit(limit)
+	}
+	return nil
+}
+
 func clamp(n int) int {
 	if n < MinLimit {
 		return MinLimit

@@ -71,6 +71,19 @@ type fakeGitLab struct {
 	cleanupResp  CleanupResponse
 }
 
+type branchLookupGitLab struct {
+	*fakeGitLab
+	branchSHA string
+	branchOK  bool
+	branchErr error
+	lookups   []string
+}
+
+func (f *branchLookupGitLab) GetBranch(_ context.Context, branch string) (string, bool, error) {
+	f.lookups = append(f.lookups, branch)
+	return f.branchSHA, f.branchOK, f.branchErr
+}
+
 func (f *fakeGitLab) CreateMR(_ context.Context, req CreateMRRequest) (CreateMRResponse, error) {
 	f.createCalls = append(f.createCalls, req)
 	return f.createResp, nil
@@ -657,7 +670,7 @@ func TestDevboxWorker_ForwardsAllowlistedDeclaredTestsAndRecordsSkipped(t *testi
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if got := db.calls[0].TestCommands; !reflect.DeepEqual(got, []string{"go test ./cmd/loom -run Mills", "go test ./pkg/mills/..."}) {
+	if got := db.calls[0].TestCommands; !reflect.DeepEqual(got, []string{"GOWORK=off go test ./cmd/loom -run Mills", "GOWORK=off go test ./pkg/mills/..."}) {
 		t.Fatalf("test commands = %v", got)
 	}
 	if db.calls[0].Env["GIT_TOKEN"] != "token" {
@@ -665,6 +678,35 @@ func TestDevboxWorker_ForwardsAllowlistedDeclaredTestsAndRecordsSkipped(t *testi
 	}
 	if got := out.Artifacts[skippedDeclaredTestsArtifactKey]; !reflect.DeepEqual(got, []string{"make test"}) {
 		t.Fatalf("skipped tests artifact = %#v", got)
+	}
+}
+
+// The workspace convention declares tests as "GOWORK=off go test ./pkg/..." —
+// entries with leading env assignments must execute (they previously fell to
+// the skip bucket), and bare `go test` entries must be normalized to GOWORK=off
+// so the sandbox's go.work (whose toolchain floor the sandbox Go may not meet)
+// never resolves. Regression for the 2026-08-14 instant "FAIL test:0" class.
+func TestDeclaredDevboxTests_EnvPrefixesExecuteAndBareGetsGoworkOff(t *testing.T) {
+	item := &store.BacklogItem{Success: store.SuccessCriteria{Tests: []string{
+		"GOWORK=off go test ./pkg/a/...",
+		"FOO=1 GOWORK=off go test ./pkg/b/...",
+		"FOO=1 go test ./pkg/c/...",
+		"go test ./pkg/d/...",
+		"make test",
+		"gotestsum ./...",
+	}}}
+	allowed, skipped := declaredDevboxTests(item)
+	wantAllowed := []string{
+		"GOWORK=off go test ./pkg/a/...",
+		"FOO=1 GOWORK=off go test ./pkg/b/...",
+		"GOWORK=off FOO=1 go test ./pkg/c/...",
+		"GOWORK=off go test ./pkg/d/...",
+	}
+	if !reflect.DeepEqual(allowed, wantAllowed) {
+		t.Fatalf("allowed = %#v, want %#v", allowed, wantAllowed)
+	}
+	if !reflect.DeepEqual(skipped, []string{"make test", "gotestsum ./..."}) {
+		t.Fatalf("skipped = %#v", skipped)
 	}
 }
 
@@ -828,6 +870,49 @@ func TestGitLabWorker_CreateMR_SkipsPushWhenWorktreeMissing(t *testing.T) {
 	}
 	if len(gl.createCalls) != 1 {
 		t.Errorf("CreateMR not called, len=%d", len(gl.createCalls))
+	}
+}
+
+func TestGitLabWorker_CreateMR_BlocksMissingOriginBranchWithoutWorktree(t *testing.T) {
+	base := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	gl := &branchLookupGitLab{fakeGitLab: base}
+	w := &GitLabWorker{Client: gl}
+	jc := sampleJobContext("mr", func(jc *JobContext) { jc.Run.WorktreePath = "" })
+	_, err := w.Run(context.Background(), jc)
+	if err == nil || !strings.Contains(err.Error(), "implement spawn never pushed") || !strings.Contains(err.Error(), "feat/BL-X") {
+		t.Fatalf("error = %v, want missing pushed branch error", err)
+	}
+	if len(base.createCalls) != 0 {
+		t.Fatalf("CreateMR called %d times, want 0", len(base.createCalls))
+	}
+}
+
+func TestGitLabWorker_CreateMR_BranchLookupErrorFailsOpen(t *testing.T) {
+	base := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	gl := &branchLookupGitLab{fakeGitLab: base, branchErr: errors.New("gitlab unavailable")}
+	w := &GitLabWorker{Client: gl}
+	jc := sampleJobContext("mr", func(jc *JobContext) { jc.Run.WorktreePath = "" })
+	if _, err := w.Run(context.Background(), jc); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(base.createCalls) != 1 {
+		t.Fatalf("CreateMR called %d times, want 1", len(base.createCalls))
+	}
+}
+
+func TestGitLabWorker_CreateMR_WorktreePushSkipsOriginLookup(t *testing.T) {
+	base := &fakeGitLab{createResp: CreateMRResponse{MRIID: 99}}
+	gl := &branchLookupGitLab{fakeGitLab: base}
+	pusher := &recordingPusher{}
+	w := &GitLabWorker{Client: gl, BranchPusher: pusher}
+	if _, err := w.Run(context.Background(), sampleJobContext("mr")); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(gl.lookups) != 0 {
+		t.Fatalf("GetBranch called with worktree present: %v", gl.lookups)
+	}
+	if len(pusher.calls) != 1 || len(base.createCalls) != 1 {
+		t.Fatalf("push calls=%d create calls=%d, want 1 each", len(pusher.calls), len(base.createCalls))
 	}
 }
 

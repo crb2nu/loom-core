@@ -29,17 +29,24 @@ const (
 // nil limit resolves to the compiled, behavior-neutral default. Explicit
 // values, including zero, must pass Validate before being applied.
 type PipelineConcurrencyPolicy struct {
-	// MaxConcurrentPipelines bounds simultaneous pipeline scheduler work. Nil
+	// MaxConcurrency bounds simultaneous council read-autonomy work. Nil
 	// preserves the compiled conservative default for older policy documents.
+	MaxConcurrency *int `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
+
+	// MaxConcurrentPipelines bounds simultaneous pipeline scheduler work. Nil
+	// preserves compatibility with the earlier policy spelling.
 	MaxConcurrentPipelines *int `json:"max_concurrent_pipelines,omitempty" yaml:"max_concurrent_pipelines,omitempty"`
 
 	// Limit is the legacy spelling retained while existing callers migrate.
-	// New policy documents must use max_concurrent_pipelines.
+	// New policy documents must use max_concurrency.
 	Limit *int `json:"concurrency_limit,omitempty" yaml:"concurrency_limit,omitempty"`
 }
 
 // EffectiveLimit returns the configured limit or the compiled default.
 func (p PipelineConcurrencyPolicy) EffectiveLimit() int {
+	if p.MaxConcurrency != nil {
+		return *p.MaxConcurrency
+	}
 	if p.MaxConcurrentPipelines != nil {
 		return *p.MaxConcurrentPipelines
 	}
@@ -51,14 +58,23 @@ func (p PipelineConcurrencyPolicy) EffectiveLimit() int {
 
 // Validate rejects explicit values outside the supported concurrency range.
 func (p PipelineConcurrencyPolicy) Validate() error {
-	if p.MaxConcurrentPipelines != nil && p.Limit != nil {
-		return fmt.Errorf("max_concurrent_pipelines and legacy concurrency_limit cannot both be set")
+	configured := 0
+	for _, limit := range []*int{p.MaxConcurrency, p.MaxConcurrentPipelines, p.Limit} {
+		if limit != nil {
+			configured++
+		}
 	}
-	limit := p.MaxConcurrentPipelines
-	field := "max_concurrent_pipelines"
+	if configured > 1 {
+		return fmt.Errorf("max_concurrency, max_concurrent_pipelines, and legacy concurrency_limit are mutually exclusive")
+	}
+	limit := p.MaxConcurrency
+	field := "max_concurrency"
 	if limit == nil {
-		limit = p.Limit
-		field = "concurrency_limit"
+		limit = p.MaxConcurrentPipelines
+		field = "max_concurrent_pipelines"
+	}
+	if limit == nil {
+		limit, field = p.Limit, "concurrency_limit"
 	}
 	if limit == nil {
 		return nil

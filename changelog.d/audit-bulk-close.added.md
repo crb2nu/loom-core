@@ -1,0 +1,1 @@
+- Add `scripts/close-stale-audit-advisories.sh`, its audit selection and rollback-label contract in `pkg/mills/audit/advisory.go`, and the one-time bulk-close operator runbook.

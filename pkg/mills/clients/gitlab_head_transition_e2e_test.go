@@ -145,6 +145,12 @@ func (f *fakeGitLab) handler() http.Handler {
 				f.head = e2eSuccessorSHA
 			}
 
+		case r.Method == http.MethodGet && path == base+"/repository/branches/feat%2FBL-E2E-374":
+			writeE2EJSON(w, 200, map[string]any{
+				"name":   "feat/BL-E2E-374",
+				"commit": map[string]any{"id": f.head},
+			})
+
 		case r.Method == http.MethodPut && path == base+"/merge_requests/77/merge":
 			body := readE2EBody(r)
 			f.mergePUTBodies = append(f.mergePUTBodies, body)

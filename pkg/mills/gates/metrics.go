@@ -10,6 +10,7 @@ const (
 	GateMetricScope           = "scope"
 	GateMetricPRSelfReview    = "pr_self_review"
 	GateMetricNonemptyDiff    = "nonempty_diff"
+	GateMetricBranchPushed    = "branch_pushed"
 )
 
 // GateFlakeMetrics exports pass/fail totals and verdict transitions for the
@@ -59,7 +60,7 @@ func (m *GateFlakeMetrics) RecordGateEvaluation(e telemetry.GateEvaluation) {
 
 func isFlakeTelemetryGate(gateID string) bool {
 	switch gateID {
-	case GateMetricSpecConformance, GateMetricScope, GateMetricPRSelfReview, GateMetricNonemptyDiff:
+	case GateMetricSpecConformance, GateMetricScope, GateMetricPRSelfReview, GateMetricNonemptyDiff, GateMetricBranchPushed:
 		return true
 	default:
 		return false

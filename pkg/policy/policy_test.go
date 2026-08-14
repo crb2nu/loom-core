@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,7 +28,7 @@ func TestPipelineConcurrencyPolicy(t *testing.T) {
 		{name: "overflow", limit: intPointer(loomconcurrency.MaxLimit + 1), want: loomconcurrency.MaxLimit + 1, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := PipelineConcurrencyPolicy{MaxConcurrentPipelines: tc.limit}
+			p := PipelineConcurrencyPolicy{MaxConcurrency: tc.limit}
 			if got := p.EffectiveLimit(); got != tc.want {
 				t.Fatalf("EffectiveLimit() = %d, want %d", got, tc.want)
 			}
@@ -35,10 +36,42 @@ func TestPipelineConcurrencyPolicy(t *testing.T) {
 			if gotErr := err != nil; gotErr != tc.wantErr {
 				t.Fatalf("Validate() error = %v, want error %v", err, tc.wantErr)
 			}
-			if tc.wantErr && !strings.Contains(err.Error(), "max_concurrent_pipelines ") {
+			if tc.wantErr && !strings.Contains(err.Error(), "max_concurrency ") {
 				t.Fatalf("Validate() error = %q, want field and rejected value", err)
 			}
 		})
+	}
+}
+
+func TestPipelineConcurrencyPolicyDecodesMaxConcurrency(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		data   []byte
+		decode func([]byte, any) error
+	}{
+		{name: "json", data: []byte(`{"max_concurrency":3}`), decode: json.Unmarshal},
+		{name: "yaml", data: []byte("max_concurrency: 3\n"), decode: yaml.Unmarshal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var configured PipelineConcurrencyPolicy
+			if err := tc.decode(tc.data, &configured); err != nil {
+				t.Fatal(err)
+			}
+			if configured.MaxConcurrency == nil || *configured.MaxConcurrency != 3 {
+				t.Fatalf("MaxConcurrency = %v, want 3", configured.MaxConcurrency)
+			}
+		})
+	}
+}
+
+func TestPipelineConcurrencyPolicyRejectsMultipleSpellings(t *testing.T) {
+	preferred, legacy := 3, 4
+	configured := PipelineConcurrencyPolicy{
+		MaxConcurrency:         &preferred,
+		MaxConcurrentPipelines: &legacy,
+	}
+	if err := configured.Validate(); err == nil {
+		t.Fatal("expected multiple policy spellings to be rejected")
 	}
 }
 
@@ -67,7 +100,7 @@ func TestProductionConfigMapPinsPipelineConcurrencyDefault(t *testing.T) {
 
 func TestPipelineConcurrencyPolicyRejectsWrongType(t *testing.T) {
 	var configured PipelineConcurrencyPolicy
-	if err := yaml.Unmarshal([]byte("max_concurrent_pipelines: many\n"), &configured); err == nil {
+	if err := yaml.Unmarshal([]byte("max_concurrency: many\n"), &configured); err == nil {
 		t.Fatal("expected wrong-type policy value to fail decoding")
 	}
 }

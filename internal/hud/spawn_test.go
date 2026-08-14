@@ -1357,6 +1357,50 @@ func TestInjectAgentConfigGitPrivateAuth(t *testing.T) {
 	}
 }
 
+func TestInjectAgentConfigGitAuthorIdentity(t *testing.T) {
+	tests := []struct {
+		name      string
+		author    string
+		email     string
+		wantName  string
+		wantEmail string
+	}{
+		{name: "defaults", wantName: "loom-spawn", wantEmail: "loom-spawn@loom.local"},
+		{name: "overrides", author: "Mills Agent", email: "mills@example.com", wantName: "Mills Agent", wantEmail: "mills@example.com"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SPAWN_GIT_AUTHOR_NAME", tc.author)
+			t.Setenv("SPAWN_GIT_AUTHOR_EMAIL", tc.email)
+			rb := &recordingBackend{}
+			if err := (&SpawnOrchestrator{}).injectAgentConfig(context.Background(), rb, "pod-1", "codex", "/workspace/services/loom-core"); err != nil {
+				t.Fatalf("injectAgentConfig: %v", err)
+			}
+			commands := make([]string, 0, len(rb.execCalls))
+			for _, call := range rb.execCalls {
+				commands = append(commands, call.Command)
+			}
+			joined := strings.Join(commands, "\n")
+			for _, want := range []string{
+				"git config --global user.name " + shellQuote(tc.wantName),
+				"git config --global user.email " + shellQuote(tc.wantEmail),
+			} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("commands do not contain %q: %s", want, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestInjectAgentConfigGitAuthorIdentityErrorPropagates(t *testing.T) {
+	rb := &recordingBackend{execErr: errors.New("exec failed")}
+	err := (&SpawnOrchestrator{}).injectAgentConfig(context.Background(), rb, "pod-1", "codex", "/workspace/services/loom-core")
+	if err == nil || !strings.Contains(err.Error(), "configure git author user.name") {
+		t.Fatalf("error = %v, want author configuration error", err)
+	}
+}
+
 // TestSubstrateBackend covers the Slice 2d substrate routing helper.
 // Empty substrate → default backend (current pre-Slice-2c behavior).
 // Known substrate → its registered backend.

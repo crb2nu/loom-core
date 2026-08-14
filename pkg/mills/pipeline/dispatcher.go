@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1289,16 +1290,44 @@ func devboxScopeFor(_ *store.BacklogItem) []string {
 	return gitCloneTestsScope
 }
 
+// declaredTestEnvWord matches one leading KEY=value environment assignment.
+// Declared tests in this workspace are conventionally written as
+// "GOWORK=off go test ./pkg/..." — the sandbox checkout carries a go.work
+// whose toolchain requirement the sandbox Go may not satisfy, so bare
+// `go test` dies instantly on workspace resolution (observed 2026-08-14:
+// "go.work requires go >= 1.26.4 (running go 1.26.0; GOTOOLCHAIN=local)",
+// FAIL test:0 in ~100ms while the same command passed under GOWORK=off).
+var declaredTestEnvWord = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+`)
+
 func declaredDevboxTests(item *store.BacklogItem) (allowed, skipped []string) {
 	if item == nil {
 		return nil, nil
 	}
 	for _, command := range item.Success.Tests {
-		if strings.HasPrefix(command, "go test ") {
-			allowed = append(allowed, command)
-		} else {
-			skipped = append(skipped, command)
+		rest := command
+		sawGowork := false
+		for {
+			m := declaredTestEnvWord.FindString(rest)
+			if m == "" {
+				break
+			}
+			if strings.HasPrefix(m, "GOWORK=") {
+				sawGowork = true
+			}
+			rest = rest[len(m):]
 		}
+		if !strings.HasPrefix(rest, "go test ") {
+			skipped = append(skipped, command)
+			continue
+		}
+		if !sawGowork {
+			// Commands run via `sh -c` in the sandbox, so a leading env
+			// assignment applies to the whole entry. Default to module mode:
+			// the sandbox tests exactly one module and its go.work is not a
+			// supported surface here.
+			command = "GOWORK=off " + command
+		}
+		allowed = append(allowed, command)
 	}
 	return allowed, skipped
 }
@@ -1690,9 +1719,18 @@ func (w *GitLabWorker) runMR(ctx context.Context, jc JobContext) (StageOutput, e
 	// (canary !518 surfaced this on 2026-05-25). Push is best-effort
 	// when worktree path is missing — the legacy code path assumed a
 	// pre-pushed branch.
+	client := w.clientFor(jc.Item)
 	if w.BranchPusher != nil && jc.Run != nil && jc.Run.WorktreePath != "" {
 		if err := w.BranchPusher.Push(ctx, jc.Run.WorktreePath, sourceBranch); err != nil {
 			return StageOutput{}, fmt.Errorf("mr: push %q to origin: %w", sourceBranch, err)
+		}
+	} else if jc.Run == nil || jc.Run.WorktreePath == "" {
+		if lookup, ok := client.(interface {
+			GetBranch(context.Context, string) (string, bool, error)
+		}); ok {
+			if _, exists, err := lookup.GetBranch(ctx, sourceBranch); err == nil && !exists {
+				return StageOutput{}, fmt.Errorf("mr: source branch %q does not exist on origin; the implement spawn never pushed it", sourceBranch)
+			}
 		}
 	}
 	req := CreateMRRequest{
@@ -1704,7 +1742,7 @@ func (w *GitLabWorker) runMR(ctx context.Context, jc JobContext) (StageOutput, e
 		AutoMerge:    w.computeAutoMerge(jc),
 		Env:          jc.Env,
 	}
-	resp, err := w.clientFor(jc.Item).CreateMR(ctx, req)
+	resp, err := client.CreateMR(ctx, req)
 	if err != nil {
 		return StageOutput{}, err
 	}

@@ -29,6 +29,10 @@ import (
 // ----- Council metrics -----
 
 var (
+	ScopeDeferralCount               = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "mills_reconciler_scope_deferral_count", Help: "Durable scope-overlap deferrals for a queued item."}, []string{"item"})
+	ScopeQueueAgeSeconds             = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "mills_reconciler_scope_queue_age_seconds", Help: "Seconds since a queued item's first scope-overlap deferral."}, []string{"item"})
+	ScopeStarvationTotal             = promauto.NewCounter(prometheus.CounterOpts{Name: "mills_reconciler_scope_starvation_total", Help: "Scope reservations activated after the fairness threshold."})
+	ScopeReservationCapReleasesTotal = promauto.NewCounter(prometheus.CounterOpts{Name: "mills_reconciler_scope_reservation_cap_releases_total", Help: "Scope reservations released after their hold cap."})
 	// CouncilRunsTotal counts every council run that reached a terminal
 	// state, partitioned by trigger (cron/roadmap/incident/manual) and
 	// outcome (success/partial/error/conflict).

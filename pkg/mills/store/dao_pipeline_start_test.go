@@ -132,6 +132,40 @@ func TestClaimPipelineStart_ConcurrentExactlyOne(t *testing.T) {
 	}
 }
 
+func TestClaimPipelineStart_RejectsOverlappingScopeReservation(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	reserved := seedClaimBacklog(t, st, "RESERVED")
+	reserved.Slices = []Slice{{Name: "reserved", Files: []string{"pkg/mills/a.go"}}}
+	if err := st.Backlog.Put(ctx, reserved); err != nil {
+		t.Fatal(err)
+	}
+	candidate := seedClaimBacklog(t, st, "CANDIDATE")
+	candidate.Slices = []Slice{{Name: "candidate", Files: []string{"pkg/mills/b.go"}}}
+	if err := st.Backlog.Put(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, tripped, err := st.Backlog.RecordScopeDeferral(ctx, reserved.ID, time.Now().UTC(), 1, time.Hour); err != nil || !tripped {
+		t.Fatalf("reserve scope: tripped=%v err=%v", tripped, err)
+	}
+	req := claimTestRequest(candidate.ID)
+	req.ExpectedRevision = candidate.Revision + 1
+	req.SerializeOverlappingScopes = true
+	req.EnforceScopeReservations = true
+	_, err := st.ClaimPipelineStart(ctx, req)
+	var conflict *ScopeReservationConflictError
+	if !errors.Is(err, ErrScopeReservationConflict) || !errors.As(err, &conflict) || conflict.BlockerID != reserved.ID {
+		t.Fatalf("claim error=%v conflict=%+v", err, conflict)
+	}
+	unchanged, err := st.Backlog.Get(ctx, candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.State != BacklogQueued || unchanged.Revision != candidate.Revision || unchanged.ClaimVersion != candidate.ClaimVersion {
+		t.Fatalf("reservation rejection mutated candidate: before=%+v after=%+v", candidate, unchanged)
+	}
+}
+
 func TestClaimPipelineStart_FaultMatrixAtomicity(t *testing.T) {
 	injected := errors.New("injected claim fault")
 	for _, point := range claimPipelineStartFaultPoints {

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
@@ -178,6 +179,35 @@ func (r *Reconciler) scopeOverlapBlocker(ctx context.Context, item *store.Backlo
 	for _, other := range running {
 		if other == nil || other.ID == item.ID {
 			continue
+		}
+		if hit, witness := store.BacklogScopesOverlap(item, other, r.HomeProject); hit {
+			return other.ID, witness, nil
+		}
+	}
+	return "", "", nil
+}
+
+func (r *Reconciler) scopeReservationBlocker(ctx context.Context, item *store.BacklogItem, hold time.Duration) (string, string, error) {
+	reservations, err := r.Store.Backlog.ScopeReservations(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	now := r.now().UTC()
+	for _, reservation := range reservations {
+		if reservation.ReservedAt != nil && now.Sub(*reservation.ReservedAt) >= hold {
+			if err := r.Store.Backlog.ResetScopeFairness(ctx, reservation.BacklogID); err != nil {
+				return "", "", err
+			}
+			ScopeReservationCapReleasesTotal.Inc()
+			r.append(ctx, "reconciler.scope_reservation_cap_released", "released", map[string]any{"item": reservation.BacklogID, "held_seconds": now.Sub(*reservation.ReservedAt).Seconds()})
+			continue
+		}
+		if reservation.BacklogID == item.ID {
+			continue
+		}
+		other, err := r.Store.Backlog.Get(ctx, reservation.BacklogID)
+		if err != nil {
+			return "", "", err
 		}
 		if hit, witness := store.BacklogScopesOverlap(item, other, r.HomeProject); hit {
 			return other.ID, witness, nil

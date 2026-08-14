@@ -1398,6 +1398,24 @@ func (o *SpawnOrchestrator) injectAgentConfig(ctx context.Context, be backend.Ba
 	// agent-context) directly against the Plan Store. Empty url ⇒ feature off.
 	planStoreWSURL := resolvePlanStoreWSURL()
 
+	gitAuthorName := strings.TrimSpace(os.Getenv("SPAWN_GIT_AUTHOR_NAME"))
+	if gitAuthorName == "" {
+		gitAuthorName = "loom-spawn"
+	}
+	gitAuthorEmail := strings.TrimSpace(os.Getenv("SPAWN_GIT_AUTHOR_EMAIL"))
+	if gitAuthorEmail == "" {
+		gitAuthorEmail = "loom-spawn@loom.local"
+	}
+	for _, author := range []struct{ key, value string }{
+		{"user.name", gitAuthorName},
+		{"user.email", gitAuthorEmail},
+	} {
+		cmd := fmt.Sprintf("git config --global %s %s", author.key, shellQuote(author.value))
+		if _, err := be.Exec(ctx, backend.ExecOpts{ContainerID: containerID, Command: cmd, TimeoutSec: 30}); err != nil {
+			return fmt.Errorf("configure git author %s: %w", author.key, err)
+		}
+	}
+
 	// Authenticate direct git fetches of private modules so the agent can
 	// `go build`/`go test` the single-repo clone without the ../../libs
 	// siblings its go.work references. $GIT_TOKEN is the same token the

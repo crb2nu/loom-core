@@ -31,7 +31,7 @@ func TestConfigureConcurrency(t *testing.T) {
 	t.Run("configured", func(t *testing.T) {
 		limiter := &recordingConcurrencyLimiter{}
 		limit := 2
-		if err := ConfigureConcurrency(limiter, sharedpolicy.PipelineConcurrencyPolicy{MaxConcurrentPipelines: &limit}); err != nil {
+		if err := ConfigureConcurrency(limiter, sharedpolicy.PipelineConcurrencyPolicy{MaxConcurrency: &limit}); err != nil {
 			t.Fatal(err)
 		}
 		if limiter.limit != 2 || limiter.calls != 1 {
@@ -42,7 +42,7 @@ func TestConfigureConcurrency(t *testing.T) {
 	t.Run("invalid is not applied", func(t *testing.T) {
 		limiter := &recordingConcurrencyLimiter{limit: 7}
 		for _, limit := range []int{0, -1, loomconcurrency.MaxLimit + 1} {
-			err := ConfigureConcurrency(limiter, sharedpolicy.PipelineConcurrencyPolicy{MaxConcurrentPipelines: &limit})
+			err := ConfigureConcurrency(limiter, sharedpolicy.PipelineConcurrencyPolicy{MaxConcurrency: &limit})
 			if err == nil {
 				t.Fatalf("limit %d: expected validation error", limit)
 			}

@@ -962,7 +962,7 @@ func TestCommitFormat_LongSubjectFails(t *testing.T) {
 func TestDefault_HasAllCoreGates(t *testing.T) {
 	r := Default()
 	got := r.Names()
-	want := []string{"commit_format", "diff_size", "docs_guardrail", "fabricated_slice", "nonempty_diff", "path_policy", "scope", "secret_scan"}
+	want := []string{"branch_pushed", "commit_format", "diff_size", "docs_guardrail", "fabricated_slice", "nonempty_diff", "path_policy", "scope", "secret_scan"}
 	if len(got) != len(want) {
 		t.Fatalf("default registry: got %v want %v", got, want)
 	}

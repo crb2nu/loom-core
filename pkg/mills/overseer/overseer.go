@@ -23,6 +23,38 @@ const (
 	S2SoakMaximumDivergences = 0
 )
 
+const (
+	// SoakGateMinimumDuration is the inclusive minimum observation window.
+	SoakGateMinimumDuration = 168 * time.Hour
+	// SoakGatePassMetric is a stable numeric projection of the gate verdict.
+	SoakGatePassMetric = "mills_overseer_s2_soak_gate_pass"
+)
+
+// SoakGateTelemetry is one complete snapshot of reviewed dry-run evidence.
+// Window is supplied explicitly so evaluation does not depend on wall time.
+type SoakGateTelemetry struct {
+	Window            time.Duration `json:"window"`
+	Regressions       int           `json:"regressions"`
+	ReviewedDecisions int           `json:"reviewed_decisions"`
+	Disagreements     int           `json:"disagreements"`
+}
+
+// SoakGateVerdict is the stable, machine-readable result of one atomic
+// evaluation. MetricPass is 1 on pass and 0 on every fail-closed result.
+type SoakGateVerdict struct {
+	Pass                     bool     `json:"pass"`
+	DecisionDisagreementRate float64  `json:"decision_disagreement_rate"`
+	FailureReasons           []string `json:"failure_reasons"`
+	MetricPass               int      `json:"mills_overseer_s2_soak_gate_pass"`
+}
+
+// SoakGate evaluates telemetry only. It has no promotion dependency or side
+// effects, so a verdict cannot itself change rollout state.
+type SoakGate struct{}
+
+// NewSoakGate constructs the stateless S2 soak evaluator.
+func NewSoakGate() SoakGate { return SoakGate{} }
+
 // Stable metric names consumed by status and promotion tooling.
 const (
 	S2SoakElapsedDaysMetric     = "mills_overseer_soak_elapsed_days"

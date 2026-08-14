@@ -15,6 +15,11 @@ const AuditAdvisoryDefaultStaleAfter = 30 * 24 * time.Hour
 // issues. Deployments using a different bot identity must pass -author.
 const AuditAdvisoryDigestAuthor = "mills-bot"
 
+// AuditAdvisoryBulkCloseRollbackLabel identifies only the issues closed by the
+// one-time stale-advisory cleanup. Operators use this label to verify the run
+// and to select the exact rollback set for reopening.
+const AuditAdvisoryBulkCloseRollbackLabel = "audit-bulk-close-2026-08-14"
+
 // IsAuditAdvisoryDigest reports whether issue has the complete producer
 // identity. A title fragment, marker, label, or author by itself is never
 // enough to authorize mutation.

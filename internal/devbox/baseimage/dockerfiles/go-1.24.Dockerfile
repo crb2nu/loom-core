@@ -1,6 +1,6 @@
 # Pre-built Go 1.24 base image for devbox sandboxes.
 # Built by scripts/build-base-images.sh and pushed to Harbor.
-FROM golang:1.26-alpine
+FROM golang:1.26.6-alpine
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 RUN apk add --no-cache \

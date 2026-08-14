@@ -1,0 +1,1 @@
+- Fixed the Mills tests-stage executor in `pkg/mills/pipeline/dispatcher.go` to run environment-prefixed declared Go tests, report skipped commands, preserve failed-check output in stage logs, and select a patched Go 1.26 devbox image from `internal/devbox/baseimage`.

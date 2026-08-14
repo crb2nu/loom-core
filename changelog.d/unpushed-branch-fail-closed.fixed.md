@@ -1,0 +1,1 @@
+- Fail closed when Mills implement spawns do not push their branch by adding the `branch_pushed` gate, an MR-stage origin check, and default spawn Git author identity configuration.

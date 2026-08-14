@@ -2,8 +2,11 @@ package mills
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
@@ -17,6 +20,90 @@ func itemWithFiles(id string, files ...string) *store.BacklogItem {
 		Slices:    []store.Slice{{Name: "s", Files: files}},
 		Budget:    store.Budget{MaxCostUSD: 1.0, MaxTurns: 30},
 		CreatedBy: "test",
+	}
+}
+
+func TestScopeFairnessPolicy_Defaults(t *testing.T) {
+	var p ScopeFairnessPolicy
+	if !p.IsEnabled() || p.Deferrals() != 50 || p.Age() != 6*time.Hour || p.Hold() != 2*time.Hour {
+		t.Fatalf("unexpected defaults: enabled=%v count=%d age=%s hold=%s", p.IsEnabled(), p.Deferrals(), p.Age(), p.Hold())
+	}
+}
+
+func TestReconciler_ScopeFairnessReservationConvoy(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	blocker := itemWithFiles("RUNNING", "pkg/mills/pipeline/blocker.go")
+	blocker.State = store.BacklogRunning
+	starved := itemWithFiles("STARVED", "pkg/mills/pipeline/starved.go")
+	newer := itemWithFiles("NEWER", "pkg/mills/pipeline/newer.go")
+	for _, item := range []*store.BacklogItem{blocker, starved, newer} {
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy := env.policy.Current()
+	policy.Pipeline.ScopeFairness.DeferralThreshold = 2
+	policy.Pipeline.ScopeFairness.AgeThresholdHours = 24
+	for i := 0; i < 2; i++ {
+		decision, _, _, err := env.rec.tryStart(ctx, starved, policy)
+		if err != nil || decision != decisionDeferred {
+			t.Fatalf("deferral %d: decision=%v err=%v", i+1, decision, err)
+		}
+	}
+	state, err := env.store.Backlog.ScopeFairness(ctx, starved.ID)
+	if err != nil || state.DeferralCount != 2 || state.ReservedAt == nil {
+		t.Fatalf("state=%+v err=%v", state, err)
+	}
+	decision, _, reason, err := env.rec.tryStart(ctx, newer, policy)
+	if err != nil || decision != decisionDeferred || !strings.Contains(reason, starved.ID) {
+		t.Fatalf("newer decision=%v reason=%q err=%v", decision, reason, err)
+	}
+	blocker.State = store.BacklogMerged
+	if err := env.store.Backlog.Put(ctx, blocker); err != nil {
+		t.Fatal(err)
+	}
+	fresh, _ := env.store.Backlog.Get(ctx, starved.ID)
+	decision, _, _, err = env.rec.tryStart(ctx, fresh, policy)
+	if err != nil || decision != decisionStarted {
+		t.Fatalf("reserved writer did not start: decision=%v err=%v", decision, err)
+	}
+	if _, err := env.store.Backlog.ScopeFairness(ctx, starved.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("fairness state survived start: %v", err)
+	}
+}
+
+func TestScopeFairness_TimeBoundaryAndCapRestartAging(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := env.now.UTC()
+	item := itemWithFiles("AGED", "pkg/mills/store/a.go")
+	if err := env.store.Backlog.Put(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	state, tripped, err := env.store.Backlog.RecordScopeDeferral(ctx, item.ID, now, 50, 6*time.Hour)
+	if err != nil || tripped {
+		t.Fatalf("first deferral state=%+v tripped=%v err=%v", state, tripped, err)
+	}
+	state, tripped, err = env.store.Backlog.RecordScopeDeferral(ctx, item.ID, now.Add(6*time.Hour), 50, 6*time.Hour)
+	if err != nil || !tripped || state.ReservedAt == nil {
+		t.Fatalf("age boundary state=%+v tripped=%v err=%v", state, tripped, err)
+	}
+	env.rec.Clock = func() time.Time { return now.Add(8 * time.Hour) }
+	other := itemWithFiles("OTHER", "pkg/mills/store/b.go")
+	if err := env.store.Backlog.Put(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	blocker, _, err := env.rec.scopeReservationBlocker(ctx, other, 2*time.Hour)
+	if err != nil || blocker != "" {
+		t.Fatalf("cap release blocker=%q err=%v", blocker, err)
+	}
+	if _, err := env.store.Backlog.ScopeFairness(ctx, item.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cap did not reset aging: %v", err)
+	}
+	state, _, err = env.store.Backlog.RecordScopeDeferral(ctx, item.ID, now.Add(8*time.Hour), 50, 6*time.Hour)
+	if err != nil || !state.FirstDeferredAt.Equal(now.Add(8*time.Hour)) || state.DeferralCount != 1 {
+		t.Fatalf("aging did not restart: %+v err=%v", state, err)
 	}
 }
 

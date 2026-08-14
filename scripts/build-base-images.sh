@@ -18,6 +18,7 @@ fi
 images=(
     "go:1.24:go-1.24.Dockerfile"
     "go:1.25:go-1.25.Dockerfile"
+    "go:1.26:go-1.26.Dockerfile"
     "python:3.12:python-3.12.Dockerfile"
     "python:3.13:python-3.13.Dockerfile"
     "node:20:node-20.Dockerfile"

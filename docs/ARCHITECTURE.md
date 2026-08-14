@@ -208,6 +208,15 @@ Notes:
 - Secrets should be referenced indirectly (`${env:...}` / `${secret:...}`), not stored plaintext.
 - Best-effort cleanup paths log warnings instead of crashing parent workflows.
 
-## Diagram Sources
+## Diagrams
 
-Diagram source files live under `docs/diagrams/`.
+![Component architecture](diagrams/component.svg)
+
+![Config flow](diagrams/config-flow.svg)
+
+![Tool call sequence](diagrams/tool-call-sequence.svg)
+
+Sources live under `docs/diagrams/` (`.mmd`); the module-level maps
+(`internal-modules.mmd`, `pkg-modules.mmd`) are auto-generated from the
+package tree by `libs/py-diagram-gen` and are best viewed as Mermaid
+source.

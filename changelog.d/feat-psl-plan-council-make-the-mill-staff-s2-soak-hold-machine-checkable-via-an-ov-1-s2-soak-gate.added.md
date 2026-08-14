@@ -1,0 +1,1 @@
+- Add the pure, fail-closed Mill Staff S2 `SoakGate` evaluator with a 168-hour minimum window, zero-regression requirement, and strictly-below-5% disagreement threshold in `pkg/mills/overseer/overseer.go`, `pkg/mills/overseer/soak_gate.go`, and `docs/mill-staff-s2-soak.md`.

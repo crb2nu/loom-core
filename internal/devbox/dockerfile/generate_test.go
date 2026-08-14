@@ -86,6 +86,30 @@ func TestGenerate_GoProject_BumpsOldGo125Patch(t *testing.T) {
 	}
 }
 
+func TestGenerate_GoProject_UsesPatchedGo126Base(t *testing.T) {
+	fp := &detect.EnvFingerprint{
+		ProjectDir:  "/tmp/mygoproject",
+		ProjectName: "mygoproject",
+		Languages: []detect.LanguageSpec{
+			{Language: "go", Version: "1.26.0"},
+		},
+		Hash: "go126",
+	}
+
+	out, err := Generate(fp)
+	if err != nil {
+		t.Fatalf("Generate() returned unexpected error: %v", err)
+	}
+
+	dockerfile := string(out)
+	if !strings.Contains(dockerfile, "registry.harbor.lan/mcp/devbox-base/go:1.26") {
+		t.Errorf("Go Dockerfile should use the patched Go 1.26 base, got:\n%s", dockerfile)
+	}
+	if strings.Contains(dockerfile, "golang:1.26.0-alpine") {
+		t.Errorf("Go Dockerfile must not fall back to the stale declared patch, got:\n%s", dockerfile)
+	}
+}
+
 func TestGenerate_GoProject_WithTools(t *testing.T) {
 	fp := &detect.EnvFingerprint{
 		ProjectDir:  "/tmp/mygoproject",

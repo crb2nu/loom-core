@@ -52,6 +52,109 @@ type EscalationRecheck struct {
 	Streak       int
 }
 
+// RecordScopeDeferral increments durable aging and atomically creates a
+// reservation when either threshold is reached.
+func (d *BacklogDAO) RecordScopeDeferral(ctx context.Context, id string, now time.Time, countThreshold int, ageThreshold time.Duration) (ScopeFairnessState, bool, error) {
+	now = now.UTC()
+	_, err := d.db.ExecContext(ctx, `INSERT INTO scope_fairness_state(backlog_id, first_deferred_at, deferral_count) VALUES(?,?,1)
+		ON CONFLICT(backlog_id) DO UPDATE SET deferral_count=deferral_count+1`, id, timeRFC3339(now))
+	if err != nil {
+		return ScopeFairnessState{}, false, fmt.Errorf("scope fairness defer %s: %w", id, err)
+	}
+	state, err := d.ScopeFairness(ctx, id)
+	if err != nil {
+		return state, false, err
+	}
+	trip := state.ReservedAt == nil && (state.DeferralCount >= countThreshold || now.Sub(state.FirstDeferredAt) >= ageThreshold)
+	if trip {
+		res, err := d.db.ExecContext(ctx, `UPDATE scope_fairness_state SET reserved_at=? WHERE backlog_id=? AND reserved_at IS NULL`, timeRFC3339(now), id)
+		if err != nil {
+			return state, false, err
+		}
+		n, _ := res.RowsAffected()
+		trip = n == 1
+		if trip {
+			state.ReservedAt = &now
+		}
+	}
+	return state, trip, nil
+}
+
+func (d *BacklogDAO) ScopeFairness(ctx context.Context, id string) (ScopeFairnessState, error) {
+	var s ScopeFairnessState
+	var first string
+	var reserved sql.NullString
+	err := d.db.QueryRowContext(ctx, `SELECT backlog_id, first_deferred_at, deferral_count, reserved_at FROM scope_fairness_state WHERE backlog_id=?`, id).Scan(&s.BacklogID, &first, &s.DeferralCount, &reserved)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s, ErrNotFound
+	}
+	if err != nil {
+		return s, err
+	}
+	s.FirstDeferredAt, err = parseTime(first)
+	if err != nil {
+		return s, err
+	}
+	if reserved.Valid {
+		t, e := parseTime(reserved.String)
+		if e != nil {
+			return s, e
+		}
+		s.ReservedAt = &t
+	}
+	return s, nil
+}
+
+func (d *BacklogDAO) ScopeReservations(ctx context.Context) ([]ScopeFairnessState, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT s.backlog_id,s.first_deferred_at,s.deferral_count,s.reserved_at FROM scope_fairness_state s JOIN backlog_items b ON b.id=s.backlog_id WHERE s.reserved_at IS NOT NULL AND b.state=? ORDER BY s.reserved_at,s.backlog_id`, string(BacklogQueued))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ScopeFairnessState{}
+	for rows.Next() {
+		var s ScopeFairnessState
+		var first, reserved string
+		if err := rows.Scan(&s.BacklogID, &first, &s.DeferralCount, &reserved); err != nil {
+			return nil, err
+		}
+		s.FirstDeferredAt, _ = parseTime(first)
+		t, e := parseTime(reserved)
+		if e != nil {
+			return nil, e
+		}
+		s.ReservedAt = &t
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (d *BacklogDAO) ResetScopeFairness(ctx context.Context, id string) error {
+	_, err := d.db.ExecContext(ctx, `DELETE FROM scope_fairness_state WHERE backlog_id=?`, id)
+	return err
+}
+
+// ScopeFairnessSummary returns current durable fairness values for KPI export.
+func (d *BacklogDAO) ScopeFairnessSummary(ctx context.Context, now time.Time) (deferrals, reservations int, maxAgeSeconds float64, err error) {
+	var first sql.NullString
+	err = d.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(s.deferral_count),0), COALESCE(SUM(CASE WHEN s.reserved_at IS NOT NULL THEN 1 ELSE 0 END),0), MIN(s.first_deferred_at)
+		FROM scope_fairness_state s JOIN backlog_items b ON b.id=s.backlog_id WHERE b.state=?`, string(BacklogQueued)).Scan(&deferrals, &reservations, &first)
+	if err != nil {
+		return
+	}
+	if first.Valid {
+		var t time.Time
+		t, err = parseTime(first.String)
+		if err == nil {
+			maxAgeSeconds = now.UTC().Sub(t).Seconds()
+			if maxAgeSeconds < 0 {
+				maxAgeSeconds = 0
+			}
+		}
+	}
+	return
+}
+
 // EscalationRecheck returns an item's persisted sweep throttle.
 func (d *BacklogDAO) EscalationRecheck(ctx context.Context, id string) (EscalationRecheck, error) {
 	var state EscalationRecheck
@@ -375,6 +478,11 @@ func (d *BacklogDAO) TransitionState(
 		RETURNING `+backlogColumns+`
 	`, string(to), timeRFC3339(now), id, expectedClaimVersion, string(from), string(to), int64(math.MaxInt64)))
 	if err == nil {
+		if to != BacklogQueued && to != BacklogRunning {
+			if _, deleteErr := tx.ExecContext(ctx, `DELETE FROM scope_fairness_state WHERE backlog_id=?`, id); deleteErr != nil {
+				return nil, fmt.Errorf("backlog transition %s clear scope fairness: %w", id, deleteErr)
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("backlog transition %s commit: %w", id, err)
 		}

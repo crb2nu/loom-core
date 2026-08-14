@@ -1,7 +1,8 @@
 # Mill Staff S2 overseer soak gate
 
-Promotion from overseer dry-run is controlled by `EvaluateSoakGate`. The gate
-passes only when one evidence set satisfies every criterion:
+Promotion from overseer dry-run is held until `EvaluateSoakGate` passes. The
+gate evaluates only: it does not perform, queue, or record promotion. It passes
+only when one `SoakGateTelemetry` snapshot satisfies every criterion:
 
 - the closed soak window is at least 168 hours;
 - the regression count is zero; and
@@ -10,6 +11,11 @@ passes only when one evidence set satisfies every criterion:
 Exactly 5% disagreement fails. Missing, negative, or internally inconsistent
 evidence also fails closed. At least one reviewed decision is required so the
 rate has a meaningful denominator.
+
+The input fields are `window`, `regressions`, `reviewed_decisions`, and
+`disagreements`. Callers provide the window explicitly, making the 168-hour
+boundary independent of wall time. The threshold comparison uses exact integer
+arithmetic; the floating-point rate is output for observation only.
 
 The JSON verdict contains `pass`, the observed
 `decision_disagreement_rate`, stable `failure_reasons`, and

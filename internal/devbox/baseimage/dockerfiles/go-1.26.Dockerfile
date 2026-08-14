@@ -1,4 +1,4 @@
-# Pre-built Go 1.25 base image for devbox sandboxes.
+# Pre-built Go 1.26 base image for devbox sandboxes.
 # Built by scripts/build-base-images.sh and pushed to Harbor.
 FROM golang:1.26.6-alpine
 ENV PATH="/usr/local/go/bin:${PATH}"

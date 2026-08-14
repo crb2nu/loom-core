@@ -421,7 +421,8 @@ type PipelinePolicy struct {
 	// failure-classification MRs, zero mergeable). *bool so an omitted key
 	// defaults to true — this is a correctness guard; opt OUT with
 	// serialize_overlapping_scopes: false. Hot-reloads via PolicyManager.
-	SerializeOverlappingScopes *bool `yaml:"serialize_overlapping_scopes,omitempty"`
+	SerializeOverlappingScopes *bool               `yaml:"serialize_overlapping_scopes,omitempty"`
+	ScopeFairness              ScopeFairnessPolicy `yaml:"scope_fairness,omitempty"`
 
 	// StageSubstrate selects which devbox backend each spawn-driven stage
 	// runs against (harvester-vm Slice 2). Keys are stage IDs; values are
@@ -544,6 +545,36 @@ type CIWatchPolicy struct {
 // field so the default rule stays in one place.
 func (p PipelinePolicy) SerializeOverlappingScopesEnabled() bool {
 	return p.SerializeOverlappingScopes == nil || *p.SerializeOverlappingScopes
+}
+
+// ScopeFairnessPolicy bounds writer-preference for repeatedly scope-blocked
+// backlog items. It is default-on because it is the liveness half of scope
+// serialization; an explicit enabled:false restores the legacy admission path.
+type ScopeFairnessPolicy struct {
+	Enabled              *bool `yaml:"enabled,omitempty"`
+	DeferralThreshold    int   `yaml:"deferral_threshold,omitempty"`
+	AgeThresholdHours    int   `yaml:"age_threshold_hours,omitempty"`
+	ReservationHoldHours int   `yaml:"reservation_hold_hours,omitempty"`
+}
+
+func (p ScopeFairnessPolicy) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+func (p ScopeFairnessPolicy) Deferrals() int {
+	if p.DeferralThreshold > 0 {
+		return p.DeferralThreshold
+	}
+	return 50
+}
+func (p ScopeFairnessPolicy) Age() time.Duration {
+	if p.AgeThresholdHours > 0 {
+		return time.Duration(p.AgeThresholdHours) * time.Hour
+	}
+	return 6 * time.Hour
+}
+func (p ScopeFairnessPolicy) Hold() time.Duration {
+	if p.ReservationHoldHours > 0 {
+		return time.Duration(p.ReservationHoldHours) * time.Hour
+	}
+	return 2 * time.Hour
 }
 
 // Auto-requeue defaults. Conservative on purpose: a retryable escalation
@@ -1370,6 +1401,9 @@ func (p *Policy) Validate() error {
 	}
 	if p.Pipeline.Retry.CooldownSeconds < 0 {
 		return errors.New("pipeline.retry.cooldown_seconds must be >= 0")
+	}
+	if p.Pipeline.ScopeFairness.DeferralThreshold < 0 || p.Pipeline.ScopeFairness.AgeThresholdHours < 0 || p.Pipeline.ScopeFairness.ReservationHoldHours < 0 {
+		return errors.New("pipeline.scope_fairness thresholds must be >= 0")
 	}
 	for i, ov := range p.Pipeline.PerLabelOverrides {
 		if ov.Label == "" {

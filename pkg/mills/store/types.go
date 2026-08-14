@@ -143,6 +143,14 @@ type BacklogItem struct {
 	UpdatedAt  time.Time
 }
 
+// ScopeFairnessState is durable aging state for scope-overlap admission.
+type ScopeFairnessState struct {
+	BacklogID       string
+	FirstDeferredAt time.Time
+	DeferralCount   int
+	ReservedAt      *time.Time
+}
+
 // PlanTasteAggregate is the merged-work taste rollup for one plan.
 type PlanTasteAggregate struct {
 	PlanID        string  `json:"plan_id"`

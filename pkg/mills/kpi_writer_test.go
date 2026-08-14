@@ -86,6 +86,33 @@ func TestKPIWriter_RecordWritesRollingSnapshot(t *testing.T) {
 	}
 }
 
+func TestKPIWriter_ScopeFairnessKeys(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	item := itemWithFiles("KPI-FAIR", "pkg/mills/a.go")
+	if err := env.store.Backlog.Put(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := env.store.Backlog.RecordScopeDeferral(ctx, item.ID, env.now.Add(-7*time.Hour), 1, 6*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	w := NewKPIWriter(env.store, env.policy)
+	w.Clock = func() time.Time { return env.now }
+	snap, err := w.snapshot(ctx, env.now, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snap.Metrics["scope_deferrals"]; got != 1 {
+		t.Errorf("scope_deferrals=%v", got)
+	}
+	if got := snap.Metrics["scope_starvation_reservations"]; got != 1 {
+		t.Errorf("reservations=%v", got)
+	}
+	if got := snap.Metrics["scope_max_queue_age_seconds"]; got != float64(7*time.Hour/time.Second) {
+		t.Errorf("queue age=%v", got)
+	}
+}
+
 // TestKPIWriter_GatePassRateExcludesSkips pins the KPI half of the scope-gate
 // skip change: a 'skip' outcome (advisory/not-applicable gate) must be excluded
 // from BOTH the pass count and the total so it neither raises nor lowers

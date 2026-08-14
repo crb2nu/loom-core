@@ -17,6 +17,7 @@ type entry struct {
 var registry = []entry{
 	{"go", "1.24", "registry.harbor.lan/mcp/devbox-base/go:1.24"},
 	{"go", "1.25", "registry.harbor.lan/mcp/devbox-base/go:1.25"},
+	{"go", "1.26", "registry.harbor.lan/mcp/devbox-base/go:1.26"},
 	{"python", "3.12", "registry.harbor.lan/mcp/devbox-base/python:3.12"},
 	{"python", "3.13", "registry.harbor.lan/mcp/devbox-base/python:3.13"},
 	{"node", "20", "registry.harbor.lan/mcp/devbox-base/node:20"},

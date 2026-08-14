@@ -1,0 +1,1 @@
+- Add the `max_concurrency` policy field and apply its validated value through the Mills pipeline concurrency limiter (`pkg/policy/policy.go`, `internal/loomconcurrency/limit.go`, and `pkg/mills/pipeline/pipeline.go`).

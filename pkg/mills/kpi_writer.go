@@ -234,6 +234,10 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 	if err != nil {
 		return nil, err
 	}
+	scopeDeferrals, scopeReservations, scopeMaxQueueAge, err := w.Store.Backlog.ScopeFairnessSummary(ctx, now)
+	if err != nil {
+		return nil, err
+	}
 
 	metrics := map[string]any{
 		"policy_enabled":          w.policyEnabled(),
@@ -257,10 +261,13 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 		// (escalated→queued) in the window without a human hitting the requeue
 		// endpoint. Windowed like the other counters; for the primary 1d
 		// snapshot this is the rolling-24h fleet total the per-day cap bounds.
-		"auto_requeues":      autoRequeues,
-		"gate_evaluations":   gateTotal,
-		"gate_passes":        gatePass,
-		"eval_average_score": avgEval,
+		"auto_requeues":                 autoRequeues,
+		"gate_evaluations":              gateTotal,
+		"gate_passes":                   gatePass,
+		"eval_average_score":            avgEval,
+		"scope_deferrals":               scopeDeferrals,
+		"scope_starvation_reservations": scopeReservations,
+		"scope_max_queue_age_seconds":   scopeMaxQueueAge,
 		// retry_cost_usd: dollars spent on stage attempts > 1 in the window
 		// (the "retry burn" — money re-running stages that failed the first
 		// time). Same started_at window mechanics as pipeline_cost_usd, but

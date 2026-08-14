@@ -125,3 +125,19 @@ func TestApplyValue_Clamps(t *testing.T) {
 func TestApplyValue_NilIsNoOp(t *testing.T) {
 	ApplyValue(nil, 4) // must not panic
 }
+
+func TestApplyValidatedRejectsWithoutMutation(t *testing.T) {
+	f := &fakeLimiter{}
+	if err := ApplyValidated(f, MinLimit-1); err == nil {
+		t.Fatal("expected invalid limit to be rejected")
+	}
+	if _, ok := f.lastValue(); ok {
+		t.Fatal("invalid limit mutated limiter")
+	}
+	if err := ApplyValidated(f, 3); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := f.lastValue(); !ok || got != 3 {
+		t.Fatalf("valid limit = %d, applied %v; want 3, true", got, ok)
+	}
+}

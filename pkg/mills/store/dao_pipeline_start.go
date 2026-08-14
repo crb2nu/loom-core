@@ -17,6 +17,11 @@ var (
 	// and claim version observed by the caller. It is an expected race outcome,
 	// not a store failure.
 	ErrClaimConflict = errors.New("pipeline start: backlog claim conflict")
+	// ErrScopeReservationConflict means an older queued item has reserved an
+	// overlapping scope. ClaimPipelineStart returns this stable reason before
+	// attempting the backlog CAS, so a stale revision cannot mask writer
+	// preference as ErrClaimConflict.
+	ErrScopeReservationConflict = errors.New("pipeline start: scope reservation conflict")
 	// ErrInvalidClaim reports malformed transactional-admission input.
 	ErrInvalidClaim = errors.New("pipeline start: invalid claim")
 	// ErrDispatchClaimConflict means an outbox row is not currently claimable
@@ -60,6 +65,26 @@ type ScopeConflictError struct {
 	BlockerID string
 	Witness   string
 }
+
+// ScopeReservationConflictError identifies the queued item whose reservation
+// rejected admission. It is errors.Is-matchable with
+// ErrScopeReservationConflict and is deliberately distinct from a running
+// scope conflict.
+type ScopeReservationConflictError struct {
+	BacklogID string
+	BlockerID string
+	Witness   string
+}
+
+func (e *ScopeReservationConflictError) Error() string {
+	if e == nil {
+		return ErrScopeReservationConflict.Error()
+	}
+	return fmt.Sprintf("%s: backlog %s overlaps reserved backlog %s at %s",
+		ErrScopeReservationConflict, e.BacklogID, e.BlockerID, e.Witness)
+}
+
+func (e *ScopeReservationConflictError) Unwrap() error { return ErrScopeReservationConflict }
 
 func (e *ScopeConflictError) Error() string {
 	if e == nil {
@@ -112,6 +137,7 @@ type ClaimPipelineStartRequest struct {
 	ExpectedClaimVersion       int64
 	ExpectedRevision           int64
 	SerializeOverlappingScopes bool
+	EnforceScopeReservations   bool
 	HomeProject                string
 	Template                   string
 	EstimateUSD                float64
@@ -154,6 +180,27 @@ func (s *Store) ClaimPipelineStart(ctx context.Context, req ClaimPipelineStartRe
 	req.HomeProject = strings.TrimSpace(req.HomeProject)
 	if err := validateClaimPipelineStartRequest(req); err != nil {
 		return nil, err
+	}
+
+	// Reservation rejection has precedence over the claim CAS contract. Read
+	// the current queued envelope and reject an existing reservation before any
+	// revision-bumping write. The same predicate is checked again after the CAS
+	// below to close the concurrent-reservation race transactionally.
+	if req.SerializeOverlappingScopes && req.EnforceScopeReservations {
+		item, err := scanBacklog(s.db.QueryRowContext(ctx,
+			`SELECT `+backlogColumns+` FROM backlog_items WHERE id = ?`, req.BacklogID))
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("pipeline start: load reservation candidate: %w", err)
+		}
+		if err == nil && item.State == BacklogQueued {
+			conflict, err := findPipelineStartReservationConflict(ctx, s.db, item, req.HomeProject)
+			if err != nil {
+				return nil, err
+			}
+			if conflict != nil {
+				return nil, conflict
+			}
+		}
 	}
 
 	now := req.Now.UTC()
@@ -219,6 +266,15 @@ func (s *Store) ClaimPipelineStart(ctx context.Context, req ClaimPipelineStartRe
 		}
 		if conflict != nil {
 			return nil, conflict
+		}
+		if req.EnforceScopeReservations {
+			reservationConflict, err := findPipelineStartReservationConflict(ctx, tx, item, req.HomeProject)
+			if err != nil {
+				return nil, err
+			}
+			if reservationConflict != nil {
+				return nil, reservationConflict
+			}
 		}
 	}
 
@@ -366,6 +422,13 @@ func (s *Store) ClaimPipelineStart(ctx context.Context, req ClaimPipelineStartRe
 		UpdatedAt:        now,
 	}
 
+	// Starting the reserved writer releases its fairness state in the same
+	// transaction as the claim. A separate best-effort delete can silently
+	// leave stale aging state behind when the claim has already committed.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM scope_fairness_state WHERE backlog_id = ?`, req.BacklogID); err != nil {
+		return nil, fmt.Errorf("pipeline start: clear scope fairness %s: %w", req.BacklogID, err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("pipeline start: commit %s: %w", run.ID, err)
 	}
@@ -439,6 +502,50 @@ func findPipelineStartScopeConflict(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("pipeline start: scope check rows: %w", err)
+	}
+	return nil, nil
+}
+
+// findPipelineStartReservationConflict closes the race between the
+// reconciler's advisory reservation check and the atomic start claim. A
+// reservation created by another reconciler before this transaction obtains
+// its write lock must win over a newer overlapping admission.
+type pipelineStartQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func findPipelineStartReservationConflict(
+	ctx context.Context,
+	q pipelineStartQueryer,
+	item *BacklogItem,
+	homeProject string,
+) (*ScopeReservationConflictError, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT `+backlogColumns+`
+		FROM backlog_items b
+		JOIN scope_fairness_state s ON s.backlog_id = b.id
+		WHERE b.state = ? AND b.id <> ? AND s.reserved_at IS NOT NULL
+		ORDER BY s.reserved_at ASC, b.id ASC
+	`, string(BacklogQueued), item.ID)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline start: scope reservation check: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		other, err := scanBacklog(rows)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline start: scope reservation scan: %w", err)
+		}
+		if hit, witness := BacklogScopesOverlap(item, other, homeProject); hit {
+			return &ScopeReservationConflictError{
+				BacklogID: item.ID,
+				BlockerID: other.ID,
+				Witness:   witness,
+			}, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pipeline start: scope reservation rows: %w", err)
 	}
 	return nil, nil
 }

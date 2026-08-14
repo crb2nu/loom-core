@@ -8,6 +8,8 @@ Go backend for the Loom ecosystem:
 - `loom` CLI for config generation/sync, daemon control, and tooling (`cmd/loom/`)
 - `loomd` daemon for MCP server lifecycle and tool routing (`cmd/loomd/`)
 
+![Component architecture](docs/diagrams/component.svg)
+
 ## Implementation Status
 
 Current shipped/in-progress status is tracked in one place:
@@ -17,7 +19,7 @@ Current shipped/in-progress status is tracked in one place:
 Roadmap and execution sequencing:
 
 - `ROADMAP.md`
-- `docs/planning/2026-02-17-architecture-refactor-opportunities.md`
+- `docs/planning/2026-02-17-architecture-refactor-opportunities.md` (historical context)
 
 ## Start Here By Role
 
@@ -57,8 +59,7 @@ make build
 - Safe local upgrade: `make dev-upgrade`
 - Force daemon restart upgrade: `make dev-reload`
 - Health check: `curl http://localhost:9876/health`
-- Main HUD: `https://hud.flexinfer.ai` served by Kubernetes deployment `loom-hub/mobile-hud`
-- Verify main HUD deployment: `kubectl -n loom-hub rollout status deployment/mobile-hud`
+- Main HUD: served from the cluster deployment (see `docs/DEPLOYMENT*.md`)
 - Local development HUD only: `./bin/loom hud --port 3333`
 - Local HUD launchd lifecycle (macOS): `./bin/loom hud install`, `./bin/loom hud status`
 - Agent token launchd sync (Codex/Gemini): `./bin/loom sync agent-tokens install`, `./bin/loom sync agent-tokens status`
