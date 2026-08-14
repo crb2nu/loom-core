@@ -1,0 +1,1 @@
+- iOS companion: tapping a stalled merge-request attention lane now opens the MR in the browser instead of silently landing on the Work tab, and stalled MRs group under "Stalled merge requests" instead of inverting their meaning inside "Merge-ready branches".

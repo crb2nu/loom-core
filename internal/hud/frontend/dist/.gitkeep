@@ -1,0 +1,10 @@
+# This directory holds the built Svelte HUD bundle (vite output).
+#
+# The bundle itself is NOT committed — its content-hashed filenames change on
+# every build, which caused a merge conflict on every concurrent HUD MR. It is
+# built by `make hud-frontend` locally, by the CI `build:frontend` job, and by
+# the Docker image's frontend builder stage.
+#
+# This .gitkeep is the only tracked file here. It keeps the directory present so
+# `//go:embed all:frontend/dist` (internal/hud/app.go) stays valid even before
+# vite has run. Do not delete it. See .gitignore for the ignore rule.

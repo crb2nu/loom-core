@@ -1,0 +1,1 @@
+- Add bounded per-gate failure categories, retained pipeline run IDs, and deterministic KPI aggregation in `pkg/mills/gates/gates.go` and `pkg/telemetry/telemetry.go`.

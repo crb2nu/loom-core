@@ -2,7 +2,6 @@ package agentcontext
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,13 +10,15 @@ import (
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
+type MemorySvc struct{ *Service }
+
 // GetMemoryHierarchy returns the memory hierarchy for direct access
-func (s *Service) GetMemoryHierarchy() *MemoryHierarchy {
+func (s *MemorySvc) GetMemoryHierarchy() *MemoryHierarchy {
 	return s.memoryHierarchy
 }
 
 // HandleMemoryAdd adds items to the memory hierarchy
-func (s *Service) HandleMemoryAdd(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryAdd(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	sessionID := v.String("session_id", "")
 	agentID := v.String("agent_id", s.cfg.DefaultAgentID)
@@ -108,7 +109,7 @@ func (s *Service) HandleMemoryAdd(ctx context.Context, args map[string]any) (*mc
 }
 
 // HandleMemoryGet retrieves memory items by ID
-func (s *Service) HandleMemoryGet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryGet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	itemIDs := v.RequiredStringSlice("item_ids")
 
@@ -133,7 +134,7 @@ func (s *Service) HandleMemoryGet(ctx context.Context, args map[string]any) (*mc
 }
 
 // HandleMemoryRecall recalls memories matching criteria
-func (s *Service) HandleMemoryRecall(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryRecall(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	query := v.String("query", "")
 	namespace := v.String("namespace", "")
@@ -187,7 +188,7 @@ func (s *Service) HandleMemoryRecall(ctx context.Context, args map[string]any) (
 }
 
 // HandleMemoryDelete deletes memory items
-func (s *Service) HandleMemoryDelete(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryDelete(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	itemIDs := v.RequiredStringSlice("item_ids")
 	confirm := v.Bool("confirm", false)
@@ -214,7 +215,7 @@ func (s *Service) HandleMemoryDelete(ctx context.Context, args map[string]any) (
 }
 
 // HandleMemoryPromote promotes items to a higher tier
-func (s *Service) HandleMemoryPromote(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryPromote(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	itemIDs := v.RequiredStringSlice("item_ids")
 
@@ -244,7 +245,7 @@ func (s *Service) HandleMemoryPromote(ctx context.Context, args map[string]any) 
 }
 
 // HandleMemoryDemote demotes items to a lower tier
-func (s *Service) HandleMemoryDemote(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryDemote(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	itemIDs := v.RequiredStringSlice("item_ids")
 
@@ -273,88 +274,8 @@ func (s *Service) HandleMemoryDemote(ctx context.Context, args map[string]any) (
 	return mcp.JSONResult(result)
 }
 
-// HandleMemoryCompress compresses items to reduce token usage
-func (s *Service) HandleMemoryCompress(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	v := validate.NewArgs(args)
-	// Check if we're compressing specific items or running tier-wide compression
-	itemIDs := v.StringSlice("item_ids")
-	tierStr := v.String("tier", "")
-
-	tier := MemoryTier(tierStr)
-
-	if len(itemIDs) > 0 {
-		// Compress specific items
-		var compressed []string
-		var errors []string
-		for _, id := range itemIDs {
-			if err := s.memoryHierarchy.CompressItem(id); err == nil {
-				compressed = append(compressed, id)
-			} else {
-				errors = append(errors, fmt.Sprintf("%s: %v", id, err))
-			}
-		}
-
-		result := map[string]any{
-			"ok":         true,
-			"compressed": compressed,
-		}
-		if len(errors) > 0 {
-			result["errors"] = errors
-		}
-		return mcp.JSONResult(result)
-	}
-
-	if tier != "" {
-		// Run tier-wide compression
-		job, err := s.memoryHierarchy.RunCompression(tier)
-		if err != nil {
-			return mcp.ErrorResult(err), nil
-		}
-
-		return mcp.JSONResult(map[string]any{
-			"ok":                true,
-			"job_id":            job.ID,
-			"tier":              job.Tier,
-			"item_count":        job.ItemCount,
-			"expired_count":     job.ExpiredCount,
-			"original_tokens":   job.OriginalTokens,
-			"compressed_tokens": job.CompressedTokens,
-			"status":            job.Status,
-		})
-	}
-
-	return mcp.ErrorResult(fmt.Errorf("either item_ids or tier is required")), nil
-}
-
-// HandleMemoryMerge merges multiple items into one
-func (s *Service) HandleMemoryMerge(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	v := validate.NewArgs(args)
-	itemIDs := v.RequiredStringSlice("item_ids")
-	newTitle := v.String("new_title", "Merged Memory")
-
-	if err := v.Validate(); err != nil {
-		return mcp.ErrorResult(err), nil
-	}
-
-	if len(itemIDs) < 2 {
-		return mcp.ErrorResult(fmt.Errorf("at least 2 item_ids are required to merge")), nil
-	}
-
-	merged, err := s.memoryHierarchy.MergeItems(itemIDs, newTitle)
-	if err != nil {
-		return mcp.ErrorResult(err), nil
-	}
-
-	return mcp.JSONResult(map[string]any{
-		"ok":              true,
-		"merged_item_id":  merged.ID,
-		"merged_item":     memoryItemToMap(merged),
-		"source_item_ids": itemIDs,
-	})
-}
-
 // HandleMemoryStats returns memory hierarchy statistics
-func (s *Service) HandleMemoryStats(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryStats(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	stats := s.memoryHierarchy.Stats()
 
 	return mcp.JSONResult(map[string]any{
@@ -389,7 +310,7 @@ func (s *Service) HandleMemoryStats(ctx context.Context, args map[string]any) (*
 }
 
 // HandleMemoryPolicyGet returns retention policy for a tier
-func (s *Service) HandleMemoryPolicyGet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *MemorySvc) HandleMemoryPolicyGet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	tierStr := v.Required("tier")
 
@@ -422,85 +343,6 @@ func (s *Service) HandleMemoryPolicyGet(ctx context.Context, args map[string]any
 			"dedupe_enabled":         policy.DedupeEnabled,
 			"dedupe_similarity":      policy.DedupeSimilarity,
 		},
-	})
-}
-
-// HandleMemoryPolicySet updates retention policy for a tier
-func (s *Service) HandleMemoryPolicySet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	v := validate.NewArgs(args)
-	tierStr := v.Required("tier")
-	name := v.String("name", "")
-	ttl := v.Int("default_ttl_hours", 0)
-	compress := v.Int("compress_after_hours", 0)
-	ratio := v.Float("compression_ratio", 0)
-	merge := v.Float("merge_threshold", 0)
-	promo := v.Float("promotion_threshold", 0)
-	demo := v.Float("demotion_threshold", 0)
-	access := v.Int("access_count_threshold", 0)
-	maxItems := v.Int("max_items", 0)
-	maxTokens := v.Int("max_tokens", 0)
-	dedupeEnabled := v.Bool("dedupe_enabled", true)
-	dedupeSim := v.Float("dedupe_similarity", 0)
-
-	if err := v.Validate(); err != nil {
-		return mcp.ErrorResult(err), nil
-	}
-
-	tier := MemoryTier(tierStr)
-
-	// Get existing policy or create new
-	policy := s.memoryHierarchy.GetRetentionPolicy(tier)
-	if policy == nil {
-		policy = &RetentionPolicy{
-			ID:   fmt.Sprintf("custom-%s", tier),
-			Tier: tier,
-		}
-	}
-
-	// Update fields if provided
-	if name != "" {
-		policy.Name = name
-	}
-	if ttl > 0 {
-		policy.DefaultTTL = ttl
-	}
-	if compress > 0 {
-		policy.CompressAfterHours = compress
-	}
-	if ratio > 0 {
-		policy.CompressionRatio = ratio
-	}
-	if merge > 0 {
-		policy.MergeThreshold = merge
-	}
-	if promo > 0 {
-		policy.PromotionThreshold = promo
-	}
-	if demo > 0 {
-		policy.DemotionThreshold = demo
-	}
-	if access > 0 {
-		policy.AccessCountThreshold = access
-	}
-	if maxItems > 0 {
-		policy.MaxItems = maxItems
-	}
-	if maxTokens > 0 {
-		policy.MaxTokens = maxTokens
-	}
-	if _, ok := args["dedupe_enabled"]; ok {
-		policy.DedupeEnabled = dedupeEnabled
-	}
-	if dedupeSim > 0 {
-		policy.DedupeSimilarity = dedupeSim
-	}
-
-	s.memoryHierarchy.SetRetentionPolicy(policy)
-
-	return mcp.JSONResult(map[string]any{
-		"ok":      true,
-		"tier":    string(tier),
-		"message": "Retention policy updated",
 	})
 }
 
@@ -551,103 +393,4 @@ func memoryItemToMap(item *MemoryItem) map[string]any {
 	}
 
 	return m
-}
-
-// HandleMemoryExport exports memory to universal JSON format
-func (s *Service) HandleMemoryExport(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	v := validate.NewArgs(args)
-	agentID := v.String("agent_id", "")
-	namespace := v.String("namespace", "")
-	sessionID := v.String("session_id", "")
-	format := v.String("format", "loom")
-	includeGraph := v.Bool("include_graph", true)
-	includeWorkflows := v.Bool("include_workflows", false)
-	includeEmbeddings := v.Bool("include_embeddings", false)
-	tiers := v.StringSlice("tiers")
-	tags := v.StringSlice("tags")
-
-	if err := v.Validate(); err != nil {
-		return mcp.ErrorResult(err), nil
-	}
-
-	opts := ExportOptions{
-		IncludeMemories:   true,
-		IncludeGraph:      includeGraph,
-		IncludeWorkflows:  includeWorkflows,
-		IncludeEmbeddings: includeEmbeddings,
-		MemoryTiers:       tiers,
-		SessionID:         sessionID,
-		Namespace:         namespace,
-		Format:            format,
-		AgentID:           agentID,
-		Tags:              tags,
-	}
-
-	data, err := s.memoryExporter.Export(opts)
-	if err != nil {
-		return mcp.ErrorResult(fmt.Errorf("export: %w", err)), nil
-	}
-
-	return mcp.JSONResult(map[string]any{
-		"ok":     true,
-		"export": data,
-		"stats":  data.Stats,
-	})
-}
-
-// HandleMemoryImport imports memory from universal JSON format
-func (s *Service) HandleMemoryImport(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-	v := validate.NewArgs(args)
-	conflictStrategy := v.String("conflict_strategy", "skip")
-	idPrefix := v.String("id_prefix", "")
-	targetTier := v.String("target_tier", "")
-	targetNamespace := v.String("target_namespace", "")
-	importGraph := v.Bool("import_graph", true)
-	importWorkflows := v.Bool("import_workflows", false)
-	regenerateEmbeddings := v.Bool("regenerate_embeddings", false)
-
-	if err := v.Validate(); err != nil {
-		return mcp.ErrorResult(err), nil
-	}
-
-	// Get the data payload
-	dataRaw, ok := args["data"]
-	if !ok {
-		return mcp.ErrorResult(fmt.Errorf("data is required")), nil
-	}
-
-	// Marshal and unmarshal to get a proper UniversalMemoryFormat
-	dataBytes, err := json.Marshal(dataRaw)
-	if err != nil {
-		return mcp.ErrorResult(fmt.Errorf("invalid data format: %w", err)), nil
-	}
-
-	opts := ImportOptions{
-		ImportMemories:       true,
-		ImportGraph:          importGraph,
-		ImportWorkflows:      importWorkflows,
-		ConflictStrategy:     conflictStrategy,
-		IDPrefix:             idPrefix,
-		TargetTier:           targetTier,
-		TargetNamespace:      targetNamespace,
-		RegenerateEmbeddings: regenerateEmbeddings,
-	}
-
-	result, err := s.memoryImporter.ImportFromJSON(dataBytes, opts)
-	if err != nil {
-		return mcp.ErrorResult(fmt.Errorf("import: %w", err)), nil
-	}
-
-	return mcp.JSONResult(map[string]any{
-		"ok":                 true,
-		"memories_imported":  result.MemoriesImported,
-		"memories_skipped":   result.MemoriesSkipped,
-		"entities_imported":  result.EntitiesImported,
-		"entities_skipped":   result.EntitiesSkipped,
-		"relations_imported": result.RelationsImported,
-		"relations_skipped":  result.RelationsSkipped,
-		"workflows_imported": result.WorkflowsImported,
-		"workflows_skipped":  result.WorkflowsSkipped,
-		"errors":             result.Errors,
-	})
 }

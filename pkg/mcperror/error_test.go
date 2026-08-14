@@ -495,6 +495,8 @@ func TestIsNotFound(t *testing.T) {
 		{"server error", ServerError("boom"), false},
 		{"nil error", nil, false},
 		{"plain Go error", errors.New("not found"), false},
+		{"wrapped not_found", fmt.Errorf("lookup failed: %w", NotFound("user", "1")), true},
+		{"typed-nil *Error", func() error { return WrapAPI("svc", nil) }(), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -20,6 +20,16 @@ Build a companion iOS/iPadOS app for loom-core operators to monitor agent fleets
 - Editing registry/platform config from mobile.
 - Replacing desktop HUD for deep diagnostics or graph-heavy analysis.
 
+## Scope Guardrails (v1)
+
+- Any request that expands beyond monitoring + session lifecycle (`start/end`) is out-of-scope for v1.
+- Out-of-scope asks must be routed to post-v1 backlog issues before implementation starts.
+- Out-of-scope backlog entries should include:
+  - requested capability,
+  - operator impact,
+  - target milestone (`v1.1+` or explicit roadmap phase),
+  - link back to Mobile Companion scope discipline issue `#37`.
+
 ## Users
 
 - Primary: operator/lead developer supervising multiple coding agents.
@@ -123,6 +133,13 @@ Build a companion iOS/iPadOS app for loom-core operators to monitor agent fleets
 - iOS app must declare and explain required local network purpose text and, when applicable, required Bonjour service declarations.
 - Connection profile health UI must distinguish auth failure, local network permission denied, and transport-unreachable states.
 
+### R12: Release Operability (Install -> Internal Distribution -> Full Release)
+
+- The product must have a deterministic install path for a developer-owned iPhone using development signing.
+- The product must support artifact-based distribution (`.xcarchive`/`.ipa`) for internal testing workflows.
+- A TestFlight-first publish path must be documented and automatable before public release readiness.
+- CI/CD requirements for iOS packaging must be defined without regressing the existing Go pipeline.
+
 ## UX Flows
 
 ### Flow A: Quick status check
@@ -184,6 +201,7 @@ New backend work required:
 - Should iPad prioritize split-view operator console layout in v1 or v1.1?
 - Which mutation endpoints remain disabled on mobile at launch?
 - Should profile mode fail over automatically between LAN and gateway, or remain explicitly user-selected?
+- Should ad-hoc export remain a first-class lane, or should TestFlight be the single supported internal distribution path?
 
 ## Sources
 
@@ -203,8 +221,112 @@ New backend work required:
 - `AGENTS.md:43`
 - `ROADMAP.md:13`
 - `.loom/13-research-mobile-roadmap-features-2026-02-19.md`
+- `.loom/14-research-mobile-signing-publish-2026-02-25.md`
+- `apps/loom-companion-ios/project.yml:22-42`
+- `Makefile:729-829`
+- `.gitlab-ci.yml:20-24`
+- `.gitlab-ci.yml:390-469`
+- `docs/MOBILE_COMPANION_IPHONE_TESTING.md:64-87`
 - `https://datatracker.ietf.org/doc/rfc8252/`
 - `https://datatracker.ietf.org/doc/html/rfc9700`
 - `https://datatracker.ietf.org/doc/html/rfc8628`
 - `https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy`
 - `https://developer.apple.com/design/human-interface-guidelines/managing-notifications`
+
+---
+
+# 2026-03-16 Product Spec Addendum: Synthetic Bulk Server Tools
+
+## Summary
+
+Add daemon-generated `server__bulk` tools for mutation-oriented MCP servers so an agent can write a manifest file once and execute many same-server operations with one Loom tool call.
+
+## Goals
+
+- Reduce repeated MCP round trips for bursty same-server mutations.
+- Keep the agent-visible request small by moving verbose argument lists into a local manifest file.
+- Preserve existing authorization, validation, audit, and output-scanning behavior by routing nested operations through the daemon.
+- Return compact summaries that conserve context while still surfacing failures clearly.
+
+## Non-Goals
+
+- Replacing domain-specific bulk APIs where a server already has better native batch semantics.
+- Supporting mixed-server manifests in the first slice.
+- Returning full nested result payloads for every operation.
+- Enabling recursive bulk calls.
+
+## Users
+
+- Primary: agents automating many same-shape mutations against a single server, such as GitLab issue creation, GitHub issue updates, or batch sync/retry/send flows.
+- Secondary: human operators who want a reproducible manifest artifact for review before execution.
+
+## User Stories
+
+1. As an agent, I can write a manifest file containing ten GitLab issue creations and execute them with one `gitlab__bulk` call.
+2. As an agent, I can dry-run a manifest to validate tool names and structure before making changes.
+3. As an operator, I can inspect a compact response that tells me how many operations succeeded or failed without scrolling through ten full payloads.
+
+## Requirements
+
+### R1: Server-scoped synthetic tools
+
+- The daemon must expose `server__bulk` only for servers where bulk mutation support is sensible.
+- Excluded servers must not surface a bulk tool.
+
+### R2: File-driven manifest contract
+
+- The bulk tool must accept an absolute `file` path.
+- The manifest must support JSON and YAML.
+- The manifest must support:
+  - `default_tool`
+  - `operations[]`
+  - per-operation `id`
+  - per-operation `tool`
+  - per-operation `arguments`
+  - optional `continue_on_error`
+
+### R3: Execution controls
+
+- The tool must support `dry_run`.
+- The tool must support `stop_on_error`.
+- The tool must enforce configurable result and operation caps.
+
+### R4: Safety and policy inheritance
+
+- Each nested operation must execute through the normal daemon call path.
+- Existing schema validation, authorization, request policy, audit logging, metrics, and output scanning must still apply.
+- Nested bulk operations must be rejected.
+
+### R5: Compact response shape
+
+- The response must include:
+  - server,
+  - manifest path,
+  - total/executed/succeeded/failed counts,
+  - stop/truncation markers when relevant,
+  - a compact per-operation summary list.
+- Per-operation summaries should prioritize IDs, titles, statuses, and URLs over full payloads.
+
+## Acceptance Criteria
+
+- `loom/tools` includes `gitlab__bulk` and other eligible bulk tools derived from inventory.
+- `prometheus__bulk`, `time__bulk`, and similar excluded tools are not exposed.
+- JSON and YAML manifests both execute successfully.
+- A stop-on-error manifest aborts after the first failure.
+- A continue-on-error manifest records failures and finishes the remaining operations.
+
+## Sources
+
+- `internal/daemon/bulk_tools.go:109`
+- `internal/daemon/bulk_tools.go:117`
+- `internal/daemon/bulk_tools.go:168`
+- `internal/daemon/bulk_tools.go:285`
+- `internal/daemon/bulk_tools.go:407`
+- `internal/daemon/bulk_tools.go:434`
+- `internal/daemon/bulk_tools.go:638`
+- `internal/daemon/daemon_toolcache.go:176`
+- `internal/daemon/schema_validate.go:134`
+- `internal/daemon/bulk_tools_test.go:13`
+- `internal/daemon/bulk_tools_test.go:42`
+- `internal/daemon/bulk_tools_test.go:71`
+- `internal/daemon/bulk_tools_test.go:111`

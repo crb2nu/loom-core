@@ -2,6 +2,7 @@ package validate
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 )
 
@@ -188,6 +189,9 @@ func TestAsInt(t *testing.T) {
 		{"string", "nope", 0, false},
 		{"nil", nil, 0, false},
 		{"bool", true, 0, false},
+		{"float64 NaN", math.NaN(), 0, false},
+		{"float64 +Inf", math.Inf(1), 0, false},
+		{"float64 overflow", 1e300, 0, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -823,6 +827,152 @@ func TestArgs_GetPagination(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Pattern constants are valid regex
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Standalone helpers (StringSliceFromArgs, BoolFromArgs, IntFromArgs)
+// ---------------------------------------------------------------------------
+
+func TestStringSliceFromArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		args map[string]any
+		key  string
+		want []string
+	}{
+		{"present", map[string]any{"tags": []any{"a", "b"}}, "tags", []string{"a", "b"}},
+		{"missing key", map[string]any{}, "tags", nil},
+		{"nil map", nil, "tags", nil},
+		{"wrong type", map[string]any{"tags": "not-a-slice"}, "tags", nil},
+		{"empty slice", map[string]any{"tags": []any{}}, "tags", nil},
+		{"mixed types skips non-string", map[string]any{"tags": []any{"a", 42, "b"}}, "tags", []string{"a", "b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := StringSliceFromArgs(tt.args, tt.key)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestBoolFromArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		args       map[string]any
+		key        string
+		defaultVal bool
+		want       bool
+	}{
+		{"present true", map[string]any{"flag": true}, "flag", false, true},
+		{"present false", map[string]any{"flag": false}, "flag", true, false},
+		{"missing uses default true", map[string]any{}, "flag", true, true},
+		{"missing uses default false", map[string]any{}, "flag", false, false},
+		{"nil map", nil, "flag", true, true},
+		{"wrong type", map[string]any{"flag": "yes"}, "flag", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := BoolFromArgs(tt.args, tt.key, tt.defaultVal)
+			if got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIntFromArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		args       map[string]any
+		key        string
+		defaultVal int
+		want       int
+	}{
+		{"float64", map[string]any{"limit": float64(42)}, "limit", 10, 42},
+		{"int", map[string]any{"limit": int(7)}, "limit", 10, 7},
+		{"int64", map[string]any{"limit": int64(99)}, "limit", 10, 99},
+		{"json.Number", map[string]any{"limit": json.Number("25")}, "limit", 10, 25},
+		{"zero value", map[string]any{"limit": float64(0)}, "limit", 10, 0},
+		{"missing uses default", map[string]any{}, "limit", 10, 10},
+		{"nil map", nil, "limit", 5, 5},
+		{"wrong type", map[string]any{"limit": "ten"}, "limit", 10, 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := IntFromArgs(tt.args, tt.key, tt.defaultVal)
+			if got != tt.want {
+				t.Errorf("got %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStringFromArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		args       map[string]any
+		key        string
+		defaultVal string
+		want       string
+	}{
+		{"present", map[string]any{"name": "hello"}, "name", "", "hello"},
+		{"whitespace trimmed", map[string]any{"name": "  hello  "}, "name", "", "hello"},
+		{"empty after trim returns default", map[string]any{"name": "   "}, "name", "fallback", "fallback"},
+		{"missing uses default", map[string]any{}, "name", "default", "default"},
+		{"nil map", nil, "name", "default", "default"},
+		{"wrong type", map[string]any{"name": 42}, "name", "default", "default"},
+		{"empty string returns default", map[string]any{"name": ""}, "name", "fb", "fb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := StringFromArgs(tt.args, tt.key, tt.defaultVal)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFloat64FromArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		args       map[string]any
+		key        string
+		defaultVal float64
+		want       float64
+	}{
+		{"present", map[string]any{"weight": 0.75}, "weight", 0.5, 0.75},
+		{"zero value", map[string]any{"weight": 0.0}, "weight", 0.5, 0.0},
+		{"missing uses default", map[string]any{}, "weight", 0.5, 0.5},
+		{"nil map", nil, "weight", 0.5, 0.5},
+		{"wrong type", map[string]any{"weight": "high"}, "weight", 0.5, 0.5},
+		{"int type returns default", map[string]any{"weight": 1}, "weight", 0.5, 0.5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := Float64FromArgs(tt.args, tt.key, tt.defaultVal)
+			if got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestPatternConstants(t *testing.T) {
 	t.Parallel()

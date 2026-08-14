@@ -1,0 +1,1 @@
+- Run allowlisted item-declared Go tests during the Mills tests stage and report rejected commands (`pkg/mills`).

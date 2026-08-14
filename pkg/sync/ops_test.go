@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/skills"
 )
@@ -790,6 +791,87 @@ func TestDiscoverSkillsRegistryPath_FindsAncestorWorkspacePlatformRegistry(t *te
 	}
 }
 
+func TestDiscoverSkillsRegistryPath_FindsAncestorWorkspaceLoomCoreRegistry(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	repoRoot := filepath.Join(workspaceRoot, "services", "other-repo")
+	if err := os.MkdirAll(repoRoot, 0755); err != nil {
+		t.Fatalf("mkdir repo root: %v", err)
+	}
+
+	skillsRegistry := filepath.Join(workspaceRoot, "services", "loom-core", "mcp", "context", "skills-registry.yaml")
+	if err := os.MkdirAll(filepath.Dir(skillsRegistry), 0755); err != nil {
+		t.Fatalf("mkdir skills dir: %v", err)
+	}
+	if err := os.WriteFile(skillsRegistry, []byte("version: 1\nskills: []\n"), 0644); err != nil {
+		t.Fatalf("write skills registry: %v", err)
+	}
+
+	got := discoverSkillsRegistryPath(repoRoot)
+	if got != skillsRegistry {
+		t.Fatalf("discoverSkillsRegistryPath()=%q, want %q", got, skillsRegistry)
+	}
+}
+
+func TestRegenerateSkills_UpdatesRegistryDate(t *testing.T) {
+	repoRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	// Create local skills registry with a stale updated date.
+	registryPath := filepath.Join(repoRoot, "mcp", "context", "skills-registry.yaml")
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0755); err != nil {
+		t.Fatalf("mkdir registry dir: %v", err)
+	}
+	registry := `version: 1
+updated: "2026-01-01"
+skills:
+  - name: test-skill
+    categories: [test]
+    common:
+      description: "test"
+      instructions: "Do test work."
+    targets:
+      codex:
+        enabled: true
+        type: skill
+`
+	if err := os.WriteFile(registryPath, []byte(registry), 0644); err != nil {
+		t.Fatalf("write skills registry: %v", err)
+	}
+
+	m, err := NewManager(repoRoot)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	m.HomeDir = homeDir
+
+	p := &Profile{
+		Name:         "codex",
+		RepoDir:      ".codex",
+		HomeDir:      filepath.Join(homeDir, ".codex"),
+		SkillsTarget: "codex",
+	}
+
+	if err := m.regenerateSkills(p); err != nil {
+		t.Fatalf("regenerateSkills: %v", err)
+	}
+
+	updatedBytes, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatalf("read updated registry: %v", err)
+	}
+	updated := string(updatedBytes)
+
+	today := time.Now().Format("2006-01-02")
+	wantQuoted := `updated: "` + today + `"`
+	wantBare := "updated: " + today
+	if !strings.Contains(updated, wantQuoted) && !strings.Contains(updated, wantBare) {
+		t.Fatalf("expected registry to contain %q or %q, got:\n%s", wantQuoted, wantBare, updated)
+	}
+	if strings.Contains(updated, `updated: "2026-01-01"`) {
+		t.Fatalf("expected stale updated date to be replaced, got:\n%s", updated)
+	}
+}
+
 func TestValidate_McpJson(t *testing.T) {
 	homeDir := t.TempDir()
 	profileDir := filepath.Join(homeDir, "test-profile")
@@ -811,6 +893,30 @@ func TestValidate_McpJson(t *testing.T) {
 	err := m.Validate("test")
 	if err != nil {
 		t.Errorf("Validate should pass when mcp.json exists: %v", err)
+	}
+}
+
+func TestValidate_McpConfigJsonWithHomeGeneratedFileOverride(t *testing.T) {
+	homeDir := t.TempDir()
+	profileDir := filepath.Join(homeDir, "test-profile")
+	os.MkdirAll(profileDir, 0755)
+	validJSON := `{"mcpServers": {"test": {"command": "node", "args": ["server.js"]}}}`
+	os.WriteFile(filepath.Join(profileDir, "mcp_config.json"), []byte(validJSON), 0644)
+
+	m, _ := NewManager(t.TempDir())
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:              "test",
+		RepoDir:           "test-repo",
+		HomeDir:           filepath.Join(homeDir, "test-profile"),
+		GeneratorTarget:   "antigravity",
+		GeneratedFile:     "mcp.json",
+		HomeGeneratedFile: "mcp_config.json",
+	}
+
+	err := m.Validate("test")
+	if err != nil {
+		t.Errorf("Validate should pass when mcp_config.json exists: %v", err)
 	}
 }
 
@@ -1108,6 +1214,74 @@ func TestSyncToHome_GeneratedOnly(t *testing.T) {
 	}
 }
 
+func TestSyncToHome_GeneratedOnly_HomeGeneratedFileOverride(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	repoProfDir := filepath.Join(repoDir, "test-profile")
+	os.MkdirAll(repoProfDir, 0755)
+	os.WriteFile(filepath.Join(repoProfDir, "mcp.json"), []byte("content"), 0644)
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:              "test",
+		RepoDir:           "test-profile",
+		HomeDir:           filepath.Join(homeDir, "dest"),
+		GeneratedFile:     "mcp.json",
+		HomeGeneratedFile: "mcp_config.json",
+		SyncGeneratedOnly: true,
+	}
+
+	err := m.SyncToHome("test", false, false, false, false, "", false, "", false)
+	if err != nil {
+		t.Fatalf("SyncToHome failed: %v", err)
+	}
+
+	if !Exists(filepath.Join(homeDir, "dest", "mcp_config.json")) {
+		t.Error("expected mcp.json to be synced to home as mcp_config.json")
+	}
+	if Exists(filepath.Join(homeDir, "dest", "mcp.json")) {
+		t.Error("did not expect mcp.json in home when HomeGeneratedFile is set")
+	}
+}
+
+func TestSyncToHome_GeneratedOnly_HomeExtraGeneratedFileOverride(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	repoProfDir := filepath.Join(repoDir, "test-profile")
+	os.MkdirAll(repoProfDir, 0755)
+	os.WriteFile(filepath.Join(repoProfDir, "mcp_config.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(repoProfDir, "hooks.json"), []byte(`{"loom":{}}`), 0644)
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:                "test",
+		RepoDir:             "test-profile",
+		HomeDir:             filepath.Join(homeDir, "dest"),
+		GeneratedFile:       "mcp_config.json",
+		ExtraGeneratedFiles: []string{"hooks.json"},
+		HomeExtraGeneratedFiles: map[string]string{
+			"hooks.json": "config/hooks.json",
+		},
+		SyncGeneratedOnly: true,
+	}
+
+	err := m.SyncToHome("test", false, false, false, false, "", false, "", false)
+	if err != nil {
+		t.Fatalf("SyncToHome failed: %v", err)
+	}
+
+	if !Exists(filepath.Join(homeDir, "dest", "config", "hooks.json")) {
+		t.Fatal("expected hooks.json to be synced to home override path config/hooks.json")
+	}
+	if Exists(filepath.Join(homeDir, "dest", "hooks.json")) {
+		t.Fatal("did not expect hooks.json at the home profile root when HomeExtraGeneratedFiles is set")
+	}
+}
+
 func TestBackup_GeneratedOnly(t *testing.T) {
 	repoDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -1146,6 +1320,35 @@ func TestBackup_GeneratedOnly(t *testing.T) {
 	}
 	if Exists(filepath.Join(backupDir, "extra.txt")) {
 		t.Error("did not expect extra.txt to be backed up for generated-only profile")
+	}
+}
+
+func TestPullFromHome_GeneratedOnly_HomeGeneratedFileOverride(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	homeProfDir := filepath.Join(homeDir, "app-dir")
+	os.MkdirAll(homeProfDir, 0755)
+	os.WriteFile(filepath.Join(homeProfDir, "mcp_config.json"), []byte("content"), 0644)
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:              "test",
+		RepoDir:           "test-profile",
+		HomeDir:           homeProfDir,
+		GeneratedFile:     "mcp.json",
+		HomeGeneratedFile: "mcp_config.json",
+		SyncGeneratedOnly: true,
+	}
+
+	err := m.PullFromHome("test", false)
+	if err != nil {
+		t.Fatalf("PullFromHome failed: %v", err)
+	}
+
+	if !Exists(filepath.Join(repoDir, "test-profile", "mcp.json")) {
+		t.Error("expected home mcp_config.json to be pulled into repo mcp.json")
 	}
 }
 
@@ -1340,6 +1543,185 @@ func TestSyncAll_PerProfileDefaults(t *testing.T) {
 }
 
 // =============================================================================
+// GeneratedDirectToHome Tests
+// =============================================================================
+
+func TestCleanRepoGenerated_RemovesStaleFiles(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+
+	p := &Profile{
+		Name:                  "codex",
+		RepoDir:               ".codex",
+		GeneratedFile:         "config.toml",
+		ExtraGeneratedFiles:   []string{"settings.json"},
+		GeneratedDirectToHome: true,
+	}
+
+	repoCodex := filepath.Join(repoDir, ".codex")
+	if err := os.MkdirAll(repoCodex, 0o755); err != nil {
+		t.Fatalf("mkdir repo codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoCodex, "config.toml"), []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write stale config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoCodex, "settings.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("write stale settings: %v", err)
+	}
+
+	m.cleanRepoGenerated(p)
+
+	if Exists(filepath.Join(repoCodex, "config.toml")) {
+		t.Error("expected stale config.toml to be removed")
+	}
+	if Exists(filepath.Join(repoCodex, "settings.json")) {
+		t.Error("expected stale settings.json to be removed")
+	}
+}
+
+func TestSyncToHome_RepoOnlySkipsHomeOnlyCodex(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+
+	homeCodex := filepath.Join(homeDir, ".codex")
+	if err := os.MkdirAll(homeCodex, 0o755); err != nil {
+		t.Fatalf("mkdir home codex: %v", err)
+	}
+
+	if err := m.SyncToHome("codex", false, false, true, false, "", false, "", false); err != nil {
+		t.Fatalf("SyncToHome failed: %v", err)
+	}
+
+	if Exists(filepath.Join(homeCodex, "config.toml")) {
+		t.Error("did not expect repo-only sync to write home config")
+	}
+}
+
+func TestSyncAllProjects_StripsHomeManagedSettingsKeys(t *testing.T) {
+	repoDir := t.TempDir()
+	workspaceDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+
+	projectSettings := filepath.Join(workspaceDir, "project-a", ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(projectSettings), 0o755); err != nil {
+		t.Fatalf("mkdir project settings dir: %v", err)
+	}
+	content := []byte(`{"hooks":{"session":true},"permissions":{"allow":["Bash"]},"theme":"dark"}`)
+	if err := os.WriteFile(projectSettings, content, 0o644); err != nil {
+		t.Fatalf("write project settings: %v", err)
+	}
+
+	updated, err := m.SyncAllProjects("claude", workspaceDir, false, false)
+	if err != nil {
+		t.Fatalf("SyncAllProjects failed: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated = %d, want 1", updated)
+	}
+
+	got, err := os.ReadFile(projectSettings)
+	if err != nil {
+		t.Fatalf("read project settings: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatalf("parse stripped settings: %v", err)
+	}
+	if _, ok := parsed["hooks"]; ok {
+		t.Fatal("expected hooks removed from workspace project settings")
+	}
+	if _, ok := parsed["permissions"]; ok {
+		t.Fatal("expected permissions removed from workspace project settings")
+	}
+	if parsed["theme"] != "dark" {
+		t.Fatalf("expected theme preserved, got %#v", parsed["theme"])
+	}
+}
+
+func TestCleanAllProjectsGenerated_RemovesWorkspaceCopiesForHomeManagedProfiles(t *testing.T) {
+	repoDir := t.TempDir()
+	workspaceDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+
+	projectConfig := filepath.Join(workspaceDir, "project-a", ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(projectConfig), 0o755); err != nil {
+		t.Fatalf("mkdir project config dir: %v", err)
+	}
+	if err := os.WriteFile(projectConfig, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+
+	updated, err := m.CleanAllProjectsGenerated("codex", workspaceDir, false, false)
+	if err != nil {
+		t.Fatalf("CleanAllProjectsGenerated failed: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated = %d, want 1", updated)
+	}
+	if Exists(projectConfig) {
+		t.Fatal("expected stale project codex config to be removed")
+	}
+}
+
+func TestRegenerate_AutoCleansStaleProjectConfigs(t *testing.T) {
+	repoDir := t.TempDir()
+	workspaceDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+	m.WorkspaceRoot = workspaceDir
+
+	// Create a stale codex config in a workspace sub-project
+	projectConfig := filepath.Join(workspaceDir, "project-a", ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(projectConfig), 0o755); err != nil {
+		t.Fatalf("mkdir project config dir: %v", err)
+	}
+	if err := os.WriteFile(projectConfig, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+
+	// Verify the stale config exists before Regenerate
+	if !Exists(projectConfig) {
+		t.Fatal("expected stale project codex config to exist before test")
+	}
+
+	// Regenerate will fail because there's no real registry, but the cleanup
+	// happens before generation — test that cleanRepoGenerated + CleanAllProjectsGenerated
+	// are called for GeneratedDirectToHome profiles by calling them directly
+	// (matching what Regenerate does).
+	p, err := m.GetProfile("codex")
+	if err != nil {
+		t.Fatalf("GetProfile codex: %v", err)
+	}
+	if !p.GeneratedDirectToHome {
+		t.Fatal("expected codex profile to have GeneratedDirectToHome=true")
+	}
+
+	// Simulate what Regenerate does for GeneratedDirectToHome profiles
+	m.cleanRepoGenerated(p)
+	if m.WorkspaceRoot != "" {
+		n, cleanErr := m.CleanAllProjectsGenerated(p.Name, m.WorkspaceRoot, false, false)
+		if cleanErr != nil {
+			t.Fatalf("CleanAllProjectsGenerated failed: %v", cleanErr)
+		}
+		if n != 1 {
+			t.Fatalf("CleanAllProjectsGenerated cleaned %d, want 1", n)
+		}
+	}
+
+	if Exists(projectConfig) {
+		t.Fatal("expected stale project codex config to be removed during regen cleanup")
+	}
+}
+
+// =============================================================================
 // SkillsDirectToHome Tests
 // =============================================================================
 
@@ -1370,7 +1752,7 @@ func TestCleanRepoSkills_RemovesStaleFiles(t *testing.T) {
 	// Create stale instructions.md
 	os.WriteFile(filepath.Join(repoGemini, "instructions.md"), []byte("stale"), 0644)
 
-	m.cleanRepoSkills(p)
+	m.cleanRepoSkills(p, []string{"test-skill"})
 
 	if Exists(filepath.Join(repoGemini, "skills")) {
 		t.Error("expected skills directory to be removed")
@@ -1397,7 +1779,7 @@ func TestCleanRepoSkills_NoopWhenNothingExists(t *testing.T) {
 	}
 
 	// Should not panic or error when nothing exists
-	m.cleanRepoSkills(p)
+	m.cleanRepoSkills(p, nil)
 }
 
 func TestSyncToHome_SkillsDirectToHome_SkipsRepoCopy(t *testing.T) {
@@ -1445,6 +1827,75 @@ func TestSyncToHome_SkillsDirectToHome_SkipsRepoCopy(t *testing.T) {
 		if string(content) == "repo skill" {
 			t.Error("repo skill should not have been copied to home when SkillsDirectToHome is true")
 		}
+	}
+}
+
+func TestRegenerateSkills_AntigravityUsesOwnTargetAndHomePath(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	regDir := filepath.Join(repoDir, "mcp", "context")
+	if err := os.MkdirAll(regDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	registryYAML := `version: 1
+skills:
+  - name: ag-only
+    common:
+      description: Antigravity-only helper
+      instructions: "Run ${SKILL_PATH}/scripts/run.sh"
+    targets:
+      gemini:
+        enabled: false
+        type: skill
+        instructions_append: |
+          ## Gemini Notes
+          wrong target
+      antigravity:
+        enabled: true
+        type: command
+        instructions_append: |
+          ## Antigravity Notes
+          right target
+`
+	if err := os.WriteFile(filepath.Join(regDir, "skills-registry.yaml"), []byte(registryYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := NewManager(repoDir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	m.HomeDir = homeDir
+	p := m.Get("antigravity")
+	p.SkillsHomePath = filepath.Join(homeDir, ".gemini", "antigravity", "skills")
+
+	if err := m.regenerateSkills(p); err != nil {
+		t.Fatalf("regenerateSkills(antigravity): %v", err)
+	}
+
+	antigravitySkill := filepath.Join(homeDir, ".gemini", "antigravity", "skills", "ag-only", "SKILL.md")
+	data, err := os.ReadFile(antigravitySkill)
+	if err != nil {
+		t.Fatalf("expected Antigravity skill at %s: %v", antigravitySkill, err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "## Antigravity Notes") {
+		t.Fatalf("expected Antigravity target override in skill:\n%s", text)
+	}
+	if strings.Contains(text, "Gemini Notes") {
+		t.Fatalf("Antigravity skill used Gemini target override:\n%s", text)
+	}
+	if Exists(filepath.Join(homeDir, ".gemini", "skills", "ag-only", "SKILL.md")) {
+		t.Fatal("did not expect Antigravity sync to write into the Gemini skills root")
+	}
+
+	manifest, err := skills.ReadManifest(filepath.Join(homeDir, ".gemini", "antigravity"))
+	if err != nil {
+		t.Fatalf("read Antigravity manifest: %v", err)
+	}
+	if manifest == nil || manifest.Platform != "antigravity" {
+		t.Fatalf("manifest platform = %#v, want antigravity", manifest)
 	}
 }
 
@@ -1614,22 +2065,385 @@ func TestFilterPrunedExtensions_NoPrunedIsNoop(t *testing.T) {
 	}
 }
 
-func TestGeminiProfile_HasSkillsDirectToHome(t *testing.T) {
+func TestAllSkillProfiles_HaveSkillsDirectToHome(t *testing.T) {
 	m, _ := NewManager(t.TempDir())
 
-	gemini := m.Get("gemini")
-	if gemini == nil {
-		t.Fatal("gemini profile not found")
-	}
-	if !gemini.SkillsDirectToHome {
-		t.Error("gemini profile should have SkillsDirectToHome=true")
+	tests := []struct {
+		name     string
+		homePath string
+	}{
+		{"gemini", "$HOME/.gemini/skills"},
+		{"antigravity", "$HOME/.gemini/antigravity/skills"},
+		{"claude", "$HOME/.claude/skills"},
+		{"kilocode", "$HOME/.kilocode/skills"},
+		{"codex", "$HOME/.codex/skills"},
+		{"opencode", "$HOME/.config/opencode/skills"},
+		{"zed", "$HOME/.config/zed/skills"},
 	}
 
-	// Other profiles should NOT have it
-	for _, name := range []string{"claude", "codex", "kilocode"} {
-		p := m.Get(name)
-		if p != nil && p.SkillsDirectToHome {
-			t.Errorf("%s profile should not have SkillsDirectToHome=true", name)
+	for _, tt := range tests {
+		p := m.Get(tt.name)
+		if p == nil {
+			t.Fatalf("%s profile not found", tt.name)
 		}
+		if !p.SkillsDirectToHome {
+			t.Errorf("%s profile should have SkillsDirectToHome=true", tt.name)
+		}
+		if p.SkillsHomePath != tt.homePath {
+			t.Errorf("%s SkillsHomePath = %q, want %q", tt.name, p.SkillsHomePath, tt.homePath)
+		}
+	}
+
+	// Verify antigravity uses its own registry target while emitting
+	// Gemini-style SKILL.md bundles.
+	antigravity := m.Get("antigravity")
+	if antigravity.SkillsTarget != "antigravity" {
+		t.Errorf("antigravity SkillsTarget = %q, want %q", antigravity.SkillsTarget, "antigravity")
+	}
+}
+
+func TestCodexProfile_HasHomeOnlySkills(t *testing.T) {
+	m, _ := NewManager(t.TempDir())
+
+	codex := m.Get("codex")
+	if codex == nil {
+		t.Fatal("codex profile not found")
+	}
+	if !codex.SkillsDirectToHome {
+		t.Error("codex profile should have SkillsDirectToHome=true")
+	}
+	if codex.SkillsHomePath != "$HOME/.codex/skills" {
+		t.Errorf("codex SkillsHomePath = %q, want %q", codex.SkillsHomePath, "$HOME/.codex/skills")
+	}
+}
+
+// =============================================================================
+// Drift Detection Tests
+// =============================================================================
+
+func TestConfigInSyncIgnoringKeys_HooksDifferOnly(t *testing.T) {
+	tests := []struct {
+		name       string
+		repo       string
+		home       string
+		ignoreKeys []string
+		wantSync   bool
+	}{
+		{
+			name:       "differ only in hooks — in sync",
+			repo:       `{"theme":"dark"}`,
+			home:       `{"theme":"dark","hooks":{"preToolUse":"echo hi"}}`,
+			ignoreKeys: []string{"hooks"},
+			wantSync:   true,
+		},
+		{
+			name:       "differ in other keys — out of sync",
+			repo:       `{"theme":"dark"}`,
+			home:       `{"theme":"light","hooks":{"preToolUse":"echo hi"}}`,
+			ignoreKeys: []string{"hooks"},
+			wantSync:   false,
+		},
+		{
+			name:       "identical — in sync",
+			repo:       `{"theme":"dark"}`,
+			home:       `{"theme":"dark"}`,
+			ignoreKeys: []string{"hooks"},
+			wantSync:   true,
+		},
+		{
+			name:       "multiple ignored keys",
+			repo:       `{"theme":"dark"}`,
+			home:       `{"theme":"dark","hooks":{},"notify":{"url":"http://example.com"}}`,
+			ignoreKeys: []string{"hooks", "notify"},
+			wantSync:   true,
+		},
+		{
+			name:       "invalid JSON repo — not in sync",
+			repo:       `not json`,
+			home:       `{"theme":"dark"}`,
+			ignoreKeys: []string{"hooks"},
+			wantSync:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			repoFile := filepath.Join(dir, "repo.json")
+			homeFile := filepath.Join(dir, "home.json")
+
+			os.WriteFile(repoFile, []byte(tt.repo), 0644)
+			os.WriteFile(homeFile, []byte(tt.home), 0644)
+
+			got := configInSyncIgnoringKeys(repoFile, homeFile, tt.ignoreKeys)
+			if got != tt.wantSync {
+				t.Errorf("configInSyncIgnoringKeys() = %v, want %v", got, tt.wantSync)
+			}
+		})
+	}
+}
+
+func TestSettingsInSyncIgnoringHomeManaged(t *testing.T) {
+	tests := []struct {
+		name     string
+		repo     string
+		home     string
+		profile  *Profile
+		wantSync bool
+	}{
+		{
+			name:     "claude: hooks+permissions stripped from repo — in sync",
+			repo:     `{"$schema":"x"}`,
+			home:     `{"$schema":"x","hooks":{"PostToolUse":[]},"permissions":{"allow":["mcp__loom"]}}`,
+			profile:  &Profile{HomeManagedSettingsKeys: []string{"hooks", "permissions"}},
+			wantSync: true,
+		},
+		{
+			name:     "gemini: 5-key strip — in sync",
+			repo:     `{"$schema":"x"}`,
+			home:     `{"$schema":"x","hooks":{},"experimental":{},"general":{},"tools":{},"security":{}}`,
+			profile:  &Profile{HomeManagedSettingsKeys: []string{"hooks", "experimental", "general", "tools", "security"}},
+			wantSync: true,
+		},
+		{
+			name:     "non-managed key differs — out of sync",
+			repo:     `{"$schema":"x","theme":"dark"}`,
+			home:     `{"$schema":"x","theme":"light","hooks":{}}`,
+			profile:  &Profile{HomeManagedSettingsKeys: []string{"hooks"}},
+			wantSync: false,
+		},
+		{
+			name:     "nil profile falls back to hooks-only",
+			repo:     `{"$schema":"x"}`,
+			home:     `{"$schema":"x","hooks":{}}`,
+			profile:  nil,
+			wantSync: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			repoFile := filepath.Join(dir, "repo.json")
+			homeFile := filepath.Join(dir, "home.json")
+			os.WriteFile(repoFile, []byte(tt.repo), 0644)
+			os.WriteFile(homeFile, []byte(tt.home), 0644)
+
+			got := settingsInSyncIgnoringHomeManaged(repoFile, homeFile, tt.profile)
+			if got != tt.wantSync {
+				t.Errorf("settingsInSyncIgnoringHomeManaged() = %v, want %v", got, tt.wantSync)
+			}
+		})
+	}
+}
+
+func TestTomlInSyncIgnoringKeys_NotifyDiffers(t *testing.T) {
+	tests := []struct {
+		name       string
+		repo       string
+		home       string
+		ignoreKeys []string
+		wantSync   bool
+	}{
+		{
+			name:       "differ only in notify — in sync",
+			repo:       "[mcp_servers.test]\ncommand = \"echo\"\n",
+			home:       "[mcp_servers.test]\ncommand = \"echo\"\n\n[notify]\nurl = \"http://localhost:3333\"\n",
+			ignoreKeys: []string{"notify"},
+			wantSync:   true,
+		},
+		{
+			name:       "differ in mcp_servers — out of sync",
+			repo:       "[mcp_servers.test]\ncommand = \"echo\"\n",
+			home:       "[mcp_servers.other]\ncommand = \"node\"\n\n[notify]\nurl = \"http://localhost:3333\"\n",
+			ignoreKeys: []string{"notify"},
+			wantSync:   false,
+		},
+		{
+			name:       "identical — in sync",
+			repo:       "[mcp_servers.test]\ncommand = \"echo\"\n",
+			home:       "[mcp_servers.test]\ncommand = \"echo\"\n",
+			ignoreKeys: []string{"notify"},
+			wantSync:   true,
+		},
+		{
+			name:       "nested notify section — in sync",
+			repo:       "[mcp_servers.test]\ncommand = \"echo\"\n",
+			home:       "[mcp_servers.test]\ncommand = \"echo\"\n\n[notify]\nurl = \"http://localhost\"\n\n[notify.hooks]\non_start = true\n",
+			ignoreKeys: []string{"notify"},
+			wantSync:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			repoFile := filepath.Join(dir, "repo.toml")
+			homeFile := filepath.Join(dir, "home.toml")
+
+			os.WriteFile(repoFile, []byte(tt.repo), 0644)
+			os.WriteFile(homeFile, []byte(tt.home), 0644)
+
+			got := tomlInSyncIgnoringKeys(repoFile, homeFile, tt.ignoreKeys)
+			if got != tt.wantSync {
+				t.Errorf("tomlInSyncIgnoringKeys() = %v, want %v", got, tt.wantSync)
+			}
+		})
+	}
+}
+
+func TestDriftSummary(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+
+	// Clear default profiles.
+	m.Profiles = map[string]*Profile{}
+
+	// Profile 1: in-sync (both dirs exist with matching generated file)
+	repo1 := filepath.Join(repoDir, "p1")
+	home1 := filepath.Join(homeDir, "p1")
+	os.MkdirAll(repo1, 0755)
+	os.MkdirAll(home1, 0755)
+	os.WriteFile(filepath.Join(repo1, "mcp.json"), []byte("content"), 0644)
+	os.WriteFile(filepath.Join(home1, "mcp.json"), []byte("content"), 0644)
+	m.Profiles["p1"] = &Profile{
+		Name:              "p1",
+		RepoDir:           "p1",
+		HomeDir:           filepath.Join(homeDir, "p1"),
+		GeneratedFile:     "mcp.json",
+		SyncGeneratedOnly: true,
+	}
+
+	// Profile 2: out-of-sync (content differs)
+	repo2 := filepath.Join(repoDir, "p2")
+	home2 := filepath.Join(homeDir, "p2")
+	os.MkdirAll(repo2, 0755)
+	os.MkdirAll(home2, 0755)
+	os.WriteFile(filepath.Join(repo2, "config.toml"), []byte("repo"), 0644)
+	os.WriteFile(filepath.Join(home2, "config.toml"), []byte("home-different"), 0644)
+	m.Profiles["p2"] = &Profile{
+		Name:              "p2",
+		RepoDir:           "p2",
+		HomeDir:           filepath.Join(homeDir, "p2"),
+		GeneratedFile:     "config.toml",
+		SyncGeneratedOnly: true,
+	}
+
+	// Profile 3: missing (home dir doesn't exist)
+	repo3 := filepath.Join(repoDir, "p3")
+	os.MkdirAll(repo3, 0755)
+	os.WriteFile(filepath.Join(repo3, "mcp.json"), []byte("content"), 0644)
+	m.Profiles["p3"] = &Profile{
+		Name:              "p3",
+		RepoDir:           "p3",
+		HomeDir:           filepath.Join(homeDir, "p3-nonexistent"),
+		GeneratedFile:     "mcp.json",
+		SyncGeneratedOnly: true,
+	}
+
+	inSync, outOfSync, missing, err := m.DriftSummary()
+	if err != nil {
+		t.Fatalf("DriftSummary failed: %v", err)
+	}
+
+	if inSync != 1 {
+		t.Errorf("inSync = %d, want 1", inSync)
+	}
+	if outOfSync != 1 {
+		t.Errorf("outOfSync = %d, want 1", outOfSync)
+	}
+	if missing != 1 {
+		t.Errorf("missing = %d, want 1", missing)
+	}
+}
+
+func TestSkillsDirectToHome_AllProfiles_HaveHomePath(t *testing.T) {
+	m, _ := NewManager(t.TempDir())
+
+	for _, name := range m.List() {
+		p := m.Get(name)
+		if p.SkillsDirectToHome && p.SkillsHomePath == "" {
+			t.Errorf("profile %q has SkillsDirectToHome=true but empty SkillsHomePath", name)
+		}
+	}
+}
+
+func TestCompareHomeGeneratedFiles_ReportsMissingExtras(t *testing.T) {
+	homeDir := t.TempDir()
+
+	// Create profile with primary and extra generated files.
+	profile := &Profile{
+		Name:                  "test",
+		GeneratedFile:         "config.toml",
+		ExtraGeneratedFiles:   []string{"settings.json"},
+		GeneratedDirectToHome: true,
+	}
+
+	// Only the primary exists, extras are missing — should not report drift.
+	homeProfile := filepath.Join(homeDir, "test")
+	os.MkdirAll(homeProfile, 0755)
+	os.WriteFile(filepath.Join(homeProfile, "config.toml"), []byte("content"), 0644)
+
+	items := compareHomeGeneratedFiles(homeProfile, profile)
+
+	// Should report the primary as in-sync and the missing extra as drift.
+	if len(items) != 2 {
+		t.Fatalf("expected 2 drift items, got %d: %+v", len(items), items)
+	}
+	foundPrimary := false
+	foundMissingExtra := false
+	for _, item := range items {
+		switch item.File {
+		case "config.toml":
+			foundPrimary = item.Status == DriftInSync
+		case "settings.json":
+			foundMissingExtra = item.Status == DriftMissing
+		}
+	}
+	if !foundPrimary {
+		t.Fatal("expected primary config.toml to be in sync")
+	}
+	if !foundMissingExtra {
+		t.Fatal("expected missing settings.json extra artifact to be reported")
+	}
+
+	// Now also create the extra file — should report 2 in-sync items.
+	os.WriteFile(filepath.Join(homeProfile, "settings.json"), []byte("{}"), 0644)
+
+	items = compareHomeGeneratedFiles(homeProfile, profile)
+	if len(items) != 2 {
+		t.Fatalf("expected 2 drift items, got %d: %+v", len(items), items)
+	}
+	for _, item := range items {
+		if item.Status != DriftInSync {
+			t.Errorf("file %q status = %v, want DriftInSync", item.File, item.Status)
+		}
+	}
+}
+
+func TestCleanSkillsAt_PrunesRegistryCommandsOnly(t *testing.T) {
+	repoDir := t.TempDir()
+	m, _ := NewManager(repoDir)
+
+	claudeDir := filepath.Join(repoDir, ".claude")
+	cmdDir := filepath.Join(claudeDir, "commands")
+	if err := os.MkdirAll(cmdDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(cmdDir, "registry-skill.md")
+	handAuthored := filepath.Join(cmdDir, "my-own.md")
+	os.WriteFile(stale, []byte("stale"), 0644)
+	os.WriteFile(handAuthored, []byte("mine"), 0644)
+
+	m.cleanSkillsAt(claudeDir, []string{"registry-skill"})
+
+	if Exists(stale) {
+		t.Error("registry-derived stale command must be pruned")
+	}
+	if !Exists(handAuthored) {
+		t.Error("hand-authored command must survive pruning")
 	}
 }

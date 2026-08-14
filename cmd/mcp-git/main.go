@@ -12,8 +12,10 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
+	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/pathsec"
@@ -52,6 +54,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-git", "version", version, "repo", defaultRepo)
 
 	server := mcp.NewServer("mcp-git", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Fast Go-native Git MCP server. Supports status, diff, log, branch operations.")
 
 	// git_status
@@ -209,7 +212,7 @@ func run(ctx context.Context) error {
 	// git_commit
 	server.AddTool(mcp.Tool{
 		Name:        "git_commit",
-		Description: "Create a commit",
+		Description: "Create a commit. Supports optional agent_id trailer for provenance tracking.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -224,6 +227,14 @@ func run(ctx context.Context) error {
 				"all": map[string]any{
 					"type":        "boolean",
 					"description": "Stage all modified files (-a)",
+				},
+				"agent_id": map[string]any{
+					"type":        "string",
+					"description": "Agent identifier to stamp as Agent-ID git trailer for provenance and pipeline correlation",
+				},
+				"session_id": map[string]any{
+					"type":        "string",
+					"description": "Session identifier to stamp as Agent-Session git trailer for thread tracking",
 				},
 			},
 			Required: []string{"message"},
@@ -355,6 +366,19 @@ func runGit(ctx context.Context, repoPath string, args ...string) (string, error
 	return string(output), nil
 }
 
+// checkRef rejects a user-supplied ref/branch/commit that git would interpret
+// as an option. Such values are appended as bare positional args, so a leading
+// dash lets a caller smuggle flags into the git invocation (e.g. commit=
+// "--output=/path" makes `git diff` write an arbitrary file; branch="-f" makes
+// `git checkout` force-discard the working tree). git itself forbids ref names
+// beginning with "-", so this rejects nothing legitimate.
+func checkRef(name, val string) error {
+	if strings.HasPrefix(val, "-") {
+		return mcperror.InvalidParam(name, "must not begin with '-' (option injection)")
+	}
+	return nil
+}
+
 func sanitizedGitEnv(envVars []string) []string {
 	// Strip inherited repository-routing variables (e.g. from git hooks) so
 	// each command targets cmd.Dir/repoPath instead of caller context.
@@ -438,6 +462,9 @@ func handleGitDiff(ctx context.Context, args map[string]any) (*mcp.CallToolResul
 	commit := v.String("commit", "")
 	file := v.String("file", "")
 	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if err := checkRef("commit", commit); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
 
@@ -533,6 +560,12 @@ func handleGitBranch(ctx context.Context, args map[string]any) (*mcp.CallToolRes
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
+	if err := checkRef("create", create); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if err := checkRef("delete", delete); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
 
 	if create != "" {
 		output, err := runGit(ctx, path, "branch", create)
@@ -550,7 +583,13 @@ func handleGitBranch(ctx context.Context, args map[string]any) (*mcp.CallToolRes
 		return mcp.JSONResult(map[string]any{"deleted": delete, "output": output})
 	}
 
-	gitArgs := []string{"branch", "--format=%(HEAD) %(refname:short) %(upstream:short)"}
+	// Use an explicit field separator: %(HEAD) is "*" for the current branch
+	// and a single space otherwise, so a whitespace-split (strings.Fields)
+	// collapses that leading space and shifts every field — dropping
+	// upstream-less branches entirely and mislabeling tracking branches. A
+	// literal delimiter keeps empty fields addressable.
+	const sep = "\x1f" // ASCII unit separator; can't appear in a ref name
+	gitArgs := []string{"branch", "--format=%(HEAD)" + sep + "%(refname:short)" + sep + "%(upstream:short)"}
 	if all {
 		gitArgs = append(gitArgs, "-a")
 	}
@@ -565,24 +604,30 @@ func handleGitBranch(ctx context.Context, args map[string]any) (*mcp.CallToolRes
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.Fields(line)
-		if len(parts) >= 2 {
-			isCurrent := parts[0] == "*"
-			name := parts[1]
-			if isCurrent {
-				name = parts[1]
-				current = name
-			}
-			upstream := ""
-			if len(parts) >= 3 {
-				upstream = parts[2]
-			}
-			branches = append(branches, map[string]any{
-				"name":     name,
-				"current":  isCurrent,
-				"upstream": upstream,
-			})
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+		fields := strings.Split(line, sep)
+		if len(fields) < 2 {
+			continue
+		}
+		isCurrent := strings.TrimSpace(fields[0]) == "*"
+		name := fields[1]
+		if name == "" {
+			continue
+		}
+		upstream := ""
+		if len(fields) >= 3 {
+			upstream = fields[2]
+		}
+		if isCurrent {
+			current = name
+		}
+		branches = append(branches, map[string]any{
+			"name":     name,
+			"current":  isCurrent,
+			"upstream": upstream,
+		})
 	}
 
 	return mcp.JSONResult(map[string]any{"branches": branches, "current": current})
@@ -595,6 +640,9 @@ func handleGitCheckout(ctx context.Context, args map[string]any) (*mcp.CallToolR
 	create := v.Bool("create", false)
 	file := v.String("file", "")
 	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if err := checkRef("branch", branch); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
 
@@ -643,6 +691,8 @@ func handleGitCommit(ctx context.Context, args map[string]any) (*mcp.CallToolRes
 	path := v.String("path", "")
 	message := v.Required("message")
 	all := v.Bool("all", false)
+	agentID := v.String("agent_id", "")
+	sessionID := v.String("session_id", "")
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
@@ -651,13 +701,26 @@ func handleGitCommit(ctx context.Context, args map[string]any) (*mcp.CallToolRes
 	if all {
 		gitArgs = append(gitArgs, "-a")
 	}
+	if agentID != "" {
+		gitArgs = append(gitArgs, "--trailer", fmt.Sprintf("Agent-ID: %s", agentID))
+	}
+	if sessionID != "" {
+		gitArgs = append(gitArgs, "--trailer", fmt.Sprintf("Agent-Session: %s", sessionID))
+	}
 
 	output, err := runGit(ctx, path, gitArgs...)
 	if err != nil {
 		return nil, err
 	}
 
-	return mcp.JSONResult(map[string]any{"status": "committed", "message": message, "output": output})
+	result := map[string]any{"status": "committed", "message": message, "output": output}
+	if agentID != "" {
+		result["agent_id"] = agentID
+	}
+	if sessionID != "" {
+		result["session_id"] = sessionID
+	}
+	return mcp.JSONResult(result)
 }
 
 func handleGitPush(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
@@ -667,6 +730,12 @@ func handleGitPush(ctx context.Context, args map[string]any) (*mcp.CallToolResul
 	branch := v.String("branch", "")
 	setUpstream := v.Bool("set_upstream", false)
 	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if err := checkRef("remote", remote); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if err := checkRef("branch", branch); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
 
@@ -696,6 +765,12 @@ func handleGitPull(ctx context.Context, args map[string]any) (*mcp.CallToolResul
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
+	if err := checkRef("remote", remote); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if err := checkRef("branch", branch); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
 
 	gitArgs := []string{"pull"}
 	if rebase {
@@ -722,6 +797,11 @@ func handleGitStash(ctx context.Context, args map[string]any) (*mcp.CallToolResu
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
+	switch action {
+	case "push", "pop", "apply", "drop", "list", "clear":
+	default:
+		return mcp.ErrorResult(mcperror.InvalidParam("action", "must be one of: push, pop, apply, drop, list, clear")), nil
+	}
 
 	gitArgs := []string{"stash", action}
 	if action == "push" && message != "" {
@@ -742,6 +822,9 @@ func handleGitShow(ctx context.Context, args map[string]any) (*mcp.CallToolResul
 	commit := v.String("commit", "HEAD")
 	stat := v.Bool("stat", false)
 	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if err := checkRef("commit", commit); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
 

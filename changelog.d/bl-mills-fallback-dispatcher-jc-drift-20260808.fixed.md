@@ -1,0 +1,1 @@
+- Route loom-mills-operator stages through the canonical pipeline dispatcher so gate-failure retries receive feedback and create attempt-specific spawns (`cmd/loom-mills-operator`, `pkg/mills/pipeline`).

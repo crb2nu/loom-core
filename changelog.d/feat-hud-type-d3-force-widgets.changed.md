@@ -1,0 +1,1 @@
+- Type the HUD AgentTopology and EntityGraph Svelte widgets with d3-force datums in `internal/hud/frontend/src/lib/widgets/AgentTopology.svelte` and `internal/hud/frontend/src/lib/widgets/EntityGraph.svelte`.

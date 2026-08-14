@@ -15,7 +15,7 @@ func TestGetVendorCapabilities(t *testing.T) {
 		{"codex", false, "Codex CLI"},
 		{"opencode", false, "OpenCode"},
 		{"kilocode", false, "Kilo Code"},
-		{"antigravity", false, "Antigravity"},
+		{"antigravity", false, "Antigravity 2.0"},
 		{"vscode", false, "VS Code"},
 		{"zed", false, "Zed"},
 		{"nonexistent", true, ""},
@@ -59,7 +59,7 @@ func TestAllVendors(t *testing.T) {
 
 func TestCheckVendorFeatures_NoHooksWarning(t *testing.T) {
 	// Platforms without any hook support should generate a warning.
-	noHookPlatforms := []string{"kilocode", "antigravity", "vscode", "zed"}
+	noHookPlatforms := []string{"kilocode", "vscode", "zed"}
 	for _, p := range noHookPlatforms {
 		warnings := CheckVendorFeatures(p)
 		if len(warnings) == 0 {
@@ -77,7 +77,7 @@ func TestCheckVendorFeatures_NoHooksWarning(t *testing.T) {
 	}
 
 	// Platforms with hooks should NOT generate the warning.
-	hookPlatforms := []string{"claude", "gemini", "codex"}
+	hookPlatforms := []string{"claude", "gemini", "codex", "antigravity"}
 	for _, p := range hookPlatforms {
 		warnings := CheckVendorFeatures(p)
 		for _, w := range warnings {
@@ -98,16 +98,26 @@ func TestVendorCapabilities_ClaudeHasFullHooks(t *testing.T) {
 	}
 }
 
-func TestVendorCapabilities_CodexHasNotify(t *testing.T) {
+func TestVendorCapabilities_CodexHasNotifyAndHooks(t *testing.T) {
 	caps := GetVendorCapabilities("codex")
 	if !caps.NotifyHook {
-		t.Error("Codex should have notify hook support")
+		t.Error("Codex should have notify hook support (config.toml notify = […])")
 	}
 	if !caps.SandboxMode {
 		t.Error("Codex should have sandbox mode support")
 	}
-	if caps.SessionStartHook {
-		t.Error("Codex should NOT have SessionStart hook")
+	// Codex v0.129.0 (2026-05-07) shipped a Claude-shape [hooks] block. We
+	// emit hooks.json alongside config.toml so SessionStart fires natively.
+	// `notify` is retained for turn-end keepalive + as a session-end signal.
+	if !caps.SessionStartHook {
+		t.Error("Codex should have SessionStart hook (hooks.json, Codex v0.129.0+)")
+	}
+	// PostToolUse is intentionally not exposed for codex: heartbeat_matcher
+	// has no useful narrowing equivalent, so a hook would fire on every
+	// tool call and bounce the TUI. notify + keepalive-wrap cover
+	// keepalive without per-tool-call shell overhead.
+	if caps.PostToolUseHook {
+		t.Error("Codex should NOT advertise PostToolUse hook (per-tool heartbeat causes TUI bounce; notify covers keepalive)")
 	}
 }
 

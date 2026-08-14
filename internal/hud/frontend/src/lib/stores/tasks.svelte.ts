@@ -1,7 +1,16 @@
 // Tasks store - task management
-// v2: SSE-first with 30s fallback poll. Applies task list from hud.fleet snapshots.
+// v2: SSE-first with 60s fallback poll. Applies task list from hud.fleet snapshots.
+import { actionStore } from './action.svelte.ts';
 import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 import { arraysEqualById } from '../utils/diff.ts';
+import { createPoller } from '../utils/poller.ts';
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message || 'Unknown error';
+  if (typeof e === 'string') return e;
+  try { return JSON.stringify(e); } catch { return 'Unknown error'; }
+}
 
 export interface Task {
   id: string;
@@ -16,6 +25,15 @@ export interface Task {
   status: 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled';
   tags: string[];
   blocked_by: string[];
+  // Optional: dependency IDs already satisfied, used by the tasks UI to mark
+  // resolved deps in the blocked-by list. Read via `resolved_deps?.includes()`
+  // in TasksTableView/TasksGroupedView/TaskDetail; may be absent on payloads
+  // that don't compute it.
+  resolved_deps?: string[];
+  // Plan Store linkage (S7b): a task is a granular TODO under a plan slice.
+  // plan_id/slice_id deep-link a task to its first-class Plan in the Work view.
+  plan_id?: string;
+  slice_id?: string;
   created_at: string;
   updated_at: string;
 }
@@ -53,7 +71,21 @@ class TaskStore {
   sortField = $state<TaskSortField>('priority');
   sortDir = $state<TaskSortDir>('asc');
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // Staleness (Slice B3) — see fleet.svelte.ts for the pattern. tasks data
+  // arrives bundled in hud.fleet snapshots, so this matches the fleet cadence.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (!this.poller.running) return false;
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
+
+  // 60s watchdog poll — fires on SSE-down OR on stale.
+  private poller = createPoller(() => {
+    if (!eventStore.connected || this.isStale) this.fetch();
+  }, 60000);
   private eventUnsubs: Array<() => void> = [];
 
   get filteredTasks(): Task[] {
@@ -103,6 +135,21 @@ class TaskStore {
     return this.tasks.filter((t) => t.status === 'blocked').length;
   }
 
+  get dispatchedTasks(): Task[] {
+    return this.tasks.filter((t) => t.tags?.includes('dispatched'));
+  }
+
+  get dispatchedInFlightCount(): number {
+    return this.dispatchedTasks.filter((t) => t.status === 'pending' || t.status === 'in_progress').length;
+  }
+
+  get dispatchedCompletionRate(): number {
+    const dispatched = this.dispatchedTasks;
+    if (dispatched.length === 0) return 0;
+    const completed = dispatched.filter((t) => t.status === 'completed').length;
+    return Math.round((completed / dispatched.length) * 100);
+  }
+
   async fetch(): Promise<void> {
     this.loading = true;
     this.error = null;
@@ -131,7 +178,8 @@ class TaskStore {
     this.error = null;
   }
 
-  async updateStatus(taskId: string, status: string): Promise<void> {
+  async updateStatus(taskId: string, status: string): Promise<boolean> {
+    const auditId = actionStore.start(`Update task status → ${status}`, 'TasksPanel:status');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
@@ -140,12 +188,17 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Update task: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
+      return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
+      return false;
     }
   }
 
-  async setPriority(taskId: string, priority: string): Promise<void> {
+  async setPriority(taskId: string, priority: string): Promise<boolean> {
+    const auditId = actionStore.start(`Set task priority → ${priority}`, 'TasksPanel:priority');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
@@ -154,8 +207,12 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Set priority: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
+      return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
+      return false;
     }
   }
 
@@ -169,6 +226,7 @@ class TaskStore {
     lineNumber?: number;
     blockedBy?: string[];
   }): Promise<boolean> {
+    const auditId = actionStore.start('Create task', 'TasksPanel:create');
     try {
       const body: Record<string, unknown> = {
         title: params.title,
@@ -187,14 +245,17 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Create task: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
       return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
       return false;
     }
   }
 
-  async resolve(taskId: string, resolution: string): Promise<void> {
+  async resolve(taskId: string, resolution: string): Promise<boolean> {
+    const auditId = actionStore.start('Resolve task', 'TasksPanel:resolve');
     try {
       const res = await globalThis.fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
@@ -203,16 +264,19 @@ class TaskStore {
       });
       if (!res.ok) throw new Error(`Resolve task: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
+      return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
+      return false;
     }
   }
 
-  startPolling(intervalMs = 30000): void {
+  startPolling(intervalMs = 60000): void {
     this.stopPolling();
     this.fetch();
-    // 30s fallback poll (SSE is the primary data source).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.poller.start(intervalMs);
 
     // Subscribe to SSE events: apply task list directly from hud.fleet snapshots.
     // The FleetMonitor fetches all tasks on its 15s cadence and broadcasts them.
@@ -236,13 +300,11 @@ class TaskStore {
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }
 }
 
 export const taskStore = new TaskStore();
+stalenessStore.register('tasks', () => taskStore.isStale);

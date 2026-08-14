@@ -2,14 +2,21 @@ package generator
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/pelletier/go-toml/v2"
 
 	"github.com/crb2nu/loom/pkg/registry"
 	"github.com/crb2nu/loom/pkg/validator"
 )
+
+var hubWrapperResolverTestMu sync.Mutex
 
 // testRegistry returns a registry with platform_permissions populated for testing.
 func testRegistry() *registry.Registry {
@@ -19,7 +26,13 @@ func testRegistry() *registry.Registry {
 				Settings: map[string]any{
 					"dirty_worktree_mode":                   "continue_scoped_commits",
 					"dirty_worktree_nudge_on_session_start": true,
-					"dirty_worktree_nudge_message":          "Dirty worktree detected. Continue on current branch with scoped commits.",
+					"dirty_worktree_nudge_message":          "Dirty worktree detected. Continue on current branch with scoped commits, inspect existing linked trees first, and use repo-local worktrees.",
+					"guardrails": map[string]any{
+						"gitops_flux": map[string]any{
+							"blocked_commands": []any{"kubectl edit", "kubectl set env"},
+							"message":          "GitOps policy: kubectl edit/set env bypasses git history. Edit manifests and use flux reconcile.",
+						},
+					},
 				},
 			},
 			"claude": {
@@ -31,14 +44,19 @@ func testRegistry() *registry.Registry {
 					"Bash(make *)", "Bash(kubectl *)", "Bash(loom *)",
 					"WebFetch", "WebSearch",
 				},
-				Deny: []string{
-					"Bash(kubectl edit *)",
-					"Bash(kubectl set env *)",
-				},
+				Deny: []string{},
 			},
 			"codex": {
 				Settings: map[string]any{
-					"approval_policy":                    "never",
+					"approval_policy": map[string]any{
+						"granular": map[string]any{
+							"sandbox_approval":    false,
+							"rules":               false,
+							"mcp_elicitations":    false,
+							"request_permissions": false,
+							"skill_approval":      false,
+						},
+					},
 					"suppress_unstable_features_warning": true,
 					"sandbox_mode":                       "workspace-write",
 					"features": map[string]any{
@@ -48,12 +66,31 @@ func testRegistry() *registry.Registry {
 					},
 				},
 			},
+			"gemini": {
+				Settings: map[string]any{
+					"approval_mode":                  "auto_edit",
+					"checkpointing":                  true,
+					"enable_permanent_tool_approval": true,
+					"folder_trust_enabled":           true,
+					"tools_allowed": []any{
+						"run_shell_command(git)",
+						"run_shell_command(echo)",
+						"run_shell_command(printf)",
+						"run_shell_command(rg)",
+						"run_shell_command(tee)",
+					},
+					"tools_exclude": []any{
+						"run_shell_command(rm)",
+					},
+				},
+			},
 		},
 	}
 }
 
 func TestGeneratedClaudeSettingsValid(t *testing.T) {
-	config := claudeHooksConfig(testRegistry())
+	claudeProfile, _ := GetPlatformProfile("claude")
+	config := claudeHooksConfig(testRegistry(), claudeProfile, "")
 
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -75,7 +112,8 @@ func TestGeneratedClaudeSettingsValid(t *testing.T) {
 
 func TestGeneratedClaudeSettingsNilRegistry(t *testing.T) {
 	// Ensure nil registry produces valid settings with fallback permissions.
-	config := claudeHooksConfig(nil)
+	claudeProfile, _ := GetPlatformProfile("claude")
+	config := claudeHooksConfig(nil, claudeProfile, "")
 
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -126,6 +164,46 @@ func TestClaudePermissionsFromRegistry(t *testing.T) {
 	}
 }
 
+func TestClaudeHooksConfig_UsesSharedGitOpsPolicy(t *testing.T) {
+	claudeProfile, _ := GetPlatformProfile("claude")
+	config := claudeHooksConfig(testRegistry(), claudeProfile, "")
+
+	hooks, ok := config["hooks"].(map[string]any)
+	if !ok {
+		t.Fatal("expected hooks map in claude config")
+	}
+
+	preToolUse, ok := hooks["PreToolUse"].([]map[string]any)
+	if !ok || len(preToolUse) == 0 {
+		t.Fatal("expected PreToolUse hooks from shared policy")
+	}
+
+	foundPolicyMessage := false
+	foundGitCommitReminder := false
+	for _, block := range preToolUse {
+		entries, _ := block["hooks"].([]map[string]any)
+		for _, entry := range entries {
+			cmd, _ := entry["command"].(string)
+			if strings.Contains(cmd, "kubectl edit") &&
+				strings.Contains(cmd, "flux reconcile") &&
+				strings.Contains(cmd, "GitOps policy:") {
+				foundPolicyMessage = true
+			}
+			if strings.Contains(cmd, "Pre-commit quality reminder") &&
+				strings.Contains(cmd, "quality_check") {
+				foundGitCommitReminder = true
+			}
+		}
+	}
+
+	if !foundPolicyMessage {
+		t.Fatalf("expected shared GitOps policy hook to mention kubectl edit/set env and flux reconcile: %#v", preToolUse)
+	}
+	if !foundGitCommitReminder {
+		t.Fatalf("expected pre-tool-use quality reminder hook to remain present: %#v", preToolUse)
+	}
+}
+
 func TestGeneratedGeminiSettingsValid(t *testing.T) {
 	config := geminiHooksConfig()
 
@@ -139,9 +217,52 @@ func TestGeneratedGeminiSettingsValid(t *testing.T) {
 		t.Errorf("Gemini settings has validation errors: %v", result.Errors)
 	}
 
-	for _, e := range result.Errors {
-		if e.Severity == validator.SeverityWarning {
-			t.Logf("upstream schema warning: %s - %s", e.Field, e.Message)
+	// Warnings are unknown-key (additionalProperties) violations. For config
+	// WE generate they are bugs, not noise: Gemini CLI silently ignores
+	// unknown settings keys, so a typo'd or invented key ships broken with no
+	// runtime signal (same failure class as the hallucinated "agentConfig"
+	// key from commit 809562b6).
+	if result.HasWarnings() {
+		t.Errorf("Gemini settings has upstream schema warnings: %v", result.Errors)
+	}
+}
+
+// TestGeminiSettingsNoUnknownTopLevelKeys is the regression test for the
+// invented "agentConfig" settings key (commit 809562b6). Every top-level key
+// the generator emits must exist in the vendored upstream settings schema
+// (https://raw.githubusercontent.com/google-gemini/gemini-cli/main/schemas/settings.schema.json).
+// Verified against the installed binary, not just docs: gemini-cli 0.43.0's
+// bundled SETTINGS_SCHEMA accepts exactly {admin, advanced, agents, billing,
+// context, contextManagement, experimental, extensions, general, hooks,
+// hooksConfig, ide, mcp, mcpServers, model, modelConfigs, output, privacy,
+// security, skills, telemetry, tools, ui, useWriteTodos} — no "agentConfig".
+// Unknown keys are silently ignored by the CLI (probed 2026-06-09: settings
+// containing agentConfig load with exit 0 and no warning), so this test is
+// the only place such a bug surfaces.
+func TestGeminiSettingsNoUnknownTopLevelKeys(t *testing.T) {
+	schemaBytes, ok := validator.GetEmbeddedSchema("gemini_settings.json")
+	if !ok {
+		t.Fatal("vendored gemini_settings.json schema not found")
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaBytes, &schema); err != nil {
+		t.Fatalf("failed to parse vendored Gemini schema: %v", err)
+	}
+	if len(schema.Properties) == 0 {
+		t.Fatal("vendored Gemini schema has no properties; refresh it from upstream")
+	}
+
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
+
+	if _, present := config["agentConfig"]; present {
+		t.Error(`generated Gemini settings contain "agentConfig": not a Gemini CLI settings key (regression of commit 809562b6)`)
+	}
+	for key := range config {
+		if _, known := schema.Properties[key]; !known {
+			t.Errorf("generated Gemini settings key %q is not in the upstream settings schema; verify it against the installed gemini binary before emitting it", key)
 		}
 	}
 }
@@ -159,7 +280,7 @@ features = { apply_patch_freeform = true, include_apply_patch_tool = true, unifi
 sandbox_mode = "workspace-write"
 sandbox_workspace_write = { network_access = true, writable_roots = ["/tmp"] }
 
-notify = ["loom", "agent", "heartbeat", "--agent-id", "codex", "--status", "active", "--ensure-session", "--infer-namespace", "--agent-type", "codex", "--quiet"]
+notify = ["sh", "-c", "WS_ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' \"$PWD\")\"; WS_HASH=\"$(printf '%s' \"$WS_ROOT\" | cksum | cut -d' ' -f1)\"; CACHE_DIR=\"${HOME}/.cache/loom\"; AGENT_ID_FILE=\"${CACHE_DIR}/agent-id-codex-${WS_HASH}\"; KEEPALIVE_STAMP_FILE=\"${CACHE_DIR}/keepalive-wrap-codex-${WS_HASH}.stamp\"; mkdir -p \"$CACHE_DIR\"; if [ -s \"$AGENT_ID_FILE\" ]; then AGENT_ID=\"$(cat \"$AGENT_ID_FILE\")\"; else AGENT_ID=\"codex-${WS_HASH}\"; printf '%s' \"$AGENT_ID\" > \"$AGENT_ID_FILE\"; fi; NOW=\"$(date +%s)\"; LAST=\"$(cat \"$KEEPALIVE_STAMP_FILE\" 2>/dev/null || true)\"; case \"$LAST\" in ''|*[!0-9]*) ;; *) if [ $((NOW - LAST)) -lt 15 ]; then exit 0; fi ;; esac; printf '%s' \"$NOW\" > \"$KEEPALIVE_STAMP_FILE\"; HOOK_SESSION_ID=\"$(printf '%s' \"${INPUT:-}\" | jq -r '.session_id // empty' 2>/dev/null || true)\"; nohup loom agent keepalive-wrap --agent-id \"$AGENT_ID\" --session-id \"$HOOK_SESSION_ID\" --status active --ensure-session --infer-namespace --agent-type codex --description \"Codex keepalive wrapper session\" --quiet </dev/null >/dev/null 2>>\"${TMPDIR:-/tmp}/loom-agent-hooks.log\" &", "--"]
 
 [mcp_servers.loom]
 command = "loom"
@@ -182,32 +303,123 @@ tool_timeout_sec = 300
 func TestEmitCodexPreamble(t *testing.T) {
 	reg := testRegistry()
 	var sb strings.Builder
-	emitCodexPreamble(&sb, reg, "/tmp/workspace")
+	emitCodexPreamble(&sb, reg, "/tmp/workspace", "")
 	content := sb.String()
 
 	for _, want := range []string{
-		`approval_policy = "never"`,
+		`mcp_elicitations = false`,
 		`suppress_unstable_features_warning = true`,
 		`sandbox_mode = "workspace-write"`,
 		`writable_roots = ["/tmp/workspace"]`,
 		`web_search = "live"`,
 		`Git safety policy: treat pre-existing dirty worktrees as baseline context.`,
+		`Before creating another multi-file worktree, inspect existing linked trees with git worktree list or workspace-clean --report --worktrees.`,
+		`For multi-file work, create repo-local linked trees under <repo>/.worktrees/<branch>.`,
+		`Do not create sibling repos under services/, libs/, labs/, or the workspace root.`,
 		"notify =",
+		`"--"]`,
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("expected Codex preamble to contain %q", want)
 		}
+	}
+
+	for _, want := range []string{
+		`CACHE_DIR=\"${HOME}/.cache/loom\"`,
+		`${CACHE_DIR}/agent-id-codex-${WS_HASH}`,
+		`${CACHE_DIR}/keepalive-wrap-codex-${WS_HASH}.stamp`,
+		`codex-${WS_HASH}`,
+		`date +%s`,
+		` -lt 15 `,
+		`keepalive-wrap`,
+		`nohup`,
+		`--agent-id \"`,
+		`--description \"Codex keepalive wrapper session\"`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("expected Codex notify flow to contain %q", want)
+		}
+	}
+	if strings.Contains(content, "codex-${WS_HASH}-$$") {
+		t.Fatalf("expected Codex notify identity to avoid per-hook $$ churn, got: %s", content)
 	}
 }
 
 func TestEmitCodexPreambleNilRegistry(t *testing.T) {
 	// Ensure nil registry still produces valid defaults.
 	var sb strings.Builder
-	emitCodexPreamble(&sb, nil, "/tmp")
+	emitCodexPreamble(&sb, nil, "/tmp", "")
 	content := sb.String()
 
 	if !strings.Contains(content, `approval_policy = "never"`) {
 		t.Error("expected default approval_policy in nil-registry Codex preamble")
+	}
+}
+
+func TestEmitCodexPreamble_UsesExplicitLoomBinary(t *testing.T) {
+	var sb strings.Builder
+	emitCodexPreamble(&sb, testRegistry(), "/tmp/workspace", "/opt/loom/bin/loom")
+	content := sb.String()
+
+	if !strings.Contains(content, `nohup '/opt/loom/bin/loom' agent keepalive-wrap`) {
+		t.Fatalf("expected explicit loom binary in codex notify hook, got: %s", content)
+	}
+}
+
+func TestEmitCodexPreamble_NotifyRemainsTopLevel(t *testing.T) {
+	var sb strings.Builder
+	emitCodexPreamble(&sb, testRegistry(), "/tmp/workspace", "")
+
+	var parsed map[string]any
+	if err := toml.Unmarshal([]byte(sb.String()), &parsed); err != nil {
+		t.Fatalf("expected generated preamble to be valid TOML: %v", err)
+	}
+
+	notify, ok := parsed["notify"]
+	if !ok {
+		t.Fatalf("expected top-level notify key, got: %#v", parsed)
+	}
+	if !containsCodexKeepaliveWrapCommand(notify) {
+		t.Fatalf("expected top-level notify key to contain loom hook, got: %#v", notify)
+	}
+}
+
+func TestGenerateTomlConfig_CodexUsesServerApprovalMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	profile, err := GetPlatformProfile("codex")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile(codex): %v", err)
+	}
+
+	params := &GenerateParams{
+		Reg:           testRegistry(),
+		OutputDir:     tmpDir,
+		Target:        "codex",
+		Profile:       profile,
+		LoomMode:      true,
+		LoomBinary:    "/opt/loom/bin/loom",
+		WorkspaceRoot: "/tmp/workspace",
+	}
+
+	if err := generateTomlConfig(params); err != nil {
+		t.Fatalf("generateTomlConfig(codex): %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "codex", "config.toml"))
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+
+	// Codex CLI 4.x uses `default_tools_approval_mode = "approve"` at the MCP
+	// server stanza (not `always_allow`, and not `approval_mode = "always"`
+	// which isn't a valid value and regresses to prompt-every-call behavior).
+	if !strings.Contains(string(content), `default_tools_approval_mode = "approve"`) {
+		t.Fatalf("expected codex config to emit default_tools_approval_mode = \"approve\", got:\n%s", string(content))
+	}
+
+	// Verify granular approval_policy is emitted with mcp_elicitations = false.
+	if !strings.Contains(string(content), `mcp_elicitations = false`) {
+		t.Fatalf("expected codex config to emit granular approval_policy with mcp_elicitations = false, got:\n%s", string(content))
 	}
 }
 
@@ -216,7 +428,8 @@ func TestGenerateHooksConfig_WritesAndValidates(t *testing.T) {
 	reg := testRegistry()
 
 	// Generate Claude hooks config
-	if err := generateHooksConfig(reg, tmpDir, "claude"); err != nil {
+	claudeProfile, _ := GetPlatformProfile("claude")
+	if err := generateHooksConfig(reg, tmpDir, "claude", claudeProfile, ""); err != nil {
 		t.Fatalf("generateHooksConfig(claude) failed: %v", err)
 	}
 
@@ -250,7 +463,8 @@ func TestGenerateHooksConfig_WritesAndValidates(t *testing.T) {
 func TestGenerateHooksConfig_Gemini(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	if err := generateHooksConfig(nil, tmpDir, "gemini"); err != nil {
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	if err := generateHooksConfig(nil, tmpDir, "gemini", geminiProfile, ""); err != nil {
 		t.Fatalf("generateHooksConfig(gemini) failed: %v", err)
 	}
 
@@ -266,17 +480,141 @@ func TestGenerateHooksConfig_Gemini(t *testing.T) {
 	}
 }
 
-func TestGenerateHooksConfig_NoHooksPlatform(t *testing.T) {
+func TestGenerateHooksConfig_CodexEmitsHooksJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Platforms without hooks should return nil and not write any file
-	if err := generateHooksConfig(nil, tmpDir, "codex"); err != nil {
+	// Codex v0.129.0 (2026-05-07) shipped a Claude-shape [hooks] block read
+	// from ~/.codex/hooks.json (when [features] hooks = true). We emit
+	// hooks.json — NOT settings.json — alongside config.toml.
+	codexProfile, _ := GetPlatformProfile("codex")
+	if err := generateHooksConfig(testRegistry(), tmpDir, "codex", codexProfile, ""); err != nil {
 		t.Fatalf("generateHooksConfig(codex) failed: %v", err)
 	}
 
-	settingsPath := filepath.Join(tmpDir, "codex", "settings.json")
-	if _, err := os.Stat(settingsPath); !os.IsNotExist(err) {
-		t.Error("codex should not have a settings.json")
+	// settings.json must NOT exist for codex.
+	if _, err := os.Stat(filepath.Join(tmpDir, "codex", "settings.json")); !os.IsNotExist(err) {
+		t.Error("codex should not have a settings.json (uses hooks.json)")
+	}
+
+	// hooks.json must exist and contain the canonical lifecycle events.
+	hooksPath := filepath.Join(tmpDir, "codex", "hooks.json")
+	content, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatalf("hooks.json not found at %s: %v", hooksPath, err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(content, &parsed); err != nil {
+		t.Fatalf("generated hooks.json is not valid JSON: %v", err)
+	}
+	hooks, ok := parsed["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("generated hooks.json missing top-level hooks key: %s", string(content))
+	}
+
+	// One canonical lifecycle event for Codex: SessionStart (once per
+	// session). Codex has no SessionEnd event, Stop is per-turn, and
+	// PostToolUse heartbeat is intentionally suppressed because codex
+	// hook payloads have no stable tool-name surface to filter on, so
+	// an unmatched heartbeat would fire on every tool call and bounce
+	// the TUI. Session keepalive is handled by notify + keepalive-wrap.
+	for _, evt := range []string{"SessionStart"} {
+		if _, found := hooks[evt]; !found {
+			t.Errorf("expected codex hooks.json to contain %q event, got keys: %v", evt, mapKeys(hooks))
+		}
+	}
+
+	// Codex hooks.json must NOT contain a Stop entry. Codex `Stop` fires
+	// per-turn (after each model response), so mapping it to
+	// `loom agent session-end --summarize` would queue a summary on every
+	// turn. The fix is to omit Stop entirely and rely on notify+keepalive
+	// for true session-end. See pkg/generator/VENDOR_SPECS.md and the
+	// codex profile in platform_profiles.yaml.
+	if _, found := hooks["Stop"]; found {
+		t.Error("codex hooks.json must NOT contain Stop (per-turn event; would spam session-end)")
+	}
+
+	// Codex hooks should NOT carry SubagentStart (Claude-only event).
+	if _, found := hooks["SubagentStart"]; found {
+		t.Error("codex hooks.json must NOT contain SubagentStart (Claude-only event)")
+	}
+
+	// Codex hooks.json must NOT contain an UNMATCHED PostToolUse heartbeat:
+	// with no narrowing matcher a hook fires synchronously on every tool call,
+	// forking `loom agent heartbeat` each time — each fork pays for a shell
+	// bootstrap (git rev-parse + jq + cksum + file I/O) and a loom binary
+	// cold-start, bouncing the codex TUI per tool call. A TOOL-MATCHED
+	// PostToolUse hook IS allowed (and used): the `update_plan` task-sync
+	// bridge fires only on Codex plan updates (parity with Claude TodoWrite).
+	// So every PostToolUse block must carry a non-empty matcher and none may
+	// fork `agent heartbeat`. See platform_profiles.yaml (heartbeat_event: "")
+	// and the postToolUse_taskSyncPlan extra.
+	if ptu, found := hooks["PostToolUse"]; found {
+		blocks, _ := ptu.([]any)
+		for _, raw := range blocks {
+			b, _ := raw.(map[string]any)
+			if strings.TrimSpace(stringFromAny(b["matcher"])) == "" {
+				t.Error("codex PostToolUse must not contain an unmatched (heartbeat) block — matcher is empty")
+			}
+			inner, _ := b["hooks"].([]any)
+			for _, hraw := range inner {
+				h, _ := hraw.(map[string]any)
+				if cmd := stringFromAny(h["command"]); strings.Contains(cmd, "agent heartbeat") {
+					t.Errorf("codex PostToolUse must not fork `agent heartbeat` (per-tool TUI bounce); cmd=%q", cmd)
+				}
+			}
+		}
+	}
+}
+
+// stringFromAny returns v as a string, or "" if it is not a string.
+func stringFromAny(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func TestGenerateHooksConfig_CodexUsesExplicitLoomBinary(t *testing.T) {
+	tmpDir := t.TempDir()
+	codexProfile, _ := GetPlatformProfile("codex")
+
+	if err := generateHooksConfig(testRegistry(), tmpDir, "codex", codexProfile, "/opt/loom/bin/loom"); err != nil {
+		t.Fatalf("generateHooksConfig(codex) failed: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "codex", "hooks.json"))
+	if err != nil {
+		t.Fatalf("hooks.json not found: %v", err)
+	}
+
+	if !strings.Contains(string(content), `'/opt/loom/bin/loom' agent session-start`) {
+		t.Fatalf("expected explicit loom binary in generated codex hooks.json")
+	}
+}
+
+// mapKeys returns the keys of m as a slice for error messages.
+func mapKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func TestGenerateHooksConfig_UsesExplicitLoomBinary(t *testing.T) {
+	tmpDir := t.TempDir()
+	claudeProfile, _ := GetPlatformProfile("claude")
+
+	if err := generateHooksConfig(testRegistry(), tmpDir, "claude", claudeProfile, "/opt/loom/bin/loom"); err != nil {
+		t.Fatalf("generateHooksConfig(claude) failed: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("settings.json not found: %v", err)
+	}
+
+	if !strings.Contains(string(content), `'/opt/loom/bin/loom' agent session-start`) {
+		t.Fatalf("expected explicit loom binary in generated claude hooks, got: %s", string(content))
 	}
 }
 
@@ -372,8 +710,8 @@ func TestFilterClaudePermissionRules(t *testing.T) {
 		},
 		{
 			name:        "all known tool names",
-			rules:       []string{"ExitPlanMode", "KillShell", "LS", "LSP", "MultiEdit", "NotebookEdit", "NotebookRead", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch"},
-			wantKept:    []string{"ExitPlanMode", "KillShell", "LS", "LSP", "MultiEdit", "NotebookEdit", "NotebookRead", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch"},
+			rules:       []string{"AskUserQuestion", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "KillShell", "LS", "LSP", "Monitor", "MultiEdit", "NotebookEdit", "NotebookRead", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch"},
+			wantKept:    []string{"AskUserQuestion", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "KillShell", "LS", "LSP", "Monitor", "MultiEdit", "NotebookEdit", "NotebookRead", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch"},
 			wantDropped: nil,
 		},
 	}
@@ -468,6 +806,14 @@ func TestClaudePermissions_AskAndDisableBypass(t *testing.T) {
 func TestClaudePermissions_FiltersInvalidRules(t *testing.T) {
 	reg := &registry.Registry{
 		PlatformPermissions: map[string]*registry.PlatformPermission{
+			// Explicit empty agents entry signals that the test has the
+			// authoritative policy view: no shared guardrails apply. Without
+			// this, EPIC 3 / CONFIG-3 (.loom/108) embedded fallback would
+			// load the gitops_flux policy from
+			// pkg/generator/templates/policies/gitops_flux.yaml and add
+			// ~10 extra deny rules, breaking the assertion below. See
+			// LoadPolicy in pkg/generator/policies.go for the precedence rules.
+			"agents": {},
 			"claude": {
 				Allow: []string{"Bash(go *)", "invalid_tool", "mcp__loom"},
 				Deny:  []string{"Bash(rm *)", "also_invalid"},
@@ -579,7 +925,8 @@ func TestGeneratedClaudeSettings_WithInvalidRulesStillValid(t *testing.T) {
 		},
 	}
 
-	config := claudeHooksConfig(reg)
+	claudeProfile, _ := GetPlatformProfile("claude")
+	config := claudeHooksConfig(reg, claudeProfile, "")
 
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -593,7 +940,8 @@ func TestGeneratedClaudeSettings_WithInvalidRulesStillValid(t *testing.T) {
 }
 
 func TestClaudeHooksConfig_IncludesDirtyWorktreeNudge(t *testing.T) {
-	config := claudeHooksConfig(testRegistry())
+	claudeProfile, _ := GetPlatformProfile("claude")
+	config := claudeHooksConfig(testRegistry(), claudeProfile, "")
 	hooks, ok := config["hooks"].(map[string]any)
 	if !ok {
 		t.Fatal("expected hooks map in claude config")
@@ -610,7 +958,7 @@ func TestClaudeHooksConfig_IncludesDirtyWorktreeNudge(t *testing.T) {
 	found := false
 	for _, h := range entries {
 		cmd, _ := h["command"].(string)
-		if strings.Contains(cmd, "git ls-files --others --exclude-standard") &&
+		if strings.Contains(cmd, "git diff --cached --quiet --no-ext-diff") &&
 			strings.Contains(cmd, "Dirty worktree detected") {
 			found = true
 			break
@@ -622,7 +970,8 @@ func TestClaudeHooksConfig_IncludesDirtyWorktreeNudge(t *testing.T) {
 }
 
 func TestClaudeHooksConfig_UsesPersistentAgentIdBootstrap(t *testing.T) {
-	config := claudeHooksConfig(testRegistry())
+	claudeProfile, _ := GetPlatformProfile("claude")
+	config := claudeHooksConfig(testRegistry(), claudeProfile, "")
 	hooks, ok := config["hooks"].(map[string]any)
 	if !ok {
 		t.Fatal("expected hooks map in claude config")
@@ -645,13 +994,22 @@ func TestClaudeHooksConfig_UsesPersistentAgentIdBootstrap(t *testing.T) {
 		if strings.Contains(cmd, `--agent-id "claude-code-$PPID"`) {
 			t.Fatalf("found hardcoded ppid in claude session-start hook: %s", cmd)
 		}
-		if strings.Contains(cmd, `--agent-id "$AGENT_ID"`) && strings.Contains(cmd, "loom-agent-id-claude-code") {
-			// Verify workspace hash is part of the bootstrap.
+		if strings.Contains(cmd, `--agent-id "$AGENT_ID"`) && strings.Contains(cmd, "agent-id-claude-code") {
+			if !strings.Contains(cmd, "INPUT=$(cat)") {
+				t.Fatalf("expected hook input capture in claude bootstrap, got: %s", cmd)
+			}
+			if !strings.Contains(cmd, "session_id") {
+				t.Fatalf("expected session_id-derived bootstrap in claude hook, got: %s", cmd)
+			}
+			// Verify workspace hash remains part of the bootstrap fallback.
 			if !strings.Contains(cmd, "WS_HASH") {
 				t.Fatalf("expected WS_HASH in agent ID bootstrap, got: %s", cmd)
 			}
 			if !strings.Contains(cmd, "cksum") {
 				t.Fatalf("expected cksum in agent ID bootstrap, got: %s", cmd)
+			}
+			if !strings.Contains(cmd, ".cache/loom") {
+				t.Fatalf("expected cache-backed AGENT_ID_FILE path, got: %s", cmd)
 			}
 			return
 		}
@@ -660,7 +1018,8 @@ func TestClaudeHooksConfig_UsesPersistentAgentIdBootstrap(t *testing.T) {
 }
 
 func TestGeminiHooksConfig_UsesPersistentAgentIdBootstrap(t *testing.T) {
-	config := geminiHooksConfigFromRegistry(testRegistry())
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
 	hooks, ok := config["hooks"].(map[string]any)
 	if !ok {
 		t.Fatal("expected hooks map in gemini config")
@@ -683,13 +1042,22 @@ func TestGeminiHooksConfig_UsesPersistentAgentIdBootstrap(t *testing.T) {
 		if strings.Contains(cmd, `--agent-id "gemini-cli-$PPID"`) {
 			t.Fatalf("found hardcoded ppid in gemini session-start hook: %s", cmd)
 		}
-		if strings.Contains(cmd, `--agent-id "$AGENT_ID"`) && strings.Contains(cmd, "loom-agent-id-gemini-cli") {
-			// Verify workspace hash is part of the bootstrap.
+		if strings.Contains(cmd, `--agent-id "$AGENT_ID"`) && strings.Contains(cmd, "agent-id-gemini-cli") {
+			if !strings.Contains(cmd, "INPUT=$(cat)") {
+				t.Fatalf("expected hook input capture in gemini bootstrap, got: %s", cmd)
+			}
+			if !strings.Contains(cmd, "session_id") {
+				t.Fatalf("expected session_id-derived bootstrap in gemini hook, got: %s", cmd)
+			}
+			// Verify workspace hash remains part of the bootstrap fallback.
 			if !strings.Contains(cmd, "WS_HASH") {
 				t.Fatalf("expected WS_HASH in agent ID bootstrap, got: %s", cmd)
 			}
 			if !strings.Contains(cmd, "cksum") {
 				t.Fatalf("expected cksum in agent ID bootstrap, got: %s", cmd)
+			}
+			if !strings.Contains(cmd, ".cache/loom") {
+				t.Fatalf("expected cache-backed AGENT_ID_FILE path, got: %s", cmd)
 			}
 			return
 		}
@@ -697,8 +1065,70 @@ func TestGeminiHooksConfig_UsesPersistentAgentIdBootstrap(t *testing.T) {
 	t.Fatalf("expected gemini hooks to use persistent AGENT_ID bootstrap and --agent-id \"$AGENT_ID\"")
 }
 
+// collectHookCommands recursively gathers every "command" string from a
+// generated hooks structure (event -> blocks -> hooks -> command).
+func collectHookCommands(node any) []string {
+	var cmds []string
+	switch v := node.(type) {
+	case map[string]any:
+		for key, val := range v {
+			if key == "command" {
+				if cmd, ok := val.(string); ok {
+					cmds = append(cmds, cmd)
+					continue
+				}
+			}
+			cmds = append(cmds, collectHookCommands(val)...)
+		}
+	case []map[string]any:
+		for _, item := range v {
+			cmds = append(cmds, collectHookCommands(item)...)
+		}
+	case []any:
+		for _, item := range v {
+			cmds = append(cmds, collectHookCommands(item)...)
+		}
+	}
+	return cmds
+}
+
+// TestGeminiHooksConfig_NoNestedBraceDefaults guards against Gemini CLI's
+// load-time settings interpolation mangling hook commands. Gemini expands
+// ${VAR} and ${VAR:-default} in settings.json strings with a non-brace-aware
+// regex (resolveEnvVarsInString,
+// https://github.com/google-gemini/gemini-cli/blob/main/packages/cli/src/utils/envVarResolver.ts):
+// a nested default like ${HOME:-${TMPDIR:-/tmp}} matches only up to the first
+// `}`, substituting the outer variable and leaving a stray brace. Observed
+// live on Gemini CLI 0.43.0 (2026-06-09): every hook fire emitted
+// "mkdir: /Users/<user>}: Permission denied" and the agent-id cache file was
+// never written. ${shellvar:-default} is likewise replaced with the default
+// at load time, silently emptying shell-local reads like ${INPUT:-}.
+func TestGeminiHooksConfig_NoNestedBraceDefaults(t *testing.T) {
+	geminiProfile, err := GetPlatformProfile("gemini")
+	if err != nil {
+		t.Fatalf("expected gemini platform profile: %v", err)
+	}
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
+
+	cmds := collectHookCommands(config["hooks"])
+	if len(cmds) == 0 {
+		t.Fatal("expected at least one gemini hook command")
+	}
+
+	nested := regexp.MustCompile(`\$\{[^}]*\$\{`)
+	for _, cmd := range cmds {
+		if loc := nested.FindString(cmd); loc != "" {
+			t.Errorf("gemini hook command contains nested ${...${...}...} (%q) that Gemini CLI's settings loader mangles:\n%s", loc, cmd)
+		}
+		if strings.Contains(cmd, "${INPUT:-") {
+			t.Errorf("gemini hook command uses ${INPUT:-...}; Gemini's settings loader replaces it with the default, emptying hook input:\n%s", cmd)
+		}
+	}
+}
+
 func TestGeminiHooksConfig_IncludesDirtyWorktreeNudge(t *testing.T) {
-	config := geminiHooksConfigFromRegistry(testRegistry())
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
 	hooks, ok := config["hooks"].(map[string]any)
 	if !ok {
 		t.Fatal("expected hooks map in gemini config")
@@ -715,7 +1145,7 @@ func TestGeminiHooksConfig_IncludesDirtyWorktreeNudge(t *testing.T) {
 	found := false
 	for _, h := range entries {
 		cmd, _ := h["command"].(string)
-		if strings.Contains(cmd, "git ls-files --others --exclude-standard") &&
+		if strings.Contains(cmd, "git diff --cached --quiet --no-ext-diff") &&
 			strings.Contains(cmd, "Dirty worktree detected") {
 			found = true
 			break
@@ -723,6 +1153,72 @@ func TestGeminiHooksConfig_IncludesDirtyWorktreeNudge(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected dirty-worktree nudge command in SessionStart hooks: %#v", entries)
+	}
+}
+
+func TestGeminiHooksConfig_EmitsApprovalAndSecuritySettings(t *testing.T) {
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
+
+	general, ok := config["general"].(map[string]any)
+	if !ok {
+		t.Fatal("expected general block in gemini config")
+	}
+	if got := general["defaultApprovalMode"]; got != "auto_edit" {
+		t.Fatalf("defaultApprovalMode=%v, want auto_edit", got)
+	}
+	checkpointing, ok := general["checkpointing"].(map[string]any)
+	if !ok || checkpointing["enabled"] != true {
+		t.Fatalf("expected checkpointing.enabled=true, got %#v", general["checkpointing"])
+	}
+
+	tools, ok := config["tools"].(map[string]any)
+	if !ok {
+		t.Fatal("expected tools block in gemini config")
+	}
+	allowed, ok := tools["allowed"].([]string)
+	if !ok {
+		t.Fatalf("expected tools.allowed []string, got %#v", tools["allowed"])
+	}
+	wantAllowed := []string{
+		"run_shell_command(git)",
+		"run_shell_command(echo)",
+		"run_shell_command(printf)",
+		"run_shell_command(rg)",
+		"run_shell_command(tee)",
+	}
+	if len(allowed) != len(wantAllowed) {
+		t.Fatalf("unexpected tools.allowed: %#v", allowed)
+	}
+	for i, want := range wantAllowed {
+		if allowed[i] != want {
+			t.Fatalf("tools.allowed[%d]=%q, want %q (full=%#v)", i, allowed[i], want, allowed)
+		}
+	}
+	exclude, ok := tools["exclude"].([]string)
+	if !ok || len(exclude) != 1 || exclude[0] != "run_shell_command(rm)" {
+		t.Fatalf("unexpected tools.exclude: %#v", tools["exclude"])
+	}
+
+	security, ok := config["security"].(map[string]any)
+	if !ok {
+		t.Fatal("expected security block in gemini config")
+	}
+	if security["enablePermanentToolApproval"] != true {
+		t.Fatalf("expected enablePermanentToolApproval=true, got %#v", security["enablePermanentToolApproval"])
+	}
+	folderTrust, ok := security["folderTrust"].(map[string]any)
+	if !ok || folderTrust["enabled"] != true {
+		t.Fatalf("expected folderTrust.enabled=true, got %#v", security["folderTrust"])
+	}
+
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("failed to marshal Gemini settings: %v", err)
+	}
+	result := validator.ValidateGeminiSettings("settings.json", data)
+	if result.HasErrors() {
+		t.Fatalf("expected generated Gemini settings to validate cleanly, got errors: %v", result.Errors)
 	}
 }
 
@@ -740,7 +1236,7 @@ func TestEmitCodexPreamble_WebSearchOverride(t *testing.T) {
 	}
 
 	var sb strings.Builder
-	emitCodexPreamble(&sb, reg, "/tmp")
+	emitCodexPreamble(&sb, reg, "/tmp", "")
 	content := sb.String()
 
 	if !strings.Contains(content, `web_search = "cached"`) {
@@ -763,7 +1259,7 @@ func TestEmitCodexPreamble_WebSearchDisabled(t *testing.T) {
 	}
 
 	var sb strings.Builder
-	emitCodexPreamble(&sb, reg, "/tmp")
+	emitCodexPreamble(&sb, reg, "/tmp", "")
 	content := sb.String()
 
 	if !strings.Contains(content, `web_search = "disabled"`) {
@@ -771,28 +1267,40 @@ func TestEmitCodexPreamble_WebSearchDisabled(t *testing.T) {
 	}
 }
 
-// --- Workspace-scoped agent ID tests ---
+// --- Hook-scoped agent ID tests ---
 
 func TestHookAgentIDBootstrap_ContainsWorkspaceHash(t *testing.T) {
 	output := hookAgentIDBootstrap("claude-code")
 
 	for _, want := range []string{
+		"HOOK_INPUT=",
+		"HOOK_SESSION_ID=",
+		"SESSION_SCOPE=",
 		"WS_ROOT=",
 		"WS_HASH=",
 		"cksum",
 		"git rev-parse --show-toplevel",
-		"loom-agent-id-claude-code-${WS_HASH}",
-		`AGENT_ID="claude-code-${WS_HASH}-$PPID"`,
+		`AGENT_CACHE_BASE="$HOME"`,
+		`[ -n "$AGENT_CACHE_BASE" ] || AGENT_CACHE_BASE="${TMPDIR:-/tmp}"`,
+		`AGENT_CACHE_DIR="$AGENT_CACHE_BASE/.cache/loom"`,
+		"agent-id-claude-code-${WS_HASH}${SESSION_SCOPE}",
+		`AGENT_ID="claude-code-${WS_HASH}${SESSION_SCOPE}"`,
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("hookAgentIDBootstrap output missing %q\ngot: %s", want, output)
 		}
 	}
 
-	// Verify the old global file pattern is gone.
-	if strings.Contains(output, `loom-agent-id-claude-code"`) &&
-		!strings.Contains(output, `loom-agent-id-claude-code-$`) {
-		t.Error("expected workspace-scoped file name, found global pattern")
+	// Verify we no longer rely on a tempdir-only identity file.
+	if strings.Contains(output, `${TMPDIR:-/tmp}/loom-agent-id-claude-code`) {
+		t.Error("expected hook agent id bootstrap to prefer cache-backed identity storage")
+	}
+
+	// Gemini CLI's settings loader replaces ${shellvar:-default} with the
+	// default value before the shell ever runs (envVarResolver.ts), so the
+	// bootstrap must read $INPUT without a brace-default.
+	if strings.Contains(output, "${INPUT:-") {
+		t.Errorf("hookAgentIDBootstrap must not use ${INPUT:-...}; Gemini's settings loader replaces it with the default\ngot: %s", output)
 	}
 }
 
@@ -813,14 +1321,15 @@ func TestHookStaleCleanup_ChecksProcessLiveness(t *testing.T) {
 // --- Shared builder tests ---
 
 func TestBuildPlatformHooks_ClaudeEventNames(t *testing.T) {
-	hooks := buildPlatformHooks(testRegistry(), hookPlatformConfig{
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
 		AgentID:          "claude-code",
 		AgentType:        "claude-code",
 		Description:      "Claude Code session",
 		SessionEndEvent:  "Stop",
 		HeartbeatEvent:   "PostToolUse",
 		HeartbeatMatcher: "Bash|Task",
-	})
+	}, "")
 
 	for _, key := range []string{"SessionStart", "Stop", "PostToolUse"} {
 		if _, ok := hooks[key]; !ok {
@@ -837,14 +1346,15 @@ func TestBuildPlatformHooks_ClaudeEventNames(t *testing.T) {
 }
 
 func TestBuildPlatformHooks_GeminiEventNames(t *testing.T) {
-	hooks := buildPlatformHooks(testRegistry(), hookPlatformConfig{
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
 		AgentID:          "gemini-cli",
 		AgentType:        "gemini-cli",
 		Description:      "Gemini CLI session",
 		SessionEndEvent:  "SessionEnd",
 		HeartbeatEvent:   "AfterTool",
 		HeartbeatMatcher: "run_shell_command",
-	})
+	}, "")
 
 	for _, key := range []string{"SessionStart", "SessionEnd", "AfterTool"} {
 		if _, ok := hooks[key]; !ok {
@@ -860,76 +1370,1236 @@ func TestBuildPlatformHooks_GeminiEventNames(t *testing.T) {
 	}
 }
 
-func TestBuildPlatformHooks_AtomicPIDWrite(t *testing.T) {
-	hooks := buildPlatformHooks(testRegistry(), hookPlatformConfig{
+func TestBuildPlatformHooks_KeepaliveIsDetached(t *testing.T) {
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
 		AgentID:          "claude-code",
 		AgentType:        "claude-code",
 		Description:      "test",
 		SessionEndEvent:  "Stop",
 		HeartbeatEvent:   "PostToolUse",
 		HeartbeatMatcher: "Bash|Task",
-	})
+	}, "")
 
 	sessionStart := hooks["SessionStart"].([]map[string]any)
 	sessionHooks := sessionStart[0]["hooks"].([]map[string]any)
 
-	foundAtomicWrite := false
+	foundDetachedKeepalive := false
 	for _, h := range sessionHooks {
 		cmd, _ := h["command"].(string)
-		// Keepalive hook should use atomic mv pattern.
-		if strings.Contains(cmd, "keepalive") && strings.Contains(cmd, `"${PID_FILE}.tmp"`) && strings.Contains(cmd, `mv "${PID_FILE}.tmp" "$PID_FILE"`) {
-			foundAtomicWrite = true
+		if strings.Contains(cmd, "keepalive") &&
+			strings.Contains(cmd, "</dev/null") &&
+			strings.Contains(cmd, ">/dev/null") {
+			foundDetachedKeepalive = true
 			break
 		}
 	}
-	if !foundAtomicWrite {
-		t.Error("expected atomic PID write (mv .tmp pattern) in keepalive hook")
+	if !foundDetachedKeepalive {
+		t.Error("expected keepalive hook to detach stdio from the hook runner")
 	}
 }
 
-func TestBuildPlatformHooks_StaleCleanupInSessionStart(t *testing.T) {
-	hooks := buildPlatformHooks(testRegistry(), hookPlatformConfig{
+func TestBuildPlatformHooks_PkillOrphanCleanup(t *testing.T) {
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
 		AgentID:          "claude-code",
 		AgentType:        "claude-code",
 		Description:      "test",
 		SessionEndEvent:  "Stop",
 		HeartbeatEvent:   "PostToolUse",
 		HeartbeatMatcher: "Bash|Task",
-	})
+	}, "")
+
+	// Check SessionStart keepalive hook includes pkill for orphans.
+	sessionStart := hooks["SessionStart"].([]map[string]any)
+	sessionHooks := sessionStart[0]["hooks"].([]map[string]any)
+	foundPkillInStart := false
+	for _, h := range sessionHooks {
+		cmd, _ := h["command"].(string)
+		if strings.Contains(cmd, "keepalive") && strings.Contains(cmd, `pkill -f "loom agent keepalive --agent-id claude-code-${WS_HASH}"`) {
+			foundPkillInStart = true
+			break
+		}
+	}
+	if !foundPkillInStart {
+		t.Error("expected pkill orphan cleanup in SessionStart keepalive hook")
+	}
+
+	// Check Stop hook includes pkill for orphans.
+	stop := hooks["Stop"].([]map[string]any)
+	stopHooks := stop[0]["hooks"].([]map[string]any)
+	foundPkillInStop := false
+	for _, h := range stopHooks {
+		cmd, _ := h["command"].(string)
+		if strings.Contains(cmd, `pkill -f "loom agent keepalive --agent-id claude-code-${WS_HASH}"`) {
+			foundPkillInStop = true
+			break
+		}
+	}
+	if !foundPkillInStop {
+		t.Error("expected pkill orphan cleanup in Stop hook")
+	}
+}
+
+func TestBuildPlatformHooks_StaleCleanupInSessionStart(t *testing.T) {
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "test",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "")
 
 	sessionStart := hooks["SessionStart"].([]map[string]any)
 	sessionHooks := sessionStart[0]["hooks"].([]map[string]any)
 
 	foundStaleCleanup := false
+	foundFastRecallStrategy := false
 	for _, h := range sessionHooks {
 		cmd, _ := h["command"].(string)
 		if strings.Contains(cmd, "session-start") && strings.Contains(cmd, "kill -0") {
 			foundStaleCleanup = true
-			break
+		}
+		if strings.Contains(cmd, "session-start") && strings.Contains(cmd, "--auto-recall-strategy fast") {
+			foundFastRecallStrategy = true
 		}
 	}
 	if !foundStaleCleanup {
 		t.Error("expected stale cleanup (kill -0) in session-start hook chain")
 	}
+	if !foundFastRecallStrategy {
+		t.Error("expected session-start hook to include --auto-recall-strategy fast")
+	}
+}
+
+func TestBuildPlatformHooks_HeartbeatBootstrapIncludesNamespaceInference(t *testing.T) {
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "")
+
+	postToolUse := hooks["PostToolUse"].([]map[string]any)
+	entries := postToolUse[0]["hooks"].([]map[string]any)
+
+	found := false
+	for _, h := range entries {
+		cmd, _ := h["command"].(string)
+		if strings.Contains(cmd, "agent heartbeat") &&
+			strings.Contains(cmd, "--ensure-session") &&
+			strings.Contains(cmd, "--infer-namespace") &&
+			strings.Contains(cmd, `--description "Claude Code`) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected heartbeat hook bootstrap to include namespace inference and description")
+	}
+}
+
+func TestBuildPlatformHooks_StopHookUsesSummaryAsync(t *testing.T) {
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "test",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "")
+
+	stop := hooks["Stop"].([]map[string]any)
+	stopHooks := stop[0]["hooks"].([]map[string]any)
+
+	found := false
+	for _, h := range stopHooks {
+		cmd, _ := h["command"].(string)
+		if strings.Contains(cmd, "session-end") && strings.Contains(cmd, "--summary-async") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected Stop hook to include --summary-async")
+	}
 }
 
 func TestCodexPreamble_ContainsWorkspaceHash(t *testing.T) {
 	var sb strings.Builder
-	emitCodexPreamble(&sb, testRegistry(), "/tmp/workspace")
+	emitCodexPreamble(&sb, testRegistry(), "/tmp/workspace", "")
 	content := sb.String()
 
 	for _, want := range []string{
 		"WS_HASH=",
 		"cksum",
-		"codex-${WS_HASH}-$$",
+		`CACHE_DIR=\"${HOME}/.cache/loom\"`,
+		"AGENT_ID_FILE",
+		"${CACHE_DIR}/agent-id-codex-${WS_HASH}",
+		"${CACHE_DIR}/keepalive-wrap-codex-${WS_HASH}.stamp",
+		"codex-${WS_HASH}",
+		"keepalive-wrap",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("Codex preamble missing %q\ngot: %s", want, content)
 		}
 	}
 
-	// Old global pattern should be gone.
+	// Old unstable agent ID patterns should be gone.
 	if strings.Contains(content, `--agent-id "codex-$$"`) {
 		t.Error("found old global agent ID pattern codex-$$ without workspace hash")
+	}
+	if strings.Contains(content, "codex-${WS_HASH}-$$") {
+		t.Error("found old per-process codex agent ID pattern")
+	}
+}
+
+func TestResolveHubWrapper_PreferenceOrder(t *testing.T) {
+	hubWrapperResolverTestMu.Lock()
+	oldProbe := hubWrapperProbe
+	hubWrapperProbe = func(string) error { return nil }
+	t.Cleanup(func() {
+		hubWrapperProbe = oldProbe
+		hubWrapperResolverTestMu.Unlock()
+	})
+
+	tmp := t.TempDir()
+	workspaceRoot := filepath.Join(tmp, "workspace")
+	registryRoot := filepath.Join(tmp, "registry-root")
+
+	envWrapper := writeTestWrapper(t, tmp, "env-wrapper.sh", true)
+	workspaceWrapper := writeTestWrapper(t, filepath.Join(workspaceRoot, "services", "loom-core", "bin"), "mcp-hub-wrapper", true)
+	installedWrapper := writeTestWrapper(t, filepath.Join(tmp, "home", ".local", "bin"), "mcp-hub-wrapper", true)
+	pathWrapper := writeTestWrapper(t, filepath.Join(tmp, "path"), "mcp-hub-wrapper", true)
+
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	t.Setenv("PATH", filepath.Join(tmp, "path"))
+
+	t.Setenv(hubWrapperOverrideEnv, envWrapper)
+	got, err := resolveHubWrapper(workspaceRoot, registryRoot)
+	if err != nil {
+		t.Fatalf("resolveHubWrapper with env override: %v", err)
+	}
+	if got != envWrapper {
+		t.Fatalf("resolved wrapper = %q, want env override %q", got, envWrapper)
+	}
+
+	t.Setenv(hubWrapperOverrideEnv, "")
+	got, err = resolveHubWrapper(workspaceRoot, registryRoot)
+	if err != nil {
+		t.Fatalf("resolveHubWrapper with workspace wrapper: %v", err)
+	}
+	if got != workspaceWrapper {
+		t.Fatalf("resolved wrapper = %q, want workspace wrapper %q", got, workspaceWrapper)
+	}
+
+	if err := os.Remove(workspaceWrapper); err != nil {
+		t.Fatalf("remove workspace wrapper: %v", err)
+	}
+	got, err = resolveHubWrapper(workspaceRoot, registryRoot)
+	if err != nil {
+		t.Fatalf("resolveHubWrapper with installed wrapper: %v", err)
+	}
+	if got != installedWrapper {
+		t.Fatalf("resolved wrapper = %q, want installed wrapper %q", got, installedWrapper)
+	}
+
+	if err := os.Remove(installedWrapper); err != nil {
+		t.Fatalf("remove installed wrapper: %v", err)
+	}
+	got, err = resolveHubWrapper(workspaceRoot, registryRoot)
+	if err != nil {
+		t.Fatalf("resolveHubWrapper with PATH wrapper: %v", err)
+	}
+	if got != pathWrapper {
+		t.Fatalf("resolved wrapper = %q, want PATH wrapper %q", got, pathWrapper)
+	}
+}
+
+func TestBuildTargetMap_HubModeFailsWithoutHealthyWrapper(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	t.Setenv("PATH", filepath.Join(tmp, "empty-path"))
+	t.Setenv(hubWrapperOverrideEnv, writeTestWrapper(t, tmp, "broken-wrapper.sh", false))
+
+	reg := &registry.Registry{
+		Servers: []*registry.Server{
+			{
+				Name: "agent_context",
+				Common: &registry.TargetSpec{
+					Command: "mcp-agent-context",
+				},
+			},
+		},
+	}
+
+	codexProfile, _ := GetPlatformProfile("codex")
+	_, err := buildTargetMap(reg, "codex", codexProfile, true, "wss://example.test/ws", false, "", tmp, filepath.Join(tmp, "registry-root"), false)
+	if err == nil {
+		t.Fatal("expected hub mode generation to fail when no healthy wrapper is available")
+	}
+	if !strings.Contains(err.Error(), "resolve hub wrapper") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildTargetMap_HubModeUsesResolvedWrapper(t *testing.T) {
+	tmp := t.TempDir()
+	goodWrapper := writeTestWrapper(t, tmp, "good-wrapper.sh", true)
+	t.Setenv(hubWrapperOverrideEnv, goodWrapper)
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	t.Setenv("PATH", filepath.Join(tmp, "empty-path"))
+
+	reg := &registry.Registry{
+		Servers: []*registry.Server{
+			{
+				Name: "agent_context",
+				Common: &registry.TargetSpec{
+					Command: "mcp-agent-context",
+				},
+			},
+		},
+	}
+
+	codexProfile, _ := GetPlatformProfile("codex")
+	targets, err := buildTargetMap(reg, "codex", codexProfile, true, "wss://example.test/ws", false, "", filepath.Join(tmp, "workspace"), filepath.Join(tmp, "registry-root"), false)
+	if err != nil {
+		t.Fatalf("buildTargetMap: %v", err)
+	}
+
+	spec := targets["agent_context"]
+	if spec == nil {
+		t.Fatal("expected agent_context target spec")
+	}
+	if spec.Command != goodWrapper {
+		t.Fatalf("hub wrapper command = %q, want %q", spec.Command, goodWrapper)
+	}
+	gotArgs := make([]string, 0, len(spec.Args))
+	for _, a := range spec.Args {
+		gotArgs = append(gotArgs, fmt.Sprintf("%v", a))
+	}
+	want := []string{"agent_context", "--profile", "codex", "--hub-url", "wss://example.test/ws"}
+	if strings.Join(gotArgs, " ") != strings.Join(want, " ") {
+		t.Fatalf("hub wrapper args = %v, want %v", gotArgs, want)
+	}
+}
+
+func TestBuildTargetMap_LoomModeAntigravityAddsToolFilterArgs(t *testing.T) {
+	reg := &registry.Registry{}
+
+	agProfile, _ := GetPlatformProfile("antigravity")
+	targets, err := buildTargetMap(reg, "antigravity", agProfile, false, "", true, "", "", "", false)
+	if err != nil {
+		t.Fatalf("buildTargetMap: %v", err)
+	}
+
+	spec := targets["loom"]
+	if spec == nil {
+		t.Fatal("expected loom target spec in loom-mode")
+	}
+
+	gotArgs := make([]string, 0, len(spec.Args))
+	for _, a := range spec.Args {
+		gotArgs = append(gotArgs, fmt.Sprintf("%v", a))
+	}
+
+	want := []string{
+		"proxy",
+		"--agent-hint", "antigravity",
+		"--tool-profile", "antigravity-core",
+		"--max-tools", "100",
+	}
+	if strings.Join(gotArgs, " ") != strings.Join(want, " ") {
+		t.Fatalf("loom-mode antigravity args = %v, want %v", gotArgs, want)
+	}
+}
+
+func TestBuildTargetMap_LoomModeLLMClientsAddToolFilterArgs(t *testing.T) {
+	reg := &registry.Registry{}
+
+	for _, targetName := range []string{"claude", "claude_desktop", "codex", "kilocode"} {
+		t.Run(targetName, func(t *testing.T) {
+			profile, _ := GetPlatformProfile(targetName)
+			targets, err := buildTargetMap(reg, targetName, profile, false, "", true, "", "", "", false)
+			if err != nil {
+				t.Fatalf("buildTargetMap(%s): %v", targetName, err)
+			}
+
+			spec := targets["loom"]
+			if spec == nil {
+				t.Fatalf("expected loom target spec in loom-mode for %s", targetName)
+			}
+
+			gotArgs := make([]string, 0, len(spec.Args))
+			for _, a := range spec.Args {
+				gotArgs = append(gotArgs, fmt.Sprintf("%v", a))
+			}
+
+			want := []string{
+				"proxy",
+				"--agent-hint", profile.LoomProxy.AgentHint,
+				"--tool-profile", "llm-core",
+				"--max-tools", "167",
+			}
+			if strings.Join(gotArgs, " ") != strings.Join(want, " ") {
+				t.Fatalf("loom-mode %s args = %v, want %v", targetName, gotArgs, want)
+			}
+		})
+	}
+}
+
+func TestBuildTargetMap_LoomModeAppliesProxyEnv(t *testing.T) {
+	reg := &registry.Registry{}
+	profile, err := GetPlatformProfile("claude_desktop")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile: %v", err)
+	}
+
+	targets, err := buildTargetMap(reg, "claude_desktop", profile, false, "", true, "", "", "", false)
+	if err != nil {
+		t.Fatalf("buildTargetMap: %v", err)
+	}
+
+	spec := targets["loom"]
+	if spec == nil {
+		t.Fatal("expected loom target spec in loom-mode")
+	}
+	if got := spec.Env["LOOM_PROXY_IDLE_EXIT_SECONDS"]; got != "0" {
+		t.Fatalf("LOOM_PROXY_IDLE_EXIT_SECONDS = %q, want 0", got)
+	}
+}
+
+func TestBuildTargetMap_LoomModeUsesExplicitBinaryAcrossPlatforms(t *testing.T) {
+	reg := &registry.Registry{}
+	loomBinary := "/opt/loom/bin/loom"
+	targetsToCheck := []string{"antigravity", "claude", "claude_desktop", "codex", "gemini", "kilocode", "opencode", "vscode", "zed"}
+
+	for _, targetName := range targetsToCheck {
+		t.Run(targetName, func(t *testing.T) {
+			profile, err := GetPlatformProfile(targetName)
+			if err != nil {
+				t.Fatalf("GetPlatformProfile(%s): %v", targetName, err)
+			}
+
+			targets, err := buildTargetMap(reg, targetName, profile, false, "", true, loomBinary, "/tmp/workspace", "/tmp/registry-root", false)
+			if err != nil {
+				t.Fatalf("buildTargetMap(%s): %v", targetName, err)
+			}
+
+			spec := targets["loom"]
+			if spec == nil {
+				t.Fatalf("expected loom target spec for %s", targetName)
+			}
+			if spec.Command != loomBinary {
+				t.Fatalf("loom command for %s = %q, want %q", targetName, spec.Command, loomBinary)
+			}
+		})
+	}
+}
+
+func writeTestWrapper(t *testing.T, dir string, name string, healthy bool) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	path := filepath.Join(dir, name)
+	content := "#!/bin/sh\n"
+	if healthy {
+		content += "if [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 0\n"
+	} else {
+		content += "echo broken wrapper >&2\nexit 1\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+		t.Fatalf("write wrapper %s: %v", path, err)
+	}
+	return path
+}
+
+// --- CONFIG-2: Unified generator interface tests ---
+
+func TestGenerateParams_DestDir(t *testing.T) {
+	t.Parallel()
+	p := &GenerateParams{OutputDir: "/out", Target: "claude"}
+	if got := p.destDir(); got != "/out/claude" {
+		t.Errorf("destDir() = %q, want /out/claude", got)
+	}
+}
+
+func TestGenerateParams_FilePerm(t *testing.T) {
+	t.Parallel()
+
+	p := &GenerateParams{Target: "test", ResolveSecrets: false}
+	if perm := p.filePerm(); perm != 0644 {
+		t.Errorf("filePerm() = %o, want 0644", perm)
+	}
+
+	p.ResolveSecrets = true
+	if perm := p.filePerm(); perm != 0600 {
+		t.Errorf("filePerm() = %o, want 0600", perm)
+	}
+}
+
+func TestProfileDrivenJSONConfig_AllJSONPlatforms(t *testing.T) {
+	t.Parallel()
+
+	profiles, err := loadProfiles()
+	if err != nil {
+		t.Fatalf("loadProfiles: %v", err)
+	}
+
+	for name, profile := range profiles {
+		if profile.ConfigFormat != "json" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			reg := &registry.Registry{
+				Servers: []*registry.Server{
+					{
+						Name: "test-server",
+						Common: &registry.TargetSpec{
+							Command:     "echo",
+							Args:        []any{"hello"},
+							Description: "test server",
+						},
+					},
+				},
+			}
+
+			p := &GenerateParams{
+				Reg:       reg,
+				OutputDir: tmpDir,
+				Target:    name,
+				Profile:   profile,
+			}
+
+			if err := generateJSONConfig(p); err != nil {
+				t.Fatalf("generateJSONConfig(%s): %v", name, err)
+			}
+
+			outFile := filepath.Join(tmpDir, name, profile.ConfigFile)
+			data, err := os.ReadFile(outFile)
+			if err != nil {
+				t.Fatalf("read output: %v", err)
+			}
+			if !strings.HasSuffix(string(data), "\n") {
+				t.Fatalf("expected trailing newline in %s output", name)
+			}
+
+			var parsed map[string]any
+			if err := json.Unmarshal(data, &parsed); err != nil {
+				t.Fatalf("invalid JSON for %s: %v", name, err)
+			}
+
+			// Verify root key matches profile.
+			if profile.Features.CommandFormat != "array" {
+				rootKey := profile.ConfigRoot
+				if rootKey == "" {
+					rootKey = "mcpServers"
+				}
+				if _, ok := parsed[rootKey]; !ok {
+					t.Errorf("missing root key %q in %s output", rootKey, name)
+				}
+			}
+		})
+	}
+}
+
+func TestProfileDrivenTOMLConfig_AllTOMLPlatforms(t *testing.T) {
+	t.Parallel()
+
+	profiles, err := loadProfiles()
+	if err != nil {
+		t.Fatalf("loadProfiles: %v", err)
+	}
+
+	for name, profile := range profiles {
+		if profile.ConfigFormat != "toml" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			reg := &registry.Registry{
+				Servers: []*registry.Server{
+					{
+						Name: "test-server",
+						Common: &registry.TargetSpec{
+							Command:     "echo",
+							Args:        []any{"hello"},
+							Description: "test server",
+							Timeout:     30,
+						},
+					},
+				},
+			}
+
+			p := &GenerateParams{
+				Reg:       reg,
+				OutputDir: tmpDir,
+				Target:    name,
+				Profile:   profile,
+			}
+
+			if err := generateTomlConfig(p); err != nil {
+				t.Fatalf("generateTomlConfig(%s): %v", name, err)
+			}
+
+			outFile := filepath.Join(tmpDir, name, profile.ConfigFile)
+			data, err := os.ReadFile(outFile)
+			if err != nil {
+				t.Fatalf("read output: %v", err)
+			}
+
+			content := string(data)
+			// All TOML configs should have the mcp_servers section.
+			if !strings.Contains(content, "[mcp_servers.test-server]") {
+				t.Errorf("missing [mcp_servers.test-server] in %s output", name)
+			}
+
+			// Verify timeout field name matches profile.
+			if profile.Features.SupportsTimeout {
+				field := profile.Features.TimeoutField
+				if field == "" {
+					field = "timeout"
+				}
+				if !strings.Contains(content, field+" = ") {
+					t.Errorf("missing %s field in %s output", field, name)
+				}
+			}
+
+			// Verify description support.
+			if profile.Features.SupportsDescription {
+				if !strings.Contains(content, "description = ") {
+					t.Errorf("missing description in %s output (SupportsDescription=true)", name)
+				}
+			}
+		})
+	}
+}
+
+func TestProfileDrivenConfig_ClaudeDesktopUsesCustomFilename(t *testing.T) {
+	t.Parallel()
+
+	profile, err := GetPlatformProfile("claude_desktop")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	reg := &registry.Registry{
+		Servers: []*registry.Server{
+			{
+				Name: "test",
+				Common: &registry.TargetSpec{
+					Command: "echo",
+					Args:    []any{"test"},
+				},
+			},
+		},
+	}
+
+	p := &GenerateParams{
+		Reg:       reg,
+		OutputDir: tmpDir,
+		Target:    "claude_desktop",
+		Profile:   profile,
+	}
+
+	if err := generateJSONConfig(p); err != nil {
+		t.Fatalf("generateJSONConfig: %v", err)
+	}
+
+	// Verify the output uses the profile-specified filename.
+	expected := filepath.Join(tmpDir, "claude_desktop", "claude_desktop_config.json")
+	if _, err := os.Stat(expected); err != nil {
+		t.Errorf("expected output at %s: %v", expected, err)
+	}
+
+	// Verify no timeout field (SupportsTimeout=false for claude_desktop).
+	data, _ := os.ReadFile(expected)
+	if strings.Contains(string(data), "timeout") {
+		t.Error("claude_desktop should not have timeout field (SupportsTimeout=false)")
+	}
+}
+
+func TestProfileDrivenConfig_CodexUsesToolTimeoutSec(t *testing.T) {
+	t.Parallel()
+
+	profile, err := GetPlatformProfile("codex")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	reg := testRegistry()
+	reg.Servers = []*registry.Server{
+		{
+			Name: "test",
+			Common: &registry.TargetSpec{
+				Command: "echo",
+				Args:    []any{"test"},
+				Timeout: 60,
+			},
+		},
+	}
+
+	p := &GenerateParams{
+		Reg:       reg,
+		OutputDir: tmpDir,
+		Target:    "codex",
+		Profile:   profile,
+	}
+
+	if err := generateTomlConfig(p); err != nil {
+		t.Fatalf("generateTomlConfig: %v", err)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(tmpDir, "codex", "config.toml"))
+	content := string(data)
+
+	if !strings.Contains(content, "tool_timeout_sec = 60") {
+		t.Error("codex should use tool_timeout_sec for timeout field")
+	}
+	if strings.Contains(content, "\ntimeout = ") {
+		t.Error("codex should not have generic 'timeout' field")
+	}
+}
+
+// --- Policy refs and enforcement tests ---
+
+func TestAllPlatforms_HavePolicyRefs(t *testing.T) {
+	names := AllPlatformNames()
+	if len(names) < 8 {
+		t.Fatalf("expected at least 8 platforms, got %d", len(names))
+	}
+
+	for _, name := range names {
+		profile, err := GetPlatformProfile(name)
+		if err != nil {
+			t.Fatalf("GetPlatformProfile(%q): %v", name, err)
+		}
+		if len(profile.Hooks.PolicyRefs) == 0 {
+			t.Errorf("platform %q has no policy_refs defined", name)
+		}
+		found := false
+		for _, ref := range profile.Hooks.PolicyRefs {
+			if ref == "gitops_flux" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("platform %q does not reference gitops_flux policy", name)
+		}
+	}
+}
+
+func TestAllPlatforms_HaveEnforcement(t *testing.T) {
+	validEnforcements := map[string]bool{
+		"native": true,
+		"proxy":  true,
+		"plugin": true,
+	}
+
+	for _, name := range AllPlatformNames() {
+		profile, err := GetPlatformProfile(name)
+		if err != nil {
+			t.Fatalf("GetPlatformProfile(%q): %v", name, err)
+		}
+		enforcement := profile.Hooks.Enforcement
+		if enforcement == "" {
+			t.Errorf("platform %q has no enforcement field", name)
+			continue
+		}
+		if !validEnforcements[enforcement] {
+			t.Errorf("platform %q has invalid enforcement %q (expected native/proxy/plugin)", name, enforcement)
+		}
+	}
+}
+
+func TestNativeEnforcementPlatforms(t *testing.T) {
+	// Claude, Gemini, and Antigravity should have native hook enforcement.
+	for _, name := range []string{"claude", "gemini", "antigravity"} {
+		profile, err := GetPlatformProfile(name)
+		if err != nil {
+			t.Fatalf("GetPlatformProfile(%q): %v", name, err)
+		}
+		if profile.Hooks.Enforcement != "native" {
+			t.Errorf("platform %q should have native enforcement, got %q", name, profile.Hooks.Enforcement)
+		}
+	}
+}
+
+func TestProxyEnforcementPlatforms(t *testing.T) {
+	// These platforms rely on the loom proxy for enforcement.
+	proxyPlatforms := []string{"codex", "vscode", "kilocode", "zed", "claude_desktop"}
+	for _, name := range proxyPlatforms {
+		profile, err := GetPlatformProfile(name)
+		if err != nil {
+			t.Fatalf("GetPlatformProfile(%q): %v", name, err)
+		}
+		if profile.Hooks.Enforcement != "proxy" {
+			t.Errorf("platform %q should have proxy enforcement, got %q", name, profile.Hooks.Enforcement)
+		}
+	}
+}
+
+func TestPluginEnforcementPlatforms(t *testing.T) {
+	profile, err := GetPlatformProfile("opencode")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile(opencode): %v", err)
+	}
+	if profile.Hooks.Enforcement != "plugin" {
+		t.Errorf("opencode should have plugin enforcement, got %q", profile.Hooks.Enforcement)
+	}
+}
+
+func TestGeminiHooksConfig_OmitsPreToolUse(t *testing.T) {
+	// Gemini does not understand PreToolUse / SubagentStart hook events.
+	// Including them causes Gemini CLI to reject the entire hooks block,
+	// which silently disables every Gemini lifecycle hook. The gitops_flux
+	// policy is enforced at the loom proxy layer for Gemini instead.
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	config := geminiHooksConfigFromRegistry(testRegistry(), geminiProfile, "")
+
+	hooks, ok := config["hooks"].(map[string]any)
+	if !ok {
+		t.Fatal("expected hooks map in gemini config")
+	}
+
+	if _, ok := hooks["PreToolUse"]; ok {
+		t.Errorf("gemini hooks must NOT contain PreToolUse (Claude-only event), got: %#v", hooks["PreToolUse"])
+	}
+	if _, ok := hooks["SubagentStart"]; ok {
+		t.Errorf("gemini hooks must NOT contain SubagentStart (Claude-only event), got: %#v", hooks["SubagentStart"])
+	}
+	// Gemini-supported events should still be present.
+	for _, evt := range []string{"SessionStart", "SessionEnd", "AfterTool"} {
+		if _, ok := hooks[evt]; !ok {
+			t.Errorf("expected gemini hooks to contain %q event", evt)
+		}
+	}
+}
+
+func TestCodexPreamble_IncludesProxyEnforcementAnnotation(t *testing.T) {
+	var sb strings.Builder
+	emitCodexPreamble(&sb, testRegistry(), "/tmp/workspace", "")
+	content := sb.String()
+
+	if !strings.Contains(content, "Policy enforcement:") {
+		t.Error("expected policy enforcement annotation in codex preamble")
+	}
+	if !strings.Contains(content, "gitops_flux") {
+		t.Error("expected gitops_flux policy reference in codex preamble")
+	}
+	if !strings.Contains(content, "proxy") {
+		t.Error("expected proxy enforcement annotation in codex preamble")
+	}
+}
+
+func TestPlatformPolicySummaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		hp          HookProfile
+		wantLen     int
+		wantEnforce string
+	}{
+		{
+			name: "native enforcement",
+			hp: HookProfile{
+				PolicyRefs:  []string{"gitops_flux"},
+				Enforcement: "native",
+			},
+			wantLen:     1,
+			wantEnforce: "native",
+		},
+		{
+			name: "proxy enforcement",
+			hp: HookProfile{
+				PolicyRefs:  []string{"gitops_flux"},
+				Enforcement: "proxy",
+			},
+			wantLen:     1,
+			wantEnforce: "proxy",
+		},
+		{
+			name: "plugin enforcement",
+			hp: HookProfile{
+				PolicyRefs:  []string{"gitops_flux"},
+				Enforcement: "plugin",
+			},
+			wantLen:     1,
+			wantEnforce: "plugin",
+		},
+		{
+			name:    "no policy refs",
+			hp:      HookProfile{},
+			wantLen: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			summaries := PlatformPolicySummaries(tt.hp)
+			if len(summaries) != tt.wantLen {
+				t.Fatalf("expected %d summaries, got %d", tt.wantLen, len(summaries))
+			}
+			if tt.wantLen > 0 {
+				if summaries[0].Enforcement != tt.wantEnforce {
+					t.Errorf("expected enforcement %q, got %q", tt.wantEnforce, summaries[0].Enforcement)
+				}
+				if summaries[0].PolicyRef != "gitops_flux" {
+					t.Errorf("expected policy ref gitops_flux, got %q", summaries[0].PolicyRef)
+				}
+				if summaries[0].Description == "" {
+					t.Error("expected non-empty description")
+				}
+			}
+		})
+	}
+}
+
+func TestFormatPolicyComment(t *testing.T) {
+	t.Run("proxy enforcement", func(t *testing.T) {
+		hp := HookProfile{
+			PolicyRefs:  []string{"gitops_flux"},
+			Enforcement: "proxy",
+		}
+		comment := FormatPolicyComment(hp, "# ")
+		if comment == "" {
+			t.Fatal("expected non-empty comment")
+		}
+		if !strings.Contains(comment, "gitops_flux") {
+			t.Error("comment should mention gitops_flux")
+		}
+		if !strings.Contains(comment, "proxy") {
+			t.Error("comment should mention proxy enforcement")
+		}
+	})
+
+	t.Run("native enforcement", func(t *testing.T) {
+		hp := HookProfile{
+			PolicyRefs:  []string{"gitops_flux"},
+			Enforcement: "native",
+		}
+		comment := FormatPolicyComment(hp, "# ")
+		if comment == "" {
+			t.Fatal("expected non-empty comment")
+		}
+		if !strings.Contains(comment, "PreToolUse") {
+			t.Error("native enforcement comment should mention PreToolUse")
+		}
+	})
+
+	t.Run("no policy refs", func(t *testing.T) {
+		hp := HookProfile{}
+		comment := FormatPolicyComment(hp, "# ")
+		if comment != "" {
+			t.Errorf("expected empty comment for no policy refs, got %q", comment)
+		}
+	})
+}
+
+func TestGeneratedJSONConfig_KilocodeEmitsKiloJSON(t *testing.T) {
+	// Kilo 1.0 (OpenCode engine) reads kilo.json: top-level `mcp` map with
+	// type local + array command, plus a `permission` map keyed by
+	// {server}_{tool} globs. See pkg/generator/VENDOR_SPECS.md § Kilocode.
+	tmpDir := t.TempDir()
+	profile, err := GetPlatformProfile("kilocode")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile(kilocode): %v", err)
+	}
+
+	params := &GenerateParams{
+		Reg:       testRegistry(),
+		OutputDir: tmpDir,
+		Target:    "kilocode",
+		Profile:   profile,
+		LoomMode:  true,
+	}
+
+	if err := generateJSONConfig(params); err != nil {
+		t.Fatalf("generateJSONConfig(kilocode): %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "kilocode", "kilo.json"))
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(content, &parsed); err != nil {
+		t.Fatalf("generated kilo.json is not valid JSON: %v", err)
+	}
+
+	if got := parsed["$schema"]; got != "https://app.kilo.ai/config.json" {
+		t.Errorf("$schema = %v, want https://app.kilo.ai/config.json", got)
+	}
+
+	mcp, ok := parsed["mcp"].(map[string]any)
+	if !ok {
+		t.Fatal("expected top-level mcp map in kilo.json")
+	}
+	loom, ok := mcp["loom"].(map[string]any)
+	if !ok {
+		t.Fatal("expected mcp.loom entry in kilo.json")
+	}
+	if got := loom["type"]; got != "local" {
+		t.Errorf("mcp.loom.type = %v, want local", got)
+	}
+	if _, ok := loom["command"].([]any); !ok {
+		t.Errorf("mcp.loom.command should be an array, got %T", loom["command"])
+	}
+
+	permission, ok := parsed["permission"].(map[string]any)
+	if !ok {
+		t.Fatal(`expected top-level "permission" map in kilo.json`)
+	}
+	if got := permission["loom_*"]; got != "allow" {
+		t.Errorf(`permission["loom_*"] = %v, want allow`, got)
+	}
+}
+
+func TestGeneratedJSONConfig_VSCodeIncludesPolicyMetadata(t *testing.T) {
+	tmpDir := t.TempDir()
+	profile, err := GetPlatformProfile("vscode")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile(vscode): %v", err)
+	}
+
+	params := &GenerateParams{
+		Reg:       testRegistry(),
+		OutputDir: tmpDir,
+		Target:    "vscode",
+		Profile:   profile,
+		LoomMode:  true,
+	}
+
+	if err := generateJSONConfig(params); err != nil {
+		t.Fatalf("generateJSONConfig(vscode): %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "vscode", "mcp.json"))
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(content, &parsed); err != nil {
+		t.Fatalf("generated mcp.json is not valid JSON: %v", err)
+	}
+
+	policyMeta, ok := parsed["_loom_policy"].(map[string]any)
+	if !ok {
+		t.Fatal("expected _loom_policy metadata in generated vscode config")
+	}
+	if _, ok := policyMeta["gitops_flux"]; !ok {
+		t.Error("expected gitops_flux entry in _loom_policy metadata")
+	}
+
+	// VS Code's mcp.json schema declares servers under top-level "servers";
+	// "mcpServers" is silently ignored. Verified 2026-07-14 against
+	// https://code.visualstudio.com/docs/copilot/customization/mcp-servers
+	servers, ok := parsed["servers"].(map[string]any)
+	if !ok {
+		t.Fatal(`expected top-level "servers" key in generated vscode mcp.json`)
+	}
+	if _, ok := servers["loom"]; !ok {
+		t.Error(`expected "loom" entry under "servers" in generated vscode mcp.json`)
+	}
+	if _, ok := parsed["mcpServers"]; ok {
+		t.Error(`generated vscode mcp.json must not use "mcpServers" (VS Code ignores it)`)
+	}
+}
+
+// TestGeneratedJSONConfig_OpenCodeShape locks the OpenCode config surface to
+// https://opencode.ai/docs/mcp-servers/ (verified 2026-07-14): opencode.json
+// with a top-level "mcp" map, entries of type "local" with array commands.
+func TestGeneratedJSONConfig_OpenCodeShape(t *testing.T) {
+	tmpDir := t.TempDir()
+	profile, err := GetPlatformProfile("opencode")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile(opencode): %v", err)
+	}
+
+	params := &GenerateParams{
+		Reg:       testRegistry(),
+		OutputDir: tmpDir,
+		Target:    "opencode",
+		Profile:   profile,
+		LoomMode:  true,
+	}
+
+	if err := generateJSONConfig(params); err != nil {
+		t.Fatalf("generateJSONConfig(opencode): %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+
+	text := string(content)
+	for _, token := range []string{
+		`"$schema": "https://opencode.ai/config.json"`,
+		`"mcp"`,
+		`"type": "local"`,
+	} {
+		if !strings.Contains(text, token) {
+			t.Errorf("generated opencode.json missing %s", token)
+		}
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(content, &parsed); err != nil {
+		t.Fatalf("generated opencode.json is not valid JSON: %v", err)
+	}
+	mcpRoot, ok := parsed["mcp"].(map[string]any)
+	if !ok {
+		t.Fatal(`expected top-level "mcp" key in generated opencode.json`)
+	}
+	if _, ok := mcpRoot["loom"]; !ok {
+		t.Error(`expected "loom" entry under "mcp" in generated opencode.json`)
+	}
+}
+
+func TestAppendHookPolicies_ProxyEnforcementNoPreToolUse(t *testing.T) {
+	// For platforms with proxy enforcement, appendHookPolicies should not add
+	// any PreToolUse hooks.
+	hooks := map[string]any{}
+	hp := HookProfile{
+		PolicyRefs:  []string{"gitops_flux"},
+		Enforcement: "proxy",
+	}
+	appendHookPolicies(hooks, testRegistry(), hp)
+
+	if _, ok := hooks["PreToolUse"]; ok {
+		t.Error("proxy enforcement should not add PreToolUse hooks")
+	}
+}
+
+func TestAppendHookPolicies_NativeEnforcementAddsPreToolUse(t *testing.T) {
+	hooks := map[string]any{}
+	hp := HookProfile{
+		PolicyRefs:  []string{"gitops_flux"},
+		Enforcement: "native",
+		Events:      []string{"preToolUse"},
+	}
+	appendHookPolicies(hooks, testRegistry(), hp)
+
+	preToolUse, ok := hooks["PreToolUse"].([]map[string]any)
+	if !ok || len(preToolUse) == 0 {
+		t.Fatal("native enforcement with preToolUse event should add PreToolUse hooks")
+	}
+}
+
+func TestAppendHookPolicies_NativeWithoutPreToolUseEvent_NoHook(t *testing.T) {
+	// Native enforcement alone is not enough; the platform must also declare
+	// preToolUse in its events list. This guards Gemini (native enforcement
+	// but no preToolUse support) from receiving Claude-only hook events.
+	hooks := map[string]any{}
+	hp := HookProfile{
+		PolicyRefs:  []string{"gitops_flux"},
+		Enforcement: "native",
+		Events:      []string{"sessionStart", "sessionEnd", "postToolUse"},
+	}
+	appendHookPolicies(hooks, testRegistry(), hp)
+
+	if _, ok := hooks["PreToolUse"]; ok {
+		t.Error("native enforcement without preToolUse event should NOT add PreToolUse hooks")
+	}
+}
+
+func TestAppendHookPolicies_PluginEnforcementNoPreToolUse(t *testing.T) {
+	hooks := map[string]any{}
+	hp := HookProfile{
+		PolicyRefs:  []string{"gitops_flux"},
+		Enforcement: "plugin",
+	}
+	appendHookPolicies(hooks, testRegistry(), hp)
+
+	if _, ok := hooks["PreToolUse"]; ok {
+		t.Error("plugin enforcement should not add PreToolUse hooks")
+	}
+}
+
+// TestProfileDrivenConfig_ZedEmitsContextServers pins the Zed wire format:
+// a context_servers.json fragment with the "context_servers" root key and the
+// flat {"command", "args", "timeout"} stdio shape Zed reads from settings.json.
+// Zed core never reads an mcp.json/mcpServers config.
+// See https://github.com/zed-industries/zed/blob/main/docs/src/ai/mcp.md and
+// ContextServerCommand in crates/settings_content/src/project.rs (Zed renames
+// the `path` field to "command"; timeout is in seconds).
+func TestProfileDrivenConfig_ZedEmitsContextServers(t *testing.T) {
+	t.Parallel()
+
+	profile, err := GetPlatformProfile("zed")
+	if err != nil {
+		t.Fatalf("GetPlatformProfile: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	p := &GenerateParams{
+		Reg:        &registry.Registry{},
+		OutputDir:  tmpDir,
+		Target:     "zed",
+		Profile:    profile,
+		LoomMode:   true,
+		LoomBinary: "/opt/loom/bin/loom",
+	}
+
+	if err := generateJSONConfig(p); err != nil {
+		t.Fatalf("generateJSONConfig: %v", err)
+	}
+
+	outFile := filepath.Join(tmpDir, "zed", "context_servers.json")
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("expected zed fragment at %s: %v", outFile, err)
+	}
+
+	if strings.Contains(string(data), "mcpServers") {
+		t.Error("zed fragment must not contain mcpServers (Zed never reads that key)")
+	}
+
+	var parsed struct {
+		ContextServers map[string]struct {
+			Command string   `json:"command"`
+			Args    []string `json:"args"`
+			Timeout int      `json:"timeout"`
+		} `json:"context_servers"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	loom, ok := parsed.ContextServers["loom"]
+	if !ok {
+		t.Fatalf("missing loom entry under context_servers, got: %s", data)
+	}
+	if loom.Command != "/opt/loom/bin/loom" {
+		t.Errorf("command = %q, want flat string /opt/loom/bin/loom (Zed rejects the legacy nested command object)", loom.Command)
+	}
+	wantArgs := []string{"proxy", "--agent-hint", "zed"}
+	if len(loom.Args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", loom.Args, wantArgs)
+	}
+	for i, a := range wantArgs {
+		if loom.Args[i] != a {
+			t.Fatalf("args = %v, want %v", loom.Args, wantArgs)
+		}
+	}
+	if loom.Timeout != 600 {
+		t.Errorf("timeout = %d, want 600 (seconds)", loom.Timeout)
 	}
 }

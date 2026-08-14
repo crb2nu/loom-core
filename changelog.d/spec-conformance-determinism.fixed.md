@@ -1,0 +1,1 @@
+- Make `pkg/mills/gates/spec_conformance.go` snapshot and canonicalize spec-conformance judge inputs without mutating caller-owned file lists or diffs.

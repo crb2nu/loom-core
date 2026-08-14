@@ -1,0 +1,1 @@
+- Classify `ci_watch` terminal pipelines whose current failed jobs all report `runner_system_failure` as retryable transient infrastructure failures in the GitLab client and Mills pipeline runner.

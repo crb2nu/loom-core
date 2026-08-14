@@ -44,6 +44,19 @@ make check
 make check-quick
 ```
 
+### Flaky tests
+
+CI's `test:unit` runs under flake quarantine: a test that fails once and passes
+on rerun keeps the pipeline green, but is recorded — a `FLAKY-TEST-DETECTED`
+line in the job log plus a deduplicated `flaky-test` GitLab issue. A test that
+fails every attempt still reds the job, and `test:reliability` stays
+deliberately rerun-free so it can keep hunting races.
+
+If you get a `flake: <TestName>` issue assigned to your change, the test is a
+real defect (usually a race or an unsynchronised timing assumption), not CI
+noise. See [docs/FLAKE_QUARANTINE.md](FLAKE_QUARANTINE.md) for the policy, the
+label lifecycle, and why coverage is collected via `-test.gocoverdir`.
+
 ## Local Developer Loop
 
 Safe binary upgrade without breaking running agents:
@@ -64,7 +77,9 @@ First-time local onboarding:
 make bootstrap-local
 ```
 
-This rebuilds, installs atomically to `~/.local/bin`, regenerates/syncs configs in loom-mode, and restarts daemon only when idle (or always for `dev-reload`).
+This rebuilds, installs atomically to `~/.local/bin`, regenerates/syncs configs in loom-mode, restarts daemon only when idle (or always for `dev-reload`), then restarts a local development HUD when configured/running on port `3333`.
+
+For Flux-backed releases, run `make deploy-check` before `make deploy`. The deploy status target now checks Flux readiness and tracked deployment convergence when `kubectl` is available, and degrades with a clear note when cluster tooling is missing.
 
 ## Adding or Updating an MCP Server
 
@@ -81,6 +96,8 @@ This rebuilds, installs atomically to `~/.local/bin`, regenerates/syncs configs 
    - `./bin/loom sync all --regen --loom-mode`
 
 `sync --regen` prefers workspace-local registries discovered from repo ancestors before home-level defaults.
+
+Antigravity 2.0 sync now maintains `.agents/mcp_config.json` + `.agents/hooks.json` in workspaces and `~/.gemini/antigravity/mcp_config.json` + `~/.gemini/config/hooks.json` at home. Native Antigravity hooks use a distinct `hooks.json` contract, so they are emitted by `configs_antigravity.go` rather than the shared Claude/Gemini hook generator.
 
 For inventory-oriented tooling/tests in loom-mode, prefer paged proxy resources:
 
@@ -114,11 +131,33 @@ Behavior to preserve:
 
 ## HUD Development Notes
 
-Run HUD locally:
+The main shared HUD is the Kubernetes deployment `loom-hub/mobile-hud`, exposed at `https://hud.flexinfer.ai`.
+Treat that deployment as the system of record for operator checks and fleet/session triage:
+
+```bash
+kubectl -n loom-hub rollout status deployment/mobile-hud
+kubectl -n loom-hub get pods -l app=mobile-hud
+kubectl -n loom-hub get ingress mobile-hud
+kubectl -n loom-hub exec deploy/mobile-hud -- wget -qO- 'http://127.0.0.1:3333/api/traces?limit=20'
+```
+
+The k8s HUD deployment must keep daemon audit logging enabled (`LOOM_AUDIT_ENABLED=true`) so Fleet session detail and the Traces panel can read `/api/traces` and session-scoped daemon trace rows.
+
+Run HUD locally only for frontend/API development, smoke testing, or offline debugging:
 
 ```bash
 ./bin/loom hud --port 3333
 ```
+
+Manage local HUD as a launchd service (macOS):
+
+```bash
+./bin/loom hud install
+./bin/loom hud start
+./bin/loom hud status
+```
+
+Launchd mode loads optional local secrets/env overrides from `~/.config/loom/hud.env` and defaults cache backend to Redis via the launchd plist.
 
 Development mode (frontend hot reload):
 
@@ -155,7 +194,22 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 ./bin/loomd --debug
 ```
 
-Instrumented servers currently include `mcp-agent-context`, `mcp-git`, `mcp-gitlab`, and `mcp-prometheus`, with ongoing expansion noted in `ROADMAP.md`.
+Tracing wrappers now cover every `cmd/mcp-*/main.go` server entrypoint.
+
+Quick verification:
+
+```bash
+rg --files cmd | rg 'cmd/mcp-.*/main\.go' | wc -l
+rg -l 'InitTracer\(|TracedToolHandler\(' cmd/mcp-*/main.go | wc -l
+```
+
+### Structured logging (`pkg/mcplog`)
+
+`mcplog` supports:
+- `MCP_LOG_FORMAT=text` (default)
+- `MCP_LOG_FORMAT=json`
+
+When logs are emitted with context (for example via `slog.ErrorContext` in traced handlers), `trace_id` and `span_id` are attached when an active OTel span is present.
 
 ### Metrics
 

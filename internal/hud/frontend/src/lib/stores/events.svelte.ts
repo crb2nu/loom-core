@@ -17,6 +17,62 @@ export type SSEEvent = {
 
 type EventListener = (event: SSEEvent) => void;
 
+/**
+ * Registry of HUD-side SSE events the daemon emits. Used as documentation
+ * for store authors and as a discovery surface for the typed `subscribe`
+ * helper. Cadences correspond to the monitor `Start(...)` calls in
+ * `internal/hud/embed.go`.
+ *
+ * Snapshot events carry the full payload (apply directly via store
+ * `applySnapshot`); push events carry deltas that trigger targeted updates
+ * or a full refetch fallback.
+ */
+export const SUPPORTED_HUD_EVENTS: Record<string, string> = {
+  'hud.fleet': 'Fleet snapshot — sessions, tasks, agents, file_claims (every 15s)',
+  'hud.health': 'Server health snapshot (every 5s)',
+  'hud.memory': 'Memory snapshot (every 10s)',
+  'hud.workflows': 'Workflow snapshot (every 5s)',
+  'hud.stream': 'Activity stream events (every 5s)',
+  'hud.sandbox': 'Sandbox state snapshot (every 10s)',
+  'hud.sandbox.event': 'Sandbox activity event (push)',
+  'hud.cost': 'Cost snapshot (every 10s)',
+  'hud.pipeline': 'Pipeline status (every 10s when enabled)',
+  'hud.pipeline.failed': 'Pipeline failure (push)',
+  'hud.pipeline.active': 'Pipeline activated (push)',
+  'hud.pipeline.success': 'Pipeline success (push)',
+  'hud.context_health': 'Context health snapshot (every 5s)',
+  'hud.codebase': 'Codebase index snapshot (every 30s)',
+  'hud.shuttle': 'Shuttle snapshot (push)',
+  'hud.task.create': 'New task created (push)',
+  'hud.workflow.approve': 'Workflow approved (push)',
+  'hud.workflow.reject': 'Workflow rejected (push)',
+  'hud.workflow.waiting_approval': 'Workflow awaiting approval (push)',
+  'hud.memory.add': 'Memory item added (push)',
+  'hud.memory.delete': 'Memory item deleted (push)',
+  'hud.memory.promote': 'Memory item promoted (push)',
+  'hud.memory.demote': 'Memory item demoted (push)',
+  'hud.handoff.created': 'Handoff created (push)',
+  'hud.conflict': 'Conflict detected (push)',
+  'hud.approval_needed': 'Approval needed (push)',
+  'hud.claim.released': 'File claim released (push)',
+};
+
+const CORE_EVENT_TYPES = [
+  'server.health', 'config.reload', 'process.start', 'process.stop', 'workflow.step',
+  'session.start', 'session.end', 'agent.status.change',
+  'tool.call', 'tool.call.start', 'tool.call.end',
+  'agent.session.start', 'agent.session.end', 'agent.session.reaped', 'agent.session.bootstrap',
+  'agent.session.stats.updated', 'agent.heartbeat', 'agent.context.added',
+  'agent.task.update', 'agent.task.dispatched',
+  'agent.spawn.building', 'agent.spawn.running', 'agent.spawn.completed', 'agent.spawn.failed',
+  'agent.spawn.stopped', 'agent.spawn.telemetry.delta',
+  'agent.spawn.message', 'agent.spawn.thinking', 'agent.spawn.reasoning', 'agent.spawn.todo',
+  'agent.spawn.tool_start', 'agent.spawn.tool_complete', 'agent.spawn.file_change',
+  'agent.spawn.result', 'agent.spawn.rate_limit',
+  'access.denied',
+  'chapter.marked',
+];
+
 class EventStore {
   connected = $state(false);
   lastEvent: SSEEvent | null = $state(null);
@@ -30,17 +86,33 @@ class EventStore {
   private source: EventSource | null = null;
   private listeners: Map<string, EventListener[]> = new Map();
   private anyListeners: EventListener[] = [];
+  private sourceListenerTypes: Set<string> = new Set();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private countdownTimer: ReturnType<typeof setInterval> | null = null;
   private consecutiveErrors = 0;
   private static readonly MAX_RECONNECT_ERRORS = 5;
   private static readonly BASE_RECONNECT_MS = 5000;
 
+  /**
+   * Typed subscribe helper — like `on(...)` but unwraps `event.data` to a
+   * caller-specified type so stores avoid `as` casts at every callsite.
+   * Returns an unsubscribe function. Prefer this over `on(...)` for new
+   * subscriptions; `on(...)` is preserved for listeners that need the full
+   * SSEEvent envelope (id/timestamp/etc).
+   */
+  subscribe<T = Record<string, unknown>>(
+    eventType: string,
+    handler: (data: T, event: SSEEvent) => void,
+  ): () => void {
+    return this.on(eventType, (event) => handler(event.data as T, event));
+  }
+
   /** Register a listener for a specific event type. Returns an unsubscribe function. */
   on(eventType: string, listener: EventListener): () => void {
     const list = this.listeners.get(eventType) ?? [];
     list.push(listener);
     this.listeners.set(eventType, list);
+    this.ensureSourceListener(eventType);
     return () => {
       const arr = this.listeners.get(eventType);
       if (arr) {
@@ -64,6 +136,7 @@ class EventStore {
     if (this.source) return;
 
     this.source = new EventSource('/api/events');
+    this.sourceListenerTypes = new Set();
 
     this.source.addEventListener('connected', (e: MessageEvent) => {
       this.connected = true;
@@ -88,34 +161,21 @@ class EventStore {
       this.handleEvent(e.data);
     };
 
-    // Listen for known daemon event types.
-    const knownTypes = [
-      'server.health', 'config.reload', 'process.start', 'process.stop', 'workflow.step',
-      // HUD-specific snapshot events (SSE-first data flow).
-      'hud.fleet', 'hud.health', 'hud.memory', 'hud.workflows', 'hud.stream',
-      'hud.sandbox', 'hud.sandbox.event',
-      // Granular agent lifecycle events (real-time deltas, <100ms latency).
-      'agent.session.start', 'agent.session.end', 'agent.session.reaped', 'agent.session.bootstrap',
-      'agent.heartbeat', 'agent.task.update', 'agent.task.dispatched',
-      // Proactive notification events.
-      'hud.conflict', 'hud.approval_needed', 'hud.claim.released',
-      // Granular memory mutation events.
-      'hud.memory.add', 'hud.memory.delete', 'hud.memory.promote', 'hud.memory.demote',
-      // Granular workflow/task mutation events.
-      'hud.workflow.approve', 'hud.workflow.reject', 'hud.task.create',
-      // Handoff events.
-      'hud.handoff.created',
-    ];
-    for (const type of knownTypes) {
-      this.source.addEventListener(type, (e: MessageEvent) => {
-        this.handleEvent(e.data, type);
-      });
-    }
+    // EventSource only delivers named SSE events to listeners registered for
+    // that exact name. Register both the documented core set and any store
+    // subscriptions that already exist; later subscriptions attach via on().
+    const eventTypes = new Set([
+      ...CORE_EVENT_TYPES,
+      ...Object.keys(SUPPORTED_HUD_EVENTS),
+      ...this.listeners.keys(),
+    ]);
+    for (const type of eventTypes) this.ensureSourceListener(type);
 
     this.source.onerror = () => {
       this.connected = false;
       this.source?.close();
       this.source = null;
+      this.sourceListenerTypes = new Set();
       this.consecutiveErrors++;
 
       // Circuit breaker: after repeated failures, open circuit with longer cooldown.
@@ -142,8 +202,17 @@ class EventStore {
       this.source.close();
       this.source = null;
     }
+    this.sourceListenerTypes = new Set();
     this.connected = false;
     this.connectionState = 'disconnected';
+  }
+
+  private ensureSourceListener(eventType: string) {
+    if (!this.source || this.sourceListenerTypes.has(eventType)) return;
+    this.source.addEventListener(eventType, (e: MessageEvent) => {
+      this.handleEvent(e.data, eventType);
+    });
+    this.sourceListenerTypes.add(eventType);
   }
 
   /** Start a visual countdown timer for the banner. */
@@ -173,7 +242,12 @@ class EventStore {
       }
       // For HUD and agent events, the data payload is nested inside the event's
       // top-level "data" field. Parse it if it's a string (from json.RawMessage).
-      if ((event.type?.startsWith('hud.') || event.type?.startsWith('agent.')) && typeof event.data === 'string') {
+      if (
+        (event.type?.startsWith('hud.') ||
+          event.type?.startsWith('agent.') ||
+          event.type?.startsWith('chapter.')) &&
+        typeof event.data === 'string'
+      ) {
         try {
           event.data = JSON.parse(event.data as unknown as string);
         } catch { /* keep as-is */ }

@@ -1,0 +1,1 @@
+- Add deterministic external-dependency incident threshold banners to council briefs in `pkg/mills/council/incident_banner.go` and document safe triage, recovery verification, and manual override in `docs/runbook-external-dependency-incidents.md`.

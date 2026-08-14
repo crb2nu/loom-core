@@ -1,8 +1,9 @@
-<script>
+<script lang="ts">
+  import type { UnifiedAgent } from '../../utils/agents.ts';
   import { presenceDiagnosticsStore } from '../../stores/presenceDiagnostics.svelte.ts';
   import EmptyState from '../shared/EmptyState.svelte';
 
-  let { agents = [] } = $props();
+  let { agents = [] }: { agents?: UnifiedAgent[] } = $props();
 
   $effect(() => {
     presenceDiagnosticsStore.syncAgents(agents);
@@ -303,7 +304,7 @@
   .stat-card {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
+    border-radius: var(--radius-md);
     padding: 14px 16px;
     border-left: 3px solid var(--accent-color, var(--info));
     display: flex;
@@ -312,7 +313,7 @@
   }
 
   .stat-card .metric-value {
-    font-size: 22px;
+    font-size: var(--text-xl);
     font-weight: 700;
     font-family: var(--font-mono);
     color: var(--fg-primary);
@@ -320,7 +321,7 @@
   }
 
   .stat-card .metric-label {
-    font-size: 10px;
+    font-size: var(--text-2xs);
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--fg-muted);
@@ -335,7 +336,7 @@
 
   .diag-section {
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
+    border-radius: var(--radius-md);
     background: var(--bg-secondary);
     padding: 10px 12px;
     display: flex;
@@ -349,10 +350,10 @@
   }
 
   .section-title {
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: var(--tracking-wide);
     color: var(--fg-muted);
   }
 
@@ -371,11 +372,11 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-tertiary);
-    font-size: 12px;
+    font-size: var(--text-12);
   }
 
   .diag-subtitle {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--fg-muted);
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -396,7 +397,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-tertiary);
-    font-size: 12px;
+    font-size: var(--text-12);
   }
 
   .diag-lanes {
@@ -413,11 +414,11 @@
     border-radius: var(--radius-md);
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
 
   .lane-priority-chip {
-    border-color: rgba(129, 240, 254, 0.3);
+    border-color: rgba(var(--info-rgb), var(--opacity-heavy));
   }
 
   .diag-policy-form {

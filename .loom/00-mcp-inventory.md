@@ -1,100 +1,125 @@
 # MCP Inventory
 
-_Last verified: 2026-02-19T18:52:32Z_
+_Last verified: 2026-04-10_
 
 ## Why
 
-Capture MCP/runtime/tooling baseline before planning a companion iPhone/iPad app for loom-core.
+Capture the MCP/runtime baseline used for planning so later decisions are grounded in the actual session capabilities, not assumptions from prior runs.
 
 ## Runtime Mode Detection
 
-Loom-mode is active.
+This planning session is running in loom-mode.
 
-Evidence:
-- `list_mcp_resources` returned loom-scoped resources including `loom://config`, `loom://servers`, `loom://tools/index`, `loom://health`.
-- `list_mcp_resource_templates` returned paged templates including `loom://tools/page/{page}` and `loom://tools/server/{server}/page/{page}`.
+Observed behavior:
+- `list_mcp_resources` returned top-level loom resources including `loom://config`, `loom://servers`, `loom://tools`, and `loom://tools/index`.
+- `list_mcp_resource_templates` returned loom paged templates including `loom://tools/page/{page}` and `loom://tools/server/{server}/page/{page}`.
+- Direct loom resource reads succeeded for configuration, server inventory, and tool inventory.
 
-## Loom Runtime Snapshot
+Planning implication:
+- Prefer loom resource reads as the primary inventory source for this session.
+- CLI fallback remains useful, but it is not required for baseline runtime claims in this round.
 
-From `read_mcp_resource(server="loom", uri="loom://config")` and `read_mcp_resource(server="loom", uri="loom://tools/index")`:
+## Loom Inventory Snapshot
+
+Snapshot from `read_mcp_resource(server="loom", uri="loom://config")`:
 
 | Field | Value |
 |---|---|
-| Active profile | `full` |
-| Server count | `42` |
-| Tool count | `445` |
-| Running | `true` |
-| Running processes (count) | `21` |
-| Tool index page size | `100` |
-| Tool index total pages | `5` |
+| active profile | `full` |
+| daemon running | `true` |
+| registered servers | `47` |
+| aggregated tools | `502` |
+| active proxy sessions | `1` |
+| drain ready | `false` (active session) |
+| running managed processes | `gitlab`, `devbox`, `agent_context`, `codebase_memory` |
 
-## Tool Inventory (Paged Capture)
+Snapshot from `read_mcp_resource(server="loom", uri="loom://tools/index")`:
 
-Paged verification completed using CLI fallback (`./bin/loom tools list --json --page N --limit 100`):
-
-| Page | Tools |
+| Field | Value |
 |---|---|
-| 1 | 100 |
-| 2 | 100 |
-| 3 | 100 |
-| 4 | 100 |
-| 5 | 45 |
+| server | `all` |
+| totalTools | `502` |
+| totalPages | `6` |
+| pageSize | `100` |
 
-Total confirmed: `445` tools.
+Relevant planning tools confirmed available in this session:
+- `agent_context`
+- `codebase_memory`
+- `devbox`
+- `git`
+- `git_worktree`
+- `gitlab`
 
-## Tool Distribution by Server Prefix
+Inventory caveat:
+- `running: false` on `loom://servers` means the server is not currently warm, not that it is unavailable for use.
 
-From command:
-- `./bin/loom tools list --json | jq -r '.tools[]?.name | split("__")[0]' | sort | uniq -c | sort -nr`
+## Codebase Index Readiness
 
-Top-heavy servers for this workspace:
-- `agent_context`: 78
-- `jobsearch`: 66
-- `gitlab`: 30
-- `codebase_memory`: 17
-- `github`, `git`, `devbox`: 11 each
+Current session status from `codebase_memory__codebase_stats(repo_id="loom-core")`:
 
-## Codebase Index Readiness (codebase_memory)
+| Metric | Value |
+|---|---|
+| total chunks | `7861` |
+| Go chunks | `7861` |
+| TypeScript chunks | `0` |
+| JavaScript chunks | `0` |
+| Python chunks | `0` |
+| Rust chunks | `0` |
 
-Baseline check:
-- `codebase_memory__codebase_stats(repo_id="loom-core")` initially returned `total_chunks: 0`.
+Planning implication:
+- Go/backend discovery is index-ready.
+- HUD frontend (`internal/hud/frontend`) still requires direct file reads because Svelte/TS code is not indexed in `codebase_memory`.
+- The current HUD Labs review should treat backend handlers and monitors as semantically searchable, but frontend contract verification still needs manual source inspection.
 
-Indexing attempts:
-1. `codebase_index_start(..., embeddings=true)` failed.
-   - Error: `morph API HTTP 400: "The decoder prompt cannot be empty"`
-2. `codebase_index_start(..., embeddings=false)` completed and is usable as lexical/definition baseline while embedding pipeline is fixed.
-   - Final poll: `files_done: 1717 / 1717`, `chunks_total: 26930`, `status: done`.
+## Constraints
 
-Planning impact:
-- Use `codebase_text_search`, `codebase_get_definition`, `codebase_get_context`, and file/rg reads for this planning phase.
-- Treat semantic ranking quality as degraded until embeddings are restored.
+- Some servers are registered but idle until first use; `running: false` in `loom://servers` does not imply unavailable.
+- Deployment verification still requires live GitLab/Kubernetes calls because loom inventory only reports tool availability, not repo pipeline state.
+- Frontend/mobile code search is still mostly lexical/manual in this session because `codebase_memory` is Go-only.
+- Any planning claims about mobile/HUD API shape should prefer current source files and golden contracts over older `.loom/` summaries.
 
-## Constraints Relevant to Mobile Companion Planning
+## Planning Implications For HUD Labs Review
 
-- HUD currently listens on loopback (`127.0.0.1`), not LAN/public interfaces.
-- Most HUD APIs are open to local callers; only select mutation endpoints enforce admin token today.
-- SSE is first-class (`/api/events`), making real-time mobile monitoring feasible once remote-safe auth/transport is added.
+- The runtime has enough tooling to support source-backed planning without additional bootstrap work.
+- Backend/domain planning can rely on `codebase_memory` plus Go tests and contract fixtures.
+- HUD Labs work should expect more manual file inspection on the Svelte side and should avoid assuming frontend event coverage matches backend emissions.
+- If this planning track turns into implementation, keep slices narrow around auth plumbing, spawn state contracts, and devbox activity propagation.
 
-## Recommended Tooling for This Planning Slice
+## 2026-03-16 Addendum: Bulk Mutation Inventory
 
-- Runtime/mode inventory: `loom://config`, `loom://servers`, `loom://tools/index`, `loom://health`.
-- Workspace facts: `workspace_snapshot.py` output (`.loom/00-workspace-snapshot.md`).
-- API surface validation: `internal/hud/app.go`, `internal/hud/api_agent.go`, `internal/hud/bridge/agent.go`.
-- Incremental architecture research: `codebase_memory` lexical/definition tools + `rg`.
+Goal:
+- Add a context-conserving bulk execution surface for MCP servers that expose meaningful mutating operations, without cloning the same batching code into every `cmd/mcp-*` entrypoint.
+
+Facts found:
+- The active loom daemon inventory at planning time reported `46` servers and `483` tools before the bulk work started.
+- Tool discovery is centralized in the daemon cache and already feeds `loom://tools`, tool search, and tool get flows, which makes the daemon the narrowest integration point for synthetic tool exposure.
+- Schema validation resolves tool definitions from the daemon cache before forwarding calls, so a synthetic tool needs to participate there as well to avoid validation failures.
+- The existing daemon call path already carries agent/session metadata, audit hooks, metrics, and output scanning, which are all desirable for bulk execution too.
+
+Planning implication:
+- The most leverage comes from a daemon-level synthetic tool pattern (`server__bulk`) that reads a manifest file and fans out to existing server tools internally.
+- Servers should opt in heuristically based on their discovered tool surfaces instead of a hand-maintained allowlist of every single mutating server.
+- A conservative exclusion list is still needed for servers where batching is low-value, risky, or already covered by richer domain-specific primitives.
+
+Expected server classes for bulk support:
+- API-style CRUD/integration servers such as `gitlab`, `github`, `jira`, `google-workspace`, `cloudflare`, `substack`, `linkedin`, `jobsearch`, and similar mutation-oriented integrations.
+
+Expected exclusions:
+- Low-level infrastructure/debug/search servers such as `git`, `git_worktree`, `k8s_*`, `prometheus`, `loki`, `grafana`, `time`, `devbox`, `codebase_memory`, and comparable tools where a file-driven bulk wrapper would either add little value or create unclear operational risk.
+
+Sources:
+- Tool call: `read_mcp_resource(server="loom", uri="loom://config")` -> active profile `full`, `46` servers, `483` tools
+- Tool call: `codebase_memory__codebase_stats(repo_id="loom-core")` -> `7861` indexed Go chunks
+- `internal/daemon/daemon_toolcache.go:176`
+- `internal/daemon/daemon_toolcache.go:244`
+- `internal/daemon/schema_validate.go:134`
+- `internal/daemon/daemon_call.go:26`
 
 ## Sources
 
-- `list_mcp_resources` (2026-02-19): loom resources present including `loom://config`, `loom://servers`, `loom://tools/index`, `loom://health`.
-- `list_mcp_resource_templates` (2026-02-19): includes paged templates `loom://tools/page/{page}` and `loom://tools/server/{server}/page/{page}`.
-- `read_mcp_resource(server="loom", uri="loom://config")` (2026-02-19).
-- `read_mcp_resource(server="loom", uri="loom://tools/index")` (2026-02-19).
-- `read_mcp_resource(server="loom", uri="loom://servers")` (2026-02-19).
-- `read_mcp_resource(server="loom", uri="loom://health")` (2026-02-19).
-- Command: `./bin/loom tools list --json | jq -r '.tools | length as $n | "total_tools=\($n)"'`.
-- Command: `./bin/loom tools list --json --page {1..5} --limit 100 | jq ...`.
-- Command: `./bin/loom tools list --json | jq -r '.tools[]?.name | split("__")[0]' | sort | uniq -c | sort -nr`.
-- `codebase_memory__codebase_stats(repo_id="loom-core")` and `codebase_index_poll(job_id=...)` outputs captured 2026-02-19.
-- `internal/hud/app.go:317`
-- `internal/hud/app.go:528`
-- `internal/hud/api_agent.go:735`
-- `internal/hud/api_agent.go:829`
+- Tool call: `list_mcp_resources` (2026-04-10)
+- Tool call: `list_mcp_resource_templates` (2026-04-10)
+- Tool call: `read_mcp_resource(server="loom", uri="loom://config")` (2026-04-10)
+- Tool call: `read_mcp_resource(server="loom", uri="loom://servers")` (2026-04-10)
+- Tool call: `read_mcp_resource(server="loom", uri="loom://tools/index")` (2026-04-10)
+- Tool call: `codebase_memory__codebase_stats(repo_id="loom-core")` (2026-04-10)

@@ -1,0 +1,1 @@
+- Gate paid Mills retries on the persisted resolved failure verdict in `pkg/mills/budget/retry_policy.go` and `pkg/mills/pipeline/retry_policy.go`, parking external incidents and unresolved verdicts while preserving repository-regression repair retries.

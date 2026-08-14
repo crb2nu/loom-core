@@ -1,0 +1,103 @@
+{
+  "items": [
+    {
+      "id": "DEBT-070",
+      "title": "Replace hand-coded fi-accel race-test exclusion with dependency-graph computed list",
+      "component": ".gitlab-ci.yml test:race + cmd/loom-mills-operator",
+      "impact": 5,
+      "risk_reduction": 5,
+      "drag_reduction": 5,
+      "effort": 2
+    },
+    {
+      "id": "DEBT-071",
+      "title": "Clear gosec G202 false positive blocking main (dao_workflow.go IN-clause)",
+      "component": "pkg/mills/store/dao_workflow.go + CI security:gosec",
+      "impact": 5,
+      "risk_reduction": 4,
+      "drag_reduction": 4,
+      "effort": 1
+    },
+    {
+      "id": "DEBT-072",
+      "title": "Durable hub WS transport hardening (keepalive, liveness gating, backoff)",
+      "component": "libs/mcp-go websocket + internal/daemon routing/callpipeline",
+      "impact": 5,
+      "risk_reduction": 5,
+      "drag_reduction": 4,
+      "effort": 4
+    },
+    {
+      "id": "DEBT-073",
+      "title": "Fix recurring Mills escalation classes and de-noise incident issues",
+      "component": "pkg/mills/pipeline (ci_watch, merge, scope gate) + issue hygiene",
+      "impact": 4,
+      "risk_reduction": 4,
+      "drag_reduction": 5,
+      "effort": 3
+    },
+    {
+      "id": "DEBT-074",
+      "title": "Split internal/hud/spawn.go monolith (2206 LOC, top churn)",
+      "component": "internal/hud/spawn.go",
+      "impact": 3,
+      "risk_reduction": 3,
+      "drag_reduction": 4,
+      "effort": 3
+    },
+    {
+      "id": "DEBT-075",
+      "title": "Split cmd/loom-mills-operator/main.go (1469 LOC) into handler modules",
+      "component": "cmd/loom-mills-operator/main.go",
+      "impact": 3,
+      "risk_reduction": 3,
+      "drag_reduction": 3,
+      "effort": 3
+    },
+    {
+      "id": "DEBT-067",
+      "title": "Split cmd_sync.go into generate, sync, pull, and backup slices (carryover, grew to 1004 LOC)",
+      "component": "cmd/loom/cmd_sync.go",
+      "impact": 3,
+      "risk_reduction": 2,
+      "drag_reduction": 3,
+      "effort": 3
+    },
+    {
+      "id": "DEBT-066",
+      "title": "Migrate largest remaining MCP server mains onto mcpscaffold (carryover, issue #50)",
+      "component": "cmd/mcp-linear, mcp-terraform, mcp-github, mcp-argocd, mcp-neo4j, mcp-notion",
+      "impact": 2,
+      "risk_reduction": 2,
+      "drag_reduction": 3,
+      "effort": 3
+    },
+    {
+      "id": "DEBT-076",
+      "title": "Finish EPIC 2 migration of CLI tasks/sessions onto visibility contracts",
+      "component": "cmd/loom/cmd_tasks.go, cmd/loom/cmd_sessions.go",
+      "impact": 2,
+      "risk_reduction": 2,
+      "drag_reduction": 2,
+      "effort": 2
+    },
+    {
+      "id": "DEBT-077",
+      "title": "Deslop sweep: banner comments, commented-out code, generation TODOs (343 candidates)",
+      "component": "cmd/ (155 hits), internal/ (188 hits), frontend hooks",
+      "impact": 2,
+      "risk_reduction": 2,
+      "drag_reduction": 2,
+      "effort": 2
+    },
+    {
+      "id": "DEBT-078",
+      "title": "Decompose HUD frontend monolith components (5 files over 1000 LOC)",
+      "component": "frontend: mills.svelte.ts, App.svelte, SpawnDetailPanel, GraphFullView, MemoryPanel",
+      "impact": 2,
+      "risk_reduction": 2,
+      "drag_reduction": 3,
+      "effort": 3
+    }
+  ]
+}

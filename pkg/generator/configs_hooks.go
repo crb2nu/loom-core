@@ -1,0 +1,671 @@
+package generator
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/crb2nu/loom/pkg/registry"
+)
+
+// hookProfileHasEvent returns true when the platform's declared events list
+// contains the given event name. Used to gate platform-specific hook emission
+// (e.g. only emit SubagentStart for platforms that actually support it). The
+// match is case-insensitive to tolerate "subagentStart" vs "SubagentStart"
+// spellings between the YAML profile and Go event names.
+func hookProfileHasEvent(hp HookProfile, event string) bool {
+	target := strings.ToLower(event)
+	for _, e := range hp.Events {
+		if strings.ToLower(e) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// hookNamespaceVars returns a shell snippet that computes NS_PROJECT (workspace-
+// relative 2-level project path) and NS_BRANCH from the WS_ROOT variable set by
+// hookAgentIDBootstrap. Resolves to the main repo root for both workspace-
+// standard (<repo>/.worktrees/<branch>) and Claude Code tool-managed
+// (<repo>/.claude/worktrees/<branch>) linked-tree layouts so namespace stays
+// consistent across main and worktree checkouts.
+//
+// The derivation is path-only, so a degenerate WS_ROOT (a detached/keepalive
+// process where `git rev-parse` failed and PWD is "/", or an agent running
+// OUTSIDE a workspace repo like ~ or ~/workspace) would otherwise mint a garbage
+// 2-level value such as "Users/cblevins", "agents/<id>" or "5f1b/fi-fhir". Those
+// then canonicalize to a fake project key ("Users", "agents", "5f1b") and
+// pollute the flexdeck /projects federation with phantom project buckets. The
+// trailing `case` guard keeps NS_PROJECT only when it is rooted at a real
+// workspace bucket (the SAME set as pkg/projectmeta.workspaceNamespaceRoots),
+// otherwise empties it so the namespace becomes an honest project-less
+// "/<branch>" (rendered as a muted "—" by the HUD's parseNamespace and
+// excluded — not mis-bucketed — by the PM view). Healthy workspace-rooted
+// namespaces are untouched.
+func hookNamespaceVars() string {
+	return `if echo "$WS_ROOT" | grep -q '/.claude/worktrees/'; then ` +
+		`_MAIN="${WS_ROOT%%/.claude/worktrees/*}"; ` +
+		`NS_PROJECT="$(basename "$(dirname "$_MAIN")")/$(basename "$_MAIN")"; ` +
+		`elif echo "$WS_ROOT" | grep -q '/.worktrees/'; then ` +
+		`_MAIN="${WS_ROOT%%/.worktrees/*}"; ` +
+		`NS_PROJECT="$(basename "$(dirname "$_MAIN")")/$(basename "$_MAIN")"; ` +
+		`else ` +
+		`NS_PROJECT="$(basename "$(dirname "$WS_ROOT")")/$(basename "$WS_ROOT")"; ` +
+		`fi; ` +
+		`case "$NS_PROJECT" in apps/*|labs/*|libs/*|platform/*|private/*|services/*) ;; *) NS_PROJECT="" ;; esac; ` +
+		`NS_BRANCH="$(git branch --show-current 2>/dev/null || echo main)"`
+}
+
+// worktreeCanonRootShell returns a shell snippet that rewrites $WS_ROOT in place
+// to the MAIN repo root, collapsing both workspace-standard
+// (<repo>/.worktrees/<branch>) and Claude Code tool-managed
+// (<repo>/.claude/worktrees/<branch>) linked-tree layouts back to <repo>.
+//
+// Workspace-anchored vendors (codex) mint their agent_id as `codex-<WS_HASH>`
+// where WS_HASH is the cksum of $WS_ROOT and there is no per-conversation
+// SESSION_SCOPE to fall back on. Hashing the raw `git rev-parse --show-toplevel`
+// (the worktree path) therefore yields a DIFFERENT id per worktree, so one codex
+// app working across worktrees of the same repo fragments into orphaned rows in
+// the HUD — conversationId keeps the WS_HASH for codex (see
+// WORKSPACE_ANCHORED_BASES in agents.ts), so it cannot recover the shared repo
+// from the opaque hash. Canonicalizing $WS_ROOT before hashing makes the id
+// stable across worktrees. hookNamespaceVars already collapses the same two
+// layouts, so identity and namespace agree on "the repo". Mirrors the Go helper
+// stripWorktreeFromRepoRoot (cmd/loom/cmd_agent_session.go). Returned as a plain
+// string (not a format template) so its `%%` parameter-expansions stay literal.
+func worktreeCanonRootShell() string {
+	return `case "$WS_ROOT" in ` +
+		`*/.claude/worktrees/*) WS_ROOT="${WS_ROOT%%/.claude/worktrees/*}" ;; ` +
+		`*/.worktrees/*) WS_ROOT="${WS_ROOT%%/.worktrees/*}" ;; ` +
+		`esac`
+}
+
+// buildPlatformHooks generates the shared SessionStart / session-end / heartbeat
+// hooks for any platform that supports lifecycle hooks. Platform-specific extras
+// (e.g. policy-driven PreToolUse guardrails) are appended by the caller.
+// Hook parameters are read from the platform profile's HookProfile.
+//
+// SubagentStart is only emitted for platforms whose Events list explicitly
+// declares "subagentStart" (currently Claude Code only). Other platforms like
+// Gemini do not understand this event and reject the entire hooks block when
+// it is present.
+func buildPlatformHooks(reg *registry.Registry, hp HookProfile, loomBinary string) map[string]any {
+	log := `2>>"${TMPDIR:-/tmp}/loom-agent-hooks.log"`
+	bootstrap := hookAgentIDBootstrap(hp.AgentID)
+	staleCleanup := hookStaleCleanup()
+	nsVars := hookNamespaceVars()
+	loomCmd := shellQuote(normalizeLoomBinary(loomBinary))
+	policy := agentSafetyPolicyFromRegistry(reg)
+	descPrefix := strings.TrimSuffix(hp.Description, " session")
+
+	sessionStartHooks := []map[string]any{
+		{
+			"type": "command",
+			"command": fmt.Sprintf(
+				// Stamp the session's starting $PWD so later hooks can detect
+				// cwd drift caused by `cd /abs/path` persisting across Bash
+				// invocations. Without this stamp, a hook that calls
+				// `git rev-parse --show-toplevel` resolves the *drifted* repo,
+				// which silently mis-targets worktree cleanup and `git commit`
+				// on the wrong branch.
+				`INPUT=$(cat); %s; %s; %s; printf '%%s' "$PWD" > "${AGENT_CACHE_DIR}/session-cwd-${AGENT_ID}" 2>/dev/null || true; PARENT_FLAG=""; PARENT_FILE="${AGENT_CACHE_DIR}/parent-session-${AGENT_ID}"; if [ -s "$PARENT_FILE" ]; then PARENT_FLAG="--parent-session-id $(cat "$PARENT_FILE")"; rm -f "$PARENT_FILE"; elif [ -n "${LOOM_PARENT_SESSION_ID:-}" ]; then PARENT_FLAG="--parent-session-id $LOOM_PARENT_SESSION_ID"; fi; %s agent session-start --namespace "$NS_PROJECT/$NS_BRANCH" --agent-id "$AGENT_ID" --agent-type %s --description "%s · $NS_PROJECT" --auto-recall --auto-recall-strategy fast $PARENT_FLAG --quiet %s || true`,
+				bootstrap, staleCleanup, nsVars, loomCmd, hp.AgentType, descPrefix, log),
+		},
+		{
+			"type": "command",
+			"command": fmt.Sprintf(
+				// Kill any stale keepalives for this workspace before spawning a new one.
+				// Two-layer cleanup:
+				// 1. PID file glob — catches keepalives with intact PID files.
+				// 2. pkill by agent-id pattern — catches orphans whose PID files
+				//    were lost or started from a different binary path.
+				`INPUT=$(cat); %s; `+
+					`for pf in "${TMPDIR:-/tmp}"/loom-keepalive-%s-"${WS_HASH}"*.pid; do `+
+					`[ -f "$pf" ] && kill "$(cat "$pf")" 2>/dev/null && rm -f "$pf"; `+
+					`done; `+
+					`pkill -f "loom agent keepalive --agent-id %s-${WS_HASH}" 2>/dev/null || true; `+
+					`%s agent keepalive --agent-id "$AGENT_ID" --agent-type %s --quiet </dev/null >/dev/null %s &`,
+				bootstrap, hp.AgentID, hp.AgentID, loomCmd, hp.AgentType, log),
+		},
+	}
+	if policy.DirtyWorktreeNudgeOnSessionStart {
+		sessionStartHooks = append(sessionStartHooks, map[string]any{
+			"type":    "command",
+			"command": dirtyWorktreeSessionStartNudgeCommand(policy),
+		})
+	}
+	// Suggest worktree allocation when on main/master to avoid dirty-worktree issues.
+	sessionStartHooks = append(sessionStartHooks, map[string]any{
+		"type":    "command",
+		"command": mainBranchWorktreeNudgeCommand(),
+	})
+
+	hooks := map[string]any{
+		"SessionStart": []map[string]any{
+			{
+				"hooks": sessionStartHooks,
+			},
+		},
+	}
+
+	// Heartbeat hook (Claude/Gemini PostToolUse/AfterTool with a narrow
+	// matcher) — only emit when the profile declares an event AND a
+	// narrowing matcher pattern exists. Codex sets heartbeat_event to ""
+	// because its hook payloads don't expose a stable tool-name surface
+	// to filter on, so an unmatched heartbeat would fire on every tool
+	// call and bounce the TUI. notify + keepalive-wrap cover the
+	// keepalive surface for codex without per-tool-call shell overhead.
+	if hp.HeartbeatEvent != "" {
+		hooks[hp.HeartbeatEvent] = []map[string]any{
+			{
+				"matcher": hp.HeartbeatMatcher,
+				"hooks": []map[string]any{
+					{
+						"type": "command",
+						"command": fmt.Sprintf(
+							`INPUT=$(cat); %s; %s; %s agent heartbeat --agent-id "$AGENT_ID" --namespace "$NS_PROJECT/$NS_BRANCH" --status active --ensure-session --infer-namespace --agent-type %s --description "%s · $NS_PROJECT" --quiet %s || true`,
+							bootstrap, nsVars, loomCmd, hp.AgentType, descPrefix, log),
+					},
+				},
+			},
+		}
+	}
+
+	// SessionEnd hook (Claude `SessionEnd`, Gemini `SessionEnd`, etc.) —
+	// only emit when the profile declares a session-end event AND that
+	// event is semantically session-scoped (not per-turn). Codex has no
+	// SessionEnd event and `Stop` fires per turn, so codex sets
+	// session_end_event to "" to suppress this block; lifecycle is then
+	// handled exclusively by notify + keepalive-wrap (deregister-on-exit).
+	// Claude has `SessionEnd` as a distinct session-scoped event; mapping
+	// session-end to `Stop` would spam `loom agent session-end` every turn.
+	if hp.SessionEndEvent != "" {
+		hooks[hp.SessionEndEvent] = []map[string]any{
+			{
+				"hooks": []map[string]any{
+					{
+						"type": "command",
+						"command": fmt.Sprintf(
+							// Kill keepalives matching this workspace (any session scope) — not just exact agent ID.
+							// Two-layer cleanup: PID file glob + pkill for orphans from different binary paths.
+							`INPUT=$(cat); %s; for pf in "${TMPDIR:-/tmp}"/loom-keepalive-%s-"${WS_HASH}"*.pid; do [ -f "$pf" ] && kill "$(cat "$pf")" 2>/dev/null && rm -f "$pf"; done; pkill -f "loom agent keepalive --agent-id %s-${WS_HASH}" 2>/dev/null || true; rm -f "$AGENT_ID_FILE"; %s agent session-end --agent-id "$AGENT_ID" --summarize --summary-async --quiet %s || true`,
+							bootstrap, hp.AgentID, hp.AgentID, loomCmd, log),
+					},
+					{
+						"type": "command",
+						// Auto-release the current harness-allocated worktree if it's clean
+						// and fully pushed. Resolves the worktree path from the cwd stamped
+						// at SessionStart so cleanup still works when the agent's cwd has
+						// drifted (e.g. `cd /abs/path/to/main` in a Bash invocation).
+						// Fires only when the stamped cwd resolves to a path containing
+						// /.claude/worktrees/; otherwise it's a no-op.
+						"command": fmt.Sprintf(
+							`%s; SESSION_CWD_FILE="${AGENT_CACHE_DIR}/session-cwd-${AGENT_ID}"; if [ -s "$SESSION_CWD_FILE" ]; then WT_PATH="$(cat "$SESSION_CWD_FILE")"; else WT_PATH="$(git rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$PWD")"; fi; WT_ROOT="$(git -C "$WT_PATH" rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$WT_PATH")"; if printf '%%s' "$WT_ROOT" | grep -q '/.claude/worktrees/'; then %s agent worktree-cleanup-self --worktree-path "$WT_ROOT" --quiet %s || true; fi; rm -f "$SESSION_CWD_FILE" 2>/dev/null || true`,
+							bootstrap, loomCmd, log),
+					},
+				},
+			},
+		}
+	}
+
+	// Capture parent session ID for subagent session grouping.
+	// Write to a file so the subagent's SessionStart can read it
+	// (env vars don't propagate across hook subprocess boundaries).
+	//
+	// Only emit SubagentStart for platforms that declare it in their Events
+	// list. Gemini and other platforms reject hook blocks containing unknown
+	// event names, which would silently disable ALL of their hooks.
+	if hookProfileHasEvent(hp, "subagentStart") {
+		hooks["SubagentStart"] = []map[string]any{
+			{
+				"hooks": []map[string]any{
+					{
+						"type": "command",
+						"command": fmt.Sprintf(
+							`INPUT=$(cat); %s; PARENT_SID=$(%s agent session --agent-id "$AGENT_ID" --quiet 2>/dev/null | jq -r '.session.id // empty' 2>/dev/null || true); PARENT_FILE="${AGENT_CACHE_DIR}/parent-session-${AGENT_ID}"; if [ -n "$PARENT_SID" ]; then printf '%%s' "$PARENT_SID" > "$PARENT_FILE"; else rm -f "$PARENT_FILE"; fi; exit 0`,
+							bootstrap, loomCmd),
+					},
+				},
+			},
+		}
+	}
+
+	return hooks
+}
+
+// appendHookPolicies emits PreToolUse hooks for each declared policy ref.
+// EPIC 3 / CONFIG-3 (.loom/108): dispatch is now name-agnostic — adding a
+// new policy requires only a YAML file under
+// pkg/generator/templates/policies/ (with optional registry override),
+// not a Go switch case.
+//
+// For native enforcement platforms that explicitly support preToolUse,
+// each policy contributes its own deny block. A single git-commit quality
+// reminder hook is appended once per platform regardless of the number
+// of policies. For proxy/plugin enforcement, or native platforms that
+// lack preToolUse (e.g. Gemini), policies are enforced at the loom proxy
+// layer and no PreToolUse hooks are generated here.
+func appendHookPolicies(hooks map[string]any, reg *registry.Registry, hp HookProfile) {
+	if hp.Enforcement != "native" || !hookProfileHasEvent(hp, "preToolUse") {
+		// Proxy/plugin enforcement: policy denies and the git-commit reminder
+		// are skipped (they're PreToolUse hooks). The cwd-drift guardrail is
+		// also gated here for the same reason.
+		return
+	}
+
+	// Always emit the cwd-drift guardrail on platforms that support PreToolUse.
+	// It is not policy-gated: drift can mis-target commits regardless of which
+	// policies (if any) the platform has loaded.
+	hooks["PreToolUse"] = appendHookBlocks(hooks["PreToolUse"], gitCommitCwdDriftWarningHook(hookAgentIDBootstrap(hp.AgentID)))
+
+	if len(hp.PolicyRefs) == 0 {
+		return
+	}
+
+	emittedAny := false
+	for _, ref := range hp.PolicyRefs {
+		policy, err := LoadPolicy(reg, ref)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARN  policy %q load error: %v\n", ref, err)
+			continue
+		}
+		if policy == nil {
+			continue
+		}
+		policyHooks := policyGuardrailHooks(policy)
+		if len(policyHooks) == 0 {
+			continue
+		}
+		hooks["PreToolUse"] = appendHookBlocks(hooks["PreToolUse"], policyHooks...)
+		emittedAny = true
+	}
+	if emittedAny {
+		// Append the policy-agnostic git-commit quality reminder once per
+		// platform regardless of how many policies emitted hooks above.
+		hooks["PreToolUse"] = appendHookBlocks(hooks["PreToolUse"], gitCommitQualityReminderHook())
+	}
+}
+
+// PolicyEnforcementSummary describes how a policy ref is enforced for a platform.
+type PolicyEnforcementSummary struct {
+	PolicyRef   string // e.g. "gitops_flux"
+	Enforcement string // "native", "proxy", or "plugin"
+	Description string // Human-readable enforcement description
+}
+
+// PlatformPolicySummaries returns enforcement summaries for all policy refs
+// defined on a platform. Used by config generators to annotate proxy-enforced
+// policies in generated config comments.
+func PlatformPolicySummaries(hp HookProfile) []PolicyEnforcementSummary {
+	summaries := make([]PolicyEnforcementSummary, 0, len(hp.PolicyRefs))
+	for _, ref := range hp.PolicyRefs {
+		desc := ""
+		switch hp.Enforcement {
+		case "native":
+			desc = "enforced via PreToolUse hooks in settings.json"
+		case "proxy":
+			desc = "enforced at loom proxy layer (no native hook support)"
+		case "plugin":
+			desc = "enforced via plugin hooks"
+		default:
+			desc = "enforcement method not specified"
+		}
+		summaries = append(summaries, PolicyEnforcementSummary{
+			PolicyRef:   ref,
+			Enforcement: hp.Enforcement,
+			Description: desc,
+		})
+	}
+	return summaries
+}
+
+// FormatPolicyComment returns a comment block documenting how policies are
+// enforced for a given platform. Returns empty string if no policy refs exist.
+func FormatPolicyComment(hp HookProfile, prefix string) string {
+	summaries := PlatformPolicySummaries(hp)
+	if len(summaries) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(prefix + "Policy enforcement:\n")
+	for _, s := range summaries {
+		sb.WriteString(fmt.Sprintf("%s  - %s: %s\n", prefix, s.PolicyRef, s.Description))
+	}
+	return sb.String()
+}
+
+// appendHookExtras dispatches profile-defined extras to their hook
+// implementations. EPIC 3 / CONFIG-2 (.loom/108): the simple cases
+// (formatters, taskSync, retrospective, testHealth, lint) flow through
+// the data-driven extraDescriptors map + extras templates. The
+// platform-aware multi-event walker telemetry_eventEmit stays in Go
+// because its dispatch logic doesn't fit the single-template / single-
+// event-set descriptor model.
+//
+// The HookProfile is needed (rather than just hp.Extras) so platform-
+// aware extras like "telemetry_eventEmit" can read AgentID to decide
+// the correct `loom agent event-emit --platform` flag.
+func appendHookExtras(hooks map[string]any, hp HookProfile, loomBinary string) {
+	for _, extra := range hp.Extras {
+		if descriptor, ok := extraDescriptors[extra]; ok {
+			rendered, err := renderExtraTemplate(descriptor.templatePath, newExtraContext(loomBinary, hp.AgentID))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "WARN  extra %q render failed: %v\n", extra, err)
+				continue
+			}
+			if len(rendered) == 0 {
+				continue
+			}
+			for _, evt := range descriptor.targetEvents {
+				existing, ok := hooks[evt].([]map[string]any)
+				if !ok || len(existing) == 0 {
+					// Extras only enrich already-built event slots — they
+					// don't bootstrap empty slots (legacy behavior) — UNLESS
+					// the descriptor opts in via bootstrap (a tool-matched
+					// extra that must run where the platform has no built-in
+					// hook, e.g. Codex update_plan task-sync).
+					if !descriptor.bootstrap {
+						continue
+					}
+					existing = nil
+				}
+				hooks[evt] = append(existing, rendered...)
+			}
+			continue
+		}
+
+		// Special-case branches for extras whose dispatch doesn't fit the
+		// descriptor-driven model.
+		switch extra {
+		case "telemetry_eventEmit":
+			// Walks each existing event slot, injecting an event-emit hook
+			// per canonical event. The multi-event walk + platform
+			// normalization is genuine Go logic, not a template concern.
+			appendTelemetryEventEmitHooks(hooks, hp, loomBinary)
+		}
+	}
+}
+
+// appendTelemetryEventEmitHooks walks the platform's existing hook event slots
+// and, for each canonical telemetry hook the platform supports, appends a hook
+// block that pipes the platform-native hook payload into
+// `loom agent event-emit --hook <name> --platform <p>`.
+//
+// Skipped silently when the AgentID does not yet have an event-emit CLI
+// normalizer (`telemetryEventEmitPlatform` returns ""). The injected hook is
+// best-effort (`|| true`) so a slow or down daemon never fails the user's
+// CLI session.
+//
+// Phase 2.1's `cmd/loom/cmd_agent_event_emit.go` is the consumer of these
+// hooks; see `.loom/99-implementation-plan-agent-telemetry-spectator-2026-05-04.md`
+// for the broader spectator plan.
+func appendTelemetryEventEmitHooks(hooks map[string]any, hp HookProfile, loomBinary string) {
+	platform := telemetryEventEmitPlatform(hp)
+	if platform == "" {
+		return
+	}
+
+	loomCmd := shellQuote(normalizeLoomBinary(loomBinary))
+	log := `2>>"${TMPDIR:-/tmp}/loom-agent-hooks.log"`
+	bootstrap := hookAgentIDBootstrap(hp.AgentID)
+
+	// Walk known event slots; only inject when the slot is non-empty (mirrors
+	// the existing extras' behavior of acting only on already-built events).
+	// Gemini emits SessionStart/SessionEnd/AfterTool (no PreToolUse), so
+	// AfterTool/BeforeTool are included alongside Claude's PreToolUse/
+	// PostToolUse — canonicalTelemetryHookForEvent collapses them to the
+	// platform-agnostic canonical hook name.
+	for _, event := range []string{"SessionStart", "Stop", "SessionEnd", "PreToolUse", "PostToolUse", "BeforeTool", "AfterTool"} {
+		canonical := canonicalTelemetryHookForEvent(event)
+		if canonical == "" {
+			continue
+		}
+		existing, ok := hooks[event].([]map[string]any)
+		if !ok || len(existing) == 0 {
+			continue
+		}
+		block := map[string]any{
+			"hooks": []map[string]any{
+				{
+					"type": "command",
+					"command": fmt.Sprintf(
+						`INPUT=$(cat); %s; printf '%%s' "$INPUT" | %s agent event-emit --hook %s --platform %s --agent-id "$AGENT_ID" --quiet %s || true`,
+						bootstrap, loomCmd, canonical, platform, log),
+				},
+			},
+		}
+		hooks[event] = append(existing, block)
+	}
+}
+
+// telemetryEventEmitPlatform returns the value to pass as `--platform` to
+// `loom agent event-emit` for the given HookProfile, or "" if the platform
+// is not yet wired in cmd/loom/cmd_agent_event_emit.go. Codex is wired
+// separately via codexNotifyCommand, not via this extras case (codex has no
+// SessionStart/PreToolUse/PostToolUse — only `notify`).
+func telemetryEventEmitPlatform(hp HookProfile) string {
+	switch hp.AgentID {
+	case "claude-code":
+		return "claude-code"
+	case "gemini-cli":
+		return "gemini-cli"
+	}
+	return ""
+}
+
+// canonicalTelemetryHookForEvent maps a platform-native hook event name to the
+// canonical hook string consumed by `loom agent event-emit --hook`. Returns ""
+// for events that do not correspond to a canonical telemetry hook (e.g.
+// SubagentStart, the heartbeat-only Bash|Task PostToolUse matcher, etc.).
+//
+// `Stop` is intentionally NOT mapped to session-end. Both Claude Code and
+// Codex fire `Stop` once per turn (after every model response), not at
+// true session termination. Mapping `Stop` to "session-end" caused
+// `loom agent event-emit --hook session-end` to fire every turn. Use the
+// platform's real session-end event instead: Claude `SessionEnd`, Gemini
+// `SessionEnd`. Codex has no session-end event — session-end signal flows
+// through notify + keepalive-wrap deregister-on-exit, not telemetry.
+// AfterTool is Gemini's name for the post-tool-use hook; BeforeTool is its
+// pre-tool-use counterpart.
+func canonicalTelemetryHookForEvent(event string) string {
+	switch event {
+	case "SessionStart":
+		return "session-start"
+	case "SessionEnd":
+		return "session-end"
+	case "PreToolUse", "BeforeTool":
+		return "pre-tool-use"
+	case "PostToolUse", "AfterTool":
+		return "post-tool-use"
+	}
+	return ""
+}
+
+func appendHookBlocks(existing any, hooks ...map[string]any) []map[string]any {
+	current, ok := existing.([]map[string]any)
+	if !ok {
+		current = []map[string]any{}
+	}
+	return append(current, hooks...)
+}
+
+// hookAgentIDBootstrap returns shell that derives a stable AGENT_ID for the
+// current Claude/Gemini hook input.
+//
+// When hook JSON includes a session_id, the identity is scoped to that Claude
+// session so subprocesses from the same CLI instance stay grouped together.
+// If hook input is unavailable, we fall back to a workspace-scoped key.
+//
+// Gemini CLI expands ${VAR} and ${VAR:-default} in settings.json strings at
+// load time with a non-brace-aware regex (resolveEnvVarsInString,
+// https://github.com/google-gemini/gemini-cli/blob/main/packages/cli/src/utils/envVarResolver.ts):
+// a nested default like ${HOME:-${TMPDIR:-/tmp}} truncates at the first `}`
+// and leaves a stray brace, and ${shellvar:-default} for variables not in the
+// CLI's environment (e.g. $INPUT) is replaced by the default before the shell
+// ever runs. This snippet must therefore avoid nested ${...${...}...} and
+// avoid ${...:-...} defaults on shell-local variables; only plain $VAR /
+// ${VAR} (preserved when unknown) and ${ENVVAR:-literal} are safe.
+func hookAgentIDBootstrap(agentID string) string {
+	// Workspace-anchored vendors (codex) must hash the CANONICAL main-repo root so
+	// their WS_HASH is stable across worktrees and folds with the scopeless notify
+	// mint (see worktreeCanonRootShell + codexNotifyCommand) — codex's
+	// conversationId keeps the WS_HASH, so every codex mint path must agree on it
+	// or one app splits into a row per worktree (and the scoped hooks.json id would
+	// even split from the scopeless notify id WITHIN one worktree). Conversation-
+	// scoped vendors (claude/gemini) keep the raw worktree root: their
+	// conversationId drops the WS_HASH and their proxy base-matches the
+	// worktree-scoped session. Injected (not always-on) so non-codex hook output is
+	// byte-for-byte unchanged — and the canon snippet is never emitted into
+	// Gemini's settings.json, which has a brittle ${...} interpolator.
+	wsCanon := ""
+	if agentID == "codex" {
+		wsCanon = worktreeCanonRootShell() + "; "
+	}
+	return fmt.Sprintf(
+		`HOOK_INPUT="$INPUT"; `+
+			`HOOK_SESSION_ID=""; `+
+			`if [ -n "$HOOK_INPUT" ]; then `+
+			`HOOK_SESSION_ID="$(printf '%%s' "$HOOK_INPUT" | jq -r '.session_id // .conversationId // empty' 2>/dev/null || true)"; `+
+			`fi; `+
+			`SESSION_SCOPE=""; `+
+			`if [ -n "$HOOK_SESSION_ID" ]; then `+
+			`SESSION_SCOPE="-$(printf '%%s' "$HOOK_SESSION_ID" | cksum | cut -d' ' -f1)"; `+
+			`fi; `+
+			`WS_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || printf '%%s' "$PWD")"; `+
+			`%s`+
+			`WS_HASH="$(printf '%%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; `+
+			`AGENT_CACHE_BASE="$HOME"; `+
+			`[ -n "$AGENT_CACHE_BASE" ] || AGENT_CACHE_BASE="${TMPDIR:-/tmp}"; `+
+			`AGENT_CACHE_DIR="$AGENT_CACHE_BASE/.cache/loom"; `+
+			`mkdir -p "$AGENT_CACHE_DIR"; `+
+			`AGENT_ID_FILE="${AGENT_CACHE_DIR}/agent-id-%s-${WS_HASH}${SESSION_SCOPE}"; `+
+			`if [ -s "$AGENT_ID_FILE" ]; then `+
+			`AGENT_ID="$(cat "$AGENT_ID_FILE")"; `+
+			`else `+
+			`AGENT_ID="%s-${WS_HASH}${SESSION_SCOPE}"; `+
+			`printf '%%s' "$AGENT_ID" > "$AGENT_ID_FILE"; `+
+			`fi`,
+		wsCanon, agentID, agentID,
+	)
+}
+
+// hookStaleCleanup returns a shell snippet that removes stale PID and agent ID
+// files left behind by a previous session that crashed (Stop hook never fired).
+// It checks whether the PID recorded in the keepalive PID file is still alive;
+// if the process is dead, it removes both files so a fresh session can start.
+func hookStaleCleanup() string {
+	return `PID_FILE="${TMPDIR:-/tmp}/loom-keepalive-${AGENT_ID}.pid"; ` +
+		`if [ -f "$PID_FILE" ]; then ` +
+		`OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"; ` +
+		`if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then ` +
+		`rm -f "$PID_FILE" "$AGENT_ID_FILE"; ` +
+		`fi; fi`
+}
+
+// hooksConfigFromProfile builds a generic hooks config from the platform profile.
+// Used for platforms that have hooks.enabled but no platform-specific wrapper.
+func hooksConfigFromProfile(reg *registry.Registry, profile *PlatformProfile, loomBinary string) map[string]any {
+	hooks := buildPlatformHooks(reg, profile.Hooks, loomBinary)
+	appendHookExtras(hooks, profile.Hooks, loomBinary)
+	return map[string]any{"hooks": hooks}
+}
+
+// emitSandboxPolicy writes a .sandbox-policy.json file for the HUD and agents.
+func emitSandboxPolicy(policy *registry.SandboxPolicy, outputDir string) error {
+	data := map[string]any{
+		"require_sandbox":   policy.RequireSandbox,
+		"recommend_sandbox": policy.RecommendSandbox,
+		"auto_provision":    policy.AutoProvision,
+		"default_backend":   policy.DefaultBackend,
+	}
+	out, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal sandbox policy: %w", err)
+	}
+	path := filepath.Join(outputDir, ".sandbox-policy.json")
+	return os.WriteFile(path, append(out, '\n'), 0644)
+}
+
+type agentSafetyPolicy struct {
+	DirtyWorktreeMode                string
+	DirtyWorktreeNudgeOnSessionStart bool
+	DirtyWorktreeNudgeMessage        string
+}
+
+func defaultAgentSafetyPolicy() agentSafetyPolicy {
+	return agentSafetyPolicy{
+		DirtyWorktreeMode:                "continue_scoped_commits",
+		DirtyWorktreeNudgeOnSessionStart: true,
+		DirtyWorktreeNudgeMessage:        "Dirty worktree detected. Treat pre-existing changes as baseline context, continue work, and stage/commit only files for the active task. Before creating another multi-file worktree, inspect existing linked trees with git -C <repo> worktree list or workspace-clean --report --worktrees. For multi-file work, create repo-local linked trees under <repo>/.worktrees/<branch>; do not create sibling repos under services/, libs/, labs/, or the workspace root. Escalate only if new unexpected changes appear in files you are editing.",
+	}
+}
+
+func agentSafetyPolicyFromRegistry(reg *registry.Registry) agentSafetyPolicy {
+	policy := defaultAgentSafetyPolicy()
+	pp := registryPlatformPerms(reg, "agents")
+	if pp == nil || pp.Settings == nil {
+		return policy
+	}
+
+	if v, ok := pp.Settings["dirty_worktree_mode"].(string); ok && strings.TrimSpace(v) != "" {
+		policy.DirtyWorktreeMode = strings.TrimSpace(v)
+	}
+	if v, ok := pp.Settings["dirty_worktree_nudge_on_session_start"].(bool); ok {
+		policy.DirtyWorktreeNudgeOnSessionStart = v
+	}
+	if v, ok := pp.Settings["dirty_worktree_nudge_message"].(string); ok && strings.TrimSpace(v) != "" {
+		policy.DirtyWorktreeNudgeMessage = strings.TrimSpace(v)
+	}
+	return policy
+}
+
+func dirtyWorktreeSessionStartNudgeCommand(policy agentSafetyPolicy) string {
+	payload, err := json.Marshal(map[string]string{
+		"systemMessage": policy.DirtyWorktreeNudgeMessage,
+	})
+	if err != nil {
+		payload = []byte(`{"systemMessage":"Dirty worktree detected. Continue on this branch and stage only task-scoped files."}`)
+	}
+
+	// Keep this check fast at session start by avoiding untracked-file scans,
+	// which can be expensive in large monorepos.
+	return fmt.Sprintf(`if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then if ! git diff --quiet --no-ext-diff || ! git diff --cached --quiet --no-ext-diff; then printf '%%s\n' %q; fi; fi; exit 0`, string(payload))
+}
+
+// mainBranchWorktreeNudgeCommand returns a shell command that emits a systemMessage
+// suggesting worktree allocation when the agent is on main or master. This is a
+// non-blocking suggestion — quick single-file fixes on main are still fine.
+func mainBranchWorktreeNudgeCommand() string {
+	payload := `{"systemMessage":"You are on main. Before starting feature work or another multi-file change, inspect existing linked trees with git worktree list or workspace-clean --report --worktrees. If you need a new one, use agent_worktree_allocate() to create a repo-local worktree under <repo>/.worktrees/<branch>."}`
+	return fmt.Sprintf(`if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then BRANCH="$(git branch --show-current 2>/dev/null)"; if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then printf '%%s\n' %q; fi; fi; exit 0`, payload)
+}
+
+// sessionEndRetroHooks renders the post_session_end_retrospective extras
+// template. EPIC 3 / CONFIG-2 (.loom/108): the source of truth for this
+// hook is now templates/extras/post_session_end_retrospective.json.tmpl;
+// this Go wrapper exists for backward compatibility with unit tests in
+// configs_hooks_test.go that call it directly. New consumers should
+// declare "postSessionEnd_retrospective" in HookProfile.Extras and let
+// appendHookExtras dispatch via the descriptor.
+func sessionEndRetroHooks(loomBinary string) []map[string]any {
+	blocks, err := renderExtraTemplate("extras/post_session_end_retrospective.json.tmpl", newExtraContext(loomBinary, ""))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN  sessionEndRetroHooks render failed: %v\n", err)
+		return nil
+	}
+	return blocks
+}
+
+// testHealthSessionStartHooks renders the session_start_test_health
+// extras template. See sessionEndRetroHooks for the wrapper-rationale
+// docstring (same backward-compat reason).
+func testHealthSessionStartHooks(loomBinary string) []map[string]any {
+	blocks, err := renderExtraTemplate("extras/session_start_test_health.json.tmpl", newExtraContext(loomBinary, ""))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN  testHealthSessionStartHooks render failed: %v\n", err)
+		return nil
+	}
+	return blocks
+}

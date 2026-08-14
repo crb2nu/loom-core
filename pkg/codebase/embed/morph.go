@@ -14,10 +14,11 @@ import (
 
 // MorphClient implements Embedder using the Morph/OpenAI-compatible embeddings API.
 type MorphClient struct {
-	http    *httpclient.Client
-	baseURL string
-	apiKey  string
-	model   string
+	http     *httpclient.Client
+	baseURL  string
+	apiKey   string
+	model    string
+	provider string
 }
 
 // Ensure MorphClient implements Embedder.
@@ -25,10 +26,11 @@ var _ Embedder = (*MorphClient)(nil)
 
 func NewMorphClient(httpc *httpclient.Client, baseURL, apiKey, model string) *MorphClient {
 	return &MorphClient{
-		http:    httpc,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  apiKey,
-		model:   model,
+		http:     httpc,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		apiKey:   apiKey,
+		model:    model,
+		provider: "morph",
 	}
 }
 
@@ -53,7 +55,9 @@ func (c *MorphClient) EmbedQuery(ctx context.Context, query string) ([]float64, 
 	return vecs[0], nil
 }
 
-func (c *MorphClient) EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error) {
+func (c *MorphClient) EmbedDocuments(ctx context.Context, texts []string) (embeddings [][]float64, err error) {
+	observation := observeRequest(ctx, c.provider)
+	defer func() { observation.finish(err) }()
 	if len(texts) == 0 {
 		return [][]float64{}, nil
 	}
@@ -64,6 +68,12 @@ func (c *MorphClient) EmbedDocuments(ctx context.Context, texts []string) ([][]f
 	payload := map[string]any{
 		"model": c.model,
 		"input": texts,
+		// Send the OpenAI default explicitly. When omitted, some proxies
+		// (e.g. litellm) forward `encoding_format: null` to the backend, and
+		// llama.cpp's OpenAI-compat server (b8173) rejects a null with
+		// HTTP 500 "type must be string, but is null". An explicit "float"
+		// avoids that across the morph primary and the flexinfer fallback.
+		"encoding_format": "float",
 	}
 	body, _ := json.Marshal(payload)
 
@@ -85,7 +95,11 @@ func (c *MorphClient) EmbedDocuments(ctx context.Context, texts []string) ([][]f
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("morph API HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, &HTTPStatusError{
+			Provider:   c.Name(),
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+		}
 	}
 
 	var decoded map[string]any
@@ -94,7 +108,7 @@ func (c *MorphClient) EmbedDocuments(ctx context.Context, texts []string) ([][]f
 	}
 
 	rawData, _ := decoded["data"].([]any)
-	embeddings := make([][]float64, 0, len(rawData))
+	embeddings = make([][]float64, 0, len(rawData))
 	for _, item := range rawData {
 		m, ok := item.(map[string]any)
 		if !ok {

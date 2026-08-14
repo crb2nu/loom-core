@@ -2,10 +2,10 @@ package coordinator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/crb2nu/loom/internal/hud/bridge"
 )
@@ -19,6 +19,11 @@ type SessionSummaryResult struct {
 	FilesTouched []string `json:"files_touched"`
 	Unresolved   []string `json:"unresolved"`
 	Tags         []string `json:"tags"`
+	AgentID      string   `json:"agent_id,omitempty"`
+
+	PromptTokensBefore int `json:"prompt_tokens_before,omitempty"`
+	PromptTokensAfter  int `json:"prompt_tokens_after,omitempty"`
+	PromptTokensDelta  int `json:"prompt_tokens_delta,omitempty"`
 }
 
 // Summarizer handles LLM-powered session summarization.
@@ -26,16 +31,32 @@ type Summarizer struct {
 	client *FlexInferClient
 	agent  *bridge.AgentBridge
 	config Config
+	model  string // Resolved model from selectModel().
 	logger *slog.Logger
+
+	// summarized tracks session IDs that have already been summarized
+	// in this process lifetime, preventing re-processing on each sweep.
+	summarizedMu sync.Mutex
+	summarized   map[string]struct{}
+
+	// retryCount tracks failed storeSummary attempts per session to
+	// prevent infinite retries on persistent failures (max 3 attempts).
+	retryCountMu sync.Mutex
+	retryCount   map[string]int
+
+	// metrics is set by the coordinator after construction.
+	metrics *Metrics
 }
 
 // NewSummarizer creates a Summarizer.
 func NewSummarizer(client *FlexInferClient, agent *bridge.AgentBridge, cfg Config, logger *slog.Logger) *Summarizer {
 	return &Summarizer{
-		client: client,
-		agent:  agent,
-		config: cfg,
-		logger: logger.With("subsystem", "summarizer"),
+		client:     client,
+		agent:      agent,
+		config:     cfg,
+		logger:     logger.With("subsystem", "summarizer"),
+		summarized: make(map[string]struct{}),
+		retryCount: make(map[string]int),
 	}
 }
 
@@ -59,18 +80,25 @@ func (s *Summarizer) summarizeFromEntries(ctx context.Context, sessionID string,
 	// Format entries into a user message.
 	userMsg := formatEntries(entries)
 
-	model := s.config.DefaultModel
+	model := s.model
+	if model == "" {
+		model = s.config.DefaultModel
+	}
 	raw, err := s.client.CompleteSimple(ctx, model, promptSessionSummarize, userMsg, s.config.SummarizerMaxTokens)
 	if err != nil {
-		// Fallback: extractive summary.
-		return s.extractiveFallback(sessionID, entries), nil
+		// Fallback: extractive summary — still store so we don't retry.
+		fallback := s.extractiveFallback(sessionID, entries)
+		s.storeSummary(sessionID, fallback)
+		return fallback, nil
 	}
 
 	// Parse the JSON response.
 	result, err := parseSummaryResponse(raw)
 	if err != nil {
 		s.logger.Warn("failed to parse LLM summary, using extractive fallback", "error", err)
-		return s.extractiveFallback(sessionID, entries), nil
+		fallback := s.extractiveFallback(sessionID, entries)
+		s.storeSummary(sessionID, fallback)
+		return fallback, nil
 	}
 	result.SessionID = sessionID
 
@@ -100,18 +128,40 @@ func (s *Summarizer) SweepEndedSessions(ctx context.Context, maxSessions int) (i
 			continue
 		}
 
+		// Skip sessions already summarized in this process lifetime.
+		s.summarizedMu.Lock()
+		_, alreadySummarized := s.summarized[sess.ID]
+		s.summarizedMu.Unlock()
+		if alreadySummarized {
+			continue
+		}
+
 		// Fetch session entries once and reuse for both summary detection and
 		// summarization input to avoid duplicate context-search calls.
 		entries, err := s.agent.SessionEntries(sess.ID, 100)
 		if err != nil {
 			continue
 		}
-		if hasSummaryEntry(entries) {
+
+		// Skip empty sessions entirely — nothing useful to summarize and
+		// storing an "empty session" summary creates a loop (the semantic
+		// search in SessionEntries can't find it, so hasSummaryEntry stays
+		// false forever).
+		if len(entries) == 0 {
 			continue
 		}
 
+		if hasSummaryEntry(entries) {
+			// Cache so future poll cycles skip the SessionEntries call.
+			s.summarizedMu.Lock()
+			s.summarized[sess.ID] = struct{}{}
+			s.summarizedMu.Unlock()
+			continue
+		}
+
+		s.logger.Info("summarizing ended session", "session_id", sess.ID, "entry_count", len(entries))
 		if _, err := s.summarizeFromEntries(ctx, sess.ID, entries); err != nil {
-			s.logger.Debug("sweep summarize failed", "session_id", sess.ID, "error", err)
+			s.logger.Warn("sweep summarize failed", "session_id", sess.ID, "error", err)
 			continue
 		}
 		count++
@@ -126,6 +176,9 @@ func (s *Summarizer) SweepEndedSessions(ctx context.Context, maxSessions int) (i
 
 // extractiveFallback produces a simple summary from entry titles.
 func (s *Summarizer) extractiveFallback(sessionID string, entries []bridge.ContextEntryInfo) *SessionSummaryResult {
+	if s.metrics != nil {
+		s.metrics.FallbackSummaries.Inc()
+	}
 	var titles []string
 	for _, e := range entries {
 		if e.Entry.Title != "" {
@@ -170,11 +223,8 @@ func formatEntries(entries []bridge.ContextEntryInfo) string {
 
 // parseSummaryResponse parses the LLM JSON response into a SessionSummaryResult.
 func parseSummaryResponse(raw string) (*SessionSummaryResult, error) {
-	// Strip markdown code fences if present.
-	raw = stripCodeFence(raw)
-
 	var result SessionSummaryResult
-	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+	if err := decodeStructuredJSON(raw, &result); err != nil {
 		return nil, fmt.Errorf("parse summary JSON: %w", err)
 	}
 	if result.Summary == "" {
@@ -215,7 +265,13 @@ func (s *Summarizer) storeSummary(sessionID string, result *SessionSummaryResult
 	title := "Session Summary: " + sessionID
 	content := summaryContent(result)
 
-	if err := s.agent.ContextAdd(sessionID, []map[string]any{
+	contextStored := false
+	// Skip the context entry store if sessionID is empty — the MCP tool
+	// requires it and would error.
+	if sessionID == "" {
+		s.logger.Debug("storeSummary: skipping context entry for empty session ID")
+		contextStored = true // Treat empty-ID as success for marking purposes.
+	} else if err := s.agent.ContextAdd(sessionID, []map[string]any{
 		{
 			"entry_type": "summary",
 			"title":      title,
@@ -224,8 +280,11 @@ func (s *Summarizer) storeSummary(sessionID string, result *SessionSummaryResult
 		},
 	}); err != nil {
 		s.logger.Warn("failed to store session summary context entry", "session_id", sessionID, "error", err)
+	} else {
+		contextStored = true
 	}
 
+	// MemoryAdd is best-effort — don't gate summarized status on it.
 	if err := s.agent.MemoryAdd(
 		title,
 		content,
@@ -234,6 +293,33 @@ func (s *Summarizer) storeSummary(sessionID string, result *SessionSummaryResult
 		"summary",
 	); err != nil {
 		s.logger.Warn("failed to store session summary memory", "session_id", sessionID, "error", err)
+	}
+
+	if contextStored {
+		s.summarizedMu.Lock()
+		s.summarized[sessionID] = struct{}{}
+		s.summarizedMu.Unlock()
+	} else {
+		// Track retry count — give up after 3 attempts to prevent infinite retries.
+		s.retryCountMu.Lock()
+		s.retryCount[sessionID]++
+		count := s.retryCount[sessionID]
+		s.retryCountMu.Unlock()
+
+		if count >= 3 {
+			s.summarizedMu.Lock()
+			s.summarized[sessionID] = struct{}{}
+			s.summarizedMu.Unlock()
+			s.logger.Warn("giving up on session summary after 3 attempts", "session_id", sessionID)
+		}
+	}
+
+	// Update metrics if available.
+	if s.metrics != nil {
+		s.summarizedMu.Lock()
+		n := len(s.summarized)
+		s.summarizedMu.Unlock()
+		s.metrics.SummarizedSessions.Set(float64(n))
 	}
 }
 

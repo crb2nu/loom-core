@@ -2,6 +2,8 @@ package agentcontext
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,10 +24,22 @@ type Metrics struct {
 	searchLatencyMu    sync.Mutex
 	maxSearchLatencies int
 
+	// Recall latency by backend (in microseconds)
+	recallLatencies    map[string][]int64
+	recallLatencyMu    sync.Mutex
+	maxRecallLatencies int
+
 	// Embedding costs
 	EmbeddingRequests atomic.Int64
 	EmbeddingTokens   atomic.Int64
 	EmbeddingErrors   atomic.Int64
+
+	// Write-path embed fallback + fail-closed degradation (see
+	// embed_degradation.go). The fallback ratio is derived from the two
+	// cumulative counters when a snapshot is taken.
+	EmbedWriteAttempts      atomic.Int64
+	EmbedFallbackWrites     atomic.Int64
+	EmbedDegradedRejections atomic.Int64
 
 	// Recall quality
 	RecallRequests  atomic.Int64
@@ -70,6 +84,38 @@ type Metrics struct {
 
 	// Timestamps
 	StartTime time.Time
+
+	// Rerank (Slice A1 / F1) — appended to keep diff surgical.
+	RerankRequests atomic.Int64
+	RerankTimeouts atomic.Int64
+	RerankErrors   atomic.Int64
+
+	// Rerank latency by backend (in microseconds).
+	rerankLatencies    map[string][]int64
+	rerankLatencyMu    sync.Mutex
+	maxRerankLatencies int
+
+	// Compaction fallbacks (Slice B / F2) — counts LLM-mode failures that
+	// degraded to the extractive path.
+	CompactionFallbacks atomic.Int64
+
+	// Handoff triggers (Slice C1 / F5) — per-reason fired/suppressed
+	// counters. Keyed by AutoHandoffReason* (input_tokens, cost,
+	// stalled). Appended to keep diff surgical.
+	handoffTriggerMu         sync.Mutex
+	handoffTriggerFired      map[string]*atomic.Int64
+	handoffTriggerSuppressed map[string]*atomic.Int64
+
+	// Fleet dispatch (Slice C2 / F6) — counts agent_task_dispatch invocations
+	// and mismatch outcomes (no_candidates or no_capability_match).
+	FleetDispatchRequests   atomic.Int64
+	FleetDispatchMismatches atomic.Int64
+
+	// Plan truth sweep (plan_reconciler.go) — phases auto-advanced from merged
+	// MRs, plus best-effort sweep failures. Appended to keep diff surgical.
+	PlanSweepSlicesAdvanced atomic.Int64
+	PlanSweepPlansAdvanced  atomic.Int64
+	PlanSweepErrors         atomic.Int64
 }
 
 // NewMetrics creates a new metrics instance
@@ -77,6 +123,10 @@ func NewMetrics() *Metrics {
 	return &Metrics{
 		maxSearchLatencies: 1000, // Keep last 1000 latencies
 		searchLatencies:    make([]int64, 0, 1000),
+		maxRecallLatencies: 1000,
+		recallLatencies:    make(map[string][]int64),
+		maxRerankLatencies: 1000,
+		rerankLatencies:    make(map[string][]int64),
 		StartTime:          time.Now(),
 	}
 }
@@ -86,11 +136,37 @@ func (m *Metrics) RecordSearchLatency(latencyMicros int64) {
 	m.searchLatencyMu.Lock()
 	defer m.searchLatencyMu.Unlock()
 
-	if len(m.searchLatencies) >= m.maxSearchLatencies {
+	if m.maxSearchLatencies > 0 && len(m.searchLatencies) >= m.maxSearchLatencies {
 		// Remove oldest entry
 		m.searchLatencies = m.searchLatencies[1:]
 	}
 	m.searchLatencies = append(m.searchLatencies, latencyMicros)
+}
+
+// RecordRecallLatency records a recall latency for the given backend in microseconds.
+func (m *Metrics) RecordRecallLatency(backend string, latency time.Duration) {
+	if backend == "" {
+		backend = "unknown"
+	}
+
+	latencyMicros := latency.Microseconds()
+	if latencyMicros < 0 {
+		latencyMicros = 0
+	}
+
+	m.recallLatencyMu.Lock()
+	defer m.recallLatencyMu.Unlock()
+
+	if m.recallLatencies == nil {
+		m.recallLatencies = make(map[string][]int64)
+	}
+
+	samples := m.recallLatencies[backend]
+	if m.maxRecallLatencies > 0 && len(samples) >= m.maxRecallLatencies {
+		samples = samples[1:]
+	}
+	samples = append(samples, latencyMicros)
+	m.recallLatencies[backend] = samples
 }
 
 // GetSearchLatencyStats returns latency statistics
@@ -129,6 +205,47 @@ func (m *Metrics) GetSearchLatencyStats() LatencyStats {
 	}
 }
 
+// GetRecallLatencyStats returns recall latency statistics grouped by backend.
+func (m *Metrics) GetRecallLatencyStats() map[string]LatencyStats {
+	m.recallLatencyMu.Lock()
+	defer m.recallLatencyMu.Unlock()
+
+	if len(m.recallLatencies) == 0 {
+		return map[string]LatencyStats{}
+	}
+
+	stats := make(map[string]LatencyStats, len(m.recallLatencies))
+	for backend, samples := range m.recallLatencies {
+		stats[backend] = summarizeLatencySamples(samples)
+	}
+	return stats
+}
+
+func summarizeLatencySamples(samples []int64) LatencyStats {
+	if len(samples) == 0 {
+		return LatencyStats{}
+	}
+
+	sorted := make([]int64, len(samples))
+	copy(sorted, samples)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	var sum int64
+	for _, v := range sorted {
+		sum += v
+	}
+
+	return LatencyStats{
+		Count: len(sorted),
+		Min:   sorted[0],
+		Max:   sorted[len(sorted)-1],
+		Avg:   sum / int64(len(sorted)),
+		P50:   sorted[len(sorted)*50/100],
+		P90:   sorted[len(sorted)*90/100],
+		P99:   sorted[len(sorted)*99/100],
+	}
+}
+
 // LatencyStats contains latency histogram statistics
 type LatencyStats struct {
 	Count int   `json:"count"`
@@ -150,10 +267,19 @@ type MetricsSnapshot struct {
 	// Search
 	SearchLatency LatencyStats `json:"search_latency"`
 
+	// Recall latency by backend
+	RecallLatencyByBackend map[string]LatencyStats `json:"recall_latency_by_backend"`
+
 	// Embedding
 	EmbeddingRequests int64 `json:"embedding_requests"`
 	EmbeddingTokens   int64 `json:"embedding_tokens"`
 	EmbeddingErrors   int64 `json:"embedding_errors"`
+
+	// Write-path embed fallback + fail-closed degradation
+	EmbedWriteAttempts      int64   `json:"embed_write_attempts"`
+	EmbedFallbackWrites     int64   `json:"embed_fallback_writes"`
+	EmbedDegradedRejections int64   `json:"embed_degraded_rejections"`
+	EmbedFallbackRatio      float64 `json:"embed_fallback_ratio"`
 
 	// Recall
 	RecallRequests  int64   `json:"recall_requests"`
@@ -198,6 +324,11 @@ type MetricsSnapshot struct {
 	SessionsActive int64 `json:"sessions_active"`
 	SessionsTotal  int64 `json:"sessions_total"`
 
+	// Plan truth sweep
+	PlanSweepSlicesAdvanced int64 `json:"plan_sweep_slices_advanced"`
+	PlanSweepPlansAdvanced  int64 `json:"plan_sweep_plans_advanced"`
+	PlanSweepErrors         int64 `json:"plan_sweep_errors"`
+
 	// Uptime
 	UptimeSeconds int64 `json:"uptime_seconds"`
 }
@@ -214,13 +345,18 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	recallHits := m.RecallHits.Load()
 	dedupChecks := m.DedupChecks.Load()
 	dedupHits := m.DedupHits.Load()
+	embedWriteAttempts := m.EmbedWriteAttempts.Load()
+	embedFallbackWrites := m.EmbedFallbackWrites.Load()
 
-	var recallHitRate, dedupHitRate float64
+	var recallHitRate, dedupHitRate, embedFallbackRatio float64
 	if recallReqs > 0 {
 		recallHitRate = float64(recallHits) / float64(recallReqs)
 	}
 	if dedupChecks > 0 {
 		dedupHitRate = float64(dedupHits) / float64(dedupChecks)
+	}
+	if embedWriteAttempts > 0 {
+		embedFallbackRatio = float64(embedFallbackWrites) / float64(embedWriteAttempts)
 	}
 
 	return MetricsSnapshot{
@@ -237,9 +373,14 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 			Tokens: m.LongTermMemoryTokens.Load(),
 		},
 		SearchLatency:            m.GetSearchLatencyStats(),
+		RecallLatencyByBackend:   m.GetRecallLatencyStats(),
 		EmbeddingRequests:        m.EmbeddingRequests.Load(),
 		EmbeddingTokens:          m.EmbeddingTokens.Load(),
 		EmbeddingErrors:          m.EmbeddingErrors.Load(),
+		EmbedWriteAttempts:       embedWriteAttempts,
+		EmbedFallbackWrites:      embedFallbackWrites,
+		EmbedDegradedRejections:  m.EmbedDegradedRejections.Load(),
+		EmbedFallbackRatio:       embedFallbackRatio,
 		RecallRequests:           recallReqs,
 		RecallHits:               recallHits,
 		RecallMisses:             m.RecallMisses.Load(),
@@ -267,6 +408,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		WorktreeReconcileRuns:    m.WorktreeReconcileRuns.Load(),
 		SessionsActive:           m.SessionsActive.Load(),
 		SessionsTotal:            m.SessionsTotal.Load(),
+		PlanSweepSlicesAdvanced:  m.PlanSweepSlicesAdvanced.Load(),
+		PlanSweepPlansAdvanced:   m.PlanSweepPlansAdvanced.Load(),
+		PlanSweepErrors:          m.PlanSweepErrors.Load(),
 		UptimeSeconds:            int64(time.Since(m.StartTime).Seconds()),
 	}
 }
@@ -284,9 +428,17 @@ func (m *Metrics) Reset() {
 	m.searchLatencies = make([]int64, 0, m.maxSearchLatencies)
 	m.searchLatencyMu.Unlock()
 
+	m.recallLatencyMu.Lock()
+	m.recallLatencies = make(map[string][]int64)
+	m.recallLatencyMu.Unlock()
+
 	m.EmbeddingRequests.Store(0)
 	m.EmbeddingTokens.Store(0)
 	m.EmbeddingErrors.Store(0)
+
+	m.EmbedWriteAttempts.Store(0)
+	m.EmbedFallbackWrites.Store(0)
+	m.EmbedDegradedRejections.Store(0)
 
 	m.RecallRequests.Store(0)
 	m.RecallHits.Store(0)
@@ -321,6 +473,10 @@ func (m *Metrics) Reset() {
 	m.SessionsActive.Store(0)
 	m.SessionsTotal.Store(0)
 
+	m.PlanSweepSlicesAdvanced.Store(0)
+	m.PlanSweepPlansAdvanced.Store(0)
+	m.PlanSweepErrors.Store(0)
+
 	m.StartTime = time.Now()
 }
 
@@ -347,6 +503,10 @@ agent_context_search_latency_us{quantile="0.9"} ` + formatInt64(snap.SearchLaten
 agent_context_search_latency_us{quantile="0.99"} ` + formatInt64(snap.SearchLatency.P99) + `
 agent_context_search_latency_us_count ` + formatInt64(int64(snap.SearchLatency.Count)) + `
 
+# HELP agent_context_recall_duration_seconds Recall duration by backend in seconds
+# TYPE agent_context_recall_duration_seconds summary
+` + formatRecallLatencyMetrics(snap.RecallLatencyByBackend) + `
+
 # HELP agent_context_embedding_requests_total Total embedding requests
 # TYPE agent_context_embedding_requests_total counter
 agent_context_embedding_requests_total ` + formatInt64(snap.EmbeddingRequests) + `
@@ -358,6 +518,22 @@ agent_context_embedding_tokens_total ` + formatInt64(snap.EmbeddingTokens) + `
 # HELP agent_context_embedding_errors_total Total embedding errors
 # TYPE agent_context_embedding_errors_total counter
 agent_context_embedding_errors_total ` + formatInt64(snap.EmbeddingErrors) + `
+
+# HELP agent_context_embed_write_attempts_total Write-path document embed attempts (context + tasks)
+# TYPE agent_context_embed_write_attempts_total counter
+agent_context_embed_write_attempts_total ` + formatInt64(snap.EmbedWriteAttempts) + `
+
+# HELP agent_context_embed_fallback_writes_total Write-path embed attempts that fell back to deterministic vectors
+# TYPE agent_context_embed_fallback_writes_total counter
+agent_context_embed_fallback_writes_total ` + formatInt64(snap.EmbedFallbackWrites) + `
+
+# HELP agent_context_embed_degraded_rejections_total Writes rejected fail-closed while the embedder was degraded
+# TYPE agent_context_embed_degraded_rejections_total counter
+agent_context_embed_degraded_rejections_total ` + formatInt64(snap.EmbedDegradedRejections) + `
+
+# HELP agent_context_embed_fallback_ratio Ratio of write-path embed attempts that used fallback vectors
+# TYPE agent_context_embed_fallback_ratio gauge
+agent_context_embed_fallback_ratio ` + formatFloat64(snap.EmbedFallbackRatio) + `
 
 # HELP agent_context_recall_requests_total Total recall requests
 # TYPE agent_context_recall_requests_total counter
@@ -412,7 +588,7 @@ agent_context_sessions_active ` + formatInt64(snap.SessionsActive) + `
 # HELP agent_context_uptime_seconds Service uptime in seconds
 # TYPE agent_context_uptime_seconds counter
 agent_context_uptime_seconds ` + formatInt64(snap.UptimeSeconds) + `
-`
+` + m.PrometheusFormatRerank()
 }
 
 func formatInt64(v int64) string {
@@ -423,10 +599,316 @@ func formatFloat64(v float64) string {
 	return fmt.Sprintf("%.6f", v)
 }
 
+func formatRecallLatencyMetrics(stats map[string]LatencyStats) string {
+	if len(stats) == 0 {
+		return ""
+	}
+
+	backends := make([]string, 0, len(stats))
+	for backend := range stats {
+		backends = append(backends, backend)
+	}
+	sort.Strings(backends)
+
+	var b strings.Builder
+	for _, backend := range backends {
+		s := stats[backend]
+		if s.Count == 0 {
+			continue
+		}
+		b.WriteString(`agent_context_recall_duration_seconds{backend="`)
+		b.WriteString(backend)
+		b.WriteString(`",quantile="0.5"} `)
+		b.WriteString(formatFloat64(float64(s.P50) / 1e6))
+		b.WriteString("\n")
+		b.WriteString(`agent_context_recall_duration_seconds{backend="`)
+		b.WriteString(backend)
+		b.WriteString(`",quantile="0.9"} `)
+		b.WriteString(formatFloat64(float64(s.P90) / 1e6))
+		b.WriteString("\n")
+		b.WriteString(`agent_context_recall_duration_seconds{backend="`)
+		b.WriteString(backend)
+		b.WriteString(`",quantile="0.99"} `)
+		b.WriteString(formatFloat64(float64(s.P99) / 1e6))
+		b.WriteString("\n")
+		b.WriteString(`agent_context_recall_duration_seconds_count{backend="`)
+		b.WriteString(backend)
+		b.WriteString(`"} `)
+		b.WriteString(formatInt64(int64(s.Count)))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // Global metrics instance
 var globalMetrics = NewMetrics()
 
 // GetMetrics returns the global metrics instance
 func GetMetrics() *Metrics {
 	return globalMetrics
+}
+
+// =========================================================================
+// Rerank metrics (Slice A1 / F1)
+// Appended so the recall reranker can record request/timeout/error counts
+// and per-backend latency without reshuffling existing blocks.
+// =========================================================================
+
+// RecordRerankLatency records a rerank latency for the given backend in
+// microseconds. Backend defaults to "unknown" when empty.
+func (m *Metrics) RecordRerankLatency(backend string, latencyMicros int64) {
+	if backend == "" {
+		backend = "unknown"
+	}
+	if latencyMicros < 0 {
+		latencyMicros = 0
+	}
+
+	m.rerankLatencyMu.Lock()
+	defer m.rerankLatencyMu.Unlock()
+
+	if m.rerankLatencies == nil {
+		m.rerankLatencies = make(map[string][]int64)
+	}
+	if m.maxRerankLatencies == 0 {
+		m.maxRerankLatencies = 1000
+	}
+
+	samples := m.rerankLatencies[backend]
+	if m.maxRerankLatencies > 0 && len(samples) >= m.maxRerankLatencies {
+		samples = samples[1:]
+	}
+	samples = append(samples, latencyMicros)
+	m.rerankLatencies[backend] = samples
+}
+
+// GetRerankLatencyStats returns rerank latency stats grouped by backend.
+func (m *Metrics) GetRerankLatencyStats() map[string]LatencyStats {
+	m.rerankLatencyMu.Lock()
+	defer m.rerankLatencyMu.Unlock()
+
+	if len(m.rerankLatencies) == 0 {
+		return map[string]LatencyStats{}
+	}
+
+	stats := make(map[string]LatencyStats, len(m.rerankLatencies))
+	for backend, samples := range m.rerankLatencies {
+		stats[backend] = summarizeLatencySamples(samples)
+	}
+	return stats
+}
+
+// PrometheusFormatRerank returns the rerank-specific Prometheus lines. The
+// top-level PrometheusFormat concatenates this block at the end so existing
+// metrics remain byte-stable.
+func (m *Metrics) PrometheusFormatRerank() string {
+	var b strings.Builder
+	b.WriteString("\n# HELP loom_agentcontext_rerank_requests_total Total rerank requests\n")
+	b.WriteString("# TYPE loom_agentcontext_rerank_requests_total counter\n")
+	b.WriteString("loom_agentcontext_rerank_requests_total ")
+	b.WriteString(formatInt64(m.RerankRequests.Load()))
+	b.WriteString("\n")
+
+	b.WriteString("\n# HELP loom_agentcontext_rerank_timeouts_total Total rerank timeouts\n")
+	b.WriteString("# TYPE loom_agentcontext_rerank_timeouts_total counter\n")
+	b.WriteString("loom_agentcontext_rerank_timeouts_total ")
+	b.WriteString(formatInt64(m.RerankTimeouts.Load()))
+	b.WriteString("\n")
+
+	b.WriteString("\n# HELP loom_agentcontext_rerank_errors_total Total rerank errors (non-timeout)\n")
+	b.WriteString("# TYPE loom_agentcontext_rerank_errors_total counter\n")
+	b.WriteString("loom_agentcontext_rerank_errors_total ")
+	b.WriteString(formatInt64(m.RerankErrors.Load()))
+	b.WriteString("\n")
+
+	// Latency summary by backend.
+	stats := m.GetRerankLatencyStats()
+	if len(stats) > 0 {
+		b.WriteString("\n# HELP loom_agentcontext_rerank_duration_seconds Rerank duration by backend in seconds\n")
+		b.WriteString("# TYPE loom_agentcontext_rerank_duration_seconds summary\n")
+
+		backends := make([]string, 0, len(stats))
+		for backend := range stats {
+			backends = append(backends, backend)
+		}
+		sort.Strings(backends)
+
+		for _, backend := range backends {
+			s := stats[backend]
+			if s.Count == 0 {
+				continue
+			}
+			b.WriteString(`loom_agentcontext_rerank_duration_seconds{backend="`)
+			b.WriteString(backend)
+			b.WriteString(`",quantile="0.5"} `)
+			b.WriteString(formatFloat64(float64(s.P50) / 1e6))
+			b.WriteString("\n")
+			b.WriteString(`loom_agentcontext_rerank_duration_seconds{backend="`)
+			b.WriteString(backend)
+			b.WriteString(`",quantile="0.9"} `)
+			b.WriteString(formatFloat64(float64(s.P90) / 1e6))
+			b.WriteString("\n")
+			b.WriteString(`loom_agentcontext_rerank_duration_seconds{backend="`)
+			b.WriteString(backend)
+			b.WriteString(`",quantile="0.99"} `)
+			b.WriteString(formatFloat64(float64(s.P99) / 1e6))
+			b.WriteString("\n")
+			b.WriteString(`loom_agentcontext_rerank_duration_seconds_count{backend="`)
+			b.WriteString(backend)
+			b.WriteString(`"} `)
+			b.WriteString(formatInt64(int64(s.Count)))
+			b.WriteString("\n")
+		}
+	}
+
+	// F2: compaction fallback counter (appended for minimal diff).
+	b.WriteString("\n# HELP loom_agentcontext_compaction_fallback_total Total LLM compaction failures that degraded to extractive\n")
+	b.WriteString("# TYPE loom_agentcontext_compaction_fallback_total counter\n")
+	b.WriteString("loom_agentcontext_compaction_fallback_total ")
+	b.WriteString(formatInt64(m.CompactionFallbacks.Load()))
+	b.WriteString("\n")
+
+	// F5/Slice C1: handoff trigger counters by reason. Appended for
+	// surgical diff — PrometheusFormatRerank is already called from the
+	// top-level PrometheusFormat so these lines reach the scraper.
+	b.WriteString(m.prometheusFormatHandoffTriggers())
+
+	// F6: fleet dispatch counters (appended for minimal diff).
+	b.WriteString("\n# HELP loom_fleet_dispatch_requests_total Total agent_task_dispatch requests\n")
+	b.WriteString("# TYPE loom_fleet_dispatch_requests_total counter\n")
+	b.WriteString("loom_fleet_dispatch_requests_total ")
+	b.WriteString(formatInt64(m.FleetDispatchRequests.Load()))
+	b.WriteString("\n")
+	b.WriteString("# HELP loom_fleet_dispatch_mismatch_total agent_task_dispatch calls that returned no_capability_match or no_candidates\n")
+	b.WriteString("# TYPE loom_fleet_dispatch_mismatch_total counter\n")
+	b.WriteString("loom_fleet_dispatch_mismatch_total ")
+	b.WriteString(formatInt64(m.FleetDispatchMismatches.Load()))
+	b.WriteString("\n")
+
+	// Plan truth sweep counters (appended for minimal diff).
+	b.WriteString("\n# HELP loom_plan_sweep_slices_advanced_total Plan slices auto-advanced to merged from a merged MR\n")
+	b.WriteString("# TYPE loom_plan_sweep_slices_advanced_total counter\n")
+	b.WriteString("loom_plan_sweep_slices_advanced_total ")
+	b.WriteString(formatInt64(m.PlanSweepSlicesAdvanced.Load()))
+	b.WriteString("\n")
+	b.WriteString("# HELP loom_plan_sweep_plans_advanced_total Plans auto-advanced to merged once all their slices merged\n")
+	b.WriteString("# TYPE loom_plan_sweep_plans_advanced_total counter\n")
+	b.WriteString("loom_plan_sweep_plans_advanced_total ")
+	b.WriteString(formatInt64(m.PlanSweepPlansAdvanced.Load()))
+	b.WriteString("\n")
+	b.WriteString("# HELP loom_plan_sweep_errors_total Plan truth sweep failures (list, slice write, or plan advance)\n")
+	b.WriteString("# TYPE loom_plan_sweep_errors_total counter\n")
+	b.WriteString("loom_plan_sweep_errors_total ")
+	b.WriteString(formatInt64(m.PlanSweepErrors.Load()))
+	b.WriteString("\n")
+
+	return b.String()
+}
+
+// IncHandoffTriggerFired bumps the per-reason fired counter. Reason
+// values are bounded to the AutoHandoffReason* constants defined in
+// handoff_triggers.go.
+func (m *Metrics) IncHandoffTriggerFired(reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	m.handoffTriggerMu.Lock()
+	defer m.handoffTriggerMu.Unlock()
+	if m.handoffTriggerFired == nil {
+		m.handoffTriggerFired = make(map[string]*atomic.Int64)
+	}
+	c, ok := m.handoffTriggerFired[reason]
+	if !ok {
+		c = &atomic.Int64{}
+		m.handoffTriggerFired[reason] = c
+	}
+	c.Add(1)
+}
+
+// IncHandoffTriggerSuppressed bumps the per-reason suppressed counter.
+// Suppressions happen when a breach is observed but the gate does not
+// fire (first breach of a run, within debounce, etc).
+func (m *Metrics) IncHandoffTriggerSuppressed(reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	m.handoffTriggerMu.Lock()
+	defer m.handoffTriggerMu.Unlock()
+	if m.handoffTriggerSuppressed == nil {
+		m.handoffTriggerSuppressed = make(map[string]*atomic.Int64)
+	}
+	c, ok := m.handoffTriggerSuppressed[reason]
+	if !ok {
+		c = &atomic.Int64{}
+		m.handoffTriggerSuppressed[reason] = c
+	}
+	c.Add(1)
+}
+
+// HandoffTriggerFiredCount returns the fired count for a reason. Used
+// in tests and aggregated dashboards.
+func (m *Metrics) HandoffTriggerFiredCount(reason string) int64 {
+	m.handoffTriggerMu.Lock()
+	defer m.handoffTriggerMu.Unlock()
+	if c, ok := m.handoffTriggerFired[reason]; ok {
+		return c.Load()
+	}
+	return 0
+}
+
+// HandoffTriggerSuppressedCount returns the suppressed count for a reason.
+func (m *Metrics) HandoffTriggerSuppressedCount(reason string) int64 {
+	m.handoffTriggerMu.Lock()
+	defer m.handoffTriggerMu.Unlock()
+	if c, ok := m.handoffTriggerSuppressed[reason]; ok {
+		return c.Load()
+	}
+	return 0
+}
+
+func (m *Metrics) prometheusFormatHandoffTriggers() string {
+	m.handoffTriggerMu.Lock()
+	defer m.handoffTriggerMu.Unlock()
+
+	var b strings.Builder
+	b.WriteString("\n# HELP loom_handoff_trigger_fired_total Total auto-handoff trigger fires by reason\n")
+	b.WriteString("# TYPE loom_handoff_trigger_fired_total counter\n")
+	// Emit 0 lines for all well-known reasons so the series exist even
+	// before any fires. Keeps Grafana dashboards simple.
+	for _, reason := range handoffTriggerReasons() {
+		v := int64(0)
+		if c, ok := m.handoffTriggerFired[reason]; ok {
+			v = c.Load()
+		}
+		b.WriteString(`loom_handoff_trigger_fired_total{reason="`)
+		b.WriteString(reason)
+		b.WriteString(`"} `)
+		b.WriteString(formatInt64(v))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n# HELP loom_handoff_trigger_suppressed_total Total auto-handoff trigger suppressions by reason\n")
+	b.WriteString("# TYPE loom_handoff_trigger_suppressed_total counter\n")
+	for _, reason := range handoffTriggerReasons() {
+		v := int64(0)
+		if c, ok := m.handoffTriggerSuppressed[reason]; ok {
+			v = c.Load()
+		}
+		b.WriteString(`loom_handoff_trigger_suppressed_total{reason="`)
+		b.WriteString(reason)
+		b.WriteString(`"} `)
+		b.WriteString(formatInt64(v))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// handoffTriggerReasons returns the stable list of reason labels in a
+// sorted order for deterministic Prometheus output.
+func handoffTriggerReasons() []string {
+	return []string{
+		AutoHandoffReasonCost,
+		AutoHandoffReasonInputTokens,
+		AutoHandoffReasonStalled,
+	}
 }

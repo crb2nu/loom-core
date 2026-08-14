@@ -13,9 +13,11 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -56,6 +58,22 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(
+		ctx, "mcp-mongodb",
+
+		logger,
+	)
+	if err !=
+		nil {
+		logger.
+			Warn(
+				"OTel tracer init failed", "error",
+				err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-mongodb")
 
 	if err := initMongo(ctx); err != nil {
 		logger.Error("MongoDB init error", "error", err)
@@ -66,6 +84,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-mongodb", "version", version, "uri", mongoURI)
 
 	server := mcp.NewServer("mcp-mongodb", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("MongoDB database tools. Configure with MONGODB_URI and optionally MONGODB_DATABASE for default database.")
 
 	// Database operations
@@ -76,7 +95,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleListDatabases)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_list_databases", handleListDatabases))
 
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_list_collections",
@@ -90,7 +109,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListCollections)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_list_collections", handleListCollections))
 
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_collection_stats",
@@ -109,9 +128,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"collection"},
 		},
-	}, handleCollectionStats)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// Query operations
+		// Query operations
+		"mongo_collection_stats", handleCollectionStats))
+
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_find",
 		Description: "Find documents in a collection",
@@ -149,7 +170,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"collection"},
 		},
-	}, handleFind)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_find", handleFind))
 
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_find_one",
@@ -176,7 +197,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"collection"},
 		},
-	}, handleFindOne)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_find_one", handleFindOne))
 
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_count",
@@ -199,7 +220,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"collection"},
 		},
-	}, handleCount)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_count", handleCount))
 
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_aggregate",
@@ -222,7 +243,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"collection", "pipeline"},
 		},
-	}, handleAggregate)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_aggregate", handleAggregate))
 
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_distinct",
@@ -249,7 +270,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"collection", "field"},
 		},
-	}, handleDistinct)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_distinct", handleDistinct))
 
 	server.AddTool(mcp.Tool{
 		Name:        "mongo_indexes",
@@ -268,7 +289,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"collection"},
 		},
-	}, handleIndexes)
+	}, mcpotel.TracedToolHandler(tracer, "mongo_indexes", handleIndexes))
 
 	return server.Run(ctx)
 }

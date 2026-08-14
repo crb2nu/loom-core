@@ -1,5 +1,7 @@
 // Knowledge store - cross-agent context aggregation
+import { untrack } from 'svelte';
 import { arraysEqualById } from '../utils/diff.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface KnowledgeEntry {
   id: string;
@@ -39,7 +41,7 @@ class KnowledgeStore {
   filterCategory = $state('all');
   filterAgent = $state('all');
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private poller = createPoller(() => this.fetch(), 30000);
 
   get categories(): string[] {
     return Object.keys(this.grouped).sort();
@@ -65,12 +67,20 @@ class KnowledgeStore {
     this.loading = true;
     this.error = null;
     try {
+      // Snapshot filters OUTSIDE the caller's tracking context — fetch()
+      // runs synchronously inside the panel's mount $effect (startPolling);
+      // a tracked filter read re-runs that effect on every filter write
+      // (the mills_staff pre-await-read class, MR !1474).
+      const { searchQuery, filterCategory } = untrack(() => ({
+        searchQuery: this.searchQuery,
+        filterCategory: this.filterCategory,
+      }));
       const params = new URLSearchParams();
-      if (query || this.searchQuery) {
-        params.set('query', query || this.searchQuery);
+      if (query || searchQuery) {
+        params.set('query', query || searchQuery);
       }
-      if (this.filterCategory !== 'all') {
-        params.set('category', this.filterCategory);
+      if (filterCategory !== 'all') {
+        params.set('category', filterCategory);
       }
       params.set('budget', '8000');
 
@@ -100,16 +110,12 @@ class KnowledgeStore {
   }
 
   startPolling(intervalMs = 30000): void {
-    this.stopPolling();
     this.fetch();
-    this.pollTimer = setInterval(() => this.fetch(), intervalMs);
+    this.poller.start(intervalMs);
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
   }
 }
 

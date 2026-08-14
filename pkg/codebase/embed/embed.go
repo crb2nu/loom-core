@@ -5,13 +5,24 @@ import (
 	"context"
 )
 
-// Embedder is the interface for embedding providers.
-type Embedder interface {
+// QueryEmbedder is the smallest interface needed by semantic query callers.
+type QueryEmbedder interface {
 	// EmbedQuery embeds a single query string.
 	EmbedQuery(ctx context.Context, query string) ([]float64, error)
+}
 
+// DocumentEmbedder is the batch interface used by callers that need comparable
+// vectors for more than one text. Keeping it separate lets lightweight
+// consumers depend on only the capability they need.
+type DocumentEmbedder interface {
 	// EmbedDocuments embeds multiple documents in a batch.
 	EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error)
+}
+
+// Embedder is the full interface for embedding providers.
+type Embedder interface {
+	QueryEmbedder
+	DocumentEmbedder
 
 	// Name returns the embedder name (for logging/debugging).
 	Name() string

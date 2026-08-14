@@ -1,0 +1,54 @@
+apiVersion: v1
+data:
+  server.yaml: |
+    always_allow:
+        - k8s_get_nodes
+        - k8s_scale_deploy
+        - k8s_delete_pods_by_phase
+        - vip_label_node
+        - harvester_vms_list
+        - harvester_vm_restart
+        - k3s_service_logs
+        - k3s_repair_server
+        - stabilize_cluster
+        - run_repo_script
+    categories:
+        - operations
+        - automation
+    description: Ops MCP server for k3s and Harvester operations (repair, VIP labels, VM lifecycle, scripted ops)
+    name: ops_mcp
+    timeout: 120
+  # In-cluster kubeconfig for the *k3s* tools only -- see
+  # servers/flux/configmap.yaml for why the local target's macOS
+  # K3S_KUBECONFIG path cannot work inside the hub container.
+  #
+  # This server is the one that also talks to Harvester/RKE2, so mounting a
+  # working k3s kubeconfig here was unsafe until cmd/mcp-ops resolveKubeconfig()
+  # was scoped per cluster: it used to fall back to K3S_KUBECONFIG for *every*
+  # kubectl call, so a missing RKE2_KUBECONFIG pointed the mutating
+  # harvester_vm_restart at k3s. RKE2 resolution now fails closed and never
+  # reaches these credentials.
+  kubeconfig.yaml: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: in-cluster
+        cluster:
+          server: https://kubernetes.default.svc
+          certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+      - name: service-account
+        user:
+          tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+      - name: in-cluster
+        context:
+          cluster: in-cluster
+          user: service-account
+    current-context: in-cluster
+kind: ConfigMap
+metadata:
+  labels:
+    app: ops-mcp
+    component: mcp-server
+  name: ops-mcp-config

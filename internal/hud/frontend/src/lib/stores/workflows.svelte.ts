@@ -2,6 +2,7 @@
 // v2: SSE-first with 30s fallback poll. Applies hud.workflows snapshots directly.
 import { eventStore } from './events.svelte.ts';
 import { arraysEqualById } from '../utils/diff.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface WorkflowSummary {
   id: string;
@@ -9,6 +10,9 @@ export interface WorkflowSummary {
   name?: string;
   status: string;
   current_step: string;
+  // Completion fraction (0..1) carried by the SSE summary snapshot
+  // (applySnapshot maps `wf.progress`); absent on some payloads.
+  progress?: number;
   started_at: string;
   completed_at?: string;
   steps?: Array<{
@@ -80,9 +84,16 @@ class WorkflowStore {
   selectedWorkflow = $state<WorkflowDetail | null>(null);
   loading = $state(false);
   error = $state<string | null>(null);
+  // Approve/reject/cancel failures land here, NOT in `error`: `error` is the
+  // poll channel, so writing an action failure into it renders as "Workflow
+  // refresh failed" and the operator believes the decision landed.
+  actionError = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // 30s fallback poll — fires only when SSE is disconnected.
+  private poller = createPoller(() => {
+    if (!eventStore.connected) this.fetch();
+  }, 30000);
   private eventUnsubs: Array<() => void> = [];
 
   get activeWorkflows(): WorkflowSummary[] {
@@ -169,7 +180,16 @@ class WorkflowStore {
     }
   }
 
+  /**
+   * Mutations report their outcome through `actionError`, not a boolean return:
+   * callers await, then read `actionError` (null == landed). This is now a
+   * choice, not a constraint — `CardAction.run` in utils/inbox.ts accepts
+   * `Promise<unknown>`, so returning a boolean here would type-check at that
+   * call site. Every mutation on this store reports the same way; switching one
+   * to a boolean return without the rest would be the drift worth avoiding.
+   */
   async approveStep(workflowId: string, stepId: string): Promise<void> {
+    this.actionError = null;
     try {
       const res = await globalThis.fetch(`/api/workflows/${workflowId}/approve`, {
         method: 'POST',
@@ -180,11 +200,12 @@ class WorkflowStore {
       await this.fetchDetail(workflowId);
       await this.fetch();
     } catch (e) {
-      this.error = e instanceof Error ? e.message : String(e);
+      this.actionError = e instanceof Error ? e.message : String(e);
     }
   }
 
   async rejectStep(workflowId: string, stepId: string): Promise<void> {
+    this.actionError = null;
     try {
       const res = await globalThis.fetch(`/api/workflows/${workflowId}/reject`, {
         method: 'POST',
@@ -195,11 +216,12 @@ class WorkflowStore {
       await this.fetchDetail(workflowId);
       await this.fetch();
     } catch (e) {
-      this.error = e instanceof Error ? e.message : String(e);
+      this.actionError = e instanceof Error ? e.message : String(e);
     }
   }
 
   async cancelWorkflow(workflowId: string): Promise<void> {
+    this.actionError = null;
     try {
       const res = await globalThis.fetch(`/api/workflows/${workflowId}/cancel`, {
         method: 'POST',
@@ -207,15 +229,14 @@ class WorkflowStore {
       if (!res.ok) throw new Error(`Cancel workflow: ${res.status}`);
       await this.fetch();
     } catch (e) {
-      this.error = e instanceof Error ? e.message : String(e);
+      this.actionError = e instanceof Error ? e.message : String(e);
     }
   }
 
   startPolling(intervalMs = 30000): void {
     this.stopPolling();
     this.fetch();
-    // 30s fallback poll (SSE is the primary data source).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.poller.start(intervalMs);
 
     // Subscribe to SSE events: apply data directly from hud.workflows snapshots.
     this.eventUnsubs.push(
@@ -230,10 +251,7 @@ class WorkflowStore {
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }

@@ -1,0 +1,374 @@
+package backend
+
+import (
+	"fmt"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// buildPodSpec creates a Pod spec for a devbox sandbox.
+func (k *K8sBackend) buildPodSpec(opts StartOpts, imageTag string) *corev1.Pod {
+	env := make([]corev1.EnvVar, 0, len(opts.Env)+len(opts.SecretEnv))
+	for key, val := range opts.Env {
+		env = append(env, corev1.EnvVar{Name: key, Value: val})
+	}
+	for _, s := range opts.SecretEnv {
+		env = append(env, corev1.EnvVar{
+			Name: s.Name,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s.SecretName},
+					Key:                  s.SecretKey,
+					Optional:             boolPtr(true),
+				},
+			},
+		})
+	}
+
+	// In git-clone mode, expose the same git token the init container used so
+	// the runtime agent can authenticate further git operations — notably
+	// `go mod download` of private sibling modules via the url.insteadOf rule
+	// the spawn orchestrator configures (services/loom-core implement stage).
+	// The token is already baked into the clone's remote URL, so this is not a
+	// new exposure; it makes the credential available for fetches against OTHER
+	// repos on the same host. Optional so a missing secret never blocks start.
+	if k.gitEnabled() {
+		env = append(env, corev1.EnvVar{
+			Name: "GIT_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: k.gitSecret},
+					Key:                  "token",
+					Optional:             boolPtr(true),
+				},
+			},
+		})
+	}
+
+	// Set requests (minimum Burstable QoS) and limits from config.
+	resources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("128Mi"),
+		},
+	}
+	if opts.MemoryMB > 0 {
+		resources.Limits = corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dMi", opts.MemoryMB)),
+		}
+	}
+	if opts.CPUs > 0 {
+		if resources.Limits == nil {
+			resources.Limits = corev1.ResourceList{}
+		}
+		resources.Limits[corev1.ResourceCPU] = resource.MustParse(fmt.Sprintf("%dm", int(opts.CPUs*1000)))
+	}
+
+	workspace := k.workspacePlan(opts.WorkDir, gitCloneOpts{
+		branch:     opts.Branch,
+		baseBranch: opts.BaseBranch,
+	}, nil)
+	volumes := []corev1.Volume{workspace.volume}
+	volumeMounts := append([]corev1.VolumeMount{}, workspace.volumeMounts...)
+	initContainers := append([]corev1.Container{}, workspace.initContainers...)
+
+	// Add secret volume mounts (e.g., auth token files for agent CLIs).
+	for i, sm := range opts.SecretMounts {
+		volName := fmt.Sprintf("secret-%d", i)
+		items := make([]corev1.KeyToPath, 0, len(sm.Items))
+		for _, item := range sm.Items {
+			items = append(items, corev1.KeyToPath{Key: item.Key, Path: item.Path})
+		}
+		volumes = append(volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  sm.SecretName,
+					Items:       items,
+					Optional:    boolPtr(true),
+					DefaultMode: int32Ptr(0o600),
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      volName,
+			MountPath: sm.MountPath,
+			ReadOnly:  true,
+		})
+	}
+
+	// Shared cache claims (e.g. the spawn fleet's Go build/module cache).
+	// Mounted read-write and NOT namespaced per pod: reuse across pods is
+	// the whole point. See StartOpts.CachePVCs.
+	for i, c := range opts.CachePVCs {
+		if c.ClaimName == "" || c.MountPath == "" {
+			continue
+		}
+		volName := fmt.Sprintf("cache-pvc-%d", i)
+		volumes = append(volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: c.ClaimName,
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      volName,
+			MountPath: c.MountPath,
+		})
+	}
+
+	// Add host-path mounts if requested (for additional bind mounts)
+	for i, m := range opts.Mounts {
+		volName := fmt.Sprintf("mount-%d", i)
+		hostPathType := corev1.HostPathDirectoryOrCreate
+		volumes = append(volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: m.Host,
+					Type: &hostPathType,
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      volName,
+			MountPath: m.Container,
+			ReadOnly:  m.ReadOnly,
+		})
+	}
+
+	managedBy := "mcp-devbox"
+	if opts.ManagedByOverride != "" {
+		managedBy = opts.ManagedByOverride
+	}
+	labels := map[string]string{
+		"app.kubernetes.io/managed-by": managedBy,
+		"devbox/project":               opts.Name,
+	}
+	if opts.AgentID != "" {
+		labels["devbox/agent-id"] = opts.AgentID
+	}
+	for k, v := range opts.ExtraLabels {
+		labels[k] = v
+	}
+
+	gracePeriod := int64(10)
+
+	// FSGroup makes the workspace emptyDir + secret mounts readable + writable
+	// by group 1000. The agent runtime image (cmd path: HUD spawn) runs as
+	// uid 1000 (non-root, required by claude --dangerously-skip-permissions);
+	// the git-clone init container runs as root and would otherwise leave the
+	// workspace owned by root:0 mode 0755, blocking the main container from
+	// writing settings.json and the agent's own diff. Kubelet's fsGroup
+	// chown sets group ownership to 1000 and forces 0660/0770 modes across
+	// every supported volume type (emptyDir, secret, projected, configMap),
+	// so the main container can read secrets + write the workspace.
+	//
+	// Root-mode devbox sandboxes (the legacy /workspace path used by
+	// mcp-devbox) are unaffected: their container runs as uid 0 which can
+	// already read/write everywhere regardless of fsGroup-forced modes.
+	agentFSGroup := int64(1000)
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      opts.Name,
+			Namespace: k.namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:                 corev1.RestartPolicyNever,
+			TerminationGracePeriodSeconds: &gracePeriod,
+			ServiceAccountName:            "mcp-devbox",
+			SecurityContext: &corev1.PodSecurityContext{
+				FSGroup: &agentFSGroup,
+			},
+			ImagePullSecrets: []corev1.LocalObjectReference{
+				{Name: k.imagePullSecret},
+			},
+			NodeSelector: map[string]string{
+				"kubernetes.io/arch": "amd64",
+			},
+			InitContainers: initContainers,
+			Containers: []corev1.Container{
+				{
+					Name:            "devbox",
+					Image:           imageTag,
+					Command:         []string{"sleep", "infinity"},
+					Env:             env,
+					Resources:       resources,
+					WorkingDir:      workDir(opts.WorkDir),
+					VolumeMounts:    volumeMounts,
+					ImagePullPolicy: imagePullPolicy(imageTag),
+					LivenessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							Exec: &corev1.ExecAction{
+								Command: []string{"true"},
+							},
+						},
+						PeriodSeconds:    30,
+						FailureThreshold: 3,
+					},
+				},
+			},
+			Volumes: volumes,
+		},
+	}
+}
+
+// imagePullPolicy returns IfNotPresent for hash-tagged images (immutable)
+// and Always for untagged or :latest images.
+func imagePullPolicy(imageTag string) corev1.PullPolicy {
+	// Extract the tag portion after the last colon
+	idx := strings.LastIndex(imageTag, ":")
+	if idx < 0 {
+		return corev1.PullAlways // no tag → always pull
+	}
+	tag := imageTag[idx+1:]
+	if tag == "" || tag == "latest" {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
+// registryTag prepends the registry to a local image tag.
+func (k *K8sBackend) registryTag(tag string) string {
+	if strings.Contains(tag, "/") {
+		prefix := strings.Split(tag, "/")[0]
+		if strings.Contains(prefix, ".") || strings.Contains(prefix, ":") || prefix == "localhost" {
+			return tag // already has a registry prefix
+		}
+	}
+	return k.registry + "/" + tag
+}
+
+func boolPtr(b bool) *bool    { return &b }
+func int32Ptr(i int32) *int32 { return &i }
+
+// workDir returns the working directory, defaulting to "/workspace".
+func workDir(dir string) string {
+	if dir != "" {
+		return dir
+	}
+	return "/workspace"
+}
+
+// gitEnabled returns true when the backend is configured for git-clone mode.
+func (k *K8sBackend) gitEnabled() bool {
+	return k.gitBaseURL != "" && k.gitSecret != ""
+}
+
+// gitCloneInitContainer builds an initContainer that clones a git repo into
+// the workspace emptyDir. The workDir determines which subdirectory receives
+// the clone (e.g., /workspace/services/loom-core → repo "loom-core" cloned
+// into /workspace/services/loom-core/).
+//
+// When opts.branch is non-empty, the script checks out that branch after
+// clone (creating it from opts.baseBranch when origin doesn't have it
+// yet). Without this step the pod sits on the default branch and edits
+// land on the wrong ref — which silently breaks Mills' diff capture.
+//
+// We intentionally drop --depth 1 here: a shallow clone has no merge
+// base for `git diff <base>...HEAD` (Mills' rubric-input capture relies
+// on it), and shallow clones make `git push` of a non-default branch
+// need extra unshallow steps. Full history is cheap for these repos.
+func (k *K8sBackend) gitCloneInitContainer(workDirPath string, opts gitCloneOpts) corev1.Container {
+	// Derive project name and clone destination from workDir.
+	// workDir is typically "/workspace/services/<project>" or "/workspace/<project>".
+	cloneDest := workDirPath
+	if cloneDest == "" || cloneDest == "/workspace" {
+		cloneDest = "/workspace/project"
+	}
+
+	// Extract project name from the last path component for the git URL.
+	parts := strings.Split(strings.TrimSuffix(cloneDest, "/"), "/")
+	projectName := parts[len(parts)-1]
+	repoURL := strings.TrimSuffix(k.gitBaseURL, "/") + "/" + projectName + ".git"
+
+	// Preserve the original URL scheme (http vs https) so internal
+	// HTTP-only registries work.
+	scheme := "https"
+	if strings.HasPrefix(repoURL, "http://") {
+		scheme = "http"
+	}
+	hostAndPath := strings.TrimPrefix(strings.TrimPrefix(repoURL, "https://"), "http://")
+	// The runtime container runs as uid 1000 (the `agent` user in
+	// spawn-runtime-codex / spawn-runtime-claude). Without an explicit
+	// chown, the workspace ends up owned by root:0 with mode 0644 — the
+	// agent can read but not write, so it cannot modify files, commit, or
+	// push. fsGroup chowns the emptyDir mount point to gid 1000 but does
+	// not propagate to files written into the volume by a later init
+	// container running as root. The umask + recursive chown make every
+	// freshly-cloned path agent-writable. Without this, the spawn fix
+	// from ab6f8446 (init container checks out req.Branch) reaches the
+	// right branch but produces no diff because the agent can't write.
+	cloneScript := fmt.Sprintf(
+		`set -e
+umask 002
+mkdir -p "$(dirname %q)"
+git clone "%s://token:${GIT_TOKEN}@%s" %q
+cd %q
+if [ -n "${SPAWN_BRANCH:-}" ]; then
+  BASE="${SPAWN_BASE_BRANCH:-main}"
+  if git ls-remote --exit-code --heads origin "${SPAWN_BRANCH}" >/dev/null 2>&1; then
+    git checkout "${SPAWN_BRANCH}"
+  elif git ls-remote --exit-code --heads origin "${BASE}" >/dev/null 2>&1; then
+    git checkout -b "${SPAWN_BRANCH}" "origin/${BASE}"
+  else
+    git checkout -b "${SPAWN_BRANCH}"
+  fi
+fi
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+chown -R 1000:1000 %q
+echo "git-clone: ready %s on ${BRANCH}"`,
+		cloneDest,
+		scheme,
+		hostAndPath,
+		cloneDest,
+		cloneDest,
+		cloneDest,
+		projectName,
+	)
+
+	env := []corev1.EnvVar{
+		{
+			Name: "GIT_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: k.gitSecret},
+					Key:                  "token",
+				},
+			},
+		},
+	}
+	if opts.branch != "" {
+		env = append(env, corev1.EnvVar{Name: "SPAWN_BRANCH", Value: opts.branch})
+	}
+	if opts.baseBranch != "" {
+		env = append(env, corev1.EnvVar{Name: "SPAWN_BASE_BRANCH", Value: opts.baseBranch})
+	}
+
+	return corev1.Container{
+		Name:    "git-clone",
+		Image:   k.gitCloneImage,
+		Command: []string{"sh", "-c", cloneScript},
+		Env:     env,
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "workspace", MountPath: "/workspace"},
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: k.gitCloneMemoryRequest,
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: k.gitCloneMemoryLimit,
+			},
+		},
+	}
+}

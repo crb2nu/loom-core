@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,9 +144,9 @@ func TestMemoryMonitor_BridgeBackedRefreshAndMutations(t *testing.T) {
 				"total_items":       totalItems,
 				"total_tokens":      90,
 			}), nil
-		case "agent_context__agent_memory_recall":
+		case "agent_context__agent_recall":
 			return toolEnvelope(map[string]any{
-				"items": []map[string]any{
+				"memory_items": []map[string]any{
 					{"id": "mem-1", "title": "first", "tier": "working", "importance": "medium", "importance_score": 0.5, "original_tokens": 10},
 				},
 			}), nil
@@ -453,8 +454,6 @@ func TestFleetMonitor_BridgeBackedRefreshAndDebounce(t *testing.T) {
 			return toolEnvelope(map[string]any{
 				"handoffs": []map[string]any{},
 			}), nil
-		case "agent_context__agent_handoff_list":
-			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
 		default:
 			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
 		}
@@ -498,5 +497,412 @@ func TestFleetMonitor_BridgeBackedRefreshAndDebounce(t *testing.T) {
 	}
 	if statusCalls != prevStatusCalls || toolCalls["agent_context__agent_session_list"] != prevSessionCalls {
 		t.Fatalf("expected second refresh to debounce without new RPC calls, status=%d->%d sessions=%d->%d", prevStatusCalls, statusCalls, prevSessionCalls, toolCalls["agent_context__agent_session_list"])
+	}
+}
+
+// TestFleetMonitor_CarryOverOnSessionFetchError pins the partial-failure
+// guard: when agent_session_list errors (e.g., MCP lock timeout), the
+// refresh must NOT zero out Sessions/Agents in the snapshot. Instead it
+// carries over the previous values so /api/fleet keeps showing live data.
+func TestFleetMonitor_CarryOverOnSessionFetchError(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	client, agent := newBridges(t, sockPath)
+
+	var sessionShouldFail atomic.Bool
+
+	handlers.handle("loom/status", func(_ json.RawMessage) (any, error) {
+		return map[string]any{"running": true, "servers": 1, "activeConns": 0, "idleConns": 0, "processes": []string{"agent_context"}}, nil
+	})
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			if sessionShouldFail.Load() {
+				return nil, fmt.Errorf("simulated mcp lock timeout")
+			}
+			return toolEnvelope(map[string]any{
+				"sessions": []map[string]any{
+					{"id": "s1", "agent_id": "a1", "status": "active", "total_tokens": 200},
+					{"id": "s2", "agent_id": "a2", "status": "active", "total_tokens": 100},
+				},
+			}), nil
+		case "agent_context__agent_task_list":
+			return toolEnvelope(map[string]any{"tasks": []map[string]any{}}), nil
+		case "agent_context__agent_memory_stats":
+			return toolEnvelope(map[string]any{"total_items": 0, "total_tokens": 0}), nil
+		case "agent_context__agent_graph_stats":
+			return toolEnvelope(map[string]any{"total_entities": 0, "total_relations": 0}), nil
+		case "agent_context__agent_workflow_list":
+			return toolEnvelope(map[string]any{"workflows": []map[string]any{}}), nil
+		case "agent_context__agent_presence_list":
+			now := time.Now().UTC().Format(time.RFC3339)
+			return toolEnvelope(map[string]any{
+				"agents": []map[string]any{
+					{"agent_id": "a1", "session_id": "s1", "status": "active", "last_heartbeat": now},
+					{"agent_id": "a2", "session_id": "s2", "status": "active", "last_heartbeat": now},
+				},
+			}), nil
+		case "agent_context__agent_file_claim_list":
+			return toolEnvelope(map[string]any{"claims": []map[string]any{}}), nil
+		case "agent_context__agent_worktree_list":
+			return toolEnvelope(map[string]any{"assignments": []map[string]any{}}), nil
+		case "agent_context__agent_handoff_inbox":
+			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
+		default:
+			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
+		}
+	})
+
+	monitor := NewFleetMonitor(client, agent, nil)
+	if err := monitor.Refresh(); err != nil {
+		t.Fatalf("refresh #1: %v", err)
+	}
+	baseline := monitor.Snapshot()
+	if baseline.TotalSessions != 2 || baseline.ActiveSessions != 2 || baseline.TotalTokens != 300 {
+		t.Fatalf("unexpected baseline session counts: total=%d active=%d tokens=%d", baseline.TotalSessions, baseline.ActiveSessions, baseline.TotalTokens)
+	}
+	if baseline.ActiveAgents != 2 {
+		t.Fatalf("unexpected baseline active agents: %d", baseline.ActiveAgents)
+	}
+
+	// Flip session fetch to error and force a second refresh past the debounce.
+	sessionShouldFail.Store(true)
+	if err := monitor.RefreshForce(); err != nil {
+		t.Fatalf("refresh #2 (force): %v", err)
+	}
+
+	got := monitor.Snapshot()
+	if got.TotalSessions != baseline.TotalSessions {
+		t.Errorf("TotalSessions zeroed after session fetch error: got %d, want carried-over %d", got.TotalSessions, baseline.TotalSessions)
+	}
+	if got.ActiveSessions != baseline.ActiveSessions {
+		t.Errorf("ActiveSessions zeroed: got %d, want %d", got.ActiveSessions, baseline.ActiveSessions)
+	}
+	if got.TotalTokens != baseline.TotalTokens {
+		t.Errorf("TotalTokens zeroed: got %d, want %d", got.TotalTokens, baseline.TotalTokens)
+	}
+	if len(got.Sessions) != len(baseline.Sessions) {
+		t.Errorf("Sessions slice replaced with empty: got %d, want %d", len(got.Sessions), len(baseline.Sessions))
+	}
+	if got.ActiveAgents != baseline.ActiveAgents {
+		t.Errorf("ActiveAgents zeroed: got %d, want %d", got.ActiveAgents, baseline.ActiveAgents)
+	}
+	if len(got.Agents) != len(baseline.Agents) {
+		t.Errorf("Agents slice replaced: got %d, want %d", len(got.Agents), len(baseline.Agents))
+	}
+}
+
+// TestFleetMonitor_CarryOverOnPresenceFetchError mirrors the session-error
+// test but trips PresenceList. The carry-over branch should activate for
+// either side of the coupled fetch.
+func TestFleetMonitor_CarryOverOnPresenceFetchError(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	client, agent := newBridges(t, sockPath)
+
+	var presenceShouldFail atomic.Bool
+
+	handlers.handle("loom/status", func(_ json.RawMessage) (any, error) {
+		return map[string]any{"running": true, "servers": 1, "activeConns": 0, "idleConns": 0, "processes": []string{"agent_context"}}, nil
+	})
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			return toolEnvelope(map[string]any{
+				"sessions": []map[string]any{
+					{"id": "s1", "agent_id": "a1", "status": "active", "total_tokens": 75},
+				},
+			}), nil
+		case "agent_context__agent_task_list":
+			return toolEnvelope(map[string]any{"tasks": []map[string]any{}}), nil
+		case "agent_context__agent_memory_stats":
+			return toolEnvelope(map[string]any{"total_items": 0, "total_tokens": 0}), nil
+		case "agent_context__agent_graph_stats":
+			return toolEnvelope(map[string]any{"total_entities": 0, "total_relations": 0}), nil
+		case "agent_context__agent_workflow_list":
+			return toolEnvelope(map[string]any{"workflows": []map[string]any{}}), nil
+		case "agent_context__agent_presence_list":
+			if presenceShouldFail.Load() {
+				return nil, fmt.Errorf("simulated mcp lock timeout")
+			}
+			now := time.Now().UTC().Format(time.RFC3339)
+			return toolEnvelope(map[string]any{
+				"agents": []map[string]any{
+					{"agent_id": "a1", "session_id": "s1", "status": "active", "last_heartbeat": now},
+				},
+			}), nil
+		case "agent_context__agent_file_claim_list":
+			return toolEnvelope(map[string]any{"claims": []map[string]any{}}), nil
+		case "agent_context__agent_worktree_list":
+			return toolEnvelope(map[string]any{"assignments": []map[string]any{}}), nil
+		case "agent_context__agent_handoff_inbox":
+			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
+		default:
+			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
+		}
+	})
+
+	monitor := NewFleetMonitor(client, agent, nil)
+	if err := monitor.Refresh(); err != nil {
+		t.Fatalf("refresh #1: %v", err)
+	}
+	baseline := monitor.Snapshot()
+	if baseline.ActiveAgents != 1 {
+		t.Fatalf("unexpected baseline active agents: %d", baseline.ActiveAgents)
+	}
+
+	presenceShouldFail.Store(true)
+	if err := monitor.RefreshForce(); err != nil {
+		t.Fatalf("refresh #2 (force): %v", err)
+	}
+
+	got := monitor.Snapshot()
+	if got.ActiveAgents != baseline.ActiveAgents {
+		t.Errorf("ActiveAgents zeroed after presence fetch error: got %d, want %d", got.ActiveAgents, baseline.ActiveAgents)
+	}
+	if len(got.Agents) != len(baseline.Agents) {
+		t.Errorf("Agents slice replaced: got %d, want %d", len(got.Agents), len(baseline.Agents))
+	}
+	if got.TotalSessions != baseline.TotalSessions {
+		t.Errorf("TotalSessions changed despite session fetch success: got %d, want %d", got.TotalSessions, baseline.TotalSessions)
+	}
+}
+
+// TestFleetMonitor_MergesActiveSessionsWhenUnfilteredListMissesThem is the
+// regression test for the HUD "0 active sessions while 12 were running" bug.
+//
+// The unfiltered agent_session_list call can come back with a window of
+// ended/summarized rows that excludes the actively running sessions (the
+// production failure mode that prompted sessionListScrollCap). FleetMonitor
+// is expected to compensate by also calling the filtered status="active"
+// path and union-ing the results into snap.Sessions, so the live counters
+// and stale-session reaper stay correct.
+//
+// This test wires the mock daemon to return only ended sessions for the
+// unfiltered call and a fresh active session for the filtered call, then
+// asserts that the snapshot contains both — and that ActiveSessions > 0.
+func TestFleetMonitor_MergesActiveSessionsWhenUnfilteredListMissesThem(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	client, agent := newBridges(t, sockPath)
+
+	handlers.handle("loom/status", func(_ json.RawMessage) (any, error) {
+		return map[string]any{
+			"running": true, "servers": 1, "activeConns": 0, "idleConns": 0,
+			"processes": []string{"agent_context"},
+		}, nil
+	})
+
+	now := time.Now().UTC()
+	endedStart := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	activeStart := now.Add(-1 * time.Minute).Format(time.RFC3339Nano)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			// Mirror the production failure mode: the unfiltered call
+			// returns only ended history, the filtered call returns the
+			// live actives. This is what the Qdrant scroll bug looked
+			// like in practice before sessionListScrollCap landed.
+			status, _ := req.Arguments["status"].(string)
+			if status == "active" {
+				return toolEnvelope(map[string]any{
+					"sessions": []map[string]any{
+						{
+							"id": "sess-active-1", "agent_id": "claude-live",
+							"status": "active", "started_at": activeStart,
+						},
+					},
+				}), nil
+			}
+			return toolEnvelope(map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id": "sess-ended-1", "agent_id": "claude-old",
+						"status": "ended", "started_at": endedStart,
+					},
+				},
+			}), nil
+		case "agent_context__agent_task_list":
+			return toolEnvelope(map[string]any{"tasks": []map[string]any{}}), nil
+		case "agent_context__agent_memory_stats":
+			return toolEnvelope(map[string]any{"total_items": 0, "total_tokens": 0}), nil
+		case "agent_context__agent_graph_stats":
+			return toolEnvelope(map[string]any{"total_entities": 0, "total_relations": 0}), nil
+		case "agent_context__agent_workflow_list":
+			return toolEnvelope(map[string]any{"workflows": []map[string]any{}}), nil
+		case "agent_context__agent_presence_list":
+			heartbeat := now.Format(time.RFC3339Nano)
+			return toolEnvelope(map[string]any{
+				"agents": []map[string]any{
+					{
+						"agent_id": "claude-live", "session_id": "sess-active-1",
+						"status": "active", "last_heartbeat": heartbeat,
+					},
+				},
+			}), nil
+		case "agent_context__agent_file_claim_list":
+			return toolEnvelope(map[string]any{"claims": []map[string]any{}}), nil
+		case "agent_context__agent_worktree_list":
+			return toolEnvelope(map[string]any{"assignments": []map[string]any{}}), nil
+		case "agent_context__agent_handoff_inbox":
+			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
+		default:
+			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
+		}
+	})
+
+	monitor := NewFleetMonitor(client, agent, nil)
+	if err := monitor.Refresh(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	snap := monitor.Snapshot()
+	if len(snap.Sessions) != 2 {
+		t.Fatalf("expected merged snapshot of 2 sessions (1 ended + 1 active), got %d: %+v",
+			len(snap.Sessions), snap.Sessions)
+	}
+
+	var sawActive, sawEnded bool
+	for _, s := range snap.Sessions {
+		switch s.ID {
+		case "sess-active-1":
+			sawActive = true
+			if s.Status != "active" {
+				t.Errorf("merged active row has wrong status %q", s.Status)
+			}
+		case "sess-ended-1":
+			sawEnded = true
+		}
+	}
+	if !sawActive {
+		t.Error("active session was not merged into snap.Sessions — the union path didn't fire")
+	}
+	if !sawEnded {
+		t.Error("ended session was dropped from snap.Sessions — the merge replaced instead of unioned")
+	}
+
+	if snap.ActiveSessions != 1 {
+		t.Errorf("expected ActiveSessions=1 after merge, got %d", snap.ActiveSessions)
+	}
+}
+
+// TestFleetMonitor_ActiveFallbackWhenUnfilteredSessionListTimesOut is the
+// regression test for the recurring HUD "No active agents" bug.
+//
+// Production failure mode: once enough ended/summarized sessions accumulate,
+// the unfiltered limit=1000 agent_session_list payload exceeds the daemon's
+// recv cap and times out on every refresh. The status="active" path stays
+// fast (small bounded result). Before the fix, the unfiltered timeout left
+// sessionsOK=false, the coupled sessions+presence join was skipped, and the
+// live agent roster was blanked even though PresenceList succeeded.
+//
+// FleetMonitor must fall back to the active-only fetch so the agent roster
+// (driven by presence) and the live session counters stay populated.
+func TestFleetMonitor_ActiveFallbackWhenUnfilteredSessionListTimesOut(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	client, agent := newBridges(t, sockPath)
+
+	handlers.handle("loom/status", func(_ json.RawMessage) (any, error) {
+		return map[string]any{
+			"running": true, "servers": 1, "activeConns": 0, "idleConns": 0,
+			"processes": []string{"agent_context"},
+		}, nil
+	})
+
+	now := time.Now().UTC()
+	activeStart := now.Add(-1 * time.Minute).Format(time.RFC3339Nano)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			// Only the unfiltered fetch times out (the oversized payload);
+			// the filtered status="active" path stays healthy.
+			status, _ := req.Arguments["status"].(string)
+			if status != "active" {
+				return nil, fmt.Errorf("simulated tools/call timeout during recv after 3s")
+			}
+			return toolEnvelope(map[string]any{
+				"sessions": []map[string]any{
+					{
+						"id": "sess-active-1", "agent_id": "claude-live",
+						"status": "active", "started_at": activeStart, "total_tokens": 42,
+					},
+				},
+			}), nil
+		case "agent_context__agent_task_list":
+			return toolEnvelope(map[string]any{"tasks": []map[string]any{}}), nil
+		case "agent_context__agent_memory_stats":
+			return toolEnvelope(map[string]any{"total_items": 0, "total_tokens": 0}), nil
+		case "agent_context__agent_graph_stats":
+			return toolEnvelope(map[string]any{"total_entities": 0, "total_relations": 0}), nil
+		case "agent_context__agent_workflow_list":
+			return toolEnvelope(map[string]any{"workflows": []map[string]any{}}), nil
+		case "agent_context__agent_presence_list":
+			heartbeat := now.Format(time.RFC3339Nano)
+			return toolEnvelope(map[string]any{
+				"agents": []map[string]any{
+					{
+						"agent_id": "claude-live", "session_id": "sess-active-1",
+						"status": "active", "last_heartbeat": heartbeat,
+					},
+				},
+			}), nil
+		case "agent_context__agent_file_claim_list":
+			return toolEnvelope(map[string]any{"claims": []map[string]any{}}), nil
+		case "agent_context__agent_worktree_list":
+			return toolEnvelope(map[string]any{"assignments": []map[string]any{}}), nil
+		case "agent_context__agent_handoff_inbox":
+			return toolEnvelope(map[string]any{"handoffs": []map[string]any{}}), nil
+		default:
+			return nil, fmt.Errorf("unexpected tool: %s", req.Name)
+		}
+	})
+
+	monitor := NewFleetMonitor(client, agent, nil)
+	if err := monitor.Refresh(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	snap := monitor.Snapshot()
+	// The core regression: the agent roster must NOT be blanked when the
+	// unfiltered session list times out but presence succeeded.
+	if snap.ActiveAgents != 1 {
+		t.Errorf("ActiveAgents blanked by unfiltered-session timeout: got %d, want 1", snap.ActiveAgents)
+	}
+	if len(snap.Agents) != 1 {
+		t.Errorf("agent roster empty after fallback: got %d agents, want 1", len(snap.Agents))
+	}
+	// The live session counters should recover from the active-only fetch.
+	if snap.ActiveSessions != 1 {
+		t.Errorf("ActiveSessions not recovered via fallback: got %d, want 1", snap.ActiveSessions)
+	}
+	if snap.TotalTokens != 42 {
+		t.Errorf("TotalTokens not recovered via fallback: got %d, want 42", snap.TotalTokens)
 	}
 }

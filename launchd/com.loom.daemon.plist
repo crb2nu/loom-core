@@ -10,6 +10,8 @@
         <string>/Users/cblevins/.local/bin/loomd</string>
         <string>--registry</string>
         <string>/Users/cblevins/.config/loom/registry.yaml</string>
+        <string>--hud-port</string>
+        <string>3333</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -33,9 +35,13 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/cblevins/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>/Users/cblevins</string>
+        <key>CACHE_BACKEND</key>
+        <string>redis</string>
+        <key>REDIS_URL</key>
+        <string>redis://localhost:6379</string>
     </dict>
 
     <key>ThrottleInterval</key>

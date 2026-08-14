@@ -1,5 +1,7 @@
 // Graph store - knowledge graph visualization
+import { untrack } from 'svelte';
 import { arraysEqualById } from '../utils/diff.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface Relation {
   source: string;
@@ -56,7 +58,7 @@ class GraphStore {
   searchQuery = $state<string>('');
   filterType = $state<string>('all');
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private poller = createPoller(() => this.fetch(), 15000);
 
   get entityTypeList(): string[] {
     return Object.keys(this.stats.entity_types);
@@ -70,9 +72,17 @@ class GraphStore {
     this.loading = true;
     this.error = null;
     try {
+      // Snapshot filters OUTSIDE the caller's tracking context — fetch()
+      // runs synchronously inside panel mount $effects (startPolling); a
+      // tracked filter read re-runs those effects on every filter write
+      // (the mills_staff pre-await-read class, MR !1474).
+      const { searchQuery, filterType } = untrack(() => ({
+        searchQuery: this.searchQuery,
+        filterType: this.filterType,
+      }));
       const params = new URLSearchParams();
-      if (this.searchQuery) params.set('q', this.searchQuery);
-      if (this.filterType !== 'all') params.set('type', this.filterType);
+      if (searchQuery) params.set('q', searchQuery);
+      if (filterType !== 'all') params.set('type', filterType);
       params.set('limit', '100');
 
       const [statsRes, entitiesRes] = await Promise.all([
@@ -219,16 +229,12 @@ class GraphStore {
   }
 
   startPolling(intervalMs = 15000): void {
-    this.stopPolling();
     this.fetch();
-    this.pollTimer = setInterval(() => this.fetch(), intervalMs);
+    this.poller.start(intervalMs);
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
   }
 }
 

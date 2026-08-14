@@ -1,5 +1,6 @@
 // Topology store - agent relationship graph
 import { eventStore } from './events.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface TopologyNode {
   agent_id: string;
@@ -40,7 +41,10 @@ class TopologyStore {
   selectedNode = $state<string | null>(null);
 
   private eventUnsubs: Array<() => void> = [];
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // 30s fallback poll — fires only when SSE is disconnected.
+  private poller = createPoller(() => {
+    if (!eventStore.connected) this.fetch();
+  }, 30000);
 
   async fetch(): Promise<void> {
     this.loading = true;
@@ -80,7 +84,7 @@ class TopologyStore {
   startPolling(intervalMs = 30000): void {
     this.stopPolling();
     this.fetch();
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.poller.start(intervalMs);
 
     // Fleet snapshot updates node statuses in-place.
     this.eventUnsubs.push(
@@ -94,10 +98,7 @@ class TopologyStore {
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }

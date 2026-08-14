@@ -1,0 +1,1 @@
+- Persist Mills pipeline external-dependency classifications from `pkg/mills/pipeline/runner.go` so council incident history and classification metrics populate; repeated fingerprints accumulate occurrence counts, while store failures remain non-blocking.

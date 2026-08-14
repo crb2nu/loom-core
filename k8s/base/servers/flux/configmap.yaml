@@ -1,0 +1,50 @@
+apiVersion: v1
+data:
+  server.yaml: |
+    always_allow:
+        - flux_get_sources
+        - flux_get_kustomizations
+        - flux_get_helmreleases
+        - flux_reconcile
+        - flux_suspend
+        - flux_resume
+        - flux_logs
+        - flux_events
+    categories:
+        - gitops
+        - kubernetes
+    description: Flux CD GitOps operations (sources, kustomizations, reconciliation)
+    name: flux
+    timeout: 120
+  # In-cluster kubeconfig. The hub runs this server in a Linux container, so it
+  # cannot use the operator's macOS kubeconfig path that the local (stdio)
+  # target in mcp/context/registry.yaml points FLUX_KUBECONFIG at. mcp-flux
+  # feeds FLUX_KUBECONFIG to clientcmd as an ExplicitPath, and an ExplicitPath
+  # that does not exist is a hard error rather than an empty-config error, so
+  # clientcmd's in-cluster fallback never engages -- every tool failed with
+  # "load kubeconfig: stat ...: no such file or directory". Mount a real file
+  # that authenticates as the pod's ServiceAccount instead.
+  kubeconfig.yaml: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: in-cluster
+        cluster:
+          server: https://kubernetes.default.svc
+          certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+      - name: service-account
+        user:
+          tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+      - name: in-cluster
+        context:
+          cluster: in-cluster
+          user: service-account
+    current-context: in-cluster
+kind: ConfigMap
+metadata:
+  labels:
+    app: flux
+    component: mcp-server
+  name: flux-config

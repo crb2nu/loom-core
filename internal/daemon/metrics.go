@@ -14,6 +14,7 @@ type Metrics struct {
 	// Request metrics
 	RequestsTotal    *prometheus.CounterVec
 	RequestDuration  *prometheus.HistogramVec
+	ToolCallDuration *prometheus.HistogramVec
 	RequestsInFlight *prometheus.GaugeVec
 
 	// Server health metrics
@@ -63,8 +64,21 @@ type Metrics struct {
 	// EventBus metrics
 	EventsDropped prometheus.Counter
 
+	// Concurrency metrics
+	ConcurrentCalls prometheus.Gauge
+
 	// Contention metrics
 	CallLockWaitTotal *prometheus.CounterVec
+
+	// Routing metrics
+	RoutingPinOverrides *prometheus.CounterVec
+
+	// Proxy session metrics
+	SessionActive             prometheus.Gauge
+	SessionDaemonEpoch        prometheus.Gauge
+	SessionReapedTotal        prometheus.Counter
+	SessionEvictedTotal       prometheus.Counter
+	SessionEpochMismatchTotal prometheus.Counter
 
 	registry *prometheus.Registry
 }
@@ -95,6 +109,16 @@ func NewMetrics() *Metrics {
 			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 15), // 1ms to ~16s
 		},
 		[]string{"server", "method", "target"}, // target: local, hub
+	)
+	m.ToolCallDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "tool_call_duration_seconds",
+			Help:      "Tool call duration in seconds by server, tool, and status",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 15),
+		},
+		[]string{"server", "tool", "status"},
 	)
 
 	m.RequestsInFlight = prometheus.NewGaugeVec(
@@ -387,6 +411,16 @@ func NewMetrics() *Metrics {
 		},
 	)
 
+	// Concurrency metrics
+	m.ConcurrentCalls = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "concurrent_calls",
+			Help:      "Current number of in-flight tool calls across all servers",
+		},
+	)
+
 	// Contention metrics
 	m.CallLockWaitTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -398,10 +432,64 @@ func NewMetrics() *Metrics {
 		[]string{"server"},
 	)
 
+	// Routing metrics
+	m.RoutingPinOverrides = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "routing_pin_override_total",
+			Help:      "Calls where a configured routing pin was overridden (e.g. prefer-local upgraded to prefer-hub while off-LAN)",
+		},
+		[]string{"server", "pin", "effective", "reason"},
+	)
+
+	// Proxy session metrics
+	m.SessionActive = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "session_active",
+			Help:      "Number of proxy sessions currently in active state",
+		},
+	)
+	m.SessionDaemonEpoch = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "session_daemon_epoch",
+			Help:      "Current daemon epoch (increments on daemon restart)",
+		},
+	)
+	m.SessionReapedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "session_reaped_total",
+			Help:      "Total number of proxy sessions reaped after lease expiry",
+		},
+	)
+	m.SessionEvictedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "session_evicted_total",
+			Help:      "Total number of proxy sessions evicted (LRU)",
+		},
+	)
+	m.SessionEpochMismatchTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "loom",
+			Subsystem: "daemon",
+			Name:      "session_epoch_mismatch_total",
+			Help:      "Total number of heartbeats rejected due to daemon epoch mismatch",
+		},
+	)
+
 	// Register all metrics
 	m.registry.MustRegister(
 		m.RequestsTotal,
 		m.RequestDuration,
+		m.ToolCallDuration,
 		m.RequestsInFlight,
 		m.ServerHealth,
 		m.ServerLatency,
@@ -432,10 +520,51 @@ func NewMetrics() *Metrics {
 		m.MemSysBytes,
 		m.GCPauseNs,
 		m.EventsDropped,
+		m.ConcurrentCalls,
 		m.CallLockWaitTotal,
+		m.RoutingPinOverrides,
+		m.SessionActive,
+		m.SessionDaemonEpoch,
+		m.SessionReapedTotal,
+		m.SessionEvictedTotal,
+		m.SessionEpochMismatchTotal,
 	)
 
 	return m
+}
+
+// UpdateSessionGauges sets the active-session count and daemon epoch gauges.
+// Called from the metrics collector loop.
+func (m *Metrics) UpdateSessionGauges(active int, daemonEpoch int64) {
+	m.SessionActive.Set(float64(active))
+	m.SessionDaemonEpoch.Set(float64(daemonEpoch))
+}
+
+// RecordSessionReaped increments the session-reaped counter by n.
+func (m *Metrics) RecordSessionReaped(n int) {
+	if n <= 0 {
+		return
+	}
+	m.SessionReapedTotal.Add(float64(n))
+}
+
+// RecordSessionEvicted increments the session-evicted (LRU) counter.
+func (m *Metrics) RecordSessionEvicted() {
+	m.SessionEvictedTotal.Inc()
+}
+
+// RecordSessionEpochMismatch increments the epoch-mismatch counter.
+func (m *Metrics) RecordSessionEpochMismatch() {
+	m.SessionEpochMismatchTotal.Inc()
+}
+
+// RecordRoutingPinOverride counts a call whose configured routing pin was
+// replaced by a different effective preference (reason e.g. "off_lan").
+func (m *Metrics) RecordRoutingPinOverride(server, pin, effective, reason string) {
+	if m == nil {
+		return
+	}
+	m.RoutingPinOverrides.WithLabelValues(server, pin, effective, reason).Inc()
 }
 
 // Handler returns an HTTP handler for the /metrics endpoint.
@@ -449,6 +578,12 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) RecordRequest(server, method, status, target string, duration time.Duration) {
 	m.RequestsTotal.WithLabelValues(server, method, status).Inc()
 	m.RequestDuration.WithLabelValues(server, method, target).Observe(duration.Seconds())
+}
+
+// RecordToolCall records a low-cardinality latency histogram suitable for
+// p50/p95 breakdowns by server, tool, and call status.
+func (m *Metrics) RecordToolCall(server, tool, status string, duration time.Duration) {
+	m.ToolCallDuration.WithLabelValues(server, tool, status).Observe(duration.Seconds())
 }
 
 // RecordRequestStart records the start of a request (increments in-flight counter).

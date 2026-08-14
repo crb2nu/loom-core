@@ -1,0 +1,1 @@
+- Make pipeline concurrency policy in `pkg/policy/policy.go` fail closed to its bounded default and enforce the resolved limit in `pkg/mills/pipeline/pipeline.go`.

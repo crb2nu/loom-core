@@ -1,0 +1,1 @@
+- Fixed Mills Claude CLI JSON-stream failure classification in `pkg/mills/pipeline/error_class.go` and `pkg/mills/pipeline/spawn_class.go`, so upstream quota and authentication failures remain retryable rather than escalating as code.

@@ -1,0 +1,333 @@
+{
+ "window_seconds": 604800,
+ "generated_at": "2026-07-16T22:00:00Z",
+ "runs": {
+  "total": 36,
+  "done": 14,
+  "escalated": 22,
+  "retry_burn_cost_usd": 11.15,
+  "retry_burn_seconds": 29313
+ },
+ "stages": [
+  {
+   "stage": "plan_slice",
+   "attempts": 43,
+   "errors": 8,
+   "error_rate": 0.186,
+   "p50_seconds": 180,
+   "p90_seconds": 264,
+   "max_seconds": 491,
+   "total_seconds": 7906,
+   "cost_usd": 3.69,
+   "retry_attempts": 7,
+   "retry_cost_usd": 0.34
+  },
+  {
+   "stage": "research",
+   "attempts": 56,
+   "errors": 24,
+   "error_rate": 0.429,
+   "p50_seconds": 20,
+   "p90_seconds": 25,
+   "max_seconds": 109,
+   "total_seconds": 865,
+   "cost_usd": 0.01,
+   "retry_attempts": 21,
+   "retry_cost_usd": 0.0
+  },
+  {
+   "stage": "implement",
+   "attempts": 57,
+   "errors": 23,
+   "error_rate": 0.404,
+   "p50_seconds": 731,
+   "p90_seconds": 1385,
+   "max_seconds": 2632,
+   "total_seconds": 40547,
+   "cost_usd": 17.59,
+   "retry_attempts": 25,
+   "retry_cost_usd": 5.35
+  },
+  {
+   "stage": "tests",
+   "attempts": 31,
+   "errors": 4,
+   "error_rate": 0.129,
+   "p50_seconds": 92,
+   "p90_seconds": 425,
+   "max_seconds": 480,
+   "total_seconds": 4198,
+   "cost_usd": 0.0,
+   "retry_attempts": 3,
+   "retry_cost_usd": 0.0
+  },
+  {
+   "stage": "pr_self_review",
+   "attempts": 49,
+   "errors": 15,
+   "error_rate": 0.306,
+   "p50_seconds": 724,
+   "p90_seconds": 1269,
+   "max_seconds": 1537,
+   "total_seconds": 33110,
+   "cost_usd": 12.12,
+   "retry_attempts": 22,
+   "retry_cost_usd": 5.46
+  },
+  {
+   "stage": "mr",
+   "attempts": 25,
+   "errors": 3,
+   "error_rate": 0.12,
+   "p50_seconds": 1,
+   "p90_seconds": 3,
+   "max_seconds": 4,
+   "total_seconds": 44,
+   "cost_usd": 0.0,
+   "retry_attempts": 2,
+   "retry_cost_usd": 0.0
+  },
+  {
+   "stage": "ci_watch",
+   "attempts": 24,
+   "errors": 7,
+   "error_rate": 0.292,
+   "p50_seconds": 423,
+   "p90_seconds": 1117,
+   "max_seconds": 1800,
+   "total_seconds": 13301,
+   "cost_usd": 0.0,
+   "retry_attempts": 2,
+   "retry_cost_usd": 0.0
+  },
+  {
+   "stage": "merge",
+   "attempts": 17,
+   "errors": 3,
+   "error_rate": 0.176,
+   "p50_seconds": 6,
+   "p90_seconds": 9,
+   "max_seconds": 11,
+   "total_seconds": 100,
+   "cost_usd": 0.0,
+   "retry_attempts": 0,
+   "retry_cost_usd": 0.0
+  },
+  {
+   "stage": "cleanup",
+   "attempts": 20,
+   "errors": 6,
+   "error_rate": 0.3,
+   "p50_seconds": 1,
+   "p90_seconds": 3,
+   "max_seconds": 4,
+   "total_seconds": 34,
+   "cost_usd": 0.0,
+   "retry_attempts": 6,
+   "retry_cost_usd": 0.0
+  }
+ ],
+ "gates": [
+  {
+   "gate": "nonempty_diff",
+   "evaluations": 34,
+   "passes": 34,
+   "fails": 0,
+   "skips": 0,
+   "unparseable": 0
+  },
+  {
+   "gate": "diff_size",
+   "evaluations": 34,
+   "passes": 34,
+   "fails": 0,
+   "skips": 0,
+   "unparseable": 0
+  },
+  {
+   "gate": "scope",
+   "evaluations": 34,
+   "passes": 28,
+   "fails": 6,
+   "skips": 0,
+   "unparseable": 0
+  },
+  {
+   "gate": "path_policy",
+   "evaluations": 34,
+   "passes": 34,
+   "fails": 0,
+   "skips": 0,
+   "unparseable": 0
+  },
+  {
+   "gate": "secret_scan",
+   "evaluations": 34,
+   "passes": 34,
+   "fails": 0,
+   "skips": 0,
+   "unparseable": 0
+  },
+  {
+   "gate": "commit_format",
+   "evaluations": 34,
+   "passes": 34,
+   "fails": 0,
+   "skips": 0,
+   "unparseable": 0
+  },
+  {
+   "gate": "spec_conformance",
+   "evaluations": 32,
+   "passes": 28,
+   "fails": 4,
+   "skips": 0,
+   "unparseable": 4
+  },
+  {
+   "gate": "pr_self_review",
+   "evaluations": 32,
+   "passes": 24,
+   "fails": 8,
+   "skips": 0,
+   "unparseable": 3
+  }
+ ],
+ "escalation_funnel": [
+  {
+   "last_stage": "ci_watch",
+   "outcome": "error",
+   "count": 5
+  },
+  {
+   "last_stage": "implement",
+   "outcome": "success",
+   "count": 3
+  },
+  {
+   "last_stage": "pr_self_review",
+   "outcome": "success",
+   "count": 3
+  },
+  {
+   "last_stage": "research",
+   "outcome": "error",
+   "count": 3
+  },
+  {
+   "last_stage": "merge",
+   "outcome": "error",
+   "count": 3
+  },
+  {
+   "last_stage": "plan_slice",
+   "outcome": "error",
+   "count": 1
+  },
+  {
+   "last_stage": "tests",
+   "outcome": "error",
+   "count": 1
+  },
+  {
+   "last_stage": "pr_self_review",
+   "outcome": "none",
+   "count": 1
+  },
+  {
+   "last_stage": "mr",
+   "outcome": "error",
+   "count": 1
+  },
+  {
+   "last_stage": "implement",
+   "outcome": "error",
+   "count": 1
+  }
+ ],
+ "model_economics": [
+  {
+   "model": "claude-opus-4-8",
+   "backend": "spawn",
+   "calls": 106,
+   "cost_usd": 29.71,
+   "errors": 38,
+   "error_rate": 0.358,
+   "avg_seconds": 712
+  },
+  {
+   "model": "or/kimi-k3",
+   "backend": "litellm",
+   "calls": 64,
+   "cost_usd": 2.14,
+   "errors": 7,
+   "error_rate": 0.109,
+   "avg_seconds": 41
+  },
+  {
+   "model": "qwen-3-coder-30b",
+   "backend": "flexinfer",
+   "calls": 56,
+   "cost_usd": 0.01,
+   "errors": 24,
+   "error_rate": 0.429,
+   "avg_seconds": 18
+  },
+  {
+   "model": "unknown",
+   "backend": "unknown",
+   "calls": 118,
+   "cost_usd": 0.0,
+   "errors": 19,
+   "error_rate": 0.161,
+   "avg_seconds": 96
+  }
+ ],
+ "failure_classes": [
+  {
+   "stage": "research",
+   "class": "model_unavailable",
+   "count": 24
+  },
+  {
+   "stage": "implement",
+   "class": "spawn_infra",
+   "count": 18
+  },
+  {
+   "stage": "pr_self_review",
+   "class": "spawn_infra",
+   "count": 13
+  },
+  {
+   "stage": "ci_watch",
+   "class": "ci_poll_timeout",
+   "count": 7
+  },
+  {
+   "stage": "plan_slice",
+   "class": "spawn_infra",
+   "count": 8
+  },
+  {
+   "stage": "cleanup",
+   "class": "gitlab_api",
+   "count": 6
+  },
+  {
+   "stage": "tests",
+   "class": "devbox_gate_empty",
+   "count": 4
+  },
+  {
+   "stage": "mr",
+   "class": "gitlab_api",
+   "count": 3
+  },
+  {
+   "stage": "merge",
+   "class": "gitlab_api",
+   "count": 3
+  }
+ ]
+}

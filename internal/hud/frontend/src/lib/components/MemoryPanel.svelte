@@ -1,42 +1,48 @@
-<script>
+<script lang="ts">
+  import type { MemoryItem, MemoryStats } from '../stores/memory.svelte.ts';
   import { memoryStore } from '../stores/memory.svelte.ts';
   import { toastStore } from '../stores/toasts.svelte.ts';
   import { formatNumber, relativeTime, statusVariant } from '../utils/format.ts';
+  import type { BulkAction } from '../utils/confirm.ts';
   import Gauge from '../widgets/Gauge.svelte';
   import Badge from '../widgets/Badge.svelte';
   import Modal from '../widgets/Modal.svelte';
-  import ConfirmDialog from '../widgets/ConfirmDialog.svelte';
+  import ConfirmDialog from './shared/ConfirmDialog.svelte';
   import FilterBar from './shared/FilterBar.svelte';
   import EmptyState from './shared/EmptyState.svelte';
   import DataTable from './shared/DataTable.svelte';
   import BulkToolbar from './shared/BulkToolbar.svelte';
   import DetailDrawer from './shared/DetailDrawer.svelte';
+  import PanelHeader from './shared/PanelHeader.svelte';
+  import ErrorBanner from './shared/ErrorBanner.svelte';
 
   $effect(() => {
     memoryStore.startPolling(8000);
     return () => { memoryStore.stopPolling(); };
   });
 
-  let stats = $derived(memoryStore.stats ?? {});
+  // memoryStore.stats/items are always initialized; the former `?? {}`/`?? []`
+  // fallbacks were unreachable and masked the field types.
+  let stats = $derived(memoryStore.stats);
   let items = $derived(memoryStore.items ?? []);
 
   let activeTier = $state('working');
   let searchQuery = $state('');
   let sortKey = $state('');
-  let sortDir = $state('asc');
+  let sortDir = $state<'asc' | 'desc'>('asc');
 
   const memColumns = [
     { key: 'title', label: 'Title', sortable: true },
     { key: 'importance', label: 'Importance', sortable: true, width: '100px' },
-    { key: 'tokens', label: 'Tokens', sortable: true, width: '80px' },
+    { key: 'tokens', label: 'Tokens', sortable: true, width: '80px', hideBelow: 660 },
     { key: 'status', label: 'Status', width: '100px' },
-    { key: 'category', label: 'Category', sortable: true, width: '120px' },
-    { key: 'last_accessed', label: 'Accessed', sortable: true, width: '120px' },
+    { key: 'category', label: 'Category', sortable: true, width: '120px', hideBelow: 780 },
+    { key: 'last_accessed', label: 'Accessed', sortable: true, width: '120px', hideBelow: 900 },
     { key: 'actions', label: '', width: '90px' },
   ];
 
   // Expanded items (click to see full content)
-  let expandedItems = $state(new Set());
+  let expandedItems = $state<Set<string>>(new Set());
 
   // Add memory modal
   let showAddModal = $state(false);
@@ -49,18 +55,30 @@
 
   // Delete confirm dialog
   let showDeleteConfirm = $state(false);
-  let deleteTarget = $state(null);
+  let deleteTarget = $state<MemoryItem | null>(null);
 
   // Compaction status
-  let compaction = $state(null);
+  interface CompactionStatus {
+    status?: string;
+    items_processed?: number;
+    items_compacted?: number;
+    last_run?: string;
+  }
+  let compaction = $state<CompactionStatus | null>(null);
 
-  // Tier data accessors
-  let workingTier = $derived(stats.working_memory ?? {});
-  let shortTier = $derived(stats.short_term_memory ?? {});
-  let longTier = $derived(stats.long_term_memory ?? {});
+  // Tier data accessors — tiers are always present on MemoryStats.
+  let workingTier = $derived(stats.working_memory);
+  let shortTier = $derived(stats.short_term_memory);
+  let longTier = $derived(stats.long_term_memory);
 
-  // Compression stats
-  let compression = $derived(stats.compression ?? {});
+  // Compression stats — optional on MemoryStats; Partial keeps the fields
+  // typed while tolerating the empty fallback.
+  let compression = $derived<Partial<NonNullable<MemoryStats['compression']>>>(stats.compression ?? {});
+
+  // Total items across all three tiers (for the panel identity count).
+  let totalItems = $derived(
+    (workingTier.items ?? 0) + (shortTier.items ?? 0) + (longTier.items ?? 0)
+  );
 
   // Filtered items for browser
   let filteredItems = $derived.by(() => {
@@ -85,8 +103,8 @@
     if (!sortKey) return filteredItems;
     const result = [...filteredItems];
     result.sort((a, b) => {
-      let va = a[sortKey] ?? '';
-      let vb = b[sortKey] ?? '';
+      let va: string | number = (a as unknown as Record<string, string | number>)[sortKey] ?? '';
+      let vb: string | number = (b as unknown as Record<string, string | number>)[sortKey] ?? '';
       if (sortKey === 'tokens') { va = a.tokens ?? 0; vb = b.tokens ?? 0; }
       if (va < vb) return sortDir === 'asc' ? -1 : 1;
       if (va > vb) return sortDir === 'asc' ? 1 : -1;
@@ -95,7 +113,7 @@
     return result;
   });
 
-  function switchTier(tier) {
+  function switchTier(tier: string) {
     activeTier = tier;
     expandedItems = new Set();
     memoryStore.recall(tier, searchQuery || '', 100);
@@ -105,17 +123,22 @@
     memoryStore.recall(activeTier, searchQuery, 100);
   }
 
-  function promoteItem(id) {
-    memoryStore.promote(id);
-    toastStore.info('Memory promoted');
+  function clearFilters() {
+    searchQuery = '';
+    memoryStore.recall(activeTier, '', 100);
   }
 
-  function demoteItem(id) {
-    memoryStore.demote(id);
-    toastStore.info('Memory demoted');
+  async function promoteItem(id: string) {
+    if (await memoryStore.promote(id)) toastStore.info('Memory promoted');
+    else toastStore.error(memoryStore.error ?? 'Failed to promote');
   }
 
-  function toggleExpand(id) {
+  async function demoteItem(id: string) {
+    if (await memoryStore.demote(id)) toastStore.info('Memory demoted');
+    else toastStore.error(memoryStore.error ?? 'Failed to demote');
+  }
+
+  function toggleExpand(id: string) {
     const next = new Set(expandedItems);
     if (next.has(id)) {
       next.delete(id);
@@ -165,7 +188,7 @@
   }
 
   // Delete memory
-  function confirmDelete(item) {
+  function confirmDelete(item: MemoryItem) {
     deleteTarget = item;
     showDeleteConfirm = true;
   }
@@ -190,12 +213,12 @@
   // Fetch compaction on mount
   $effect(() => {
     memoryStore.fetchCompaction().then(data => {
-      if (data) compaction = data;
+      if (data) compaction = data as CompactionStatus;
     });
   });
 
-  function importanceColor(importance) {
-    const map = {
+  function importanceColor(importance: string | number) {
+    const map: Record<string, string> = {
       critical: 'var(--error)',
       high: 'var(--warning)',
       medium: 'var(--fg-primary)',
@@ -204,13 +227,13 @@
     return map[importance] ?? 'var(--fg-secondary)';
   }
 
-  function importanceBorderColor(importance) {
+  function importanceBorderColor(importance: string | number) {
     if (typeof importance === 'number') {
       if (importance >= 0.7) return 'var(--accent)';
       if (importance >= 0.4) return 'var(--info)';
       return 'var(--fg-muted)';
     }
-    const map = {
+    const map: Record<string, string> = {
       critical: 'var(--accent)',
       high: 'var(--accent)',
       medium: 'var(--info)',
@@ -219,16 +242,16 @@
     return map[importance] ?? 'var(--fg-muted)';
   }
 
-  function importanceScore(importance) {
+  function importanceScore(importance: string | number) {
     if (typeof importance === 'number') return importance;
-    const map = { critical: 1.0, high: 0.8, medium: 0.5, low: 0.2 };
+    const map: Record<string, number> = { critical: 1.0, high: 0.8, medium: 0.5, low: 0.2 };
     return map[importance] ?? 0.3;
   }
 
   // Bulk selection
-  let selectedMemIds = $state(new Set());
+  let selectedMemIds = $state<Set<string>>(new Set());
 
-  function handleMemSelect(ids) {
+  function handleMemSelect(ids: Set<string>) {
     selectedMemIds = ids;
   }
 
@@ -238,46 +261,87 @@
     selectedMemIds = new Set();
   });
 
-  async function bulkPromote() {
-    for (const id of selectedMemIds) {
-      await memoryStore.promote(id);
+  let bulkBusy = $state(false);
+
+  // A bulk pass is N sequential mutations, so it needs two guards: `bulkBusy`
+  // locks the toolbar for the duration so a second click cannot start an
+  // overlapping pass over a selection the first one is still draining, and the
+  // ids are snapshotted up front so a mid-pass selection change cannot
+  // retarget the pass that is already running.
+  async function runBulk(pass: (ids: string[]) => Promise<void>): Promise<void> {
+    if (bulkBusy) return;
+    bulkBusy = true;
+    try {
+      await pass([...selectedMemIds]);
+      selectedMemIds = new Set();
+    } finally {
+      bulkBusy = false;
     }
-    toastStore.success(`${selectedMemIds.size} items promoted`);
-    selectedMemIds = new Set();
   }
 
-  async function bulkDemote() {
-    for (const id of selectedMemIds) {
-      await memoryStore.demote(id);
+  // promote/demote/deleteItem each report their own outcome, so a pass the
+  // daemon partly rejected reports what actually landed instead of claiming the
+  // whole selection succeeded.
+  async function bulkPromote(ids: string[]) {
+    let failures = 0;
+    for (const id of ids) {
+      if (!(await memoryStore.promote(id))) failures++;
     }
-    toastStore.success(`${selectedMemIds.size} items demoted`);
-    selectedMemIds = new Set();
+    const ok = ids.length - failures;
+    if (failures === 0) toastStore.success(`${ids.length} items promoted`);
+    else if (ok === 0) toastStore.error(`Failed to promote ${ids.length} items`);
+    else toastStore.warning(`Promoted ${ok} of ${ids.length} items (${failures} failed)`);
   }
 
-  async function bulkDelete() {
-    for (const id of selectedMemIds) {
-      await memoryStore.deleteItem(id);
+  async function bulkDemote(ids: string[]) {
+    let failures = 0;
+    for (const id of ids) {
+      if (!(await memoryStore.demote(id))) failures++;
     }
-    toastStore.success(`${selectedMemIds.size} items deleted`);
-    selectedMemIds = new Set();
+    const ok = ids.length - failures;
+    if (failures === 0) toastStore.success(`${ids.length} items demoted`);
+    else if (ok === 0) toastStore.error(`Failed to demote ${ids.length} items`);
+    else toastStore.warning(`Demoted ${ok} of ${ids.length} items (${failures} failed)`);
+  }
+
+  async function bulkDelete(ids: string[]) {
+    let failures = 0;
+    for (const id of ids) {
+      if (!(await memoryStore.deleteItem(id))) failures++;
+    }
+    const ok = ids.length - failures;
+    if (failures === 0) toastStore.success(`${ids.length} items deleted`);
+    else if (ok === 0) toastStore.error(`Failed to delete ${ids.length} items`);
+    else toastStore.warning(`Deleted ${ok} of ${ids.length} items (${failures} failed)`);
   }
 
   let memBulkActions = $derived(() => {
-    const actions = [];
+    const actions: BulkAction[] = [];
     if (activeTier !== 'long_term') {
-      actions.push({ label: 'Promote', variant: 'success', onclick: bulkPromote });
+      actions.push({ label: 'Promote', variant: 'success', onclick: () => void runBulk(bulkPromote) });
     }
     if (activeTier !== 'working') {
-      actions.push({ label: 'Demote', variant: 'warning', onclick: bulkDemote });
+      actions.push({ label: 'Demote', variant: 'warning', onclick: () => void runBulk(bulkDemote) });
     }
-    actions.push({ label: 'Delete', variant: 'danger', onclick: bulkDelete });
+    // Bulk delete is irreversible and unselective — gate it the same way the
+    // single-row delete has always been gated.
+    actions.push({
+      label: 'Delete',
+      variant: 'danger',
+      onclick: () => void runBulk(bulkDelete),
+      confirm: {
+        title: 'Delete selected memory items?',
+        message: `Delete ${selectedMemIds.size} memory item(s)? This cannot be undone.`,
+        confirmLabel: 'Delete',
+      },
+    });
     return actions;
   });
 
   // Detail drawer
-  let drawerItem = $state(null);
+  let drawerItem = $state<MemoryItem | null>(null);
 
-  function openItemDrawer(item) {
+  function openItemDrawer(item: MemoryItem) {
     drawerItem = item;
   }
 
@@ -288,6 +352,8 @@
 </script>
 
 <div class="panel memory-panel">
+  <PanelHeader title="Memory" icon={'▤'} count={totalItems} />
+
   <!-- Top section: Tier Overview -->
   <div class="tier-overview">
     <div class="tier-col" style="--tier-color: var(--tier-working)">
@@ -412,22 +478,25 @@
   <!-- Bottom section: Item Browser -->
   <div class="item-browser">
     <div class="browser-toolbar">
-      <div class="tier-tabs">
+      <div class="tier-tabs" role="group" aria-label="Memory tier">
         <button
           class="tier-tab"
           class:active-tab={activeTier === 'working'}
+          aria-pressed={activeTier === 'working'}
           onclick={() => switchTier('working')}
           style="--tab-color: var(--tier-working)"
         >Working</button>
         <button
           class="tier-tab"
           class:active-tab={activeTier === 'short_term'}
+          aria-pressed={activeTier === 'short_term'}
           onclick={() => switchTier('short_term')}
           style="--tab-color: var(--tier-short)"
         >Short-Term</button>
         <button
           class="tier-tab"
           class:active-tab={activeTier === 'long_term'}
+          aria-pressed={activeTier === 'long_term'}
           onclick={() => switchTier('long_term')}
           style="--tab-color: var(--tier-long)"
         >Long-Term</button>
@@ -438,13 +507,31 @@
       placeholder="Search memories..."
       resultCount={filteredItems.length}
       onSearch={(val) => { searchQuery = val; handleSearch(); }}
+      onClear={clearFilters}
     >
       {#snippet actions()}
         <button class="btn btn-success" onclick={openAddModal}>+ Add Memory</button>
       {/snippet}
     </FilterBar>
 
-    {#if sortedItems.length === 0}
+    {#if memoryStore.error}
+      <!-- Fetch errors on /memory/* were otherwise swallowed: a cold-
+           start failure showed the same empty-state as a tier with no
+           items, and a refresh failure left stale items on screen with
+           no signal the data had gone stale. Banner mirrors the
+           CatalogPanel pattern; auto-clears on the next successful
+           fetch (the store resets error to null at fetch start). -->
+      <ErrorBanner prefix="Memory refresh failed" message={memoryStore.error} />
+    {/if}
+
+    {#if sortedItems.length === 0 && memoryStore.lastUpdated && !memoryStore.loading}
+      <!-- Gate the empty state on a completed fetch (lastUpdated set) and
+           idle (loading=false); during a refetch or tier switch the
+           previous run had finished so sortedItems briefly drops to 0
+           while the next fetch is in flight, flashing this empty state.
+           The DataTable below renders nothing when fed an empty rows
+           array, so the skeleton/loading-bar carries the visual state
+           during the gap. -->
       <EmptyState icon={'\u25A1'} heading="No items in this tier" compact />
     {:else}
       <DataTable
@@ -454,6 +541,7 @@
         {sortDir}
         expandedIds={expandedItems}
         idKey="id"
+        stableLayout={true}
         selectable={true}
         selectedIds={selectedMemIds}
         onSelect={handleMemSelect}
@@ -461,7 +549,7 @@
         onToggleExpand={(item) => toggleExpand(item.id)}
         onRowClick={openItemDrawer}
       >
-        {#snippet row({ row: item, expanded })}
+        {#snippet row({ row: item, expanded, hiddenColumns })}
           <td style="border-left: 3px solid {importanceBorderColor(item.importance)}">
             <span class="expand-icon">{expanded ? '\u25BC' : '\u25B6'}</span>
             {item.title ?? '---'}
@@ -471,31 +559,40 @@
               {item.importance ?? 'medium'}
             </span>
           </td>
+          {#if !hiddenColumns.has('tokens')}
           <td class="text-mono">{formatNumber(item.tokens ?? 0)}</td>
+          {/if}
           <td>
             <Badge text={item.status ?? 'active'} variant={statusVariant(item.status)} />
           </td>
+          {#if !hiddenColumns.has('category')}
           <td class="text-mono text-muted">{item.category ?? '---'}</td>
+          {/if}
+          {#if !hiddenColumns.has('last_accessed')}
           <td class="text-mono text-muted">{relativeTime(item.last_accessed)}</td>
+          {/if}
           <td class="actions-cell">
             {#if activeTier !== 'long_term'}
               <button
                 class="action-btn promote-btn"
-                onclick={(e) => { e.stopPropagation(); promoteItem(item.id); }}
+                onclick={(e) => { e.stopPropagation(); void promoteItem(item.id); }}
                 title="Promote"
+                aria-label="Promote"
               >&#8593;</button>
             {/if}
             {#if activeTier !== 'working'}
               <button
                 class="action-btn demote-btn"
-                onclick={(e) => { e.stopPropagation(); demoteItem(item.id); }}
+                onclick={(e) => { e.stopPropagation(); void demoteItem(item.id); }}
                 title="Demote"
+                aria-label="Demote"
               >&#8595;</button>
             {/if}
             <button
               class="action-btn delete-btn"
               onclick={(e) => { e.stopPropagation(); confirmDelete(item); }}
               title="Delete"
+              aria-label="Delete"
             >&#10005;</button>
           </td>
         {/snippet}
@@ -508,6 +605,7 @@
       <BulkToolbar
         count={selectedMemIds.size}
         actions={memBulkActions()}
+        busy={bulkBusy}
         onClearSelection={() => { selectedMemIds = new Set(); }}
       />
     {/if}
@@ -563,7 +661,7 @@
   title="Delete Memory"
   message={deleteTarget ? `Delete "${deleteTarget.title}"? This cannot be undone.` : ''}
   confirmLabel="Delete"
-  destructive={true}
+  variant="danger"
   onConfirm={executeDelete}
   onCancel={cancelDelete}
 />
@@ -611,12 +709,12 @@
     {#if drawerItem}
       <div class="drawer-actions">
         {#if activeTier !== 'long_term'}
-          <button class="btn btn-success btn-sm" onclick={() => { promoteItem(drawerItem.id); }}>Promote</button>
+          <button class="btn btn-success btn-sm" onclick={() => { if (drawerItem) void promoteItem(drawerItem.id); }}>Promote</button>
         {/if}
         {#if activeTier !== 'working'}
-          <button class="btn btn-ghost btn-sm" onclick={() => { demoteItem(drawerItem.id); }}>Demote</button>
+          <button class="btn btn-ghost btn-sm" onclick={() => { if (drawerItem) void demoteItem(drawerItem.id); }}>Demote</button>
         {/if}
-        <button class="btn btn-danger btn-sm" onclick={() => { closeItemDrawer(); confirmDelete(drawerItem); }}>Delete</button>
+        <button class="btn btn-danger btn-sm" onclick={() => { const target = drawerItem; closeItemDrawer(); if (target) confirmDelete(target); }}>Delete</button>
       </div>
     {/if}
   {/snippet}
@@ -627,34 +725,44 @@
     display: flex;
     flex-direction: column;
     overflow-y: auto;
-    gap: 16px;
+    gap: var(--space-4);
   }
 
   /* Tier Overview */
   .tier-overview {
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
-    gap: 16px;
+    gap: var(--space-4);
   }
 
   .tier-col {
+    position: relative;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
+    border-radius: var(--radius-md);
     border-top: 3px solid var(--tier-color);
-    padding: 14px 16px;
+    padding: var(--space-3) var(--space-4);
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
+  }
+
+  .tier-col::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
   }
 
   .tier-name {
-    font-size: 12px;
+    font-size: var(--text-sm);
     font-weight: 600;
     color: var(--fg-primary);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: var(--tracking-wide);
   }
 
   .tier-tokens {
@@ -669,58 +777,78 @@
   /* Stats row */
   .stats-row {
     display: flex;
-    gap: 16px;
+    gap: var(--space-4);
   }
 
   /* Compression */
   .compression-section {
+    position: relative;
     flex: 1;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-    padding: 12px 16px;
+    border-radius: var(--radius-md);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .compression-section::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
   }
 
   .compression-cards {
     display: grid;
     grid-template-columns: repeat(6, 1fr);
-    gap: 12px;
+    gap: var(--space-3);
   }
 
   /* Compaction */
   .compaction-section {
+    position: relative;
     flex: 0 0 auto;
     min-width: 260px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-    padding: 12px 16px;
+    border-radius: var(--radius-md);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .compaction-section::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
   }
 
   .compaction-cards {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
+    gap: var(--space-3);
   }
 
   .comp-card {
     text-align: center;
-    padding: 8px;
+    padding: var(--space-2);
   }
 
   .comp-card .metric-value {
-    font-size: 18px;
+    font-size: var(--text-lg);
     font-weight: 700;
     font-family: var(--font-mono);
     color: var(--fg-primary);
-    line-height: 1.1;
+    line-height: var(--leading-tight);
   }
 
   .comp-card .metric-label {
-    font-size: 9px;
+    font-size: var(--text-2xs);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--fg-muted);
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-dim);
     margin-top: 4px;
   }
 
@@ -732,49 +860,67 @@
     min-height: 200px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
+    border-radius: var(--radius-md);
     overflow: hidden;
   }
 
   .browser-toolbar {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 8px 12px 0;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3) 0;
+  }
+
+  .browser-toolbar::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 10%;
+    right: 10%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(var(--info-rgb), 0.06) 50%, transparent);
+    pointer-events: none;
   }
 
   .tier-tabs {
     display: flex;
     gap: 2px;
     background: var(--bg-tertiary);
-    border-radius: var(--border-radius);
+    border-radius: var(--radius-md);
     padding: 2px;
   }
 
   .tier-tab {
     padding: 4px 10px;
-    font-size: 11px;
+    font-size: var(--text-sm);
     font-weight: 500;
     border-radius: var(--radius-sm);
     color: var(--fg-secondary);
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-fast), color var(--transition-fast);
   }
 
   .tier-tab:hover {
     color: var(--fg-primary);
   }
 
+  .tier-tab:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   .active-tab {
     background: var(--bg-secondary) !important;
     color: var(--tab-color, var(--fg-primary)) !important;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    box-shadow: var(--glow-shadow-md) var(--glow-accent);
   }
 
   .expand-icon {
-    font-size: 8px;
+    font-size: var(--text-2xs);
     flex-shrink: 0;
     width: 10px;
-    color: var(--fg-muted);
+    color: var(--fg-dim);
   }
 
   .expand-content {
@@ -787,19 +933,20 @@
 
   .content-pre {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--text-sm);
     color: var(--fg-secondary);
     white-space: pre-wrap;
     word-break: break-word;
-    line-height: 1.5;
+    line-height: var(--leading-normal);
     margin: 0;
   }
 
   .importance-text {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--text-sm);
     font-weight: 600;
     text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
   }
 
   .actions-cell {
@@ -814,9 +961,9 @@
     align-items: center;
     justify-content: center;
     border-radius: var(--radius-sm);
-    font-size: 14px;
+    font-size: var(--text-base);
     font-weight: 700;
-    transition: background 0.15s;
+    transition: background var(--transition-fast);
   }
 
   .promote-btn {
@@ -824,7 +971,7 @@
   }
 
   .promote-btn:hover {
-    background: rgba(34, 178, 85, 0.15);
+    background: var(--success-dim);
   }
 
   .demote-btn {
@@ -832,16 +979,16 @@
   }
 
   .demote-btn:hover {
-    background: rgba(231, 179, 18, 0.15);
+    background: var(--warning-dim);
   }
 
   .delete-btn {
     color: var(--error);
-    font-size: 12px;
+    font-size: var(--text-sm);
   }
 
   .delete-btn:hover {
-    background: rgba(230, 30, 63, 0.15);
+    background: var(--error-dim);
   }
 
   /* Add memory form */
@@ -852,12 +999,12 @@
 
   .add-form textarea {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--text-sm);
     background: var(--bg-primary);
     color: var(--fg-primary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-    padding: 8px;
+    border-radius: var(--radius-md);
+    padding: var(--space-2);
     resize: vertical;
     outline: none;
   }
@@ -868,7 +1015,7 @@
 
   .form-row {
     display: flex;
-    gap: 12px;
+    gap: var(--space-3);
   }
 
   .form-row .form-field {
@@ -879,6 +1026,17 @@
 
   .drawer-actions {
     display: flex;
-    gap: var(--space-2, 8px);
+    gap: var(--space-2);
+  }
+
+  /* Phone/tablet reflow (WCAG 1.4.10): the fixed 3-col tier overview and
+     6-col compression strip overflow narrow viewports. */
+  @media (max-width: 800px) {
+    .tier-overview { grid-template-columns: 1fr; }
+    .compression-cards { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 480px) {
+    .compression-cards { grid-template-columns: repeat(2, 1fr); }
+    .compaction-cards { grid-template-columns: 1fr; }
   }
 </style>

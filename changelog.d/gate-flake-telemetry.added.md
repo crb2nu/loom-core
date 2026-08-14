@@ -1,0 +1,1 @@
+- Export bounded pass/fail and verdict-flip telemetry for deterministic Mills gates via `pkg/mills/gates/metrics.go` and concurrency-safe prior-verdict accounting in `pkg/telemetry/telemetry.go`.

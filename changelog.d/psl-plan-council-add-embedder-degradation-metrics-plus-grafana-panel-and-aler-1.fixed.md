@@ -1,0 +1,1 @@
+- Add bounded embedder failure and latency telemetry in `pkg/codebase/embed/metrics.go` and `pkg/telemetry/telemetry.go`.

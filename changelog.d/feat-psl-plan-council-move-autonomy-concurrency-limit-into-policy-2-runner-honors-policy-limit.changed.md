@@ -1,0 +1,1 @@
+- Record that `pkg/mills/runner/runner.go` honors the validated pipeline concurrency policy limit, preserves the prior default, and rejects invalid limits before worker execution.

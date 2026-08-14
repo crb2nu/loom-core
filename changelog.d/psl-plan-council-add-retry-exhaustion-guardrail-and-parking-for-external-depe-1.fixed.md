@@ -1,0 +1,1 @@
+- Add a persisted external-dependency retry cap and recovery parking guardrail in `pkg/mills/pipeline/retry_policy.go`, `pkg/mills/store/runs.go`, and `pkg/telemetry/metrics.go`, with policy coverage in `pkg/mills/pipeline/retry_policy_test.go`.

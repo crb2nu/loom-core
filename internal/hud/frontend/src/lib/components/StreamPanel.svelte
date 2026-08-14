@@ -1,11 +1,24 @@
-<script>
+<script lang="ts">
   import { streamStore } from '../stores/stream.svelte.ts';
   import { formatTime, entryVariant } from '../utils/format.ts';
   import Badge from '../widgets/Badge.svelte';
+  import SparkLine from '../widgets/SparkLine.svelte';
   import EmptyState from './shared/EmptyState.svelte';
+  import PanelHeader from './shared/PanelHeader.svelte';
+  import VirtualList from '../widgets/VirtualList.svelte';
+  import { createStreamScroll } from '../widgets/useStreamScroll.svelte.ts';
+  import UnseenAboveChip from '../widgets/UnseenAboveChip.svelte';
 
+  // Stream rows are bounded at 500 entries server-side but accumulate over
+  // the session via SSE pushes (`hud.stream` every 5s); virtualize the render
+  // path so the long-tail of older entries doesn't sit in the DOM. Single-line
+  // rows fit a fixed height cleanly; 40px is enough for the padded line on
+  // desktop and stays close to the prior mobile touch-target minimum (44px).
+  const STREAM_ROW_HEIGHT = 40;
+
+  // Slice B3 — polling is just a safety-net fallback for SSE disconnects.
   $effect(() => {
-    streamStore.startPolling(2000);
+    streamStore.startPolling(60000);
     return () => { streamStore.stopPolling(); };
   });
 
@@ -14,12 +27,11 @@
 
   let typeFilter = $state('all');
   let agentFilter = $state('all');
-  let streamEl = $state(null);
 
   const entryTypes = ['all', 'decision', 'finding', 'error', 'task', 'file_read', 'note'];
 
   let agents = $derived.by(() => {
-    const set = new Set();
+    const set = new Set<string>();
     entries.forEach(e => { if (e.agent) set.add(e.agent); });
     return ['all', ...Array.from(set).sort()];
   });
@@ -38,26 +50,55 @@
     return result;
   });
 
-  // Auto-scroll when not paused and new entries arrive
-  $effect(() => {
-    const count = filtered.length;
-    if (!paused && streamEl) {
-      streamEl.scrollTop = 0;
-    }
+  // Scroll behavior: snap-to-top on real prepend (when at top + not
+  // paused), anchor scrollTop on prepend when scrolled down, accumulate
+  // unseen count for the "↑ N new entries" chip. See createStreamScroll
+  // for the full pattern — TimelinePanel and TracesPanel share it.
+  const scroll = createStreamScroll({
+    rowHeight: STREAM_ROW_HEIGHT,
+    source: () => entries.length,
+    visible: () => filtered.length,
+    paused: () => paused,
   });
 
-  function setTypeFilter(type) {
+  function setTypeFilter(type: string) {
     typeFilter = type;
     streamStore.filterType = type;
   }
 
-  function setAgentFilter(agent) {
+  function setAgentFilter(agent: string) {
     agentFilter = agent;
     streamStore.filterAgent = agent;
   }
 
-  function typeBorderColor(type) {
-    const map = {
+  // Event density: bucket entries into 12 time slices for sparkline
+  let densityData = $derived.by(() => {
+    if (entries.length < 2) return [];
+    const times = entries.map(e => new Date(e.timestamp).getTime()).filter(t => !isNaN(t));
+    if (times.length < 2) return [];
+    const min = Math.min(...times);
+    const max = Math.max(...times);
+    const span = max - min || 1;
+    const buckets = new Array(12).fill(0);
+    for (const t of times) {
+      const idx = Math.min(11, Math.floor(((t - min) / span) * 12));
+      buckets[idx]++;
+    }
+    return buckets;
+  });
+
+  // Entry type distribution counts
+  let typeCounts = $derived.by(() => {
+    const counts: Record<string, number> = {};
+    for (const e of entries) {
+      const t = e.entry_type ?? 'note';
+      counts[t] = (counts[t] || 0) + 1;
+    }
+    return counts;
+  });
+
+  function typeBorderColor(type: string) {
+    const map: Record<string, string> = {
       decision: 'var(--accent)',
       finding: 'var(--info)',
       error: 'var(--error)',
@@ -70,13 +111,18 @@
 </script>
 
 <div class="panel stream-panel">
-  <!-- Header: Filters -->
+  <PanelHeader title="Stream" icon={'≡'} count={filtered.length} />
+
+  <!-- Filter bar: kept as its own row below the identity header — the pill
+       set is wide enough that folding it into the header snippet would
+       crowd the title on narrow layouts. -->
   <div class="stream-header">
-    <div class="filter-pills">
+    <div class="filter-pills" role="group" aria-label="Entry type">
       {#each entryTypes as type}
         <button
           class="filter-chip"
           class:active={typeFilter === type}
+          aria-pressed={typeFilter === type}
           onclick={() => setTypeFilter(type)}
         >
           {type === 'all' ? 'All' : type.replace('_', ' ')}
@@ -87,7 +133,8 @@
       <select
         class="agent-select"
         value={agentFilter}
-        onchange={(e) => setAgentFilter(e.target.value)}
+        aria-label="Filter by agent"
+        onchange={(e) => setAgentFilter((e.target as HTMLSelectElement).value)}
       >
         {#each agents as agent}
           <option value={agent}>{agent === 'all' ? 'All Agents' : agent}</option>
@@ -96,6 +143,7 @@
       <button
         class="btn pause-btn"
         class:paused-btn={paused}
+        aria-pressed={paused}
         onclick={() => streamStore.togglePause()}
       >
         {#if paused}
@@ -107,32 +155,68 @@
     </div>
   </div>
 
+  <!-- Density strip -->
+  {#if densityData.length > 0 || Object.keys(typeCounts).length > 0}
+    <div class="density-strip">
+      {#if densityData.length > 0}
+        <SparkLine data={densityData} width={140} height={20} color="var(--accent)" />
+      {/if}
+      {#if Object.keys(typeCounts).length > 0}
+        <div class="type-dist">
+          {#each Object.entries(typeCounts).sort((a, b) => b[1] - a[1]) as [type, count]}
+            <span class="type-dist-item" style:border-color={typeBorderColor(type)}>
+              {type.replace('_', ' ')}: {count}
+            </span>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
+
   <!-- Stream area -->
-  <div class="stream-container" bind:this={streamEl}>
+  <div class="stream-container">
     {#if paused}
       <div class="paused-overlay">
         <span class="paused-text">PAUSED</span>
       </div>
     {/if}
 
+    {#if scroll.unseenCount > 0 && !scroll.isAtTop}
+      <UnseenAboveChip count={scroll.unseenCount} onClick={scroll.jumpToNewest} />
+    {/if}
+
     {#if filtered.length === 0}
-      <EmptyState icon={'\u25C9'} heading="No activity yet" description="Context entries will appear here in real-time" />
+      {#if streamStore.error}
+        <!-- A failed /stream/recent fetch previously rendered the same
+             "No activity yet" copy as an empty cold-start, hiding the
+             reason from the operator. -->
+        <EmptyState icon={'\u26A0'} heading="Stream unavailable" description={streamStore.error} />
+      {:else}
+        <EmptyState icon={'\u25C9'} heading="No activity yet" description="Context entries will appear here in real-time" />
+      {/if}
     {:else}
-      {#each filtered as entry, i (entry.id ?? `${entry.timestamp}-${i}`)}
-        <div
-          class="stream-row"
-          class:alt-row={i % 2 === 1}
-          style="border-left: 3px solid {typeBorderColor(entry.entry_type)}"
-        >
-          <span class="stream-time text-mono">{formatTime(entry.timestamp)}</span>
-          <Badge text={entry.entry_type ?? 'note'} variant={entryVariant(entry.entry_type)} />
-          <span class="stream-agent">
-            <Badge text={entry.agent ?? '---'} variant="info" />
-          </span>
-          <span class="stream-ns text-mono text-muted">{entry.namespace ?? ''}</span>
-          <span class="stream-title truncate">{entry.title ?? entry.content?.slice(0, 80) ?? '---'}</span>
-        </div>
-      {/each}
+      <VirtualList items={filtered} itemHeight={STREAM_ROW_HEIGHT} label="Activity stream" bind:containerEl={scroll.containerEl}>
+        {#snippet children({ item: entry, index })}
+          <div
+            class="stream-row"
+            class:alt-row={index % 2 === 1}
+            style="border-left: 3px solid {typeBorderColor(entry.entry_type)}"
+          >
+            <span class="stream-time text-mono">{formatTime(entry.timestamp)}</span>
+            <Badge text={entry.entry_type ?? 'note'} variant={entryVariant(entry.entry_type)} />
+            <span class="stream-agent">
+              <Badge text={entry.agent ?? '---'} variant="info" />
+            </span>
+            {#if entry.session_id}
+              <span class="stream-session text-mono" title={entry.session_id}>
+                {entry.session_id.slice(0, 8)}
+              </span>
+            {/if}
+            <span class="stream-ns text-mono text-muted">{entry.namespace ?? ''}</span>
+            <span class="stream-title truncate">{entry.title ?? entry.content?.slice(0, 80) ?? '---'}</span>
+          </div>
+        {/snippet}
+      </VirtualList>
     {/if}
   </div>
 </div>
@@ -148,22 +232,52 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 0;
+    padding: var(--space-2) 0;
     border-bottom: 1px solid var(--border);
-    gap: 12px;
+    gap: var(--space-3);
     flex-wrap: wrap;
+  }
+
+  .density-strip {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-1) 0;
+    border-bottom: 1px solid var(--border-subtle);
+    flex-wrap: wrap;
+  }
+
+  .type-dist {
+    display: flex;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+
+  .type-dist-item {
+    font-size: var(--text-xs);
+    font-family: var(--font-mono);
+    color: var(--fg-muted);
+    border-left: 2px solid;
+    padding-left: 6px;
+    letter-spacing: var(--tracking-normal);
   }
 
   .filter-pills {
     display: flex;
-    gap: 6px;
+    gap: 4px;
     flex-wrap: wrap;
+  }
+
+  .filter-chip:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .header-controls {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
   }
 
   .agent-select {
@@ -171,41 +285,48 @@
   }
 
   .pause-btn {
-    padding: 4px 12px;
+    padding: 4px var(--space-3);
     background: var(--bg-tertiary);
-    border-radius: var(--border-radius);
-    font-size: 11px;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
     font-weight: 500;
     display: flex;
     align-items: center;
     gap: 4px;
-    transition: background 0.15s, color 0.15s;
+    transition: background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
+    letter-spacing: var(--tracking-normal);
   }
 
   .pause-btn:hover {
-    background: var(--bg-secondary);
+    background: var(--bg-elevated);
     color: var(--fg-primary);
   }
 
   .paused-btn {
-    background: rgba(231, 179, 18, 0.15);
+    background: var(--warning-dim);
     color: var(--warning);
-    border: 1px solid rgba(231, 179, 18, 0.3);
+    border: 1px solid rgba(var(--warning-rgb), 0.3);
+    box-shadow: var(--glow-shadow-lg) var(--glow-warning);
   }
 
   .pause-icon {
     font-size: 10px;
   }
 
-  /* Stream container */
+  /* Stream container — bounded flex column. VirtualList owns the scroll
+     viewport; .stream-container just provides a fixed slot underneath the
+     paused overlay so VirtualList can compute its own client height. */
   .stream-container {
     flex: 1;
-    overflow-y: auto;
+    min-height: 0;
+    overflow: hidden;
     position: relative;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-    margin-top: 8px;
+    border-radius: var(--radius-md);
+    margin-top: var(--space-2);
+    display: flex;
+    flex-direction: column;
   }
 
   .paused-overlay {
@@ -215,27 +336,32 @@
     display: flex;
     justify-content: center;
     padding: 4px;
-    background: rgba(231, 179, 18, 0.1);
-    border-bottom: 1px solid rgba(231, 179, 18, 0.3);
+    background: var(--warning-dim);
+    border-bottom: 1px solid rgba(var(--warning-rgb), 0.3);
+    backdrop-filter: blur(4px);
   }
 
   .paused-text {
     font-family: var(--font-mono);
     font-size: 10px;
     font-weight: 700;
-    letter-spacing: 2px;
+    letter-spacing: 3px;
     color: var(--warning);
-    animation: pulse 2s ease-in-out infinite;
+    animation: glowPulse 2s ease-in-out infinite;
   }
 
   .stream-row {
+    box-sizing: border-box;
+    height: 40px;
+    overflow: hidden;
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
-    border-bottom: 1px solid rgba(3, 89, 100, 0.5);
-    font-size: 12px;
-    transition: background 0.1s;
+    gap: var(--space-2);
+    padding: 6px var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: var(--text-sm);
+    transition: background var(--transition-fast);
+    position: relative;
   }
 
   .stream-row:hover {
@@ -247,22 +373,35 @@
   }
 
   .alt-row {
-    background: rgba(0, 23, 26, 0.3);
+    background: rgba(6, 12, 16, 0.4);
   }
 
   .stream-time {
-    color: var(--fg-muted);
-    font-size: 11px;
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
     flex-shrink: 0;
     width: 65px;
+    letter-spacing: var(--tracking-normal);
   }
 
   .stream-agent {
     flex-shrink: 0;
   }
 
+  .stream-session {
+    flex-shrink: 0;
+    max-width: 76px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--accent);
+    font-size: var(--text-xs);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 1px 5px;
+  }
+
   .stream-ns {
-    font-size: 10px;
+    font-size: var(--text-xs);
     flex-shrink: 0;
     max-width: 120px;
     overflow: hidden;
@@ -274,5 +413,20 @@
     color: var(--fg-primary);
     flex: 1;
     min-width: 0;
+  }
+
+  @media (max-width: 768px) {
+    .stream-header {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .stream-ns {
+      display: none;
+    }
+    .stream-session {
+      max-width: 62px;
+    }
+    /* .stream-row uses an explicit 40px height for VirtualList; no mobile
+       min-height override — virtualization requires a single row height. */
   }
 </style>

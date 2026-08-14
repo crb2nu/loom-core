@@ -1,0 +1,1 @@
+- Distinguish omitted and explicitly zero pipeline concurrency limits in `pkg/policy/policy.go`, rejecting zero during policy validation while preserving the existing default.

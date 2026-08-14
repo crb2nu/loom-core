@@ -1,5 +1,135 @@
 # Decisions
 
+## 2026-07-14: Bind S1c crash evidence to reviewed render specs and one chained gate session
+
+- Decision:
+  - Version the Flux provenance contract at v5 and require each live Kustomization's complete canonical spec digest to equal the digest reconstructed from its reviewed `platform/gitops` manifest.
+  - Bind all four Kustomization definitions, including `loom-hub-servers`, to the platform review baseline; keep the loom-core protected identity as the independent identity of the rendered payload.
+  - Bind the referenced `gitops-gitlab` and `loom-core` GitRepository objects as first-class provenance: bracket the Kustomization List with two stable GitRepository Lists, compare complete reviewed/live specs, and fence UID, generation, resource version, Ready/ArtifactInStorage generations, artifact revision, and artifact digest through each delete boundary.
+  - Persist the opening GitRepository-A completion timestamp as well as the Kustomization and closing GitRepository-B timestamps, reject overlapping brackets, and reject any terminating source object. In protected-scope mode, accept an artifact digest change only with a changed normalized artifact revision.
+  - Version Deployment provenance at v1. Reconstruct `loom-mills/loom-mills-operator` and `loom-hub/mobile-hud` with `flux build kustomization --dry-run` from private exports of the exact reviewed Git commits, server-normalize each desired object with a Kubernetes dry-run UPDATE, and require its complete `.spec` SHA-256 to equal the fresh live `.spec` SHA-256.
+  - Bind each Deployment proof to its UID, generation, Flux owner/full spec digest, platform transform baseline, payload source baseline, raw rendered spec digest, and Flux renderer version. Cache exact-baseline renders in the harness, but repeat server normalization and live comparison on every preflight.
+  - Version controller Pod execution provenance at v1. Reconstruct the exact ReplicaSet-controller Pod CREATE request, replay current API defaulting/admission with `dryRun=All`, and require the complete admitted PodSpec SHA-256 to equal the complete live PodSpec SHA-256. Normalize only a scheduler-assigned live `nodeName` when the dry-run result has none and the randomized name of one otherwise-identical projected `kube-api-access-*` volume plus its matching mounts. Separately require the live labels to satisfy the full ReplicaSet selector and preserve exact Pod -> ReplicaSet -> Deployment controller lineage. Read each controller namespace through one raw Pod List page with `limit=5000`, rejecting continuation or overflow instead of permitting kubectl to merge pages. Retain each accepted List resourceVersion as observation provenance but exclude only that List revision from cross-observation incarnation equality; Pod and ReplicaSet object resourceVersions remain exact.
+  - Before launch, perform one complete namespace Pod List page with `limit=5000`; reject a continuation token or overflow before watch/launch, retain terminal spawn history in the census, reject every active spawn-related Pod, and anchor the namespace Watch to the accepted List resourceVersion.
+  - Version the authority-plane contract at v1. Load the selected kubeconfig once, minify and flatten it into one private frozen source, and use that exact source for both kubectl reads and the client-go DELETE. Serialize only public endpoint/trust hashes plus the live operator Namespace UID. Require HTTPS without URL userinfo, reread the same active Namespace UID through client-go before the time-sensitive delete hook, and leave only the exact UID-and-resourceVersion-preconditioned DELETE after that hook.
+  - Require every operator REST response used by the gate to carry its Downward-API Pod name, namespace, UID, Deployment name, and a per-process cryptographically random boot ID. Bind those fields to the independently selected Pod -> ReplicaSet -> reviewed Deployment chain. Treat header or boot-ID drift as a terminal authority failure, not an ambiguous retry; after the planned operator DELETE, independently converge and install the exact replacement chain before cleanup REST can resume, even when the caller is canceled or delete-receipt evidence fails. For an unplanned authority change, allow cleanup only through a separate ephemeral mitigation harness that re-proves the original Namespace/reviewed Deployment root plus the current Deployment -> ReplicaSet -> Pod and response boot ID; never copy that replacement into gate evidence, and return a typed authority error immediately on any further drift.
+  - Cap every generic kubectl subprocess at 64 MiB stdout and 64 KiB stderr. Reject overflow, stderr truncation, and command failure without returning partial stdout to any Kubernetes object parser.
+  - Version policy ConfigMap provenance at v1. Select exactly `loom-mills/loom-mills-policy` from the same reviewed `apps` Flux output as the operator Deployment, hash its complete `data`, `binaryData`, and `immutable` payload, and require the live API payload hash to match.
+  - Compute the policy source SHA-256 over the exact committed bytes at `<platform-baseline>:k3s/mills/configmap-policy.yaml`, without YAML reserialization or newline normalization. Require that digest to equal the reviewed pod-template annotation, fresh live Deployment annotation, serialized report checksum, and policy review identity.
+  - Version the policy delete-boundary contract at v1. After the final target controller reread, make the last foreground gate reads before each Pod DELETE an ordered policy ConfigMap A -> effective operator policy -> stable live operator Deployment -> policy ConfigMap B bracket. Require both ConfigMaps to retain the exact reviewed UID, resourceVersion, and complete payload; require the effective policy to remain closed/k8s-only; require the operator Deployment's complete stable identity and checksum to equal immediate preflight; and require B's request-start timestamp to be no more than ten seconds before the recorded DELETE request. The independent process observer remains active and may sample concurrently.
+  - Version the three-run gate binding at v1. Allocate one 32-hex gate ID, derive server-persisted run IDs `wf-canary-<gate-id>-01..03`, and bind run N+1 to the SHA-256 of run N's final evidence file.
+  - Before the live CLI prints gate PASS, rerun the canonical offline verifier over the written summary and run artifacts. A failure atomically invalidates the summary (`overall=false`) and returns an error.
+- Rationale:
+  - Ready status, revision equality, generation stability, and a first-snapshot digest can all bless spec drift that predates the gate. Reconstructing the expected digest from protected Git closes that gap.
+  - Kustomization stability alone does not prove its referenced GitRepository has not been redirected or advanced just before reconciliation. The cross-kind bracket and source-object fence prevent a mixed or stale source snapshot from authorizing a crash.
+  - Without the opening-A timestamp, serialized evidence cannot prove two source brackets or two gate-run windows did not overlap. An unchanged artifact revision with changed bytes is likewise not a proven descendant advance.
+  - Flux Ready and a stable Deployment generation can still bless an arbitrary command, environment, service account, volume, init-container, security, or scheduling patch that predates the gate. Reconstructing and normalizing the reviewed desired object prevents pre-existing live drift from becoming the accepted baseline.
+  - A reviewed Deployment and ReplicaSet template do not prove that the selected live Pod was created under the same API defaults/admission or that its execution spec still matches. Replaying the exact create shape through current admission closes that gap without persisting a Pod; limiting normalization keeps same-image command, environment, service-account, volume-source, security-context, init/ephemeral-container, and scheduling drift visible.
+  - Checking only `data["policy.yaml"]` permits extra live data, binary payloads, or `immutable` drift to become part of the accepted baseline. Checking only the live Deployment annotation permits a hand-maintained checksum to drift away from the reviewed source file.
+  - A valid immediate preflight alone leaves a time-of-check/time-of-use window in which the policy ConfigMap, effective policy, or operator rollout can change before DELETE. The final ordered bracket narrows that window, charges slow request latency against the freshness budget, and makes the remaining non-atomic limitation explicit.
+  - Independent valid run files can otherwise be assembled from unrelated historical gates. A gate-scoped ID, canonical server-bound run IDs, and predecessor hashes make accidental or opportunistic cross-gate mixing fail closed.
+- Alternatives considered:
+  - Compare only `path`, `sourceRef`, and `targetNamespace`; rejected because patches, images, decryption, and `postBuild` would remain unbound.
+  - Read each referenced GitRepository once; rejected because Kubernetes cannot atomically list Kustomizations and GitRepositories, so a single read can construct a mixed cross-kind view.
+  - Trust first-observed live spec hashes; rejected because pre-existing drift would become the baseline.
+  - Compare a hand-selected Deployment field tuple or rely only on the Kustomization digest; rejected because server-side apply can preserve foreign-owned fields that are absent from the reviewed render.
+  - Hash only the parsed `policy.yaml` value; rejected because it ignores other policy-bearing ConfigMap payload fields and cannot prove the exact reviewed source file drove the rollout checksum.
+  - Apply a local hand-maintained list of Kubernetes defaults; rejected because API and admission defaults can evolve. Server-side dry-run UPDATE supplies the same defaulting/admission path without persisting a mutation.
+  - Sign every evidence artifact in this slice; deferred because no gate-signing trust root exists yet. The chain provides integrity and session cohesion, not authenticity against an attacker able to rewrite all artifacts.
+- Consequences:
+  - Full gates require local `platform/gitops` and `loom-core` repositories, the Flux CLI, cluster permission to dry-run Deployment updates, and protected-scope identity mode.
+  - Full gates also require `create pods` authorization in `loom-mills` and `loom-hub`; the harness always supplies `dryRun=All`, but Kubernetes RBAC does not grant a distinct dry-run verb. Pod dry-run replays current admission rather than source-reviewing webhook configuration, so a future Pod-mutating webhook or namespace LimitRange must become a reviewed, versioned evidence dependency before the gate can reopen.
+  - The reviewed operator Deployment must inject `POD_NAME`, `POD_NAMESPACE`, and `POD_UID` with Downward API `fieldRef`s and the restart-stable route must preserve the authority headers. The current external `platform/gitops` manifest is not changed by this loom-core slice; until that reviewed prerequisite lands, the new binary alone cannot satisfy the gate and S1c remains closed.
+  - Authority headers and the boot ID provide fail-closed operational backend/incarnation detection, not cryptographic authenticity against a proxy or workload able to forge headers. Transport authentication and the independently reviewed Kubernetes owner chain remain separate trust requirements.
+  - The frozen kubeconfig directory is mode `0700` and its credential-bearing file is mode `0600`. Normal cleanup failure changes the command exit status and suppresses final gate PASS; `SIGKILL` cannot run cleanup and may leave a private `$TMPDIR/mills-s1c-kubeconfig-*` residual for explicit operator removal.
+  - Dynamic `postBuild.substituteFrom` is rejected because offline exact rendering cannot prove Secret/ConfigMap substitution inputs. Static reviewed substitutions remain part of the full Kustomization spec and render.
+  - Reviewed renders are cached by both exact baseline revisions/digests, both relevant Flux spec digests, binary path, and renderer version. Returned Deployments are deep copies; a renderer identity change creates a different proof and is rejected by gate continuity.
+  - Policy evidence serializes explicit ConfigMap name/namespace, apps Flux full-spec SHA, platform baseline revision/scope digest, exact source path/SHA, renderer identity, rendered/live payload SHAs, and the final delete-boundary bracket. Missing fields, pre-existing drift, extra payload, checksum mismatch, stale or reordered boundary reads, or review changes across samples fail closed.
+  - Flux API default `spec.force=false` is reconstructed before hashing reviewed YAML; any other schema/default change fails closed until the contract is deliberately versioned.
+  - Reviewed Flux manifests must be exactly one YAML document with the expected API version, kind, name, and `flux-system` namespace. Repository credential contents are never serialized; the complete spec hash binds the `secretRef` identity.
+  - Offline verification recomputes every file hash and pure verdict, validates exact run IDs and predecessor links, and rejects legacy or mixed evidence.
+- Sources:
+  - `pkg/mills/workflow/killtest/preflight.go`
+  - `pkg/mills/workflow/killtest/flux_provenance.go`
+  - `pkg/mills/workflow/killtest/deployment_provenance.go`
+  - `pkg/mills/workflow/killtest/pod_execution_provenance.go`
+  - `pkg/mills/workflow/killtest/policy_configmap_provenance.go`
+  - `pkg/mills/workflow/killtest/authority_plane.go`
+  - `pkg/mills/workflow/killtest/cleanup_authority.go`
+  - `pkg/mills/workflow/killtest/kube.go`
+  - `pkg/mills/workflow/killtest/types.go`
+  - `pkg/mills/workflow/killtest/runtime.go`
+  - `cmd/mills-workflow-killtest/main.go`
+  - `cmd/mills-workflow-killtest/verify.go`
+
+## 2026-03-16: Implement generic bulk mutations as daemon-generated synthetic tools
+
+- Decision:
+  - Add daemon-generated `server__bulk` tools for eligible mutation-oriented MCP servers instead of implementing separate native bulk handlers in each `cmd/mcp-*` server.
+  - Use a file-driven JSON/YAML manifest contract so agents can move repetitive arguments out of model context and into a local artifact.
+- Rationale:
+  - The daemon already owns aggregated tool discovery, schema validation, authorization, audit logging, metrics, and output scanning.
+  - Implementing bulk at the daemon layer lets one slice cover many servers while preserving the existing execution contract for each nested operation.
+  - A server-scoped synthetic surface like `gitlab__bulk` is easier to discover and reason about than a single cross-server mega-tool.
+- Alternatives considered:
+  - Add native bulk tools to each individual MCP server.
+  - Rely on agent-side macros that still emit repeated MCP calls.
+  - Add one universal cross-server `bulk` tool.
+- Consequences:
+  - Bulk eligibility is heuristic plus exclusion-list driven, so follow-up tuning is expected as more real usage appears.
+  - The daemon needs a nested-call path that bypasses semaphore reacquisition for internal bulk fan-out.
+  - The first slice intentionally keeps manifests single-server and forbids nested bulk.
+- Sources:
+  - `internal/daemon/bulk_tools.go:19`
+  - `internal/daemon/bulk_tools.go:168`
+  - `internal/daemon/bulk_tools.go:285`
+  - `internal/daemon/bulk_tools.go:638`
+  - `internal/daemon/daemon_call.go:26`
+  - `internal/daemon/daemon_toolcache.go:176`
+  - `internal/daemon/schema_validate.go:134`
+
+## 2026-03-13: Continue HUD/UX work in a fresh main-based worktree
+
+- Decision:
+  - Create a new sibling worktree at `/Users/cblevins/workspace/services/loom-core-hud-ux` on branch `codex/hud-ux`, starting from `main`.
+  - Treat `codex/hud-view-fixes` as reference material to review or cherry-pick selectively instead of continuing on that branch directly.
+- Rationale:
+  - The primary checkout already had unrelated local edits, so a clean worktree keeps HUD/UX work isolated.
+  - The existing `codex/hud-view-fixes` branch contains useful panel and shared-component changes, but it is not aligned closely enough with `main` to assume a straight continuation path.
+  - Current `.loom/10`, `.loom/20`, and `.loom/30` docs are serving the mobile companion thread, so HUD/UX continuation needed a fresh dated planning set.
+- Alternatives considered:
+  - Reusing the existing `codex/hud-view-fixes` worktree directly.
+  - Working from the dirty primary checkout.
+- Consequences:
+  - HUD/UX work now has an isolated continuation lane with updated planning artifacts.
+  - The next implementation pass should begin with carry-forward triage from `codex/hud-view-fixes`.
+- Sources:
+  - Command: `git worktree add -b codex/hud-ux ../loom-core-hud-ux main`
+  - Command: `git log --oneline --decorate --no-merges main..codex/hud-view-fixes`
+  - Command: `git diff --stat main..codex/hud-view-fixes`
+  - `ROADMAP.md:212`
+  - `ROADMAP.md:219`
+
+## 2026-03-11: Make codebase benchmark artifacts valid under default MCP output mode
+
+- Decision:
+  - `cmd/codebase-bench` will decode MCP tool responses as structured text that may be JSON, TOON, or an MCP error envelope.
+  - Watch benchmark runs will derive a stable fallback repo ID from the fixture name when `--repo-id` is omitted.
+- Rationale:
+  - `mcp.JSONResult(...)` defaults to TOON output in this repo, so a plain `json.Unmarshal` made `make codebase-bench-baseline` fail before any measurement could start.
+  - The previous watch repo ID fallback produced `-watch`, which made artifacts hard to compare or script.
+- Alternatives considered:
+  - Forcing `LOOM_MCP_OUTPUT_FORMAT=json` only inside the benchmark command.
+  - Requiring `--repo-id` for all watch runs.
+- Consequences:
+  - The benchmark harness now works under the same default output mode as the rest of the repo.
+  - Watch artifacts are attributable (`mixedrepo-watch`) and can feed reporting automation.
+- Sources:
+  - [S1] `cmd/codebase-bench/main.go:223`
+  - [S2] `cmd/codebase-bench/main.go:283`
+  - [S3] `cmd/codebase-bench/main.go:418`
+  - [S4] `cmd/codebase-bench/main_test.go:10`
+
 ## 2026-02-19: Set mobile auth bootstrap default to native OAuth + PKCE with device-code fallback
 
 - Decision:
@@ -218,6 +348,40 @@
   - [S1] Research findings F1, F3, F7 (`10-research.md`)
   - [S2] `layout.css` — existing ad-hoc grid/component styles
 
+## 2026-03-06: Move private workspace libs out of CI bootstrap and into pinned modules plus go.work
+
+- Decision:
+  - Keep developer-local sibling library usage in a committed `go.work`.
+  - Pin `gitlab.flexinfer.ai/libs/mcp-go`, `gitlab.flexinfer.ai/libs/fi-mcp-kit`, and `gitlab.flexinfer.ai/libs/fi-accel/go/fiaccel` in `go.mod`.
+  - In CI, force `GOWORK=off` and authenticate direct private module fetches with GitLab job-token URL rewrites instead of cloning sibling repos into `../../libs`.
+- Rationale:
+  - The previous pattern made every heavy CI job pay for manual repo bootstrap and three extra clones before any actual build or test work started.
+  - The repo still needs local workspace overlays for adjacent-lib development, but that concern belongs in `go.work`, not in CI job bootstrap.
+- Consequences:
+  - CI resolves reproducible pinned versions while local workspace builds still track sibling checkout heads.
+  - Private module auth is now an explicit CI concern.
+- Sources:
+  - [S1] `go.mod:35`
+  - [S2] `go.work:1`
+  - [S3] `.gitlab-ci.yml:61`
+  - [S4] `.gitlab-ci.yml:125`
+
+## 2026-03-06: Use named BuildKit context plus container-local replaces for custom-server local image builds
+
+- Decision:
+  - Build `Dockerfile.custom-server.local` from `services/loom-core` as the primary context and pass `libs/` as a named BuildKit context.
+  - Inside the builder, inject temporary `go mod edit -replace` mappings for the three private sibling modules before compiling.
+- Rationale:
+  - Using the whole workspace as Docker context pushed multiple gigabytes of unrelated artifacts into every image build.
+  - The container still needs sibling lib content, but that should be an explicit secondary context, not a workspace-root side effect.
+- Consequences:
+  - Local image builds are materially smaller and no longer depend on remote GitLab auth for the private sibling modules.
+  - This logic is intentionally local-only and remains isolated to `Dockerfile.custom-server.local`.
+- Sources:
+  - [S1] `Makefile:979`
+  - [S2] `Dockerfile.custom-server.local:21`
+  - [S3] `Dockerfile.custom-server.local:32`
+
 ## 2026-02-13: Use slide-over DetailDrawer for drill-down (not modal)
 
 - Decision:
@@ -254,3 +418,24 @@
   - [S1] `.codex/skills/plan-loom-core/SKILL.md:15`
   - [S2] Command: unset `CODEX_HOME` + raw command failure.
   - [S3] Command: unset `CODEX_HOME` + fallback command success.
+
+## 2026-03-04: Responses integration as isolated orchestration layer (not proxy-core change)
+
+- Decision:
+  - Implement OpenAI Responses support as a dedicated Loom orchestration package/command that executes tools through existing daemon `loom/call` paths, instead of embedding Responses logic directly into `loom proxy` transport handlers.
+- Rationale:
+  - `loom proxy` currently focuses on MCP transport aggregation and routing (`cmd/loom/proxy.go`), with strict concerns around transport reliability, timeout derivation, and payload truncation.
+  - Daemon call pipeline already centralizes RBAC, policy checks, caching, and audit (`internal/daemon/daemon_call.go`, `internal/daemon/callpipeline.go`).
+  - Reusing existing call paths minimizes security/regression risk while enabling Responses-specific orchestration in a separable layer.
+- Alternatives considered:
+  - Add Responses orchestration directly into proxy handlers: rejected due mixed concerns and higher blast radius.
+  - Keep loop orchestration entirely in clients: rejected due policy/audit fragmentation.
+- Consequences:
+  - New package/API surface required for Responses request/stream loop handling.
+  - Existing proxy/daemon behavior remains unchanged for non-Responses workflows.
+- Sources:
+  - [S1] `cmd/loom/proxy.go:412`
+  - [S2] `cmd/loom/proxy.go:438`
+  - [S3] `internal/daemon/daemon_call.go:24`
+  - [S4] `internal/daemon/callpipeline.go:126`
+  - [S5] `.loom/15-research-openai-responses-tool-context-2026-03-04.md`

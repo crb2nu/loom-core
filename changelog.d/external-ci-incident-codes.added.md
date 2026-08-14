@@ -1,0 +1,1 @@
+- **Structured external CI incident codes** (`pkg/telemetry/incident_codes.go`, `pkg/mcperror/classification.go`, `pkg/mills/audit/classification.go`): GitLab CI-style external dependency failures now normalize through stable `external_dependency_incident` reason codes and emit deterministic `incident_class`/`incident_code` labels from the audit classifier.

@@ -1,31 +1,51 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/remotecommand"
 )
 
-const defaultBuilderImage = "quay.io/buildah/stable:v1.38.0"
+const (
+	defaultBuilderImage  = "quay.io/buildah/stable:v1.38.0"
+	defaultGitCloneImage = "alpine/git:2.47.2"
+)
+
+const (
+	defaultBuildCPURequest              = "1"
+	defaultBuildCPULimit                = "3"
+	defaultBuildMemoryRequest           = "1Gi"
+	defaultBuildMemoryLimit             = "3Gi"
+	defaultBuildEphemeralStorageRequest = "2Gi"
+	defaultBuildEphemeralStorageLimit   = "40Gi"
+	defaultMaxBuilds                    = 1
+)
+
+const (
+	// git-clone init container memory. The clone is a FULL clone (no --depth 1,
+	// see gitCloneInitContainer), so `git index-pack` delta resolution spikes
+	// memory on larger-history repos. The old hardcoded 256Mi limit intermittently
+	// OOM-killed (exit 137) clones of bigger services repos (e.g. flexdeck during
+	// the 2026-07-05 cross-repo kill-test). The limit allows a brief burst during
+	// delta resolution; the request stays modest so scheduling isn't burdened.
+	defaultGitCloneMemoryRequest = "256Mi"
+	defaultGitCloneMemoryLimit   = "1Gi"
+)
 
 // K8sBackend implements Backend using a Kubernetes cluster.
 // Builds are performed in-cluster via Buildah pods — no local Docker daemon required.
+// Each build pod gets its own EmptyDir storage and uses registry-based layer caching
+// via --cache-from, allowing parallel builds across projects.
 type K8sBackend struct {
 	clientset       kubernetes.Interface
 	restConfig      *rest.Config
@@ -35,18 +55,59 @@ type K8sBackend struct {
 	imagePullSecret string // image pull secret name for private registry
 	workspaceRoot   string // host path to workspace (NFS export source)
 	builderImage    string // Buildah builder image
+	gitCloneImage   string // git image used by git-clone init containers
+	nfsFlush        bool   // prepend NFS cache flush to exec commands
+	gitBaseURL      string // base git URL for workspace repos (enables git-clone mode)
+	gitSecret       string // secret name containing git token (key: "token")
+
+	buildCPURequest              resource.Quantity
+	buildCPULimit                resource.Quantity
+	buildMemoryRequest           resource.Quantity
+	buildMemoryLimit             resource.Quantity
+	buildEphemeralStorageRequest resource.Quantity
+	buildEphemeralStorageLimit   resource.Quantity
+	buildAvoidNodes              []string
+	buildSlots                   chan struct{}
+
+	gitCloneMemoryRequest resource.Quantity
+	gitCloneMemoryLimit   resource.Quantity
+
+	// Tar-pipe sync configuration.
+	syncMode     string   // "tar-pipe", "git-clone", or "nfs"
+	syncExcludes []string // additional exclude patterns for tar-pipe sync
+	maxSyncSize  int64    // max uncompressed tar size in bytes (0 = default 200MB)
 }
 
 // K8sBackendConfig holds configuration for the K8s backend.
 type K8sBackendConfig struct {
-	Kubeconfig      string // path to kubeconfig file
-	Namespace       string // namespace for sandbox pods (default: "devbox")
-	Registry        string // image registry (e.g., "registry.harbor.lan")
-	StorageClass    string // storage class for PVCs (default: "longhorn")
-	WorkspacePVC    string // PVC name for NFS workspace (default: "devbox-workspace-nfs")
-	ImagePullSecret string // image pull secret name (default: "harbor-creds")
-	WorkspaceRoot   string // host path to workspace (for NFS-relative path computation)
-	BuilderImage    string // Buildah builder image (default: quay.io/buildah/stable:v1.38.0)
+	Kubeconfig                   string // path to kubeconfig file
+	Namespace                    string // namespace for sandbox pods (default: "devbox")
+	Registry                     string // image registry (e.g., "registry.harbor.lan")
+	StorageClass                 string // storage class for PVCs (default: "longhorn")
+	WorkspacePVC                 string // PVC name for NFS workspace (default: "devbox-workspace-nfs")
+	ImagePullSecret              string // image pull secret name (default: "harbor-creds")
+	WorkspaceRoot                string // host path to workspace (for NFS-relative path computation)
+	BuilderImage                 string // Buildah builder image (default: quay.io/buildah/stable:v1.38.0)
+	GitCloneImage                string // git image for git-clone init containers (default: alpine/git:2.47.2)
+	NFSFlush                     bool   // prepend NFS attr cache flush to exec commands (default: true for K8s)
+	GitBaseURL                   string // base git URL for repos (e.g., "https://gitlab.blevins.dev/homelab"); enables git-clone mode
+	GitSecret                    string // secret name containing git token (key: "token"); required when GitBaseURL is set
+	BuildCPURequest              string // Buildah pod CPU request as Kubernetes quantity (default: "1")
+	BuildCPULimit                string // Buildah pod CPU limit as Kubernetes quantity (default: "3")
+	BuildMemoryRequest           string // Buildah pod memory request as Kubernetes quantity (default: "1Gi")
+	BuildMemoryLimit             string // Buildah pod memory limit as Kubernetes quantity (default: "3Gi")
+	BuildEphemeralStorageRequest string // Buildah pod ephemeral-storage request (default: "2Gi")
+	BuildEphemeralStorageLimit   string // Buildah pod ephemeral-storage limit (default: "40Gi")
+	BuildAvoidNodes              string // comma-separated node names to avoid for Buildah pods
+	MaxConcurrentBuilds          int    // max concurrent Buildah pods per backend process (default: 1)
+
+	GitCloneMemoryRequest string // git-clone init container memory request as Kubernetes quantity (default: "256Mi")
+	GitCloneMemoryLimit   string // git-clone init container memory limit as Kubernetes quantity (default: "1Gi")
+
+	// Tar-pipe sync: stream local files into pods via SPDY exec.
+	SyncMode     string   // "tar-pipe" (default local), "git-clone", "nfs"
+	SyncExcludes []string // additional exclude patterns for tar-pipe sync
+	MaxSyncSize  int64    // max uncompressed tar bytes (default: 200MB)
 }
 
 // NewK8sBackend creates a new Kubernetes backend.
@@ -66,9 +127,47 @@ func NewK8sBackend(cfg K8sBackendConfig) (*K8sBackend, error) {
 	if cfg.BuilderImage == "" {
 		cfg.BuilderImage = defaultBuilderImage
 	}
+	if cfg.GitCloneImage == "" {
+		cfg.GitCloneImage = defaultGitCloneImage
+	}
 	if cfg.WorkspaceRoot == "" {
 		home, _ := os.UserHomeDir()
 		cfg.WorkspaceRoot = filepath.Join(home, "workspace")
+	}
+	buildCPURequest, err := parseBuildQuantity("build CPU request", cfg.BuildCPURequest, defaultBuildCPURequest)
+	if err != nil {
+		return nil, err
+	}
+	buildCPULimit, err := parseBuildQuantity("build CPU limit", cfg.BuildCPULimit, defaultBuildCPULimit)
+	if err != nil {
+		return nil, err
+	}
+	buildMemoryRequest, err := parseBuildQuantity("build memory request", cfg.BuildMemoryRequest, defaultBuildMemoryRequest)
+	if err != nil {
+		return nil, err
+	}
+	buildMemoryLimit, err := parseBuildQuantity("build memory limit", cfg.BuildMemoryLimit, defaultBuildMemoryLimit)
+	if err != nil {
+		return nil, err
+	}
+	buildEphemeralStorageRequest, err := parseBuildQuantity("build ephemeral-storage request", cfg.BuildEphemeralStorageRequest, defaultBuildEphemeralStorageRequest)
+	if err != nil {
+		return nil, err
+	}
+	buildEphemeralStorageLimit, err := parseBuildQuantity("build ephemeral-storage limit", cfg.BuildEphemeralStorageLimit, defaultBuildEphemeralStorageLimit)
+	if err != nil {
+		return nil, err
+	}
+	gitCloneMemoryRequest, err := parseBuildQuantity("git-clone memory request", cfg.GitCloneMemoryRequest, defaultGitCloneMemoryRequest)
+	if err != nil {
+		return nil, err
+	}
+	gitCloneMemoryLimit, err := parseBuildQuantity("git-clone memory limit", cfg.GitCloneMemoryLimit, defaultGitCloneMemoryLimit)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.MaxConcurrentBuilds <= 0 {
+		cfg.MaxConcurrentBuilds = defaultMaxBuilds
 	}
 
 	restConfig, err := buildRestConfig(cfg.Kubeconfig)
@@ -82,15 +181,58 @@ func NewK8sBackend(cfg K8sBackendConfig) (*K8sBackend, error) {
 	}
 
 	return &K8sBackend{
-		clientset:       clientset,
-		restConfig:      restConfig,
-		namespace:       cfg.Namespace,
-		registry:        cfg.Registry,
-		workspacePVC:    cfg.WorkspacePVC,
-		imagePullSecret: cfg.ImagePullSecret,
-		workspaceRoot:   cfg.WorkspaceRoot,
-		builderImage:    cfg.BuilderImage,
+		clientset:                    clientset,
+		restConfig:                   restConfig,
+		namespace:                    cfg.Namespace,
+		registry:                     cfg.Registry,
+		workspacePVC:                 cfg.WorkspacePVC,
+		imagePullSecret:              cfg.ImagePullSecret,
+		workspaceRoot:                cfg.WorkspaceRoot,
+		builderImage:                 cfg.BuilderImage,
+		gitCloneImage:                cfg.GitCloneImage,
+		nfsFlush:                     cfg.NFSFlush,
+		gitBaseURL:                   cfg.GitBaseURL,
+		gitSecret:                    cfg.GitSecret,
+		buildCPURequest:              buildCPURequest,
+		buildCPULimit:                buildCPULimit,
+		buildMemoryRequest:           buildMemoryRequest,
+		buildMemoryLimit:             buildMemoryLimit,
+		buildEphemeralStorageRequest: buildEphemeralStorageRequest,
+		buildEphemeralStorageLimit:   buildEphemeralStorageLimit,
+		buildAvoidNodes:              splitCSV(cfg.BuildAvoidNodes),
+		buildSlots:                   make(chan struct{}, cfg.MaxConcurrentBuilds),
+		gitCloneMemoryRequest:        gitCloneMemoryRequest,
+		gitCloneMemoryLimit:          gitCloneMemoryLimit,
+		syncMode:                     cfg.SyncMode,
+		syncExcludes:                 cfg.SyncExcludes,
+		maxSyncSize:                  cfg.MaxSyncSize,
 	}, nil
+}
+
+func splitCSV(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func parseBuildQuantity(name, value, fallback string) (resource.Quantity, error) {
+	if value == "" {
+		value = fallback
+	}
+	q, err := resource.ParseQuantity(value)
+	if err != nil {
+		return resource.Quantity{}, fmt.Errorf("invalid %s %q: %w", name, value, err)
+	}
+	return q, nil
 }
 
 func buildRestConfig(kubeconfig string) (*rest.Config, error) {
@@ -105,6 +247,28 @@ func buildRestConfig(kubeconfig string) (*rest.Config, error) {
 	return clientcmd.BuildConfigFromFlags("", home+"/.kube/config")
 }
 
+// Clientset returns the underlying Kubernetes clientset. This allows callers
+// (e.g., the spawn controller) to share the same authenticated client for
+// direct pod queries without creating a separate kubeconfig connection.
+func (k *K8sBackend) Clientset() kubernetes.Interface {
+	return k.clientset
+}
+
+// Namespace returns the K8s namespace this backend targets.
+func (k *K8sBackend) Namespace() string {
+	return k.namespace
+}
+
+// RestConfig returns the Kubernetes REST config for StreamExec callers.
+func (k *K8sBackend) RestConfig() *rest.Config {
+	return k.restConfig
+}
+
+// NFSFlush returns whether NFS cache flush is enabled.
+func (k *K8sBackend) NFSFlush() bool {
+	return k.nfsFlush
+}
+
 func (k *K8sBackend) Health(ctx context.Context) error {
 	_, err := k.clientset.CoreV1().Namespaces().Get(ctx, k.namespace, metav1.GetOptions{})
 	if err != nil {
@@ -113,727 +277,119 @@ func (k *K8sBackend) Health(ctx context.Context) error {
 	return nil
 }
 
-const buildMaxRetries = 2
-
-func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, error) {
-	registryTag := k.registryTag(opts.Tag)
-
-	// Compute NFS-relative paths so the Buildah pod can find files via the shared PVC.
-	contextRel, err := filepath.Rel(k.workspaceRoot, opts.ContextDir)
-	if err != nil || strings.HasPrefix(contextRel, "..") {
-		return nil, fmt.Errorf("context dir %q is not under workspace root %q", opts.ContextDir, k.workspaceRoot)
+// ResolveSecretEnv implements SecretResolver. Reads each referenced K8s
+// Secret via the backend's Clientset and returns a name → plaintext value
+// map. Missing Secrets and missing keys are skipped silently (Optional
+// semantics matching how K8s SecretKeyRef behaves on pod-spec env). Reads
+// are cached by SecretName so multiple SecretEnvVar entries pointing at
+// the same Secret hit the API once.
+//
+// Errors are returned only for unexpected failures (e.g., permission
+// denied, transport error). NotFound on a Secret is treated as absent.
+func (k *K8sBackend) ResolveSecretEnv(ctx context.Context, secrets []SecretEnvVar) (map[string]string, error) {
+	out := make(map[string]string, len(secrets))
+	if len(secrets) == 0 {
+		return out, nil
 	}
-
-	// Detach from the request context: builds are long-running and must
-	// survive MCP proxy timeouts / client disconnects. Use a generous
-	// build-scoped timeout instead.
-	buildCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-
-	buildName := sanitizeBuildName(opts.Tag)
-
-	// Inject Dockerfile via ConfigMap so it's accessible to the Buildah pod
-	// without requiring the local filesystem to be the NFS volume.
-	cmName := "buildah-dockerfile-" + buildName
-	if err := k.createDockerfileConfigMap(buildCtx, cmName, opts.Dockerfile); err != nil {
-		return nil, fmt.Errorf("create dockerfile configmap: %w", err)
+	type cacheEntry struct {
+		data    map[string][]byte
+		present bool
 	}
-	defer func() {
-		_ = k.deleteConfigMap(context.Background(), cmName)
-	}()
-
-	podName := "buildah-build-" + buildName
-
-	var lastErr error
-	for attempt := range buildMaxRetries {
-		result, err := k.runBuildPod(buildCtx, podName, registryTag, cmName, contextRel)
-		if err == nil {
-			return result, nil
+	cache := make(map[string]cacheEntry, len(secrets))
+	for _, s := range secrets {
+		if s.Name == "" || s.SecretName == "" || s.SecretKey == "" {
+			continue
 		}
-		lastErr = err
-
-		// Don't retry on context cancellation
-		if buildCtx.Err() != nil {
-			break
+		entry, ok := cache[s.SecretName]
+		if !ok {
+			secret, err := k.clientset.CoreV1().Secrets(k.namespace).Get(ctx, s.SecretName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					entry = cacheEntry{present: false}
+				} else {
+					return nil, fmt.Errorf("get secret %q: %w", s.SecretName, err)
+				}
+			} else {
+				entry = cacheEntry{data: secret.Data, present: true}
+			}
+			cache[s.SecretName] = entry
 		}
-
-		if attempt < buildMaxRetries-1 {
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		if !entry.present {
+			continue
 		}
-	}
-	return nil, lastErr
-}
-
-// runBuildPod creates a Buildah build pod, waits for completion, and returns the result.
-func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmName, contextRel string) (*BuildResult, error) {
-	pod := k.buildBuildahPodSpec(podName, registryTag, cmName, contextRel)
-
-	// Delete any leftover build pod with the same name
-	_ = k.deletePod(ctx, podName)
-
-	if _, err := k.clientset.CoreV1().Pods(k.namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-		return nil, fmt.Errorf("create buildah pod: %w", err)
-	}
-	defer func() {
-		_ = k.deletePod(context.Background(), podName)
-	}()
-
-	// Wait for the build to complete
-	if err := k.waitForPodDone(ctx, podName, 10*time.Minute); err != nil {
-		logs, _ := k.getPodLogs(ctx, podName)
-		return nil, fmt.Errorf("buildah build failed: %w\n%s", err, logs)
-	}
-
-	// Read build logs and check for cache hits
-	logs, _ := k.getPodLogs(ctx, podName)
-	cached := strings.Contains(logs, "Using cache") ||
-		strings.Contains(logs, "--> Using cache")
-
-	return &BuildResult{ImageTag: registryTag, Cached: cached}, nil
-}
-
-func (k *K8sBackend) Start(ctx context.Context, opts StartOpts) (*StartResult, error) {
-	// Delete existing pod if present (idempotent)
-	_ = k.Stop(ctx, opts.Name)
-
-	registryTag := k.registryTag(opts.ImageTag)
-	pod := k.buildPodSpec(opts, registryTag)
-
-	created, err := k.clientset.CoreV1().Pods(k.namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("create pod: %w", err)
-	}
-
-	// Wait for pod to be Running; cleanup dangling pod on failure
-	if err := k.waitForPodRunning(ctx, opts.Name, 120*time.Second); err != nil {
-		_ = k.Stop(ctx, opts.Name) // cleanup dangling pod
-		return nil, fmt.Errorf("pod not ready: %w", err)
-	}
-
-	return &StartResult{ContainerID: created.Name}, nil
-}
-
-func (k *K8sBackend) Exec(ctx context.Context, opts ExecOpts) (*ExecResult, error) {
-	if opts.TimeoutSec > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(opts.TimeoutSec)*time.Second)
-		defer cancel()
-	}
-
-	start := time.Now()
-
-	// Build the command with workdir and env vars prepended
-	shellCmd := opts.Command
-	if len(opts.Env) > 0 {
-		var envPrefix strings.Builder
-		for k, v := range opts.Env {
-			envPrefix.WriteString(fmt.Sprintf("export %s=%q; ", k, v))
-		}
-		shellCmd = envPrefix.String() + shellCmd
-	}
-	if opts.WorkDir != "" {
-		shellCmd = fmt.Sprintf("cd %q && %s", opts.WorkDir, shellCmd)
-	}
-
-	req := k.clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(opts.ContainerID).
-		Namespace(k.namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: "devbox",
-			Command:   []string{"sh", "-c", shellCmd},
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-
-	executor, err := remotecommand.NewSPDYExecutor(k.restConfig, "POST", req.URL())
-	if err != nil {
-		return nil, fmt.Errorf("create executor: %w", err)
-	}
-
-	var stdoutBuf, stderrBuf bytes.Buffer
-	streamErr := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdoutBuf,
-		Stderr: &stderrBuf,
-	})
-
-	durationMs := time.Since(start).Milliseconds()
-
-	exitCode := 0
-	if streamErr != nil {
-		if ctx.Err() != nil {
-			return &ExecResult{
-				ExitCode:   124,
-				StdoutTail: "command timed out",
-				DurationMs: durationMs,
-			}, nil
-		}
-		// Extract exit code from error message if possible
-		exitCode = parseExitCode(streamErr)
-	}
-
-	maxLines := opts.MaxLines
-	if maxLines <= 0 {
-		maxLines = 20
-	}
-
-	stdoutTail, stdoutTotal, stdoutTrunc := TruncateOutput(stdoutBuf.String(), maxLines)
-	stderrTail, stderrTotal, stderrTrunc := TruncateOutput(stderrBuf.String(), maxLines)
-
-	return &ExecResult{
-		ExitCode:    exitCode,
-		StdoutLines: stdoutTotal,
-		StderrLines: stderrTotal,
-		StdoutTail:  stdoutTail,
-		StderrTail:  stderrTail,
-		DurationMs:  durationMs,
-		Truncated:   stdoutTrunc || stderrTrunc,
-		OOMKilled:   exitCode == 137,
-	}, nil
-}
-
-func (k *K8sBackend) Stop(ctx context.Context, id string) error {
-	gracePeriod := int64(5)
-	err := k.clientset.CoreV1().Pods(k.namespace).Delete(ctx, id, metav1.DeleteOptions{
-		GracePeriodSeconds: &gracePeriod,
-	})
-	if err != nil && !isNotFound(err) {
-		return fmt.Errorf("delete pod: %w", err)
-	}
-	return nil
-}
-
-func (k *K8sBackend) Status(ctx context.Context, id string) (*StatusResult, error) {
-	pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, id, metav1.GetOptions{})
-	if err != nil {
-		if isNotFound(err) {
-			return &StatusResult{Running: false, Status: "not_found"}, nil
-		}
-		return nil, fmt.Errorf("get pod: %w", err)
-	}
-
-	status := strings.ToLower(string(pod.Status.Phase))
-	return &StatusResult{
-		Running: pod.Status.Phase == corev1.PodRunning,
-		Status:  status,
-	}, nil
-}
-
-func (k *K8sBackend) Pause(_ context.Context, _ string) error {
-	return ErrNotSupported
-}
-
-func (k *K8sBackend) Resume(_ context.Context, _ string) error {
-	return ErrNotSupported
-}
-
-func (k *K8sBackend) ReadFile(ctx context.Context, id, path string) ([]byte, error) {
-	req := k.clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(id).
-		Namespace(k.namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: "devbox",
-			Command:   []string{"cat", path},
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-
-	executor, err := remotecommand.NewSPDYExecutor(k.restConfig, "POST", req.URL())
-	if err != nil {
-		return nil, fmt.Errorf("create executor: %w", err)
-	}
-
-	var stdout, stderr bytes.Buffer
-	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-	}); err != nil {
-		return nil, fmt.Errorf("read file %q: %w (%s)", path, err, strings.TrimSpace(stderr.String()))
-	}
-	return stdout.Bytes(), nil
-}
-
-func (k *K8sBackend) WriteFile(ctx context.Context, id, path string, content []byte, mode string) error {
-	if mode == "" {
-		mode = "0644"
-	}
-	shellCmd := fmt.Sprintf("cat > %q && chmod %s %q", path, mode, path)
-	req := k.clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(id).
-		Namespace(k.namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: "devbox",
-			Command:   []string{"sh", "-c", shellCmd},
-			Stdin:     true,
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-
-	executor, err := remotecommand.NewSPDYExecutor(k.restConfig, "POST", req.URL())
-	if err != nil {
-		return fmt.Errorf("create executor: %w", err)
-	}
-
-	var stderr bytes.Buffer
-	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin:  bytes.NewReader(content),
-		Stderr: &stderr,
-	}); err != nil {
-		return fmt.Errorf("write file %q: %w (%s)", path, err, strings.TrimSpace(stderr.String()))
-	}
-	return nil
-}
-
-// buildPodSpec creates a Pod spec for a devbox sandbox.
-func (k *K8sBackend) buildPodSpec(opts StartOpts, imageTag string) *corev1.Pod {
-	env := make([]corev1.EnvVar, 0, len(opts.Env))
-	for key, val := range opts.Env {
-		env = append(env, corev1.EnvVar{Name: key, Value: val})
-	}
-
-	// Set only limits (not requests) so sandbox pods schedule as Burstable/BestEffort.
-	// Dev sandbox pods are short-lived; low requests prevent scheduling failures
-	// on clusters with high CPU reservation.
-	resources := corev1.ResourceRequirements{}
-	if opts.MemoryMB > 0 {
-		resources.Limits = corev1.ResourceList{
-			corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dMi", opts.MemoryMB)),
-		}
-	}
-	if opts.CPUs > 0 {
-		if resources.Limits == nil {
-			resources.Limits = corev1.ResourceList{}
-		}
-		resources.Limits[corev1.ResourceCPU] = resource.MustParse(fmt.Sprintf("%dm", int(opts.CPUs*1000)))
-	}
-
-	// Volumes: NFS workspace via PVC (shared across all sandbox pods)
-	volumes := []corev1.Volume{
-		{
-			Name: "workspace",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: k.workspacePVC,
-				},
-			},
-		},
-	}
-	volumeMounts := []corev1.VolumeMount{
-		{Name: "workspace", MountPath: "/workspace"},
-	}
-
-	// Add host-path mounts if requested (for additional bind mounts)
-	for i, m := range opts.Mounts {
-		volName := fmt.Sprintf("mount-%d", i)
-		hostPathType := corev1.HostPathDirectoryOrCreate
-		volumes = append(volumes, corev1.Volume{
-			Name: volName,
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{
-					Path: m.Host,
-					Type: &hostPathType,
-				},
-			},
-		})
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      volName,
-			MountPath: m.Container,
-			ReadOnly:  m.ReadOnly,
-		})
-	}
-
-	labels := map[string]string{
-		"app.kubernetes.io/managed-by": "mcp-devbox",
-		"devbox/project":               opts.Name,
-	}
-	if opts.AgentID != "" {
-		labels["devbox/agent-id"] = opts.AgentID
-	}
-
-	gracePeriod := int64(3)
-
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      opts.Name,
-			Namespace: k.namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.PodSpec{
-			RestartPolicy:                 corev1.RestartPolicyNever,
-			TerminationGracePeriodSeconds: &gracePeriod,
-			ServiceAccountName:            "mcp-devbox",
-			ImagePullSecrets: []corev1.LocalObjectReference{
-				{Name: k.imagePullSecret},
-			},
-			NodeSelector: map[string]string{
-				"kubernetes.io/arch": "amd64",
-			},
-			Containers: []corev1.Container{
-				{
-					Name:            "devbox",
-					Image:           imageTag,
-					Command:         []string{"sleep", "infinity"},
-					Env:             env,
-					Resources:       resources,
-					WorkingDir:      workDir(opts.WorkDir),
-					VolumeMounts:    volumeMounts,
-					ImagePullPolicy: corev1.PullAlways,
-				},
-			},
-			Volumes: volumes,
-		},
-	}
-}
-
-// waitForPodRunning watches until the pod reaches Running phase or timeout.
-// Uses the Watch API for sub-second latency instead of polling.
-func (k *K8sBackend) waitForPodRunning(ctx context.Context, name string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	watcher, err := k.clientset.CoreV1().Pods(k.namespace).Watch(ctx, metav1.ListOptions{
-		FieldSelector: "metadata.name=" + name,
-	})
-	if err != nil {
-		return fmt.Errorf("watch pod: %w", err)
-	}
-	defer watcher.Stop()
-
-	for event := range watcher.ResultChan() {
-		pod, ok := event.Object.(*corev1.Pod)
+		val, ok := entry.data[s.SecretKey]
 		if !ok {
 			continue
 		}
-		switch pod.Status.Phase {
-		case corev1.PodRunning:
-			return nil
-		case corev1.PodFailed, corev1.PodSucceeded:
-			return fmt.Errorf("pod entered terminal phase: %s", podFailureReason(pod))
-		}
-		// Early exit on image pull errors
-		for _, cs := range pod.Status.ContainerStatuses {
-			if w := cs.State.Waiting; w != nil {
-				if w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff" {
-					return fmt.Errorf("image pull error: %s — %s", w.Reason, w.Message)
-				}
-			}
-		}
+		out[s.Name] = string(val)
 	}
-	return fmt.Errorf("watch closed for pod %s", name)
+	return out, nil
 }
 
-// podFailureReason extracts a diagnostic string from a failed pod's container statuses.
-func podFailureReason(pod *corev1.Pod) string {
-	for _, cs := range pod.Status.ContainerStatuses {
-		if t := cs.State.Terminated; t != nil {
-			parts := []string{fmt.Sprintf("exit_code=%d", t.ExitCode)}
-			if t.Reason != "" {
-				parts = append(parts, "reason="+t.Reason)
-			}
-			if t.Message != "" {
-				parts = append(parts, "message="+t.Message)
-			}
-			return strings.Join(parts, " ")
-		}
+// ResolveSecretMounts implements SecretResolver. For each SecretMount,
+// reads the referenced K8s Secret and emits one ResolvedSecretFile per
+// item whose Key is present in Secret.Data. Missing Secrets and missing
+// Keys are skipped silently (Optional semantics matching how
+// SecretVolumeSource.Optional=true behaves on pod-spec volumes — see
+// buildPodSpec in k8s_objects.go where Optional=true is hard-coded for
+// the K8s side). Per-SecretName cache keeps multiple mounts that reference
+// the same Secret to a single API Get.
+//
+// Errors are returned only for unexpected failures (e.g., permission
+// denied, transport error). NotFound on a Secret is treated as absent.
+func (k *K8sBackend) ResolveSecretMounts(ctx context.Context, mounts []SecretMount) ([]ResolvedSecretFile, error) {
+	if len(mounts) == 0 {
+		return nil, nil
 	}
-	if pod.Status.Message != "" {
-		return pod.Status.Message
+	type cacheEntry struct {
+		data    map[string][]byte
+		present bool
 	}
-	return string(pod.Status.Phase)
-}
-
-// buildBuildahPodSpec creates a Pod spec for a Buildah in-cluster build.
-// Buildah runs as root with --storage-driver=vfs --isolation=chroot.
-// Root is required because chroot isolation needs to remount / (MS_REC|MS_SLAVE).
-// The Dockerfile is injected via a ConfigMap (dockerfileCM) so it doesn't
-// need to exist on the NFS workspace volume.
-func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, contextRel string) *corev1.Pod {
-	gracePeriod := int64(0)
-	runAsUser := int64(0)
-	runAsGroup := int64(0)
-
-	buildAndPush := strings.Join([]string{
-		// Configure registries for short-name resolution (non-interactive builds)
-		"mkdir -p /etc/containers",
-		"&&",
-		`printf 'unqualified-search-registries = ["docker.io"]\nshort-name-mode = "permissive"\n' > /etc/containers/registries.conf`,
-		"&&",
-		"buildah build-using-dockerfile",
-		"--storage-driver=vfs",
-		"--isolation=chroot",
-		"--tls-verify=false",
-		"--layers",
-		"-f /buildah-dockerfile/Dockerfile",
-		"-t " + destination,
-		"/workspace/" + contextRel,
-		"&&",
-		"buildah push --storage-driver=vfs --tls-verify=false " + destination,
-	}, " ")
-
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: k.namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "mcp-devbox",
-				"devbox/build":                 "buildah",
-			},
-			Annotations: map[string]string{
-				// Belt-and-suspenders: deprecated annotation for pre-1.30 clusters
-				"container.apparmor.security.beta.kubernetes.io/buildah": "unconfined",
-			},
-		},
-		Spec: corev1.PodSpec{
-			RestartPolicy:                 corev1.RestartPolicyNever,
-			ServiceAccountName:            "mcp-devbox",
-			TerminationGracePeriodSeconds: &gracePeriod,
-			NodeSelector: map[string]string{
-				"kubernetes.io/arch": "amd64",
-			},
-			Containers: []corev1.Container{
-				{
-					Name:    "buildah",
-					Image:   k.builderImage,
-					Command: []string{"sh", "-c", buildAndPush},
-					Env: []corev1.EnvVar{
-						{Name: "BUILDAH_ISOLATION", Value: "chroot"},
-						{Name: "STORAGE_DRIVER", Value: "vfs"},
-						{Name: "CONTAINERS_REGISTRIES_CONF", Value: "/etc/containers/registries.conf"},
-					},
-					SecurityContext: &corev1.SecurityContext{
-						Privileged: boolPtr(true),
-						RunAsUser:  &runAsUser,
-						RunAsGroup: &runAsGroup,
-					},
-					Resources: corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("500m"),
-							corev1.ResourceMemory: resource.MustParse("512Mi"),
-						},
-						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("2"),
-							corev1.ResourceMemory: resource.MustParse("2Gi"),
-						},
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: "workspace", MountPath: "/workspace"},
-						{Name: "dockerfile", MountPath: "/buildah-dockerfile", ReadOnly: true},
-						{Name: "buildah-storage", MountPath: "/var/lib/containers/storage"},
-						{Name: "auth", MountPath: "/run/containers/0/auth.json", SubPath: "config.json", ReadOnly: true},
-					},
-				},
-			},
-			Volumes: []corev1.Volume{
-				{
-					Name: "workspace",
-					VolumeSource: corev1.VolumeSource{
-						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-							ClaimName: k.workspacePVC,
-						},
-					},
-				},
-				{
-					Name: "dockerfile",
-					VolumeSource: corev1.VolumeSource{
-						ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: dockerfileCM,
-							},
-						},
-					},
-				},
-				{
-					Name: "buildah-storage",
-					VolumeSource: corev1.VolumeSource{
-						EmptyDir: &corev1.EmptyDirVolumeSource{
-							SizeLimit: resourcePtr(resource.MustParse("10Gi")),
-						},
-					},
-				},
-				{
-					Name: "auth",
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{
-							SecretName: k.imagePullSecret,
-							Items: []corev1.KeyToPath{
-								{Key: ".dockerconfigjson", Path: "config.json"},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-// waitForPodDone watches until the pod reaches Succeeded or Failed, or timeout.
-// Uses the Watch API for sub-second latency instead of polling.
-// Returns early on image pull errors to avoid waiting the full timeout.
-func (k *K8sBackend) waitForPodDone(ctx context.Context, name string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	watcher, err := k.clientset.CoreV1().Pods(k.namespace).Watch(ctx, metav1.ListOptions{
-		FieldSelector: "metadata.name=" + name,
-	})
-	if err != nil {
-		return fmt.Errorf("watch pod: %w", err)
-	}
-	defer watcher.Stop()
-
-	for event := range watcher.ResultChan() {
-		pod, ok := event.Object.(*corev1.Pod)
-		if !ok {
+	cache := make(map[string]cacheEntry, len(mounts))
+	out := make([]ResolvedSecretFile, 0, len(mounts))
+	for _, m := range mounts {
+		if m.SecretName == "" || m.MountPath == "" {
 			continue
 		}
-		switch pod.Status.Phase {
-		case corev1.PodSucceeded:
-			return nil
-		case corev1.PodFailed:
-			return fmt.Errorf("build pod failed: %s", podFailureReason(pod))
-		}
-		// Early exit on image pull errors
-		for _, cs := range pod.Status.ContainerStatuses {
-			if w := cs.State.Waiting; w != nil {
-				if w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff" {
-					return fmt.Errorf("image pull error: %s — %s", w.Reason, w.Message)
+		entry, ok := cache[m.SecretName]
+		if !ok {
+			secret, err := k.clientset.CoreV1().Secrets(k.namespace).Get(ctx, m.SecretName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					entry = cacheEntry{present: false}
+				} else {
+					return nil, fmt.Errorf("get secret %q: %w", m.SecretName, err)
 				}
+			} else {
+				entry = cacheEntry{data: secret.Data, present: true}
 			}
+			cache[m.SecretName] = entry
+		}
+		if !entry.present {
+			continue
+		}
+		for _, it := range m.Items {
+			if it.Key == "" || it.Path == "" {
+				continue
+			}
+			val, ok := entry.data[it.Key]
+			if !ok {
+				continue
+			}
+			content := make([]byte, len(val))
+			copy(content, val)
+			out = append(out, ResolvedSecretFile{
+				Path:    filepath.Join(m.MountPath, it.Path),
+				Content: content,
+				Mode:    "0600",
+			})
 		}
 	}
-	return fmt.Errorf("watch closed for pod %s", name)
+	return out, nil
 }
 
-// getPodLogs reads the last 100 lines from the buildah container.
-func (k *K8sBackend) getPodLogs(ctx context.Context, podName string) (string, error) {
-	tailLines := int64(100)
-	req := k.clientset.CoreV1().Pods(k.namespace).GetLogs(podName, &corev1.PodLogOptions{
-		Container: "buildah",
-		TailLines: &tailLines,
-	})
-	stream, err := req.Stream(ctx)
-	if err != nil {
-		return "", fmt.Errorf("get logs: %w", err)
-	}
-	defer stream.Close()
-
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, stream); err != nil {
-		return "", fmt.Errorf("read logs: %w", err)
-	}
-	return buf.String(), nil
-}
-
-// createDockerfileConfigMap creates a ConfigMap containing the Dockerfile.
-func (k *K8sBackend) createDockerfileConfigMap(ctx context.Context, name string, dockerfile []byte) error {
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: k.namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "mcp-devbox",
-				"devbox/build":                 "buildah",
-			},
-		},
-		Data: map[string]string{
-			"Dockerfile": string(dockerfile),
-		},
-	}
-	_ = k.deleteConfigMap(ctx, name)
-	_, err := k.clientset.CoreV1().ConfigMaps(k.namespace).Create(ctx, cm, metav1.CreateOptions{})
-	return err
-}
-
-// deleteConfigMap deletes a ConfigMap by name.
-func (k *K8sBackend) deleteConfigMap(ctx context.Context, name string) error {
-	err := k.clientset.CoreV1().ConfigMaps(k.namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	if err != nil && !isNotFound(err) {
-		return err
-	}
-	return nil
-}
-
-// deletePod deletes a pod with zero grace period (immediate).
-func (k *K8sBackend) deletePod(ctx context.Context, name string) error {
-	gracePeriod := int64(0)
-	err := k.clientset.CoreV1().Pods(k.namespace).Delete(ctx, name, metav1.DeleteOptions{
-		GracePeriodSeconds: &gracePeriod,
-	})
-	if err != nil && !isNotFound(err) {
-		return fmt.Errorf("delete pod: %w", err)
-	}
-	return nil
-}
-
-// sanitizeBuildName extracts a filesystem-safe name from an image tag.
+// buildNameRe matches characters unsafe for K8s resource names.
 var buildNameRe = regexp.MustCompile(`[^a-zA-Z0-9-]`)
-
-func sanitizeBuildName(tag string) string {
-	// Use the last path component, strip the registry prefix
-	parts := strings.Split(tag, "/")
-	name := parts[len(parts)-1]
-	// Replace colons and other unsafe chars
-	name = buildNameRe.ReplaceAllString(name, "-")
-	if len(name) > 63 {
-		name = name[:63]
-	}
-	return name
-}
-
-// registryTag prepends the registry to a local image tag.
-func (k *K8sBackend) registryTag(tag string) string {
-	if strings.Contains(tag, "/") {
-		prefix := strings.Split(tag, "/")[0]
-		if strings.Contains(prefix, ".") || strings.Contains(prefix, ":") || prefix == "localhost" {
-			return tag // already has a registry prefix
-		}
-	}
-	return k.registry + "/" + tag
-}
-
-func boolPtr(b bool) *bool                               { return &b }
-func resourcePtr(q resource.Quantity) *resource.Quantity { return &q }
-
-// parseExitCode extracts the exit code from a K8s exec error.
-// Returns 1 as default for non-zero exits when code can't be parsed.
-func parseExitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	msg := err.Error()
-	// K8s exec errors look like: "command terminated with exit code 2"
-	if strings.Contains(msg, "exit code") {
-		var code int
-		if _, scanErr := fmt.Sscanf(msg[strings.LastIndex(msg, "exit code")+len("exit code "):], "%d", &code); scanErr == nil {
-			return code
-		}
-	}
-	return 1
-}
-
-// isNotFound returns true if the error is a K8s "not found" error.
-func isNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	if apierrors.IsNotFound(err) {
-		return true
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "not found")
-}
-
-// workDir returns the working directory, defaulting to "/workspace".
-func workDir(dir string) string {
-	if dir != "" {
-		return dir
-	}
-	return "/workspace"
-}
 
 // Ensure K8sBackend implements Backend at compile time.
 var _ Backend = (*K8sBackend)(nil)

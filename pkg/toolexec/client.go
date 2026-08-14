@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/pkg/strutil"
 )
 
 // Config holds configuration for the daemon loopback client.
@@ -120,7 +122,7 @@ func (c *Client) connectLocked(ctx context.Context) error {
 
 	// MCP initialize handshake.
 	initReq, err := mcp.NewRequest(c.reqID.Add(1), "initialize", mcp.InitializeParams{
-		ProtocolVersion: mcp.ProtocolVersion,
+		ProtocolVersion: mcp.ProtocolVersion20250618,
 		Capabilities:    mcp.Capabilities{},
 		ClientInfo:      mcp.ClientInfo{Name: "toolexec", Version: "1.0.0"},
 	})
@@ -191,16 +193,13 @@ func parseToolResult(raw json.RawMessage) (map[string]any, error) {
 			return map[string]any{"result": ""}, nil
 		}
 
-		// Try parsing text as JSON object.
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(text), &obj); err == nil {
-			return obj, nil
-		}
-
-		// Try parsing text as JSON array.
-		var arr []any
-		if err := json.Unmarshal([]byte(text), &arr); err == nil {
-			return map[string]any{"result": arr}, nil
+		if value, ok := parseEmbeddedJSONText(text); ok {
+			switch typed := value.(type) {
+			case map[string]any:
+				return typed, nil
+			case []any:
+				return map[string]any{"result": typed}, nil
+			}
 		}
 
 		// Return raw text.
@@ -214,4 +213,16 @@ func parseToolResult(raw json.RawMessage) (map[string]any, error) {
 	}
 
 	return map[string]any{"raw": string(raw)}, nil
+}
+
+func parseEmbeddedJSONText(text string) (any, bool) {
+	raw, err := strutil.ExtractEmbeddedJSON([]byte(text))
+	if err != nil {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, false
+	}
+	return value, true
 }

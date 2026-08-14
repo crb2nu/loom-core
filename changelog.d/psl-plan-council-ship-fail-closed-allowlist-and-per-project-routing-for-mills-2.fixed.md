@@ -1,0 +1,1 @@
+- Route admitted Mills intake items through `pkg/mills/crossrepo/routing.go` and `pkg/mills/intake/router.go` to exact allowlisted per-project pipelines, failing closed for missing or denied projects.

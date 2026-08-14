@@ -1,4 +1,12 @@
 // Reasoning store - reasoning chain tracking and visualization
+import { actionStore } from './action.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message || 'Unknown error';
+  if (typeof e === 'string') return e;
+  try { return JSON.stringify(e); } catch { return 'Unknown error'; }
+}
 
 export interface ReasoningChain {
   id: string;
@@ -28,7 +36,7 @@ class ReasoningStore {
   error = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private poller = createPoller(() => this.fetch(), 15000);
 
   get activeChains(): ReasoningChain[] {
     return this.chains.filter((c) => c.status === 'active' || c.status === 'in_progress');
@@ -66,6 +74,7 @@ class ReasoningStore {
   }
 
   async createChain(title: string, description: string): Promise<boolean> {
+    const auditId = actionStore.start(`Create reasoning chain → ${title}`, 'ReasoningPanel:create');
     try {
       const res = await globalThis.fetch('/api/reasoning/chains', {
         method: 'POST',
@@ -74,24 +83,22 @@ class ReasoningStore {
       });
       if (!res.ok) throw new Error(`Create chain: ${res.status}`);
       await this.fetch();
+      actionStore.succeed(auditId);
       return true;
     } catch (e) {
+      actionStore.fail(auditId, errorMessage(e));
       this.error = e instanceof Error ? e.message : String(e);
       return false;
     }
   }
 
   startPolling(intervalMs = 15000): void {
-    this.stopPolling();
     this.fetch();
-    this.pollTimer = setInterval(() => this.fetch(), intervalMs);
+    this.poller.start(intervalMs);
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
   }
 }
 

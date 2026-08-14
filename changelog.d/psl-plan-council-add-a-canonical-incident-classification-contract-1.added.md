@@ -1,0 +1,1 @@
+- Add the Loom-owned council incident classification schema, including external-dependency local follow-up fields (`internal/contracts/incident_classification.go`, `internal/contracts/incident_classification_test.go`).

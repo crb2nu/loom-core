@@ -13,7 +13,7 @@ import (
 
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
-	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -33,26 +33,30 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
-	logger.Info("starting server", "name", "mcp-asus-router", "version", version, "host", hostAlias)
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-asus-router", version,
+		mcpscaffold.WithInstructions("ASUS Router management via SSH"),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cleanup(ctx) }()
 
-	server := mcp.NewServer("mcp-asus-router", version)
-	server.SetInstructions("ASUS Router management via SSH")
+	srv.Logger.Info("router config", "host", hostAlias)
 
 	// Register tools
-	registerTools(server)
+	registerTools(srv)
 
-	return server.Run(ctx)
+	return srv.Run(ctx)
 }
 
-func registerTools(server *mcp.Server) {
-	server.AddTool(mcp.Tool{
+func registerTools(srv *mcpscaffold.Server) {
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "router_status",
 		Description: "Uptime, WAN, and memory utilization snapshot.",
 		InputSchema: mcp.InputSchema{Type: "object", Properties: map[string]any{}},
 	}, handleStatus)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "router_logread",
 		Description: "Tail BusyBox syslog (logread -n <lines>).",
 		InputSchema: mcp.InputSchema{
@@ -63,7 +67,7 @@ func registerTools(server *mcp.Server) {
 		},
 	}, handleLogread)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "router_kernelTail",
 		Description: "Tail kernel messages (dmesg | tail).",
 		InputSchema: mcp.InputSchema{
@@ -74,7 +78,7 @@ func registerTools(server *mcp.Server) {
 		},
 	}, handleKernelTail)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "router_execCommand",
 		Description: "Run a whitelisted maintenance command",
 		InputSchema: mcp.InputSchema{
@@ -89,7 +93,7 @@ func registerTools(server *mcp.Server) {
 		},
 	}, handleExecCommand)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "router_reboot",
 		Description: "Reboot the ASUS router (requires confirm=true).",
 		InputSchema: mcp.InputSchema{
@@ -101,13 +105,13 @@ func registerTools(server *mcp.Server) {
 		},
 	}, handleReboot)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "router_wanStatus",
 		Description: "WAN IP, gateway, DNS, and link snapshot.",
 		InputSchema: mcp.InputSchema{Type: "object", Properties: map[string]any{}},
 	}, handleWanStatus)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "router_wifiStatus",
 		Description: "Wi-Fi chanspec/bandwidth and assoc list.",
 		InputSchema: mcp.InputSchema{Type: "object", Properties: map[string]any{}},

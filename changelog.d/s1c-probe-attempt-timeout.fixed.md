@@ -1,0 +1,1 @@
+S1c crash-window observation calls are individually bounded (ProcessProbeAttemptTimeout, default 1.2s) under the sample deadline, so one hung kubectl exec can no longer consume the whole ProcessMaxSampleGap budget and starve the transient retry (v6d run 1: a single hung probe ate the full 3s gap).

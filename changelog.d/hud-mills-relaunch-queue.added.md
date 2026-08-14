@@ -1,0 +1,1 @@
+- Added the retryable escalation relaunch queue to the HUD Sparks panel, with explicit loading, empty, and unavailable states plus one-click requeue actions.

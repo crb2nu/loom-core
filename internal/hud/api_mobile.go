@@ -1,77 +1,12 @@
 package hud
 
 import (
-	"bytes"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
-	"encoding/json"
-	"io"
 	"net/http"
-	"strconv"
 	"strings"
-	"time"
 )
 
-const (
-	mobileScopeRead          = "mobile:read"
-	mobileScopeSessionCreate = "mobile:session:create"
-	mobileScopeSessionEnd    = "mobile:session:end"
-)
-
-// mobileEnvelope is the standard response shape for /api/mobile/v1 endpoints.
-type mobileEnvelope struct {
-	OK    bool    `json:"ok"`
-	Data  any     `json:"data,omitempty"`
-	Error any     `json:"error,omitempty"`
-	Meta  mobMeta `json:"meta"`
-}
-
-type mobMeta struct {
-	RequestID string `json:"request_id"`
-	Timestamp string `json:"timestamp"`
-}
-
-type mobError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-func newRequestID() string {
-	var buf [8]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "req_unknown"
-	}
-	return "req_" + hex.EncodeToString(buf[:])
-}
-
-func (a *App) writeMobileJSON(w http.ResponseWriter, status int, data any) {
-	env := mobileEnvelope{
-		OK:   true,
-		Data: data,
-		Meta: mobMeta{
-			RequestID: newRequestID(),
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-		},
-	}
-	a.writeJSON(w, status, env)
-}
-
-func (a *App) writeMobileError(w http.ResponseWriter, status int, code, message string) {
-	env := mobileEnvelope{
-		OK: false,
-		Error: mobError{
-			Code:    code,
-			Message: message,
-		},
-		Meta: mobMeta{
-			RequestID: newRequestID(),
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-		},
-	}
-	a.writeJSON(w, status, env)
-}
-
+// extractBearerToken extracts a bearer token from the Authorization header.
 func extractBearerToken(r *http.Request) string {
 	if r == nil {
 		return ""
@@ -87,6 +22,8 @@ func extractBearerToken(r *http.Request) string {
 	return strings.TrimSpace(parts[1])
 }
 
+// isMobileOperatorToken returns true if the request carries the configured
+// mobile operator bearer token.
 func (a *App) isMobileOperatorToken(r *http.Request) bool {
 	expected := strings.TrimSpace(a.config.MobileOperatorToken)
 	if expected == "" {
@@ -99,279 +36,72 @@ func (a *App) isMobileOperatorToken(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
 }
 
+// mobileCompanionExtraPrefixes are the non-/api/mobile/v1 path prefixes the
+// mobile operator token is ALSO allowed to reach: the read/board surfaces the
+// companion app renders directly off the HUD proxy (Mills, the Plan Store,
+// Weaver, and the AI-model roles Weaver reads). The app hits these paths
+// verbatim (see apps/loom-companion-ios .../Networking/Endpoint.swift), so
+// without this allowlist every Mills/Plans/Weaver request 403s with
+// "restricted to /api/mobile/v1 endpoints" — which surfaces as "Couldn't reach
+// Mills" on the phone.
+//
+// This only lets the token REACH the routes; it does NOT grant admin power.
+// Mutations under /api/mills (spin, escalate, backlog, kill-switch, council)
+// stay behind their own admin gate (handleProxyAdminPost → requireAdminToken →
+// X-Admin-Token / HUD_ADMIN_TOKEN), so a mobile token still cannot mutate
+// without a separate admin token. Plan advance/priority are intentionally open
+// (the HUD web frontend advances with a bare fetch too). Agent/labs/spawn and
+// every other admin surface remain blocked for the mobile token.
+var mobileCompanionExtraPrefixes = []string{
+	"/api/mobile/v1/", // the primary mobile surface
+	"/api/mills/",
+	"/api/plans/", // /api/plans/{id}[/advance|/priority]; the bare collection is matched below
+	"/api/weaver/",
+	"/api/aimodels/",
+	// Cross-vendor transcript list/search (GET-only routes; the bare
+	// collection is matched below). Lets the companion's operator surface
+	// browse claude/codex CLI sessions on the workstation.
+	"/api/vendor-sessions/",
+}
+
+// mobileCompanionExactPaths are non-prefixed routes (no subpath) the mobile
+// token may reach — the Plan Store collection endpoint and the Pattern Loom
+// catalog.
+//
+// /api/patterns is a read-only GET the iOS shift report calls as
+// `GET /api/patterns?status=approved`; without it the companion gets a 403
+// "mobile_operator token is restricted..." and the shift report renders empty.
+// It is deliberately an EXACT path, not a prefix: POST /api/patterns/stamp
+// mutates the catalog and stays out of reach of the mobile token.
+var mobileCompanionExactPaths = map[string]bool{
+	"/api/plans":           true,
+	"/api/patterns":        true,
+	"/api/vendor-sessions": true,
+	// /api/health is served unauthenticated to everyone, so denying it to a
+	// scoped token grants no protection — it only breaks callers that present
+	// their token on every request. The mills operator's sentinel liveness
+	// probe (LOOM_HUD_TOKEN is the mobile operator token) does exactly that
+	// and would otherwise trip a permanent "hud" incident on 403s.
+	"/api/health": true,
+}
+
+// mobileTokenOutsideMobileAPI returns true when a request uses the mobile
+// operator token but targets a path the token is not permitted to reach. The
+// mobile surface (/api/mobile/v1/*) plus the companion's read/board surfaces
+// (mobileCompanionExtraPrefixes/mobileCompanionExactPaths) are allowed;
+// everything else is denied.
 func (a *App) mobileTokenOutsideMobileAPI(r *http.Request) bool {
 	if !a.isMobileOperatorToken(r) {
 		return false
 	}
-	return !strings.HasPrefix(r.URL.Path, "/api/mobile/v1/")
-}
-
-func (a *App) requireMobileScope(w http.ResponseWriter, r *http.Request, requiredScope string) bool {
-	expected := strings.TrimSpace(a.config.MobileOperatorToken)
-	if expected == "" {
-		a.writeMobileError(w, http.StatusForbidden, "not_configured", "mobile operator token is not configured; set HUD_MOBILE_OPERATOR_TOKEN")
+	path := r.URL.Path
+	if mobileCompanionExactPaths[path] {
 		return false
 	}
-
-	actual := extractBearerToken(r)
-	if actual == "" {
-		a.writeMobileError(w, http.StatusUnauthorized, "unauthorized", "mobile bearer token is required")
-		return false
+	for _, prefix := range mobileCompanionExtraPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return false
+		}
 	}
-
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) != 1 {
-		a.writeMobileError(w, http.StatusUnauthorized, "unauthorized", "invalid mobile bearer token")
-		return false
-	}
-
-	if !a.mobileScopeAllowed(requiredScope) {
-		a.writeMobileError(w, http.StatusForbidden, "forbidden", "mobile token missing required scope")
-		return false
-	}
-
 	return true
-}
-
-func (a *App) mobileScopeAllowed(required string) bool {
-	if required == "" {
-		return true
-	}
-	raw := strings.TrimSpace(a.config.MobileOperatorScopes)
-	if raw == "" {
-		return false
-	}
-	for _, scope := range strings.Split(raw, ",") {
-		if strings.TrimSpace(scope) == required {
-			return true
-		}
-	}
-	return false
-}
-
-// logMobileAudit records a structured audit entry for mobile mutation operations.
-func (a *App) logMobileAudit(r *http.Request, action string, targets map[string]string, outcome string, auditErr error) {
-	attrs := []any{
-		"source", "mobile",
-		"action", action,
-		"endpoint", r.Method + " " + r.URL.Path,
-		"remote_addr", r.RemoteAddr,
-		"outcome", outcome,
-	}
-	for k, v := range targets {
-		attrs = append(attrs, k, v)
-	}
-	if auditErr != nil {
-		attrs = append(attrs, "error", auditErr.Error())
-	}
-	a.logger.Info("mobile_audit", attrs...)
-}
-
-// --- Mobile companion v1 handlers ---
-
-func (a *App) handleMobilePing(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeRead) {
-		return
-	}
-	a.writeMobileJSON(w, http.StatusOK, map[string]any{"pong": true})
-}
-
-func (a *App) handleMobileDashboard(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeRead) {
-		return
-	}
-
-	fleetSnap := a.fleetMonitor.Snapshot()
-	healthSum := a.healthMonitor.Summary()
-
-	// Collect recent critical timeline entries (last 10).
-	var recentTimeline []TimelineEntry
-	if a.eventLog != nil {
-		recentTimeline = a.eventLog.All(10)
-	}
-	if recentTimeline == nil {
-		recentTimeline = []TimelineEntry{}
-	}
-
-	a.writeMobileJSON(w, http.StatusOK, map[string]any{
-		"daemon_running":  fleetSnap.DaemonRunning,
-		"server_count":    fleetSnap.ServerCount,
-		"active_sessions": fleetSnap.ActiveSessions,
-		"active_agents":   fleetSnap.ActiveAgents,
-		"idle_agents":     fleetSnap.IdleAgents,
-		"offline_agents":  fleetSnap.OfflineAgents,
-		"updated_at":      fleetSnap.UpdatedAt,
-		"health": map[string]any{
-			"total_servers":    healthSum.TotalServers,
-			"healthy_servers":  healthSum.HealthyServers,
-			"degraded_servers": healthSum.DegradedServers,
-			"down_servers":     healthSum.DownServers,
-			"idle_servers":     healthSum.IdleServers,
-		},
-		"recent_timeline": recentTimeline,
-	})
-}
-
-func (a *App) handleMobileSessions(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeRead) {
-		return
-	}
-
-	sessions, err := a.agent.Sessions()
-	if err != nil {
-		a.writeMobileError(w, http.StatusBadGateway, "upstream_error", "failed to list sessions")
-		return
-	}
-	a.writeMobileJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
-}
-
-func (a *App) handleMobileSessionDetail(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeRead) {
-		return
-	}
-
-	sessionID := strings.TrimSpace(r.PathValue("session_id"))
-	if sessionID == "" {
-		a.writeMobileError(w, http.StatusBadRequest, "bad_request", "session_id is required")
-		return
-	}
-
-	sessions, err := a.agent.Sessions()
-	if err != nil {
-		a.writeMobileError(w, http.StatusBadGateway, "upstream_error", "failed to list sessions")
-		return
-	}
-
-	for _, s := range sessions {
-		if strings.TrimSpace(s.ID) == sessionID {
-			a.writeMobileJSON(w, http.StatusOK, map[string]any{"session": s})
-			return
-		}
-	}
-
-	a.writeMobileError(w, http.StatusNotFound, "not_found", "session not found")
-}
-
-func (a *App) handleMobileSessionEvents(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeRead) {
-		return
-	}
-
-	sessionID := strings.TrimSpace(r.PathValue("session_id"))
-	if sessionID == "" {
-		a.writeMobileError(w, http.StatusBadRequest, "bad_request", "session_id is required")
-		return
-	}
-
-	limit := 100
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 500 {
-			limit = parsed
-		}
-	}
-
-	events := make([]TimelineEntry, 0, limit)
-	if a.eventLog != nil {
-		for _, evt := range a.eventLog.All(1000) {
-			if eventHasSessionID(evt.Data, sessionID) {
-				events = append(events, evt)
-				if len(events) >= limit {
-					break
-				}
-			}
-		}
-	}
-
-	a.writeMobileJSON(w, http.StatusOK, map[string]any{
-		"session_id": sessionID,
-		"events":     events,
-	})
-}
-
-func (a *App) handleMobileEventsStream(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeRead) {
-		return
-	}
-	a.handleSSE(w, r)
-}
-
-func (a *App) handleMobileSessionCreate(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeSessionCreate) {
-		return
-	}
-
-	// Read the body to extract audit fields before forwarding.
-	var reqBody struct {
-		AgentID   string `json:"agent_id"`
-		Namespace string `json:"namespace"`
-	}
-	bodyBytes, _ := io.ReadAll(r.Body)
-	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		_ = json.Unmarshal(bodyBytes, &reqBody)
-	}
-
-	a.logMobileAudit(r, "session_create", map[string]string{
-		"agent_id":  reqBody.AgentID,
-		"namespace": reqBody.Namespace,
-	}, "initiated", nil)
-
-	// Reconstruct request body for the downstream handler.
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	r.ContentLength = int64(len(bodyBytes))
-	a.handleAgentSessionStart(w, r)
-}
-
-func (a *App) handleMobileSessionEnd(w http.ResponseWriter, r *http.Request) {
-	if !a.requireMobileScope(w, r, mobileScopeSessionEnd) {
-		return
-	}
-
-	sessionID := strings.TrimSpace(r.PathValue("session_id"))
-	if sessionID == "" {
-		a.writeMobileError(w, http.StatusBadRequest, "bad_request", "session_id is required")
-		return
-	}
-
-	var body struct {
-		Summarize bool `json:"summarize"`
-	}
-	if r.Body != nil {
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			a.writeMobileError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-			return
-		}
-		if len(bytes.TrimSpace(data)) > 0 {
-			if err := json.Unmarshal(data, &body); err != nil {
-				a.writeMobileError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-				return
-			}
-		}
-	}
-
-	a.logMobileAudit(r, "session_end", map[string]string{
-		"session_id": sessionID,
-		"summarize":  strconv.FormatBool(body.Summarize),
-	}, "initiated", nil)
-
-	proxyBody, _ := json.Marshal(map[string]any{
-		"session_id": sessionID,
-		"summarize":  body.Summarize,
-	})
-	proxyReq := r.Clone(r.Context())
-	proxyReq.Body = io.NopCloser(bytes.NewReader(proxyBody))
-	proxyReq.ContentLength = int64(len(proxyBody))
-	proxyReq.Header.Set("Content-Type", "application/json")
-	a.handleAgentSessionEnd(w, proxyReq)
-}
-
-func eventHasSessionID(raw json.RawMessage, sessionID string) bool {
-	if len(raw) == 0 || sessionID == "" {
-		return false
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return false
-	}
-	got, _ := payload["session_id"].(string)
-	return strings.TrimSpace(got) == sessionID
 }

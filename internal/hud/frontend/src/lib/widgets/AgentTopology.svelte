@@ -1,48 +1,86 @@
-<script>
+<script lang="ts">
   import { onDestroy, untrack } from 'svelte';
   import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force';
+  import type { Simulation, SimulationLinkDatum, SimulationNodeDatum } from 'd3-force';
+  import { agentColor, statusColor } from '../utils/format.ts';
 
-  /** @type {{ nodes: any[], edges: any[], clusters: any[], width?: number, height?: number, selectedNode?: string | null, onselect?: (id: string | null) => void }} */
-  let { nodes: inputNodes = [], edges: inputEdges = [], clusters = [], width = 800, height = 500, selectedNode = null, onselect } = $props();
-
-  // Agent type colors (shared with PresencePanel)
-  const AGENT_COLORS = {
-    claude: '#E95D74',
-    codex: '#22B255',
-    gemini: '#018799',
-    copilot: '#E7B312',
+  type AgentInputNode = {
+    agent_id: string;
+    agent_type?: string | null;
+    status?: string | null;
   };
 
-  function agentColor(agentType) {
-    if (!agentType) return '#5EBDC9';
-    const lower = agentType.toLowerCase();
-    for (const [key, color] of Object.entries(AGENT_COLORS)) {
-      if (lower.includes(key)) return color;
-    }
-    return '#5EBDC9';
-  }
+  type AgentInputEdge = {
+    source: string;
+    target: string;
+    edge_type?: string;
+    weight?: number;
+    label?: string;
+    status?: string;
+  };
 
-  function statusColor(status) {
-    if (status === 'active') return 'var(--success)';
-    if (status === 'idle') return 'var(--warning)';
-    return 'var(--fg-muted)';
-  }
+  type AgentCluster = {
+    project: string;
+    agent_ids: string[];
+  };
 
-  let svgEl = $state(null);
-  let simulation = null;
-  let simNodes = $state([]);
-  let simLinks = $state([]);
+  type AgentNode = SimulationNodeDatum &
+    AgentInputNode & {
+      id: string;
+      color: string;
+    };
+
+  type AgentLink = SimulationLinkDatum<AgentNode> & {
+    edge_type?: string;
+    weight: number;
+    label?: string;
+    status?: string;
+  };
+
+  type HullPoint = [number, number];
+
+  type HullPath = {
+    project: string;
+    d: string;
+    cx: number;
+    cy: number;
+  };
+
+  type Props = {
+    nodes?: AgentInputNode[];
+    edges?: AgentInputEdge[];
+    clusters?: AgentCluster[];
+    width?: number;
+    height?: number;
+    selectedNode?: string | null;
+    onselect?: (id: string | null) => void;
+  };
+
+  let {
+    nodes: inputNodes = [],
+    edges: inputEdges = [],
+    clusters = [],
+    width = 800,
+    height = 500,
+    selectedNode = null,
+    onselect,
+  }: Props = $props();
+
+  let svgEl = $state<SVGSVGElement | null>(null);
+  let simulation: Simulation<AgentNode, AgentLink> | null = null;
+  let simNodes = $state<AgentNode[]>([]);
+  let simLinks = $state<AgentLink[]>([]);
   let transform = $state({ x: 0, y: 0, k: 1 });
 
   // Pan state
   let isPanning = false;
   let panStart = { x: 0, y: 0 };
-  let dragNode = null;
+  let dragNode: AgentNode | null = null;
 
   // Cluster hull paths
-  let hullPaths = $state([]);
+  let hullPaths = $state<HullPath[]>([]);
 
-  function buildGraph() {
+  function buildGraph(): void {
     if (!inputNodes || inputNodes.length === 0) {
       simNodes = [];
       simLinks = [];
@@ -52,7 +90,7 @@
 
     const nodeIds = new Set(inputNodes.map((n) => n.agent_id));
 
-    const newNodes = inputNodes.map((n) => ({
+    const newNodes: AgentNode[] = inputNodes.map((n) => ({
       ...n,
       id: n.agent_id,
       color: agentColor(n.agent_type),
@@ -64,7 +102,7 @@
       (e) => nodeIds.has(e.source) && nodeIds.has(e.target)
     );
 
-    const newLinks = validEdges.map((e) => ({
+    const newLinks: AgentLink[] = validEdges.map((e) => ({
       source: e.source,
       target: e.target,
       edge_type: e.edge_type,
@@ -79,8 +117,8 @@
     if (simulation) simulation.stop();
 
     // Custom cluster force: nudge nodes toward their cluster centroid.
-    function clusterForce(alpha) {
-      const clusterCentroids = new Map();
+    function clusterForce(alpha: number): void {
+      const clusterCentroids = new Map<string, { x: number; y: number }>();
       for (const c of clusters) {
         const members = simNodes.filter((n) => c.agent_ids.includes(n.id));
         if (members.length === 0) continue;
@@ -93,8 +131,8 @@
           if (c.agent_ids.includes(n.id)) {
             const centroid = clusterCentroids.get(c.project);
             if (centroid) {
-              n.vx += (centroid.x - n.x) * alpha * 0.3;
-              n.vy += (centroid.y - n.y) * alpha * 0.3;
+              n.vx = (n.vx ?? 0) + (centroid.x - (n.x ?? 0)) * alpha * 0.3;
+              n.vy = (n.vy ?? 0) + (centroid.y - (n.y ?? 0)) * alpha * 0.3;
             }
             break;
           }
@@ -103,17 +141,17 @@
     }
 
     let lastTickUpdate = 0;
-    simulation = forceSimulation(simNodes)
+    simulation = forceSimulation<AgentNode>(simNodes)
       .force(
         'link',
-        forceLink(simLinks)
+        forceLink<AgentNode, AgentLink>(simLinks)
           .id((d) => d.id)
           .distance((d) => d.edge_type === 'shared_file' ? 60 : 100)
       )
       .force('charge', forceManyBody().strength(-200))
       .force('center', forceCenter(width / 2, height / 2))
       .force('collide', forceCollide(30))
-      .force('cluster', () => clusterForce(simulation.alpha()))
+      .force('cluster', clusterForce)
       .on('tick', () => {
         const now = Date.now();
         if (now - lastTickUpdate < 50) return;
@@ -129,14 +167,14 @@
       });
   }
 
-  function computeHulls() {
-    const paths = [];
+  function computeHulls(): void {
+    const paths: HullPath[] = [];
     for (const c of clusters) {
       const members = simNodes.filter((n) => c.agent_ids.includes(n.id));
       if (members.length < 2) continue;
 
       // Compute convex hull with padding.
-      const points = members.map((n) => [n.x, n.y]);
+      const points: HullPoint[] = members.map((n) => [n.x ?? 0, n.y ?? 0]);
       const hull = convexHull(points);
       if (hull.length < 3) continue;
 
@@ -158,17 +196,17 @@
   }
 
   // Simple convex hull (Graham scan).
-  function convexHull(points) {
+  function convexHull(points: HullPoint[]): HullPoint[] {
     if (points.length < 3) return points;
     const sorted = [...points].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-    const cross = (O, A, B) => (A[0] - O[0]) * (B[1] - O[1]) - (A[1] - O[1]) * (B[0] - O[0]);
-    const lower = [];
+    const cross = (O: HullPoint, A: HullPoint, B: HullPoint): number => (A[0] - O[0]) * (B[1] - O[1]) - (A[1] - O[1]) * (B[0] - O[0]);
+    const lower: HullPoint[] = [];
     for (const p of sorted) {
       while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0)
         lower.pop();
       lower.push(p);
     }
-    const upper = [];
+    const upper: HullPoint[] = [];
     for (let i = sorted.length - 1; i >= 0; i--) {
       const p = sorted[i];
       while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0)
@@ -191,7 +229,7 @@
 
   let graphFocused = $state(false);
 
-  function handleWheel(e) {
+  function handleWheel(e: WheelEvent): void {
     if (!graphFocused && !e.ctrlKey && !e.metaKey) return;
     e.preventDefault();
     const delta = e.deltaY > 0 ? 0.9 : 1.1;
@@ -199,17 +237,18 @@
     transform = { ...transform, k: newK };
   }
 
-  function handleMouseDown(e) {
-    if (e.target.closest('.topo-node')) return;
+  function handleMouseDown(e: MouseEvent): void {
+    if (e.target instanceof Element && e.target.closest('.topo-node')) return;
     isPanning = true;
     panStart = { x: e.clientX - transform.x, y: e.clientY - transform.y };
   }
 
-  function handleMouseMove(e) {
+  function handleMouseMove(e: MouseEvent): void {
     if (isPanning) {
       transform = { ...transform, x: e.clientX - panStart.x, y: e.clientY - panStart.y };
     }
     if (dragNode && simulation) {
+      if (!svgEl) return;
       const rect = svgEl.getBoundingClientRect();
       dragNode.fx = (e.clientX - rect.left - transform.x) / transform.k;
       dragNode.fy = (e.clientY - rect.top - transform.y) / transform.k;
@@ -217,7 +256,7 @@
     }
   }
 
-  function handleMouseUp() {
+  function handleMouseUp(): void {
     isPanning = false;
     if (dragNode) {
       dragNode.fx = null;
@@ -227,7 +266,7 @@
     }
   }
 
-  function handleNodeMouseDown(e, node) {
+  function handleNodeMouseDown(e: MouseEvent, node: AgentNode): void {
     e.stopPropagation();
     dragNode = node;
     node.fx = node.x;
@@ -235,24 +274,24 @@
     if (simulation) simulation.alphaTarget(0.3).restart();
   }
 
-  function handleNodeClick(e, node) {
+  function handleNodeClick(e: MouseEvent, node: AgentNode): void {
     e.stopPropagation();
     if (onselect) onselect(selectedNode === node.id ? null : node.id);
   }
 
-  function edgeStroke(edgeType) {
+  function edgeStroke(edgeType?: string): string {
     if (edgeType === 'handoff') return 'var(--accent)';
     if (edgeType === 'shared_file') return 'var(--warning)';
     return 'var(--info)';
   }
 
-  function edgeDashArray(edgeType) {
+  function edgeDashArray(edgeType?: string): string {
     if (edgeType === 'handoff') return '6,3';
     if (edgeType === 'shared_branch') return '2,3';
     return 'none';
   }
 
-  function nodeShape(agentType) {
+  function nodeShape(agentType?: string | null): 'circle' | 'rect' | 'hexagon' | 'diamond' {
     if (!agentType) return 'circle';
     const lower = agentType.toLowerCase();
     if (lower.includes('claude')) return 'circle';
@@ -261,7 +300,7 @@
     return 'diamond';
   }
 
-  function truncate(s, len) {
+  function truncate(s: string | null | undefined, len: number): string {
     if (!s) return '';
     return s.length > len ? s.slice(0, len - 1) + '\u2026' : s;
   }

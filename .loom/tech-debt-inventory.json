@@ -1,117 +1,193 @@
 {
+  "meta": {
+    "cycle": "2026-02-23-cycle-2",
+    "previous_cycle": "2026-02-23-cycle-1 (DEBT-001 through DEBT-011, all resolved)",
+    "scoring_model": "impact 35%, risk_reduction 30%, drag_reduction 20%, effort_inverse 15%"
+  },
+  "completed": [
+    {"id": "DEBT-001", "status": "done", "closed_by": "Structured error types (proxyTransportError)"},
+    {"id": "DEBT-002", "status": "done", "closed_by": "ddd4e85 (response ID validation)"},
+    {"id": "DEBT-003", "status": "done", "closed_by": "Bounded retry + cooldown (proxy.go:114-132)"},
+    {"id": "DEBT-004", "status": "done", "closed_by": "session.go, session_handlers.go, proxy.go"},
+    {"id": "DEBT-005", "status": "done", "closed_by": "Pool-reusing passive checks"},
+    {"id": "DEBT-006", "status": "done", "closed_by": "Session-aware drain + smoke checks"},
+    {"id": "DEBT-007", "status": "done", "closed_by": "internal/integration/proxy_daemon_test.go"},
+    {"id": "DEBT-008", "status": "done", "closed_by": "1fc56e0 (daemon.go split)"},
+    {"id": "DEBT-009", "status": "done", "closed_by": "Background reader goroutine in transport.go"},
+    {"id": "DEBT-010", "status": "done", "closed_by": "812c638 (ADC migration)"},
+    {"id": "DEBT-011", "status": "done", "closed_by": "b6ca3da (signal handling + idle timeout)"}
+  ],
   "items": [
     {
-      "id": "DEBT-001",
-      "title": "Harden proxy transport state reset and reconnect classification",
-      "component": "cmd/loom/proxy.go",
-      "impact": 5,
-      "risk_reduction": 5,
+      "id": "DEBT-012",
+      "title": "Split agentcontext service.go god object into domain modules",
+      "component": "pkg/agentcontext/service.go",
+      "impact": 4,
+      "risk_reduction": 3,
       "drag_reduction": 4,
       "effort": 2,
+      "status": "active",
       "evidence": [
-        "cmd/loom/proxy.go:93",
-        "cmd/loom/proxy.go:158",
-        "cmd/loom/proxy.go:167",
-        "cmd/loom/proxy.go:170",
-        "cmd/loom/proxy.go:243"
+        "pkg/agentcontext/service.go: 1,829 LOC, 40 funcs, 15+ Qdrant client fields",
+        "Service struct has 50+ fields mixing sessions, presence, workflows, memory, graph",
+        "111 defer Unlock calls across the package indicate lock management complexity"
       ]
     },
     {
-      "id": "DEBT-002",
-      "title": "Enforce end-to-end RPC deadlines for proxy and CLI daemon calls",
-      "component": "cmd/loom/proxy.go, cmd/loom/daemon.go, internal/daemon/daemon.go",
-      "impact": 5,
-      "risk_reduction": 5,
-      "drag_reduction": 5,
+      "id": "DEBT-013",
+      "title": "Split codebase service.go monolith (2,140 LOC) into indexing/watch/embed modules",
+      "component": "pkg/codebase/service.go",
+      "impact": 3,
+      "risk_reduction": 2,
+      "drag_reduction": 3,
       "effort": 3,
+      "status": "active",
       "evidence": [
-        "cmd/loom/proxy.go:60",
-        "cmd/loom/proxy.go:181",
-        "cmd/loom/proxy.go:378",
-        "cmd/loom/proxy.go:382",
-        "cmd/loom/daemon.go:32",
-        "cmd/loom/daemon.go:43"
+        "pkg/codebase/service.go: 2,140 LOC, 33 funcs, ~65 lines/func average",
+        "Mixes indexing orchestration, watch/poll loop, embedding provider config, search handlers",
+        "2 nolint:noctx suppressions at lines 2099, 2105"
       ]
     },
     {
-      "id": "DEBT-003",
-      "title": "Replace one-shot autostart with retryable daemon reconnection policy",
-      "component": "cmd/loom/proxy.go, internal/daemon/ensure.go",
-      "impact": 4,
-      "risk_reduction": 4,
-      "drag_reduction": 4,
-      "effort": 3,
-      "evidence": [
-        "cmd/loom/proxy.go:76",
-        "cmd/loom/proxy.go:144",
-        "cmd/loom/proxy.go:264",
-        "internal/daemon/ensure.go:31"
-      ]
-    },
-    {
-      "id": "DEBT-004",
-      "title": "Introduce unified local proxy session lease/epoch management",
-      "component": "internal/daemon/http_handler.go, internal/daemon/session.go, cmd/loom/proxy.go",
-      "impact": 4,
-      "risk_reduction": 5,
-      "drag_reduction": 4,
+      "id": "DEBT-014",
+      "title": "Decompose cmd/loom/main.go (1,907 LOC, 18 funcs, ~106 lines/func)",
+      "component": "cmd/loom/main.go",
+      "impact": 3,
+      "risk_reduction": 2,
+      "drag_reduction": 3,
       "effort": 4,
+      "status": "active",
       "evidence": [
-        "internal/daemon/http_handler.go:13",
-        "internal/daemon/http_handler.go:140",
-        "internal/daemon/session.go:8",
-        "internal/daemon/session.go:25",
-        "docs/STREAMABLE_HTTP.md:88"
+        "cmd/loom/main.go: 1,907 LOC with only 18 functions = ~106 lines per function",
+        "All Cobra command registration in a single file; violates 20-line function guideline",
+        "21 touches in recent 2-day commit window"
       ]
     },
     {
-      "id": "DEBT-005",
-      "title": "Reduce health monitor process churn for local dev efficiency",
-      "component": "internal/daemon/health.go, internal/daemon/daemon.go",
-      "impact": 4,
-      "risk_reduction": 4,
-      "drag_reduction": 3,
+      "id": "DEBT-015",
+      "title": "Converge agent contracts: split cmd_agent.go + bridge/agent.go + api_agent.go",
+      "component": "cmd/loom/cmd_agent.go, internal/hud/bridge/agent.go, internal/hud/api_agent.go",
+      "impact": 3,
+      "risk_reduction": 3,
+      "drag_reduction": 4,
       "effort": 3,
+      "status": "active",
       "evidence": [
-        "internal/daemon/health.go:127",
-        "internal/daemon/health.go:154",
-        "internal/daemon/health.go:170",
-        "internal/daemon/daemon.go:1825",
-        "internal/daemon/daemon.go:1850",
-        "internal/daemon/daemon.go:1874"
+        "cmd/loom/cmd_agent.go: 1,706 LOC, 47 funcs",
+        "internal/hud/bridge/agent.go: 1,993 LOC, 71 funcs",
+        "internal/hud/api_agent.go: 989 LOC",
+        "Duplicate request parsing and error message code between HUD handlers and CLI fallback paths",
+        "Roadmap issue #21 (Stage 1 complete, Stage 2 not started)"
       ]
     },
     {
-      "id": "DEBT-006",
-      "title": "Make dev-upgrade daemon restart safety session-aware and resilience-aware",
-      "component": "scripts/dev/upgrade_local.sh, cmd/loom/status.go, internal/daemon/daemon.go",
+      "id": "DEBT-016",
+      "title": "Finish callpipeline hardening: unit tests per failure class + error mapping",
+      "component": "internal/daemon/callpipeline.go",
       "impact": 4,
       "risk_reduction": 4,
       "drag_reduction": 3,
-      "effort": 2,
+      "effort": 4,
+      "status": "active",
       "evidence": [
-        "scripts/dev/upgrade_local.sh:104",
-        "scripts/dev/upgrade_local.sh:107",
-        "scripts/dev/upgrade_local.sh:141",
-        "cmd/loom/status.go:20",
-        "internal/daemon/daemon.go:1190",
-        "internal/daemon/daemon.go:1196"
+        "Roadmap issue #20 (Stage 1 complete via 8c2c50d, Stage 2 in progress)",
+        "callpipeline_test.go: 2,120 LOC but focused on existing paths, not all failure classes",
+        "Side effects (audit/cost/cache/metrics) not fully isolated behind stage helpers",
+        "Blocks gateway policy hooks (#25) and observability (#12)"
       ]
     },
     {
-      "id": "DEBT-007",
-      "title": "Add restart/reconnect chaos tests for proxy-daemon sessions",
-      "component": "internal/integration/proxy_daemon_test.go",
-      "impact": 4,
-      "risk_reduction": 4,
-      "drag_reduction": 5,
-      "effort": 2,
+      "id": "DEBT-017",
+      "title": "Decompose devbox K8s backend into build/runtime/objects/wait files",
+      "component": "internal/devbox/backend/k8s.go",
+      "impact": 2,
+      "risk_reduction": 3,
+      "drag_reduction": 3,
+      "effort": 4,
+      "status": "active",
       "evidence": [
-        "internal/integration/proxy_daemon_test.go:59",
-        "internal/integration/proxy_daemon_test.go:110",
-        "internal/integration/proxy_daemon_test.go:158",
-        "internal/integration/proxy_daemon_test.go:224",
-        "internal/integration/proxy_daemon_test.go:272"
+        "internal/devbox/backend/k8s.go: 760 LOC, single file handles configmap, build pod, wait/poll, exec",
+        "High churn area from recent Kaniko->Buildah and watch-related changes",
+        "Roadmap issue #23 (tracked, not started)"
+      ]
+    },
+    {
+      "id": "DEBT-018",
+      "title": "Close test coverage gaps in untested packages toward 40% target",
+      "component": "internal/hud/window, internal/tui/theme, internal/hud/notify, internal/daemon, internal/devbox",
+      "impact": 3,
+      "risk_reduction": 3,
+      "drag_reduction": 2,
+      "effort": 3,
+      "status": "active",
+      "evidence": [
+        "internal/hud/window: 5 Go files, 0 test files",
+        "internal/tui/theme: 1 Go file, 0 tests",
+        "internal/hud/notify: 2 Go files, 0 tests",
+        "Overall coverage: 30.4%, target: 40%",
+        "Roadmap issue #2 (daemon lifecycle + devbox integration coverage outstanding)"
+      ]
+    },
+    {
+      "id": "DEBT-019",
+      "title": "Extract hardcoded config values to constants/env vars",
+      "component": "pkg/codebase/service.go, pkg/agentcontext/memory_hierarchy.go, cmd/loom/main.go",
+      "impact": 2,
+      "risk_reduction": 2,
+      "drag_reduction": 2,
+      "effort": 5,
+      "status": "active",
+      "evidence": [
+        "pkg/codebase/service.go:72 hardcoded http://localhost:8080",
+        "pkg/codebase/service.go:76 hardcoded model 'BAAI/bge-large-en-v1.5'",
+        "pkg/codebase/service.go:83 hardcoded http://localhost:11434",
+        "pkg/agentcontext/memory_hierarchy.go:61-98 hardcoded retention policies (24h TTL, 4h compression, 100k token limits)",
+        "cmd/loom/main.go:46 version hardcoded as '0.9.7'"
+      ]
+    },
+    {
+      "id": "DEBT-020",
+      "title": "Extract repeated type-assertion/error patterns to pkg/validate helpers",
+      "component": "pkg/codebase/service.go, pkg/agentcontext/service.go",
+      "impact": 2,
+      "risk_reduction": 1,
+      "drag_reduction": 3,
+      "effort": 5,
+      "status": "active",
+      "evidence": [
+        "pkg/codebase/service.go:150-169 type assertion + string slice extraction repeated 8+ times",
+        "No helper exists for UnmarshalStringSlice(args, key) pattern",
+        "pkg/validate already exists but lacks these common helpers"
+      ]
+    },
+    {
+      "id": "DEBT-021",
+      "title": "Split large MCP server main.go files into per-tool modules",
+      "component": "cmd/mcp-gitlab/main.go, cmd/mcp-linkedin/main.go, cmd/mcp-k8s/main.go",
+      "impact": 2,
+      "risk_reduction": 1,
+      "drag_reduction": 2,
+      "effort": 4,
+      "status": "active",
+      "evidence": [
+        "cmd/mcp-gitlab/main.go: 1,594 LOC, 28 funcs (~57 lines/func)",
+        "cmd/mcp-linkedin/main.go: 1,403 LOC, 58 funcs",
+        "cmd/mcp-k8s/main.go: 1,089 LOC"
+      ]
+    },
+    {
+      "id": "DEBT-022",
+      "title": "Introduce Qdrant client registry to replace 15+ individual client fields",
+      "component": "pkg/agentcontext/service.go, pkg/agentcontext/qdrant.go",
+      "impact": 2,
+      "risk_reduction": 2,
+      "drag_reduction": 3,
+      "effort": 4,
+      "status": "active",
+      "evidence": [
+        "pkg/agentcontext/service.go struct has 15 *QdrantClient fields (context, sessions, tasks, annotations, handoffs, templates, graphEntities, graphRelations, workflows, workflowDefs, memory, presence, fileClaims, worktree)",
+        "Adding a new collection requires modifying Service struct + init function + passing client to handler",
+        "pkg/agentcontext/qdrant.go: 1,221 LOC"
       ]
     }
   ]

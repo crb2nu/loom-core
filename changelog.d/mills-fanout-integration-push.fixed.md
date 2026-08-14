@@ -1,0 +1,1 @@
+- **Mills fan-out integration branches are safely published before MR creation** (`pkg/mills/clients/git_merger.go`): serialize shared-checkout merges, reset retries idempotently, and push with an explicit fetch-snapshotted force-with-lease; actionable fetch or publication failures now stop and escalate the pipeline.

@@ -19,9 +19,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 )
 
 var version = "1.0.0"
@@ -53,6 +55,22 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-flexinfer",
+		logger,
+	)
+	if err !=
+		nil {
+		logger.Warn("OTel tracer init failed",
+
+			"error",
+
+			err,
+		)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-flexinfer")
 
 	kubeconfig := os.Getenv("FLEXINFER_KUBECONFIG")
 	if kubeconfig == "" {
@@ -87,6 +105,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-flexinfer", "version", version, "namespace", namespace)
 
 	server := mcp.NewServer("mcp-flexinfer", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("FlexInfer AI inference operator MCP server. Manage Model CRs, LoRA adapters, model catalogs, GPU status, and proxy health. Uses Kubernetes API with unstructured client for CRD operations.")
 
 	// --- Read-only tools (always_allow) ---
@@ -103,7 +122,7 @@ func run(ctx context.Context) error {
 				"backend":        map[string]any{"type": "string", "description": "Filter by backend: ollama, vllm, llamacpp, etc."},
 			},
 		},
-	}, f.handleListModels)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_list_models", f.handleListModels))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_get_model",
@@ -116,7 +135,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name"},
 		},
-	}, f.handleGetModel)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_get_model", f.handleGetModel))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_list_lora_adapters",
@@ -129,7 +148,7 @@ func run(ctx context.Context) error {
 				"model_ref":      map[string]any{"type": "string", "description": "Filter by parent model name"},
 			},
 		},
-	}, f.handleListLoRAAdapters)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_list_lora_adapters", f.handleListLoRAAdapters))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_get_lora_adapter",
@@ -142,7 +161,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name"},
 		},
-	}, f.handleGetLoRAAdapter)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_get_lora_adapter", f.handleGetLoRAAdapter))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_list_catalogs",
@@ -154,7 +173,7 @@ func run(ctx context.Context) error {
 				"all_namespaces": map[string]any{"type": "boolean", "description": "Query all namespaces"},
 			},
 		},
-	}, f.handleListCatalogs)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_list_catalogs", f.handleListCatalogs))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_get_catalog",
@@ -167,7 +186,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name"},
 		},
-	}, f.handleGetCatalog)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_get_catalog", f.handleGetCatalog))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_gpu_status",
@@ -178,7 +197,7 @@ func run(ctx context.Context) error {
 				"node": map[string]any{"type": "string", "description": "Filter to a specific node name"},
 			},
 		},
-	}, f.handleGPUStatus)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_gpu_status", f.handleGPUStatus))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_benchmarks",
@@ -190,7 +209,7 @@ func run(ctx context.Context) error {
 				"model":     map[string]any{"type": "string", "description": "Filter by model name"},
 			},
 		},
-	}, f.handleBenchmarks)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_benchmarks", f.handleBenchmarks))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_proxy_models",
@@ -201,7 +220,7 @@ func run(ctx context.Context) error {
 				"proxy_url": map[string]any{"type": "string", "description": "Override proxy URL (default: FLEXINFER_PROXY_URL env)"},
 			},
 		},
-	}, f.handleProxyModels)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_proxy_models", f.handleProxyModels))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_proxy_health",
@@ -212,7 +231,7 @@ func run(ctx context.Context) error {
 				"proxy_url": map[string]any{"type": "string", "description": "Override proxy URL (default: FLEXINFER_PROXY_URL env)"},
 			},
 		},
-	}, f.handleProxyHealth)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_proxy_health", f.handleProxyHealth))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_probe",
@@ -223,9 +242,10 @@ func run(ctx context.Context) error {
 				"namespace": map[string]any{"type": "string", "description": "Namespace to probe (default: flexinfer-system)"},
 			},
 		},
-	}, f.handleProbe)
+	}, mcpotel.TracedToolHandler(
 
-	// --- Mutating tools (require approval) ---
+		// --- Mutating tools (require approval) ---
+		tracer, "flexinfer_probe", f.handleProbe))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_create_model",
@@ -247,7 +267,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name", "backend", "source"},
 		},
-	}, f.handleCreateModel)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_create_model", f.handleCreateModel))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_update_model",
@@ -269,7 +289,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name"},
 		},
-	}, f.handleUpdateModel)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_update_model", f.handleUpdateModel))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_delete_model",
@@ -283,7 +303,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name", "confirm"},
 		},
-	}, f.handleDeleteModel)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_delete_model", f.handleDeleteModel))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_scale_model",
@@ -297,7 +317,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name", "min_replicas"},
 		},
-	}, f.handleScaleModel)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_scale_model", f.handleScaleModel))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_activate_model",
@@ -310,7 +330,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name"},
 		},
-	}, f.handleActivateModel)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_activate_model", f.handleActivateModel))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_create_lora_adapter",
@@ -328,7 +348,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name", "model_ref", "adapter_name", "source_type", "source_uri"},
 		},
-	}, f.handleCreateLoRAAdapter)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_create_lora_adapter", f.handleCreateLoRAAdapter))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_delete_lora_adapter",
@@ -342,7 +362,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name", "confirm"},
 		},
-	}, f.handleDeleteLoRAAdapter)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_delete_lora_adapter", f.handleDeleteLoRAAdapter))
 
 	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_create_catalog",
@@ -358,7 +378,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"name", "registries"},
 		},
-	}, f.handleCreateCatalog)
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_create_catalog", f.handleCreateCatalog))
 
 	return server.Run(ctx)
 }

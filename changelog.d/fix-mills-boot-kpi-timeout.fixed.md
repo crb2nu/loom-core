@@ -1,0 +1,1 @@
+- **Mills startup no longer waits on KPI persistence** (`pkg/mills/scheduler.go`): the immediate boot reconcile skips the best-effort KPI snapshot, while periodic and merge-triggered ticks retain their dedicated persistence timeout.

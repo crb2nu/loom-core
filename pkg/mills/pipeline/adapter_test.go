@@ -1,0 +1,296 @@
+package pipeline
+
+import (
+	"context"
+	"log/slog"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/crb2nu/loom/pkg/mills/store"
+)
+
+func TestRunnerStarter_RoutesSingleSliceToRunner(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{Path: filepath.Join(dir, "h.db")})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	item := &store.BacklogItem{
+		ID:    "BL-SOLO",
+		Title: "single slice item",
+		State: store.BacklogQueued, Priority: store.P2,
+	}
+	if err := st.Backlog.Put(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	run := &store.PipelineRun{
+		ID: "PIPE-SOLO", BacklogID: item.ID, Template: "x",
+		State: store.PipelineQueued, Attempts: 1, StartedAt: time.Now(),
+	}
+	if err := st.Pipeline.PutRun(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	dispatched := int32(0)
+	disp := workerFn(func(_ context.Context, _ JobContext) (StageOutput, error) {
+		atomic.AddInt32(&dispatched, 1)
+		return StageOutput{}, nil
+	})
+	r := New(st, newPassingGates(t), &fakeWorkerDispatch{w: disp}, nil)
+	starter := NewRunnerStarter(r, nil)
+	if err := starter.Start(context.Background(), run, item); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	starter.Wait() // deterministic: drive goroutine has exited
+	got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
+	if got.State != store.PipelineDone {
+		t.Errorf("state = %s, want done", got.State)
+	}
+	if atomic.LoadInt32(&dispatched) == 0 {
+		t.Errorf("runner dispatcher should have been called")
+	}
+}
+
+// fakeWorkerDispatch wraps a workerFn to satisfy WorkerDispatcher.
+type fakeWorkerDispatch struct{ w Worker }
+
+func (f *fakeWorkerDispatch) Dispatch(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, stage Stage, prior map[string]StageOutput) (StageOutput, error) {
+	return f.w.Run(ctx, JobContext{Run: run, Item: item, Stage: stage, Prior: prior})
+}
+
+type blockingCountingAllocator struct {
+	release     <-chan struct{}
+	allocations atomic.Int32
+	releases    atomic.Int32
+}
+
+func (a *blockingCountingAllocator) Allocate(_ context.Context, req WorktreeRequest) (WorktreeHandle, error) {
+	a.allocations.Add(1)
+	<-a.release
+	return WorktreeHandle{
+		Path:   "/tmp/wt-" + req.BacklogID + "-" + req.SliceName,
+		Branch: req.BranchName,
+	}, nil
+}
+
+func (a *blockingCountingAllocator) Release(_ context.Context, _ WorktreeHandle) error {
+	a.releases.Add(1)
+	return nil
+}
+
+type countingMerger struct {
+	calls atomic.Int32
+}
+
+func (m *countingMerger) Merge(_ context.Context, _ MergeBranchesRequest) (MergeBranchesResponse, error) {
+	m.calls.Add(1)
+	return MergeBranchesResponse{IntegratedSHA: "deadbeef"}, nil
+}
+
+func TestRunnerStarter_RoutesParallelSlicesThroughIntegrator(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{Path: filepath.Join(dir, "h.db")})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	item := &store.BacklogItem{
+		ID: "BL-PAR", Title: "fan out", State: store.BacklogQueued, Priority: store.P2,
+		Slices: []store.Slice{
+			{Name: "alpha", ParallelWith: []string{"beta"}},
+			{Name: "beta", ParallelWith: []string{"alpha"}},
+		},
+	}
+	if err := st.Backlog.Put(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	run := &store.PipelineRun{
+		ID: "PIPE-PAR", BacklogID: item.ID, Template: "x",
+		State: store.PipelineQueued, Attempts: 1, StartedAt: time.Now(),
+	}
+	if err := st.Pipeline.PutRun(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	disp := &fakeDispatcher{}
+	r := New(st, newPassingGates(t), disp, nil)
+
+	allocator := &fakeAllocator{}
+	merger := &fakeMerger{sha: "deadbeef"}
+	sub := &recordingSubRunner{store: st, settleMS: 5}
+	itg := NewIntegrator(st, sub, allocator, merger)
+
+	starter := NewRunnerStarter(r, itg)
+	if err := starter.Start(context.Background(), run, item); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// Wait deterministically for the fan-out goroutine to finish before
+	// reading the shared run/merger/allocator state. The goroutine does
+	// `*run = parentRun` (integrator.go) — a poll loop touching `run`
+	// concurrently is a data race (DEBT-079).
+	starter.Wait()
+	got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
+	if got.State != store.PipelineDone {
+		t.Errorf("state = %s, want done after integrator+runner", got.State)
+	}
+	if len(merger.calls) != 1 {
+		t.Errorf("merger should have been invoked once, got %d", len(merger.calls))
+	}
+	if len(allocator.allocated) != 2 {
+		t.Errorf("expected 2 worktree allocations, got %d", len(allocator.allocated))
+	}
+}
+
+func TestRunnerStarter_ConcurrentFanOutStartsExactlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{Path: filepath.Join(dir, "h.db")})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	item := &store.BacklogItem{
+		ID: "BL-PAR-CONCURRENT", Title: "concurrent fan out", State: store.BacklogQueued, Priority: store.P2,
+		Slices: []store.Slice{
+			{Name: "alpha", ParallelWith: []string{"beta"}},
+			{Name: "beta", ParallelWith: []string{"alpha"}},
+		},
+	}
+	if err := st.Backlog.Put(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	run := &store.PipelineRun{
+		ID: "PIPE-PAR-CONCURRENT", BacklogID: item.ID, Template: "x",
+		State: store.PipelineQueued, Attempts: 1, StartedAt: time.Now(),
+	}
+	if err := st.Pipeline.PutRun(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	allocator := &blockingCountingAllocator{release: release}
+	merger := &countingMerger{}
+	sub := &recordingSubRunner{store: st}
+	runner := New(st, newPassingGates(t), &fakeDispatcher{}, nil)
+	quiet := slog.New(slog.DiscardHandler)
+	runner.Logger = quiet
+	integrator := NewIntegrator(st, sub, allocator, merger)
+	integrator.Logger = quiet
+	starter := NewRunnerStarter(runner, integrator)
+	starter.Logger = quiet
+
+	const callers = 100
+	ready := make(chan struct{})
+	errs := make(chan error, callers)
+	var starts sync.WaitGroup
+	starts.Add(callers)
+	for range callers {
+		go func() {
+			defer starts.Done()
+			<-ready
+			errs <- starter.Start(context.Background(), run, item)
+		}()
+	}
+	close(ready)
+	starts.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent start: %v", err)
+		}
+	}
+
+	close(release)
+	starter.Wait()
+
+	if got := allocator.allocations.Load(); got != int32(len(item.Slices)) {
+		t.Fatalf("worktree allocations = %d, want %d from one fan-out", got, len(item.Slices))
+	}
+	if got := allocator.releases.Load(); got != int32(len(item.Slices)) {
+		t.Fatalf("worktree releases = %d, want %d from one fan-out", got, len(item.Slices))
+	}
+	if got := merger.calls.Load(); got != 1 {
+		t.Fatalf("integration merges = %d, want 1", got)
+	}
+	gotRun, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get completed run: %v", err)
+	}
+	if gotRun.State != store.PipelineDone {
+		t.Fatalf("run state = %s, want done after fan-out and post-run completion", gotRun.State)
+	}
+	if _, active := runner.active.Load(run.ID); active {
+		t.Fatalf("run %s remained active after fan-out and post-run completion", run.ID)
+	}
+}
+
+func TestRunnerStarter_ResumesPostFanoutRunThroughRunner(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{Path: filepath.Join(dir, "h.db")})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	item := &store.BacklogItem{
+		ID: "BL-PAR-RESUME", Title: "fan out resume", State: store.BacklogRunning, Priority: store.P2,
+		Slices: []store.Slice{
+			{Name: "alpha", ParallelWith: []string{"beta"}},
+			{Name: "beta", ParallelWith: []string{"alpha"}},
+		},
+	}
+	if err := st.Backlog.Put(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	run := &store.PipelineRun{
+		ID: "PIPE-PAR-RESUME", BacklogID: item.ID, Template: "x",
+		State: store.PipelineMR, CurrentStage: "mr",
+		Attempts: 1, StartedAt: time.Now(),
+	}
+	if err := st.Pipeline.PutRun(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	disp := &fakeDispatcher{}
+	r := New(st, newPassingGates(t), disp, nil)
+	allocator := &fakeAllocator{}
+	merger := &fakeMerger{sha: "deadbeef"}
+	sub := &recordingSubRunner{store: st, settleMS: 5}
+	itg := NewIntegrator(st, sub, allocator, merger)
+
+	starter := NewRunnerStarter(r, itg)
+	if err := starter.Start(context.Background(), run, item); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	starter.Wait() // deterministic join before reading shared run/merger state
+	got, _ := st.Pipeline.GetRun(context.Background(), run.ID)
+	if got.State != store.PipelineDone {
+		t.Errorf("state = %s, want done", got.State)
+	}
+	if len(merger.calls) != 0 {
+		t.Errorf("merger should not rerun for post-fanout resume, got %d calls", len(merger.calls))
+	}
+	calls := disp.callsList()
+	if len(calls) == 0 || calls[0] != "mr" {
+		t.Fatalf("runner calls = %v, want resume at mr", calls)
+	}
+}
+
+func TestRunnerStarter_RejectsBadConfig(t *testing.T) {
+	if err := (&RunnerStarter{}).Start(context.Background(), nil, nil); err == nil {
+		t.Error("expected error for nil Runner")
+	}
+	r := &Runner{}
+	s := NewRunnerStarter(r, nil)
+	if err := s.Start(context.Background(), nil, &store.BacklogItem{ID: "x"}); err == nil {
+		t.Error("expected error for nil run")
+	}
+	if err := s.Start(context.Background(), &store.PipelineRun{ID: "x"}, nil); err == nil {
+		t.Error("expected error for nil item")
+	}
+}

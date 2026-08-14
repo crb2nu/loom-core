@@ -45,6 +45,80 @@ func TestAgentBridge_CallAgentTool_PropagatesToolErrorEnvelope(t *testing.T) {
 	}
 }
 
+func TestAgentBridge_CallAgentTool_PropagatesToolErrorEnvelopeWithNilTarget(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+		if req.Name != "agent_context__agent_task_update" {
+			t.Fatalf("unexpected tool name: %s", req.Name)
+		}
+		return map[string]any{
+			"isError": true,
+			"content": []map[string]any{
+				{"type": "text", "text": "task not found"},
+			},
+		}, nil
+	})
+
+	client := NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	bridge := NewAgentBridge(client)
+	err := bridge.callAgentTool("agent_task_update", map[string]any{"task_id": "task-missing"}, nil)
+	if err == nil {
+		t.Fatal("expected tool-level error to be propagated for nil target")
+	}
+	if !strings.Contains(err.Error(), "task not found") {
+		t.Fatalf("expected error to include task failure detail, got: %v", err)
+	}
+}
+
+func TestAgentBridge_CallAgentToolTimeout_PropagatesToolErrorEnvelopeWithNilTarget(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+		if req.Name != "agent_context__agent_task_add" {
+			t.Fatalf("unexpected tool name: %s", req.Name)
+		}
+		return map[string]any{
+			"isError": true,
+			"content": []map[string]any{
+				{"type": "text", "text": "session missing"},
+			},
+		}, nil
+	})
+
+	client := NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	bridge := NewAgentBridge(client)
+	err := bridge.callAgentToolTimeout("agent_task_add", map[string]any{"session_id": "missing"}, nil, time.Second)
+	if err == nil {
+		t.Fatal("expected timeout call to propagate tool-level error for nil target")
+	}
+	if !strings.Contains(err.Error(), "session missing") {
+		t.Fatalf("expected error to include tool failure detail, got: %v", err)
+	}
+}
+
 func TestAgentBridge_CallAgentTool_SucceedsWithTargetNil(t *testing.T) {
 	sockPath, handlers := mockDaemon(t)
 
@@ -393,6 +467,16 @@ func TestAgentBridge_CreateTask_UsesTasksArrayShape(t *testing.T) {
 		if got, _ := task["title"].(string); got != "Fix HUD sync" {
 			t.Fatalf("expected title, got %q", got)
 		}
+		if got, _ := task["project"].(string); got != "services/loom-core" {
+			t.Fatalf("expected project services/loom-core, got %q", got)
+		}
+		pipelineRef, ok := task["pipeline_ref"].(map[string]any)
+		if !ok || int(pipelineRef["id"].(float64)) != 42 {
+			t.Fatalf("expected pipeline_ref id 42, got %#v", task["pipeline_ref"])
+		}
+		if got, _ := task["workflow_id"].(string); got != "wf-77" {
+			t.Fatalf("expected workflow_id wf-77, got %q", got)
+		}
 		return map[string]any{
 			"isError": false,
 			"content": []map[string]any{
@@ -408,14 +492,24 @@ func TestAgentBridge_CreateTask_UsesTasksArrayShape(t *testing.T) {
 	defer client.Close()
 
 	bridge := NewAgentBridge(client)
-	err := bridge.CreateTask(CreateTaskParams{
+	result, err := bridge.CreateTask(CreateTaskParams{
 		SessionID: "sess-1",
 		Title:     "Fix HUD sync",
 		Priority:  "high",
+		Project:   "services/loom-core",
 		Context:   "update task payload shape",
+		PipelineRef: &PipelineRef{
+			ID:      42,
+			Project: "services/loom-core",
+			Ref:     "main",
+		},
+		WorkflowID: "wf-77",
 	})
 	if err != nil {
 		t.Fatalf("create task failed: %v", err)
+	}
+	if result == nil || len(result.TaskIDs) != 1 || result.TaskIDs[0] != "t-1" {
+		t.Fatalf("expected task_ids [t-1], got %#v", result)
 	}
 }
 
@@ -424,6 +518,7 @@ func TestAgentBridge_DispatchTask_WithActiveSessionIncludesTaskMetadata(t *testi
 
 	var taskAddSeen bool
 	var handoffSeen bool
+	var dispatcherSessionSeen bool
 
 	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
 		var req struct {
@@ -436,10 +531,36 @@ func TestAgentBridge_DispatchTask_WithActiveSessionIncludesTaskMetadata(t *testi
 
 		switch req.Name {
 		case "agent_context__agent_session_list":
+			if got, _ := req.Arguments["agent_id"].(string); got == "hud-dispatcher" {
+				return map[string]any{
+					"isError": false,
+					"content": []map[string]any{
+						{"type": "text", "text": `{"sessions":[]}`},
+					},
+				}, nil
+			}
 			return map[string]any{
 				"isError": false,
 				"content": []map[string]any{
 					{"type": "text", "text": `{"sessions":[{"id":"sess-1","agent_id":"agent-1","status":"active"}]}`},
+				},
+			}, nil
+		case "agent_context__agent_session_start":
+			dispatcherSessionSeen = true
+			if got, _ := req.Arguments["agent_id"].(string); got != "hud-dispatcher" {
+				t.Fatalf("expected dispatcher agent_id, got %q", got)
+			}
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"session_id":"sess-dispatcher"}`},
+				},
+			}, nil
+		case "agent_context__agent_presence_register":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true}`},
 				},
 			}, nil
 		case "agent_context__agent_task_add":
@@ -477,13 +598,23 @@ func TestAgentBridge_DispatchTask_WithActiveSessionIncludesTaskMetadata(t *testi
 			}, nil
 		case "agent_context__agent_handoff_create":
 			handoffSeen = true
-			if got, _ := req.Arguments["to_agent"].(string); got != "agent-1" {
-				t.Fatalf("expected to_agent=agent-1, got %q", got)
+			if got, _ := req.Arguments["target_agent_id"].(string); got != "agent-1" {
+				t.Fatalf("expected target_agent_id=agent-1, got %q", got)
+			}
+			if got, _ := req.Arguments["session_id"].(string); got != "sess-dispatcher" {
+				t.Fatalf("expected dispatcher session_id, got %q", got)
+			}
+			if got, _ := req.Arguments["handoff_type"].(string); got != "summary_only" {
+				t.Fatalf("expected handoff_type=summary_only, got %q", got)
+			}
+			instructions, _ := req.Arguments["instructions"].(string)
+			if !strings.HasPrefix(instructions, "[Dispatched] Review enterprise rollout") {
+				t.Fatalf("unexpected handoff instructions: %q", instructions)
 			}
 			return map[string]any{
 				"isError": false,
 				"content": []map[string]any{
-					{"type": "text", "text": `{"ok":true}`},
+					{"type": "text", "text": `{"ok":true,"handoff_id":"handoff-1"}`},
 				},
 			}, nil
 		default:
@@ -518,8 +649,17 @@ func TestAgentBridge_DispatchTask_WithActiveSessionIncludesTaskMetadata(t *testi
 	if !handoffSeen {
 		t.Fatalf("expected handoff_create call")
 	}
+	if !dispatcherSessionSeen {
+		t.Fatalf("expected dispatcher session bootstrap")
+	}
 	if created, _ := result["task_created"].(bool); !created {
 		t.Fatalf("expected task_created=true, got %#v", result["task_created"])
+	}
+	if got, _ := result["handoff_id"].(string); got != "handoff-1" {
+		t.Fatalf("expected handoff_id handoff-1, got %#v", result["handoff_id"])
+	}
+	if got, _ := result["source_session_id"].(string); got != "sess-dispatcher" {
+		t.Fatalf("expected source_session_id sess-dispatcher, got %#v", result["source_session_id"])
 	}
 }
 
@@ -527,6 +667,7 @@ func TestAgentBridge_DispatchTask_WithoutActiveSessionCreatesHandoffOnly(t *test
 	sockPath, handlers := mockDaemon(t)
 
 	var handoffSeen bool
+	var dispatcherSessionSeen bool
 
 	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
 		var req struct {
@@ -539,10 +680,33 @@ func TestAgentBridge_DispatchTask_WithoutActiveSessionCreatesHandoffOnly(t *test
 
 		switch req.Name {
 		case "agent_context__agent_session_list":
+			if got, _ := req.Arguments["agent_id"].(string); got == "hud-dispatcher" {
+				return map[string]any{
+					"isError": false,
+					"content": []map[string]any{
+						{"type": "text", "text": `{"sessions":[]}`},
+					},
+				}, nil
+			}
 			return map[string]any{
 				"isError": false,
 				"content": []map[string]any{
 					{"type": "text", "text": `{"sessions":[]}`},
+				},
+			}, nil
+		case "agent_context__agent_session_start":
+			dispatcherSessionSeen = true
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"session_id":"sess-dispatcher"}`},
+				},
+			}, nil
+		case "agent_context__agent_presence_register":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true}`},
 				},
 			}, nil
 		case "agent_context__agent_task_add":
@@ -550,10 +714,16 @@ func TestAgentBridge_DispatchTask_WithoutActiveSessionCreatesHandoffOnly(t *test
 			return nil, nil
 		case "agent_context__agent_handoff_create":
 			handoffSeen = true
+			if got, _ := req.Arguments["target_agent_id"].(string); got != "agent-2" {
+				t.Fatalf("expected target_agent_id=agent-2, got %q", got)
+			}
+			if got, _ := req.Arguments["session_id"].(string); got != "sess-dispatcher" {
+				t.Fatalf("expected dispatcher session_id, got %q", got)
+			}
 			return map[string]any{
 				"isError": false,
 				"content": []map[string]any{
-					{"type": "text", "text": `{"ok":true}`},
+					{"type": "text", "text": `{"ok":true,"handoff_id":"handoff-2"}`},
 				},
 			}, nil
 		default:
@@ -581,8 +751,55 @@ func TestAgentBridge_DispatchTask_WithoutActiveSessionCreatesHandoffOnly(t *test
 	if !handoffSeen {
 		t.Fatalf("expected handoff_create call")
 	}
+	if !dispatcherSessionSeen {
+		t.Fatalf("expected dispatcher session bootstrap")
+	}
 	if created, _ := result["task_created"].(bool); created {
 		t.Fatalf("expected task_created=false when no active session")
+	}
+	if got, _ := result["handoff_id"].(string); got != "handoff-2" {
+		t.Fatalf("expected handoff_id handoff-2, got %#v", result["handoff_id"])
+	}
+}
+
+func TestAgentBridge_SessionsUsesExpandedDefaultLimit(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+		if req.Name != "agent_context__agent_session_list" {
+			t.Fatalf("unexpected tool name: %s", req.Name)
+		}
+		if got, _ := req.Arguments["limit"].(float64); int(got) != defaultSessionListLimit {
+			t.Fatalf("expected limit=%d, got %#v", defaultSessionListLimit, req.Arguments["limit"])
+		}
+		return map[string]any{
+			"isError": false,
+			"content": []map[string]any{
+				{"type": "text", "text": `{"sessions":[{"id":"sess-1","agent_id":"agent-1","status":"active"}]}`},
+			},
+		}, nil
+	})
+
+	client := NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	bridge := NewAgentBridge(client)
+	sessions, err := bridge.Sessions()
+	if err != nil {
+		t.Fatalf("Sessions() failed: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "sess-1" {
+		t.Fatalf("unexpected sessions: %#v", sessions)
 	}
 }
 
@@ -821,7 +1038,7 @@ func TestAgentBridge_KnowledgeRecall_SetsCrossAgent(t *testing.T) {
 		if err := json.Unmarshal(params, &req); err != nil {
 			t.Fatalf("unmarshal params: %v", err)
 		}
-		if req.Name != "agent_context__agent_context_recall_enhanced" {
+		if req.Name != "agent_context__agent_recall" {
 			t.Fatalf("unexpected tool name: %s", req.Name)
 		}
 		crossAgent, _ := req.Arguments["cross_agent"].(bool)
@@ -859,5 +1076,454 @@ func TestAgentBridge_KnowledgeRecall_SetsCrossAgent(t *testing.T) {
 	}
 	if result.Entries[0].EntryType != "decision" {
 		t.Fatalf("expected entry_type 'decision', got %q", result.Entries[0].EntryType)
+	}
+}
+
+func TestBuildSessionStartRecallArgs_DefaultsBalanced(t *testing.T) {
+	args := buildSessionStartRecallArgs(SessionStartParams{
+		Namespace:   "loom-core/main",
+		AgentID:     "codex-gpt5",
+		Description: "stabilize hook startup and memory pressure",
+	})
+
+	if got, _ := args["query"].(string); got != "stabilize hook startup and memory pressure" {
+		t.Fatalf("expected description-backed query, got %q", got)
+	}
+	if got, _ := args["agent_id"].(string); got != "codex-gpt5" {
+		t.Fatalf("expected agent_id codex-gpt5, got %q", got)
+	}
+	if got, _ := args["file_context"].(string); got != "loom-core/main" {
+		t.Fatalf("expected file_context loom-core/main, got %q", got)
+	}
+	if got, _ := args["token_budget"].(int); got != 4000 {
+		t.Fatalf("expected token_budget 4000, got %v", args["token_budget"])
+	}
+	if got, _ := args["scope"].(string); got != "all" {
+		t.Fatalf("expected scope all, got %q", got)
+	}
+	if got, _ := args["include_tasks"].(bool); !got {
+		t.Fatalf("expected include_tasks=true, got %v", args["include_tasks"])
+	}
+	if got, _ := args["include_decisions"].(bool); !got {
+		t.Fatalf("expected include_decisions=true, got %v", args["include_decisions"])
+	}
+	if got, _ := args["include_summaries"].(bool); !got {
+		t.Fatalf("expected include_summaries=true, got %v", args["include_summaries"])
+	}
+	if got, _ := args["recency_weight"].(float64); got != 0.20 {
+		t.Fatalf("expected recency_weight=0.20, got %v", args["recency_weight"])
+	}
+	if got, ok := args["memory_tiers"].([]string); !ok || len(got) != 3 || got[0] != "working" || got[1] != "short_term" || got[2] != "long_term" {
+		t.Fatalf("expected balanced memory_tiers [working short_term long_term], got %#v", args["memory_tiers"])
+	}
+}
+
+func TestBuildSessionStartRecallArgs_FastProfileAndOverrides(t *testing.T) {
+	args := buildSessionStartRecallArgs(SessionStartParams{
+		Namespace:             "loom-core/feature-x",
+		AgentID:               "codex-gpt5",
+		AutoRecallStrategy:    "FAST",
+		AutoRecallQuery:       "focus on recent queue-policy decisions",
+		AutoRecallTokenBudget: 64,
+	})
+
+	if got, _ := args["query"].(string); got != "focus on recent queue-policy decisions" {
+		t.Fatalf("expected override query, got %q", got)
+	}
+	if got, _ := args["token_budget"].(int); got != 256 {
+		t.Fatalf("expected clamped token_budget 256, got %v", args["token_budget"])
+	}
+	if got, _ := args["scope"].(string); got != "all" {
+		t.Fatalf("expected scope all, got %q", got)
+	}
+	if got, _ := args["include_tasks"].(bool); got {
+		t.Fatalf("expected include_tasks=false for fast profile, got %v", args["include_tasks"])
+	}
+	if got, _ := args["recency_weight"].(float64); got != 0.45 {
+		t.Fatalf("expected recency_weight=0.45 for fast profile, got %v", args["recency_weight"])
+	}
+	if got, ok := args["memory_tiers"].([]string); !ok || len(got) != 2 || got[0] != "working" || got[1] != "short_term" {
+		t.Fatalf("expected fast memory_tiers [working short_term], got %#v", args["memory_tiers"])
+	}
+}
+
+func TestAgentBridge_StartSession_AutoRecallUsesStrategyArgs(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	recallArgsCh := make(chan map[string]any, 1)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"sessions":[]}`},
+				},
+			}, nil
+		case "agent_context__agent_session_start":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"session_id":"sess-123"}`},
+				},
+			}, nil
+		case "agent_context__agent_presence_register":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true}`},
+				},
+			}, nil
+		case "agent_context__agent_recall":
+			select {
+			case recallArgsCh <- req.Arguments:
+			default:
+			}
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true,"entries":[{"id":"e1","agent_id":"codex-gpt5","entry_type":"decision","title":"Adopt queue throttling","content":"Heartbeat bursts were spamming downstream consumers and needed debounce.","namespace":"loom-core/main","token_count":55}],"count":1,"total_tokens":55,"token_budget":1800}`},
+				},
+			}, nil
+		default:
+			t.Fatalf("unexpected tool name: %s", req.Name)
+			return nil, nil
+		}
+	})
+
+	client := NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	bridge := NewAgentBridge(client)
+	result, err := bridge.StartSession(SessionStartParams{
+		Namespace:             "loom-core/main",
+		AgentID:               "codex-gpt5",
+		AgentType:             "codex",
+		Description:           "stabilize session bootstrap behavior",
+		AutoRecall:            true,
+		AutoRecallStrategy:    "fast",
+		AutoRecallTokenBudget: 1800,
+	})
+	if err != nil {
+		t.Fatalf("start session failed: %v", err)
+	}
+	if result == nil || result.SessionID != "sess-123" {
+		t.Fatalf("unexpected session result: %+v", result)
+	}
+	if result.StartupBriefing == "" {
+		t.Fatalf("expected startup briefing to be populated")
+	}
+	if result.RecalledContext != result.StartupBriefing {
+		t.Fatalf("expected recalled_context compatibility alias, got %q vs %q", result.RecalledContext, result.StartupBriefing)
+	}
+	if result.StartupBriefingEntries != 1 {
+		t.Fatalf("expected startup_briefing_entries=1, got %d", result.StartupBriefingEntries)
+	}
+
+	select {
+	case recallArgs := <-recallArgsCh:
+		if got, _ := recallArgs["agent_id"].(string); got != "codex-gpt5" {
+			t.Fatalf("expected recall agent_id codex-gpt5, got %q", got)
+		}
+		if got, _ := recallArgs["file_context"].(string); got != "loom-core/main" {
+			t.Fatalf("expected recall file_context loom-core/main, got %q", got)
+		}
+		if got, _ := recallArgs["query"].(string); got != "stabilize session bootstrap behavior" {
+			t.Fatalf("expected recall query from description, got %q", got)
+		}
+		if got, _ := recallArgs["token_budget"].(float64); int(got) != 1800 {
+			t.Fatalf("expected recall token_budget 1800, got %v", recallArgs["token_budget"])
+		}
+		if got, _ := recallArgs["scope"].(string); got != "all" {
+			t.Fatalf("expected recall scope all, got %q", got)
+		}
+		if got, _ := recallArgs["include_tasks"].(bool); got {
+			t.Fatalf("expected include_tasks=false for fast strategy, got %v", recallArgs["include_tasks"])
+		}
+		memoryTiers, ok := recallArgs["memory_tiers"].([]any)
+		if !ok || len(memoryTiers) != 2 || memoryTiers[0] != "working" || memoryTiers[1] != "short_term" {
+			t.Fatalf("expected recall memory_tiers [working short_term], got %#v", recallArgs["memory_tiers"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for recall call")
+	}
+}
+
+func TestAgentBridge_StartSession_ExistingSessionCanStillReturnBriefing(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	recallCalls := 0
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"sessions":[{"id":"sess-existing","agent_id":"codex-gpt5","namespace":"loom-core/main","status":"active"}]}`},
+				},
+			}, nil
+		case "agent_context__agent_presence_register":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true}`},
+				},
+			}, nil
+		case "agent_context__agent_recall":
+			recallCalls++
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true,"entries":[{"id":"e1","agent_id":"codex-gpt5","entry_type":"finding","title":"Context telemetry shipped","content":"HUD now exposes prompt pressure metrics and timeline samples.","namespace":"loom-core/main","token_count":42}],"count":1,"total_tokens":42,"token_budget":1500}`},
+				},
+			}, nil
+		default:
+			t.Fatalf("unexpected tool name: %s", req.Name)
+			return nil, nil
+		}
+	})
+
+	client := NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	bridge := NewAgentBridge(client)
+	result, err := bridge.StartSession(SessionStartParams{
+		Namespace:          "loom-core/main",
+		AgentID:            "codex-gpt5",
+		AgentType:          "codex",
+		AutoRecall:         true,
+		AutoRecallStrategy: "fast",
+	})
+	if err != nil {
+		t.Fatalf("start session failed: %v", err)
+	}
+	if !result.AlreadyExisted {
+		t.Fatalf("expected already_existed=true")
+	}
+	if result.StartupBriefing == "" {
+		t.Fatalf("expected startup briefing for existing session")
+	}
+	if recallCalls != 1 {
+		t.Fatalf("recallCalls = %d, want 1", recallCalls)
+	}
+}
+
+func TestFormatSessionStartBriefing_TruncatesAndSummarizes(t *testing.T) {
+	briefing := formatSessionStartBriefing(&KnowledgeResult{
+		Entries: []KnowledgeEntry{
+			{
+				EntryType: "decision",
+				Title:     "Use bounded startup recall",
+				Content:   "We want startup recall to return a concise, structured briefing instead of a huge raw dump that bloats prompt context immediately.",
+				Namespace: "loom-core/main",
+			},
+			{
+				EntryType: "task",
+				Content:   "Add alerting thresholds once telemetry is stable in production.",
+			},
+		},
+		TotalTokens: 200,
+	}, autoRecallProfile{BriefingItems: 2, BriefingChars: 280})
+
+	if !strings.Contains(briefing, "Recalled 2 entries") {
+		t.Fatalf("unexpected briefing header: %q", briefing)
+	}
+	if !strings.Contains(briefing, "decision: Use bounded startup recall") {
+		t.Fatalf("expected decision summary in briefing: %q", briefing)
+	}
+	if !strings.Contains(briefing, "task:") {
+		t.Fatalf("expected task summary in briefing: %q", briefing)
+	}
+	if len([]rune(briefing)) > 280 {
+		t.Fatalf("expected briefing to respect char limit, got %d chars", len([]rune(briefing)))
+	}
+}
+
+func TestAgentBridge_StartSession_IdempotentForSameNamespace(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	sessionStartCalls := 0
+	presenceRegisterCalls := make(chan map[string]any, 1)
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"sessions":[{"id":"sess-existing","agent_id":"codex-gpt5","namespace":"loom-core/main","status":"active"}]}`},
+				},
+			}, nil
+		case "agent_context__agent_presence_register":
+			select {
+			case presenceRegisterCalls <- req.Arguments:
+			default:
+			}
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true}`},
+				},
+			}, nil
+		case "agent_context__agent_session_start":
+			sessionStartCalls++
+			if got, _ := req.Arguments["project"].(string); got != "services/loom-core" {
+				t.Fatalf("expected project services/loom-core, got %q", got)
+			}
+			if got, _ := req.Arguments["pipeline_project"].(string); got != "services/loom-core" {
+				t.Fatalf("expected pipeline_project services/loom-core, got %q", got)
+			}
+			if got, _ := req.Arguments["pipeline_id"].(float64); int(got) != 4242 {
+				t.Fatalf("expected pipeline_id 4242, got %#v", req.Arguments["pipeline_id"])
+			}
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"session_id":"sess-new"}`},
+				},
+			}, nil
+		default:
+			t.Fatalf("unexpected tool name: %s", req.Name)
+			return nil, nil
+		}
+	})
+
+	client := NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	bridge := NewAgentBridge(client)
+	result, err := bridge.StartSession(SessionStartParams{
+		Namespace: "loom-core/main",
+		AgentID:   "codex-gpt5",
+		AgentType: "codex",
+	})
+	if err != nil {
+		t.Fatalf("start session failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil session result")
+	}
+	if result.SessionID != "sess-existing" {
+		t.Fatalf("session_id = %q, want sess-existing", result.SessionID)
+	}
+	if !result.AlreadyExisted {
+		t.Fatal("expected already_existed=true")
+	}
+	if sessionStartCalls != 0 {
+		t.Fatalf("session_start calls = %d, want 0", sessionStartCalls)
+	}
+	select {
+	case args := <-presenceRegisterCalls:
+		if got, _ := args["session_id"].(string); got != "sess-existing" {
+			t.Fatalf("presence register session_id = %q, want sess-existing", got)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected presence register call for reused session")
+	}
+}
+
+func TestAgentBridge_StartSession_NewNamespaceStartsNewSession(t *testing.T) {
+	sockPath, handlers := mockDaemon(t)
+	sessionStartCalls := 0
+
+	handlers.handle("tools/call", func(params json.RawMessage) (any, error) {
+		var req struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+
+		switch req.Name {
+		case "agent_context__agent_session_list":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"sessions":[{"id":"sess-existing","agent_id":"codex-gpt5","namespace":"loom-core/old","status":"active"}]}`},
+				},
+			}, nil
+		case "agent_context__agent_session_start":
+			sessionStartCalls++
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"session_id":"sess-new"}`},
+				},
+			}, nil
+		case "agent_context__agent_presence_register":
+			return map[string]any{
+				"isError": false,
+				"content": []map[string]any{
+					{"type": "text", "text": `{"ok":true}`},
+				},
+			}, nil
+		default:
+			t.Fatalf("unexpected tool name: %s", req.Name)
+			return nil, nil
+		}
+	})
+
+	client := NewDaemonClient(sockPath, nil)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	bridge := NewAgentBridge(client)
+	result, err := bridge.StartSession(SessionStartParams{
+		Namespace:       "loom-core/new",
+		Project:         "services/loom-core",
+		AgentID:         "codex-gpt5",
+		AgentType:       "codex",
+		PipelineProject: "services/loom-core",
+		PipelineID:      4242,
+	})
+	if err != nil {
+		t.Fatalf("start session failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil session result")
+	}
+	if result.SessionID != "sess-new" {
+		t.Fatalf("session_id = %q, want sess-new", result.SessionID)
+	}
+	if result.AlreadyExisted {
+		t.Fatal("expected already_existed=false")
+	}
+	if sessionStartCalls != 1 {
+		t.Fatalf("session_start calls = %d, want 1", sessionStartCalls)
 	}
 }

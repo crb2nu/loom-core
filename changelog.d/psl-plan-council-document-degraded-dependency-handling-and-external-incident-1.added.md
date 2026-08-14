@@ -1,0 +1,1 @@
+- **Documented Mills degraded dependency semantics** (`docs/mills-degraded-mode.md`): added operator guidance defining `healthy`, `degraded`, `blocked`, and `external_dependency_incident` handling, retry boundaries, evidence requirements, and council follow-up rules.

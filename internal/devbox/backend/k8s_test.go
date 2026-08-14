@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -10,9 +11,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -20,13 +23,29 @@ import (
 
 func testK8sBackend() *K8sBackend {
 	return &K8sBackend{
-		namespace:       "devbox",
-		registry:        "registry.harbor.lan",
-		workspacePVC:    "devbox-workspace-nfs",
-		imagePullSecret: "harbor-creds",
-		workspaceRoot:   "/workspace",
-		builderImage:    "quay.io/buildah/stable:v1.38.0",
+		namespace:                    "devbox",
+		registry:                     "registry.harbor.lan",
+		workspacePVC:                 "devbox-workspace-nfs",
+		imagePullSecret:              "harbor-creds",
+		workspaceRoot:                "/workspace",
+		builderImage:                 "quay.io/buildah/stable:v1.38.0",
+		gitCloneImage:                defaultGitCloneImage,
+		buildCPURequest:              resource.MustParse(defaultBuildCPURequest),
+		buildCPULimit:                resource.MustParse(defaultBuildCPULimit),
+		buildMemoryRequest:           resource.MustParse(defaultBuildMemoryRequest),
+		buildMemoryLimit:             resource.MustParse(defaultBuildMemoryLimit),
+		buildEphemeralStorageRequest: resource.MustParse(defaultBuildEphemeralStorageRequest),
+		buildEphemeralStorageLimit:   resource.MustParse(defaultBuildEphemeralStorageLimit),
+		gitCloneMemoryRequest:        resource.MustParse(defaultGitCloneMemoryRequest),
+		gitCloneMemoryLimit:          resource.MustParse(defaultGitCloneMemoryLimit),
 	}
+}
+
+func testK8sBackendGitClone() *K8sBackend {
+	k := testK8sBackend()
+	k.gitBaseURL = "https://gitlab.blevins.dev/homelab"
+	k.gitSecret = "gitlab-creds"
+	return k
 }
 
 func envMap(vars []corev1.EnvVar) map[string]string {
@@ -35,6 +54,171 @@ func envMap(vars []corev1.EnvVar) map[string]string {
 		out[v.Name] = v.Value
 	}
 	return out
+}
+
+func writeTestKubeconfig(t *testing.T) string {
+	t.Helper()
+
+	cfg := []byte(`apiVersion: v1
+kind: Config
+clusters:
+  - name: test
+    cluster:
+      server: https://127.0.0.1:6443
+contexts:
+  - name: test
+    context:
+      cluster: test
+      user: test
+current-context: test
+users:
+  - name: test
+    user:
+      token: fake-token
+`)
+
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(path, cfg, 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+	return path
+}
+
+func TestExecModeDefault(t *testing.T) {
+	t.Setenv("DEVBOX_EXEC_MODE", "")
+
+	if got := execMode(); got != "spdy" {
+		t.Fatalf("execMode() = %q, want spdy", got)
+	}
+}
+
+func TestExecModeOverride(t *testing.T) {
+	t.Setenv("DEVBOX_EXEC_MODE", " websocket ")
+
+	if got := execMode(); got != "websocket" {
+		t.Fatalf("execMode() = %q, want websocket", got)
+	}
+}
+
+func TestBuildRestConfig_UsesExplicitKubeconfig(t *testing.T) {
+	kubeconfig := writeTestKubeconfig(t)
+
+	cfg, err := buildRestConfig(kubeconfig)
+	if err != nil {
+		t.Fatalf("buildRestConfig returned error: %v", err)
+	}
+	if got := cfg.Host; got != "https://127.0.0.1:6443" {
+		t.Fatalf("unexpected kube API host: %q", got)
+	}
+}
+
+func TestNewK8sBackend_DefaultsAndOverrides(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	kubeconfig := writeTestKubeconfig(t)
+
+	t.Run("defaults", func(t *testing.T) {
+		k, err := NewK8sBackend(K8sBackendConfig{Kubeconfig: kubeconfig})
+		if err != nil {
+			t.Fatalf("NewK8sBackend returned error: %v", err)
+		}
+
+		if k.namespace != "devbox" {
+			t.Fatalf("namespace=%q", k.namespace)
+		}
+		if k.registry != "registry.harbor.lan" {
+			t.Fatalf("registry=%q", k.registry)
+		}
+		if k.workspacePVC != "devbox-workspace-nfs" {
+			t.Fatalf("workspacePVC=%q", k.workspacePVC)
+		}
+		if k.imagePullSecret != "harbor-creds" {
+			t.Fatalf("imagePullSecret=%q", k.imagePullSecret)
+		}
+		if k.builderImage != defaultBuilderImage {
+			t.Fatalf("builderImage=%q", k.builderImage)
+		}
+		if k.gitCloneImage != defaultGitCloneImage {
+			t.Fatalf("gitCloneImage=%q", k.gitCloneImage)
+		}
+		if k.workspaceRoot != filepath.Join(homeDir, "workspace") {
+			t.Fatalf("workspaceRoot=%q", k.workspaceRoot)
+		}
+		if got := cap(k.buildSlots); got != defaultMaxBuilds {
+			t.Fatalf("default max build slots=%d, want %d", got, defaultMaxBuilds)
+		}
+		if got := k.buildCPULimit.String(); got != defaultBuildCPULimit {
+			t.Fatalf("default build CPU limit=%s", got)
+		}
+		if got := k.buildEphemeralStorageRequest.String(); got != defaultBuildEphemeralStorageRequest {
+			t.Fatalf("default build ephemeral-storage request=%s", got)
+		}
+		if got := k.buildEphemeralStorageLimit.String(); got != defaultBuildEphemeralStorageLimit {
+			t.Fatalf("default build ephemeral-storage limit=%s", got)
+		}
+		if got := k.gitCloneMemoryRequest.String(); got != defaultGitCloneMemoryRequest {
+			t.Fatalf("default git-clone memory request=%s, want %s", got, defaultGitCloneMemoryRequest)
+		}
+		if got := k.gitCloneMemoryLimit.String(); got != defaultGitCloneMemoryLimit {
+			t.Fatalf("default git-clone memory limit=%s, want %s", got, defaultGitCloneMemoryLimit)
+		}
+	})
+
+	t.Run("overrides", func(t *testing.T) {
+		k, err := NewK8sBackend(K8sBackendConfig{
+			Kubeconfig:                   kubeconfig,
+			Namespace:                    "custom-ns",
+			Registry:                     "registry.example.test",
+			WorkspacePVC:                 "custom-pvc",
+			ImagePullSecret:              "custom-secret",
+			WorkspaceRoot:                "/srv/workspace",
+			BuilderImage:                 "quay.io/custom/buildah:v1",
+			GitCloneImage:                "alpine/git:custom",
+			SyncMode:                     "tar-pipe",
+			SyncExcludes:                 []string{"**/*.tmp"},
+			MaxSyncSize:                  512,
+			GitBaseURL:                   "https://gitlab.example.test/team",
+			GitSecret:                    "git-token",
+			BuildCPURequest:              "250m",
+			BuildCPULimit:                "500m",
+			BuildEphemeralStorageRequest: "3Gi",
+			BuildEphemeralStorageLimit:   "9Gi",
+			MaxConcurrentBuilds:          2,
+			GitCloneMemoryRequest:        "512Mi",
+			GitCloneMemoryLimit:          "2Gi",
+		})
+		if err != nil {
+			t.Fatalf("NewK8sBackend returned error: %v", err)
+		}
+
+		if k.namespace != "custom-ns" || k.registry != "registry.example.test" {
+			t.Fatalf("unexpected core overrides: namespace=%q registry=%q", k.namespace, k.registry)
+		}
+		if k.workspacePVC != "custom-pvc" || k.imagePullSecret != "custom-secret" {
+			t.Fatalf("unexpected storage overrides: pvc=%q secret=%q", k.workspacePVC, k.imagePullSecret)
+		}
+		if k.workspaceRoot != "/srv/workspace" || k.builderImage != "quay.io/custom/buildah:v1" {
+			t.Fatalf("unexpected path/image overrides: root=%q image=%q", k.workspaceRoot, k.builderImage)
+		}
+		if k.gitCloneImage != "alpine/git:custom" {
+			t.Fatalf("unexpected git clone image override: %q", k.gitCloneImage)
+		}
+		if k.syncMode != "tar-pipe" || len(k.syncExcludes) != 1 || k.syncExcludes[0] != "**/*.tmp" || k.maxSyncSize != 512 {
+			t.Fatalf("unexpected sync overrides: mode=%q excludes=%v max=%d", k.syncMode, k.syncExcludes, k.maxSyncSize)
+		}
+		if k.gitBaseURL != "https://gitlab.example.test/team" || k.gitSecret != "git-token" {
+			t.Fatalf("unexpected git overrides: base=%q secret=%q", k.gitBaseURL, k.gitSecret)
+		}
+		if k.buildCPURequest.String() != "250m" || k.buildCPULimit.String() != "500m" || cap(k.buildSlots) != 2 {
+			t.Fatalf("unexpected build overrides: req=%s limit=%s slots=%d", k.buildCPURequest.String(), k.buildCPULimit.String(), cap(k.buildSlots))
+		}
+		if k.buildEphemeralStorageRequest.String() != "3Gi" || k.buildEphemeralStorageLimit.String() != "9Gi" {
+			t.Fatalf("unexpected ephemeral-storage overrides: req=%s limit=%s", k.buildEphemeralStorageRequest.String(), k.buildEphemeralStorageLimit.String())
+		}
+		if k.gitCloneMemoryRequest.String() != "512Mi" || k.gitCloneMemoryLimit.String() != "2Gi" {
+			t.Fatalf("unexpected git-clone memory overrides: req=%s limit=%s", k.gitCloneMemoryRequest.String(), k.gitCloneMemoryLimit.String())
+		}
+	})
 }
 
 func TestBuildPodSpecDefaults(t *testing.T) {
@@ -51,13 +235,14 @@ func TestBuildPodSpecDefaults(t *testing.T) {
 	if pod.Labels["devbox/agent-id"] != "agent-1" {
 		t.Fatalf("expected devbox/agent-id label, got: %#v", pod.Labels)
 	}
-	if got := pod.Spec.Containers[0].WorkingDir; got != "/workspace" {
+	container := pod.Spec.Containers[0]
+	if got := container.WorkingDir; got != "/workspace" {
 		t.Fatalf("expected default work dir /workspace, got: %s", got)
 	}
-	if got := pod.Spec.Containers[0].Image; got != "registry.harbor.lan/devbox:latest" {
+	if got := container.Image; got != "registry.harbor.lan/devbox:latest" {
 		t.Fatalf("unexpected image: %s", got)
 	}
-	if got := envMap(pod.Spec.Containers[0].Env)["FOO"]; got != "bar" {
+	if got := envMap(container.Env)["FOO"]; got != "bar" {
 		t.Fatalf("expected env FOO=bar, got: %q", got)
 	}
 	if pod.Spec.ImagePullSecrets[0].Name != "harbor-creds" {
@@ -65,6 +250,32 @@ func TestBuildPodSpecDefaults(t *testing.T) {
 	}
 	if len(pod.Spec.Volumes) != 1 || pod.Spec.Volumes[0].PersistentVolumeClaim == nil {
 		t.Fatalf("expected default workspace PVC volume, got: %#v", pod.Spec.Volumes)
+	}
+
+	// Verify resource requests (Burstable QoS)
+	cpuReq := container.Resources.Requests["cpu"]
+	if cpuReq.String() != "100m" {
+		t.Errorf("expected 100m CPU request, got %s", cpuReq.String())
+	}
+	memReq := container.Resources.Requests["memory"]
+	if memReq.String() != "128Mi" {
+		t.Errorf("expected 128Mi memory request, got %s", memReq.String())
+	}
+
+	// Verify liveness probe
+	if container.LivenessProbe == nil {
+		t.Fatal("expected liveness probe")
+	}
+	if container.LivenessProbe.Exec == nil || container.LivenessProbe.Exec.Command[0] != "true" {
+		t.Fatalf("expected exec true liveness probe, got: %#v", container.LivenessProbe)
+	}
+	if container.LivenessProbe.PeriodSeconds != 30 {
+		t.Errorf("expected 30s probe period, got %d", container.LivenessProbe.PeriodSeconds)
+	}
+
+	// Verify grace period
+	if *pod.Spec.TerminationGracePeriodSeconds != 10 {
+		t.Errorf("expected 10s grace period, got %d", *pod.Spec.TerminationGracePeriodSeconds)
 	}
 }
 
@@ -115,7 +326,7 @@ func TestBuildPodSpecResourcesAndMounts(t *testing.T) {
 
 func TestBuildBuildahPodSpec(t *testing.T) {
 	k := testK8sBackend()
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "services/loom-core")
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
 
 	if pod.Name != "build-pod" || pod.Namespace != "devbox" {
 		t.Fatalf("unexpected pod metadata: %#v", pod.ObjectMeta)
@@ -151,6 +362,26 @@ func TestBuildBuildahPodSpec(t *testing.T) {
 	if container.SecurityContext.Privileged == nil || !*container.SecurityContext.Privileged {
 		t.Fatalf("expected privileged build pod, got: %#v", container.SecurityContext)
 	}
+	if got := container.Resources.Requests.Cpu().String(); got != "1" {
+		t.Fatalf("expected default build CPU request 1, got %s", got)
+	}
+	if got := container.Resources.Limits.Cpu().String(); got != "3" {
+		t.Fatalf("expected default build CPU limit 3, got %s", got)
+	}
+	if got := container.Resources.Requests.Memory().String(); got != "1Gi" {
+		t.Fatalf("expected default build memory request 1Gi, got %s", got)
+	}
+	if got := container.Resources.Limits.Memory().String(); got != "3Gi" {
+		t.Fatalf("expected default build memory limit 3Gi, got %s", got)
+	}
+	ephemeralRequest := container.Resources.Requests[corev1.ResourceEphemeralStorage]
+	if got := ephemeralRequest.String(); got != "2Gi" {
+		t.Fatalf("expected default build ephemeral-storage request 2Gi, got %s", got)
+	}
+	ephemeralLimit := container.Resources.Limits[corev1.ResourceEphemeralStorage]
+	if got := ephemeralLimit.String(); got != "40Gi" {
+		t.Fatalf("expected default build ephemeral-storage limit 40Gi, got %s", got)
+	}
 
 	if len(pod.Spec.Volumes) != 4 {
 		t.Fatalf("expected 4 volumes, got %d", len(pod.Spec.Volumes))
@@ -163,6 +394,39 @@ func TestBuildBuildahPodSpec(t *testing.T) {
 	}
 	if pod.Spec.Volumes[3].Secret == nil || pod.Spec.Volumes[3].Secret.SecretName != "harbor-creds" {
 		t.Fatalf("unexpected auth secret volume: %#v", pod.Spec.Volumes[3])
+	}
+}
+
+func TestBuildBuildahPodSpec_CustomBuildResources(t *testing.T) {
+	k := testK8sBackend()
+	k.buildCPURequest = resource.MustParse("250m")
+	k.buildCPULimit = resource.MustParse("500m")
+	k.buildMemoryRequest = resource.MustParse("768Mi")
+	k.buildMemoryLimit = resource.MustParse("2Gi")
+	k.buildEphemeralStorageRequest = resource.MustParse("4Gi")
+	k.buildEphemeralStorageLimit = resource.MustParse("12Gi")
+
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	res := pod.Spec.Containers[0].Resources
+	if got := res.Requests.Cpu().String(); got != "250m" {
+		t.Fatalf("CPU request = %s, want 250m", got)
+	}
+	if got := res.Limits.Cpu().String(); got != "500m" {
+		t.Fatalf("CPU limit = %s, want 500m", got)
+	}
+	if got := res.Requests.Memory().String(); got != "768Mi" {
+		t.Fatalf("memory request = %s, want 768Mi", got)
+	}
+	if got := res.Limits.Memory().String(); got != "2Gi" {
+		t.Fatalf("memory limit = %s, want 2Gi", got)
+	}
+	ephemeralRequest := res.Requests[corev1.ResourceEphemeralStorage]
+	if got := ephemeralRequest.String(); got != "4Gi" {
+		t.Fatalf("ephemeral-storage request = %s, want 4Gi", got)
+	}
+	ephemeralLimit := res.Limits[corev1.ResourceEphemeralStorage]
+	if got := ephemeralLimit.String(); got != "12Gi" {
+		t.Fatalf("ephemeral-storage limit = %s, want 12Gi", got)
 	}
 }
 
@@ -245,6 +509,493 @@ func TestBuildRejectsContextOutsideWorkspaceRoot(t *testing.T) {
 	}
 }
 
+func TestBuildBuildahPodSpec_EmptyDirAndRegistryCache(t *testing.T) {
+	k := testK8sBackend()
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+
+	// Verify the buildah-storage volume always uses EmptyDir
+	var found bool
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name == "buildah-storage" {
+			found = true
+			if vol.EmptyDir == nil {
+				t.Fatal("expected EmptyDir volume for buildah-storage")
+			}
+			if vol.PersistentVolumeClaim != nil {
+				t.Fatal("should not have PVC — builds use EmptyDir + registry cache")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("buildah-storage volume not found")
+	}
+
+	// Verify build command includes --cache-from with bare repo (no tag/digest).
+	buildCmd := pod.Spec.Containers[0].Command[2] // sh -c "<cmd>"
+	if !strings.Contains(buildCmd, "--cache-from=registry.harbor.lan/devbox") {
+		t.Fatalf("expected --cache-from with bare repo in build command, got: %s", buildCmd)
+	}
+	if strings.Contains(buildCmd, "--cache-from=registry.harbor.lan/devbox:") {
+		t.Fatalf("--cache-from must not include a tag (buildah v1.29+ rejects it), got: %s", buildCmd)
+	}
+
+	// Verify build command pushes cache tag
+	if !strings.Contains(buildCmd, "buildah tag") {
+		t.Fatalf("expected cache tag push in build command, got: %s", buildCmd)
+	}
+
+	// Verify bumped resources: 1 CPU request, 3 CPU limit
+	container := pod.Spec.Containers[0]
+	cpuReq := container.Resources.Requests["cpu"]
+	if cpuReq.String() != "1" {
+		t.Errorf("expected 1 CPU request, got %s", cpuReq.String())
+	}
+	cpuLim := container.Resources.Limits["cpu"]
+	if cpuLim.String() != "3" {
+		t.Errorf("expected 3 CPU limit, got %s", cpuLim.String())
+	}
+}
+
+func TestBuildBuildahPodSpec_PreferExistingImage(t *testing.T) {
+	k := testK8sBackend()
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", true)
+
+	buildCmd := pod.Spec.Containers[0].Command[2]
+	for _, want := range []string{
+		"skopeo inspect --raw --tls-verify=false docker://registry.harbor.lan/devbox:tag",
+		"buildah manifest inspect --tls-verify=false registry.harbor.lan/devbox:tag",
+		"grep -q 'not a list type'",
+		"echo Using existing image registry.harbor.lan/devbox:tag",
+		"exit 0",
+		"buildah build-using-dockerfile",
+	} {
+		if !strings.Contains(buildCmd, want) {
+			t.Fatalf("prefer-existing build command missing %q:\n%s", want, buildCmd)
+		}
+	}
+	if strings.Contains(buildCmd, "; &&") {
+		t.Fatalf("prefer-existing build command has invalid shell join:\n%s", buildCmd)
+	}
+}
+
+func TestBuildBuildahPodSpec_AvoidNodesAffinity(t *testing.T) {
+	k := testK8sBackend()
+	k.buildAvoidNodes = []string{"k3s-w-7", "k3s-w-8"}
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+
+	affinity := pod.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		t.Fatalf("expected required node affinity, got %#v", affinity)
+	}
+	expr := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0]
+	if expr.Key != "kubernetes.io/hostname" || expr.Operator != corev1.NodeSelectorOpNotIn {
+		t.Fatalf("unexpected affinity expression: %#v", expr)
+	}
+	if got := strings.Join(expr.Values, ","); got != "k3s-w-7,k3s-w-8" {
+		t.Fatalf("affinity values = %q", got)
+	}
+}
+
+func TestImagePullPolicy(t *testing.T) {
+	tests := []struct {
+		imageTag string
+		want     corev1.PullPolicy
+	}{
+		{"registry.harbor.lan/mcp/devbox/app:a3b9c1d", corev1.PullIfNotPresent},
+		{"registry.harbor.lan/mcp/devbox/app:v1.2.3", corev1.PullIfNotPresent},
+		{"registry.harbor.lan/mcp/devbox/app:latest", corev1.PullAlways},
+		{"registry.harbor.lan/mcp/devbox/app", corev1.PullAlways},
+		{"nginx:1.25", corev1.PullIfNotPresent},
+		{"nginx:latest", corev1.PullAlways},
+		{"nginx", corev1.PullAlways},
+	}
+	for _, tt := range tests {
+		got := imagePullPolicy(tt.imageTag)
+		if got != tt.want {
+			t.Errorf("imagePullPolicy(%q) = %v, want %v", tt.imageTag, got, tt.want)
+		}
+	}
+}
+
+func TestBuildPodSpec_ImagePullPolicy_HashTag(t *testing.T) {
+	k := testK8sBackend()
+	pod := k.buildPodSpec(StartOpts{
+		Name: "demo",
+	}, "registry.harbor.lan/devbox:a3b9c1d")
+
+	got := pod.Spec.Containers[0].ImagePullPolicy
+	if got != corev1.PullIfNotPresent {
+		t.Fatalf("expected IfNotPresent for hash-tagged image, got %v", got)
+	}
+}
+
+func TestBuildPodSpec_ImagePullPolicy_Latest(t *testing.T) {
+	k := testK8sBackend()
+	pod := k.buildPodSpec(StartOpts{
+		Name: "demo",
+	}, "registry.harbor.lan/devbox:latest")
+
+	got := pod.Spec.Containers[0].ImagePullPolicy
+	if got != corev1.PullAlways {
+		t.Fatalf("expected Always for :latest image, got %v", got)
+	}
+}
+
+func TestGitEnabled(t *testing.T) {
+	k := testK8sBackend()
+	if k.gitEnabled() {
+		t.Fatal("expected gitEnabled=false for default backend")
+	}
+
+	k.gitBaseURL = "https://gitlab.example.com/team"
+	if k.gitEnabled() {
+		t.Fatal("expected gitEnabled=false when gitSecret is empty")
+	}
+
+	k.gitSecret = "git-creds"
+	if !k.gitEnabled() {
+		t.Fatal("expected gitEnabled=true when both gitBaseURL and gitSecret are set")
+	}
+}
+
+func TestGitCloneInitContainer(t *testing.T) {
+	k := testK8sBackendGitClone()
+
+	ic := k.gitCloneInitContainer("/workspace/services/loom-core", gitCloneOpts{})
+	if ic.Name != "git-clone" {
+		t.Fatalf("expected initContainer name 'git-clone', got %q", ic.Name)
+	}
+	if ic.Image != defaultGitCloneImage {
+		t.Fatalf("expected %s image, got %q", defaultGitCloneImage, ic.Image)
+	}
+
+	// Should have GIT_TOKEN env from secret ref (no SPAWN_BRANCH when opts empty).
+	if len(ic.Env) != 1 || ic.Env[0].Name != "GIT_TOKEN" {
+		t.Fatalf("expected only GIT_TOKEN env, got: %#v", ic.Env)
+	}
+	if ic.Env[0].ValueFrom == nil || ic.Env[0].ValueFrom.SecretKeyRef == nil {
+		t.Fatal("expected GIT_TOKEN from secretKeyRef")
+	}
+	if ic.Env[0].ValueFrom.SecretKeyRef.Name != "gitlab-creds" {
+		t.Fatalf("expected secret name 'gitlab-creds', got %q", ic.Env[0].ValueFrom.SecretKeyRef.Name)
+	}
+
+	// Clone script should reference the correct repo URL and destination
+	script := ic.Command[2]
+	if !strings.Contains(script, "gitlab.blevins.dev/homelab/loom-core.git") {
+		t.Fatalf("expected repo URL in clone script, got: %s", script)
+	}
+	if !strings.Contains(script, "/workspace/services/loom-core") {
+		t.Fatalf("expected clone dest /workspace/services/loom-core, got: %s", script)
+	}
+
+	// --depth 1 was load-bearing for the no-diff bug: shallow clones
+	// have no merge base for Mills' rubric-input `git diff`. Pin that
+	// the flag stays out.
+	if strings.Contains(script, "--depth") {
+		t.Fatalf("expected full clone (no --depth flag), got: %s", script)
+	}
+
+	// umask 002 + recursive chown to 1000:1000 are load-bearing for
+	// agent writes: the init container runs as root, the runtime as
+	// uid 1000. Without these, the cloned workspace is root:0 mode
+	// 0644 and the agent cannot modify, commit, or push — the same
+	// "no diff" pathology as the missing branch checkout.
+	if !strings.Contains(script, "umask 002") {
+		t.Fatalf("expected `umask 002` in clone script, got: %s", script)
+	}
+	if !strings.Contains(script, "chown -R 1000:1000") {
+		t.Fatalf("expected `chown -R 1000:1000` after checkout, got: %s", script)
+	}
+	if !strings.Contains(script, `BRANCH="$(git rev-parse --abbrev-ref HEAD)"`) {
+		t.Fatalf("expected branch capture before chown, got: %s", script)
+	}
+	if strings.Contains(script, `on $(git rev-parse --abbrev-ref HEAD)`) {
+		t.Fatalf("git-clone readiness log must not run git after chown, got: %s", script)
+	}
+
+	// Should mount workspace volume
+	if len(ic.VolumeMounts) != 1 || ic.VolumeMounts[0].MountPath != "/workspace" {
+		t.Fatalf("expected /workspace volume mount, got: %#v", ic.VolumeMounts)
+	}
+
+	// Memory limit is load-bearing: the full clone's `git index-pack` delta
+	// resolution spikes memory, and the old hardcoded 256Mi intermittently
+	// OOM-killed larger-history repos (flexdeck, 2026-07-05 cross-repo kill-test).
+	// Assert the configured request/limit flow through (defaults 256Mi/1Gi).
+	gotMemReq := ic.Resources.Requests[corev1.ResourceMemory]
+	gotMemLim := ic.Resources.Limits[corev1.ResourceMemory]
+	if wantReq := resource.MustParse(defaultGitCloneMemoryRequest); gotMemReq.Cmp(wantReq) != 0 {
+		t.Fatalf("expected git-clone memory request %s, got %s", wantReq.String(), gotMemReq.String())
+	}
+	if wantLim := resource.MustParse(defaultGitCloneMemoryLimit); gotMemLim.Cmp(wantLim) != 0 {
+		t.Fatalf("expected git-clone memory limit %s, got %s", wantLim.String(), gotMemLim.String())
+	}
+}
+
+func TestGitCloneInitContainer_BranchCheckout(t *testing.T) {
+	k := testK8sBackendGitClone()
+
+	ic := k.gitCloneInitContainer("/workspace/services/loom-core", gitCloneOpts{
+		branch:     "mills-canary-fix-test",
+		baseBranch: "main",
+	})
+
+	// SPAWN_BRANCH + SPAWN_BASE_BRANCH must reach the init container as
+	// plain-value env vars so the script's checkout block can resolve.
+	var sawBranch, sawBase bool
+	for _, e := range ic.Env {
+		switch e.Name {
+		case "SPAWN_BRANCH":
+			sawBranch = true
+			if e.Value != "mills-canary-fix-test" {
+				t.Fatalf("SPAWN_BRANCH value=%q, want mills-canary-fix-test", e.Value)
+			}
+		case "SPAWN_BASE_BRANCH":
+			sawBase = true
+			if e.Value != "main" {
+				t.Fatalf("SPAWN_BASE_BRANCH value=%q, want main", e.Value)
+			}
+		}
+	}
+	if !sawBranch {
+		t.Fatalf("expected SPAWN_BRANCH env var, got: %#v", ic.Env)
+	}
+	if !sawBase {
+		t.Fatalf("expected SPAWN_BASE_BRANCH env var, got: %#v", ic.Env)
+	}
+
+	// Script must (a) cd into the clone dest before checkout, (b) check
+	// out existing remote branches, and (c) fall back to creating from
+	// origin/${BASE}. Each of these was missing pre-fix.
+	script := ic.Command[2]
+	for _, needle := range []string{
+		`cd "/workspace/services/loom-core"`,
+		`if [ -n "${SPAWN_BRANCH:-}" ]`,
+		`git ls-remote --exit-code --heads origin "${SPAWN_BRANCH}"`,
+		`git checkout "${SPAWN_BRANCH}"`,
+		`git checkout -b "${SPAWN_BRANCH}" "origin/${BASE}"`,
+	} {
+		if !strings.Contains(script, needle) {
+			t.Fatalf("clone script missing %q, full script:\n%s", needle, script)
+		}
+	}
+}
+
+func TestBuildPodSpec_GitCloneMode(t *testing.T) {
+	k := testK8sBackendGitClone()
+	pod := k.buildPodSpec(StartOpts{
+		Name:    "devbox-loom-core",
+		WorkDir: "/workspace/services/loom-core",
+		AgentID: "agent-1",
+	}, "registry.harbor.lan/devbox/loom-core:abc123")
+
+	// Should use emptyDir, not NFS PVC
+	wsVol := pod.Spec.Volumes[0]
+	if wsVol.Name != "workspace" {
+		t.Fatalf("expected workspace volume first, got: %q", wsVol.Name)
+	}
+	if wsVol.EmptyDir == nil {
+		t.Fatal("expected emptyDir workspace volume in git-clone mode")
+	}
+	if wsVol.PersistentVolumeClaim != nil {
+		t.Fatal("should not have PVC in git-clone mode")
+	}
+
+	// Should have a git-clone initContainer
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("expected 1 initContainer, got %d", len(pod.Spec.InitContainers))
+	}
+	ic := pod.Spec.InitContainers[0]
+	if ic.Name != "git-clone" {
+		t.Fatalf("expected git-clone initContainer, got %q", ic.Name)
+	}
+
+	// The runtime container must also carry GIT_TOKEN (same secret/key as the
+	// init container) so the agent can authenticate private-module fetches via
+	// the url.insteadOf rule the spawn orchestrator configures.
+	var tok *corev1.EnvVar
+	for i := range pod.Spec.Containers[0].Env {
+		if pod.Spec.Containers[0].Env[i].Name == "GIT_TOKEN" {
+			tok = &pod.Spec.Containers[0].Env[i]
+		}
+	}
+	if tok == nil {
+		t.Fatal("expected GIT_TOKEN env on runtime container in git-clone mode")
+	}
+	if tok.ValueFrom == nil || tok.ValueFrom.SecretKeyRef == nil ||
+		tok.ValueFrom.SecretKeyRef.Name != k.gitSecret || tok.ValueFrom.SecretKeyRef.Key != "token" {
+		t.Fatalf("GIT_TOKEN must come from secret %q key \"token\", got %#v", k.gitSecret, tok.ValueFrom)
+	}
+}
+
+func TestBuildPodSpec_NFSMode(t *testing.T) {
+	k := testK8sBackend() // no git config → NFS mode
+	pod := k.buildPodSpec(StartOpts{
+		Name:    "devbox-loom-core",
+		WorkDir: "/workspace/services/loom-core",
+	}, "registry.harbor.lan/devbox/loom-core:abc123")
+
+	// Should use NFS PVC
+	wsVol := pod.Spec.Volumes[0]
+	if wsVol.PersistentVolumeClaim == nil {
+		t.Fatal("expected NFS PVC workspace volume in NFS mode")
+	}
+	if wsVol.PersistentVolumeClaim.ClaimName != "devbox-workspace-nfs" {
+		t.Fatalf("unexpected PVC name: %q", wsVol.PersistentVolumeClaim.ClaimName)
+	}
+
+	// Should NOT have initContainers
+	if len(pod.Spec.InitContainers) != 0 {
+		t.Fatalf("expected 0 initContainers in NFS mode, got %d", len(pod.Spec.InitContainers))
+	}
+
+	// No git-clone → no GIT_TOKEN on the runtime container.
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == "GIT_TOKEN" {
+			t.Fatal("GIT_TOKEN must not be set on the runtime container in NFS mode")
+		}
+	}
+}
+
+// TestBuildPodSpec_CallerLabelsOverrideDefaults regresses the Mills spawn
+// reconciliation bug where the spawn orchestrator could not override the
+// backend's default `app.kubernetes.io/managed-by=mcp-devbox` label.
+// spawn.K8sController.Reconcile lists pods by managed-by=loom-spawn, so the
+// mismatch caused every spawn to be flagged "pod not found during
+// reconciliation" mid-run and Mills retried the stage 2× before succeeding.
+func TestBuildPodSpec_CallerLabelsOverrideDefaults(t *testing.T) {
+	k := testK8sBackend()
+	pod := k.buildPodSpec(StartOpts{
+		Name:              "spawn-abc123",
+		AgentID:           "spawn-codex-abc123",
+		ManagedByOverride: "loom-spawn",
+		ExtraLabels: map[string]string{
+			"loom.dev/spawn-id":   "abc123",
+			"loom.dev/agent-id":   "spawn-codex-abc123",
+			"loom.dev/agent-type": "codex",
+			"loom.dev/project":    "loom-core",
+		},
+	}, "registry.harbor.lan/devbox:latest")
+
+	if got := pod.Labels["app.kubernetes.io/managed-by"]; got != "loom-spawn" {
+		t.Fatalf("expected managed-by=loom-spawn override, got %q", got)
+	}
+	if got := pod.Labels["loom.dev/spawn-id"]; got != "abc123" {
+		t.Fatalf("expected loom.dev/spawn-id=abc123, got %q", got)
+	}
+	if got := pod.Labels["loom.dev/agent-id"]; got != "spawn-codex-abc123" {
+		t.Fatalf("expected loom.dev/agent-id, got %q", got)
+	}
+	if got := pod.Labels["loom.dev/agent-type"]; got != "codex" {
+		t.Fatalf("expected loom.dev/agent-type=codex, got %q", got)
+	}
+	if got := pod.Labels["loom.dev/project"]; got != "loom-core" {
+		t.Fatalf("expected loom.dev/project=loom-core, got %q", got)
+	}
+	// Backend-owned labels still present alongside caller overrides.
+	if got := pod.Labels["devbox/project"]; got != "spawn-abc123" {
+		t.Fatalf("expected devbox/project preserved, got %q", got)
+	}
+	if got := pod.Labels["devbox/agent-id"]; got != "spawn-codex-abc123" {
+		t.Fatalf("expected devbox/agent-id preserved, got %q", got)
+	}
+}
+
+func TestBuildPodSpec_TarPipeMode(t *testing.T) {
+	k := testK8sBackend()
+	k.syncMode = "tar-pipe"
+	pod := k.buildPodSpec(StartOpts{
+		Name:    "devbox-loom-core",
+		WorkDir: "/workspace/services/loom-core",
+		AgentID: "claude-code",
+	}, "registry.harbor.lan/devbox/loom-core:abc123")
+
+	// Should use emptyDir (files come via SyncWorkspace after pod starts).
+	wsVol := pod.Spec.Volumes[0]
+	if wsVol.EmptyDir == nil {
+		t.Fatal("expected emptyDir workspace volume in tar-pipe mode")
+	}
+	if wsVol.PersistentVolumeClaim != nil {
+		t.Fatal("should not have PVC in tar-pipe mode")
+	}
+
+	// Should NOT have initContainers (tar-pipe syncs post-start).
+	if len(pod.Spec.InitContainers) != 0 {
+		t.Fatalf("expected 0 initContainers in tar-pipe mode, got %d", len(pod.Spec.InitContainers))
+	}
+
+	// Agent ID should be in labels.
+	if pod.Labels["devbox/agent-id"] != "claude-code" {
+		t.Fatalf("expected agent-id label, got: %v", pod.Labels)
+	}
+}
+
+func TestBuildBuildahPodSpec_GitCloneMode(t *testing.T) {
+	k := testK8sBackendGitClone()
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+
+	// Should use emptyDir for workspace, not NFS PVC
+	wsVol := pod.Spec.Volumes[0]
+	if wsVol.EmptyDir == nil {
+		t.Fatal("expected emptyDir workspace volume in git-clone mode for build pod")
+	}
+	if wsVol.PersistentVolumeClaim != nil {
+		t.Fatal("should not have PVC in git-clone mode for build pod")
+	}
+
+	// Should have a git-clone initContainer
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("expected 1 initContainer, got %d", len(pod.Spec.InitContainers))
+	}
+	ic := pod.Spec.InitContainers[0]
+	if ic.Name != "git-clone" {
+		t.Fatalf("expected git-clone initContainer, got %q", ic.Name)
+	}
+
+	// The clone script should target the correct path derived from contextRel
+	script := ic.Command[2]
+	if !strings.Contains(script, "loom-core.git") {
+		t.Fatalf("expected loom-core.git in clone script, got: %s", script)
+	}
+}
+
+func TestBuildBuildahPodSpec_TarPipeMode(t *testing.T) {
+	k := testK8sBackend()
+	k.syncMode = "tar-pipe"
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+
+	wsVol := pod.Spec.Volumes[0]
+	if wsVol.EmptyDir == nil {
+		t.Fatal("expected emptyDir workspace volume in tar-pipe mode for build pod")
+	}
+	if wsVol.PersistentVolumeClaim != nil {
+		t.Fatal("should not have PVC in tar-pipe mode for build pod")
+	}
+	if wsVol.EmptyDir.SizeLimit == nil || wsVol.EmptyDir.SizeLimit.String() != "5Gi" {
+		t.Fatalf("expected 5Gi emptyDir size limit, got %#v", wsVol.EmptyDir.SizeLimit)
+	}
+	if len(pod.Spec.InitContainers) != 0 {
+		t.Fatalf("expected 0 initContainers in tar-pipe mode for build pod, got %d", len(pod.Spec.InitContainers))
+	}
+}
+
+func TestBuildBuildahPodSpec_NFSMode(t *testing.T) {
+	k := testK8sBackend()
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+
+	wsVol := pod.Spec.Volumes[0]
+	if wsVol.PersistentVolumeClaim == nil {
+		t.Fatal("expected NFS PVC workspace volume in default build pod mode")
+	}
+	if wsVol.PersistentVolumeClaim.ClaimName != "devbox-workspace-nfs" {
+		t.Fatalf("unexpected PVC name: %q", wsVol.PersistentVolumeClaim.ClaimName)
+	}
+	if len(pod.Spec.InitContainers) != 0 {
+		t.Fatalf("expected 0 initContainers in NFS mode for build pod, got %d", len(pod.Spec.InitContainers))
+	}
+}
+
 func TestBuild_MonorepoContextCompletesWithFakeK8s(t *testing.T) {
 	workspaceRoot := t.TempDir()
 	contextDir := filepath.Join(workspaceRoot, "services", "loom-core")
@@ -298,5 +1049,773 @@ func TestBuild_MonorepoContextCompletesWithFakeK8s(t *testing.T) {
 	cmd := strings.Join(createdBuildPod.Spec.Containers[0].Command, " ")
 	if !strings.Contains(cmd, "/workspace/services/loom-core") {
 		t.Fatalf("expected monorepo-relative context path in build command, got: %s", cmd)
+	}
+}
+
+// TestBuildPodSpec_ClaudeOAuthTokenEnvOptional is the integration-level
+// smoke test for Slice 2b.2a: when a caller (internal/hud/spawn.go
+// agentSecretEnvVars("claude-code") after !207) passes a SecretEnv entry
+// binding CLAUDE_CODE_OAUTH_TOKEN to cluster-agent-auth/claude-oauth-token,
+// buildPodSpec must emit a k8s env var with an Optional SecretKeyRef so
+// the pod starts cleanly while the token is still unpopulated. Anti-pattern
+// guard: if Optional ever flips to false, every spawn hard-fails until
+// an operator runs `claude setup-token`.
+func TestBuildPodSpec_ClaudeOAuthTokenEnvOptional(t *testing.T) {
+	// Values mirror internal/hud/spawn.go:1298-1318 agentSecretEnvVars("claude-code")
+	// post-!207. TestAgentSecretEnvVars_ClaudeOAuthToken (internal/hud/
+	// spawn_test.go) asserts that helper emits exactly these entries.
+	opts := StartOpts{
+		Name: "claude-spawn-test",
+		SecretEnv: []SecretEnvVar{
+			{Name: "CLAUDE_CODE_OAUTH_TOKEN", SecretName: "cluster-agent-auth", SecretKey: "claude-oauth-token"},
+			{Name: "ANTHROPIC_API_KEY", SecretName: "cluster-agent-api-keys", SecretKey: "ANTHROPIC_API_KEY"},
+		},
+	}
+	pod := testK8sBackend().buildPodSpec(opts, "registry.harbor.lan/devbox:latest")
+
+	envByName := make(map[string]corev1.EnvVar, len(pod.Spec.Containers[0].Env))
+	for _, e := range pod.Spec.Containers[0].Env {
+		envByName[e.Name] = e
+	}
+
+	oauthEnv, ok := envByName["CLAUDE_CODE_OAUTH_TOKEN"]
+	if !ok {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN env var missing from pod spec; got keys %v", keysOf(envByName))
+	}
+	if oauthEnv.ValueFrom == nil || oauthEnv.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN must source from SecretKeyRef, got ValueFrom=%#v", oauthEnv.ValueFrom)
+	}
+	ref := oauthEnv.ValueFrom.SecretKeyRef
+	if ref.Name != "cluster-agent-auth" {
+		t.Errorf("CLAUDE_CODE_OAUTH_TOKEN secret name = %q, want cluster-agent-auth", ref.Name)
+	}
+	if ref.Key != "claude-oauth-token" {
+		t.Errorf("CLAUDE_CODE_OAUTH_TOKEN secret key = %q, want claude-oauth-token", ref.Key)
+	}
+	if ref.Optional == nil || !*ref.Optional {
+		t.Errorf("CLAUDE_CODE_OAUTH_TOKEN SecretKeyRef.Optional must be true (fail-soft when token absent); got %v", ref.Optional)
+	}
+
+	// ANTHROPIC_API_KEY must still be present as fallback — losing it
+	// would break spawns that haven't yet set claude-oauth-token.
+	apiKeyEnv, ok := envByName["ANTHROPIC_API_KEY"]
+	if !ok {
+		t.Fatalf("ANTHROPIC_API_KEY fallback env var missing; got keys %v", keysOf(envByName))
+	}
+	if apiKeyEnv.ValueFrom == nil || apiKeyEnv.ValueFrom.SecretKeyRef == nil ||
+		apiKeyEnv.ValueFrom.SecretKeyRef.Optional == nil || !*apiKeyEnv.ValueFrom.SecretKeyRef.Optional {
+		t.Errorf("ANTHROPIC_API_KEY must be Optional SecretKeyRef; got %#v", apiKeyEnv.ValueFrom)
+	}
+}
+
+func keysOf(m map[string]corev1.EnvVar) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func TestBuildPodSpec_ManagedByOverride(t *testing.T) {
+	k := testK8sBackend()
+
+	t.Run("default managed-by when override is empty", func(t *testing.T) {
+		pod := k.buildPodSpec(StartOpts{
+			Name: "devbox-test",
+		}, "registry.harbor.lan/devbox:latest")
+
+		if got := pod.Labels["app.kubernetes.io/managed-by"]; got != "mcp-devbox" {
+			t.Fatalf("expected default managed-by=mcp-devbox, got %q", got)
+		}
+	})
+
+	t.Run("override managed-by to loom-spawn", func(t *testing.T) {
+		pod := k.buildPodSpec(StartOpts{
+			Name:              "spawn-abc123",
+			ManagedByOverride: "loom-spawn",
+		}, "registry.harbor.lan/devbox:latest")
+
+		if got := pod.Labels["app.kubernetes.io/managed-by"]; got != "loom-spawn" {
+			t.Fatalf("expected managed-by=loom-spawn, got %q", got)
+		}
+	})
+}
+
+func TestBuildPodSpec_ExtraLabels(t *testing.T) {
+	k := testK8sBackend()
+
+	t.Run("extra labels merged into pod", func(t *testing.T) {
+		pod := k.buildPodSpec(StartOpts{
+			Name:              "spawn-abc123",
+			AgentID:           "agent-1",
+			ManagedByOverride: "loom-spawn",
+			ExtraLabels: map[string]string{
+				"loom.dev/spawn-id": "spawn-abc123",
+				"loom.dev/agent-id": "agent-1",
+			},
+		}, "registry.harbor.lan/devbox:latest")
+
+		if got := pod.Labels["loom.dev/spawn-id"]; got != "spawn-abc123" {
+			t.Fatalf("expected loom.dev/spawn-id=spawn-abc123, got %q", got)
+		}
+		if got := pod.Labels["loom.dev/agent-id"]; got != "agent-1" {
+			t.Fatalf("expected loom.dev/agent-id=agent-1, got %q", got)
+		}
+		if got := pod.Labels["app.kubernetes.io/managed-by"]; got != "loom-spawn" {
+			t.Fatalf("expected managed-by=loom-spawn, got %q", got)
+		}
+	})
+
+	t.Run("extra labels override defaults", func(t *testing.T) {
+		pod := k.buildPodSpec(StartOpts{
+			Name: "devbox-test",
+			ExtraLabels: map[string]string{
+				"devbox/project": "custom-project",
+			},
+		}, "registry.harbor.lan/devbox:latest")
+
+		if got := pod.Labels["devbox/project"]; got != "custom-project" {
+			t.Fatalf("expected extra label to override default, got %q", got)
+		}
+	})
+
+	t.Run("nil extra labels does not panic", func(t *testing.T) {
+		pod := k.buildPodSpec(StartOpts{
+			Name:        "devbox-test",
+			ExtraLabels: nil,
+		}, "registry.harbor.lan/devbox:latest")
+
+		if pod.Labels["devbox/project"] != "devbox-test" {
+			t.Fatalf("unexpected project label: %q", pod.Labels["devbox/project"])
+		}
+	})
+}
+
+func TestK8sStart_ForeignIdentityNeverReusesOrDeletes(t *testing.T) {
+	opts := StartOpts{
+		Name:              "spawn-owned",
+		ImageTag:          "devbox:abc123",
+		ManagedByOverride: "loom-spawn",
+		ExtraLabels: map[string]string{
+			"loom.dev/spawn-id":         "spawn-owned",
+			"loom.dev/driver-owner":     "owner-a",
+			"loom.dev/spawn-generation": "generation-a",
+		},
+	}
+	for _, tc := range []struct {
+		name  string
+		phase corev1.PodPhase
+		image string
+	}{
+		{name: "running same image", phase: corev1.PodRunning, image: "registry.harbor.lan/devbox:abc123"},
+		{name: "running different image", phase: corev1.PodRunning, image: "registry.harbor.lan/devbox:old"},
+		{name: "pending", phase: corev1.PodPending, image: "registry.harbor.lan/devbox:abc123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "spawn-owned", Namespace: "devbox",
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "loom-spawn",
+						"loom.dev/spawn-id":            "spawn-owned",
+						"loom.dev/driver-owner":        "owner-b",
+						"loom.dev/spawn-generation":    "generation-b",
+					},
+				},
+				Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "devbox", Image: tc.image}}},
+				Status: corev1.PodStatus{Phase: tc.phase},
+			}
+			client := k8sfake.NewSimpleClientset(pod)
+			k := testK8sBackend()
+			k.clientset = client
+
+			if _, err := k.Start(t.Context(), opts); !errors.Is(err, ErrRuntimeIdentityConflict) {
+				t.Fatalf("Start error = %v, want ErrRuntimeIdentityConflict", err)
+			}
+			for _, action := range client.Actions() {
+				if action.GetResource().Resource == "pods" &&
+					(action.GetVerb() == "create" || action.GetVerb() == "delete" || action.GetVerb() == "update") {
+					t.Fatalf("foreign pod was mutated: %s %s", action.GetVerb(), action.GetResource().Resource)
+				}
+			}
+			got, err := client.CoreV1().Pods("devbox").Get(t.Context(), pod.Name, metav1.GetOptions{})
+			if err != nil || got.Labels["loom.dev/driver-owner"] != "owner-b" {
+				t.Fatalf("foreign pod changed or disappeared: pod=%v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestK8sStart_MissingIdentityRequiresAuthority(t *testing.T) {
+	opts := StartOpts{
+		Name: "spawn-legacy", ImageTag: "devbox:abc123",
+		ManagedByOverride: "loom-spawn",
+		ExtraLabels: map[string]string{
+			"loom.dev/spawn-id":         "spawn-legacy",
+			"loom.dev/driver-owner":     "owner-a",
+			"loom.dev/spawn-generation": "generation-a",
+		},
+	}
+	newBackend := func(t *testing.T) (*K8sBackend, *k8sfake.Clientset) {
+		t.Helper()
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: opts.Name, Namespace: "devbox"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "devbox", Image: "registry.harbor.lan/devbox:abc123"}}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		client := k8sfake.NewSimpleClientset(pod)
+		k := testK8sBackend()
+		k.clientset = client
+		return k, client
+	}
+
+	k, _ := newBackend(t)
+	if _, err := k.Start(t.Context(), opts); !errors.Is(err, ErrRuntimeIdentityConflict) {
+		t.Fatalf("ordinary Start error = %v, want identity conflict", err)
+	}
+
+	k, client := newBackend(t)
+	opts.AllowMissingIdentityLabels = true
+	if _, err := k.Start(t.Context(), opts); err != nil {
+		t.Fatalf("recovery authority Start: %v", err)
+	}
+	pod, err := client.CoreV1().Pods("devbox").Get(t.Context(), opts.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range expectedStartIdentityLabels(opts) {
+		if got := pod.Labels[key]; got != want {
+			t.Errorf("patched label %s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestK8sStart_WaitsForDeletedGenerationBeforeCreate(t *testing.T) {
+	labels := map[string]string{
+		"app.kubernetes.io/managed-by": "loom-spawn",
+		"loom.dev/spawn-id":            "spawn-owned",
+		"loom.dev/driver-owner":        "owner-a",
+		"loom.dev/spawn-generation":    "generation-a",
+	}
+	oldUID := types.UID("pod-generation-old")
+	oldPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "spawn-owned", Namespace: "devbox", UID: oldUID, Labels: labels,
+		},
+		Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "devbox", Image: "registry.harbor.lan/devbox:old"}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	newPod := oldPod.DeepCopy()
+	newPod.UID = types.UID("pod-generation-new")
+	newPod.Spec.Containers[0].Image = "registry.harbor.lan/devbox:new"
+
+	client := k8sfake.NewSimpleClientset()
+	deleted := false
+	servedTerminating := false
+	observedNotFound := false
+	created := false
+	client.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !deleted {
+			return true, oldPod.DeepCopy(), nil
+		}
+		if !servedTerminating {
+			servedTerminating = true
+			terminating := oldPod.DeepCopy()
+			now := metav1.Now()
+			terminating.DeletionTimestamp = &now
+			return true, terminating, nil
+		}
+		if !created {
+			observedNotFound = true
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, oldPod.Name)
+		}
+		return true, newPod.DeepCopy(), nil
+	})
+	client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deleteAction := action.(k8stesting.DeleteAction)
+		opts := deleteAction.GetDeleteOptions()
+		if opts.Preconditions == nil || opts.Preconditions.UID == nil || *opts.Preconditions.UID != oldUID {
+			t.Fatalf("delete UID precondition = %#v, want %q", opts.Preconditions, oldUID)
+		}
+		deleted = true
+		return true, nil, nil
+	})
+	client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !observedNotFound {
+			t.Fatal("replacement Create ran before the old pod reached NotFound")
+		}
+		created = true
+		return true, newPod.DeepCopy(), nil
+	})
+
+	k := testK8sBackend()
+	k.clientset = client
+	result, err := k.Start(t.Context(), StartOpts{
+		Name: "spawn-owned", ImageTag: "devbox:new",
+		ManagedByOverride: "loom-spawn", ExtraLabels: labels,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if result.ContainerID != newPod.Name || !servedTerminating || !observedNotFound || !created {
+		t.Fatalf("replacement evidence = result %#v terminating=%v notFound=%v created=%v",
+			result, servedTerminating, observedNotFound, created)
+	}
+}
+
+func TestK8sProbeStartIdentity_RejectsTerminatingPod(t *testing.T) {
+	now := metav1.Now()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "spawn-owned", Namespace: "devbox", DeletionTimestamp: &now,
+			Labels: map[string]string{
+				"loom.dev/driver-owner":     "owner-a",
+				"loom.dev/spawn-generation": "generation-a",
+			},
+		},
+	}
+	k := testK8sBackend()
+	k.clientset = k8sfake.NewSimpleClientset(pod)
+	exists, err := k.ProbeStartIdentity(t.Context(), StartOpts{
+		Name: pod.Name,
+		ExtraLabels: map[string]string{
+			"loom.dev/driver-owner":     "owner-a",
+			"loom.dev/spawn-generation": "generation-a",
+		},
+	})
+	if !exists || !errors.Is(err, ErrRuntimeIdentityConflict) {
+		t.Fatalf("ProbeStartIdentity() = exists %v, err %v; want terminating identity conflict", exists, err)
+	}
+}
+
+func TestK8sProbeStartIdentity_RejectsUnattachableRuntime(t *testing.T) {
+	labels := map[string]string{
+		"loom.dev/driver-owner":     "owner-a",
+		"loom.dev/spawn-generation": "generation-a",
+	}
+	for _, tc := range []struct {
+		name  string
+		phase corev1.PodPhase
+		image string
+	}{
+		{name: "pending", phase: corev1.PodPending, image: "registry.harbor.lan/devbox:new"},
+		{name: "wrong image", phase: corev1.PodRunning, image: "registry.harbor.lan/devbox:old"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "spawn-owned", Namespace: "devbox", Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "devbox", Image: tc.image}}},
+				Status:     corev1.PodStatus{Phase: tc.phase},
+			}
+			k := testK8sBackend()
+			k.clientset = k8sfake.NewSimpleClientset(pod)
+			exists, err := k.ProbeStartIdentity(t.Context(), StartOpts{
+				Name: pod.Name, ImageTag: "devbox:new", ExtraLabels: labels,
+			})
+			if !exists || !errors.Is(err, ErrRuntimeIdentityConflict) {
+				t.Fatalf("ProbeStartIdentity() = exists %v, err %v; want unattachable identity conflict", exists, err)
+			}
+		})
+	}
+}
+
+func TestK8sProbeStartIdentity_IsReadOnly(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "spawn-legacy", Namespace: "devbox"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	client := k8sfake.NewSimpleClientset(pod)
+	k := testK8sBackend()
+	k.clientset = client
+	opts := StartOpts{
+		Name: "spawn-legacy", AllowMissingIdentityLabels: true,
+		ExtraLabels: map[string]string{"loom.dev/driver-owner": "owner-a"},
+	}
+	exists, err := k.ProbeStartIdentity(t.Context(), opts)
+	if err != nil || !exists {
+		t.Fatalf("ProbeStartIdentity = exists %v, err %v", exists, err)
+	}
+	for _, action := range client.Actions() {
+		if action.GetResource().Resource == "pods" && action.GetVerb() == "update" {
+			t.Fatalf("read-only probe updated pod")
+		}
+	}
+}
+
+func TestK8sStart_GetErrorFailsClosed(t *testing.T) {
+	client := k8sfake.NewSimpleClientset()
+	client.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "spawn-owned", errors.New("denied"))
+	})
+	k := testK8sBackend()
+	k.clientset = client
+	_, err := k.Start(t.Context(), StartOpts{Name: "spawn-owned", ImageTag: "devbox:abc123"})
+	if err == nil {
+		t.Fatalf("Start must fail closed on GET error, got %v", err)
+	}
+	for _, action := range client.Actions() {
+		if action.GetResource().Resource == "pods" && (action.GetVerb() == "create" || action.GetVerb() == "delete") {
+			t.Fatalf("GET error allowed pod mutation: %s", action.GetVerb())
+		}
+	}
+}
+
+func TestK8sBackend_ResolveSecretEnv(t *testing.T) {
+	const ns = "devbox"
+	apiKeys := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-api-keys", Namespace: ns},
+		Data: map[string][]byte{
+			"ANTHROPIC_API_KEY": []byte("sk-ant-12345"),
+			"GEMINI_API_KEY":    []byte("AIza-67890"),
+		},
+	}
+	auth := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent-auth", Namespace: ns},
+		Data: map[string][]byte{
+			"claude-oauth-token": []byte("oauth-abcdef"),
+		},
+	}
+	client := k8sfake.NewSimpleClientset(apiKeys, auth)
+	k := testK8sBackend()
+	k.clientset = client
+
+	t.Run("happy path", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "ANTHROPIC_API_KEY", SecretName: "agent-api-keys", SecretKey: "ANTHROPIC_API_KEY"},
+			{Name: "GEMINI_API_KEY", SecretName: "agent-api-keys", SecretKey: "GEMINI_API_KEY"},
+			{Name: "CLAUDE_CODE_OAUTH_TOKEN", SecretName: "agent-auth", SecretKey: "claude-oauth-token"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv: %v", err)
+		}
+		want := map[string]string{
+			"ANTHROPIC_API_KEY":       "sk-ant-12345",
+			"GEMINI_API_KEY":          "AIza-67890",
+			"CLAUDE_CODE_OAUTH_TOKEN": "oauth-abcdef",
+		}
+		for name, val := range want {
+			if got[name] != val {
+				t.Errorf("got[%q] = %q, want %q", name, got[name], val)
+			}
+		}
+	})
+
+	t.Run("missing secret is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "ANTHROPIC_API_KEY", SecretName: "agent-api-keys", SecretKey: "ANTHROPIC_API_KEY"},
+			{Name: "NO_SUCH_VAR", SecretName: "nonexistent-secret", SecretKey: "k"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv returned error for absent secret: %v", err)
+		}
+		if got["ANTHROPIC_API_KEY"] != "sk-ant-12345" {
+			t.Errorf("present secret should still resolve; got %v", got)
+		}
+		if _, ok := got["NO_SUCH_VAR"]; ok {
+			t.Errorf("missing secret should be omitted from result; got %v", got)
+		}
+	})
+
+	t.Run("missing key is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "MISSING_KEY", SecretName: "agent-api-keys", SecretKey: "NOT_IN_SECRET"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv returned error for absent key: %v", err)
+		}
+		if _, ok := got["MISSING_KEY"]; ok {
+			t.Errorf("missing key should be omitted from result; got %v", got)
+		}
+	})
+
+	t.Run("empty input returns empty map", func(t *testing.T) {
+		got, err := k.ResolveSecretEnv(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv(nil): %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("expected empty map, got %v", got)
+		}
+	})
+
+	t.Run("caches secret reads", func(t *testing.T) {
+		// Pre-existing reactor instrumentation: count Get calls on Secrets.
+		var gets int
+		client2 := k8sfake.NewSimpleClientset(apiKeys)
+		client2.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			gets++
+			// Fall through to default tracker
+			return false, nil, nil
+		})
+		k2 := testK8sBackend()
+		k2.clientset = client2
+
+		_, err := k2.ResolveSecretEnv(context.Background(), []SecretEnvVar{
+			{Name: "A", SecretName: "agent-api-keys", SecretKey: "ANTHROPIC_API_KEY"},
+			{Name: "B", SecretName: "agent-api-keys", SecretKey: "GEMINI_API_KEY"},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretEnv: %v", err)
+		}
+		if gets != 1 {
+			t.Errorf("expected 1 Secret Get (cached), got %d", gets)
+		}
+	})
+
+	// Sanity: the fake apierrors helper is imported elsewhere in this file;
+	// silence the linter if it's unused locally.
+	_ = apierrors.IsNotFound
+	_ = errors.Is
+	_ = strings.Contains
+	_ = schema.GroupVersion{}
+	_ = watch.NewFake
+}
+
+func TestK8sBackend_ResolveSecretMounts(t *testing.T) {
+	const ns = "devbox"
+	auth := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-agent-auth", Namespace: ns},
+		Data: map[string][]byte{
+			"claude-oauth-json": []byte(`{"claudeAiOauth":{"accessToken":"sk-ant"}}`),
+			"codex-auth-json":   []byte(`{"OPENAI_API_KEY":"sk-codex"}`),
+			"binary-blob":       {0x00, 0xff, 0x10, 0x7f, 0x80, 0x0a, 0x00},
+		},
+	}
+	apiKeys := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-agent-api-keys", Namespace: ns},
+		Data: map[string][]byte{
+			"gemini-service-account.json": []byte(`{"type":"service_account"}`),
+		},
+	}
+	client := k8sfake.NewSimpleClientset(auth, apiKeys)
+	k := testK8sBackend()
+	k.clientset = client
+
+	t.Run("happy path resolves multi-mount, multi-item secrets", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.claude.auth",
+				Items: []SecretMountItem{
+					{Key: "claude-oauth-json", Path: "oauth.json"},
+				},
+			},
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.codex.auth",
+				Items: []SecretMountItem{
+					{Key: "codex-auth-json", Path: "auth.json"},
+				},
+			},
+			{
+				SecretName: "cluster-agent-api-keys",
+				MountPath:  "/home/agent/.gcp",
+				Items: []SecretMountItem{
+					{Key: "gemini-service-account.json", Path: "sa.json"},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("expected 3 resolved files, got %d: %#v", len(got), got)
+		}
+		byPath := make(map[string][]byte, len(got))
+		for _, f := range got {
+			byPath[f.Path] = f.Content
+			if f.Mode != "0600" {
+				t.Errorf("file %q: Mode = %q, want 0600", f.Path, f.Mode)
+			}
+		}
+		want := map[string]string{
+			"/home/agent/.claude.auth/oauth.json": `{"claudeAiOauth":{"accessToken":"sk-ant"}}`,
+			"/home/agent/.codex.auth/auth.json":   `{"OPENAI_API_KEY":"sk-codex"}`,
+			"/home/agent/.gcp/sa.json":            `{"type":"service_account"}`,
+		}
+		for path, content := range want {
+			if string(byPath[path]) != content {
+				t.Errorf("byPath[%q] = %q, want %q", path, byPath[path], content)
+			}
+		}
+	})
+
+	t.Run("binary content roundtrips byte-for-byte", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/tmp/bin",
+				Items:      []SecretMountItem{{Key: "binary-blob", Path: "payload.bin"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 file, got %d", len(got))
+		}
+		wantBytes := []byte{0x00, 0xff, 0x10, 0x7f, 0x80, 0x0a, 0x00}
+		if !bytes.Equal(got[0].Content, wantBytes) {
+			t.Errorf("binary content mismatch: got %v, want %v", got[0].Content, wantBytes)
+		}
+	})
+
+	t.Run("missing secret is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "nonexistent-secret",
+				MountPath:  "/tmp/missing",
+				Items:      []SecretMountItem{{Key: "k", Path: "f"}},
+			},
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.claude.auth",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "oauth.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts returned error for absent secret: %v", err)
+		}
+		if len(got) != 1 || got[0].Path != "/home/agent/.claude.auth/oauth.json" {
+			t.Errorf("expected only the present secret's file; got %#v", got)
+		}
+	})
+
+	t.Run("missing key is skipped, not error", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.codex.auth",
+				Items: []SecretMountItem{
+					{Key: "NOT_A_KEY", Path: "auth.json"},
+					{Key: "codex-auth-json", Path: "auth.json"},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts returned error for absent key: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 file (missing key skipped), got %d: %#v", len(got), got)
+		}
+	})
+
+	t.Run("empty input returns nil", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts(nil): %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil, got %#v", got)
+		}
+	})
+
+	t.Run("caches secret reads across mounts referencing same Secret", func(t *testing.T) {
+		var gets int
+		client2 := k8sfake.NewSimpleClientset(auth)
+		client2.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			gets++
+			return false, nil, nil
+		})
+		k2 := testK8sBackend()
+		k2.clientset = client2
+
+		_, err := k2.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.claude.auth",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "oauth.json"}},
+			},
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/home/agent/.codex.auth",
+				Items:      []SecretMountItem{{Key: "codex-auth-json", Path: "auth.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if gets != 1 {
+			t.Errorf("expected 1 Secret Get (cached), got %d", gets)
+		}
+	})
+
+	t.Run("returned content is a copy, mutating it doesn't poison cache", func(t *testing.T) {
+		got, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/tmp/copy-test",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "first.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("expected 1 file, got %d", len(got))
+		}
+		// Mutate caller-visible bytes, then re-resolve — second read must still
+		// see the original Secret value, not the mutated copy.
+		for i := range got[0].Content {
+			got[0].Content[i] = 0
+		}
+		got2, err := k.ResolveSecretMounts(context.Background(), []SecretMount{
+			{
+				SecretName: "cluster-agent-auth",
+				MountPath:  "/tmp/copy-test-2",
+				Items:      []SecretMountItem{{Key: "claude-oauth-json", Path: "second.json"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ResolveSecretMounts (second call): %v", err)
+		}
+		if string(got2[0].Content) != `{"claudeAiOauth":{"accessToken":"sk-ant"}}` {
+			t.Errorf("Secret content was mutated by caller; got %q", got2[0].Content)
+		}
+	})
+}
+
+// TestBuildPodSpecCachePVCs pins the shared-cache mount contract
+// (StartOpts.CachePVCs): a named claim becomes a PVC volume + read-write
+// mount at the requested path, blank entries are skipped, and the empty
+// default produces a byte-identical legacy pod (no extra volumes).
+func TestBuildPodSpecCachePVCs(t *testing.T) {
+	k := testK8sBackend()
+	pod := k.buildPodSpec(StartOpts{
+		Name: "demo",
+		CachePVCs: []CachePVCMount{
+			{ClaimName: "spawn-go-cache", MountPath: "/gocache"},
+			{}, // blank entry must be skipped, not panic or mount garbage
+		},
+	}, "registry.harbor.lan/devbox:latest")
+
+	var vol *corev1.Volume
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == "cache-pvc-0" {
+			vol = &pod.Spec.Volumes[i]
+		}
+		if pod.Spec.Volumes[i].Name == "cache-pvc-1" {
+			t.Error("blank CachePVCMount must not produce a volume")
+		}
+	}
+	if vol == nil || vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != "spawn-go-cache" {
+		t.Fatalf("expected cache-pvc-0 PVC volume for spawn-go-cache, got: %#v", pod.Spec.Volumes)
+	}
+	var mount *corev1.VolumeMount
+	container := pod.Spec.Containers[0]
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].Name == "cache-pvc-0" {
+			mount = &container.VolumeMounts[i]
+		}
+	}
+	if mount == nil || mount.MountPath != "/gocache" || mount.ReadOnly {
+		t.Fatalf("expected read-write /gocache mount, got: %#v", container.VolumeMounts)
+	}
+
+	bare := k.buildPodSpec(StartOpts{Name: "demo"}, "registry.harbor.lan/devbox:latest")
+	for _, v := range bare.Spec.Volumes {
+		if strings.HasPrefix(v.Name, "cache-pvc-") {
+			t.Errorf("no CachePVCs configured but found volume %s", v.Name)
+		}
 	}
 }

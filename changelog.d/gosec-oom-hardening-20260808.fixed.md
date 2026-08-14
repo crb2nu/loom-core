@@ -1,0 +1,1 @@
+- Hardened `security:gosec` in `.gitlab-ci.yml` against runner OOM and infrastructure failures with bounded memory settings and infra-only retries.

@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"sync"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 )
@@ -37,28 +36,49 @@ func fetchToolsBounded(
 
 	sem := make(chan struct{}, limit)
 	results := make([]toolFetchResult, len(sources))
+	type fetchOutcome struct {
+		idx    int
+		result toolFetchResult
+	}
+	outcomes := make(chan fetchOutcome, len(sources))
 
-	var wg sync.WaitGroup
-	wg.Add(len(sources))
 	for i, src := range sources {
 		go func(idx int, source toolSource) {
-			defer wg.Done()
-
 			// Acquire slot or abort if context is cancelled.
 			select {
 			case sem <- struct{}{}:
 				// ok
 			case <-ctx.Done():
-				results[idx] = toolFetchResult{name: source.name, err: ctx.Err()}
+				outcomes <- fetchOutcome{
+					idx: idx,
+					result: toolFetchResult{
+						name: source.name,
+						err:  ctx.Err(),
+					},
+				}
 				return
 			}
 			defer func() { <-sem }()
 
 			tools, err := fetch(ctx, source)
-			results[idx] = toolFetchResult{name: source.name, tools: tools, err: err}
+			outcomes <- fetchOutcome{
+				idx: idx,
+				result: toolFetchResult{
+					name:  source.name,
+					tools: tools,
+					err:   err,
+				},
+			}
 		}(i, src)
 	}
 
-	wg.Wait()
+	// Join every worker even after cancellation. Waiting workers observe ctx at
+	// the semaphore; active fetches receive the same ctx and must unwind before
+	// the refresh leader is considered stopped.
+	for remaining := len(sources); remaining > 0; remaining-- {
+		outcome := <-outcomes
+		results[outcome.idx] = outcome.result
+	}
+
 	return results
 }

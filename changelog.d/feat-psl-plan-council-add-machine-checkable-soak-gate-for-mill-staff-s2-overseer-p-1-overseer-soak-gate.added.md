@@ -1,0 +1,1 @@
+- Add the machine-checkable Mill Staff S2 overseer soak gate in `pkg/mills/overseer/soak_gate.go` and document its promotion criteria in `docs/mill-staff-s2-soak.md`.

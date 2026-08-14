@@ -1,0 +1,1 @@
+- Make Mills gate verdict telemetry hash only gate-relevant inputs and add deterministic replay coverage for `spec_conformance`, `scope`, `pr_self_review`, and `nonempty_diff` in `pkg/mills/gates/gates.go`, `pkg/mills/gates/gates_test.go`, and `pkg/telemetry/telemetry.go`.

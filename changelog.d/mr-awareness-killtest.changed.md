@@ -1,0 +1,1 @@
+- Make `queued-proof` and `mr-awareness` kill-test failures machine-readable with structured FAIL verdicts and stable reason codes in `cmd/mills-workflow-killtest/main.go` and `pkg/mills/pipeline/pipeline.go`, and document their evidence and rollback contract.

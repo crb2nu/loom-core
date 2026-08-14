@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mobile-hud
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-cloudflare
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Vendor transcript federation pushes (POST /api/vendor-sessions/mirror)
+    # can exceed nginx's 1m default body cap on a full snapshot; match the
+    # handler's own 8MB MaxBytesReader so the edge isn't the tighter limit.
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+  labels:
+    app: mobile-hud
+    component: mobile-hud
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - hud.flexinfer.ai
+      secretName: mobile-hud-tls
+  rules:
+    - host: hud.flexinfer.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mobile-hud
+                port:
+                  number: 80

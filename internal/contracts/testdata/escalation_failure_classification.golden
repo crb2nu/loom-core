@@ -1,0 +1,7 @@
+{
+  "classifier": "mills-failure-classifier",
+  "class": "transient_quota",
+  "retryable": true,
+  "free_retry": true,
+  "terminal": false
+}

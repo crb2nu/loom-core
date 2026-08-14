@@ -1,0 +1,249 @@
+{
+  "schema_version": "loom.fleet-reliability.suite/v1",
+  "suite_version": 4,
+  "thresholds": {
+    "time_percent": 10,
+    "bytes_percent": 15,
+    "allocations_percent": 15
+  },
+  "test_groups": [
+    {
+      "name": "daemon",
+      "race_enabled": false,
+      "scenarios": [
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestCallPipeline_TransportFailureThenRecovery"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestHandleCall_HubConcurrentCallsRunInParallel"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestShardedProcessControllerBlockedDialDoesNotPinAnotherServerGeneration"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestServerSupervisorReplacementHasSingleWinnerAndRejectsStaleFailure"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestServerSupervisorRegistryEpochFencePreservesPostReloadReplacement"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestDaemonStop_ClosesActiveHubTransportBeforeWait"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestServerSupervisorConcurrentColdConnectionUsesSinglePhysicalGeneration"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestServerSupervisorActiveMuxLeaseBlocksIdleRetirementAndShutdownJoins"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon",
+          "test": "TestToolRefreshDebounce_StopCancelsRunningAndWaits"
+        }
+      ]
+    },
+    {
+      "name": "race",
+      "race_enabled": true,
+      "scenarios": [
+        {
+          "package": "github.com/crb2nu/loom/pkg/transport/muxstdio",
+          "test": "TestRace_HighFanoutSendRecv"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/transport/muxstdio",
+          "test": "TestRace_ConcurrentSendAndClose"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestClaimPipelineStart_ConcurrentExactlyOne"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestClaimPipelineStart_FaultMatrixAtomicity"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestClaimPipelineStart_TenThousandQueueDepthNeutralAndStatementBound"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestPendingDispatch_LeaseExpiryRecoversWithFencedToken"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestPendingDispatch_RetryCeilingDeadLettersCurrentAggregate"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestPendingDispatch_DuePoisonBatchDoesNotStarveFreshTail"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_ConcurrentOutboxConsumersStartIntentOnce"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_ConcurrentDistinctOverlappingStartsHaveOneWinner"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_AdvancedRunAcknowledgesPendingDispatchWithoutStarter"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_DispatchDeadLetterRecordsTerminalMetrics"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_CrashAfterDispatchAckRecoversQueuedTopLevelRun"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_TerminalRepairBypassesMoreThanBatchOfActiveHeads"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_TenThousandQueueTickIsBounded"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_ObsoleteQueuedDispatchNeverReachesStarter"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills",
+          "test": "TestReconciler_TickRepairsTerminalBacklogWhilePolicyDisabled"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/council",
+          "test": "TestApply_AutoIDCollisionAdvancesToNextFreeSequence"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/council",
+          "test": "TestApply_ExistingIDHintUsesCurrentRevision"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/pipeline",
+          "test": "TestRunnerStarter_ConcurrentFanOutStartsExactlyOnce"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestWorkflowAppendStep_Idempotency"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestWorkflowAppendStep_ConcurrentIdempotency"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/store",
+          "test": "TestWorkflowListPending_AndCrashReconciliation"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/workflow",
+          "test": "TestRuntime_CrashResume"
+        },
+        {
+          "package": "github.com/crb2nu/loom/pkg/mills/workflow",
+          "test": "TestRuntime_ResumeReattaches"
+        },
+        {
+          "package": "github.com/crb2nu/loom/cmd/custom-server",
+          "test": "TestWriteWSSerializesConcurrentWriters"
+        },
+        {
+          "package": "github.com/crb2nu/loom/cmd/custom-server",
+          "test": "TestDrainRegistryDrainAllInvokesEachOnce"
+        },
+        {
+          "package": "github.com/crb2nu/loom/cmd/custom-server",
+          "test": "TestDrainRegistryRemoveSkipsClosed"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon/generation",
+          "test": "TestDelayedOldFailureAfterReplacementIsNoOp"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/daemon/generation",
+          "test": "TestTenThousandFaultCyclesStayWithinLeakBudget"
+        }
+      ]
+    },
+    {
+      "name": "spawn",
+      "race_enabled": false,
+      "scenarios": [
+        {
+          "package": "github.com/crb2nu/loom/internal/spawn",
+          "test": "TestReconcileTerminalHookIsIdempotent"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/spawn",
+          "test": "TestSpawnWithKeyIsDeterministicAndIdempotent"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/spawn",
+          "test": "TestReconcileRecoveryAfterRestart"
+        }
+      ]
+    },
+    {
+      "name": "contracts",
+      "race_enabled": false,
+      "scenarios": [
+        {
+          "package": "github.com/crb2nu/loom/internal/contracts",
+          "test": "TestMillsEscalationFailureRecordContract"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/contracts",
+          "test": "TestMobileEnvelopeContract"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/contracts",
+          "test": "TestOpenAPISpecLoads"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/contracts",
+          "test": "TestOpenAPIConformance_Status"
+        }
+      ]
+    },
+    {
+      "name": "integration",
+      "race_enabled": false,
+      "scenarios": [
+        {
+          "package": "github.com/crb2nu/loom/internal/integration",
+          "test": "TestIntegration_ProxyDaemon_FakeHubCloseReset"
+        },
+        {
+          "package": "github.com/crb2nu/loom/internal/integration",
+          "test": "TestIntegration_ProxyDaemon_FakeHubTransportGenerationSoak"
+        }
+      ]
+    },
+    {
+      "name": "load",
+      "race_enabled": false,
+      "scenarios": [
+        {
+          "package": "github.com/crb2nu/loom/internal/reliability",
+          "test": "TestFleetReliabilityMixedLoad"
+        }
+      ]
+    }
+  ],
+  "benchmarks": [
+    "BenchmarkFleetDaemonEventPublish",
+    "BenchmarkFleetMuxRoundTrip",
+    "BenchmarkFleetMillsEventAppend",
+    "BenchmarkFleetCustomServerWrite"
+  ]
+}

@@ -11,8 +11,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -31,6 +33,19 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-redis",
+		logger,
+	)
+	if err != nil {
+		logger.
+			Warn("OTel tracer init failed",
+
+				"error", err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-redis")
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
@@ -55,6 +70,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-redis", "version", version)
 
 	server := mcp.NewServer("mcp-redis", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Redis MCP server. Inspect cache data, monitor connections, and analyze performance.")
 
 	// redis_info
@@ -70,9 +86,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, rs.handleInfo)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_keys
+		// redis_keys
+		tracer, "redis_info", rs.handleInfo))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_keys",
 		Description: "Scan keys matching a pattern (uses SCAN, safe for production)",
@@ -93,9 +111,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, rs.handleKeys)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_get
+		// redis_get
+		tracer, "redis_keys", rs.handleKeys))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_get",
 		Description: "Get the value of a key (supports string, hash, list, set, zset)",
@@ -117,9 +137,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"key"},
 		},
-	}, rs.handleGet)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_ttl
+		// redis_ttl
+		tracer, "redis_get", rs.handleGet))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_ttl",
 		Description: "Get the time-to-live for a key",
@@ -133,9 +155,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"key"},
 		},
-	}, rs.handleTTL)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_memory
+		// redis_memory
+		tracer, "redis_ttl", rs.handleTTL))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_memory",
 		Description: "Get memory usage information for a key or the server",
@@ -148,9 +172,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, rs.handleMemory)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_dbsize
+		// redis_dbsize
+		tracer, "redis_memory", rs.handleMemory))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_dbsize",
 		Description: "Get the number of keys in the current database",
@@ -158,9 +184,11 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, rs.handleDBSize)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_slowlog
+		// redis_slowlog
+		tracer, "redis_dbsize", rs.handleDBSize))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_slowlog",
 		Description: "Get the slow query log",
@@ -173,9 +201,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, rs.handleSlowLog)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_client_list
+		// redis_client_list
+		tracer, "redis_slowlog", rs.handleSlowLog))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_client_list",
 		Description: "Get list of connected clients",
@@ -188,9 +218,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, rs.handleClientList)
+	}, mcpotel.TracedToolHandler(
 
-	// redis_pubsub_channels
+		// redis_pubsub_channels
+		tracer, "redis_client_list", rs.handleClientList))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_pubsub_channels",
 		Description: "Get active pub/sub channels",
@@ -203,9 +235,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, rs.handlePubSubChannels)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// redis_config_get
+		// redis_config_get
+		"redis_pubsub_channels", rs.handlePubSubChannels))
+
 	server.AddTool(mcp.Tool{
 		Name:        "redis_config_get",
 		Description: "Get Redis configuration parameters",
@@ -218,7 +252,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, rs.handleConfigGet)
+	}, mcpotel.TracedToolHandler(tracer, "redis_config_get", rs.handleConfigGet))
 
 	return server.Run(ctx)
 }

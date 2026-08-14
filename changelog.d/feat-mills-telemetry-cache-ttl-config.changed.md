@@ -1,0 +1,1 @@
+- Make the Mills telemetry stage-cache TTL configurable with `MILLS_TELEMETRY_CACHE_TTL_SECONDS` in `cmd/loom-mills-operator/telemetry_cache.go`, `cmd/loom-mills-operator/server.go`, and `docs/MILLS.md`.

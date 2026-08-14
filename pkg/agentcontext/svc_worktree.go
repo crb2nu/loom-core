@@ -1,0 +1,399 @@
+package agentcontext
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/pkg/validate"
+)
+
+// WorktreeSvc manages git worktree assignments, lifecycle, and reconciliation.
+type WorktreeSvc struct {
+	mu    sync.RWMutex
+	assns map[string]*WorktreeAssignment
+
+	qdrant  *QdrantClient // CollWorktree
+	cfg     Config
+	logger  *slog.Logger
+	metrics *Metrics
+
+	// Reconciler (optional, set after construction).
+	reconciler *WorktreeReconciler
+
+	// Cross-domain callbacks (wired by Service).
+	setPresenceWorktreeID   func(agentID, worktreeID string)
+	clearPresenceWorktreeID func(agentID, worktreeID string)
+	getSession              func(ctx context.Context, sessionID string) (*Session, error)
+}
+
+// NewWorktreeSvc creates a new WorktreeSvc.
+func NewWorktreeSvc(qdrant *QdrantClient, cfg Config, logger *slog.Logger, metrics *Metrics) *WorktreeSvc {
+	return &WorktreeSvc{
+		assns:   make(map[string]*WorktreeAssignment),
+		qdrant:  qdrant,
+		cfg:     cfg,
+		logger:  logger,
+		metrics: metrics,
+	}
+}
+
+// Allocate creates a worktree + branch and assigns it to an agent.
+func (wt *WorktreeSvc) Allocate(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	agentID := v.Required("agent_id")
+	sessionID := v.Required("session_id")
+	branchName := v.Required("branch_name")
+	baseBranch := v.String("base_branch", "HEAD")
+	purpose := v.String("purpose", "")
+	worktreePath := v.String("worktree_path", "")
+	explicitRepoPath := v.String("repo_path", "")
+	ttlHours := v.Int("ttl_hours", 0)
+
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+
+	repoPath, resolveErr := wt.resolveRepoPath(ctx, explicitRepoPath, sessionID)
+	if resolveErr != nil {
+		return mcp.ErrorResult(resolveErr), nil
+	}
+
+	// Determine worktree path
+	if worktreePath == "" {
+		baseDir := wt.cfg.GitWorktreeBaseDir
+		if baseDir == "" {
+			baseDir = filepath.Join(repoPath, ".worktrees")
+		}
+		worktreePath = filepath.Join(baseDir, branchName)
+	}
+
+	// Validate path is safe
+	absPath, err := filepath.Abs(worktreePath)
+	if err != nil {
+		return mcp.ErrorResult(fmt.Errorf("invalid worktree path: %w", err)), nil
+	}
+
+	// Create the worktree with a new branch
+	_, err = wt.RunGit(ctx, repoPath, "worktree", "add", "-b", branchName, absPath, baseBranch)
+	if err != nil {
+		return mcp.ErrorResult(fmt.Errorf("create worktree: %w", err)), nil
+	}
+
+	now := time.Now()
+	assignment := &WorktreeAssignment{
+		ID:           GenerateID(agentID, branchName, "worktree", now),
+		AgentID:      agentID,
+		SessionID:    sessionID,
+		WorktreePath: absPath,
+		Branch:       branchName,
+		BaseBranch:   baseBranch,
+		Purpose:      purpose,
+		Status:       WorktreeStatusActive,
+		CreatedAt:    now,
+		TTL:          ttlHours,
+	}
+
+	wt.mu.Lock()
+	wt.assns[assignment.ID] = assignment
+	wt.mu.Unlock()
+
+	// Update presence with worktree ID
+	if wt.setPresenceWorktreeID != nil {
+		wt.setPresenceWorktreeID(agentID, assignment.ID)
+	}
+
+	result := map[string]any{
+		"ok":            true,
+		"assignment_id": assignment.ID,
+		"worktree_path": absPath,
+		"branch":        branchName,
+		"base_branch":   baseBranch,
+		"agent_id":      agentID,
+	}
+
+	// Persist (non-fatal)
+	if err := wt.Persist(ctx, assignment); err != nil {
+		result["_warning"] = fmt.Sprintf("failed to persist worktree assignment: %v", err)
+	}
+
+	return mcp.JSONResult(result)
+}
+
+// resolveRepoPath picks the git repo to operate on for Allocate, in priority
+// order: explicit arg > session.WorkingDir > cfg.GitRepoPath. The chosen path
+// is verified with `git rev-parse --show-toplevel` so callers get an actionable
+// error instead of a raw "not a git repository" from git worktree add.
+func (wt *WorktreeSvc) resolveRepoPath(ctx context.Context, explicitRepoPath, sessionID string) (string, error) {
+	type attempt struct {
+		source string
+		path   string
+	}
+	attempts := []attempt{{"repo_path arg", strings.TrimSpace(explicitRepoPath)}}
+	if wt.getSession != nil && sessionID != "" {
+		if sess, err := wt.getSession(ctx, sessionID); err == nil && sess != nil {
+			attempts = append(attempts, attempt{"session.working_dir", strings.TrimSpace(sess.WorkingDir)})
+		}
+	}
+	attempts = append(attempts, attempt{"AGENT_CONTEXT_GIT_REPO_PATH/REPO_PATH", strings.TrimSpace(wt.cfg.GitRepoPath)})
+
+	var tried []string
+	for _, a := range attempts {
+		if a.path == "" {
+			tried = append(tried, fmt.Sprintf("%s=(unset)", a.source))
+			continue
+		}
+		if out, err := wt.RunGit(ctx, a.path, "rev-parse", "--show-toplevel"); err == nil {
+			resolved := strings.TrimSpace(out)
+			if resolved == "" {
+				resolved = a.path
+			}
+			return resolved, nil
+		} else {
+			tried = append(tried, fmt.Sprintf("%s=%q (not a git repo: %v)", a.source, a.path, err))
+		}
+	}
+	return "", fmt.Errorf(
+		"could not resolve a git repository for worktree allocation; tried: %s. "+
+			"Pass the 'repo_path' argument, set session.working_dir on agent_session_start, "+
+			"or set AGENT_CONTEXT_GIT_REPO_PATH / REPO_PATH on the agent-context server",
+		strings.Join(tried, "; "),
+	)
+}
+
+// Release releases a worktree assignment.
+func (wt *WorktreeSvc) Release(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	assignmentID := v.Required("assignment_id")
+	removeWorktree := v.Bool("remove_worktree", false)
+	force := v.Bool("force", false)
+
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+
+	wt.mu.Lock()
+	assignment, ok := wt.assns[assignmentID]
+	if !ok {
+		wt.mu.Unlock()
+		return mcp.ErrorResult(fmt.Errorf("assignment %s not found", assignmentID)), nil
+	}
+
+	now := time.Now()
+	assignment.Status = WorktreeStatusReleased
+	assignment.ReleasedAt = &now
+	wt.mu.Unlock()
+
+	// Remove worktree from disk if requested
+	if removeWorktree && wt.cfg.GitRepoPath != "" {
+		gitArgs := []string{"worktree", "remove"}
+		if force {
+			gitArgs = append(gitArgs, "--force")
+		}
+		gitArgs = append(gitArgs, assignment.WorktreePath)
+
+		if _, err := wt.RunGit(ctx, wt.cfg.GitRepoPath, gitArgs...); err != nil {
+			return mcp.ErrorResult(fmt.Errorf("remove worktree: %w", err)), nil
+		}
+	}
+
+	// Update presence
+	if wt.clearPresenceWorktreeID != nil {
+		wt.clearPresenceWorktreeID(assignment.AgentID, assignmentID)
+	}
+
+	result := map[string]any{
+		"ok":               true,
+		"assignment_id":    assignmentID,
+		"status":           string(assignment.Status),
+		"worktree_removed": removeWorktree,
+	}
+
+	// Persist update (non-fatal)
+	if err := wt.Persist(ctx, assignment); err != nil {
+		result["_warning"] = fmt.Sprintf("failed to persist worktree release: %v", err)
+	}
+
+	return mcp.JSONResult(result)
+}
+
+// List lists worktree assignments.
+func (wt *WorktreeSvc) List(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	agentID := v.String("agent_id", "")
+	statusFilter := v.String("status", "")
+	includeGitStatus := v.Bool("include_git_status", false)
+	includeDiskUsage := v.Bool("include_disk_usage", false)
+	includeUntracked := v.Bool("include_untracked", false)
+
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+
+	// Optionally trigger untracked detection first
+	if includeUntracked && wt.reconciler != nil {
+		wt.reconciler.detectUntrackedWorktrees(ctx)
+	}
+
+	wt.mu.RLock()
+	defer wt.mu.RUnlock()
+
+	var assignments []map[string]any
+	var totalDiskUsage int64
+
+	for _, a := range wt.assns {
+		if agentID != "" && a.AgentID != agentID {
+			continue
+		}
+		if statusFilter != "" && string(a.Status) != statusFilter {
+			continue
+		}
+
+		entry := map[string]any{
+			"assignment_id": a.ID,
+			"agent_id":      a.AgentID,
+			"session_id":    a.SessionID,
+			"worktree_path": a.WorktreePath,
+			"branch":        a.Branch,
+			"base_branch":   a.BaseBranch,
+			"purpose":       a.Purpose,
+			"status":        string(a.Status),
+			"created_at":    a.CreatedAt.Format(time.RFC3339),
+		}
+		if a.ReleasedAt != nil {
+			entry["released_at"] = a.ReleasedAt.Format(time.RFC3339)
+		}
+		if a.OrphanedAt != nil {
+			entry["orphaned_at"] = a.OrphanedAt.Format(time.RFC3339)
+		}
+		if a.TTL > 0 {
+			entry["ttl_hours"] = a.TTL
+		}
+
+		// Include disk usage (from cache or live scan)
+		if includeDiskUsage && a.Status != WorktreeStatusReleased {
+			diskUsage := a.DiskUsage
+			if diskUsage == 0 {
+				if size, err := dirDiskUsage(a.WorktreePath); err == nil {
+					diskUsage = size
+				}
+			}
+			entry["disk_usage_bytes"] = diskUsage
+			entry["disk_usage_human"] = humanizeBytes(diskUsage)
+			if a.DiskMeasuredAt != nil {
+				entry["disk_measured_at"] = a.DiskMeasuredAt.Format(time.RFC3339)
+			}
+			totalDiskUsage += diskUsage
+		}
+
+		if includeGitStatus && a.Status == WorktreeStatusActive && wt.cfg.GitRepoPath != "" {
+			if status, err := wt.RunGit(ctx, a.WorktreePath, "status", "--porcelain"); err == nil {
+				entry["git_status"] = status
+			}
+			if branch, err := wt.RunGit(ctx, a.WorktreePath, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
+				entry["current_branch"] = branch
+			}
+		}
+
+		assignments = append(assignments, entry)
+	}
+
+	result := map[string]any{
+		"ok":          true,
+		"assignments": assignments,
+		"count":       len(assignments),
+	}
+	if includeDiskUsage {
+		result["total_disk_usage_bytes"] = totalDiskUsage
+		result["total_disk_usage_human"] = humanizeBytes(totalDiskUsage)
+	}
+
+	return mcp.JSONResult(result)
+}
+
+// OrphanForAgent marks all active worktrees for an agent as orphaned.
+func (wt *WorktreeSvc) OrphanForAgent(agentID string) {
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+
+	now := time.Now()
+	for _, a := range wt.assns {
+		if a.AgentID == agentID && a.Status == WorktreeStatusActive {
+			a.Status = WorktreeStatusOrphaned
+			a.OrphanedAt = &now
+		}
+	}
+}
+
+// RunGit executes a git command in the given directory.
+func (wt *WorktreeSvc) RunGit(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s failed: %v, output: %s", args[0], err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// Persist stores an assignment to Qdrant.
+func (wt *WorktreeSvc) Persist(ctx context.Context, a *WorktreeAssignment) error {
+	if wt.qdrant == nil {
+		return nil
+	}
+	if err := wt.qdrant.EnsureCollection(ctx, sessionsVectorSize); err != nil {
+		return err
+	}
+
+	point := Point{
+		ID:      a.ID,
+		Vector:  make([]float64, sessionsVectorSize),
+		Payload: worktreeAssignmentToPayload(a),
+	}
+
+	return wt.qdrant.Upsert(ctx, []Point{point}, true)
+}
+
+// LoadFromQdrant loads worktree assignments on startup.
+func (wt *WorktreeSvc) LoadFromQdrant(ctx context.Context) error {
+	if wt.qdrant == nil {
+		return nil
+	}
+
+	points, err := wt.qdrant.ScrollPoints(ctx, nil, 500, false)
+	if err != nil {
+		return err
+	}
+
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+
+	for _, p := range points {
+		a := payloadToWorktreeAssignment(p.Payload)
+		if a == nil {
+			continue
+		}
+		wt.assns[a.ID] = a
+	}
+	return nil
+}
+
+// StartReconciler starts the reconciler loop if configured.
+func (wt *WorktreeSvc) StartReconciler(ctx context.Context) {
+	if wt.reconciler != nil {
+		wt.reconciler.Start(ctx)
+	}
+}
+
+// StopReconciler stops the reconciler if running.
+func (wt *WorktreeSvc) StopReconciler() {
+	if wt.reconciler != nil {
+		wt.reconciler.Stop()
+	}
+}

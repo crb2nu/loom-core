@@ -1,0 +1,1 @@
+- **Added storage-health and incident-classification guardrails** (`docs/storage-health-and-incident-classification.md`): define canonical incident classes, the external-incident repository boundary, and roadmap extraction checks for planners and reviewers.

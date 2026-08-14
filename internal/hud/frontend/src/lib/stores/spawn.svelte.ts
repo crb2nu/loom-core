@@ -1,0 +1,522 @@
+// Spawn store — manages headless agent spawns via /api/agent/spawn endpoints
+// and subscribes to SSE events for real-time spawn lifecycle updates.
+import { untrack } from 'svelte';
+import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
+import { adminFetch, labsAuthStore } from './labsAuth.svelte.ts';
+import { fleetStore, type Session } from './fleet.svelte.ts';
+
+export interface SpawnActivityEvent {
+  /** Stable identity assigned on append. The feed is rendered newest-first
+   *  over a head-growing array, so positional identity shifts on every push. */
+  id: string;
+  type: string;
+  timestamp: string;
+  data: Record<string, unknown>;
+}
+
+export interface SpawnRequest {
+  agent_type: string;
+  project: string;
+  branch?: string;
+  base_branch?: string;
+  task_description: string;
+  namespace?: string;
+  memory_mb?: number;
+  cpus?: number;
+  timeout_minutes?: number;
+  multi_turn?: boolean;
+  max_cost_usd?: number;
+  max_turns?: number;
+  /** Caller-supplied tags. The weaver spawn bridge writes
+   * `weaver_query_id` and `weaver_domain` here for HUD correlation. */
+  metadata?: Record<string, string>;
+}
+
+// SpawnTokenUsage mirrors internal/hud/bridge/spawn_telemetry.go SpawnTokenUsage.
+export interface SpawnTokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+}
+
+// SpawnModelUsage mirrors internal/hud/bridge/spawn_telemetry.go ModelUse.
+export interface SpawnModelUsage {
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+// SpawnTelemetry mirrors internal/hud/bridge/spawn_telemetry.go SpawnTelemetry.
+export interface SpawnTelemetry {
+  external_session_id?: string;
+  turn_count: number;
+  total_cost_usd: number;
+  cost_estimated?: boolean;
+  token_usage: SpawnTokenUsage;
+  model_usage?: Record<string, SpawnModelUsage>;
+  stop_reason?: string;
+  last_message?: string;
+}
+
+export interface SpawnState {
+  spawn_id: string;
+  agent_id: string;
+  pod_name: string;
+  status: 'creating' | 'building' | 'running' | 'completed' | 'failed' | 'stopped';
+  request: SpawnRequest;
+  started_at: string;
+  ended_at?: string;
+  error?: string;
+  telemetry?: SpawnTelemetry | null;
+}
+
+export interface SpawnConfigAgentType {
+  id: string;
+  name: string;
+  available: boolean;
+}
+
+export interface SpawnConfigProject {
+  name: string;
+  path: string;
+}
+
+export interface SpawnConfigDefaults {
+  agent_type: string;
+  base_branch: string;
+  memory_mb: number;
+  cpus: number;
+  timeout_minutes: number;
+  max_cost_usd?: number;
+  max_turns?: number;
+}
+
+export interface SpawnConfig {
+  configured: boolean;
+  agent_types: SpawnConfigAgentType[];
+  projects: SpawnConfigProject[];
+  defaults: SpawnConfigDefaults;
+  notes?: {
+    auth_required?: boolean;
+    multi_turn_supported?: boolean;
+    follow_up_supported?: boolean;
+    interrupt_supported?: boolean;
+    telemetry_requires_auth?: boolean;
+    project_count?: number;
+    active_spawn_count?: number;
+    reason?: string;
+    hint?: string;
+  };
+}
+
+class SpawnStore {
+  spawns = $state<SpawnState[]>([]);
+  loading = $state(false);
+  spawning = $state(false);
+  error = $state<string | null>(null);
+  config = $state<SpawnConfig | null>(null);
+  configLoading = $state(false);
+  configError = $state<string | null>(null);
+  lastUpdated = $state<Date | null>(null);
+  // telemetryBySpawnId holds live telemetry snapshots for spawns that do not
+  // embed telemetry in the list response (typically active spawns). Completed
+  // spawns generally carry telemetry directly on SpawnState.telemetry.
+  telemetryBySpawnId = $state(new Map<string, SpawnTelemetry>());
+  // activityBySpawnId accumulates real-time SSE activity events per spawn
+  // (messages, tool calls, thinking, file changes, results). Capped at 500 per spawn.
+  activityBySpawnId = $state(new Map<string, SpawnActivityEvent[]>());
+
+  // Per-panel UI state (Slice B2 — moved out of SpawnPanel.svelte so the
+  // panel becomes a pure composition shell).
+  statusFilter = $state<string>('all');
+  searchQuery = $state<string>('');
+
+  setStatusFilter(value: string): void { this.statusFilter = value; }
+  setSearchQuery(value: string): void { this.searchQuery = value; }
+
+  // Staleness (Slice B3) — fleet snapshots don't include spawns, so spawn
+  // relies on the fine-grained agent.spawn.* SSE stream plus this watchdog
+  // poll. We use a longer staleAfter than the fleet/health stores because
+  // an idle daemon (no active spawns, no events) is a legitimate state.
+  staleAfter = 180_000;
+  get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (!this.poller.running) return false;
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
+
+  private static readonly MAX_ACTIVITY_EVENTS = 500;
+  // Watchdog poll — fires on SSE-down OR on stale (SSE-connected-but-quiet).
+  // The gate lives in shouldTick so the SSE-invalidation path
+  // (refreshCoalesced) is not suppressed by it.
+  private poller = createPoller(() => this.fetch(), 60000, {
+    shouldTick: () => !eventStore.connected || this.isStale,
+  });
+  private eventUnsubs: Array<() => void> = [];
+  // spawn_id / agent_id → spawn_id, rebuilt whenever the roster changes. The
+  // activity handler used two linear scans per event, which is the hot path
+  // during a spawn burst.
+  private spawnIdByKey = new Map<string, string>();
+  private activitySeq = 0;
+
+  get activeSpawns(): SpawnState[] {
+    return this.spawns.filter(s => s.status === 'creating' || s.status === 'building' || s.status === 'running');
+  }
+
+  get completedSpawns(): SpawnState[] {
+    return this.spawns.filter(s => s.status !== 'creating' && s.status !== 'building' && s.status !== 'running');
+  }
+
+  /** Find a spawn by its agent_id (for cross-referencing with fleet sessions). */
+  spawnForAgent(agentId: string): SpawnState | undefined {
+    return this.spawns.find(s => s.agent_id === agentId);
+  }
+
+  /**
+   * sessionForSpawn looks up the fleet session linked to a given spawn.
+   * Finds the spawn by spawnId, extracts its agent_id, then queries
+   * fleetStore.sessions for a session with the same agent_id.
+   */
+  sessionForSpawn(spawnId: string): Session | undefined {
+    const spawn = this.spawns.find(s => s.spawn_id === spawnId);
+    if (!spawn) return undefined;
+    return fleetStore.sessionForAgent(spawn.agent_id);
+  }
+
+  /**
+   * telemetryFor returns the best-known telemetry for a spawn:
+   *   1. Live snapshot from telemetryBySpawnId (populated by fetchActiveTelemetry).
+   *   2. Embedded telemetry on SpawnState (backend sends this for completed spawns).
+   * Returns undefined when neither source has data yet.
+   */
+  telemetryFor(spawnId: string): SpawnTelemetry | undefined {
+    const live = this.telemetryBySpawnId.get(spawnId);
+    if (live) return live;
+    const s = this.spawns.find(sp => sp.spawn_id === spawnId);
+    return s?.telemetry ?? undefined;
+  }
+
+  clearError(): void {
+    this.error = null;
+  }
+
+  /** Replace the roster and rebuild the activity-resolution index. spawn_id
+   *  entries are written last so they win over an agent_id collision, matching
+   *  the lookup order the linear scans used. */
+  private applySpawns(next: SpawnState[]): void {
+    this.spawns = next;
+    const index = new Map<string, string>();
+    for (const s of next) if (s.agent_id) index.set(s.agent_id, s.spawn_id);
+    for (const s of next) if (s.spawn_id) index.set(s.spawn_id, s.spawn_id);
+    this.spawnIdByKey = index;
+  }
+
+  async fetch(): Promise<void> {
+    this.loading = true;
+    this.error = null;
+    try {
+      const res = await fetch('/api/agent/spawns');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      this.applySpawns(data.spawns ?? []);
+      this.lastUpdated = new Date();
+      // Fire-and-forget active-spawn telemetry refresh. Any errors are
+      // swallowed — the map just stays stale and rows fall back to caps-only.
+      this.fetchActiveTelemetry().catch(() => { /* best-effort */ });
+    } catch (err) {
+      this.error = err instanceof Error ? err.message : String(err);
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async fetchConfig(): Promise<void> {
+    this.configLoading = true;
+    this.configError = null;
+    try {
+      const res = await fetch('/api/agent/spawn/config');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      this.config = await res.json();
+    } catch (err) {
+      this.configError = err instanceof Error ? err.message : String(err);
+    } finally {
+      this.configLoading = false;
+    }
+  }
+
+  /**
+   * fetchActiveTelemetry refreshes telemetry snapshots for every currently
+   * active spawn in parallel. The paginated list response from /api/agent/spawns
+   * does not embed live telemetry for active spawns, so we pull each via
+   * /api/agent/spawn/{id}/telemetry. Completed spawns are skipped (they carry
+   * telemetry on the list payload).
+   */
+  async fetchActiveTelemetry(): Promise<void> {
+    if (!labsAuthStore.hasToken) {
+      if (this.telemetryBySpawnId.size > 0) {
+        this.telemetryBySpawnId = new Map<string, SpawnTelemetry>();
+      }
+      return;
+    }
+
+    const active = this.activeSpawns;
+    if (active.length === 0) {
+      // Prune stale entries for spawns that have since completed.
+      if (this.telemetryBySpawnId.size > 0) {
+        const next = new Map<string, SpawnTelemetry>();
+        for (const [id, tel] of this.telemetryBySpawnId) {
+          if (this.spawns.some(s => s.spawn_id === id)) {
+            next.set(id, tel);
+          }
+        }
+        this.telemetryBySpawnId = next;
+      }
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      active.map(async (s) => {
+        const res = await adminFetch(`/api/agent/spawn/${encodeURIComponent(s.spawn_id)}/telemetry`, {
+          requireToken: true,
+          action: 'Loading spawn telemetry',
+        });
+        if (!res.ok) return { spawnId: s.spawn_id, telemetry: null as SpawnTelemetry | null };
+        const data = await res.json();
+        return { spawnId: s.spawn_id, telemetry: (data?.telemetry ?? null) as SpawnTelemetry | null };
+      })
+    );
+
+    const next = new Map(this.telemetryBySpawnId);
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue;
+      const { spawnId, telemetry } = r.value;
+      if (telemetry) {
+        next.set(spawnId, telemetry);
+      } else {
+        next.delete(spawnId);
+      }
+    }
+    // Drop entries for spawns no longer in the list (terminal + evicted).
+    for (const id of Array.from(next.keys())) {
+      if (!this.spawns.some(s => s.spawn_id === id)) {
+        next.delete(id);
+      }
+    }
+    this.telemetryBySpawnId = next;
+  }
+
+  async spawn(req: SpawnRequest): Promise<{ spawn_id: string; agent_id: string } | null> {
+    this.spawning = true;
+    this.error = null;
+    try {
+      const res = await adminFetch('/api/agent/spawn', {
+        method: 'POST',
+        requireToken: true,
+        action: 'Spawning an agent',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      await this.fetch();
+      return { spawn_id: data.spawn_id, agent_id: data.agent_id };
+    } catch (err) {
+      this.error = err instanceof Error ? err.message : String(err);
+      return null;
+    } finally {
+      this.spawning = false;
+    }
+  }
+
+  async stop(spawnId: string): Promise<boolean> {
+    this.error = null;
+    try {
+      const res = await adminFetch(`/api/agent/spawn/${spawnId}/stop`, {
+        method: 'POST',
+        requireToken: true,
+        action: 'Stopping a spawn',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await this.fetch();
+      return true;
+    } catch (err) {
+      this.error = err instanceof Error ? err.message : String(err);
+      return false;
+    }
+  }
+
+  async delete(spawnId: string): Promise<boolean> {
+    this.error = null;
+    try {
+      const res = await adminFetch(`/api/agent/spawn/${encodeURIComponent(spawnId)}`, {
+        method: 'DELETE',
+        requireToken: true,
+        action: 'Deleting a spawn',
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      await this.fetch();
+      return true;
+    } catch (err) {
+      this.error = err instanceof Error ? err.message : String(err);
+      return false;
+    }
+  }
+
+  async sendMessage(spawnId: string, message: string): Promise<boolean> {
+    this.error = null;
+    try {
+      const res = await adminFetch(`/api/agent/spawn/${encodeURIComponent(spawnId)}/message`, {
+        method: 'POST',
+        requireToken: true,
+        action: 'Sending a spawn follow-up',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: message }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      return true;
+    } catch (err) {
+      this.error = err instanceof Error ? err.message : String(err);
+      return false;
+    }
+  }
+
+  async interrupt(spawnId: string): Promise<boolean> {
+    this.error = null;
+    try {
+      const res = await adminFetch(`/api/agent/spawn/${encodeURIComponent(spawnId)}/interrupt`, {
+        method: 'POST',
+        requireToken: true,
+        action: 'Interrupting a spawn',
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      return true;
+    } catch (err) {
+      this.error = err instanceof Error ? err.message : String(err);
+      return false;
+    }
+  }
+
+  startPolling(intervalMs = 60000): void {
+    // Snapshot the config gate OUTSIDE the caller's tracking context.
+    // startPolling runs synchronously inside panel mount $effects; a tracked
+    // read of config/configLoading here re-runs the effect on every
+    // fetchConfig completion — and when /api/agent/spawn/config errors,
+    // config stays null so each re-run refires fetchConfig: an infinite
+    // refetch loop at network round-trip cadence.
+    const needsConfig = untrack(() => !this.config && !this.configLoading);
+    if (needsConfig) {
+      this.fetchConfig().catch(() => { /* best-effort */ });
+    }
+    this.fetch();
+    this.subscribeSSE();
+    if (this.poller.running) return;
+    this.poller.start(intervalMs);
+  }
+
+  stopPolling(): void {
+    this.poller.stop();
+    this.eventUnsubs.forEach(u => u());
+    this.eventUnsubs = [];
+  }
+
+  private subscribeSSE(): void {
+    if (this.eventUnsubs.length > 0) return;
+    const spawnEvents = [
+      'agent.spawn.building',
+      'agent.spawn.running',
+      'agent.spawn.completed',
+      'agent.spawn.failed',
+      'agent.spawn.stopped',
+    ];
+    for (const eventType of spawnEvents) {
+      this.eventUnsubs.push(
+        eventStore.on(eventType, () => {
+          // Coalesced: a spawn transitioning through building→running→completed
+          // fires three pushes in quick succession, and a fleet-wide rollout
+          // fires one set per spawn.
+          this.poller.refreshCoalesced();
+        })
+      );
+    }
+    this.eventUnsubs.push(
+      eventStore.on('agent.spawn.telemetry.delta', (event) => {
+        const data = event.data ?? {};
+        const spawnId = typeof data.spawn_id === 'string' ? data.spawn_id : '';
+        if (!spawnId) return;
+        const tokenUsage = (data.token_usage as Record<string, unknown> | undefined) ?? {};
+        const next = new Map(this.telemetryBySpawnId);
+        next.set(spawnId, {
+          turn_count: Number(data.turn_count ?? 0),
+          total_cost_usd: Number(data.total_cost_usd ?? 0),
+          cost_estimated: Boolean(data.cost_estimated),
+          token_usage: {
+            input_tokens: Number(tokenUsage.input_tokens ?? 0),
+            output_tokens: Number(tokenUsage.output_tokens ?? 0),
+            cache_creation_tokens: Number(tokenUsage.cache_creation_tokens ?? 0),
+            cache_read_tokens: Number(tokenUsage.cache_read_tokens ?? 0),
+          },
+          stop_reason: typeof data.stop_reason === 'string' ? data.stop_reason : undefined,
+          last_message: typeof data.last_message === 'string' ? data.last_message : undefined,
+        });
+        this.telemetryBySpawnId = next;
+      })
+    );
+
+    // Subscribe to spawn activity events for live feed.
+    const activityEvents = [
+      'agent.spawn.message', 'agent.spawn.thinking', 'agent.spawn.reasoning',
+      'agent.spawn.todo', 'agent.spawn.tool_start', 'agent.spawn.tool_complete',
+      'agent.spawn.file_change', 'agent.spawn.result', 'agent.spawn.rate_limit',
+    ];
+    for (const eventType of activityEvents) {
+      this.eventUnsubs.push(
+        eventStore.on(eventType, (event) => {
+          const data = event.data ?? {};
+          const spawnId = typeof data.spawn_id === 'string' ? data.spawn_id
+            : typeof data.agent_id === 'string' ? data.agent_id : '';
+          if (!spawnId) return;
+          // Resolve spawn by agent_id if spawn_id not directly in payload.
+          const resolvedId = this.spawnIdByKey.get(spawnId) ?? spawnId;
+          const next = new Map(this.activityBySpawnId);
+          // The array must get a NEW identity: ActivityTab chains
+          // `events = $derived(map.get(id))` into `reversed = $derived(...)`,
+          // and a derived that recomputes to the same reference does not
+          // propagate — an in-place push freezes the feed.
+          const list = [...(next.get(resolvedId) ?? [])];
+          list.push({
+            id: `${eventType}-${event.id || 'local'}-${++this.activitySeq}`,
+            type: eventType.replace('agent.spawn.', ''),
+            timestamp: event.timestamp || new Date().toISOString(),
+            data,
+          });
+          // Cap at max events.
+          if (list.length > SpawnStore.MAX_ACTIVITY_EVENTS) {
+            list.splice(0, list.length - SpawnStore.MAX_ACTIVITY_EVENTS);
+          }
+          next.set(resolvedId, list);
+          this.activityBySpawnId = next;
+        })
+      );
+    }
+  }
+}
+
+export const spawnStore = new SpawnStore();
+stalenessStore.register('spawn', () => spawnStore.isStale);

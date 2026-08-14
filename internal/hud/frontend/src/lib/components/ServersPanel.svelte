@@ -1,70 +1,51 @@
-<script>
-  import { healthStore } from '../stores/health.svelte.ts';
-  import StatusDot from '../widgets/StatusDot.svelte';
-  import SparkLine from '../widgets/SparkLine.svelte';
-  import Badge from '../widgets/Badge.svelte';
+<script lang="ts">
+  /**
+   * ServersPanel — composition shell for the Operations → Servers view.
+   * The header, table, infra cards, and drawer live in
+   * `lib/components/servers/*`; pure helpers + filter logic live in
+   * `lib/utils/serversHelpers.ts`. Filter/sort state moved into
+   * healthStore per the panel decomp contract
+   * (`docs/HUD_PANEL_DECOMP.md`).
+   */
+  import { healthStore, type MergedServer } from '../stores/health.svelte.ts';
+  import { rbacStore } from '../stores/rbac.svelte.ts';
+  import { daemonMetricsStore } from '../stores/daemonMetrics.svelte.ts';
+  import { otelStore } from '../stores/otel.svelte.ts';
   import FilterBar from './shared/FilterBar.svelte';
-  import DataTable from './shared/DataTable.svelte';
-  import DetailDrawer from './shared/DetailDrawer.svelte';
-  import EmptyState from './shared/EmptyState.svelte';
-  import { sanitizeText } from '../utils/format.ts';
+  import ErrorBanner from './shared/ErrorBanner.svelte';
+  import ServersHeader from './servers/ServersHeader.svelte';
+  import ServersTable from './servers/ServersTable.svelte';
+  import InfraCards from './servers/InfraCards.svelte';
+  import RbacOtelCards from './servers/RbacOtelCards.svelte';
+  import RequestMetricsCard from './servers/RequestMetricsCard.svelte';
+  import ServerDetail from './servers/ServerDetail.svelte';
+  import {
+    filterServers,
+    sortServers,
+    categoryOptionsFrom,
+  } from '../utils/serversHelpers';
 
-  $effect(() => {
-    healthStore.startPolling(5000);
-    return () => { healthStore.stopPolling(); };
-  });
+  const otelPollingOwner = Symbol('ServersPanel');
+
+  $effect(() => { rbacStore.startPolling(30000); return () => rbacStore.stopPolling(); });
+  $effect(() => { otelStore.startPolling(30000, otelPollingOwner); return () => otelStore.stopPolling(otelPollingOwner); });
+  $effect(() => { healthStore.startPolling(60000); return () => { healthStore.stopPolling(); }; });
+  $effect(() => { daemonMetricsStore.startPolling(15000); return () => daemonMetricsStore.stopPolling(); });
 
   let servers = $derived(healthStore.servers ?? []);
-
-  // --- Tunnel + Cache state ---
-  let tunnels = $state([]);
-  let cacheStats = $state(null);
-  let infraLoading = $state(false);
-
-  async function fetchInfraStats() {
-    infraLoading = true;
-    const [t, c] = await Promise.all([
-      healthStore.fetchTunnels(),
-      healthStore.fetchCacheStats(),
-    ]);
-    tunnels = t;
-    cacheStats = c;
-    infraLoading = false;
-  }
-
-  $effect(() => {
-    fetchInfraStats();
-    const timer = setInterval(fetchInfraStats, 30000);
-    return () => clearInterval(timer);
-  });
-
-  // --- Filters & Sort ---
-  let searchQuery = $state('');
-  let categoryFilter = $state('');
-  let statusFilter = $state('');
-  let sortKey = $state('name');
-  let sortDir = $state('asc');
-  let selectedServer = $state(null);
-
-  let categoryOptions = $derived.by(() => {
-    const cats = new Set();
-    servers.forEach(s => {
-      (s.categories ?? []).forEach(c => cats.add(c));
-    });
-    return Array.from(cats).sort().map(c => ({ value: c, label: c }));
-  });
+  let categoryOptions = $derived(categoryOptionsFrom(servers));
 
   let filterDefs = $derived([
     {
       key: 'category',
       label: 'All Categories',
-      value: categoryFilter,
+      value: healthStore.categoryFilter,
       options: categoryOptions,
     },
     {
       key: 'status',
       label: 'All Status',
-      value: statusFilter,
+      value: healthStore.statusFilter,
       options: [
         { value: 'healthy', label: 'Running' },
         { value: 'idle', label: 'Idle' },
@@ -74,147 +55,35 @@
     },
   ]);
 
-  function handleSearch(val) {
-    searchQuery = val;
+  let filtered = $derived(filterServers(servers, healthStore.searchQuery, healthStore.categoryFilter, healthStore.statusFilter));
+  let sorted = $derived(sortServers(filtered, healthStore.sortKey, healthStore.sortDir));
+
+  let selectedServer = $state<MergedServer | null>(null);
+
+  function handleSearch(val: string) { healthStore.setSearch(val); }
+  function handleFilter(key: string, val: string) {
+    if (key === 'category') healthStore.setCategoryFilter(val);
+    else if (key === 'status') healthStore.setStatusFilter(val);
   }
-
-  function handleFilter(key, val) {
-    if (key === 'category') categoryFilter = val;
-    else if (key === 'status') statusFilter = val;
-  }
-
-  function clearFilters() {
-    searchQuery = '';
-    categoryFilter = '';
-    statusFilter = '';
-  }
-
-  let hasActiveFilters = $derived(
-    searchQuery.trim() !== '' || categoryFilter !== '' || statusFilter !== ''
-  );
-
-  let healthyCt = $derived(servers.filter(s => s.status === 'healthy').length);
-  let idleCt = $derived(servers.filter(s => s.status === 'idle').length);
-  let degradedCt = $derived(servers.filter(s => s.status === 'degraded').length);
-  let downCt = $derived(servers.filter(s => s.status === 'down').length);
-  let totalTools = $derived(servers.reduce((sum, s) => sum + (s.tool_count ?? 0), 0));
-
-  let filtered = $derived.by(() => {
-    let result = servers;
-
-    if (searchQuery.trim()) {
-      const q = sanitizeText(searchQuery).toLowerCase();
-      result = result.filter(s =>
-        sanitizeText(s.name ?? '').toLowerCase().includes(q) ||
-        sanitizeText(s.description ?? '').toLowerCase().includes(q)
-      );
-    }
-
-    if (categoryFilter) {
-      result = result.filter(s => (s.categories ?? []).includes(categoryFilter));
-    }
-
-    if (statusFilter) {
-      result = result.filter(s => s.status === statusFilter);
-    }
-
-    return result;
-  });
-
-  // Sorted rows for DataTable
-  const STATUS_SORT_ORDER = { healthy: 0, idle: 1, degraded: 2, down: 3 };
-
-  let sorted = $derived.by(() => {
-    const rows = [...filtered];
-    rows.sort((a, b) => {
-      let av, bv;
-      if (sortKey === 'status') {
-        av = STATUS_SORT_ORDER[a.status] ?? 9;
-        bv = STATUS_SORT_ORDER[b.status] ?? 9;
-      } else {
-        const rawA = a[sortKey];
-        const rawB = b[sortKey];
-        av = typeof rawA === 'string' ? sanitizeText(rawA) : (rawA ?? '');
-        bv = typeof rawB === 'string' ? sanitizeText(rawB) : (rawB ?? '');
-      }
-      let cmp;
-      if (typeof av === 'number' && typeof bv === 'number') {
-        cmp = av - bv;
-      } else {
-        cmp = String(av).toLowerCase().localeCompare(String(bv).toLowerCase());
-      }
-      return sortDir === 'desc' ? -cmp : cmp;
-    });
-    return rows;
-  });
-
-  function handleSort(key, dir) {
-    sortKey = key;
-    sortDir = dir;
-  }
-
-  // DataTable column definitions
-  const columns = [
-    { key: 'name', label: 'Server', sortable: true, width: '140px' },
-    { key: 'status', label: 'Status', sortable: true, width: '80px' },
-    { key: 'latency', label: 'Latency', sortable: true, width: '80px' },
-    { key: 'tool_count', label: 'Tools', sortable: true, width: '60px' },
-    { key: 'target', label: 'Target', width: '180px' },
-    { key: 'sparkline', label: 'Sparkline', width: '130px' },
-  ];
-
-  function selectServer(server) {
+  function selectServer(server: MergedServer) {
     selectedServer = selectedServer?.name === server.name ? null : server;
-  }
-
-  function formatLatency(ms) {
-    if (ms == null) return '---';
-    if (ms < 1) return '<1ms';
-    return ms.toFixed(0) + 'ms';
-  }
-
-  function tunnelStateVariant(state) {
-    if (state === 'connected') return 'success';
-    if (state === 'connecting' || state === 'reconnecting') return 'warning';
-    return 'error';
   }
 </script>
 
 <div class="panel servers-panel">
-  <!-- Header bar -->
-  <div class="header-bar">
-    <div class="header-stats">
-      <span class="header-total text-mono">{servers.length} servers</span>
-      <span class="header-stat healthy-stat">
-        <span class="dot dot-healthy"></span>
-        {healthyCt} running
-      </span>
-      <span class="header-stat idle-stat">
-        <span class="dot dot-idle"></span>
-        {idleCt} idle
-      </span>
-      {#if degradedCt > 0}
-        <span class="header-stat degraded-stat">
-          <span class="dot dot-degraded"></span>
-          {degradedCt} degraded
-        </span>
-      {/if}
-      {#if downCt > 0}
-        <span class="header-stat down-stat">
-          <span class="dot dot-down"></span>
-          {downCt} down
-        </span>
-      {/if}
-      <span class="header-stat tools-stat">
-        <span class="tools-icon">{'\u2699'}</span>
-        {totalTools} tools
-      </span>
-    </div>
-  </div>
+  <ServersHeader />
 
-  <!-- Filter row (shared component) -->
+  {#if healthStore.error && healthStore.lastUpdated}
+    <!-- Refresh failure with servers already on screen: the health poll fell
+         over but the last-known table stays visible, so flag it as stale
+         rather than silently serving old data. A cold-start failure (no
+         lastUpdated) surfaces inside ServersTable instead of an endless
+         skeleton. -->
+    <ErrorBanner prefix="Server health refresh failed" message={healthStore.error} />
+  {/if}
+
   <FilterBar
-    search={searchQuery}
+    search={healthStore.searchQuery}
     placeholder="Search servers..."
     filters={filterDefs}
     resultCount={filtered.length}
@@ -222,198 +91,18 @@
     onFilter={handleFilter}
   />
 
-  <!-- Sortable table -->
-  <div class="table-container">
-    {#if filtered.length === 0 && healthStore.lastUpdated}
-      <EmptyState
-        icon={'\u2665'}
-        heading="No servers match filters"
-        description="Try adjusting your search or filter criteria."
-        compact
-      >
-        {#snippet action()}
-          {#if hasActiveFilters}
-            <button class="btn btn-ghost" onclick={clearFilters}>Clear filters</button>
-          {/if}
-        {/snippet}
-      </EmptyState>
-    {:else}
-      <DataTable
-        {columns}
-        rows={sorted}
-        {sortKey}
-        {sortDir}
-        stableLayout={true}
-        loading={!healthStore.lastUpdated}
-        skeletonRows={5}
-        idKey="name"
-        onSort={handleSort}
-        onRowClick={selectServer}
-      >
-        {#snippet row({ row: server })}
-          <td class="text-mono server-name" title={sanitizeText(server.name)}>{sanitizeText(server.name)}</td>
-          <td>
-            <StatusDot status={server.status ?? 'unknown'} />
-          </td>
-          <td class="text-mono">{#key server.latency}<span class="data-updated">{formatLatency(server.latency)}</span>{/key}</td>
-          <td class="text-mono">{server.tool_count ?? 0}</td>
-          <td class="text-mono text-muted target-cell" title={sanitizeText(server.target ?? '---')}>
-            {sanitizeText(server.target ?? '---')}
-          </td>
-          <td class="sparkline-cell">
-            {#if server.latencyHistory?.length}
-              <SparkLine
-                data={server.latencyHistory}
-                width={120}
-                height={24}
-                color={server.status === 'healthy' ? 'var(--success)' : server.status === 'degraded' ? 'var(--warning)' : 'var(--error)'}
-              />
-            {:else}
-              <span class="text-muted text-xs">no data</span>
-            {/if}
-          </td>
-        {/snippet}
-      </DataTable>
-    {/if}
+  <div class="servers-layout">
+    <ServersTable rows={sorted} onSelect={selectServer} />
+
+    <aside class="servers-rail">
+      <InfraCards />
+      <RbacOtelCards />
+      <RequestMetricsCard />
+    </aside>
   </div>
-
-  <!-- Infrastructure cards row: Tunnels + Cache -->
-  <div class="infra-cards">
-    <!-- Tunnels Card -->
-    <div class="infra-card">
-      <div class="infra-card-header">
-        <span class="infra-card-title">SSH Tunnels</span>
-        {#if tunnels.length > 0}
-          <Badge text="{tunnels.length} active" variant="info" />
-        {:else}
-          <Badge text="none" variant="info" />
-        {/if}
-      </div>
-      <div class="infra-card-body">
-        {#if tunnels.length > 0}
-          <div class="tunnel-list">
-            {#each tunnels as tunnel}
-              <div class="tunnel-row">
-                <StatusDot status={tunnel.state === 'connected' ? 'healthy' : tunnel.state === 'connecting' ? 'degraded' : 'down'} />
-                <span class="text-mono tunnel-name">{tunnel.name}</span>
-                <span class="text-muted text-xs">{tunnel.remote_host}</span>
-                <Badge text={tunnel.state} variant={tunnelStateVariant(tunnel.state)} />
-                {#if tunnel.uptime}
-                  <span class="text-muted text-xs">up {tunnel.uptime}</span>
-                {/if}
-                {#if tunnel.reconnects > 0}
-                  <span class="text-xs reconnect-count">{'\u21BB'} {tunnel.reconnects}</span>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        {:else}
-          <span class="text-muted text-xs">No active tunnels</span>
-        {/if}
-      </div>
-    </div>
-
-    <!-- Cache Stats Card -->
-    <div class="infra-card">
-      <div class="infra-card-header">
-        <span class="infra-card-title">Response Cache</span>
-        {#if cacheStats}
-          <Badge text="{cacheStats.entries} entries" variant="info" />
-        {/if}
-      </div>
-      <div class="infra-card-body">
-        {#if cacheStats}
-          <div class="cache-grid">
-            <div class="cache-stat">
-              <span class="cache-stat-value text-mono">{cacheStats.entries}</span>
-              <span class="cache-stat-label">Entries</span>
-            </div>
-            {#if cacheStats.size}
-              <div class="cache-stat">
-                <span class="cache-stat-value text-mono">{cacheStats.size}</span>
-                <span class="cache-stat-label">Size</span>
-              </div>
-            {/if}
-            <div class="cache-stat">
-              <span class="cache-stat-value text-mono" style:color={cacheStats.hit_rate > 0.5 ? 'var(--success)' : 'var(--fg-secondary)'}>{(cacheStats.hit_rate * 100).toFixed(1)}%</span>
-              <span class="cache-stat-label">Hit Rate</span>
-            </div>
-          </div>
-        {:else if infraLoading}
-          <span class="text-muted text-xs">Loading...</span>
-        {:else}
-          <span class="text-muted text-xs">Unavailable</span>
-        {/if}
-      </div>
-    </div>
-  </div>
-
-
 </div>
 
-<!-- Server Detail Drawer -->
-<DetailDrawer
-  open={!!selectedServer}
-  title={sanitizeText(selectedServer?.name ?? '')}
-  subtitle={sanitizeText(selectedServer?.target ?? '')}
-  onClose={() => { selectedServer = null; }}
->
-  {#snippet header()}
-    {#if selectedServer}
-      <div class="detail-stats">
-        <div class="stat-chip">
-          <StatusDot status={selectedServer.status ?? 'unknown'} />
-          <span class="stat-chip-label">{selectedServer.status ?? 'unknown'}</span>
-        </div>
-        <div class="stat-chip">
-          <span class="stat-chip-value">{selectedServer.tool_count ?? 0}</span>
-          <span class="stat-chip-label">tools</span>
-        </div>
-        {#if selectedServer.latency != null}
-          <div class="stat-chip">
-            <span class="stat-chip-value">{formatLatency(selectedServer.latency)}</span>
-            <span class="stat-chip-label">latency</span>
-          </div>
-        {/if}
-      </div>
-    {/if}
-  {/snippet}
-
-  {#if selectedServer}
-    {#if selectedServer.description}
-      <div class="section">
-        <div class="section-title text-xs uppercase text-muted">Description</div>
-        <p class="text-sm text-secondary">{sanitizeText(selectedServer.description)}</p>
-      </div>
-    {/if}
-    {#if selectedServer.categories?.length}
-      <div class="section">
-        <div class="section-title text-xs uppercase text-muted">Categories</div>
-        <div class="detail-cats">
-          {#each selectedServer.categories as cat}
-            <span class="cat-chip">{sanitizeText(cat)}</span>
-          {/each}
-        </div>
-      </div>
-    {/if}
-    {#if selectedServer.latencyHistory?.length}
-      <div class="section">
-        <div class="section-title text-xs uppercase text-muted">Latency History</div>
-        <SparkLine
-          data={selectedServer.latencyHistory}
-          width={340}
-          height={60}
-          color={selectedServer.status === 'healthy' ? 'var(--success)' : 'var(--warning)'}
-        />
-      </div>
-    {/if}
-    {#if selectedServer.error_message}
-      <div class="detail-error">
-        <span class="error-label">ERROR:</span> {sanitizeText(selectedServer.error_message)}
-      </div>
-    {/if}
-  {/if}
-</DetailDrawer>
+<ServerDetail server={selectedServer} onClose={() => { selectedServer = null; }} />
 
 <style>
   .servers-panel {
@@ -422,191 +111,25 @@
     overflow: hidden;
   }
 
-  .header-bar {
-    padding: 8px 0;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 0;
-  }
-
-  .header-stats {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    font-size: 12px;
-  }
-
-  .header-total {
-    font-weight: 600;
-    color: var(--fg-primary);
-  }
-
-  .header-stat {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--fg-secondary);
-  }
-
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-  }
-
-  .dot-healthy { background: var(--success); }
-  .dot-idle { background: var(--fg-muted); }
-  .dot-degraded { background: var(--warning); }
-  .dot-down { background: var(--error); }
-
-  .tools-icon {
-    font-size: 11px;
-  }
-
-  .table-container {
+  .servers-layout {
     flex: 1;
-    overflow-y: auto;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-  }
-
-  .server-name {
-    color: var(--fg-primary);
-    font-weight: 500;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .target-cell {
-    max-width: 200px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .sparkline-cell {
-    width: 130px;
-    padding: 4px 10px;
-    display: flex;
-    align-items: center;
-    justify-content: flex-start;
-    min-height: 24px;
-  }
-
-  /* --- Infrastructure Cards --- */
-
-  .infra-cards {
+    min-height: 0;
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    margin-top: 12px;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    gap: var(--space-3);
   }
 
-  .infra-card {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-    padding: 12px 16px;
-  }
-
-  .infra-card-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 8px;
-  }
-
-  .infra-card-title {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--fg-muted);
-  }
-
-  .infra-card-body {
-    font-size: 12px;
-  }
-
-  .tunnel-list {
+  .servers-rail {
+    min-height: 0;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: var(--space-3);
   }
 
-  .tunnel-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .tunnel-name {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--fg-primary);
-  }
-
-  .reconnect-count {
-    color: var(--warning);
-    font-family: var(--font-mono);
-  }
-
-  .cache-grid {
-    display: flex;
-    gap: 24px;
-  }
-
-  .cache-stat {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-  }
-
-  .cache-stat-value {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--fg-primary);
-  }
-
-  .cache-stat-label {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    color: var(--fg-muted);
-  }
-
-  /* --- Detail Drawer (shared classes in theme.css) --- */
-
-  .detail-cats {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    margin-bottom: 6px;
-  }
-
-  .cat-chip {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    padding: 2px 6px;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-sm);
-    color: var(--fg-secondary);
-  }
-
-  .detail-error {
-    color: var(--error);
-    margin-top: 6px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    padding: 6px 8px;
-    background: rgba(230, 30, 63, 0.08);
-    border-radius: var(--radius-sm);
-    border: 1px solid rgba(230, 30, 63, 0.2);
-  }
-
-  .error-label {
-    font-weight: 700;
+  @media (max-width: 1280px) {
+    .servers-layout {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

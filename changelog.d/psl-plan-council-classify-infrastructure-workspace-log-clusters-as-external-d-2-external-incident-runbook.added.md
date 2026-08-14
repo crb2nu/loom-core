@@ -1,0 +1,1 @@
+- Document every infrastructure workspace-signal classifier rule and enforce runbook synchronization in `docs/runbook-external-dependency-incidents.md` and `pkg/mills/council/workspace_signal_classifier_test.go`.

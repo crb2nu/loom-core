@@ -1,0 +1,1 @@
+- Bound plan→repo bootstrap failures with durable per-target retry accounting, immediate terminal classification for GitLab configuration errors, and an atomic `queued` → `escalated` handoff when repair requires an operator.

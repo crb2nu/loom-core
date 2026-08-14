@@ -7,13 +7,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-
-	"gitlab.flexinfer.ai/libs/mcp-go"
+	"strings"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
-	"github.com/crb2nu/loom/pkg/mcplog"
-	"github.com/crb2nu/loom/pkg/mcpotel"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 )
 
 var version = "0.2.0"
@@ -26,16 +25,20 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
-
-	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-devbox", logger)
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-devbox", version,
+		mcpscaffold.WithInstructions("Project-aware dev sandbox executor. Builds isolated containers with auto-detected runtimes and deps. "+
+			"Tools: devbox_exec, devbox_build, devbox_status, devbox_stop, devbox_detect, "+
+			"devbox_read_file, devbox_write_file, devbox_exec_async, devbox_exec_poll, "+
+			"devbox_metrics, devbox_summary"),
+	)
 	if err != nil {
-		logger.Warn("OTel tracer init failed", "error", err)
+		return err
 	}
-	defer func() { _ = shutdownTracer(ctx) }()
-	tracer := mcpotel.Tracer(tp, "mcp-devbox")
+	defer func() { _ = cleanup(ctx) }()
 
-	logger.Info("starting server", "name", "mcp-devbox", "version", version)
+	logger := srv.Logger
+	logger.Info("starting server", "name", "mcp-devbox", "version", version,
+		"backend", env.String("DEVBOX_BACKEND", "docker"))
 
 	workspaceRoot := env.String("DEVBOX_WORKSPACE_ROOT", "")
 	if workspaceRoot == "" {
@@ -49,26 +52,114 @@ func run(ctx context.Context) error {
 		cacheDir = home + "/.cache/loom/devbox"
 	}
 
+	backendType := env.String("DEVBOX_BACKEND", "docker")
+
+	// K8s backend defaults to 2h idle timeout (sleeping pods are nearly free).
+	defaultIdleTimeout := 30 * 60 * time.Second // 30m for Docker
+	if backendType == "k8s" || backendType == "kubernetes" {
+		defaultIdleTimeout = 2 * time.Hour
+	}
+
+	// Sync mode: tar-pipe (default for local), git-clone, nfs.
+	// Auto-detect: if workspace root exists on disk, default to tar-pipe (local mode).
+	// Otherwise default to git-clone (hub/remote mode).
+	syncMode := env.String("DEVBOX_SYNC_MODE", "")
+	if syncMode == "" {
+		if _, err := os.Stat(workspaceRoot); err == nil {
+			syncMode = "tar-pipe"
+		} else {
+			syncMode = "git-clone"
+		}
+	}
+
+	// Parse extra sync excludes from comma-separated env var.
+	var syncExcludes []string
+	if se := env.String("DEVBOX_SYNC_EXCLUDES", ""); se != "" {
+		for _, e := range strings.Split(se, ",") {
+			e = strings.TrimSpace(e)
+			if e != "" {
+				syncExcludes = append(syncExcludes, e)
+			}
+		}
+	}
+
+	maxSyncSizeMB := env.Int("DEVBOX_MAX_SYNC_SIZE_MB", 200)
+
+	// NFS cache flush: only for NFS sync mode.
+	isK8s := backendType == "k8s" || backendType == "kubernetes"
+	nfsFlush := env.Bool("DEVBOX_NFS_FLUSH", isK8s && syncMode == "nfs")
+
+	// Parse warm projects from comma-separated env var
+	var warmProjects []string
+	if wp := env.String("DEVBOX_WARM_PROJECTS", ""); wp != "" {
+		for _, p := range strings.Split(wp, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				warmProjects = append(warmProjects, p)
+			}
+		}
+	}
+
+	logger.Info("workspace sync", "mode", syncMode, "workspace", workspaceRoot)
+
 	mgr, err := newManager(ctx, logger, managerConfig{
-		workspaceRoot:      workspaceRoot,
-		cacheDir:           cacheDir,
-		backendType:        env.String("DEVBOX_BACKEND", "docker"),
-		registry:           env.String("DEVBOX_REGISTRY", "registry.harbor.lan"),
-		imagePrefix:        env.String("DEVBOX_IMAGE_PREFIX", "mcp/devbox"),
-		maxTailLines:       env.Int("DEVBOX_MAX_TAIL_LINES", 20),
-		idleTimeout:        env.Duration("DEVBOX_IDLE_TIMEOUT", 30*60*1e9), // 30m
-		defaultCPU:         env.Float("DEVBOX_DEFAULT_CPU", 0.5),
-		defaultMemMB:       env.Int("DEVBOX_DEFAULT_MEMORY_MB", 512),
-		kubeconfig:         env.String("DEVBOX_KUBECONFIG", ""),
-		k8sNamespace:       env.String("DEVBOX_K8S_NAMESPACE", "devbox"),
-		storageClass:       env.String("DEVBOX_K8S_STORAGE_CLASS", "longhorn"),
-		k8sWorkspacePVC:    env.String("DEVBOX_K8S_WORKSPACE_PVC", "devbox-workspace-nfs"),
-		k8sImagePullSecret: env.String("DEVBOX_K8S_IMAGE_PULL_SECRET", "harbor-creds"),
-		builderImage:       builderImage(),
+		workspaceRoot:                workspaceRoot,
+		cacheDir:                     cacheDir,
+		backendType:                  backendType,
+		registry:                     env.String("DEVBOX_REGISTRY", "registry.harbor.lan"),
+		imagePrefix:                  env.String("DEVBOX_IMAGE_PREFIX", "mcp/devbox"),
+		maxTailLines:                 env.Int("DEVBOX_MAX_TAIL_LINES", 20),
+		idleTimeout:                  env.Duration("DEVBOX_IDLE_TIMEOUT", defaultIdleTimeout),
+		defaultCPU:                   env.Float("DEVBOX_DEFAULT_CPU", 0.5),
+		defaultMemMB:                 env.Int("DEVBOX_DEFAULT_MEMORY_MB", 2048),
+		kubeconfig:                   env.String("DEVBOX_KUBECONFIG", ""),
+		k8sNamespace:                 env.String("DEVBOX_K8S_NAMESPACE", "devbox"),
+		storageClass:                 env.String("DEVBOX_K8S_STORAGE_CLASS", "longhorn"),
+		k8sWorkspacePVC:              env.String("DEVBOX_K8S_WORKSPACE_PVC", "devbox-workspace-nfs"),
+		k8sImagePullSecret:           env.String("DEVBOX_K8S_IMAGE_PULL_SECRET", "harbor-creds"),
+		builderImage:                 builderImage(),
+		gitCloneImage:                env.String("DEVBOX_K8S_GIT_CLONE_IMAGE", ""),
+		buildCPURequest:              env.String("DEVBOX_K8S_BUILD_CPU_REQUEST", ""),
+		buildCPULimit:                env.String("DEVBOX_K8S_BUILD_CPU_LIMIT", ""),
+		buildMemoryRequest:           env.String("DEVBOX_K8S_BUILD_MEMORY_REQUEST", ""),
+		buildMemoryLimit:             env.String("DEVBOX_K8S_BUILD_MEMORY_LIMIT", ""),
+		buildEphemeralStorageRequest: env.String("DEVBOX_K8S_BUILD_EPHEMERAL_STORAGE_REQUEST", ""),
+		buildEphemeralStorageLimit:   env.String("DEVBOX_K8S_BUILD_EPHEMERAL_STORAGE_LIMIT", ""),
+		buildAvoidNodes:              env.String("DEVBOX_K8S_BUILD_AVOID_NODES", ""),
+		maxConcurrentBuilds:          env.Int("DEVBOX_K8S_MAX_CONCURRENT_BUILDS", 1),
+		gitCloneMemoryRequest:        env.String("DEVBOX_K8S_GIT_CLONE_MEMORY_REQUEST", ""),
+		gitCloneMemoryLimit:          env.String("DEVBOX_K8S_GIT_CLONE_MEMORY_LIMIT", ""),
+		nfsFlush:                     nfsFlush,
+		gitBaseURL:                   env.String("DEVBOX_K8S_GIT_BASE_URL", ""),
+		gitSecret:                    env.String("DEVBOX_K8S_GIT_SECRET", ""),
+		syncMode:                     syncMode,
+		syncExcludes:                 syncExcludes,
+		maxSyncSize:                  int64(maxSyncSizeMB) * 1024 * 1024,
+		warmProjects:                 warmProjects,
+		harvesterKubeconfig:          env.String("DEVBOX_HARVESTER_KUBECONFIG", ""),
+		harvesterBaseImage:           env.String("DEVBOX_HARVESTER_BASE_IMAGE", ""),
+		harvesterNamespace:           env.String("DEVBOX_HARVESTER_NAMESPACE", "default"),
+		harvesterStorageClass:        env.String("DEVBOX_HARVESTER_STORAGE_CLASS", ""),
+		harvesterNetworkAttachDef:    env.String("DEVBOX_HARVESTER_NETWORK_ATTACH_DEF", "default/lan10g"),
+		harvesterDefaultVCPUs:        env.Int("DEVBOX_HARVESTER_DEFAULT_VCPUS", 2),
+		harvesterDefaultMemMi:        env.Int("DEVBOX_HARVESTER_DEFAULT_MEM_MI", 4096),
+		harvesterDefaultDiskGi:       env.Int("DEVBOX_HARVESTER_DEFAULT_DISK_GI", 20),
+		// Empty default on purpose: NewHarvesterVMBackend applies the canonical
+		// "agent" user (backend.defaultHarvesterSSHUser) when SSHUser is unset.
+		// Slice 2d.5c moved the VM's cloud-init login + auth-file home to the
+		// uid-1000 "agent" user for home-parity with the K8s spawn pod; the old
+		// hardcoded "ubuntu" fallback here made devbox-launched harvester-vm
+		// sandboxes SSH as the wrong user, so mounted agent auth files
+		// (~/.codex/auth.json etc.) would not resolve. Let the backend be the
+		// single source of truth, matching the operator/HUD spawn path.
+		harvesterSSHUser: env.String("DEVBOX_HARVESTER_SSH_USER", ""),
 	})
 	if err != nil {
 		return fmt.Errorf("init manager: %w", err)
 	}
+
+	// Set startup time for uptime tracking.
+	mgr.startedAt = time.Now()
 
 	// Initialize metrics
 	mgr.metrics = newMetrics()
@@ -80,21 +171,24 @@ func run(ctx context.Context) error {
 	mgr.asyncExecs = newAsyncRegistry()
 	go mgr.asyncExecs.cleanupLoop(ctx)
 
-	server := mcp.NewServer("mcp-devbox", version)
-	server.SetInstructions("Project-aware dev sandbox executor. Builds isolated containers with auto-detected runtimes and deps. " +
-		"Tools: devbox_exec, devbox_build, devbox_status, devbox_stop, devbox_detect, " +
-		"devbox_read_file, devbox_write_file, devbox_exec_async, devbox_exec_poll, " +
-		"devbox_metrics, devbox_summary")
+	registerTools(srv.Server, mgr, srv.Tracer)
 
-	registerTools(server, mgr, tracer)
+	// Reconcile stale state entries (pods evicted, node reboots)
+	mgr.reconcileState(ctx)
 
 	// Start idle reaper
 	go mgr.reapLoop(ctx)
 
+	// Start warm pool if configured
+	if len(mgr.cfg.warmProjects) > 0 {
+		logger.Info("warm pool enabled", "projects", mgr.cfg.warmProjects)
+		go mgr.warmPool(ctx)
+	}
+
 	// Cleanup on shutdown
 	defer mgr.shutdownAll(context.Background())
 
-	return server.Run(ctx)
+	return srv.Run(ctx)
 }
 
 // builderImage returns the builder image, checking DEVBOX_BUILDER_IMAGE first,

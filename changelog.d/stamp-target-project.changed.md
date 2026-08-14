@@ -1,0 +1,1 @@
+- Require durable cross-repository stamps to carry normalized target projects and route their GitLab operations through project-scoped clients (`pkg/mills/crossrepo`, `pkg/mills/store`, and `pkg/mills/clients`).

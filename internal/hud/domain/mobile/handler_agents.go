@@ -1,0 +1,854 @@
+package mobile
+
+import (
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/crb2nu/loom/internal/hud/bridge"
+	"github.com/crb2nu/loom/internal/hud/fleetview"
+	"github.com/crb2nu/loom/internal/hud/monitor"
+	"github.com/crb2nu/loom/internal/visibility/contracts/presence"
+	"github.com/crb2nu/loom/pkg/projectmeta"
+)
+
+func (d *MobileDomain) handleMobilePresence(w http.ResponseWriter, r *http.Request) {
+	if !d.requireMobileScope(w, r, ScopeRead) {
+		return
+	}
+
+	snap := monitor.FleetSnapshot{}
+	if fleet := d.deps.Monitors().Fleet; fleet != nil {
+		snap = fleet.Snapshot()
+	}
+	limit := parseMobileLimit(r, DefaultLimit, MaxLimit)
+	statusFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+	agentFilter := strings.TrimSpace(r.URL.Query().Get("agent_id"))
+
+	agents := make([]presence.PresenceInfo, 0, len(snap.Agents))
+	for _, agent := range snap.Agents {
+		status := normalizeMobilePresenceStatus(agent.Status)
+		if statusFilter != "" && status != statusFilter {
+			continue
+		}
+		if agentFilter != "" && !strings.EqualFold(agent.AgentID, agentFilter) {
+			continue
+		}
+		agent.Status = status
+		agents = append(agents, agent)
+	}
+	sortSliceStable(agents, func(i, j int) bool {
+		ti := parseMobileTime(agents[i].LastHeartbeat)
+		tj := parseMobileTime(agents[j].LastHeartbeat)
+		if ti.Equal(tj) {
+			return agents[i].AgentID < agents[j].AgentID
+		}
+		return ti.After(tj)
+	})
+	if len(agents) > limit {
+		agents = agents[:limit]
+	}
+
+	claims := make([]bridge.FileClaimInfo, 0, len(snap.FileClaims))
+	for _, claim := range snap.FileClaims {
+		if agentFilter != "" && !strings.EqualFold(claim.AgentID, agentFilter) {
+			continue
+		}
+		claims = append(claims, claim)
+	}
+	sortSliceStable(claims, func(i, j int) bool {
+		ti := parseMobileTime(claims[i].CreatedAt)
+		tj := parseMobileTime(claims[j].CreatedAt)
+		if ti.Equal(tj) {
+			return claims[i].ID < claims[j].ID
+		}
+		return ti.After(tj)
+	})
+	if len(claims) > limit {
+		claims = claims[:limit]
+	}
+
+	worktrees := make([]bridge.WorktreeInfo, 0, len(snap.Worktrees))
+	for _, wt := range snap.Worktrees {
+		if agentFilter != "" && !strings.EqualFold(wt.AgentID, agentFilter) {
+			continue
+		}
+		worktrees = append(worktrees, wt)
+	}
+	sortSliceStable(worktrees, func(i, j int) bool {
+		ti := parseMobileTime(worktrees[i].CreatedAt)
+		tj := parseMobileTime(worktrees[j].CreatedAt)
+		if ti.Equal(tj) {
+			return worktrees[i].AssignmentID < worktrees[j].AssignmentID
+		}
+		return ti.After(tj)
+	})
+	if len(worktrees) > limit {
+		worktrees = worktrees[:limit]
+	}
+
+	summary := presenceSummary{
+		TotalAgents:   len(agents),
+		ClaimCount:    len(claims),
+		WorktreeCount: len(worktrees),
+	}
+	for _, agent := range agents {
+		switch agent.Status {
+		case "active":
+			summary.ActiveAgents++
+		case "idle":
+			summary.IdleAgents++
+		case "offline":
+			summary.OfflineAgents++
+		}
+	}
+
+	var spawns any = snap.Spawns
+	if snap.Spawns == nil {
+		spawns = []struct{}{}
+	}
+
+	d.writeMobileJSON(w, http.StatusOK, map[string]any{
+		"agents":    agents,
+		"claims":    claims,
+		"worktrees": worktrees,
+		"spawns":    spawns,
+		"summary":   summary,
+		"coordination": map[string]any{
+			"summary":          snap.Coordination.Summary,
+			"attention_agents": limitMobileSlice(filterMobileCoordinationAgents(snap.Coordination.Agents, agentFilter, statusFilter), 8),
+			"relations":        limitMobileSlice(filterMobileRelations(snap.Coordination.Relations, agentFilter), 10),
+		},
+	})
+}
+
+func (d *MobileDomain) handleMobileNamespaces(w http.ResponseWriter, r *http.Request) {
+	if !d.requireMobileScope(w, r, ScopeRead) {
+		return
+	}
+
+	snap := monitor.FleetSnapshot{}
+	if fleet := d.deps.Monitors().Fleet; fleet != nil {
+		snap = fleet.Snapshot()
+	}
+
+	// Build agent status lookup from presence data.
+	agentActive := map[string]bool{}
+	for _, pa := range snap.Agents {
+		agentActive[pa.AgentID] = normalizeMobilePresenceStatus(pa.Status) == "active"
+	}
+
+	type nsData struct {
+		sessions int
+		agents   map[string]bool // agentID -> isActive
+	}
+	nsMap := map[string]*nsData{}
+
+	for _, sess := range snap.Sessions {
+		if sess.Namespace == "" {
+			continue
+		}
+		data, ok := nsMap[sess.Namespace]
+		if !ok {
+			data = &nsData{agents: map[string]bool{}}
+			nsMap[sess.Namespace] = data
+		}
+		data.sessions++
+		isActive := agentActive[sess.AgentID]
+		if prev, seen := data.agents[sess.AgentID]; !seen || (!prev && isActive) {
+			data.agents[sess.AgentID] = isActive
+		}
+	}
+
+	results := make([]namespaceSummary, 0, len(nsMap))
+	for ns, data := range nsMap {
+		active := 0
+		for _, a := range data.agents {
+			if a {
+				active++
+			}
+		}
+		results = append(results, namespaceSummary{
+			Namespace:    ns,
+			SessionCount: data.sessions,
+			AgentCount:   len(data.agents),
+			ActiveAgents: active,
+		})
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].ActiveAgents != results[j].ActiveAgents {
+			return results[i].ActiveAgents > results[j].ActiveAgents
+		}
+		if results[i].SessionCount != results[j].SessionCount {
+			return results[i].SessionCount > results[j].SessionCount
+		}
+		return results[i].Namespace < results[j].Namespace
+	})
+
+	d.writeMobileJSON(w, http.StatusOK, map[string]any{
+		"namespaces": results,
+	})
+}
+
+func (d *MobileDomain) handleMobileAgents(w http.ResponseWriter, r *http.Request) {
+	if !d.requireMobileScope(w, r, ScopeRead) {
+		return
+	}
+
+	snap := monitor.FleetSnapshot{}
+	if fleet := d.deps.Monitors().Fleet; fleet != nil {
+		snap = fleet.Snapshot()
+	}
+	limit := parseMobileLimit(r, DefaultLimit, MaxLimit)
+	statusFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+	typeFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("type")))
+
+	agentMap := make(map[string]*unifiedAgent)
+
+	// Re-run the canonical join so we get the same HasSession / SessionID /
+	// synthetic "session-only" rows regardless of whether the snapshot came
+	// from a live FleetMonitor (where Join is already applied) or from a
+	// hand-built test fixture. Join is idempotent on already-joined input —
+	// it resets session-derived fields and re-correlates from snap.Sessions.
+	// SessionEvidence carries the monitor's orphan-grace verdicts through
+	// this re-join: without it, the RegisteredAt-anchored orphan clock would
+	// re-flag the transient sessionless flap the monitor just suppressed.
+	joined := fleetview.JoinOpts(snap.Agents, snap.Sessions, snap.UpdatedAt, fleetview.JoinOptions{
+		LastSessionSeen: fleetview.SessionEvidence(snap.Agents, snap.UpdatedAt),
+	})
+
+	// Look up session-local details (namespace, entry count, tokens) that
+	// are not carried on PresenceInfo.
+	sessionByID := make(map[string]bridge.SessionInfo, len(snap.Sessions))
+	for _, sess := range snap.Sessions {
+		if sess.ID != "" {
+			sessionByID[sess.ID] = sess
+		}
+	}
+
+	taskFeed := buildMobileTaskFeed(snap.Tasks, snap)
+	taskHints := buildMobileAgentHintsFromTasks(taskFeed)
+	worktreeHints := buildMobileAgentHintsFromWorktrees(snap.Worktrees)
+	claimHints := buildMobileAgentHintsFromClaims(snap.FileClaims)
+
+	for _, pa := range joined {
+		status := normalizeMobilePresenceStatus(pa.Status)
+		agentType := pa.AgentType
+		if agentType == "" || agentType == "unknown" {
+			agentType = inferAgentType(pa.AgentID)
+		}
+		source := pa.Source
+		if source == "" {
+			source = "presence"
+		}
+		// Mobile clients (iOS) expect "session_only" for synthetic rows
+		// created when a session has no matching presence. fleetview.Join
+		// emits "session" for this case; translate here for wire
+		// compatibility. See apps/loom-companion-ios/.../AgentRowView.swift.
+		if source == "session" {
+			source = "session_only"
+		}
+		ua := &unifiedAgent{
+			AgentID:         pa.AgentID,
+			AgentType:       agentType,
+			Status:          status,
+			Source:          source,
+			Description:     pa.Description,
+			CurrentTask:     pa.CurrentTask,
+			Branch:          pa.Branch,
+			LastHeartbeat:   pa.LastHeartbeat,
+			ActiveFileCount: len(pa.ActiveFiles),
+			HeartbeatAgeSec: pa.HeartbeatAgeSeconds,
+			SessionAgeSec:   pa.SessionAgeSeconds,
+			TelemetryStatus: pa.TelemetryStatus,
+			HasPresence:     pa.HasPresence,
+			HasSession:      pa.HasSession,
+			IsOrphan:        pa.IsOrphan,
+			OrphanAgeSec:    pa.OrphanAgeSeconds,
+			SessionID:       pa.SessionID,
+			SessionStatus:   pa.SessionStatus,
+			SessionStarted:  pa.SessionStartedAt,
+		}
+		if pa.HasSession {
+			if sess, ok := sessionByID[pa.SessionID]; ok {
+				ua.Namespace = sess.Namespace
+				ua.Project = projectmeta.Canonical(sess.Project, sess.Namespace)
+				ua.EntryCount = sess.EntryCount
+				ua.TotalTokens = sess.TotalTokens
+				ua.ParentSessionID = sess.ParentSessionID
+				ua.RootSessionID = sess.RootSessionID
+				if ua.Description == "" {
+					ua.Description = sess.Description
+				}
+			}
+		}
+		if ua.TelemetryStatus == "" {
+			ua.TelemetryStatus = mobileAgentTelemetryStatus(*ua)
+		}
+		applyMobileAgentHint(ua, taskHints[pa.AgentID])
+		applyMobileAgentHint(ua, worktreeHints[pa.AgentID])
+		applyMobileAgentHint(ua, claimHints[pa.AgentID])
+		applyMobileAgentHint(ua, buildMobileAgentHintFromActiveFiles(pa.ActiveFiles, pa.Branch))
+		agentMap[pa.AgentID] = ua
+	}
+
+	for _, sp := range snap.Spawns {
+		if ua, ok := agentMap[sp.AgentID]; ok {
+			ua.SpawnID = sp.SpawnID
+			ua.SpawnStatus = sp.Status
+			ua.Project = sp.Project
+			if ua.Branch == "" {
+				ua.Branch = sp.Branch
+			}
+			if ua.AgentType == "unknown" || ua.AgentType == "" {
+				ua.AgentType = sp.AgentType
+			}
+		} else {
+			ua := &unifiedAgent{
+				AgentID:         sp.AgentID,
+				AgentType:       sp.AgentType,
+				Status:          "active",
+				Source:          "spawn",
+				Description:     sp.Task,
+				Branch:          sp.Branch,
+				SpawnID:         sp.SpawnID,
+				SpawnStatus:     sp.Status,
+				Project:         sp.Project,
+				TelemetryStatus: "spawn",
+			}
+			agentMap[sp.AgentID] = ua
+		}
+	}
+
+	for _, ca := range snap.Coordination.Agents {
+		if ua, ok := agentMap[ca.AgentID]; ok {
+			ua.NeedsAttention = ca.NeedsAttention
+			ua.AttentionReasons = ca.AttentionReasons
+			ua.ClaimCount = ca.ClaimCount
+		}
+	}
+
+	taskCountsByAgent := summarizeMobileTaskCountsByAgent(taskFeed)
+	for _, ua := range agentMap {
+		if counts, ok := taskCountsByAgent[ua.AgentID]; ok {
+			ua.TaskCount = counts.Pending + counts.InProgress + counts.Blocked + counts.Completed
+			ua.BlockedTasks = counts.Blocked
+		}
+		if ua.TelemetryStatus == "" {
+			ua.TelemetryStatus = mobileAgentTelemetryStatus(*ua)
+		}
+		applyMobileAgentHint(ua, taskHints[ua.AgentID])
+		applyMobileAgentHint(ua, worktreeHints[ua.AgentID])
+		applyMobileAgentHint(ua, claimHints[ua.AgentID])
+	}
+
+	// Correlate pipelines by branch.
+	if mon := d.deps.Monitors(); mon.Pipeline != nil {
+		branchPipelines := map[string]struct {
+			count  int
+			status string
+		}{}
+		for _, p := range mon.Pipeline.Pipelines() {
+			if p.Ref == "" {
+				continue
+			}
+			bp := branchPipelines[p.Ref]
+			bp.count++
+			// Keep the most relevant status (running > pending > failed > success).
+			if bp.status == "" || p.Status == "running" || (bp.status != "running" && p.Status == "failed") {
+				bp.status = p.Status
+			}
+			branchPipelines[p.Ref] = bp
+		}
+		for _, ua := range agentMap {
+			if ua.Branch == "" {
+				continue
+			}
+			if bp, ok := branchPipelines[ua.Branch]; ok {
+				ua.PipelineCount = bp.count
+				ua.PipelineStatus = bp.status
+			}
+		}
+	}
+
+	// Collapse workspace-anchored (codex) twins — the scopeless `codex-<WS>`
+	// notify-hook row and the scoped `codex-<WS>-<SCOPE>` session row are one
+	// app — into a single row before the roster is serialized, so the iOS
+	// roster stops fragmenting one codex into a live row plus a separate
+	// "Orphan without session" row. Mirrors mergeWorkspaceAnchoredTwins in the
+	// web client's agents.ts.
+	mergeMobileWorkspaceAnchoredTwins(agentMap)
+
+	agents := make([]unifiedAgent, 0, len(agentMap))
+	for _, ua := range agentMap {
+		if ua.Project == "" {
+			ua.Project = projectmeta.Canonical(ua.Project, ua.Namespace)
+		}
+		// Stamp the conversation identity so the iOS roster can group by
+		// conversation (one chat across repos / a codex app's twins) the same
+		// way the web HUD does.
+		ua.ConversationID = fleetview.ConversationID(ua.AgentID)
+		if statusFilter != "" && ua.Status != statusFilter {
+			continue
+		}
+		if typeFilter != "" && !strings.EqualFold(ua.AgentType, typeFilter) {
+			continue
+		}
+		agents = append(agents, *ua)
+	}
+
+	statusOrder := map[string]int{"active": 0, "idle": 1, "offline": 2, "unknown": 3}
+	sort.SliceStable(agents, func(i, j int) bool {
+		oi, oj := statusOrder[agents[i].Status], statusOrder[agents[j].Status]
+		if oi != oj {
+			return oi < oj
+		}
+		ti := agentSortTime(agents[i])
+		tj := agentSortTime(agents[j])
+		if ti.Equal(tj) {
+			return agents[i].AgentID < agents[j].AgentID
+		}
+		return ti.After(tj)
+	})
+
+	if len(agents) > limit {
+		agents = agents[:limit]
+	}
+
+	summary := unifiedAgentsSummary{TotalAgents: len(agents)}
+	for _, ua := range agents {
+		switch ua.Status {
+		case "active":
+			summary.ActiveAgents++
+		case "idle":
+			summary.IdleAgents++
+		case "offline":
+			summary.OfflineAgents++
+		}
+		if ua.SpawnID != "" {
+			summary.SpawnedAgents++
+		}
+		if ua.SessionID != "" {
+			summary.WithSessions++
+		}
+		if ua.IsOrphan {
+			summary.Orphans++
+		}
+	}
+
+	d.writeMobileJSON(w, http.StatusOK, map[string]any{
+		"agents":  agents,
+		"summary": summary,
+	})
+}
+
+type mobileAgentHint struct {
+	Project   string
+	Namespace string
+	Branch    string
+	UpdatedAt time.Time
+	Strength  int
+}
+
+func buildMobileAgentHintsFromTasks(tasks []taskDTO) map[string]mobileAgentHint {
+	hints := make(map[string]mobileAgentHint)
+	for _, task := range tasks {
+		agentID := strings.TrimSpace(task.AgentID)
+		if agentID == "" {
+			continue
+		}
+		hint := mobileAgentHint{
+			Project:   projectmeta.Canonical(task.Project, task.Namespace),
+			Namespace: strings.TrimSpace(task.Namespace),
+			UpdatedAt: parseMobileTime(task.UpdatedAt),
+		}
+		if hint.Project != "" {
+			hint.Strength += 2
+		}
+		if hint.Namespace != "" {
+			hint.Strength++
+		}
+		if hint.Strength == 0 {
+			continue
+		}
+		hints[agentID] = mergeMobileAgentHint(hints[agentID], hint)
+	}
+	return hints
+}
+
+func buildMobileAgentHintsFromWorktrees(worktrees []bridge.WorktreeInfo) map[string]mobileAgentHint {
+	hints := make(map[string]mobileAgentHint)
+	for _, worktree := range worktrees {
+		agentID := strings.TrimSpace(worktree.AgentID)
+		if agentID == "" {
+			continue
+		}
+		hint := mobileAgentHint{
+			Project:   projectmeta.FromPath(worktree.WorktreePath),
+			Branch:    strings.TrimSpace(worktree.Branch),
+			UpdatedAt: parseMobileTime(worktree.CreatedAt),
+		}
+		if hint.Project != "" {
+			hint.Strength += 2
+		}
+		if hint.Branch != "" {
+			hint.Strength++
+		}
+		if hint.Strength == 0 {
+			continue
+		}
+		hints[agentID] = mergeMobileAgentHint(hints[agentID], hint)
+	}
+	return hints
+}
+
+func buildMobileAgentHintsFromClaims(claims []bridge.FileClaimInfo) map[string]mobileAgentHint {
+	hints := make(map[string]mobileAgentHint)
+	for _, claim := range claims {
+		agentID := strings.TrimSpace(claim.AgentID)
+		if agentID == "" {
+			continue
+		}
+		project := projectmeta.FromPath(claim.FilePath)
+		if project == "" {
+			continue
+		}
+		hint := mobileAgentHint{
+			Project:   project,
+			UpdatedAt: parseMobileTime(claim.CreatedAt),
+			Strength:  2,
+		}
+		hints[agentID] = mergeMobileAgentHint(hints[agentID], hint)
+	}
+	return hints
+}
+
+func buildMobileAgentHintFromActiveFiles(activeFiles []string, branch string) mobileAgentHint {
+	hint := mobileAgentHint{Branch: strings.TrimSpace(branch)}
+	if hint.Branch != "" {
+		hint.Strength++
+	}
+	for _, path := range activeFiles {
+		if project := projectmeta.FromPath(path); project != "" {
+			hint.Project = project
+			hint.Strength += 2
+			break
+		}
+	}
+	return hint
+}
+
+func mergeMobileAgentHint(current, next mobileAgentHint) mobileAgentHint {
+	if next.Strength == 0 {
+		return current
+	}
+	if current.Strength == 0 {
+		return next
+	}
+	if next.Strength > current.Strength {
+		return next
+	}
+	if next.Strength == current.Strength && next.UpdatedAt.After(current.UpdatedAt) {
+		return next
+	}
+	if current.Project == "" && next.Project != "" {
+		current.Project = next.Project
+	}
+	if current.Namespace == "" && next.Namespace != "" {
+		current.Namespace = next.Namespace
+	}
+	if current.Branch == "" && next.Branch != "" {
+		current.Branch = next.Branch
+	}
+	if current.UpdatedAt.IsZero() || next.UpdatedAt.After(current.UpdatedAt) {
+		current.UpdatedAt = next.UpdatedAt
+	}
+	if next.Strength > current.Strength {
+		current.Strength = next.Strength
+	}
+	return current
+}
+
+func applyMobileAgentHint(agent *unifiedAgent, hint mobileAgentHint) {
+	if agent == nil || hint.Strength == 0 {
+		return
+	}
+	if agent.Project == "" && hint.Project != "" {
+		agent.Project = hint.Project
+	}
+	if agent.Namespace == "" && hint.Namespace != "" {
+		agent.Namespace = hint.Namespace
+	}
+	if agent.Branch == "" && hint.Branch != "" {
+		agent.Branch = hint.Branch
+	}
+}
+
+func mobileSessionIsLive(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), "active")
+}
+
+// mobileAgentTelemetryStatus is the fallback label derivation for rows that
+// did not pass through fleetview.Join (e.g. spawn-only rows). The stale
+// horizon mirrors fleetview.LivePresenceStaleAfter so the mobile API can
+// never call an agent "live" past the threshold the web HUD uses.
+func mobileAgentTelemetryStatus(agent unifiedAgent) string {
+	switch {
+	case agent.SpawnID != "":
+		return "spawn"
+	case agent.HasSession && !agent.HasPresence:
+		return "session_only"
+	case agent.Status == "offline":
+		return "offline"
+	case agent.HeartbeatAgeSec >= int(fleetview.LivePresenceStaleAfter.Seconds()):
+		return "stale"
+	case agent.Status == "idle":
+		return "idle"
+	case agent.Status == "active":
+		return "live"
+	default:
+		return "unknown"
+	}
+}
+
+// handleMobileSessionActivity returns a unified view of session tasks, pipeline, and recent context.
+func (d *MobileDomain) handleMobileSessionActivity(w http.ResponseWriter, r *http.Request) {
+	if !d.requireMobileScope(w, r, ScopeRead) {
+		return
+	}
+
+	sessionID := strings.TrimSpace(r.PathValue("session_id"))
+	if sessionID == "" {
+		d.writeMobileError(w, http.StatusBadRequest, "bad_request", "session_id is required")
+		return
+	}
+
+	agent := d.deps.Agent()
+
+	// Fetch tasks for this session.
+	tasks, err := agent.Tasks(sessionID)
+	if err != nil {
+		d.writeMobileError(w, http.StatusBadGateway, "upstream_error", "failed to list session tasks")
+		return
+	}
+	if tasks == nil {
+		tasks = []bridge.TaskInfo{}
+	}
+
+	// Build task DTOs with pipeline/workflow info.
+	type activityTaskDTO struct {
+		ID         string   `json:"id"`
+		Title      string   `json:"title"`
+		Status     string   `json:"status"`
+		Priority   string   `json:"priority"`
+		Tags       []string `json:"tags,omitempty"`
+		WorkflowID string   `json:"workflow_id,omitempty"`
+		PipelineID int      `json:"pipeline_id,omitempty"`
+		CreatedAt  string   `json:"created_at"`
+		UpdatedAt  string   `json:"updated_at"`
+	}
+
+	taskDTOs := make([]activityTaskDTO, 0, len(tasks))
+	for _, t := range tasks {
+		dto := activityTaskDTO{
+			ID:        t.ID,
+			Title:     t.Title,
+			Status:    normalizeMobileTaskStatus(t.Status),
+			Priority:  normalizeMobilePriority(t.Priority),
+			Tags:      t.Tags,
+			CreatedAt: t.CreatedAt,
+			UpdatedAt: t.UpdatedAt,
+		}
+		taskDTOs = append(taskDTOs, dto)
+	}
+
+	// Check if any active pipelines match this session's agent by branch.
+	type pipelineSummaryDTO struct {
+		ID             int    `json:"id"`
+		Project        string `json:"project"`
+		Ref            string `json:"ref"`
+		Status         string `json:"status"`
+		CurrentStage   string `json:"current_stage,omitempty"`
+		FailedJobCount int    `json:"failed_job_count"`
+		WebURL         string `json:"web_url,omitempty"`
+	}
+
+	var pipelines []pipelineSummaryDTO
+	if mon := d.deps.Monitors(); mon.Pipeline != nil {
+		for _, p := range mon.Pipeline.Pipelines() {
+			detail, err := mon.Pipeline.Detail(p.Project, p.ID)
+			if err != nil {
+				continue
+			}
+			pipelines = append(pipelines, pipelineSummaryDTO{
+				ID:             p.ID,
+				Project:        p.Project,
+				Ref:            p.Ref,
+				Status:         p.Status,
+				CurrentStage:   detail.CurrentStage,
+				FailedJobCount: detail.FailedJobCount,
+				WebURL:         p.WebURL,
+			})
+		}
+	}
+	if pipelines == nil {
+		pipelines = []pipelineSummaryDTO{}
+	}
+
+	d.writeMobileJSON(w, http.StatusOK, map[string]any{
+		"session_id":     sessionID,
+		"tasks":          taskDTOs,
+		"pipelines":      pipelines,
+		"task_count":     len(taskDTOs),
+		"pipeline_count": len(pipelines),
+	})
+}
+
+// mergeMobileWorkspaceAnchoredTwins folds same-workspace codex twins (the
+// scopeless `codex-<WS>` row and any scoped `codex-<WS>-<SCOPE>` rows for one
+// app) into a single unifiedAgent. conversationId already keys them together;
+// this collapses them in agentMap so the roster, summary, and orphan lane see
+// one row per codex workspace regardless of which evidence each twin carried.
+// Conversation-scoped vendors (claude/gemini) are untouched.
+func mergeMobileWorkspaceAnchoredTwins(agentMap map[string]*unifiedAgent) {
+	groups := map[string][]*unifiedAgent{}
+	for _, ua := range agentMap {
+		if !fleetview.IsWorkspaceAnchored(ua.AgentID) {
+			continue
+		}
+		key := fleetview.ConversationID(ua.AgentID)
+		if key == "" {
+			key = ua.AgentID
+		}
+		groups[key] = append(groups[key], ua)
+	}
+	for _, members := range groups {
+		if len(members) < 2 {
+			continue
+		}
+		rep := mergeMobileTwinAgents(members)
+		for _, m := range members {
+			if m.AgentID != rep.AgentID {
+				delete(agentMap, m.AgentID)
+			}
+		}
+		agentMap[rep.AgentID] = rep
+	}
+}
+
+func mobileStatusRank(status string) int {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "active":
+		return 3
+	case "idle":
+		return 2
+	case "unknown", "":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// mergeMobileTwinAgents folds a set of same-workspace codex twins into one
+// unifiedAgent. The representative is the richest member — prefer an active
+// session, then most-live status, then freshest heartbeat, with an agent_id
+// tiebreak for determinism — and keeps its own agent_id and session linkage.
+// Evidence is OR'd across the set so the merged row reflects everything known.
+func mergeMobileTwinAgents(members []*unifiedAgent) *unifiedAgent {
+	score := func(a *unifiedAgent) int {
+		s := mobileStatusRank(a.Status) * 2
+		if a.HasSession {
+			s += 100
+		}
+		return s
+	}
+	best := members[0]
+	for _, m := range members[1:] {
+		switch {
+		case score(m) != score(best):
+			if score(m) > score(best) {
+				best = m
+			}
+		case !agentSortTime(*m).Equal(agentSortTime(*best)):
+			if agentSortTime(*m).After(agentSortTime(*best)) {
+				best = m
+			}
+		default:
+			if m.AgentID < best.AgentID {
+				best = m
+			}
+		}
+	}
+
+	merged := *best // copy
+	var sessionHolder *unifiedAgent
+	for _, m := range members {
+		if m.HasPresence {
+			merged.HasPresence = true
+		}
+		if m.HasSession {
+			merged.HasSession = true
+			if sessionHolder == nil {
+				sessionHolder = m
+			}
+		}
+		if agentSortTime(*m).After(agentSortTime(merged)) {
+			merged.LastHeartbeat = m.LastHeartbeat
+		}
+		if mobileStatusRank(m.Status) > mobileStatusRank(merged.Status) {
+			merged.Status = m.Status
+		}
+		if m.SpawnID != "" && merged.SpawnID == "" {
+			merged.SpawnID = m.SpawnID
+			merged.SpawnStatus = m.SpawnStatus
+		}
+		if m.EntryCount > merged.EntryCount {
+			merged.EntryCount = m.EntryCount
+		}
+		if m.TotalTokens > merged.TotalTokens {
+			merged.TotalTokens = m.TotalTokens
+		}
+		if m.TaskCount > merged.TaskCount {
+			merged.TaskCount = m.TaskCount
+		}
+		if m.BlockedTasks > merged.BlockedTasks {
+			merged.BlockedTasks = m.BlockedTasks
+		}
+		if m.ClaimCount > merged.ClaimCount {
+			merged.ClaimCount = m.ClaimCount
+		}
+		if m.ActiveFileCount > merged.ActiveFileCount {
+			merged.ActiveFileCount = m.ActiveFileCount
+		}
+	}
+	if sessionHolder != nil {
+		merged.SessionID = sessionHolder.SessionID
+		merged.SessionStatus = sessionHolder.SessionStatus
+		merged.SessionStarted = sessionHolder.SessionStarted
+		merged.ParentSessionID = sessionHolder.ParentSessionID
+		merged.RootSessionID = sessionHolder.RootSessionID
+		if sessionHolder.Namespace != "" {
+			merged.Namespace = sessionHolder.Namespace
+		}
+		if sessionHolder.Project != "" {
+			merged.Project = sessionHolder.Project
+		}
+	}
+	// Recompute evidence-derived source.
+	switch {
+	case merged.HasPresence && merged.HasSession:
+		merged.Source = "presence+session"
+	case merged.HasSession:
+		merged.Source = "session_only"
+	case merged.HasPresence:
+		merged.Source = "presence"
+	}
+	// A merged agent with any active session is never an orphan.
+	if merged.HasSession {
+		merged.IsOrphan = false
+		merged.OrphanAgeSec = 0
+	}
+	return &merged
+}

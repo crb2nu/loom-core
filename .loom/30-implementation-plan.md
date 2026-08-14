@@ -17,12 +17,32 @@ Backend-hardening-first, then app MVP, then controlled mutation rollout.
 
 | Milestone | Description | Status |
 |---|---|---|
-| M0 | Contract + security architecture freeze | In progress |
-| M1 | Backend mobile auth + API hardening | Not started |
-| M2 | iOS/iPad app scaffold + monitoring UI | Not started |
-| M3 | Session create/end controls | Not started |
-| M4 | Notifications + operational polish | Not started |
+| M0 | Contract + security architecture freeze | Complete |
+| M1 | Backend mobile auth + API hardening | Complete |
+| M2 | iOS/iPad app scaffold + monitoring UI | In progress |
+| M3 | Session create/end controls | Complete |
+| M4 | Notifications + operational polish | Complete |
 | M5 | Beta rollout + telemetry tuning | Not started |
+
+## Scope Discipline Gate (Issue #37)
+
+### Milestone Exit Rule
+
+Before closing any mobile milestone (M0-M5), complete a scope gate check:
+
+- Confirm deliverables stay inside v1 scope: monitoring + session lifecycle controls.
+- For any desktop-parity or advanced-control request discovered during the milestone, open/attach a post-v1 backlog issue and link it in milestone notes.
+- Mark gate status in milestone closeout notes as `Pass` or `Pass with routed deferments`.
+
+### Deliverable Boundary Audit (M1-M5)
+
+| Milestone | Boundary check | Result |
+|---|---|---|
+| M1 | Mobile auth/API hardening only; no desktop feature parity expansion | Pass |
+| M2 | Monitoring surfaces only (dashboard/sessions/detail/diagnostics) | Pass |
+| M3 | Session create/end only; no arbitrary tool execution | Pass |
+| M4 | Notification + operational polish only; no config editing or broad control plane writes | Pass |
+| M5 | Reliability/telemetry tuning only; deferred feature expansion routed to backlog | Pending |
 
 ## M0: Contract and Threat Model
 
@@ -225,6 +245,103 @@ Current state:
 - Auth provider capabilities aligned with selected bootstrap mode (PKCE/device-code/hybrid).
 - iOS app signing/provisioning setup for internal beta.
 
+## Build/Signing/Publish Addendum (2026-02-25)
+
+Distribution operations are now tracked as a dedicated implementation slice:
+- `.loom/33-mobile-signing-release-plan-2026-02-25.md`
+
+Execution intent:
+1. Establish deterministic install-now signing flow for physical iPhone.
+2. Add archive/export targets for IPA generation.
+3. Add TestFlight upload workflow.
+4. Add macOS-runner CI jobs for iOS packaging/publish gates.
+
+## OpenAI Responses Integration Addendum (2026-03-04)
+
+## HUD Labs Integration Addendum (2026-04-10)
+
+### Goal
+
+Make the HUD Labs area operationally trustworthy by fixing spawn auth/state drift, protecting sandbox mutations, and surfacing enough devbox and spawn runtime detail for operators to act from the UI.
+
+### Phase 1: Contract Repair
+
+1. Add a shared HUD-side auth mechanism for admin-protected Labs routes.
+   - Cover spawn create, stop, follow-up message, interrupt, telemetry summary, and paginated telemetry tabs.
+   - Avoid one-off header wiring in each component; centralize request decoration.
+2. Normalize spawn status handling.
+   - Add `building` to the frontend spawn state model.
+   - Subscribe to `agent.spawn.building` alongside the existing running/completed/failed/stopped events.
+3. Align sandbox mutation protection with the rest of the control plane.
+   - Decide whether sandbox start/stop should require the same admin token or a narrower operator scope.
+   - Add tests for protected and unprotected behavior explicitly.
+
+Exit criteria:
+- Spawn launch and telemetry work when `HUD_ADMIN_TOKEN` is configured.
+- A just-launched spawn can be observed in `building` state from the HUD.
+- Sandbox mutations are no longer less protected than spawn mutations.
+
+### Phase 2: Real-Time Wiring
+
+1. Make `SpawnDetailPanel` consume live state instead of one-shot fetches.
+   - Reuse `spawnStore.telemetryBySpawnId` and lifecycle events.
+   - Refresh or merge in terminal state after `agent.spawn.completed`, `agent.spawn.failed`, and `agent.spawn.stopped`.
+2. Emit first-class sandbox activity from the control path.
+   - Broadcast `hud.sandbox.event` or a replacement event directly from sandbox start/stop/build operations.
+   - Stop relying on `agent_context` title parsing as the only path for recent sandbox activity.
+3. Tighten polling behavior.
+   - Use SSE-first fallback patterns consistently so Labs does not poll aggressively when the event stream is healthy.
+
+Exit criteria:
+- Open spawn detail stays current during a live run.
+- Sandbox recent activity reflects HUD-triggered start/stop actions without waiting for unrelated context writes.
+- Labs polling drops to fallback-only where SSE already provides the state.
+
+### Phase 3: Feature Completion
+
+1. Expose one actionable devbox workflow beyond start/stop.
+   - Preferred first slice: async exec (`devbox_exec_async` + `devbox_exec_poll`) with status and output tail.
+2. Expose richer spawn runtime detail already emitted by parsers.
+   - Render message/tool/thinking/result events in the detail view or a dedicated run log.
+3. Add failure-recovery UX.
+   - Show auth failures, backend-unavailable states, and build/exec failure reasons inline with next actions.
+
+Exit criteria:
+- Labs can start a sandbox and run at least one bounded command workflow end to end.
+- Spawn detail shows enough real-time information that operators do not have to leave the HUD to understand what the run is doing.
+
+### Validation Checklist
+
+- [ ] `go test ./internal/hud/domain/spawn ./internal/hud/domain/sandbox -count=1`
+- [ ] Add/refresh frontend tests for Labs auth and state transitions
+- [ ] `pnpm build` in `internal/hud/frontend`
+- [ ] Manual smoke test: spawn launch, stop, message, interrupt, telemetry tabs
+- [ ] Manual smoke test: sandbox start, stop, activity feed, SSE reconnect behavior
+
+### Source Backing
+
+- `internal/hud/domain/spawn/handlers.go:11`
+- `internal/hud/domain/spawn/handler_telemetry.go:17`
+- `internal/hud/frontend/src/lib/stores/spawn.svelte.ts:47`
+- `internal/hud/frontend/src/lib/stores/spawn.svelte.ts:127`
+- `internal/hud/frontend/src/lib/components/SpawnDetailPanel.svelte:27`
+- `internal/hud/frontend/src/lib/stores/events.svelte.ts:91`
+- `internal/hud/spawn.go:279`
+- `internal/hud/domain/sandbox/handlers.go:29`
+- `internal/hud/domain/sandbox/handlers.go:66`
+- `internal/hud/app_routes_operations.go:330`
+- `internal/hud/domain/fleet/handler_context.go:13`
+- `cmd/mcp-devbox/tools.go:180`
+
+Parallel planning track (tool/context orchestration in loom-core):
+- Research: `.loom/15-research-openai-responses-tool-context-2026-03-04.md`
+- Product spec: `.loom/21-product-spec-openai-responses-orchestration-2026-03-04.md`
+- Implementation plan: `.loom/36-implementation-plan-openai-responses-orchestration-2026-03-04.md`
+
+Codebase index readiness note:
+- Embeddings-enabled index job failed on backend API error; fallback `embeddings=false` index job is in progress.
+- Current details tracked in `.loom/00-mcp-inventory.md`.
+
 ## Sources
 
 - `internal/hud/app.go:317`
@@ -245,8 +362,132 @@ Current state:
 - `AGENTS.md:45`
 - `ROADMAP.md:48`
 - `.loom/13-research-mobile-roadmap-features-2026-02-19.md`
+- `.loom/14-research-mobile-signing-publish-2026-02-25.md`
+- `.loom/33-mobile-signing-release-plan-2026-02-25.md`
 - `https://datatracker.ietf.org/doc/rfc8252/`
 - `https://datatracker.ietf.org/doc/html/rfc9700`
 - `https://datatracker.ietf.org/doc/html/rfc8628`
 - `https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy`
 - `https://developer.apple.com/design/human-interface-guidelines/managing-notifications`
+
+---
+
+# 2026-03-16 Implementation Addendum: Synthetic Bulk MCP Operations
+
+## Scope
+
+Deliver a daemon-level bulk execution slice that adds `server__bulk` tools for eligible mutation-oriented MCP servers and executes manifest-driven same-server batches with compact responses.
+
+## Delivery Strategy
+
+Implement the feature entirely in daemon inventory and call-routing layers so existing MCP servers stay unchanged and immediately inherit the capability where eligible.
+
+## Milestones
+
+| Milestone | Description | Status |
+|---|---|---|
+| B0 | Choose integration point and manifest contract | Complete |
+| B1 | Add synthetic tool generation + schema visibility | Complete |
+| B2 | Add manifest loader + compact executor | Complete |
+| B3 | Add nested-call routing path and regression tests | Complete |
+| B4 | Broader daemon validation and follow-up docs/examples | In progress |
+
+## B0: Architecture Decision
+
+### Tasks
+
+- Compare per-server native bulk implementations vs daemon-generated synthetic tools.
+- Define the manifest contract and server-eligibility heuristic.
+- Record exclusions and non-goals.
+
+### Exit Criteria
+
+- Decision recorded in `.loom/40-decisions.md`.
+- Implementation can proceed without touching individual `cmd/mcp-*` servers.
+
+## B1: Synthetic Tool Exposure
+
+### Tasks
+
+- Add daemon helpers that derive visible bulk tools from cached/static tool inventory.
+- Surface those tools through `loom/tools`.
+- Ensure schema validation can resolve a synthetic `server__bulk` definition.
+
+### Status
+
+- Implemented in `internal/daemon/bulk_tools.go`, `internal/daemon/daemon_toolcache.go`, and `internal/daemon/schema_validate.go`.
+
+## B2: Manifest Execution
+
+### Tasks
+
+- Add manifest loading from absolute JSON/YAML file paths.
+- Add execution controls:
+  - `dry_run`
+  - `stop_on_error`
+  - `result_limit`
+  - `operation_limit`
+- Add compact summarization and truncation helpers.
+- Reject invalid cross-server or nested-bulk operations.
+
+### Status
+
+- Implemented in `internal/daemon/bulk_tools.go`.
+
+## B3: Nested Call Routing and Tests
+
+### Tasks
+
+- Add an internal daemon call path that can execute nested tool calls without reacquiring the top-level concurrency semaphore.
+- Route synthetic bulk execution through the existing daemon machinery so policy/audit/PII scanning still runs.
+- Add focused tests for:
+  - eligible server synthesis,
+  - JSON/YAML manifest parsing,
+  - continue-on-error semantics,
+  - stop-on-error semantics.
+
+### Status
+
+- Implemented in `internal/daemon/daemon_call.go` and `internal/daemon/bulk_tools_test.go`.
+
+## B4: Finish Pass
+
+### Remaining Tasks
+
+- Run broader test coverage beyond `./internal/daemon/...`.
+- Consider adding operator-facing examples or docs for common manifest shapes.
+- Evaluate whether tool-count/reporting endpoints should report visible-tool totals rather than raw cached-tool totals.
+
+### Verification Completed
+
+- `gofmt -w internal/daemon/bulk_tools.go internal/daemon/bulk_tools_test.go internal/daemon/daemon_call.go internal/daemon/daemon_toolcache.go internal/daemon/schema_validate.go`
+- `go test ./internal/daemon/...`
+
+### Planned Verification
+
+- `go test ./cmd/loom/...`
+- `go test ./...`
+
+## Risks and Mitigations
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Bulk appears for the wrong server class | Medium | Conservative exclusion list plus mutating-token heuristic |
+| Nested daemon execution deadlocks or starves calls | High | Use `handleCallWithOptions(..., true)` for internal bulk fan-out |
+| Compact summaries hide too much detail | Medium | Keep counts, stop markers, IDs/titles/statuses/URLs in the returned summaries |
+| Agents accidentally recurse into bulk | Low | Explicitly reject nested bulk operations |
+
+## Sources
+
+- `internal/daemon/bulk_tools.go:19`
+- `internal/daemon/bulk_tools.go:168`
+- `internal/daemon/bulk_tools.go:264`
+- `internal/daemon/bulk_tools.go:285`
+- `internal/daemon/bulk_tools.go:407`
+- `internal/daemon/bulk_tools.go:558`
+- `internal/daemon/bulk_tools.go:590`
+- `internal/daemon/bulk_tools.go:638`
+- `internal/daemon/daemon_call.go:26`
+- `internal/daemon/daemon_toolcache.go:176`
+- `internal/daemon/schema_validate.go:134`
+- `internal/daemon/bulk_tools_test.go:13`

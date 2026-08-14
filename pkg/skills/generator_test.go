@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestGenerator returns a minimal Generator suitable for unit tests.
@@ -40,6 +41,9 @@ func TestGenerateCodexSkillMD_BasicFrontmatter(t *testing.T) {
 	}
 	if !strings.Contains(got, `description: "A simple skill"`) {
 		t.Errorf("output should contain quoted description, got:\n%s", got)
+	}
+	if !strings.Contains(got, "metadata:\n  short-description: \"A simple skill\"") {
+		t.Errorf("output should contain metadata.short-description, got:\n%s", got)
 	}
 	if !strings.Contains(got, "\n---\n") {
 		t.Error("output should contain closing frontmatter delimiter")
@@ -341,6 +345,267 @@ func TestGenerateForTarget_GeminiSkillCreatesBundle(t *testing.T) {
 	}
 }
 
+func TestGenerateForTarget_CodexDirectToHomeWritesRootFilesToCodexHome(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	sourceSkillDir := filepath.Join(sourceDir, "ops-helper")
+	if err := os.MkdirAll(sourceSkillDir, 0o755); err != nil {
+		t.Fatalf("mkdir source skill dir: %v", err)
+	}
+
+	enabled := true
+	instructionSkill := &Skill{
+		Name: "ops-helper",
+		Common: &SkillSpec{
+			Description:  "Ops helper skill",
+			Instructions: "# Ops Helper\n\nDo ops work.",
+		},
+		Targets: map[string]*TargetSpec{
+			"codex": {Enabled: &enabled, Type: "instruction"},
+		},
+	}
+	bundleSkill := &Skill{
+		Name: "bundle-helper",
+		Common: &SkillSpec{
+			Description:  "Bundle helper skill",
+			Instructions: "# Bundle Helper\n\nUse bundled workflows.",
+		},
+		Targets: map[string]*TargetSpec{
+			"codex": {Enabled: &enabled, Type: "skill"},
+		},
+	}
+
+	codexRoot := filepath.Join(tmpDir, "home", ".codex")
+	g := &Generator{
+		Registry:       &Registry{Skills: []*Skill{instructionSkill, bundleSkill}},
+		SourceDir:      sourceDir,
+		Target:         "codex",
+		RepoRoot:       tmpDir,
+		CodexHome:      codexRoot,
+		CodexRootDir:   codexRoot,
+		CodexSkillsDir: filepath.Join(codexRoot, "skills"),
+	}
+
+	if err := g.generateForTarget("codex"); err != nil {
+		t.Fatalf("generateForTarget(codex): %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(codexRoot, "instructions.md")); err != nil {
+		t.Fatalf("expected instructions.md in codex home root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, ".codex", "instructions.md")); !os.IsNotExist(err) {
+		t.Fatalf("did not expect instructions.md in repo .codex, err=%v", err)
+	}
+
+	manifest, err := ReadManifest(codexRoot)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if manifest == nil {
+		t.Fatal("expected manifest to be written in codex home root")
+	}
+	if !containsString(manifest.Generated, "instructions.md") {
+		t.Fatalf("expected manifest to include instructions.md, got %#v", manifest.Generated)
+	}
+
+	data, err := os.ReadFile(filepath.Join(codexRoot, "instructions.md"))
+	if err != nil {
+		t.Fatalf("read instructions.md: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "### Available skills") {
+		t.Fatalf("expected available skills section in instructions.md:\n%s", text)
+	}
+	if !strings.Contains(text, filepath.Join(codexRoot, "skills", "bundle-helper", "SKILL.md")) {
+		t.Fatalf("expected generated skill path in instructions.md:\n%s", text)
+	}
+}
+
+func TestGenerateForTarget_CodexAvailableSkillsIncludesExistingHomeSkills(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	sourceSkillDir := filepath.Join(sourceDir, "ops-helper")
+	if err := os.MkdirAll(sourceSkillDir, 0o755); err != nil {
+		t.Fatalf("mkdir source skill dir: %v", err)
+	}
+
+	enabled := true
+	instructionSkill := &Skill{
+		Name: "ops-helper",
+		Common: &SkillSpec{
+			Description:  "Ops helper skill",
+			Instructions: "# Ops Helper\n\nDo ops work.",
+		},
+		Targets: map[string]*TargetSpec{
+			"codex": {Enabled: &enabled, Type: "instruction"},
+		},
+	}
+	bundleSkill := &Skill{
+		Name: "bundle-helper",
+		Common: &SkillSpec{
+			Description:  "Bundle helper skill",
+			Instructions: "# Bundle Helper\n\nUse bundled workflows.",
+		},
+		Targets: map[string]*TargetSpec{
+			"codex": {Enabled: &enabled, Type: "skill"},
+		},
+	}
+
+	codexRoot := filepath.Join(tmpDir, "home", ".codex")
+	existingSkills := map[string]string{
+		filepath.Join(codexRoot, "skills", ".system", "openai-docs", "SKILL.md"): `---
+name: "openai-docs"
+description: "Use current OpenAI docs with citations."
+---
+
+# OpenAI Docs
+`,
+		filepath.Join(codexRoot, "skills", "speech", "SKILL.md"): `---
+name: "speech"
+description: "Generate text-to-speech output."
+---
+
+# Speech
+`,
+	}
+	for path, content := range existingSkills {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir existing skill dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write existing skill: %v", err)
+		}
+	}
+
+	g := &Generator{
+		Registry:       &Registry{Skills: []*Skill{instructionSkill, bundleSkill}},
+		SourceDir:      sourceDir,
+		Target:         "codex",
+		RepoRoot:       tmpDir,
+		CodexHome:      codexRoot,
+		CodexRootDir:   codexRoot,
+		CodexSkillsDir: filepath.Join(codexRoot, "skills"),
+	}
+
+	if err := g.generateForTarget("codex"); err != nil {
+		t.Fatalf("generateForTarget(codex): %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(codexRoot, "instructions.md"))
+	if err != nil {
+		t.Fatalf("read instructions.md: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"- openai-docs: Use current OpenAI docs with citations.",
+		"- speech: Generate text-to-speech output.",
+		filepath.Join(codexRoot, "skills", ".system", "openai-docs", "SKILL.md"),
+		filepath.Join(codexRoot, "skills", "speech", "SKILL.md"),
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected instructions.md to contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestGenerateGeminiSkillMD_UsesConfiguredSkillsHomePath(t *testing.T) {
+	g := &Generator{
+		CodexHome:        "/tmp/codex",
+		GeminiSkillsHome: "$HOME/.gemini/antigravity/skills",
+	}
+
+	skill := &Skill{
+		Name: "ops-helper",
+		Common: &SkillSpec{
+			Description:  "Ops helper skill",
+			Instructions: "Run ${SKILL_PATH}/scripts/run.sh",
+		},
+	}
+
+	got := g.generateGeminiSkillMD(skill)
+	if !strings.Contains(got, "$HOME/.gemini/antigravity/skills/ops-helper/scripts/run.sh") {
+		t.Fatalf("expected antigravity skill path in generated output:\n%s", got)
+	}
+}
+
+func TestGenerateAntigravitySkills_UsesAntigravityOverridesAndHomePath(t *testing.T) {
+	tmpDir := t.TempDir()
+	outputDir := filepath.Join(tmpDir, ".gemini", "antigravity")
+	enabled := true
+	disabled := false
+
+	g := &Generator{
+		Registry: &Registry{Skills: []*Skill{
+			{
+				Name: "core-instructions",
+				Common: &SkillSpec{
+					Description:  "Core instruction set",
+					Instructions: "# Core\n\nUse the Antigravity target.",
+				},
+				Targets: map[string]*TargetSpec{
+					"antigravity": {Enabled: &enabled, Type: "instruction"},
+				},
+			},
+			{
+				Name: "ag-only",
+				Common: &SkillSpec{
+					Description:  "Antigravity-only helper",
+					Instructions: "Run ${SKILL_PATH}/scripts/run.sh",
+				},
+				Targets: map[string]*TargetSpec{
+					"gemini":      {Enabled: &disabled, Type: "skill", InstructionsAppend: "## Gemini Notes\nWrong target."},
+					"antigravity": {Enabled: &enabled, Type: "command", InstructionsAppend: "## Antigravity Notes\nRight target."},
+				},
+			},
+		}},
+		SourceDir:        filepath.Join(tmpDir, "mcp", "skills"),
+		Target:           "antigravity",
+		OutputDir:        outputDir,
+		RepoRoot:         tmpDir,
+		CodexHome:        "/tmp/codex",
+		GeminiSkillsHome: "$HOME/.gemini/antigravity/skills",
+	}
+
+	if err := g.generateForTarget("antigravity"); err != nil {
+		t.Fatalf("generateForTarget(antigravity): %v", err)
+	}
+
+	skillPath := filepath.Join(outputDir, "skills", "ag-only", "SKILL.md")
+	data, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read Antigravity skill: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"name: ag-only",
+		"$HOME/.gemini/antigravity/skills/ag-only/scripts/run.sh",
+		"## Antigravity Notes",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected Antigravity skill to contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Gemini Notes") {
+		t.Fatalf("Antigravity skill used Gemini target override:\n%s", text)
+	}
+
+	instructions, err := os.ReadFile(filepath.Join(outputDir, "GEMINI.md"))
+	if err != nil {
+		t.Fatalf("read Antigravity GEMINI.md: %v", err)
+	}
+	if !strings.Contains(string(instructions), "$HOME/.gemini/antigravity/skills/ag-only/SKILL.md") {
+		t.Fatalf("GEMINI.md missing Antigravity skill home path:\n%s", instructions)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(outputDir, ManifestFilename))
+	if err != nil {
+		t.Fatalf("read Antigravity manifest: %v", err)
+	}
+	if !strings.Contains(string(manifest), `"platform": "antigravity"`) {
+		t.Fatalf("manifest platform should be antigravity:\n%s", manifest)
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, v := range values {
 		if v == want {
@@ -348,4 +613,906 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// =========================================================================
+// Validate tests
+// =========================================================================
+
+func TestValidate_AllResourcesExist(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "my-skill")
+
+	// Create all referenced files.
+	for _, p := range []string{
+		filepath.Join(skillDir, "scripts", "run.sh"),
+		filepath.Join(skillDir, "references", "guide.md"),
+		filepath.Join(skillDir, "assets", "templates", "default.yaml"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("ok"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	skill := newTestSkill("my-skill", "A skill")
+	skill.Common.Scripts = []*Script{{Name: "run", Path: "scripts/run.sh"}}
+	skill.Common.References = []string{"guide.md"}
+	skill.Common.Assets = []string{"templates/default.yaml"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 0 {
+		t.Fatalf("expected 0 validation errors, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestValidate_MissingScript(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "broken-skill")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("broken-skill", "Missing script")
+	skill.Common.Scripts = []*Script{{Name: "run", Path: "scripts/run.sh"}}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 validation error, got %d: %v", len(errs), errs)
+	}
+	if errs[0].ResourceType != "script" {
+		t.Errorf("expected resource type 'script', got %q", errs[0].ResourceType)
+	}
+	if errs[0].Skill != "broken-skill" {
+		t.Errorf("expected skill 'broken-skill', got %q", errs[0].Skill)
+	}
+}
+
+func TestValidate_MissingReference(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "ref-skill")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("ref-skill", "Missing ref")
+	skill.Common.References = []string{"missing.md"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 validation error, got %d: %v", len(errs), errs)
+	}
+	if errs[0].ResourceType != "reference" {
+		t.Errorf("expected resource type 'reference', got %q", errs[0].ResourceType)
+	}
+}
+
+func TestValidate_MissingAsset(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "asset-skill")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("asset-skill", "Missing asset")
+	skill.Common.Assets = []string{"templates/missing.yaml"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 validation error, got %d: %v", len(errs), errs)
+	}
+	if errs[0].ResourceType != "asset" {
+		t.Errorf("expected resource type 'asset', got %q", errs[0].ResourceType)
+	}
+}
+
+func TestValidate_MultipleErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	if err := os.MkdirAll(filepath.Join(sourceDir, "multi-err"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("multi-err", "Multiple missing resources")
+	skill.Common.Scripts = []*Script{
+		{Name: "a", Path: "scripts/a.sh"},
+		{Name: "b", Path: "scripts/b.sh"},
+	}
+	skill.Common.References = []string{"guide.md"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 3 {
+		t.Fatalf("expected 3 validation errors, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestValidate_DisabledSkillSkipped(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	if err := os.MkdirAll(filepath.Join(sourceDir, "disabled"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	disabled := false
+	skill := newTestSkill("disabled", "Disabled skill")
+	skill.Common.Scripts = []*Script{{Name: "run", Path: "scripts/run.sh"}}
+	skill.Targets = map[string]*TargetSpec{
+		"codex":    {Enabled: &disabled},
+		"claude":   {Enabled: &disabled},
+		"kilocode": {Enabled: &disabled},
+		"gemini":   {Enabled: &disabled},
+		"antigravity": {
+			Enabled: &disabled,
+		},
+	}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 0 {
+		t.Fatalf("expected 0 errors for disabled skill, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestValidate_NilScriptSkipped(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	if err := os.MkdirAll(filepath.Join(sourceDir, "nil-script"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("nil-script", "Skill with nil script entry")
+	skill.Common.Scripts = []*Script{nil, {Name: "empty", Path: ""}}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 0 {
+		t.Fatalf("expected 0 errors for nil/empty script entries, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestValidate_AlwaysAllowWriteScriptWithoutDryRunFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "unsafe-allow")
+
+	scriptPath := filepath.Join(skillDir, "scripts", "mutate.sh")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\nmkdir -p .loom\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("unsafe-allow", "Unsafe always_allow")
+	skill.Common.Scripts = []*Script{{Name: "mutate", Path: "scripts/mutate.sh"}}
+	skill.Common.AlwaysAllow = []string{"mutate"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 validation error, got %d: %v", len(errs), errs)
+	}
+	if errs[0].ResourceType != "always_allow" {
+		t.Fatalf("expected always_allow validation error, got %q", errs[0].ResourceType)
+	}
+}
+
+func TestValidate_AlwaysAllowWriteScriptWithDryRunAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "safe-allow")
+
+	scriptPath := filepath.Join(skillDir, "scripts", "generate.sh")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	content := "#!/usr/bin/env bash\n# defaults to --dry-run unless --apply is passed\nif [[ \"$1\" == \"--apply\" ]]; then echo apply; else echo --dry-run; fi\n"
+	if err := os.WriteFile(scriptPath, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("safe-allow", "Safe always_allow")
+	skill.Common.Scripts = []*Script{{Name: "generate", Path: "scripts/generate.sh"}}
+	skill.Common.AlwaysAllow = []string{"generate"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 0 {
+		t.Fatalf("expected no validation errors, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestValidate_AlwaysAllowScriptMustExistInScripts(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "bad-allow")
+	scriptPath := filepath.Join(skillDir, "scripts", "read.sh")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\necho read-only\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("bad-allow", "Bad always_allow reference")
+	skill.Common.Scripts = []*Script{{Name: "read", Path: "scripts/read.sh"}}
+	skill.Common.AlwaysAllow = []string{"missing-script-name"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	errs := g.Validate()
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 validation error, got %d: %v", len(errs), errs)
+	}
+	if errs[0].ResourceType != "always_allow" {
+		t.Fatalf("expected always_allow validation error, got %q", errs[0].ResourceType)
+	}
+}
+
+// =========================================================================
+// UpdateRegistryDate tests
+// =========================================================================
+
+func TestUpdateRegistryDate_UpdatesStaleDate(t *testing.T) {
+	tmpDir := t.TempDir()
+	registryPath := filepath.Join(tmpDir, "skills-registry.yaml")
+
+	content := "version: 1\nupdated: 2025-01-01\nskills: []\n"
+	if err := os.WriteFile(registryPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := &Generator{
+		Registry:     &Registry{},
+		RegistryPath: registryPath,
+	}
+
+	if err := g.UpdateRegistryDate(); err != nil {
+		t.Fatalf("UpdateRegistryDate: %v", err)
+	}
+
+	data, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	today := time.Now().Format("2006-01-02")
+	expected := "version: 1\nupdated: " + today + "\nskills: []\n"
+	if string(data) != expected {
+		t.Errorf("unexpected content:\ngot:  %q\nwant: %q", string(data), expected)
+	}
+}
+
+func TestUpdateRegistryDate_IdempotentWhenCurrent(t *testing.T) {
+	tmpDir := t.TempDir()
+	registryPath := filepath.Join(tmpDir, "skills-registry.yaml")
+
+	today := time.Now().Format("2006-01-02")
+	content := "version: 1\nupdated: " + today + "\nskills: []\n"
+	if err := os.WriteFile(registryPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info, _ := os.Stat(registryPath)
+	origModTime := info.ModTime()
+
+	g := &Generator{
+		Registry:     &Registry{},
+		RegistryPath: registryPath,
+	}
+
+	if err := g.UpdateRegistryDate(); err != nil {
+		t.Fatalf("UpdateRegistryDate: %v", err)
+	}
+
+	// File should not have been rewritten (same date).
+	info2, _ := os.Stat(registryPath)
+	if !info2.ModTime().Equal(origModTime) {
+		t.Error("file was rewritten despite date being current")
+	}
+}
+
+func TestUpdateRegistryDate_PreservesComments(t *testing.T) {
+	tmpDir := t.TempDir()
+	registryPath := filepath.Join(tmpDir, "skills-registry.yaml")
+
+	content := "# Header comment\nversion: 1\nupdated: 2025-06-15\n# Skills below\nskills:\n  - name: test\n"
+	if err := os.WriteFile(registryPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := &Generator{
+		Registry:     &Registry{},
+		RegistryPath: registryPath,
+	}
+
+	if err := g.UpdateRegistryDate(); err != nil {
+		t.Fatalf("UpdateRegistryDate: %v", err)
+	}
+
+	data, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := string(data)
+	if !strings.Contains(got, "# Header comment") {
+		t.Error("header comment was lost")
+	}
+	if !strings.Contains(got, "# Skills below") {
+		t.Error("inline comment was lost")
+	}
+	if !strings.Contains(got, "- name: test") {
+		t.Error("skill entry was lost")
+	}
+
+	today := time.Now().Format("2006-01-02")
+	if !strings.Contains(got, "updated: "+today) {
+		t.Errorf("date not updated, got:\n%s", got)
+	}
+}
+
+func TestUpdateRegistryDate_EmptyRegistryPath(t *testing.T) {
+	g := &Generator{
+		Registry:     &Registry{},
+		RegistryPath: "",
+	}
+
+	if err := g.UpdateRegistryDate(); err != nil {
+		t.Fatalf("expected nil error for empty path, got: %v", err)
+	}
+}
+
+// =========================================================================
+// sortSkillsByPriority tests
+// =========================================================================
+
+func intPtr(n int) *int { return &n }
+
+func TestSortSkillsByPriority_ExplicitOrder(t *testing.T) {
+	skills := []*Skill{
+		{Name: "c", Priority: intPtr(30)},
+		{Name: "a", Priority: intPtr(10)},
+		{Name: "b", Priority: intPtr(20)},
+	}
+
+	sortSkillsByPriority(skills)
+
+	want := []string{"a", "b", "c"}
+	for i, s := range skills {
+		if s.Name != want[i] {
+			t.Errorf("position %d: got %q, want %q", i, s.Name, want[i])
+		}
+	}
+}
+
+func TestSortSkillsByPriority_NilAfterExplicit(t *testing.T) {
+	skills := []*Skill{
+		{Name: "no-prio-1"},
+		{Name: "explicit", Priority: intPtr(10)},
+		{Name: "no-prio-2"},
+	}
+
+	sortSkillsByPriority(skills)
+
+	if skills[0].Name != "explicit" {
+		t.Errorf("explicit priority should come first, got %q", skills[0].Name)
+	}
+	// Nil-priority skills preserve registry order among themselves.
+	if skills[1].Name != "no-prio-1" || skills[2].Name != "no-prio-2" {
+		t.Errorf("nil-priority skills should preserve order, got [%s, %s]", skills[1].Name, skills[2].Name)
+	}
+}
+
+func TestSortSkillsByPriority_AllNilPreservesOrder(t *testing.T) {
+	skills := []*Skill{
+		{Name: "z"},
+		{Name: "m"},
+		{Name: "a"},
+	}
+
+	sortSkillsByPriority(skills)
+
+	// With no priorities, registry order is preserved.
+	want := []string{"z", "m", "a"}
+	for i, s := range skills {
+		if s.Name != want[i] {
+			t.Errorf("position %d: got %q, want %q", i, s.Name, want[i])
+		}
+	}
+}
+
+func TestSortSkillsByPriority_EqualPriorityPreservesOrder(t *testing.T) {
+	skills := []*Skill{
+		{Name: "second", Priority: intPtr(10)},
+		{Name: "first", Priority: intPtr(10)},
+		{Name: "third", Priority: intPtr(10)},
+	}
+
+	sortSkillsByPriority(skills)
+
+	// Same priority → stable sort preserves registry order.
+	want := []string{"second", "first", "third"}
+	for i, s := range skills {
+		if s.Name != want[i] {
+			t.Errorf("position %d: got %q, want %q", i, s.Name, want[i])
+		}
+	}
+}
+
+func TestCompositeInstructions_OrderRespectsPriority(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+
+	// Create minimal source dirs so generation doesn't fail.
+	for _, name := range []string{"guardrails", "mcp-usage", "memory"} {
+		if err := os.MkdirAll(filepath.Join(sourceDir, name), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	enabled := true
+	skills := []*Skill{
+		{
+			Name:     "guardrails",
+			Priority: intPtr(30),
+			Common:   &SkillSpec{Description: "Safety guardrails", Instructions: "# Guardrails\n\nBe safe."},
+			Targets:  map[string]*TargetSpec{"gemini": {Enabled: &enabled, Type: "instruction"}},
+		},
+		{
+			Name:   "mcp-usage",
+			Common: &SkillSpec{Description: "MCP usage core", Instructions: "# MCP Usage\n\nUse MCP tools."},
+			// No priority → comes after explicit priorities.
+			Targets: map[string]*TargetSpec{"gemini": {Enabled: &enabled, Type: "instruction"}},
+		},
+		{
+			Name:     "memory",
+			Priority: intPtr(10),
+			Common:   &SkillSpec{Description: "Memory practices", Instructions: "# Memory\n\nRemember things."},
+			Targets:  map[string]*TargetSpec{"gemini": {Enabled: &enabled, Type: "instruction"}},
+		},
+	}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: skills},
+		SourceDir: sourceDir,
+		Target:    "gemini",
+		RepoRoot:  tmpDir,
+		CodexHome: "/tmp/codex",
+	}
+
+	if err := g.generateForTarget("gemini"); err != nil {
+		t.Fatalf("generateForTarget: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, ".gemini", "GEMINI.md"))
+	if err != nil {
+		t.Fatalf("read GEMINI.md: %v", err)
+	}
+
+	content := string(data)
+
+	// memory (priority 10) should come before guardrails (priority 30),
+	// which should come before mcp-usage (no priority).
+	memIdx := strings.Index(content, "## Memory")
+	guardIdx := strings.Index(content, "## Guardrails")
+	mcpIdx := strings.Index(content, "## Mcp Usage")
+
+	if memIdx < 0 || guardIdx < 0 || mcpIdx < 0 {
+		t.Fatalf("missing expected sections in GEMINI.md:\n%s", content)
+	}
+
+	if memIdx > guardIdx {
+		t.Errorf("memory (priority 10) should appear before guardrails (priority 30)")
+	}
+	if guardIdx > mcpIdx {
+		t.Errorf("guardrails (priority 30) should appear before mcp-usage (no priority)")
+	}
+}
+
+func TestUpdateRegistryDate_NoUpdatedField(t *testing.T) {
+	tmpDir := t.TempDir()
+	registryPath := filepath.Join(tmpDir, "skills-registry.yaml")
+
+	content := "version: 1\nskills: []\n"
+	if err := os.WriteFile(registryPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := &Generator{
+		Registry:     &Registry{},
+		RegistryPath: registryPath,
+	}
+
+	if err := g.UpdateRegistryDate(); err != nil {
+		t.Fatalf("expected nil error when no updated field, got: %v", err)
+	}
+
+	// File should remain unchanged.
+	data, _ := os.ReadFile(registryPath)
+	if string(data) != content {
+		t.Errorf("file was modified despite no updated field:\n%s", string(data))
+	}
+}
+
+func TestGenerateClaudeCommand_DescriptionWithColonsQuoted(t *testing.T) {
+	dir := t.TempDir()
+	g := &Generator{
+		SourceDir:     filepath.Join(dir, "skills"),
+		CodexHome:     filepath.Join(dir, "codex"),
+		WorkspaceRoot: dir,
+	}
+	skill := newTestSkill("colon-cmd", "Review workflow: prioritize defects, verify coverage.")
+
+	if _, err := g.generateClaudeCommand(skill); err != nil {
+		t.Fatalf("generateClaudeCommand: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, ".claude", "commands", "colon-cmd.md"))
+	if err != nil {
+		t.Fatalf("read generated command: %v", err)
+	}
+	// Unquoted "key: value" descriptions are invalid YAML frontmatter; the
+	// description must be emitted as a quoted scalar.
+	want := `description: "Review workflow: prioritize defects, verify coverage."`
+	if !strings.Contains(string(data), want) {
+		t.Errorf("frontmatter description must be quoted.\nwant: %s\ngot:\n%s", want, string(data))
+	}
+}
+
+func TestValidate_AlwaysAllowDevNullRedirectIsSafe(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "readonly-allow")
+
+	scriptPath := filepath.Join(skillDir, "scripts", "probe.sh")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Read-only probe: output-discarding redirects must not count as writes.
+	content := "#!/usr/bin/env bash\nkubectl get pods >/dev/null 2>/dev/null\ncurl -sf http://localhost:3333/health > /dev/null\necho ok >&2\n"
+	if err := os.WriteFile(scriptPath, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("readonly-allow", "Read-only probe always_allow")
+	skill.Common.Scripts = []*Script{{Name: "probe", Path: "scripts/probe.sh"}}
+	skill.Common.AlwaysAllow = []string{"probe"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	if errs := g.Validate(); len(errs) != 0 {
+		t.Fatalf("expected no validation errors, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestValidate_AlwaysAllowMarkerOptsInWriteScript(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "mcp", "skills")
+	skillDir := filepath.Join(sourceDir, "marker-allow")
+
+	scriptPath := filepath.Join(skillDir, "scripts", "snapshot.sh")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	content := "#!/usr/bin/env bash\n# loom-always-allow: snapshot writes only its own report under .loom/\nmkdir -p .loom\nkubectl get pods > .loom/snapshot.txt\n"
+	if err := os.WriteFile(scriptPath, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skill := newTestSkill("marker-allow", "Marker opt-in always_allow")
+	skill.Common.Scripts = []*Script{{Name: "snapshot", Path: "scripts/snapshot.sh"}}
+	skill.Common.AlwaysAllow = []string{"snapshot"}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: sourceDir,
+		Target:    "all",
+		CodexHome: "/tmp/codex",
+	}
+
+	if errs := g.Validate(); len(errs) != 0 {
+		t.Fatalf("expected no validation errors, got %d: %v", len(errs), errs)
+	}
+}
+
+func TestGenerateClaudeAgentSkill_BundleLayoutAndFrontmatter(t *testing.T) {
+	dir := t.TempDir()
+	sourceDir := filepath.Join(dir, "mcp", "skills")
+	scriptPath := filepath.Join(sourceDir, "bundle-skill", "scripts", "run.sh")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho ok\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	g := &Generator{
+		SourceDir:     sourceDir,
+		CodexHome:     filepath.Join(dir, "codex"),
+		WorkspaceRoot: dir,
+	}
+	skill := newTestSkill("bundle-skill", "Review workflow: prioritize defects.")
+	skill.Common.Scripts = []*Script{{Name: "run", Path: "scripts/run.sh"}}
+	skill.Common.WhenToUse = "Use when the user says: check my diff."
+	skill.Targets = map[string]*TargetSpec{
+		"claude": {
+			Type:                   "skill",
+			DisableModelInvocation: boolPtr(true),
+			Context:                "fork",
+		},
+	}
+
+	files, err := g.generateClaudeSkillByType(skill)
+	if err != nil {
+		t.Fatalf("generateClaudeSkillByType: %v", err)
+	}
+
+	skillMD := filepath.Join(dir, ".claude", "skills", "bundle-skill", "SKILL.md")
+	data, err := os.ReadFile(skillMD)
+	if err != nil {
+		t.Fatalf("read generated SKILL.md: %v", err)
+	}
+	content := string(data)
+
+	for _, want := range []string{
+		"name: bundle-skill\n",
+		`description: "Review workflow: prioritize defects."`,
+		`when_to_use: "Use when the user says: check my diff."`,
+		"disable-model-invocation: true\n",
+		"context: fork\n",
+		"## Bundled Resources",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("SKILL.md missing %q, got:\n%s", want, content)
+		}
+	}
+
+	// Bundled script must be copied next to SKILL.md.
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "bundle-skill", "scripts", "run.sh")); err != nil {
+		t.Errorf("bundled script not copied: %v", err)
+	}
+
+	// Manifest paths must use the skills/<name>/ layout.
+	wantFiles := []string{
+		filepath.Join("skills", "bundle-skill", "SKILL.md"),
+		filepath.Join("skills", "bundle-skill", "scripts", "run.sh"),
+	}
+	for _, wf := range wantFiles {
+		found := false
+		for _, f := range files {
+			if f == wf {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("manifest files missing %q, got %v", wf, files)
+		}
+	}
+}
+
+func TestGenerateClaudeAgentSkill_OmitsOptionalFrontmatterWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	g := &Generator{
+		SourceDir:     filepath.Join(dir, "skills"),
+		CodexHome:     filepath.Join(dir, "codex"),
+		WorkspaceRoot: dir,
+	}
+	skill := newTestSkill("plain-skill", "A plain skill.")
+	skill.Targets = map[string]*TargetSpec{"claude": {Type: "skill"}}
+
+	if _, err := g.generateClaudeSkillByType(skill); err != nil {
+		t.Fatalf("generateClaudeSkillByType: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, ".claude", "skills", "plain-skill", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read generated SKILL.md: %v", err)
+	}
+	content := string(data)
+	for _, absent := range []string{"when_to_use", "disable-model-invocation", "context:", "## Bundled Resources"} {
+		if strings.Contains(content, absent) {
+			t.Errorf("SKILL.md must omit %q when unset, got:\n%s", absent, content)
+		}
+	}
+}
+
+func TestGenerateClaudeAgentSkill_ResolvesSkillPathToBundleDir(t *testing.T) {
+	dir := t.TempDir()
+	g := &Generator{
+		SourceDir:     filepath.Join(dir, "skills"),
+		CodexHome:     filepath.Join(dir, "codex"),
+		WorkspaceRoot: dir,
+	}
+	skill := newTestSkill("pathy-skill", "Path resolution skill.")
+	skill.Common.Instructions = "# Pathy\n\nRun `${SKILL_PATH}/scripts/run.sh`."
+	skill.Targets = map[string]*TargetSpec{"claude": {Type: "skill"}}
+
+	if _, err := g.generateClaudeSkillByType(skill); err != nil {
+		t.Fatalf("generateClaudeSkillByType: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, ".claude", "skills", "pathy-skill", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read generated SKILL.md: %v", err)
+	}
+	want := filepath.Join(dir, ".claude", "skills", "pathy-skill", "scripts", "run.sh")
+	if !strings.Contains(string(data), want) {
+		t.Errorf("${SKILL_PATH} must resolve to the delivered bundle dir.\nwant substring: %s\ngot:\n%s", want, string(data))
+	}
+}
+
+func TestGenerateClaudeAgentSkill_PrunesStaleCommandFile(t *testing.T) {
+	dir := t.TempDir()
+	staleCmd := filepath.Join(dir, ".claude", "commands", "migrated-skill.md")
+	if err := os.MkdirAll(filepath.Dir(staleCmd), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staleCmd, []byte("stale"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A neighboring hand-authored command must survive.
+	handAuthored := filepath.Join(dir, ".claude", "commands", "my-own-command.md")
+	if err := os.WriteFile(handAuthored, []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := &Generator{
+		SourceDir:     filepath.Join(dir, "skills"),
+		CodexHome:     filepath.Join(dir, "codex"),
+		WorkspaceRoot: dir,
+	}
+	skill := newTestSkill("migrated-skill", "Migrated skill.")
+	skill.Targets = map[string]*TargetSpec{"claude": {Type: "skill"}}
+
+	if _, err := g.generateClaudeSkillByType(skill); err != nil {
+		t.Fatalf("generateClaudeSkillByType: %v", err)
+	}
+
+	if _, err := os.Stat(staleCmd); !os.IsNotExist(err) {
+		t.Errorf("stale command file must be pruned after bundle generation")
+	}
+	if _, err := os.Stat(handAuthored); err != nil {
+		t.Errorf("hand-authored command file must survive: %v", err)
+	}
+}
+
+func TestGenerateClaudeCommand_StillWorksDuringTransition(t *testing.T) {
+	dir := t.TempDir()
+	g := &Generator{
+		SourceDir:     filepath.Join(dir, "skills"),
+		CodexHome:     filepath.Join(dir, "codex"),
+		WorkspaceRoot: dir,
+	}
+	skill := newTestSkill("legacy-cmd", "Legacy command skill.")
+	skill.Targets = map[string]*TargetSpec{"claude": {Type: "command"}}
+
+	files, err := g.generateClaudeSkillByType(skill)
+	if err != nil {
+		t.Fatalf("generateClaudeSkillByType: %v", err)
+	}
+	if len(files) != 1 || files[0] != filepath.Join("commands", "legacy-cmd.md") {
+		t.Errorf("command path must keep legacy layout, got %v", files)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "commands", "legacy-cmd.md")); err != nil {
+		t.Errorf("legacy command file not generated: %v", err)
+	}
+}
+
+func TestValidate_ClaudeListingCapExceeded(t *testing.T) {
+	long := strings.Repeat("x", 1000)
+	skill := newTestSkill("cap-skill", long)
+	skill.Common.WhenToUse = strings.Repeat("y", 600)
+	skill.Targets = map[string]*TargetSpec{"claude": {Type: "skill"}}
+
+	g := &Generator{
+		Registry:  &Registry{Skills: []*Skill{skill}},
+		SourceDir: t.TempDir(),
+		Target:    "claude",
+	}
+
+	errs := g.Validate()
+	found := false
+	for _, e := range errs {
+		if e.ResourceType == "when_to_use" && e.Skill == "cap-skill" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected when_to_use cap validation error, got %v", errs)
+	}
+
+	// Under the cap: no error.
+	skill.Common.WhenToUse = "short trigger"
+	errs = g.Validate()
+	for _, e := range errs {
+		if e.ResourceType == "when_to_use" {
+			t.Errorf("unexpected cap error for short when_to_use: %v", e)
+		}
+	}
+
+	// Cap check must not fire when claude is not a requested target.
+	skill.Common.WhenToUse = strings.Repeat("y", 600)
+	g.Target = "codex"
+	errs = g.Validate()
+	for _, e := range errs {
+		if e.ResourceType == "when_to_use" {
+			t.Errorf("cap error must not fire for non-claude target: %v", e)
+		}
+	}
 }

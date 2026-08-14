@@ -1,0 +1,1 @@
+- Factory page hierarchy pass: live metrics dock to the loom as an instrument rail, the departure board gains a clock column with distinctive flight tails and middle-truncated warp slugs, and the page reads economics → machine → log → library (`internal/hud/frontend/src/lib/components/mills/FactoryPanel.svelte`, `DepartureBoard.svelte`, `src/lib/utils/departureHelpers.ts`).

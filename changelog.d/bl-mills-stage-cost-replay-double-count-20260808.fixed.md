@@ -1,0 +1,1 @@
+- Fixed `pkg/mills/pipeline/runner.go` to persist and roll up only the new cost attributed to a re-attached spawn, preventing cumulative spawn costs from being counted once per stage attempt; existing historical run totals are unchanged.

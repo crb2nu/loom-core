@@ -1,0 +1,1 @@
+- Evaluate Mills scope at declared-directory granularity and report every normalized undeclared path as an individual structured verdict reason in `pkg/mills/gates/scope.go`.

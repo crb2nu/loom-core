@@ -1,0 +1,1 @@
+- Mark the promoted OpenRouter HTTP 402 credit-exhaustion signature as a non-retryable `external_dependency_incident` in `pkg/mills/adaptive/signatures.go`, preventing wasted provider retries.

@@ -16,11 +16,12 @@ import (
 	"cloud.google.com/go/storage"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -37,26 +38,21 @@ var (
 )
 
 func initGCP(ctx context.Context) error {
-	var opts []option.ClientOption
-
-	// Use credentials file if specified
-	if credFile := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credFile != "" {
-		opts = append(opts, option.WithCredentialsFile(credFile)) //nolint:staticcheck // TODO: migrate to workload identity or ADC
-	}
-
 	var err error
 
-	storageClient, err = storage.NewClient(ctx, opts...)
+	// All clients use Application Default Credentials (ADC).
+	// ADC checks GOOGLE_APPLICATION_CREDENTIALS, gcloud auth, and GCE metadata natively.
+	storageClient, err = storage.NewClient(ctx)
 	if err != nil {
 		return fmt.Errorf("create storage client: %w", err)
 	}
 
-	instancesClient, err = compute.NewInstancesRESTClient(ctx, opts...)
+	instancesClient, err = compute.NewInstancesRESTClient(ctx)
 	if err != nil {
 		return fmt.Errorf("create instances client: %w", err)
 	}
 
-	functionsClient, err = functions.NewFunctionClient(ctx, opts...)
+	functionsClient, err = functions.NewFunctionClient(ctx)
 	if err != nil {
 		return fmt.Errorf("create functions client: %w", err)
 	}
@@ -73,6 +69,20 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-gcp",
+		logger,
+	)
+	if err !=
+		nil {
+		logger.
+			Warn("OTel tracer init failed",
+
+				"error", err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-gcp")
 
 	if err := initGCP(ctx); err != nil {
 		logger.Error("GCP init error", "error", err)
@@ -85,6 +95,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-gcp", "version", version, "project", gcpProject, "region", gcpRegion)
 
 	server := mcp.NewServer("mcp-gcp", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Google Cloud Platform tools. Uses Application Default Credentials or GOOGLE_APPLICATION_CREDENTIALS. Set GCP_PROJECT for project-scoped operations.")
 
 	// Cloud Storage
@@ -100,7 +111,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleStorageListBuckets)
+	}, mcpotel.TracedToolHandler(tracer, "gcp_storage_list_buckets", handleStorageListBuckets))
 
 	server.AddTool(mcp.Tool{
 		Name:        "gcp_storage_list_objects",
@@ -123,7 +134,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"bucket"},
 		},
-	}, handleStorageListObjects)
+	}, mcpotel.TracedToolHandler(tracer, "gcp_storage_list_objects", handleStorageListObjects))
 
 	server.AddTool(mcp.Tool{
 		Name:        "gcp_storage_get_object",
@@ -146,7 +157,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"bucket", "object"},
 		},
-	}, handleStorageGetObject)
+	}, mcpotel.TracedToolHandler(tracer, "gcp_storage_get_object", handleStorageGetObject))
 
 	server.AddTool(mcp.Tool{
 		Name:        "gcp_storage_object_metadata",
@@ -165,9 +176,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"bucket", "object"},
 		},
-	}, handleStorageObjectMetadata)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// Compute Engine
+		// Compute Engine
+		"gcp_storage_object_metadata", handleStorageObjectMetadata))
+
 	server.AddTool(mcp.Tool{
 		Name:        "gcp_compute_list_instances",
 		Description: "List Compute Engine instances",
@@ -192,7 +205,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleComputeListInstances)
+	}, mcpotel.TracedToolHandler(tracer, "gcp_compute_list_instances", handleComputeListInstances))
 
 	server.AddTool(mcp.Tool{
 		Name:        "gcp_compute_get_instance",
@@ -215,9 +228,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"instance"},
 		},
-	}, handleComputeGetInstance)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// Cloud Functions
+		// Cloud Functions
+		"gcp_compute_get_instance", handleComputeGetInstance))
+
 	server.AddTool(mcp.Tool{
 		Name:        "gcp_functions_list",
 		Description: "List Cloud Functions (2nd gen)",
@@ -238,7 +253,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleFunctionsList)
+	}, mcpotel.TracedToolHandler(tracer, "gcp_functions_list", handleFunctionsList))
 
 	server.AddTool(mcp.Tool{
 		Name:        "gcp_functions_get",
@@ -261,7 +276,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"function"},
 		},
-	}, handleFunctionsGet)
+	}, mcpotel.TracedToolHandler(tracer, "gcp_functions_get", handleFunctionsGet))
 
 	return server.Run(ctx)
 }

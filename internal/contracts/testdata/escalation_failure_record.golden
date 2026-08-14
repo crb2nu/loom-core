@@ -1,0 +1,41 @@
+{
+  "backlog_id": "BL-ESC-1",
+  "pipeline_run_id": "PIPE-ESC-1",
+  "reason": "stage ci_watch terminal config error (not retried) [class=config]: gitlab: status 401: unauthorized",
+  "state": "escalated",
+  "cost_usd": 0.42,
+  "attempts": 1,
+  "classification": {
+    "classifier": "mills-failure-classifier",
+    "escalation_class": "config",
+    "failure_class": "configuration",
+    "retryable": false,
+    "free_retry": false,
+    "terminal": true,
+    "external_dependency_id": "external_dependency.gitlab.auth_failure",
+    "external_dependency": "gitlab"
+  },
+  "escalation_class": "config",
+  "failure_class": "configuration",
+  "retryable": false,
+  "external_dependency_id": "external_dependency.gitlab.auth_failure",
+  "external_dependency": "gitlab",
+  "stage_stack": [
+    {
+      "stage": "ci_watch",
+      "attempt": 1,
+      "outcome": "error",
+      "cost_usd": 0.42,
+      "duration": "1s"
+    }
+  ],
+  "gate_verdicts": [
+    {
+      "gate": "scope",
+      "after_stage": "implement",
+      "outcome": "pass"
+    }
+  ],
+  "last_log_tail": "gitlab: status 401: unauthorized",
+  "generated_at": "2026-07-08T18:30:00Z"
+}

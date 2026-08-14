@@ -1,0 +1,1 @@
+- Fixed Claude Code spawn lanes to use CLI 2.1.220, pass routed models, and prefer native OAuth setup-token authentication in `internal/hud/spawn.go` and its spawn tests.

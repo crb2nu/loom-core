@@ -11,7 +11,7 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
 	"github.com/crb2nu/loom/pkg/lifecycle"
-	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/pathsec"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -48,14 +48,18 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
-	logger.Info("starting server", "name", "mcp-filesystem", "version", version, "root", allowedRoot)
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-filesystem", version,
+		mcpscaffold.WithInstructions("Safe filesystem access. Tools: list_directory, read_file, search_files"),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cleanup(ctx) }()
 
-	server := mcp.NewServer("mcp-filesystem", version)
-	server.SetInstructions("Safe filesystem access. Tools: list_directory, read_file, search_files")
+	srv.Logger.Info("filesystem root", "root", allowedRoot)
 
 	// list_directory
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "list_directory",
 		Description: "List contents of a directory",
 		InputSchema: mcp.InputSchema{
@@ -71,7 +75,7 @@ func run(ctx context.Context) error {
 	}, handleListDirectory)
 
 	// read_file
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "read_file",
 		Description: "Read contents of a file",
 		InputSchema: mcp.InputSchema{
@@ -87,7 +91,7 @@ func run(ctx context.Context) error {
 	}, handleReadFile)
 
 	// search_files (simple glob)
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "search_files",
 		Description: "Search for files matching a glob pattern",
 		InputSchema: mcp.InputSchema{
@@ -106,7 +110,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleSearchFiles)
 
-	return server.Run(ctx)
+	return srv.Run(ctx)
 }
 
 func handleListDirectory(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {

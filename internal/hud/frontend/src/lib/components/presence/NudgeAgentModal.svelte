@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
   import { presenceActionsStore } from '../../stores/presenceActions.svelte.ts';
   import Modal from '../../widgets/Modal.svelte';
 </script>

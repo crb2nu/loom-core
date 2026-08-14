@@ -1,9 +1,13 @@
 package templatevars
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	regpkg "github.com/crb2nu/loom/pkg/registry"
 	"github.com/crb2nu/loom/pkg/secrets"
@@ -35,6 +39,50 @@ func (m *mockBackend) ReadOnly() bool { return false }
 
 func newMockSecrets(kv map[string]string) *secrets.Manager {
 	return secrets.NewManager(&mockBackend{store: kv})
+}
+
+type retryingSecretExecutor struct {
+	blockFirst bool
+	started    chan struct{}
+	startOnce  sync.Once
+	mu         sync.Mutex
+	whoami     int
+}
+
+func (e *retryingSecretExecutor) LookPath(file string) (string, error) {
+	if file == "op" {
+		return "/test/op", nil
+	}
+	return "", errors.New("command unavailable")
+}
+
+func (e *retryingSecretExecutor) Run(_ string, _ ...string) ([]byte, []byte, error) {
+	return nil, nil, errors.New("legacy non-context command path invoked")
+}
+
+func (e *retryingSecretExecutor) RunContext(ctx context.Context, _ string, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "whoami" {
+		e.mu.Lock()
+		e.whoami++
+		call := e.whoami
+		e.mu.Unlock()
+		if e.blockFirst && call == 1 {
+			e.startOnce.Do(func() { close(e.started) })
+			<-ctx.Done()
+			return nil, nil, ctx.Err()
+		}
+		return []byte(`{"email":"test@example.com"}`), nil, nil
+	}
+	if len(args) >= 2 && args[0] == "item" && args[1] == "get" {
+		return []byte(`{"fields":[{"id":"credential","label":"credential","value":"retry-secret"}]}`), nil, nil
+	}
+	return nil, nil, errors.New("unexpected command")
+}
+
+func (e *retryingSecretExecutor) whoamiCalls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.whoami
 }
 
 // =============================================================================
@@ -280,5 +328,74 @@ func TestExpand_NoSecretsManager_Secret(t *testing.T) {
 	got := e.Expand("${secret:ANYTHING}")
 	if got != "" {
 		t.Errorf("got %q, want empty string", got)
+	}
+}
+
+func TestExpandContext_CanceledInitializationRetriesSuccessfully(t *testing.T) {
+	t.Setenv("RETRY_SECRET", "")
+	t.Setenv("LOOM_MASTER_KEY", "templatevars-retry-test-key")
+	executor := &retryingSecretExecutor{
+		blockFirst: true,
+		started:    make(chan struct{}),
+	}
+	previous := secrets.SetExecutor(executor)
+	t.Cleanup(func() { secrets.SetExecutor(previous) })
+
+	expander := New(WithLazySecrets())
+	ctx, cancel := context.WithCancel(context.Background())
+	firstDone := make(chan string, 1)
+	go func() {
+		firstDone <- expander.ExpandContext(ctx, "${secret:RETRY_SECRET}")
+	}()
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for canceled secret initialization")
+	}
+	cancel()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("canceled secret initialization did not return")
+	}
+
+	if got := expander.Expand("${secret:RETRY_SECRET}"); got != "retry-secret" {
+		t.Fatalf("retry expansion = %q, want retry-secret", got)
+	}
+	if got := executor.whoamiCalls(); got != 2 {
+		t.Fatalf("op initialization calls = %d, want canceled attempt plus retry", got)
+	}
+}
+
+func TestExpandContext_ConcurrentLazyInitializationIsRaceFree(t *testing.T) {
+	t.Setenv("CONCURRENT_SECRET", "")
+	t.Setenv("LOOM_MASTER_KEY", "templatevars-concurrency-test-key")
+	executor := &retryingSecretExecutor{started: make(chan struct{})}
+	previous := secrets.SetExecutor(executor)
+	t.Cleanup(func() { secrets.SetExecutor(previous) })
+
+	expander := New(WithLazySecrets())
+	const workers = 32
+	start := make(chan struct{})
+	results := make(chan string, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- expander.ExpandContext(context.Background(), "${secret:CONCURRENT_SECRET}")
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if got != "retry-secret" {
+			t.Fatalf("concurrent expansion = %q, want retry-secret", got)
+		}
+	}
+	if got := executor.whoamiCalls(); got != 1 {
+		t.Fatalf("op initialization calls = %d, want one successful initialization", got)
 	}
 }

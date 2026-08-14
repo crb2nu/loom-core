@@ -1,0 +1,1 @@
+- Fix Mills Pipeline Run, Bolts, and Sparks merge-request links to route through each backlog item's `TargetProject`, while retaining copy controls (`internal/hud/frontend/src/lib/`).

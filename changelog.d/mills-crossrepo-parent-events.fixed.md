@@ -1,0 +1,1 @@
+- Made Mills cross-repository registry hot reloads debounce parent-directory filesystem hints with a bounded maximum, ignore unchanged content, and deduplicate persistent read errors while preserving last-good state across atomic replacements on inotify and kqueue.

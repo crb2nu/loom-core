@@ -22,6 +22,8 @@ if [[ -z "$base_ref" ]]; then
     base_ref="${remote}/${GITHUB_BASE_REF}"
   elif [[ -n "${CI_DEFAULT_BRANCH:-}" ]]; then
     base_ref="${remote}/${CI_DEFAULT_BRANCH}"
+  elif git rev-parse --verify "${remote}/main" >/dev/null 2>&1; then
+    base_ref="${remote}/main"
   elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
     base_ref="HEAD~1"
   fi
@@ -65,18 +67,55 @@ if [[ -z "$changed_files" ]]; then
 fi
 
 code_pattern='^(cmd/|internal/|pkg/|scripts/|Makefile$|go\.mod$|go\.sum$|\.gitlab-ci\.yml$|\.github/workflows/)'
-docs_pattern='^(README\.md$|CHANGELOG\.md$|ROADMAP\.md$|AGENTS\.md$|docs/)'
+# A per-MR changelog fragment (changelog.d/<slug>.<category>.md) counts as the
+# documentation update: fragments are the collision-free replacement for direct
+# CHANGELOG.md edits and are folded into CHANGELOG.md at release time (see
+# changelog.d/README.md). CHANGELOG.md itself stays accepted for the transition
+# period and for release folds.
+docs_pattern='^(README\.md$|CHANGELOG\.md$|ROADMAP\.md$|AGENTS\.md$|docs/|changelog\.d/)'
+
+# Generated/build artifacts AND test-only files that match code_pattern but
+# don't require user-facing documentation. Machine-produced outputs and
+# internal test code are not visible to product users, so CHANGELOG drift
+# driven by these classes produces noise instead of signal.
+#
+# Classes:
+#   /dist/            - compiled frontend bundles
+#   /testdata/        - Go test fixtures
+#   _golden\.         - contract-golden snapshots
+#   \.min\.(js|css)$  - minified bundles
+#   \.snap$           - frontend snapshot tests
+#   _test\.go$        - Go unit/integration tests
+#   _test\.py$        - Python tests
+#   ^test_.*\.py$     - Python tests (pytest naming)
+#   _mock\.go$        - Go test mocks
+#   /mocks/           - Go mock directories
+generated_pattern='(/dist/|/testdata/|_golden\.|\.min\.js$|\.min\.css$|\.snap$|_test\.go$|_test\.py$|(^|/)test_[^/]+\.py$|_mock\.go$|/mocks/)'
 
 code_changes="$(printf '%s\n' "$changed_files" | grep -E "$code_pattern" || true)"
 docs_changes="$(printf '%s\n' "$changed_files" | grep -E "$docs_pattern" || true)"
 
-if [[ -n "$code_changes" && -z "$docs_changes" ]]; then
+# Strip generated artifacts from the code change list.
+if [[ -n "$code_changes" ]]; then
+  significant_changes="$(printf '%s\n' "$code_changes" | grep -vE "$generated_pattern" || true)"
+else
+  significant_changes=""
+fi
+
+if [[ -n "$significant_changes" && -z "$docs_changes" ]]; then
   echo "docs-guardrail: code-facing changes detected without doc updates"
   echo ""
-  echo "Changed code-facing files:"
-  printf '%s\n' "$code_changes"
+  echo "Documentation-significant files:"
+  printf '%s\n' "$significant_changes"
+  if [[ "$code_changes" != "$significant_changes" ]]; then
+    skipped="$(printf '%s\n' "$code_changes" | grep -E "$generated_pattern" || true)"
+    echo ""
+    echo "Excluded (generated artifacts):"
+    printf '%s\n' "$skipped"
+  fi
   echo ""
-  echo "Expected at least one change in README.md, CHANGELOG.md, ROADMAP.md, AGENTS.md, or docs/."
+  echo "Add a changelog fragment (changelog.d/<slug>.<category>.md) describing this change,"
+  echo "or update README.md, CHANGELOG.md, ROADMAP.md, AGENTS.md, or docs/."
   echo "If this is intentional, include [skip-docs-check] in the commit message."
   exit 1
 fi

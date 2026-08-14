@@ -1,0 +1,1 @@
+- Attribute Mills `retry_cost_usd` and `auto_requeues` to bounded failure classes in `pkg/mills/budget/budget.go` and `pkg/telemetry/telemetry.go`, with operator guidance in `docs/mills-external-dependency-runbook.md`.

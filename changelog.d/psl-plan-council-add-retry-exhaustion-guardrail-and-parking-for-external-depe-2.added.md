@@ -1,0 +1,1 @@
+- **Added external-dependency incident runbook** (`docs/runbook-external-dependency-incidents.md`): documents the parked-run flow (terminal `escalated` state, not a distinct pipeline status), detection and evidence steps, resume-only-after-recovery conditions, the requeue-by-backlog-ID procedure, and `pipeline.retry` cap configuration.

@@ -1,0 +1,1 @@
+- Deny paid retries for classified external dependency incidents in `pkg/mills/budget/retry_policy.go`, with policy coverage in `pkg/mills/budget/retry_policy_test.go`.

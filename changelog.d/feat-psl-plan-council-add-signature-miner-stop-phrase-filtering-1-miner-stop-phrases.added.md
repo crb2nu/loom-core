@@ -1,0 +1,1 @@
+- Add configurable, case- and whitespace-normalized signature-miner stop-phrase filtering in `pkg/mills/adaptive/stop_phrases.go`, with table-driven coverage in `pkg/mills/adaptive/stop_phrases_test.go`.

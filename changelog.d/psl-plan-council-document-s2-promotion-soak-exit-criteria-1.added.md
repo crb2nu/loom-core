@@ -1,0 +1,1 @@
+- Add the Mill Staff S2 overseer promotion soak runbook in `docs/mill-staff-s2-soak-runbook.md`, defining the closed seven-day UTC evidence window, numeric exit gates, and fail-closed abort and escalation procedure.

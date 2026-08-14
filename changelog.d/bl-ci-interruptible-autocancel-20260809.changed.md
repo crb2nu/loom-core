@@ -1,0 +1,1 @@
+- Document the CI cancellation policy: jobs inherit `interruptible: true` for superseded feature-branch pipelines, while the default-branch deploy path remains protected from auto-cancel (`.gitlab-ci.yml`).

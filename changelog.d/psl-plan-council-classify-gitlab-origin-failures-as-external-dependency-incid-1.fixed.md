@@ -1,0 +1,1 @@
+- Classify GitLab agent unauthenticated and GitLab CI pipeline failure signatures as external dependency incidents in `pkg/mcperror/classification.go`, with regression coverage in `pkg/mcperror/classification_test.go`.

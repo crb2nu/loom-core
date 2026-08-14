@@ -1,0 +1,484 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"time"
+
+	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/internal/pool"
+	"github.com/crb2nu/loom/internal/router"
+)
+
+type statusResult struct {
+	Running             bool                 `json:"running"`
+	Servers             int                  `json:"servers"`
+	ActiveConns         int                  `json:"activeConns"`
+	IdleConns           int                  `json:"idleConns"`
+	LocalPool           *poolPressure        `json:"localPool,omitempty"`
+	HubPool             *poolPressure        `json:"hubPool,omitempty"`
+	Processes           []string             `json:"processes"`
+	ActiveRPCs          int64                `json:"activeRPCs"`
+	DrainReady          bool                 `json:"drainReady"`
+	Draining            bool                 `json:"draining"`
+	DaemonEpoch         int64                `json:"daemonEpoch"`
+	ActiveProxySessions int                  `json:"activeProxySessions"`
+	Health              *statusHealthSummary `json:"health,omitempty"`
+	Observability       observabilityStatus  `json:"observability"`
+}
+
+type poolPressure struct {
+	ActiveConns int     `json:"activeConns"`
+	IdleConns   int     `json:"idleConns"`
+	MaxIdle     int     `json:"maxIdle"`
+	MaxOpen     int     `json:"maxOpen"`
+	PressurePct float64 `json:"pressurePct"`
+	AtCapacity  bool    `json:"atCapacity"`
+}
+
+type statusHealthSummary struct {
+	Servers         map[string]*statusHealthServer `json:"servers,omitempty"`
+	DegradedServers []string                       `json:"degraded_servers,omitempty"`
+}
+
+type statusHealthServer struct {
+	Healthy           bool      `json:"healthy"`
+	Ready             bool      `json:"ready"`
+	ConsecutiveFails  int       `json:"consecutive_fails"`
+	TotalChecks       int       `json:"total_checks"`
+	TotalFailures     int       `json:"total_failures"`
+	AvgLatencyMs      float64   `json:"avg_latency_ms"`
+	LastError         string    `json:"last_error,omitempty"`
+	RestartCount      int       `json:"restart_count"`
+	LastCheck         time.Time `json:"last_check"`
+	LastHealthy       time.Time `json:"last_healthy,omitempty"`
+	LastRestart       time.Time `json:"last_restart,omitempty"`
+	AutoRestartFailed bool      `json:"auto_restart_failed,omitempty"`
+	LastDeepProbe     time.Time `json:"last_deep_probe,omitempty"`
+}
+
+func (d *Daemon) handleStatus(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	stats := d.pool.Stats()
+	rpcs := d.activeRPCs.Load()
+	serverCount := 0
+	if reg := d.currentRegistry(); reg != nil {
+		serverCount = len(reg.Servers)
+	}
+
+	activeSessions := 0
+	if d.sessions != nil {
+		activeSessions = d.sessions.ActiveCount()
+	}
+
+	result := statusResult{
+		Running:             true,
+		Servers:             serverCount,
+		ActiveConns:         stats.ActiveConns,
+		IdleConns:           stats.IdleConns,
+		LocalPool:           d.poolPressure(d.pool, false),
+		HubPool:             d.poolPressure(d.hubPool, true),
+		Processes:           d.runningLocalServerNames(),
+		ActiveRPCs:          rpcs,
+		DrainReady:          rpcs == 0,
+		Draining:            d.draining.Load(),
+		DaemonEpoch:         d.daemonEpoch,
+		ActiveProxySessions: activeSessions,
+		Health:              d.statusHealthSnapshot(),
+		Observability:       d.currentObservabilityStatus(),
+	}
+	return mcp.NewResponse(msg.ID, result)
+}
+
+func (d *Daemon) statusHealthSnapshot() *statusHealthSummary {
+	if d.healthMonitor == nil {
+		return nil
+	}
+
+	statuses := d.healthMonitor.GetAllStatuses()
+	if len(statuses) == 0 {
+		return nil
+	}
+
+	degraded := make([]string, 0, len(statuses))
+	servers := make(map[string]*statusHealthServer, len(statuses))
+	for name, status := range statuses {
+		if status == nil {
+			continue
+		}
+		servers[name] = &statusHealthServer{
+			Healthy:           status.Healthy,
+			Ready:             status.Healthy && status.ConsecutiveFails == 0 && !status.AutoRestartFailed,
+			ConsecutiveFails:  status.ConsecutiveFails,
+			TotalChecks:       status.TotalChecks,
+			TotalFailures:     status.TotalFailures,
+			AvgLatencyMs:      status.AvgLatencyMs,
+			LastError:         status.LastError,
+			RestartCount:      status.RestartCount,
+			LastCheck:         status.LastCheck,
+			LastHealthy:       status.LastHealthy,
+			LastRestart:       status.LastRestart,
+			AutoRestartFailed: status.AutoRestartFailed,
+			LastDeepProbe:     status.LastDeepProbe,
+		}
+		if !status.Healthy || status.ConsecutiveFails > 0 || status.LastError != "" || status.AutoRestartFailed {
+			degraded = append(degraded, name)
+		}
+	}
+	sort.Strings(degraded)
+
+	return &statusHealthSummary{
+		Servers:         servers,
+		DegradedServers: degraded,
+	}
+}
+
+func (d *Daemon) poolPressure(p *pool.Pool, hub bool) *poolPressure {
+	if p == nil {
+		return nil
+	}
+	stats := p.Stats()
+	maxIdle, maxOpen, _, _ := d.fileCfg.Resources.GetPoolConfig()
+	if hub {
+		maxIdle, maxOpen, _, _ = d.fileCfg.Resources.GetHubPoolConfig()
+	}
+	pressure := 0.0
+	if maxOpen > 0 {
+		pressure = float64(stats.ActiveConns) / float64(maxOpen) * 100
+	}
+	return &poolPressure{
+		ActiveConns: stats.ActiveConns,
+		IdleConns:   stats.IdleConns,
+		MaxIdle:     maxIdle,
+		MaxOpen:     maxOpen,
+		PressurePct: pressure,
+		AtCapacity:  maxOpen > 0 && stats.ActiveConns >= maxOpen,
+	}
+}
+
+// serverTransport derives the transport type (stdio, ws, sse, ssh) from registry config.
+func (d *Daemon) serverTransport(name string) string {
+	reg := d.currentRegistry()
+	if reg == nil {
+		return ""
+	}
+	for _, s := range reg.Servers {
+		if s.Name != name {
+			continue
+		}
+		if s.URL != "" {
+			if len(s.URL) >= 5 && (s.URL[:5] == "ws://" || s.URL[:6] == "wss://") {
+				return "ws"
+			}
+			return "sse"
+		}
+		spec := s.Common
+		if spec == nil {
+			if t, ok := s.Targets[d.cfg.Target]; ok {
+				spec = t
+			}
+		}
+		if spec != nil {
+			if spec.SSH != nil {
+				return "ssh"
+			}
+			if spec.Command != "" {
+				return "stdio"
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+type serversResult struct {
+	Servers []serverInfo `json:"servers"`
+}
+
+type serverInfo struct {
+	Name        string   `json:"name"`
+	Categories  []string `json:"categories,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Running     bool     `json:"running"`
+	Transport   string   `json:"transport,omitempty"`
+}
+
+func (d *Daemon) handleServers(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	var servers []serverInfo
+	reg := d.currentRegistry()
+	if reg == nil {
+		return mcp.NewResponse(msg.ID, serversResult{Servers: servers})
+	}
+	running := d.runningLocalServerNames()
+	runningSet := make(map[string]bool)
+	for _, name := range running {
+		runningSet[name] = true
+	}
+
+	for _, s := range reg.Servers {
+		desc := ""
+		if s.Common != nil {
+			desc = s.Common.Description
+		}
+		servers = append(servers, serverInfo{
+			Name:        s.Name,
+			Categories:  s.Categories,
+			Description: desc,
+			Running:     runningSet[s.Name],
+			Transport:   d.serverTransport(s.Name),
+		})
+	}
+
+	return mcp.NewResponse(msg.ID, serversResult{Servers: servers})
+}
+
+type healthResult struct {
+	Servers    map[string]serverHealth `json:"servers"`
+	Divergence []healthDivergenceEntry `json:"divergence,omitempty"`
+}
+
+type healthDivergenceEntry struct {
+	Server string `json:"server"`
+	Reason string `json:"reason"`
+}
+
+type serverHealth struct {
+	Local      *healthStatus     `json:"local,omitempty"`
+	Hub        *healthStatus     `json:"hub,omitempty"`
+	Monitor    *healthStatus     `json:"monitor,omitempty"`
+	Target     string            `json:"target"`
+	Transport  string            `json:"transport,omitempty"`
+	Divergence *HealthDivergence `json:"divergence,omitempty"`
+}
+
+type healthStatus struct {
+	Healthy      bool    `json:"healthy"`
+	ConsecFails  int     `json:"consecFails"`
+	AvgLatencyMs float64 `json:"avgLatencyMs,omitempty"`
+	ErrorMessage string  `json:"errorMessage,omitempty"`
+}
+
+func (d *Daemon) handleHealth(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	allHealth := d.router.GetAllHealth()
+	servers := make(map[string]serverHealth)
+	var divergences []healthDivergenceEntry
+
+	// Collect monitor statuses for divergence comparison.
+	var monitorStatuses map[string]*ServerHealthStatus
+	if d.healthMonitor != nil {
+		monitorStatuses = d.healthMonitor.GetAllStatuses()
+	}
+
+	for name, h := range allHealth {
+		decision, _ := d.router.Route(ctx, name)
+		target := "unavailable"
+		routerAvailable := false
+		if decision != nil {
+			target = decision.Target.String()
+			routerAvailable = decision.Target != router.TargetUnavailable
+		}
+
+		sh := serverHealth{Target: target, Transport: d.serverTransport(name)}
+		if h.Local != nil {
+			sh.Local = &healthStatus{
+				Healthy:      h.Local.Healthy,
+				ConsecFails:  h.Local.ConsecFails,
+				AvgLatencyMs: h.Local.AvgLatencyMs,
+				ErrorMessage: h.Local.ErrorMessage,
+			}
+		}
+		if h.Hub != nil {
+			sh.Hub = &healthStatus{
+				Healthy:      h.Hub.Healthy,
+				ConsecFails:  h.Hub.ConsecFails,
+				AvgLatencyMs: h.Hub.AvgLatencyMs,
+				ErrorMessage: h.Hub.ErrorMessage,
+			}
+		}
+
+		// Include monitor slice if available.
+		monStatus := monitorStatuses[name]
+		if monStatus != nil {
+			sh.Monitor = &healthStatus{
+				Healthy:      monStatus.Healthy,
+				ConsecFails:  monStatus.ConsecutiveFails,
+				AvgLatencyMs: monStatus.AvgLatencyMs,
+				ErrorMessage: monStatus.LastError,
+			}
+		}
+
+		// Check for divergence between monitor and router.
+		if div := computeHealthDivergence(monStatus, routerAvailable); div != nil {
+			sh.Divergence = div
+			divergences = append(divergences, healthDivergenceEntry{
+				Server: name,
+				Reason: div.Reason,
+			})
+		}
+
+		servers[name] = sh
+	}
+
+	return mcp.NewResponse(msg.ID, healthResult{
+		Servers:    servers,
+		Divergence: divergences,
+	})
+}
+
+// HealthResponse is the JSON response for the /health endpoint.
+type HealthResponse struct {
+	Status     string                         `json:"status"`
+	Timestamp  string                         `json:"timestamp"`
+	Uptime     string                         `json:"uptime,omitempty"`
+	Servers    map[string]*ServerHealthStatus `json:"servers,omitempty"`
+	Tunnels    map[string]*TunnelStatus       `json:"tunnels,omitempty"`
+	Summary    HealthSummary                  `json:"summary"`
+	Divergence []healthDivergenceEntry        `json:"divergence,omitempty"`
+}
+
+// HealthSummary provides aggregate health statistics.
+type HealthSummary struct {
+	Total     int `json:"total"`
+	Healthy   int `json:"healthy"`
+	Unhealthy int `json:"unhealthy"`
+	Unknown   int `json:"unknown"`
+}
+
+// HealthHandler returns an HTTP handler for detailed health status.
+func (d *Daemon) HealthHandler() http.HandlerFunc {
+	startTime := time.Now()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		resp := HealthResponse{
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Uptime:    time.Since(startTime).Round(time.Second).String(),
+		}
+
+		// Get server health from monitor
+		if d.healthMonitor != nil {
+			resp.Servers = d.healthMonitor.GetAllStatuses()
+		}
+
+		// Get tunnel status
+		if d.tunnelMgr != nil {
+			resp.Tunnels = d.tunnelMgr.GetAllStatuses()
+		}
+
+		// Check for divergence between monitor and router.
+		if d.router != nil && resp.Servers != nil {
+			for name, status := range resp.Servers {
+				decision, _ := d.router.Route(r.Context(), name)
+				routerAvailable := decision != nil && decision.Target != router.TargetUnavailable
+				if div := computeHealthDivergence(status, routerAvailable); div != nil {
+					resp.Divergence = append(resp.Divergence, healthDivergenceEntry{
+						Server: name,
+						Reason: div.Reason,
+					})
+				}
+			}
+		}
+
+		// Calculate summary
+		if reg := d.currentRegistry(); reg != nil {
+			resp.Summary.Total = len(reg.Servers)
+		}
+		for _, status := range resp.Servers {
+			if status.Healthy {
+				resp.Summary.Healthy++
+			} else {
+				resp.Summary.Unhealthy++
+			}
+		}
+		resp.Summary.Unknown = resp.Summary.Total - resp.Summary.Healthy - resp.Summary.Unhealthy
+
+		// Determine overall status
+		if len(resp.Divergence) > 0 {
+			resp.Status = "diverged"
+			w.WriteHeader(http.StatusOK)
+		} else if resp.Summary.Unhealthy > 0 {
+			resp.Status = "degraded"
+			w.WriteHeader(http.StatusOK) // Still return 200 for degraded
+		} else if resp.Summary.Healthy == 0 && resp.Summary.Total > 0 {
+			resp.Status = "unhealthy"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			resp.Status = "healthy"
+			w.WriteHeader(http.StatusOK)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+type configHashResult struct {
+	RegistryHash string `json:"registryHash"`
+	ManifestHash string `json:"manifestHash"`
+	ToolCount    int    `json:"toolCount"`
+	ServerCount  int    `json:"serverCount"`
+}
+
+// handleConfigHash returns hash of current configuration for drift detection.
+func (d *Daemon) handleConfigHash(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	d.toolCache.mu.RLock()
+	toolCount := len(visibleTools(d.toolCache.tools))
+	d.toolCache.mu.RUnlock()
+
+	serverCount := 0
+	if reg := d.currentRegistry(); reg != nil {
+		serverCount = len(reg.Servers)
+	}
+	result := configHashResult{
+		ToolCount:   toolCount,
+		ServerCount: serverCount,
+	}
+
+	return mcp.NewResponse(msg.ID, result)
+}
+
+type profileParams struct {
+	Name string `json:"name,omitempty"`
+}
+
+type profileResult struct {
+	Active    string   `json:"active"`
+	Available []string `json:"available"`
+	ToolCount int      `json:"toolCount"`
+}
+
+// handleProfile gets or sets the active profile.
+func (d *Daemon) handleProfile(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	var params profileParams
+	if msg.Params != nil {
+		json.Unmarshal(msg.Params, &params)
+	}
+
+	// If name is provided, switch profile
+	if params.Name != "" {
+		profile := d.profiles.Get(params.Name)
+		if profile == nil {
+			return mcp.NewErrorResponse(msg.ID, mcp.InvalidParams, fmt.Sprintf("unknown profile: %s", params.Name)), nil
+		}
+
+		revision := d.setActiveProfile(params.Name)
+		d.logger.Info("switching profile", "profile", params.Name, "cache_revision", revision)
+
+		// Refresh through the daemon-owned, shutdown-joined coordinator.
+		d.startBackgroundToolRefresh("profile_switch")
+	}
+
+	d.toolCache.mu.RLock()
+	toolCount := len(visibleTools(d.toolCache.tools))
+	d.toolCache.mu.RUnlock()
+
+	result := profileResult{
+		Active:    d.currentActiveProfile(),
+		Available: d.profiles.List(),
+		ToolCount: toolCount,
+	}
+
+	return mcp.NewResponse(msg.ID, result)
+}

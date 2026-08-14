@@ -1,13 +1,14 @@
 package monitor
 
 import (
+	"encoding/json"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/hud/notify"
+	"github.com/crb2nu/loom/internal/visibility/contracts/health"
 )
 
 const (
@@ -86,10 +87,14 @@ type ServerHealthEntry struct {
 	ConsecFails  int     `json:"consec_fails"`
 	AvgLatencyMs float64 `json:"avg_latency_ms"`
 	ErrorMessage string  `json:"error_message,omitempty"`
-	Target       string  `json:"target"` // "local", "hub", or "unavailable"
+	Target       string  `json:"target"`    // "local", "hub", or "unavailable"
+	Transport    string  `json:"transport"` // "ws", "stdio", "sse", "ssh", or ""
 
 	// Sparkline history (last DefaultRingSize readings, oldest first)
 	LatencyHistory []float64 `json:"latency_history"`
+
+	// Divergence between health monitor and router (nil when they agree).
+	Divergence *health.HealthDivergence `json:"divergence,omitempty"`
 
 	// Derived stats
 	ToolCount int `json:"tool_count"`
@@ -104,82 +109,67 @@ type HealthSummary struct {
 	IdleServers     int `json:"idle_servers"`
 }
 
+type healthClass string
+
+const (
+	healthClassHealthy  healthClass = "healthy"
+	healthClassDegraded healthClass = "degraded"
+	healthClassDown     healthClass = "down"
+	healthClassIdle     healthClass = "idle"
+)
+
 // HealthMonitor tracks server health and maintains sparkline latency
 // history for each server. It merges data from the Health() and Servers()
 // bridge calls.
+//
+// HealthMonitor embeds BaseMonitor for lifecycle management (stop, pollLoop)
+// but keeps its own complex Refresh implementation with internal state
+// (sparkline history, notification dedup).
 type HealthMonitor struct {
-	client *bridge.DaemonClient
-	logger *slog.Logger
+	BaseMonitor[[]ServerHealthEntry]
+	client bridge.Caller
 
-	mu      sync.RWMutex
-	servers []ServerHealthEntry
-	summary HealthSummary
 	history map[string]*RingBuffer // server name -> latency ring buffer
+	summary HealthSummary
 
-	// Notification debounce state (protected by mu).
+	// Notification debounce state (protected by base mu).
 	notifiedDown map[string]time.Time // server name -> last notification time
 	prevDown     map[string]bool      // servers that were down on previous refresh
-
-	onRefresh func([]ServerHealthEntry)
-
-	stopCh   chan struct{}
-	stopOnce sync.Once
 }
 
-// OnRefresh registers a callback that fires after each successful refresh
-// with the new server health entries. Used to broadcast data via SSE.
-func (m *HealthMonitor) OnRefresh(fn func([]ServerHealthEntry)) {
-	m.onRefresh = fn
-}
-
-// NewHealthMonitor creates a HealthMonitor backed by the given daemon client.
-func NewHealthMonitor(client *bridge.DaemonClient, logger *slog.Logger) *HealthMonitor {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return &HealthMonitor{
+// NewHealthMonitor creates a HealthMonitor backed by the given caller.
+func NewHealthMonitor(client bridge.Caller, logger *slog.Logger) *HealthMonitor {
+	m := &HealthMonitor{
 		client:       client,
-		logger:       logger.With("component", "health-monitor"),
 		history:      make(map[string]*RingBuffer),
 		notifiedDown: make(map[string]time.Time),
 		prevDown:     make(map[string]bool),
-		stopCh:       make(chan struct{}),
 	}
+	m.InitBase(logger, nil, "health-monitor")
+	return m
 }
 
 // Start begins the background polling goroutine at the given interval.
 func (m *HealthMonitor) Start(interval time.Duration) {
-	// Run initial refresh asynchronously so HUD/TUI startup is non-blocking
-	// when downstream services are slow or unavailable.
-	go func() {
-		if err := m.Refresh(); err != nil {
-			m.logger.Warn("initial health refresh failed", "error", err)
-		}
-	}()
-
-	go m.pollLoop(interval)
-}
-
-// Stop signals the background goroutine to exit. It is safe to call multiple times.
-func (m *HealthMonitor) Stop() {
-	m.stopOnce.Do(func() { close(m.stopCh) })
+	m.StartLoop(interval, m.Refresh)
 }
 
 // Servers returns the current enriched server health entries.
 func (m *HealthMonitor) Servers() []ServerHealthEntry {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.RLock()
+	defer m.RUnlock()
 
+	snap := m.GetSnapshot()
 	// Return a copy to avoid data races on the slice.
-	out := make([]ServerHealthEntry, len(m.servers))
-	copy(out, m.servers)
+	out := make([]ServerHealthEntry, len(snap))
+	copy(out, snap)
 	return out
 }
 
 // Summary returns the current health summary.
 func (m *HealthMonitor) Summary() HealthSummary {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.RLock()
+	defer m.RUnlock()
 	return m.summary
 }
 
@@ -187,27 +177,50 @@ func (m *HealthMonitor) Summary() HealthSummary {
 // history, and recomputes the summary.
 func (m *HealthMonitor) Refresh() error {
 	// Fetch health data.
-	healthResult, healthErr := m.client.Health()
+	var healthResult *health.HealthResult
+	rawHealth, healthErr := m.client.Call("loom/health", nil)
 	if healthErr != nil {
-		m.logger.Warn("health: failed to fetch health", "error", healthErr)
+		m.Logger.Warn("health: failed to fetch health", "error", healthErr)
+	} else {
+		var hr health.HealthResult
+		if err := json.Unmarshal(rawHealth, &hr); err != nil {
+			m.Logger.Warn("health: failed to unmarshal health", "error", err)
+			healthErr = err
+		} else {
+			healthResult = &hr
+		}
 	}
 
 	// Fetch server list.
-	serversResult, serversErr := m.client.Servers()
+	var serversResult *bridge.ServersResult
+	rawServers, serversErr := m.client.Call("loom/servers", nil)
 	if serversErr != nil {
-		m.logger.Warn("health: failed to fetch servers", "error", serversErr)
+		m.Logger.Warn("health: failed to fetch servers", "error", serversErr)
+	} else {
+		var sr bridge.ServersResult
+		if err := json.Unmarshal(rawServers, &sr); err != nil {
+			m.Logger.Warn("health: failed to unmarshal servers", "error", err)
+			serversErr = err
+		} else {
+			serversResult = &sr
+		}
 	}
 
 	// Fetch aggregated tool list to derive per-server tool counts.
 	// Tool names are namespaced as "server__toolname".
 	toolCounts := make(map[string]int)
-	toolsResult, toolsErr := m.client.Tools()
+	rawTools, toolsErr := m.client.Call("loom/tools", nil)
 	if toolsErr != nil {
-		m.logger.Debug("health: failed to fetch tools for counts", "error", toolsErr)
-	} else if toolsResult != nil {
-		for _, t := range toolsResult.Tools {
-			if parts := strings.SplitN(t.Name, "__", 2); len(parts) == 2 {
-				toolCounts[parts[0]]++
+		m.Logger.Debug("health: failed to fetch tools for counts", "error", toolsErr)
+	} else {
+		var toolsResult bridge.ToolsResult
+		if err := json.Unmarshal(rawTools, &toolsResult); err != nil {
+			m.Logger.Debug("health: failed to unmarshal tools", "error", err)
+		} else {
+			for _, t := range toolsResult.Tools {
+				if parts := strings.SplitN(t.Name, "__", 2); len(parts) == 2 {
+					toolCounts[parts[0]]++
+				}
 			}
 		}
 	}
@@ -226,7 +239,7 @@ func (m *HealthMonitor) Refresh() error {
 	}
 
 	// Build a map of health by name for merging.
-	healthMap := make(map[string]bridge.ServerHealth)
+	healthMap := make(map[string]health.ServerHealth)
 	if healthResult != nil {
 		for name, h := range healthResult.Servers {
 			healthMap[name] = h
@@ -242,7 +255,7 @@ func (m *HealthMonitor) Refresh() error {
 		nameSet[name] = struct{}{}
 	}
 
-	m.mu.Lock()
+	m.Lock()
 
 	entries := make([]ServerHealthEntry, 0, len(nameSet))
 	summary := HealthSummary{TotalServers: len(nameSet)}
@@ -258,24 +271,28 @@ func (m *HealthMonitor) Refresh() error {
 			entry.Categories = info.Categories
 			entry.Description = info.Description
 			entry.Running = info.Running
+			if entry.Transport == "" {
+				entry.Transport = info.Transport
+			}
 		}
 
 		// Merge health info if available. Prefer the active target endpoint.
-		if health, ok := healthMap[name]; ok {
-			entry.Target = health.Target
-			var active bridge.HealthEntry
-			switch health.Target {
+		if sh, ok := healthMap[name]; ok {
+			entry.Target = sh.Target
+			entry.Transport = sh.Transport
+			var active health.HealthEntry
+			switch sh.Target {
 			case "local":
-				active = health.Local
+				active = sh.Local
 			case "hub":
-				active = health.Hub
+				active = sh.Hub
 			default:
 				// If target is something else, try local first, then hub.
-				if health.Local.Healthy {
-					active = health.Local
+				if sh.Local.Healthy {
+					active = sh.Local
 					entry.Target = "local"
 				} else {
-					active = health.Hub
+					active = sh.Hub
 					entry.Target = "hub"
 				}
 			}
@@ -283,6 +300,7 @@ func (m *HealthMonitor) Refresh() error {
 			entry.ConsecFails = active.ConsecFails
 			entry.AvgLatencyMs = active.AvgLatencyMs
 			entry.ErrorMessage = active.ErrorMessage
+			entry.Divergence = sh.Divergence
 		}
 
 		// Set tool count from the parsed tool namespace.
@@ -298,13 +316,17 @@ func (m *HealthMonitor) Refresh() error {
 		entry.LatencyHistory = ring.Values()
 
 		// Classify for summary.
-		if !entry.Running {
+		//
+		// In hub/gateway mode, Running only reflects local process state.
+		// A server can be healthy via hub target while local process is stopped.
+		switch classifyHealthEntry(entry) {
+		case healthClassIdle:
 			summary.IdleServers++
-		} else if entry.Target == "unavailable" || (!entry.Healthy && entry.ConsecFails > 3) {
+		case healthClassDown:
 			summary.DownServers++
-		} else if !entry.Healthy || entry.ConsecFails > 0 {
+		case healthClassDegraded:
 			summary.DegradedServers++
-		} else {
+		default:
 			summary.HealthyServers++
 		}
 
@@ -325,7 +347,7 @@ func (m *HealthMonitor) Refresh() error {
 				m.notifiedDown[e.Name] = time.Now()
 				go func(name string) {
 					if err := notify.NotifyServerDown(name); err != nil {
-						m.logger.Debug("server-down notification failed", "server", name, "error", err)
+						m.Logger.Debug("server-down notification failed", "server", name, "error", err)
 					}
 				}(e.Name)
 			}
@@ -336,59 +358,56 @@ func (m *HealthMonitor) Refresh() error {
 			delete(m.notifiedDown, e.Name)
 			go func(name string) {
 				if err := notify.NotifyServerRecovered(name); err != nil {
-					m.logger.Debug("server-recovered notification failed", "server", name, "error", err)
+					m.Logger.Debug("server-recovered notification failed", "server", name, "error", err)
 				}
 			}(e.Name)
 		}
 	}
 	m.prevDown = nowDown
 
-	m.servers = entries
+	m.SetSnapshot(entries)
 	m.summary = summary
-	m.mu.Unlock()
+	m.Unlock()
 
 	// Notify listeners (e.g., SSE hub) with the fresh entries (outside lock).
-	if m.onRefresh != nil {
-		out := make([]ServerHealthEntry, len(entries))
-		copy(out, entries)
-		m.onRefresh(out)
-	}
+	out := make([]ServerHealthEntry, len(entries))
+	copy(out, entries)
+	m.FireOnRefresh(out)
 
 	return nil
 }
 
-// pollLoop runs Refresh on a ticker until stopCh is closed.
-// On consecutive errors, it backs off by skipping ticker ticks.
-func (m *HealthMonitor) pollLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	consecutiveErrors := 0
-	for {
-		select {
-		case <-m.stopCh:
-			m.logger.Debug("health monitor stopped")
-			return
-		case <-ticker.C:
-			if err := m.Refresh(); err != nil {
-				consecutiveErrors++
-				if consecutiveErrors <= 3 {
-					m.logger.Warn("health refresh error", "error", err)
-				}
-				skipTicks := min(consecutiveErrors-1, 4)
-				for range skipTicks {
-					select {
-					case <-m.stopCh:
-						return
-					case <-ticker.C:
-					}
-				}
-			} else {
-				if consecutiveErrors > 0 {
-					m.logger.Info("health refresh recovered", "after_errors", consecutiveErrors)
-				}
-				consecutiveErrors = 0
-			}
+func classifyHealthEntry(entry ServerHealthEntry) healthClass {
+	// Stopped local process with no usable health target.
+	// If the server has registered tools it is reachable through the hub
+	// and should be considered healthy rather than idle.
+	if !entry.Running && entry.Target == "unavailable" {
+		if entry.ToolCount > 0 {
+			return healthClassHealthy
 		}
+		return healthClassIdle
 	}
+
+	// A running server can briefly lose its active health target during
+	// refresh races between loom/health and loom/servers. Treat that as
+	// degraded until we have sustained failures, otherwise mobile/desktop
+	// surfaces can show false "server down" criticals.
+	if entry.Target == "unavailable" {
+		if entry.ConsecFails > 3 {
+			return healthClassDown
+		}
+		return healthClassDegraded
+	}
+
+	// Sustained failures indicate down.
+	if !entry.Healthy && entry.ConsecFails > 3 {
+		return healthClassDown
+	}
+
+	// Any remaining unhealthy/failing condition is degraded.
+	if !entry.Healthy || entry.ConsecFails > 0 {
+		return healthClassDegraded
+	}
+
+	return healthClassHealthy
 }

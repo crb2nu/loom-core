@@ -1,0 +1,1 @@
+- Add `run.verdict.operator_override` accounting and an admin-only pipeline-run verdict endpoint that verifies manually rescued merge requests in GitLab before recording immutable corrections (`pkg/mills/run_verdict.go`, `cmd/loom-mills-operator/server.go`, `cmd/loom-mills-operator/handlers_pipeline.go`).

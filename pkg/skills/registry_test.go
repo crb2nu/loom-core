@@ -3,6 +3,7 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -243,6 +244,64 @@ func TestSkill_ResolveInstructions_WithTargetAppend(t *testing.T) {
 	}
 }
 
+func TestSkill_ResolveInstructions_EscapedVariablesPreserved(t *testing.T) {
+	s := &Skill{
+		Name: "doc-skill",
+		Common: &SkillSpec{
+			Instructions: `Use \${SKILL_PATH} to reference the skill directory.
+Actual path: ${SKILL_PATH}/scripts/run.sh
+Literal codex home: \${CODEX_HOME}`,
+		},
+	}
+
+	got := s.ResolveInstructions("claude", "/home/.codex", "/workspace/skills/doc-skill")
+
+	// Escaped references should become literal ${...} in output.
+	if !strings.Contains(got, "Use ${SKILL_PATH} to reference") {
+		t.Errorf("escaped \\${SKILL_PATH} should become literal ${SKILL_PATH}, got:\n%s", got)
+	}
+	// Unescaped references should be substituted normally.
+	if !strings.Contains(got, "Actual path: /workspace/skills/doc-skill/scripts/run.sh") {
+		t.Errorf("unescaped ${SKILL_PATH} should be resolved, got:\n%s", got)
+	}
+	// Escaped ${CODEX_HOME} should become literal.
+	if !strings.Contains(got, "Literal codex home: ${CODEX_HOME}") {
+		t.Errorf("escaped \\${CODEX_HOME} should become literal, got:\n%s", got)
+	}
+}
+
+func TestSkill_ResolveInstructions_EscapedCodex(t *testing.T) {
+	s := &Skill{
+		Name: "doc-skill",
+		Common: &SkillSpec{
+			Instructions: `Real: ${CODEX_HOME}/config  Literal: \${CODEX_HOME}/config`,
+		},
+	}
+
+	got := s.ResolveInstructions("codex", "/home/.codex", "/src/skills/doc-skill")
+
+	if !strings.Contains(got, "Real: $CODEX_HOME/config") {
+		t.Errorf("unescaped ${CODEX_HOME} should resolve for codex, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Literal: ${CODEX_HOME}/config") {
+		t.Errorf("escaped \\${CODEX_HOME} should become literal, got:\n%s", got)
+	}
+}
+
+func TestSkill_ResolveInstructions_NoEscapesUnchanged(t *testing.T) {
+	s := &Skill{
+		Name: "plain",
+		Common: &SkillSpec{
+			Instructions: "No template variables here at all.",
+		},
+	}
+
+	got := s.ResolveInstructions("claude", "", "")
+	if got != "No template variables here at all." {
+		t.Errorf("expected unchanged, got:\n%s", got)
+	}
+}
+
 func TestFindSkillsSourceDir(t *testing.T) {
 	// Given a registry at mcp/context/skills-registry.yaml,
 	// skills should be at mcp/skills/.
@@ -262,6 +321,44 @@ func TestFindSkillsSourceDir_RelativePath(t *testing.T) {
 
 	if got != want {
 		t.Errorf("FindSkillsSourceDir(%q) = %q, want %q", regPath, got, want)
+	}
+}
+
+func TestFindRegistry_FindsWorkspaceLoomCoreRegistry(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	registryPath := filepath.Join(workspaceRoot, "services", "loom-core", "mcp", "context", "skills-registry.yaml")
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0755); err != nil {
+		t.Fatalf("mkdir registry dir: %v", err)
+	}
+	if err := os.WriteFile(registryPath, []byte("version: 1\nskills: []\n"), 0644); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(originalWD)
+	}()
+	if err := os.Chdir(workspaceRoot); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	got, found := FindRegistry()
+	if !found {
+		t.Fatal("expected FindRegistry to discover workspace loom-core registry")
+	}
+	gotReal, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(got): %v", err)
+	}
+	wantReal, err := filepath.EvalSymlinks(registryPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(want): %v", err)
+	}
+	if gotReal != wantReal {
+		t.Fatalf("FindRegistry()=%q (%q), want %q (%q)", got, gotReal, registryPath, wantReal)
 	}
 }
 
@@ -311,6 +408,51 @@ skills:
 	}
 	if got := reg.Skills[0].Targets["codex"].InstructionsAppend; got != "Codex-only append" {
 		t.Errorf("expected instructions_append to parse, got %q", got)
+	}
+}
+
+func TestLoad_PriorityField(t *testing.T) {
+	tmpDir := t.TempDir()
+	registryPath := filepath.Join(tmpDir, "skills-registry.yaml")
+
+	content := `version: 1
+skills:
+  - name: high-prio
+    priority: 10
+    common:
+      description: "High priority"
+      instructions: "Do first."
+  - name: no-prio
+    common:
+      description: "No priority"
+      instructions: "Do later."
+  - name: low-prio
+    priority: 50
+    common:
+      description: "Low priority"
+      instructions: "Do last."
+`
+	if err := os.WriteFile(registryPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	reg, err := Load(registryPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(reg.Skills) != 3 {
+		t.Fatalf("expected 3 skills, got %d", len(reg.Skills))
+	}
+
+	if reg.Skills[0].Priority == nil || *reg.Skills[0].Priority != 10 {
+		t.Errorf("high-prio: expected priority 10, got %v", reg.Skills[0].Priority)
+	}
+	if reg.Skills[1].Priority != nil {
+		t.Errorf("no-prio: expected nil priority, got %v", *reg.Skills[1].Priority)
+	}
+	if reg.Skills[2].Priority == nil || *reg.Skills[2].Priority != 50 {
+		t.Errorf("low-prio: expected priority 50, got %v", reg.Skills[2].Priority)
 	}
 }
 

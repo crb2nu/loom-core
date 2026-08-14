@@ -16,10 +16,13 @@ import (
 
 // MsgTasksData is sent by the app when new task data arrives.
 type MsgTasksData struct {
-	Tasks        []TaskData
-	PendingCount int
-	ActiveCount  int
-	BlockedCount int
+	Tasks              []TaskData
+	PendingCount       int
+	ActiveCount        int
+	BlockedCount       int
+	CrossAgentBlockers int
+	OrphanTasks        int
+	Blockers           []TaskBlockerData
 }
 
 // MsgTaskStatusCycled signals that a task status was toggled via the TUI.
@@ -34,7 +37,24 @@ type TaskData struct {
 	Title     string
 	Status    string
 	Priority  string
+	AgentID   string
+	Namespace string
 	BlockedBy []string
+}
+
+// TaskBlockerData holds resolved blocker relationship metadata.
+type TaskBlockerData struct {
+	TaskID             string
+	TaskTitle          string
+	TaskAgentID        string
+	TaskNamespace      string
+	BlockedByTaskID    string
+	BlockedByTaskTitle string
+	BlockedByStatus    string
+	BlockedByAgentID   string
+	BlockedByNamespace string
+	CrossAgent         bool
+	Resolved           bool
 }
 
 // ---------------------------------------------------------------------------
@@ -43,15 +63,20 @@ type TaskData struct {
 
 // TasksPanel renders a task board with status columns.
 type TasksPanel struct {
-	width, height int
-	tasks         []TaskData
-	pendingCount  int
-	activeCount   int
-	blockedCount  int
+	width, height      int
+	tasks              []TaskData
+	pendingCount       int
+	activeCount        int
+	blockedCount       int
+	crossAgentBlockers int
+	orphanTasks        int
+	blockers           []TaskBlockerData
 
 	// Interactive state
 	selectedIdx int
 	flatTasks   []TaskData // ordered: pending, active, blocked
+	searchMode  bool
+	searchQuery string
 }
 
 // NewTasksPanel creates a new tasks panel.
@@ -82,8 +107,33 @@ func (p TasksPanel) Update(msg tea.Msg) (TasksPanel, tea.Cmd) {
 		p.pendingCount = msg.PendingCount
 		p.activeCount = msg.ActiveCount
 		p.blockedCount = msg.BlockedCount
+		p.crossAgentBlockers = msg.CrossAgentBlockers
+		p.orphanTasks = msg.OrphanTasks
+		p.blockers = msg.Blockers
 		p.rebuildFlatTasks()
 	case tea.KeyMsg:
+		if p.searchMode {
+			switch msg.String() {
+			case "esc":
+				p.searchMode = false
+				p.searchQuery = ""
+				p.rebuildFlatTasks()
+			case "enter":
+				p.searchMode = false
+				// Keep filter applied.
+			case "backspace":
+				if len(p.searchQuery) > 0 {
+					p.searchQuery = p.searchQuery[:len(p.searchQuery)-1]
+					p.rebuildFlatTasks()
+				}
+			default:
+				if len(msg.String()) == 1 {
+					p.searchQuery += msg.String()
+					p.rebuildFlatTasks()
+				}
+			}
+			return p, nil
+		}
 		switch msg.String() {
 		case "j", "down":
 			if p.selectedIdx < len(p.flatTasks)-1 {
@@ -92,6 +142,14 @@ func (p TasksPanel) Update(msg tea.Msg) (TasksPanel, tea.Cmd) {
 		case "k", "up":
 			if p.selectedIdx > 0 {
 				p.selectedIdx--
+			}
+		case "/":
+			p.searchMode = true
+			p.searchQuery = ""
+		case "esc":
+			if p.searchQuery != "" {
+				p.searchQuery = ""
+				p.rebuildFlatTasks()
 			}
 		case "enter":
 			if t := p.SelectedTask(); t != nil {
@@ -105,11 +163,16 @@ func (p TasksPanel) Update(msg tea.Msg) (TasksPanel, tea.Cmd) {
 	return p, nil
 }
 
-// rebuildFlatTasks orders tasks: pending → in_progress → blocked.
+// rebuildFlatTasks orders tasks: pending → in_progress → blocked, applying search filter.
 func (p *TasksPanel) rebuildFlatTasks() {
 	p.flatTasks = p.flatTasks[:0]
+	query := strings.ToLower(p.searchQuery)
 	var pending, active, blocked []TaskData
 	for _, t := range p.tasks {
+		if query != "" && !strings.Contains(strings.ToLower(t.Title), query) &&
+			!strings.Contains(strings.ToLower(t.AgentID), query) {
+			continue
+		}
 		switch strings.ToLower(t.Status) {
 		case "pending":
 			pending = append(pending, t)
@@ -149,7 +212,20 @@ func (p TasksPanel) View() string {
 
 	// Summary counts
 	b.WriteString(p.renderSummary())
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+
+	// Search mode indicator
+	if p.searchMode {
+		searchStyle := lipgloss.NewStyle().Foreground(theme.ColorAccent).Bold(true)
+		b.WriteString(searchStyle.Render(fmt.Sprintf("  / %s", p.searchQuery)))
+		b.WriteString(lipgloss.NewStyle().Foreground(theme.ColorAccent).Blink(true).Render("_"))
+		b.WriteString("\n")
+	} else if p.searchQuery != "" {
+		filterStyle := lipgloss.NewStyle().Foreground(theme.ColorInfo)
+		b.WriteString(filterStyle.Render(fmt.Sprintf("  filter: %q (%d matches)", p.searchQuery, len(p.flatTasks))))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 
 	if len(p.tasks) == 0 {
 		b.WriteString(theme.Styles.MutedText.Render("  No tasks"))
@@ -158,10 +234,20 @@ func (p TasksPanel) View() string {
 	}
 
 	b.WriteString(p.renderColumns())
+	if selected := p.SelectedTask(); selected != nil {
+		if detail := p.renderSelectedTaskDetails(*selected); detail != "" {
+			b.WriteString("\n")
+			b.WriteString(detail)
+		}
+	}
 
 	// Navigation hint
 	hintStyle := lipgloss.NewStyle().Foreground(theme.ColorFgMuted)
-	b.WriteString(hintStyle.Render("  j/k:move  enter:cycle status"))
+	hint := "  j/k:move  enter:cycle status  /:search"
+	if p.searchQuery != "" {
+		hint += "  esc:clear"
+	}
+	b.WriteString(hintStyle.Render(hint))
 	b.WriteString("\n")
 
 	return b.String()
@@ -172,6 +258,8 @@ func (p TasksPanel) renderSummary() string {
 		theme.Styles.StatusWarn.Render(fmt.Sprintf("%d pending", p.pendingCount)),
 		theme.Styles.StatusOK.Render(fmt.Sprintf("%d active", p.activeCount)),
 		theme.Styles.StatusError.Render(fmt.Sprintf("%d blocked", p.blockedCount)),
+		theme.Styles.Label.Render("x-agent: ") + theme.Styles.Value.Render(fmt.Sprintf("%d", p.crossAgentBlockers)),
+		theme.Styles.Label.Render("orphans: ") + theme.Styles.Value.Render(fmt.Sprintf("%d", p.orphanTasks)),
 	}
 	return strings.Join(parts, "  ")
 }
@@ -251,13 +339,27 @@ func (p TasksPanel) renderColumn(title string, tasks []TaskData, width int) stri
 	for _, t := range tasks {
 		isSelected := p.isTaskSelected(t.ID)
 		badge := priorityBadge(t.Priority)
-		taskTitle := truncate(t.Title, width-6) // cursor(2) + space(1) + badge(1) + space(1) + buffer(1)
+		maxTitleWidth := width - 6 // cursor(2) + space(1) + badge(1) + space(1) + buffer(1)
+		taskTitle := truncate(t.Title, maxTitleWidth)
 
 		cursor := " "
+		style := lipgloss.NewStyle()
 		if isSelected {
 			cursor = lipgloss.NewStyle().Foreground(theme.ColorAccent).Bold(true).Render("▸")
+			style = style.Bold(true)
 		}
-		line := fmt.Sprintf("%s %s %s", cursor, badge, taskTitle)
+		// Highlight matching search query in title.
+		if p.searchQuery != "" {
+			idx := strings.Index(strings.ToLower(taskTitle), strings.ToLower(p.searchQuery))
+			if idx >= 0 {
+				before := taskTitle[:idx]
+				match := taskTitle[idx : idx+len(p.searchQuery)]
+				after := taskTitle[idx+len(p.searchQuery):]
+				matchStyle := lipgloss.NewStyle().Foreground(theme.ColorAccent).Bold(true)
+				taskTitle = before + matchStyle.Render(match) + after
+			}
+		}
+		line := fmt.Sprintf("%s %s %s", cursor, badge, style.Render(taskTitle))
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
@@ -271,6 +373,95 @@ func (p TasksPanel) isTaskSelected(id string) bool {
 		return false
 	}
 	return p.flatTasks[p.selectedIdx].ID == id
+}
+
+func (p TasksPanel) renderSelectedTaskDetails(task TaskData) string {
+	var related []TaskBlockerData
+	for _, blocker := range p.blockers {
+		if blocker.TaskID == task.ID {
+			related = append(related, blocker)
+		}
+	}
+	if len(related) == 0 {
+		return ""
+	}
+
+	cardStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(theme.ColorBorder).
+		Padding(0, 1)
+	headerStyle := lipgloss.NewStyle().Foreground(theme.ColorFgSecondary).Bold(true)
+	muted := lipgloss.NewStyle().Foreground(theme.ColorFgMuted)
+	warn := lipgloss.NewStyle().Foreground(theme.ColorWarning)
+	info := lipgloss.NewStyle().Foreground(theme.ColorInfo)
+
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("DEPENDENCY CHAIN"))
+	b.WriteString("\n")
+
+	// ASCII dependency tree
+	taskTitle := truncate(task.Title, max(20, p.width-16))
+	b.WriteString("  " + lipgloss.NewStyle().Foreground(theme.ColorError).Render(taskTitle))
+	b.WriteString("\n")
+	for i, blocker := range related {
+		connector := "  ├── "
+		if i == len(related)-1 {
+			connector = "  └── "
+		}
+		targetTitle := blocker.BlockedByTaskTitle
+		if targetTitle == "" {
+			targetTitle = blocker.BlockedByTaskID
+		}
+		statusColor := lipgloss.NewStyle().Foreground(theme.ColorFgMuted)
+		if blocker.BlockedByStatus == "in_progress" || blocker.BlockedByStatus == "active" {
+			statusColor = lipgloss.NewStyle().Foreground(theme.ColorSuccess)
+		} else if blocker.Resolved {
+			statusColor = lipgloss.NewStyle().Foreground(theme.ColorFgMuted)
+		}
+		statusLabel := statusColor.Render("[" + blocker.BlockedByStatus + "]")
+		xAgent := ""
+		if blocker.CrossAgent {
+			xAgent = " " + warn.Render("x-agent")
+		}
+		b.WriteString(muted.Render(connector) + truncate(targetTitle, max(16, p.width-30)) + " " + statusLabel + xAgent)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString(headerStyle.Render("RELATION DETAILS"))
+	b.WriteString("\n")
+	for _, blocker := range related {
+		badge := info.Render("local")
+		if blocker.CrossAgent {
+			badge = warn.Render("cross-agent")
+		}
+		status := blocker.BlockedByStatus
+		if status == "" {
+			status = "---"
+		}
+		targetTitle := blocker.BlockedByTaskTitle
+		if targetTitle == "" {
+			targetTitle = blocker.BlockedByTaskID
+		}
+		line := fmt.Sprintf("%s  %s  %s", truncate(targetTitle, max(20, p.width-28)), status, badge)
+		if blocker.Resolved {
+			line += "  resolved"
+		}
+		b.WriteString(cardStyle.Render(line))
+		b.WriteString("\n")
+		metaParts := []string{}
+		if blocker.BlockedByAgentID != "" {
+			metaParts = append(metaParts, "owner:"+blocker.BlockedByAgentID)
+		}
+		if blocker.BlockedByNamespace != "" {
+			metaParts = append(metaParts, "ns:"+blocker.BlockedByNamespace)
+		}
+		if len(metaParts) > 0 {
+			b.WriteString(muted.Render("  " + strings.Join(metaParts, "  ")))
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // priorityBadge returns a colored single-character priority indicator.

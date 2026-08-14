@@ -1,0 +1,1 @@
+- Add a client-derived seven-day Mill Efficiency strip to the HUD Factory panel, covering first-pass yield, true bolt cost, escalated waste, and retryable cloth in `internal/hud/frontend/src/lib/components/mills/` and `internal/hud/frontend/src/lib/utils/`.

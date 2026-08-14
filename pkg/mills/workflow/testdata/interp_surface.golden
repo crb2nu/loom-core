@@ -1,0 +1,22 @@
+# Interpreter replay-compatibility surface. A diff in this file trips the
+# CI drain gate (scripts/ci/check_workflow_drain_gate.sh): drain in-flight
+# imperative workflow runs, then add [workflow-drain-confirmed] to the MR.
+# Regenerate: UPDATE_INTERP_SURFACE=1 go test ./pkg/mills/workflow -run TestInterpreterSurface
+interpreter_version=starlark-go@v0.0.0-20260708150628-5395d018f003
+universe=agent ctx_now ctx_uuid gate loop_until_dry merge parallel
+host_max_fanout=8
+host_max_iter=64
+canonical_json={"a":[1,{"b":"x","c":null},true,2.5],"z":{"k":2}}
+call_hash=26448b972b8fe6db548ecea4b5514b14e62583eec20c09f78493fcc31a06aab9
+idempotency_key=wf-38d1afe6bf4f63f3eb80813b
+effect_result=CostSource:string CostUSD:float64 SpawnID:string Value:interface {}
+step_keys:
+  root/agent~ba1ada224d4205bc#0
+  root/agent~ba1ada224d4205bc#1
+  root/ctx_now~986badfb0f688109#0
+  root/ctx_uuid~b973ae0ab255952e#0
+  root/gate~4f9e81f6be550145#0
+  root/loop:drain#0/agent~6bb11b67348aa00a#0
+  root/merge~eabce8159538a174#0
+  root/par:p0/b0/agent~3e16ae2ca75317ff#0
+  root/par:p0/b1/agent~3e16ae2ca75317ff#0

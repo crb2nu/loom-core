@@ -1,0 +1,1 @@
+- Bind Mills MR lifecycle operations to the durable GitLab host, project, source branch, target branch, and CI-tested SHA; safely verify and backfill legacy project provenance; reconcile locked or interrupted merges without mutating MR state; fence recovery pipeline creation across restarts; and require a fresh gate/CI cycle after external rebases.

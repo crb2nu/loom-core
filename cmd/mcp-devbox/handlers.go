@@ -13,6 +13,7 @@ import (
 	"github.com/crb2nu/loom/internal/devbox/detect"
 	"github.com/crb2nu/loom/internal/devbox/dockerfile"
 	"github.com/crb2nu/loom/internal/devbox/state"
+	"github.com/crb2nu/loom/pkg/poll"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -23,8 +24,12 @@ func (m *manager) handleExec(ctx context.Context, args map[string]any) (*mcp.Cal
 	timeoutStr := v.String("timeout", "2m")
 	maxLines := v.Int("max_lines", m.cfg.maxTailLines)
 	agentID := v.String("agent_id", "")
+	retry := v.Int("retry", 0)
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
+	}
+	if retry > 3 {
+		retry = 3
 	}
 
 	timeout, err := time.ParseDuration(timeoutStr)
@@ -37,12 +42,16 @@ func (m *manager) handleExec(ctx context.Context, args map[string]any) (*mcp.Cal
 		return mcp.ErrorResult(err), nil
 	}
 
-	// Per-project lock prevents concurrent ensureRunning TOCTOU races
-	mu := m.projectLock(projectName)
+	// Per-project+agent lock prevents concurrent ensureRunning TOCTOU races
+	key := storeKey(projectName, agentID)
+	mu := m.projectLock(key)
 	mu.Lock()
 	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
 	mu.Unlock()
 	if err != nil {
+		if bip, ok := asBuildInProgress(err); ok {
+			return buildingResult(bip)
+		}
 		if m.metrics != nil {
 			m.metrics.errors.WithLabelValues("ensure_running").Inc()
 		}
@@ -59,22 +68,39 @@ func (m *manager) handleExec(ctx context.Context, args map[string]any) (*mcp.Cal
 		}
 	}
 
-	// Touch last used BEFORE exec so reaper doesn't kill during long-running commands
-	_ = m.store.TouchLastUsed(projectName)
-	m.incActiveExecs(projectName)
-	defer m.decActiveExecs(projectName)
+	// Re-sync workspace before exec (tar-pipe mode) so uncommitted changes propagate.
+	if err := m.syncIfNeeded(ctx, containerID, projectDir); err != nil {
+		m.logger.Warn("pre-exec sync failed", "project", projectName, "error", err)
+		// Non-fatal: exec may still work with stale files.
+	}
 
-	m.logger.Info("exec", "project", projectName, "command", command)
+	// Touch last used BEFORE exec so reaper doesn't kill during long-running commands
+	_ = m.store.TouchLastUsed(key)
+	m.incActiveExecs(key)
+	defer m.decActiveExecs(key)
+
+	m.totalExecs.Add(1)
+	m.logger.Info("exec", "project", projectName, "agent", agentID, "command", command)
 
 	start := time.Now()
-	result, err := m.backend.Exec(ctx, backend.ExecOpts{
-		ContainerID: containerID,
-		Command:     command,
-		WorkDir:     m.projectWorkDir(projectDir),
-		Env:         envVars,
-		TimeoutSec:  int(timeout.Seconds()),
-		MaxLines:    maxLines,
-	})
+	var result *backend.ExecResult
+	execFn := func(ctx context.Context) error {
+		var execErr error
+		result, execErr = m.backend.Exec(ctx, backend.ExecOpts{
+			ContainerID: containerID,
+			Command:     command,
+			WorkDir:     m.projectWorkDir(projectDir),
+			Env:         envVars,
+			TimeoutSec:  int(timeout.Seconds()),
+			MaxLines:    maxLines,
+		})
+		return execErr
+	}
+	if retry > 0 {
+		err = poll.RetryWithBackoff(ctx, retry+1, time.Second, 4*time.Second, execFn)
+	} else {
+		err = execFn(ctx)
+	}
 	execDuration := time.Since(start).Seconds()
 	if err != nil {
 		if m.metrics != nil {
@@ -84,7 +110,7 @@ func (m *manager) handleExec(ctx context.Context, args map[string]any) (*mcp.Cal
 	}
 
 	// Update last used after exec too
-	_ = m.store.TouchLastUsed(projectName)
+	_ = m.store.TouchLastUsed(key)
 
 	// Record metrics
 	if m.metrics != nil {
@@ -135,6 +161,7 @@ func (m *manager) handleBuild(ctx context.Context, args map[string]any) (*mcp.Ca
 		})
 	}
 
+	m.totalBuilds.Add(1)
 	m.logger.Info("building sandbox image", "project", projectName, "hash", fp.Hash[:7])
 
 	dockerfileContent, err := dockerfile.Generate(fp)
@@ -201,21 +228,26 @@ func (m *manager) handleStatus(ctx context.Context, args map[string]any) (*mcp.C
 	entries := m.store.List()
 	sandboxes := make([]map[string]any, 0)
 
-	for name, entry := range entries {
-		if project != "" && name != project {
+	for key, entry := range entries {
+		projectName, agentID := parseStoreKey(key)
+		if project != "" && projectName != project {
 			continue
 		}
 
 		info := map[string]any{
-			"project":   name,
+			"project":   projectName,
 			"status":    entry.Status,
 			"image":     entry.ImageTag,
 			"backend":   entry.Backend,
 			"last_used": entry.LastUsed.Format(time.RFC3339),
 		}
+		if agentID != "" {
+			info["agent_id"] = agentID
+		}
 
 		if entry.Status == "running" {
-			status, err := m.backend.Status(ctx, m.containerName(name))
+			containerName := m.containerName(projectName, agentID)
+			status, err := m.backend.Status(ctx, containerName)
 			if err == nil {
 				info["running"] = status.Running
 				if status.Running {
@@ -237,6 +269,7 @@ func (m *manager) handleStatus(ctx context.Context, args map[string]any) (*mcp.C
 func (m *manager) handleStop(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	project := v.Required("project")
+	agentID := v.String("agent_id", "")
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
 	}
@@ -246,15 +279,16 @@ func (m *manager) handleStop(ctx context.Context, args map[string]any) (*mcp.Cal
 		return mcp.ErrorResult(err), nil
 	}
 
-	containerID := m.containerName(projectName)
+	key := storeKey(projectName, agentID)
+	containerID := m.containerName(projectName, agentID)
 	if err := m.backend.Stop(ctx, containerID); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("stop failed: %w", err)), nil
 	}
 
-	entry := m.store.Get(projectName)
+	entry := m.store.Get(key)
 	if entry != nil {
 		entry.Status = "stopped"
-		_ = m.store.Set(projectName, entry)
+		_ = m.store.Set(key, entry)
 	}
 
 	return mcp.JSONResult(map[string]any{"stopped": true, "project": projectName})
@@ -298,15 +332,24 @@ func (m *manager) handleReadFile(ctx context.Context, args map[string]any) (*mcp
 		return mcp.ErrorResult(err), nil
 	}
 
-	mu := m.projectLock(projectName)
+	key := storeKey(projectName, agentID)
+	mu := m.projectLock(key)
 	mu.Lock()
 	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
 	mu.Unlock()
 	if err != nil {
+		if bip, ok := asBuildInProgress(err); ok {
+			return buildingResult(bip)
+		}
 		return mcp.ErrorResult(fmt.Errorf("ensure sandbox: %w", err)), nil
 	}
 
-	_ = m.store.TouchLastUsed(projectName)
+	_ = m.store.TouchLastUsed(key)
+
+	// Re-sync before reading (tar-pipe mode) so we read the latest local files.
+	if err := m.syncIfNeeded(ctx, containerID, projectDir); err != nil {
+		m.logger.Warn("pre-read sync failed", "project", projectName, "error", err)
+	}
 
 	// Resolve path relative to project workdir
 	filePath := path
@@ -353,15 +396,19 @@ func (m *manager) handleWriteFile(ctx context.Context, args map[string]any) (*mc
 		return mcp.ErrorResult(err), nil
 	}
 
-	mu := m.projectLock(projectName)
+	key := storeKey(projectName, agentID)
+	mu := m.projectLock(key)
 	mu.Lock()
 	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
 	mu.Unlock()
 	if err != nil {
+		if bip, ok := asBuildInProgress(err); ok {
+			return buildingResult(bip)
+		}
 		return mcp.ErrorResult(fmt.Errorf("ensure sandbox: %w", err)), nil
 	}
 
-	_ = m.store.TouchLastUsed(projectName)
+	_ = m.store.TouchLastUsed(key)
 
 	filePath := path
 	if !filepath.IsAbs(path) {

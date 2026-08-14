@@ -3,6 +3,7 @@ package agentcontext
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -377,6 +378,267 @@ func TestWorkflowEngine_RetryOnFailure(t *testing.T) {
 
 	if attempts != 3 {
 		t.Errorf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestWorkflowEngine_AutoVerifyPasses(t *testing.T) {
+	var serverName string
+	var toolName string
+	var checks any
+
+	executor := func(ctx context.Context, server, tool string, args map[string]any) (map[string]any, error) {
+		serverName = server
+		toolName = tool
+		checks = args["checks"]
+		return map[string]any{
+			"passed": true,
+			"checks": []any{
+				map[string]any{"name": "fmt", "passed": true},
+				map[string]any{"name": "lint", "passed": true},
+				map[string]any{"name": "test", "passed": true},
+				map[string]any{"name": "diff", "passed": true},
+			},
+		}, nil
+	}
+
+	engine := NewWorkflowEngine(executor)
+	def := &WorkflowDefinition{
+		Name: "auto-verify-pass",
+		Steps: []WorkflowStep{
+			{
+				ID:       "verify",
+				Name:     "Verify",
+				StepType: StepTypeAutoVerify,
+				ToolArgs: map[string]any{"project": "loom-core", "agent_id": "codex"},
+			},
+		},
+	}
+	if err := engine.RegisterDefinition(def); err != nil {
+		t.Fatalf("RegisterDefinition failed: %v", err)
+	}
+
+	wf, err := engine.StartWorkflow(context.Background(), def.ID, "session1", "agent1", nil)
+	if err != nil {
+		t.Fatalf("StartWorkflow failed: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		time.Sleep(20 * time.Millisecond)
+		wf, _ = engine.GetWorkflow(wf.ID)
+		if wf.Status == WorkflowStatusCompleted || wf.Status == WorkflowStatusFailed {
+			break
+		}
+	}
+
+	if wf.Status != WorkflowStatusCompleted {
+		t.Fatalf("expected completed, got %s: %s", wf.Status, wf.Error)
+	}
+	if serverName != "devbox" {
+		t.Fatalf("server = %q, want devbox", serverName)
+	}
+	if toolName != "devbox_quality_gate" {
+		t.Fatalf("tool = %q, want devbox_quality_gate", toolName)
+	}
+	checkList, ok := checks.([]any)
+	if !ok || len(checkList) != 4 {
+		t.Fatalf("checks = %#v, want default 4-item verification list", checks)
+	}
+
+	verifyStep := wf.StepStates["verify"]
+	if verifyStep == nil || verifyStep.Result == nil {
+		t.Fatal("expected verify step result to be recorded")
+	}
+	if autoVerified, _ := verifyStep.Result["auto_verified"].(bool); !autoVerified {
+		t.Fatalf("expected auto_verified=true, got %#v", verifyStep.Result["auto_verified"])
+	}
+	if verifyStep.RetryCount != 0 {
+		t.Fatalf("retry count = %d, want 0", verifyStep.RetryCount)
+	}
+}
+
+func TestWorkflowEngine_AutoVerifyRetriesAndFails(t *testing.T) {
+	var attempts int32
+	executor := func(ctx context.Context, server, tool string, args map[string]any) (map[string]any, error) {
+		atomic.AddInt32(&attempts, 1)
+		return map[string]any{
+			"passed": false,
+			"checks": []any{
+				map[string]any{"name": "lint", "passed": false, "output_tail": "go vet found issues"},
+			},
+		}, nil
+	}
+
+	engine := NewWorkflowEngine(executor)
+	def := &WorkflowDefinition{
+		Name: "auto-verify-fail",
+		Steps: []WorkflowStep{
+			{
+				ID:         "verify",
+				Name:       "Verify",
+				StepType:   StepTypeAutoVerify,
+				ToolArgs:   map[string]any{"project": "loom-core"},
+				MaxRetries: 2,
+				RetryDelay: 1,
+			},
+		},
+	}
+	if err := engine.RegisterDefinition(def); err != nil {
+		t.Fatalf("RegisterDefinition failed: %v", err)
+	}
+
+	wf, err := engine.StartWorkflow(context.Background(), def.ID, "session1", "agent1", nil)
+	if err != nil {
+		t.Fatalf("StartWorkflow failed: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		time.Sleep(20 * time.Millisecond)
+		wf, _ = engine.GetWorkflow(wf.ID)
+		if wf.Status == WorkflowStatusCompleted || wf.Status == WorkflowStatusFailed {
+			break
+		}
+	}
+
+	if wf.Status != WorkflowStatusFailed {
+		t.Fatalf("expected failed, got %s", wf.Status)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
+	}
+	if wf.FailedStepID != "verify" {
+		t.Fatalf("failed step = %q, want verify", wf.FailedStepID)
+	}
+	if wf.Error == "" || !strings.Contains(wf.Error, "go vet found issues") {
+		t.Fatalf("workflow error = %q, want lint failure summary", wf.Error)
+	}
+	verifyStep := wf.StepStates["verify"]
+	if verifyStep == nil || verifyStep.Result == nil {
+		t.Fatal("expected retry-exhausted verify step result to be preserved")
+	}
+	if verifyStep.RetryCount != 2 {
+		t.Fatalf("retry count = %d, want 2", verifyStep.RetryCount)
+	}
+	if verifyStep.MaxRetries != 2 {
+		t.Fatalf("max retries = %d, want 2", verifyStep.MaxRetries)
+	}
+	if checks, ok := verifyStep.Result["checks"].([]any); !ok || len(checks) != 1 {
+		t.Fatalf("verify step result checks = %#v, want single preserved failure check", verifyStep.Result["checks"])
+	}
+}
+
+func TestWorkflowEngine_AutoVerifySkippedWhenUnavailable(t *testing.T) {
+	engine := NewWorkflowEngine(nil)
+	def := &WorkflowDefinition{
+		Name: "auto-verify-skipped",
+		Steps: []WorkflowStep{
+			{
+				ID:       "verify",
+				Name:     "Verify",
+				StepType: StepTypeAutoVerify,
+				ToolArgs: map[string]any{"project": "loom-core"},
+			},
+		},
+	}
+	if err := engine.RegisterDefinition(def); err != nil {
+		t.Fatalf("RegisterDefinition failed: %v", err)
+	}
+
+	wf, err := engine.StartWorkflow(context.Background(), def.ID, "session1", "agent1", nil)
+	if err != nil {
+		t.Fatalf("StartWorkflow failed: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		time.Sleep(20 * time.Millisecond)
+		wf, _ = engine.GetWorkflow(wf.ID)
+		if wf.Status == WorkflowStatusCompleted || wf.Status == WorkflowStatusFailed {
+			break
+		}
+	}
+
+	if wf.Status != WorkflowStatusCompleted {
+		t.Fatalf("expected completed with skipped quality gate, got %s: %s", wf.Status, wf.Error)
+	}
+
+	verifyStep := wf.StepStates["verify"]
+	if verifyStep == nil {
+		t.Fatal("expected verify step state")
+	}
+	if verifyStep.Status != StepStatusSkipped {
+		t.Fatalf("verify status = %s, want skipped", verifyStep.Status)
+	}
+	if verifyStep.Result == nil || verifyStep.Result["skipped"] != true {
+		t.Fatalf("verify result = %#v, want skipped marker", verifyStep.Result)
+	}
+	if wf.Context["verify"] == nil {
+		t.Fatal("expected skipped auto verify result to be stored in workflow context")
+	}
+}
+
+func TestWorkflowStatusIncludesRetryStateAndResult(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+
+	executor := func(ctx context.Context, server, tool string, args map[string]any) (map[string]any, error) {
+		return map[string]any{
+			"passed": false,
+			"checks": []any{
+				map[string]any{"name": "lint", "passed": false, "output_tail": "lint failed"},
+			},
+		}, nil
+	}
+
+	engine := NewWorkflowEngine(executor)
+	svc := &Service{workflowEngine: engine}
+	svc.workflow = &WorkflowSvc{Service: svc}
+
+	def := &WorkflowDefinition{
+		Name: "auto-verify-status",
+		Steps: []WorkflowStep{
+			{ID: "verify", Name: "Verify", StepType: StepTypeAutoVerify, ToolArgs: map[string]any{"project": "loom-core"}, MaxRetries: 1, RetryDelay: 1},
+		},
+	}
+	if err := engine.RegisterDefinition(def); err != nil {
+		t.Fatalf("RegisterDefinition failed: %v", err)
+	}
+
+	wf, err := engine.StartWorkflow(context.Background(), def.ID, "session1", "agent1", nil)
+	if err != nil {
+		t.Fatalf("StartWorkflow failed: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		time.Sleep(20 * time.Millisecond)
+		wf, _ = engine.GetWorkflow(wf.ID)
+		if wf.Status == WorkflowStatusFailed {
+			break
+		}
+	}
+
+	result, err := svc.HandleWorkflowStatus(context.Background(), map[string]any{"workflow_id": wf.ID})
+	if err != nil {
+		t.Fatalf("HandleWorkflowStatus returned error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error result: %+v", result)
+	}
+
+	payload := decodeToolPayload(t, result.Content[0].Text)
+	steps, ok := payload["steps"].([]any)
+	if !ok || len(steps) != 1 {
+		t.Fatalf("steps = %#v, want 1 step", payload["steps"])
+	}
+	step, ok := steps[0].(map[string]any)
+	if !ok {
+		t.Fatalf("step summary type = %T, want map[string]any", steps[0])
+	}
+	if step["retry_count"] != float64(1) {
+		t.Fatalf("retry_count = %v, want 1", step["retry_count"])
+	}
+	if step["max_retries"] != float64(1) {
+		t.Fatalf("max_retries = %v, want 1", step["max_retries"])
+	}
+	if _, ok := step["result"].(map[string]any); !ok {
+		t.Fatalf("expected structured result in status payload, got %#v", step["result"])
 	}
 }
 

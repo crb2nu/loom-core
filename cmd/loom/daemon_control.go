@@ -2,10 +2,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/crb2nu/loom/internal/daemon"
+	"github.com/crb2nu/loom/pkg/launchctl"
 )
 
 const launchdLabel = "com.loom.daemon"
@@ -36,8 +37,7 @@ func stopDaemon(socketPath string) error {
 	home, _ := os.UserHomeDir()
 	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
 	if _, err := os.Stat(plistPath); err == nil {
-		cmd := exec.Command("launchctl", "stop", launchdLabel) //nolint:noctx // launchctl is a quick fire-and-forget call
-		if err := cmd.Run(); err == nil {
+		if err := launchctl.Stop(context.Background(), launchdLabel); err == nil {
 			// Wait for daemon to stop
 			for i := 0; i < 30; i++ {
 				time.Sleep(100 * time.Millisecond)
@@ -88,8 +88,7 @@ func killLoomdBySocket(socketPath string) error {
 			pattern = "loomd([[:space:]]|$)"
 		}
 	}
-	cmd := exec.Command("pkill", "-TERM", "-f", pattern) //nolint:noctx
-	_ = cmd.Run()                                        // pkill returns non-zero when no matches
+	_ = launchctl.Kill(context.Background(), "-TERM", pattern) // pkill returns non-zero when no matches
 	return nil
 }
 
@@ -160,24 +159,45 @@ func installService() error {
 	}
 
 	// Load the service
-	cmd := exec.Command("launchctl", "load", plistDest) //nolint:noctx // launchctl is a quick fire-and-forget call
-	if err := cmd.Run(); err != nil {
+	if err := launchctl.Load(context.Background(), plistDest); err != nil {
 		return fmt.Errorf("launchctl load: %w", err)
 	}
 
 	fmt.Printf("Installed launchd service: %s\n", plistDest)
 	fmt.Println("Daemon will start automatically on login")
 	fmt.Println("Start now with: loom start")
+
+	// Also install the HUD service (non-fatal).
+	fmt.Println()
+	if err := installHudService(); err != nil {
+		fmt.Printf("Warning: HUD service install failed: %v\n", err)
+	}
+
+	// Also install agent token sync (non-fatal).
+	fmt.Println()
+	if err := installAgentTokenSync(); err != nil {
+		fmt.Printf("Warning: agent token sync install failed: %v\n", err)
+	}
+
 	return nil
 }
 
 func uninstallService() error {
+	// Uninstall agent token sync first (non-fatal).
+	if err := uninstallAgentTokenSync(); err != nil {
+		fmt.Printf("Warning: agent token sync uninstall failed: %v\n", err)
+	}
+
+	// Uninstall HUD service (non-fatal).
+	if err := uninstallHudService(); err != nil {
+		fmt.Printf("Warning: HUD service uninstall failed: %v\n", err)
+	}
+
 	home, _ := os.UserHomeDir()
 	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
 
 	// Unload first
-	cmd := exec.Command("launchctl", "unload", plistPath) //nolint:noctx // launchctl is a quick fire-and-forget call
-	_ = cmd.Run()                                         // Ignore error if not loaded
+	_ = launchctl.Unload(context.Background(), plistPath) // Ignore error if not loaded
 
 	// Remove plist
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
@@ -283,6 +303,14 @@ func statusDaemon(socketPath string) error {
 			}
 		}
 	}
+
+	// Append HUD status.
+	fmt.Println()
+	_ = statusHudService()
+
+	// Append agent token sync status.
+	fmt.Println()
+	_ = agentTokenSyncStatus()
 
 	return nil
 }

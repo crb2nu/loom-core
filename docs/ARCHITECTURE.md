@@ -136,9 +136,9 @@ Loom provides a unified mechanism for delivering skills and instructions across 
 
 The `skills-registry.yaml` file is the source of truth for all skills. Each skill can have multiple target formats:
 
-- **Command (`command`):** Generates slash commands (e.g., `.claude/commands/`).
+- **Command (`command`):** Generates legacy slash commands (e.g., `.claude/commands/`). For Claude, superseded by `skill` (Agent Skills format); kept for transition compatibility.
 - **Rule (`rule`):** Generates rule files (e.g., `.claude/rules/`).
-- **Skill Bundle (`skill`):** Generates full skill directories with scripts, references, and assets (e.g., `~/.codex/skills/`).
+- **Skill Bundle (`skill`):** Generates full skill directories with scripts, references, and assets (e.g., `~/.claude/skills/`, `~/.codex/skills/`). Claude bundles support `when_to_use` trigger phrases (combined with the description, capped at 1,536 chars and validated), `disable_model_invocation` for user-only `/name` skills, and `context: fork` pass-through.
 - **Instruction (`instruction`):** Appends instructions to a composite platform instruction file.
 
 ### Instruction Files
@@ -170,10 +170,8 @@ Some platforms have specific requirements for where files reside:
 
 ```mermaid
 flowchart LR
-  subgraph Servers[Selected instrumented servers]
-    Git[mcp-git]
-    GitLab[mcp-gitlab]
-    Prom[mcp-prometheus]
+  subgraph Servers[Instrumented MCP servers]
+    MCP[All cmd/mcp-*/main.go handlers]
     AgentContext[mcp-agent-context]
     Devbox[mcp-devbox]
   end
@@ -191,15 +189,16 @@ flowchart LR
     HUD[HUD panels]
   end
 
-  Git & GitLab & Prom & AgentContext & Devbox --> Logs --> Loki
-  Git & GitLab & Prom & AgentContext --> Traces --> Jaeger
+  MCP & AgentContext & Devbox --> Logs --> Loki
+  MCP & AgentContext --> Traces --> Jaeger
   AgentContext --> Stats --> Prometheus
   Devbox --> Stats --> HUD
 ```
 
 Notes:
 
-- Tracing currently ships on selected servers, not every `mcp-*` binary.
+- Tracing wrappers now ship across all `cmd/mcp-*/main.go` MCP binaries.
+- Daemon-level span expansion (routing/spawn/proxy lifecycle) remains tracked in `ROADMAP.md`.
 - `pkg/mcpotel` is noop unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ## Reliability and Safety Notes

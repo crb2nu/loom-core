@@ -1,0 +1,1 @@
+- Add the dry-run-default audit-advisory sweep (`pkg/mills/audit/advisory.go`, `pkg/mills/audit/sweep.go`) and its one-time operator runbook (`docs/runbook-audit-advisory-sweep.md`), requiring explicit `-apply` before stale bot-authored digest issues are closed.

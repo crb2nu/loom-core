@@ -64,28 +64,60 @@ export const AGENT_COLORS: Record<string, string> = {
 
 export type BadgeVariant = 'info' | 'success' | 'warning' | 'error' | 'accent' | 'muted';
 
+/**
+ * The one status→tone map for the whole HUD. Consumed via statusVariant() /
+ * statusColor() in utils/format.ts — no panel may hand-roll its own.
+ *
+ * The semantic, fixed so a status means one thing wherever it is scanned:
+ *   info    — work in flight (running, in_progress, building, creating)
+ *   success — work that landed or is healthy (completed, done, merged,
+ *             resolved, active, approved, healthy)
+ *   error   — work that broke or is unreachable (failed, error, blocked,
+ *             down, rejected)
+ *   warning — work waiting on a human or degrading (pending, waiting,
+ *             waiting_approval, paused, escalated, degraded)
+ *   muted   — work not happening (queued, idle, offline, cancelled, stopped)
+ *
+ * Absent keys fall through to 'info' in statusVariant(), which reads as "in
+ * flight" — every state a row can actually carry must be spelled out here.
+ */
 export const STATUS_VARIANTS: Record<string, BadgeVariant> = {
-  // Task/workflow statuses
-  pending: 'warning',
+  // In flight
   in_progress: 'info',
   running: 'info',
+  // Spawn startup states. Previously absent, so a booting spawn fell through
+  // to the default tone instead of reading as work in flight.
+  creating: 'info',
+  building: 'info',
+  // Landed / healthy
   active: 'success',
   completed: 'success',
   resolved: 'success',
+  healthy: 'success',
+  approved: 'success',
+  merged: 'success',
+  done: 'success',
+  // Broken / unreachable
   failed: 'error',
   error: 'error',
   blocked: 'error',
-  cancelled: 'muted',
+  down: 'error',
+  rejected: 'error',
+  // Waiting on a human / degrading
+  pending: 'warning',
   waiting: 'warning',
+  waiting_approval: 'warning',
+  degraded: 'warning',
+  // Mills run/backlog states. Absent keys left the Warps State column
+  // permanently grey — every mills state a row can carry is spelled out.
+  paused: 'warning',
+  escalated: 'warning',
+  // Not happening
+  queued: 'muted',
   idle: 'muted',
   offline: 'muted',
-  degraded: 'warning',
-  healthy: 'success',
-  down: 'error',
-  // Workflow-specific
-  approved: 'success',
-  rejected: 'error',
-  waiting_approval: 'warning',
+  cancelled: 'muted',
+  stopped: 'muted',
   // Memory-specific
   compressed: 'accent',
   expired: 'error',

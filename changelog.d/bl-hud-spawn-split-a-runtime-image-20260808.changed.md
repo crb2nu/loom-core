@@ -1,0 +1,1 @@
+- Extract HUD runtime-image generation and agent install/auth helpers from `internal/hud/spawn.go` into cohesive package-local files.

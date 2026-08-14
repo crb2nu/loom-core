@@ -1,0 +1,1 @@
+- Clarify in `pkg/mills/store/store.go` and `pkg/mills/runner/runner.go` that workflow KPI counters derive from the durable workflow journal, not council-runner lifecycle hooks or process-local increments.

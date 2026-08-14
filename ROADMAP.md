@@ -1,227 +1,151 @@
-# Project Roadmap
+# Loom Core Roadmap
 
-> Last Updated: February 17, 2026
+> Last Updated: 2026-08-06
+> Tier: 1 (see workspace AGENTS.md "Portfolio Tiers")
+> Tracking Issue: https://gitlab.flexinfer.ai/services/loom-core/-/issues/239
+
+<!--
+Convention (portfolio-refresh 2026-H2, see libs/STANDARDS.md "Roadmap & Backlog"):
+- This file states CURRENT TRUTH, derived from git activity and deployed state —
+  never re-date stale content. Each refresh MR must cite its evidence (git-log
+  window inspected, deploy-state query used).
+- Backlog lives in GitLab issues (P1/P2/P3 labels + milestones), NOT in this file.
+  This file links the backlog; it does not duplicate it.
+- If a live plan exists in the agent-context plan store, reference its plan_id
+  here; the store is canonical and this file is a rendered summary.
+- The Mills council extracts unchecked bullets under Now/Next into
+  roadmap_intents — bullets here are demand-sourcing inputs, phrase them as
+  outcomes with their gates.
+- Staleness SLO: Tier 1/2 repos must have this file dated within 90 days.
+  `bin/portfolio-inventory --roadmaps` reports conformance.
+-->
 
 ## Current Status
 
-Loom Core is the production backend for Loom's local MCP runtime:
+Loom Core is the production backend for the Loom MCP runtime: the `loom` CLI,
+`loomd` daemon, aggregating proxy, the `cmd/mcp-*` Go server binaries, the HUD
+web dashboard, the agent-context store, and the Mills autonomous-delivery
+operator. Merges land daily. As of 2026-08-04 the Mills demand-sourcing loop is
+closed end-to-end: the council's entire queued plan backlog was verified
+shipped and the plan store reconciled (2026-08-04 session); the failure
+classifier fails closed on external-dependency signatures with bounded
+transient requeue and cost-by-class telemetry; dynamic workflows completed
+their first production run and merged the work product (!1395). The Mill Staff
+charter (`.loom/brainstorm-mill-staff-consolidation-2026-08-01.md`,
+`docs/FACTORY_MODEL.md` §3) landed S0/S1/S3 and the `pkg/mills/guard`
+substrate; the overseers ("the Alley") deployed 2026-08-01 in dry-run and the
+soak is live (Prometheus `mills_overseer_ticks_total` / `_actions_total`
+verified 2026-08-04 — note: zero groomer dedup verdicts yet, so the promotion
+review must inspect dry-run events, not just the absence of false positives).
+MR-awareness shipped M1/M2/M3b/M4 (registry, `agent_mr_status` + CLI, proxy
+trailer, bounded shepherd) plus the mobile merge attention lane. The
+agent-context embedder fallback path gained fail-closed degradation thresholds
+and a fallback-ratio gauge (!1417).
 
-- `loom` CLI for config generation/sync, daemon control, HUD launch, and agent hooks
-- `loomd` daemon for routing, process lifecycle, health monitoring, and tunnel management
-- `loom proxy` aggregating proxy for multi-platform agent support (Claude, Codex, Gemini, Zed, VS Code, Kilocode)
-- 40+ `mcp-*` server catalog in Go (Git, GitLab, GitHub, K8s, observability, memory, sandbox, and more)
-- HUD web dashboard with real-time agent observability, fleet monitoring, and workflow management
-- Agent context system with presence, file claims, worktree allocation, and workflow orchestration
+Update 2026-08-05: the roadmap→intent loop is proven — overnight the council
+consumed the 08-04 refresh and delivered 13 bolts (concurrency policy knob,
+embedder Grafana panel+alert, config-gated OTel export, multi-repo intake
+fail-closed ×2, ci-incident-classifier fixture+regression suites, langfuse
+runbook; shift report 2026-08-05 13:51 UTC + `git log origin/main`). The
+self-improving-factory waves 1+2 merged (9 MRs, !1417–!1426): plan-store truth
+sweep + mrwatch merged signal, promotion evidence report, operator-override
+labels, judge-verdict calibration, revert-precise regression attribution, and
+run provenance stamps. Wave 3 (council merged-work grounding at authoring,
+config-outcome analytics over provenance events, signature-candidate mining)
+is in flight locally — deliberately not listed as intents below until merged,
+to avoid duplicate proposals. Three overnight sparks were closed as
+superseded-duplicate work (#468–#470) — the class wave 3's grounding slice
+eliminates.
 
-## Market Context
+- **Plan store**: council demand-sourcing plans all reconciled to `merged`
+  2026-08-04 except `plan-council-add-fail-closed-thresholds-…` (in review,
+  !1417); `plan-loom-core-fleet-reliability-arch-20260710` (architecture);
+  `plan-pattern-loom-mills` (slices A2/B1 merged; B2 + live e2e open)
+- **Deployed**: k3s via Flux — `loom-mills-operator` + `loom-hub` (overseers
+  dry-run since 2026-08-01); CLI/daemon/proxy local-first on developer machines
+- **CI**: platform/gitops Go template family; **pipeline success required to
+  merge**; flake quarantine + honest reruns live (!1409)
 
-> Based on research conducted 2026-02-15. Full analysis: `.loom/12-research-market-trends-2026-02.md`
+## Now
 
-MCP is now the de facto standard for AI-tool integration (8M+ downloads, 5,800+ servers, Linux Foundation governance). The AI coding market has segmented into IDE assistants (Cursor, Copilot), terminal agents (Claude Code, Codex CLI), and orchestration platforms (GitHub Agent HQ, Augment Intent). Loom Core serves the orchestration layer — the fastest-growing, least commoditized segment.
+- [ ] Mill Staff S2 promotion — hold the ≥1-week overseer dry-run soak (live
+  since 2026-08-01), then read `GET /api/mills/promotion-report` (shipped
+  2026-08-05, explicit ZeroEvidence flag) for verdict volume and
+  false-positive dedup verdicts; if evidence is zero, extend the soak or make
+  an explicit low-evidence call before flipping `allow.dedup_close` in the
+  gitops policy ConfigMap (policy-checksum bump required)
+- [ ] Mill Staff S4 finish — unified "Mill Staff" HUD group (Drawing Office /
+  Drawing-in / The Alley) with a recent-actions strip over
+  `Events.ListByActorSince`; decide the squad-manifest advisory fields
+  (enforce `budget_share`/`gates` at dispatch or remove them from the schema)
+- [x] Mill Staff shed list (classifier half) — `council/ci_incident_classifier.go`
+  verified and test-hardened in place (fixture + regression suites, landed
+  autonomously 2026-08-05); kept, not deleted
+- [x] Mill Staff shed list — unread council notification trigger implemented
+  behind a flag (landed autonomously 2026-08-06)
+- [ ] Pattern Loom close-out — run the live queued-proof kill-test (enqueue a
+  synthetic widget stamp, verify reconciler pickup, pause before merge), wire
+  live tools-manifest probing into stamp, land A2's merged-instance checkout
+  into `repo_root`, finish B2's candidate→approved taste gate
+- [ ] Pattern Loom cross-repo stamping — give stamps a target project
+  (BacklogItem has no Project field; `target_dir` is a monorepo stopgap) so
+  patterns can land outside loom-core
+- [ ] MR-awareness remainder — the scripted kill-test (a) harness landed
+  autonomously 2026-08-06; run it, then land M3a delta-gated mr-status
+  injection via hook additionalContext (Claude/Gemini); close-out audit of
+  the shipped M4 shepherd and M5 attention-lane surfacing against
+  `product-spec-mr-awareness-2026-07-18.md`
 
-**Key competitive differentiators:**
-- Only tool unifying runtime, proxy, observability, agent orchestration, and multi-platform config in one binary
-- 6-platform config sync (no competitor matches this breadth)
-- Runtime-integrated HUD (zero-config observability, unlike bolt-on alternatives)
-- Worktree allocation + file claims (conflict prevention nobody else has)
+## Next
 
-**Key market gaps to address:**
-- Remote MCP transport + OAuth 2.1 (MCP v1.0 standard, all gateways support it)
-- RBAC / access control (enterprise requirement across gateway market)
-- OTel trace export (industry standard for enterprise observability integration)
-- Cost tracking and audit trails (compliance and visibility)
+- [ ] Autonomy throughput — the concurrency limit is now a policy field
+  (landed autonomously 2026-08-05); raise it under the S4 supervisor +
+  admission caps once S2 promotion evidence is in, watching the KPI snapshot
+  and shift reports for regression
+- [ ] Ops sweep — one-time bulk-close of pre-existing stale audit-advisory
+  issues (#339–#355 class; new findings already fold into the daily digest)
+- [ ] Semantic merged-work grounding — the lexical Jaccard band cannot see
+  same-work-different-words duplicates (live 2026-08-06: `move-autonomy-
+  concurrency-limit-into-policy` restated the just-merged `promote-pipeline-
+  concurrency-limit-to-a-policy-field`, title similarity ≈0.27 vs the 0.55
+  band; escalation #475, judge-corroborated). Extend the grounding with an
+  embedding-assisted comparison behind the same policy flag and fail-open
+  discipline, shadow-first per the promotion-evidence playbook
+- [ ] Signature miner stop-phrases — the first mined candidate was a generic
+  test-command fragment (`go test <path> <path>`); teach the n-gram picker a
+  stop-phrase list so candidates name failure signatures, not tooling
+- [ ] Promote the OpenRouter credit-exhaustion signature — provider 402
+  "requires more credits" currently classifies as `code` (live: canary
+  autopilot #477); once the miner surfaces it with shadow evidence, add it
+  to the external-dependency classifier with the litellm/credits source tag
+- [x] Embedder degradation observability — gauge shipped in !1417; Grafana
+  panel + alert landed autonomously 2026-08-05
+- [x] OTel trace export from daemon (#12) — config-gated export landed
+  autonomously 2026-08-05
+- [ ] Monolith splits — `internal/hud/spawn.go` (#168),
+  `cmd/loom-mills-operator/main.go` (#169), `cmd_sync.go` (#170)
+- [x] Mills multi-repo intake safety-rails — fail-closed on unlisted/unknown
+  target repos and on classification errors, landed autonomously 2026-08-05
 
-## Recently Shipped (post `v0.9.7`)
+## Later
 
-- ✅ **HUD UI/UX overhaul (M1-M4 complete)**
-  - Shipped design system foundation: tokens, type scale, spacing scale, elevation (`tokens.ts`, `theme.css`).
-  - Shipped shared primitives: `PanelShell`, `DataTable`, `FilterBar`, `DetailDrawer`, `EmptyState`, `MetricCard`.
-  - Shipped navigation restructure: 13 panels grouped into 6 views with badge counts, sub-tabs, keyboard shortcuts.
-  - Shipped panel migrations: Tasks, Servers, Fleet, Memory, Presence, Knowledge, Graph panels all use shared components.
-  - Shipped DataTable with sortable columns, expandable rows, skeleton loading, `aria-sort`, row click handlers.
-  - Shipped DetailDrawer integration in Fleet, Servers, Tasks, Memory, and Graph panels.
-  - Shipped FilterBar in Tasks, Memory, Graph, Servers panels.
-  - Shipped EmptyState adoption across all panels.
-  - Shipped accessibility: semantic HTML, `aria-current`, focus trapping in drawers, keyboard navigation, skip link.
-  - Shipped SSE circuit breaker with exponential backoff, incremental fetching, deduplication.
+- Debate Mode stays parked (decision 2026-08-04): wire a real Moderator behind
+  the default-off flags or delete ~600 LOC, when the Drawing Office needs
+  multi-round quality
+- Fleet S6 (hub child broker, clustered Postgres), S7 (MCP Tasks adapter) —
+  gated on fleet-plan evidence
+- Weaver S6-full/S7 registry, squad planner (gap map)
+- gpt-5.6 terra/sol re-flip — gated on #347–#351 class fixes + codexVersion bump
+- Off-LAN MCP-via-hub (Cloudflare Access); Zed `context_servers` surface + ICC
+  tool-cap rebalance
+- OpenAI Responses orchestration experimental track (#63)
+- Enterprise RBAC/gateway hardening suite (#25–#29); Simplification EPICs 1–3
+  (#65–#67)
+- Mills harvester-vm substrate Phase B (curated base image, warm pool)
 
-- ✅ **Remote MCP transport (Streamable HTTP)**
-  - Added Streamable HTTP listener to `loomd` (`--http-addr` flag) per MCP v1.0 spec.
-  - Added bearer token, OIDC, and mTLS authentication modes.
-  - Added session management with idle timeout and background reaper.
-  - Added `loom auth token-generate/show/revoke` CLI commands.
-  - Added `loom proxy --remote` for hybrid local+remote topology.
-  - Added origin restriction (DNS rebinding protection) and TLS enforcement for non-localhost.
-  - Docs: `docs/STREAMABLE_HTTP.md`.
+## Backlog
 
-- ✅ **Agent orchestration**
-  - Added presence state machine with nudge system.
-  - Added worktree lifecycle reconciler with TTL, disk scan, and orphan removal.
-  - Added workflow engine with tool executor via daemon loopback.
-  - Added FlexInfer embeddings provider with morph_fast_apply awareness.
-
-- ✅ **Daemon reliability hardening**
-  - Added `CloseOnExec` on lock FD to prevent child process lock leaks.
-  - Added flock-based singleton enforcement with stale socket detection.
-  - Added `EnsureRunning` helper for proxy autostart.
-  - Added LaunchAgent kickstart with direct-spawn fallback.
-
-- ✅ **Devbox sandboxing**
-  - Added `mcp-devbox` with project fingerprinting, Dockerfile generation, and persistent sandbox lifecycle.
-  - Added K8s backend with Kaniko in-cluster builds (replacing Docker build).
-  - Added async tools (`devbox_exec_async`, `devbox_exec_poll`) and observability tools (`devbox_metrics`, `devbox_summary`).
-  - Added HUD sandbox controls.
-
-- ✅ **Multi-platform config generation**
-  - Added registry-driven platform permissions for Claude, Codex, Gemini, Zed.
-  - Added Claude permission rule validation and Codex web_search support.
-  - Added shell completion command and `LOOM_SOCKET` env support.
-
-- ✅ **MCP server quality**
-  - Added MCP server tests and OTel instrumentation.
-  - Added error handling guardrails with `pkg/mcperror`.
-  - Added config schema validation and upstream spec tracking.
-
-- ✅ **Developer lifecycle**
-  - Added atomic install scripts and `make dev-upgrade` / `make dev-reload` workflow.
-  - Added rollback-friendly `.prev` binary flow and safer restart behavior.
-
-## Tier 1: Strengthen Existing Moats (Current)
-
-These build on shipped work and address immediate quality and reliability.
-
-- [x] **Finish HUD M3/M4** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/7)) ✅ Complete
-  - ~~DetailDrawer integration for all views (Fleet, Servers, Tasks, Memory, Graph).~~ ✅ Done
-  - ~~FilterBar across major panels (Tasks, Memory, Graph, Servers).~~ ✅ Done
-  - ~~Accessibility: semantic HTML, `aria-sort`, focus trapping, skip link, keyboard nav.~~ ✅ Done
-  - ~~SSE circuit breaker, incremental fetching, D3 simulation pause.~~ ✅ Done
-  - ~~Add bulk actions toolbar for Tasks, Memory, and Claims.~~ ✅ Done
-  - ~~Add row pagination (maxRows) for large lists (Fleet, Tasks).~~ ✅ Done
-  - ~~Ship color-blind safe status indicators (shape variants alongside color).~~ ✅ Done
-  - ~~Lazy-load heavy panels (Topology, Graph, Lifecycle).~~ ✅ Done
-
-- [ ] **Raise test coverage to 40%+** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/2))
-  - ~~Add smoke tests for 10 MCP servers (youtube, itchio, crypto, release, morph-fast-apply, alertmanager, minio, substack, qdrant, morph-embeddings).~~ ✅ Done
-  - ~~Add enterprise edge-case tests (RBAC, audit, cost, OAuth).~~ ✅ Done
-  - ~~Add agentcontext gap-fill tests (workflows, memory hierarchy, service).~~ ✅ Done
-  - Add daemon lifecycle tests: flock contention, socket cleanup, proxy autostart, graceful shutdown.
-  - Add integration tests for Docker + K8s devbox backends under monorepo layouts.
-  - Current: 30.4% (up from 29.3%). Target: 40%.
-
-- [ ] **Onboarding and docs consistency** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/6))
-  - ~~Add `docs/ENTERPRISE_SECURITY.md` covering RBAC, audit, cost, OAuth.~~ ✅ Done
-  - ~~Expand `docs/STREAMABLE_HTTP.md` with OAuth 2.1 auth type.~~ ✅ Done
-  - ~~Update README, docs hub, CHANGELOG, and ROADMAP.~~ ✅ Done
-  - Keep README/docs/changelog synchronized with shipped command and tool surface.
-  - Maintain one canonical docs entrypoint for user/developer/operator tasks.
-  - Polish `make bootstrap-local` first-run experience.
-
-## Immediate Architecture Refactor Focus (Current)
-
-Derived from commit-window review (`2026-02-15` to `2026-02-17`) to reduce regression risk before expanding Tier 3 scope.
-
-- [ ] **Harden daemon tool-call pipeline extraction** (in progress via `8c2c50d`) ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/20))
-  - ✅ Stage 1 complete: `handleCall` orchestration now delegates to `internal/daemon/callpipeline.go`.
-  - ✅ Stage 2 complete: isolated side effects (audit/cost/cache/metrics) into dedicated pipeline helpers and added targeted stage-failure tests for route/connect + transport paths.
-  - Next: unify/centralize error-envelope construction for parse/build/route stages and add end-to-end pipeline stage-boundary regression tests.
-  - Target outcome: lower conflict/churn in `internal/daemon/daemon.go` and clearer test seams.
-
-- [ ] **Finish agent contract convergence across HUD/CLI/bridge** (in progress via `8c2c50d`) ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/21))
-  - ✅ Stage 1 complete: shared contracts for context-inspect + nudge policy in `internal/hud/bridge/agent_contracts.go`.
-  - Next: split and dedupe command/bridge surfaces (`cmd/loom/cmd_agent.go`, `internal/hud/bridge/agent.go`, `internal/hud/api_agent.go`) and align error envelopes.
-  - Target outcome: single contract model for context-inspect, nudge queue, and policy mutation surfaces.
-
-- [x] **Split oversized HUD panel/state surfaces** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/22)) ✅ Complete
-  - ✅ 2026-02-17: moved diagnostics polling/fetch/mutation logic into `presenceDiagnosticsStore` and kept `PresenceDiagnosticsTab.svelte` view-only; added TUI claim-conflict visibility in `internal/tui/panels/presence.go` for HUD/TUI parity.
-  - ✅ 2026-02-21: extracted dispatch/nudge/handoff modals from `PresencePanel.svelte` into `DispatchTaskModal`, `NudgeAgentModal`, `CreateHandoffModal` components; moved `fileConflicts` derived logic into `presenceStore` getter.
-  - Target outcome: safer iteration for Fleet orchestration UX work ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/13)).
-
-- [ ] **Refactor devbox K8s backend by concern** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/23))
-  - Separate build pod orchestration from runtime lifecycle logic in `internal/devbox/backend/k8s.go`.
-  - Target outcome: faster iteration and stronger integration-test coverage for Roadmap Issue #2 remaining devbox work.
-
-- [x] **Reduce HUD dist artifact churn in feature commits** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/24)) ✅ Complete
-  - ✅ 2026-02-21: added `.gitattributes` marking dist JS/CSS as `linguist-generated -diff` to collapse in MR diffs; added `make hud-dist-check` target for local/CI freshness verification.
-  - Target outcome: cleaner review diffs and faster root-cause analysis during regressions.
-
-## Tier 2: Capture Market Gaps (Next)
-
-These address capabilities the market now expects from production MCP infrastructure.
-
-- [ ] **OTel trace export from daemon** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/12))
-  - Broaden `pkg/mcpotel` adoption across all high-traffic MCP servers.
-  - Instrument tool call latency, server spawn/restart, proxy connection lifecycle in `loomd`.
-  - Add OTLP gRPC export to configurable endpoint (Prometheus, Grafana, Jaeger).
-  - Expose OTel-compatible metrics in HUD health views.
-  - *Rationale: Industry standard. Positions Loom alongside (not against) Langfuse, Datadog, Splunk.*
-
-- [x] **Remote MCP transport + auth** ✅ Shipped
-  - ~~Add Streamable HTTP transport to `loomd` (MCP v1.0 spec compliance).~~ ✅ Done
-  - ~~Add bearer token, OIDC, and mTLS authentication for remote access.~~ ✅ Done
-  - ~~Enable hybrid local+remote topology (local proxy connecting to remote daemon).~~ ✅ Done
-  - ~~OAuth 2.1 authorization server with PKCE, dynamic client registration, AS/resource metadata ([#11](https://gitlab.flexinfer.ai/services/loom-core/-/issues/11)).~~ ✅ Done
-  - *Rationale: Transforms Loom from local dev tool into team/org infrastructure. Every MCP gateway supports this. Biggest single unlock for adoption.*
-
-- [x] **Lightweight RBAC for tool access** ([#8](https://gitlab.flexinfer.ai/services/loom-core/-/issues/8)) ✅ Shipped
-  - ~~Add role-to-tool mapping in daemon config (e.g., restrict destructive tools per agent).~~ ✅ Done
-  - ~~Enforce per-agent tool scoping at the proxy layer.~~ ✅ Done
-  - ~~Log access decisions for audit.~~ ✅ Done
-  - *Rationale: #1 enterprise requirement. All gateway competitors (Kong, Lunar.dev, TrueFoundry) offer this.*
-
-- [x] **Cost tracking and attribution** ([#10](https://gitlab.flexinfer.ai/services/loom-core/-/issues/10)) ✅ Shipped
-  - ~~Track token usage per agent session, per tool, per MCP server at the proxy layer.~~ ✅ Done
-  - Expose cost dashboard in HUD (new KPI on Overview panel).
-  - Export cost metrics via OTel.
-  - *Rationale: The proxy already sees all traffic. Adding token counting is incremental. No local tool provides this today.*
-
-- [x] **Structured audit trail** ([#9](https://gitlab.flexinfer.ai/services/loom-core/-/issues/9)) ✅ Shipped
-  - ~~Produce structured JSON event for every tool call through the proxy (agent_id, session, tool, server, duration, status).~~ ✅ Done
-  - ~~Store in append-only log file, exportable to SIEM/observability tools.~~ ✅ Done
-  - *Rationale: Compliance requirement for enterprise adoption. Addresses "Shadow MCP" concerns.*
-
-## Tier 3: Strategic Differentiation (Future)
-
-These position Loom Core in ways competitors cannot easily replicate.
-
-- [ ] **Fleet orchestration UX** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/13))
-  - Add dispatch panel in HUD for assigning tasks to agents and tracking parallel progress.
-  - Surface file claim conflicts in HUD when agents touch overlapping files.
-  - Add merge orchestration assistance after parallel agents complete work.
-  - Improve cross-agent context transfer via the handoff system.
-  - *Rationale: Market is moving to "developer as fleet commander" pattern (Augment Intent, GitHub Agent HQ, Cursor Parallel Agents).*
-
-- [ ] **MCP server catalog and discovery** ([Issue](https://gitlab.flexinfer.ai/services/loom-core/-/issues/14))
-  - Add `loom catalog list` for browsable server catalog with capabilities and env requirements.
-  - Add `loom catalog enable <server>` for one-command server activation.
-  - Add HUD catalog view for browse, enable/disable, and per-server health.
-  - *Rationale: 40+ curated Go servers is a unique asset. Docker MCP Toolkit has a catalog; Loom should too.*
-
-- [ ] **Security hardening layer** ([#25](https://gitlab.flexinfer.ai/services/loom-core/-/issues/25), [#26](https://gitlab.flexinfer.ai/services/loom-core/-/issues/26), [#27](https://gitlab.flexinfer.ai/services/loom-core/-/issues/27), [#29](https://gitlab.flexinfer.ai/services/loom-core/-/issues/29))
-  - Add input schema validation at proxy before forwarding to servers.
-  - Add output scanning for PII/secrets in tool responses.
-  - Add per-agent, per-tool rate limiting.
-  - Add deny-list for blocking tool calls based on policy.
-  - Note: prior umbrella issue `#15` is closed; active work is tracked in the concrete slice issues above.
-  - *Rationale: MCP security is enterprise-critical. Lasso, MCP Manager, MCP Total are emerging competitors.*
-
-## Ongoing Engineering Goals
-
-- Keep tool-call latency bounded under typical client deadlines (~60s).
-- Preserve backwards compatibility for `loom proxy` and generated client configs.
-- Maintain secure defaults around secrets interpolation and config validation.
-- Monitor A2A Protocol (Google) and MCP Code Mode (Cloudflare) for future integration.
-
-## References
-
-- `README.md`
-- `docs/README.md`
-- `docs/ARCHITECTURE.md`
-- `docs/DEV_BUILD_LIFECYCLE.md`
-- `docs/STREAMABLE_HTTP.md` — Streamable HTTP transport setup and configuration
-- `docs/planning/2026-02-19-enterprise-gateway-rbac-devbox-plan.md` — Scoped enterprise delivery plan for gateway, RBAC, and devbox executor
-- `.loom/12-research-market-trends-2026-02.md` — Market & platform strategic analysis (2026-02-15)
-- `.loom/10-research.md` — HUD UI/UX research brief
-- `.loom/20-product-spec.md` — HUD overhaul product spec
-- `.loom/30-implementation-plan.md` — HUD overhaul implementation plan
-- `docs/planning/2026-02-quality-onboarding-opportunities.md` — Quality and onboarding opportunities
-- `docs/planning/2026-02-17-architecture-refactor-opportunities.md` — Commit-window architecture/refactor focus and sequencing
+Full backlog: [P1 issues](https://gitlab.flexinfer.ai/services/loom-core/-/issues/?label_name%5B%5D=P1) ·
+[P2](https://gitlab.flexinfer.ai/services/loom-core/-/issues/?label_name%5B%5D=P2) ·
+[P3](https://gitlab.flexinfer.ai/services/loom-core/-/issues/?label_name%5B%5D=P3) ·
+[Milestones](https://gitlab.flexinfer.ai/services/loom-core/-/milestones)

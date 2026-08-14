@@ -1,0 +1,1 @@
+- Add bounded Prometheus counters for persisted overseer S2 dry-run decisions in `pkg/mills/overseer/overseer.go` and `pkg/telemetry/metrics.go`, with the seven-day zero-divergence promotion checks documented in `docs/mill-staff-s2-soak.md`.

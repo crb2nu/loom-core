@@ -19,9 +19,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -57,6 +59,22 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.
+		InitTracer(ctx,
+
+			"mcp-aws",
+			logger,
+		)
+	if err != nil {
+		logger.
+			Warn(
+				"OTel tracer init failed",
+
+				"error", err)
+	}
+	defer func() { _ = shutdownTracer(ctx) }()
+	tracer :=
+		mcpotel.Tracer(tp, "mcp-aws")
 
 	if err := initAWS(ctx); err != nil {
 		logger.Error("AWS init error", "error", err)
@@ -66,6 +84,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-aws", "version", version, "region", awsRegion)
 
 	server := mcp.NewServer("mcp-aws", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("AWS services tools. Uses standard AWS credential chain (env vars, shared credentials, IAM role). Set AWS_REGION to change region.")
 
 	// Identity
@@ -76,9 +95,11 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleWhoAmI)
+	}, mcpotel.TracedToolHandler(
 
-	// S3
+		// S3
+		tracer, "aws_whoami", handleWhoAmI))
+
 	server.AddTool(mcp.Tool{
 		Name:        "aws_s3_list_buckets",
 		Description: "List all S3 buckets in the account",
@@ -86,7 +107,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleS3ListBuckets)
+	}, mcpotel.TracedToolHandler(tracer, "aws_s3_list_buckets", handleS3ListBuckets))
 
 	server.AddTool(mcp.Tool{
 		Name:        "aws_s3_list_objects",
@@ -109,7 +130,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"bucket"},
 		},
-	}, handleS3ListObjects)
+	}, mcpotel.TracedToolHandler(tracer, "aws_s3_list_objects", handleS3ListObjects))
 
 	server.AddTool(mcp.Tool{
 		Name:        "aws_s3_get_object",
@@ -132,7 +153,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"bucket", "key"},
 		},
-	}, handleS3GetObject)
+	}, mcpotel.TracedToolHandler(tracer, "aws_s3_get_object", handleS3GetObject))
 
 	server.AddTool(mcp.Tool{
 		Name:        "aws_s3_head_object",
@@ -151,9 +172,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"bucket", "key"},
 		},
-	}, handleS3HeadObject)
+	}, mcpotel.TracedToolHandler(
 
-	// EC2
+		// EC2
+		tracer, "aws_s3_head_object", handleS3HeadObject))
+
 	server.AddTool(mcp.Tool{
 		Name:        "aws_ec2_describe_instances",
 		Description: "List EC2 instances with optional filtering",
@@ -175,7 +198,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleEC2DescribeInstances)
+	}, mcpotel.TracedToolHandler(tracer, "aws_ec2_describe_instances", handleEC2DescribeInstances))
 
 	server.AddTool(mcp.Tool{
 		Name:        "aws_ec2_describe_vpcs",
@@ -190,7 +213,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleEC2DescribeVPCs)
+	}, mcpotel.TracedToolHandler(tracer, "aws_ec2_describe_vpcs", handleEC2DescribeVPCs))
 
 	server.AddTool(mcp.Tool{
 		Name:        "aws_ec2_describe_security_groups",
@@ -209,7 +232,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleEC2DescribeSecurityGroups)
+	}, mcpotel.TracedToolHandler(tracer, "aws_ec2_describe_security_groups", handleEC2DescribeSecurityGroups))
 
 	// Lambda
 	server.AddTool(mcp.Tool{
@@ -224,7 +247,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleLambdaListFunctions)
+	}, mcpotel.TracedToolHandler(tracer, "aws_lambda_list_functions", handleLambdaListFunctions))
 
 	server.AddTool(mcp.Tool{
 		Name:        "aws_lambda_get_function",
@@ -239,7 +262,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"function_name"},
 		},
-	}, handleLambdaGetFunction)
+	}, mcpotel.TracedToolHandler(tracer, "aws_lambda_get_function", handleLambdaGetFunction))
 
 	server.AddTool(mcp.Tool{
 		Name:        "aws_lambda_invoke",
@@ -263,7 +286,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"function_name"},
 		},
-	}, handleLambdaInvoke)
+	}, mcpotel.TracedToolHandler(tracer, "aws_lambda_invoke", handleLambdaInvoke))
 
 	return server.Run(ctx)
 }

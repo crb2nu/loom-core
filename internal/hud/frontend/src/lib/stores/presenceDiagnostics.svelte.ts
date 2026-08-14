@@ -1,5 +1,6 @@
-import type { AgentPresence } from './presence.svelte.ts';
+import { untrack } from 'svelte';
 import { toastStore } from './toasts.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
 
 interface NudgePolicyLike {
   cap?: number;
@@ -32,7 +33,7 @@ class PresenceDiagnosticsStore {
 
   readonly nudgeDropPolicyOptions = ['drop_old', 'drop_new', 'summarize'];
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private poller = createPoller(() => { void this.fetchDiagnostics(); }, 10000);
 
   private parseLanePriorityInput(raw: string): string[] {
     return raw
@@ -68,31 +69,32 @@ class PresenceDiagnosticsStore {
     return data;
   }
 
-  syncAgents(agents: AgentPresence[]): void {
-    const current = this.diagnosticsAgentId;
-    if (current && agents.some((a) => a.agent_id === current)) return;
+  syncAgents(agents: Array<{ agent_id: string; status: string }>): void {
+    // Untracked: called from the tab's roster $effect, which should re-run
+    // on roster changes (its own read of the agents argument) — not on the
+    // agent-id this method itself writes.
+    untrack(() => {
+      const current = this.diagnosticsAgentId;
+      if (current && agents.some((a) => a.agent_id === current)) return;
 
-    const next = agents.find((a) => a.status === 'active')?.agent_id || agents[0]?.agent_id || '';
-    if (next !== this.diagnosticsAgentId) {
-      this.diagnosticsAgentId = next;
-      if (next) {
-        void this.fetchDiagnostics();
+      const next = agents.find((a) => a.status === 'active')?.agent_id || agents[0]?.agent_id || '';
+      if (next !== this.diagnosticsAgentId) {
+        this.diagnosticsAgentId = next;
+        if (next) {
+          void this.fetchDiagnostics();
+        }
       }
-    }
+    });
   }
 
   startPolling(intervalMs = 10000): void {
-    if (this.pollTimer) return;
-    this.pollTimer = setInterval(() => {
-      void this.fetchDiagnostics();
-    }, intervalMs);
+    if (this.poller.running) return;
+    this.poller.start(intervalMs);
     void this.fetchDiagnostics();
   }
 
   stopPolling(): void {
-    if (!this.pollTimer) return;
-    clearInterval(this.pollTimer);
-    this.pollTimer = null;
+    this.poller.stop();
   }
 
   markNudgePolicyDirty(): void {
@@ -194,7 +196,11 @@ class PresenceDiagnosticsStore {
   }
 
   async fetchDiagnostics(): Promise<void> {
-    const agentID = this.diagnosticsAgentId?.trim();
+    // Untracked: fetchDiagnostics runs synchronously inside the tab's mount
+    // $effect (startPolling) and syncAgents writes diagnosticsAgentId — a
+    // tracked read couples the mount effect to agent-selection writes
+    // (the mills_staff pre-await-read class, MR !1474).
+    const agentID = untrack(() => this.diagnosticsAgentId)?.trim();
     if (!agentID) return;
 
     this.diagnosticsLoading = true;

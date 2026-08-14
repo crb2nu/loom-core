@@ -1,0 +1,1 @@
+- Stamp Mills dispatch attempts in `pkg/mills/pipeline/dispatcher.go` and make active-spawn matching in `internal/hud/spawn.go` attempt-aware so retries cannot alias onto a prior active attempt.

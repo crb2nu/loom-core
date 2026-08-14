@@ -1,0 +1,12 @@
+{
+  "class": "external_dependency_incident",
+  "disposition": "wait_for_dependency_recovery",
+  "dependency": "model_provider",
+  "evidence": "OpenAI request failed with 429 rate limit from model provider",
+  "reason": "failure points to a shared dependency outside the branch diff",
+  "confidence": 0.93,
+  "retry_allowed": false,
+  "label": "external-dependency-incident",
+  "omit_reason": "external dependency incident; no actionable in-repo follow-up",
+  "in_repo_follow_up_required": false
+}

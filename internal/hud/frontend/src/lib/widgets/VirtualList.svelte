@@ -1,4 +1,6 @@
-<script>
+<script lang="ts" generics="T">
+  import type { Snippet } from 'svelte';
+
   /**
    * VirtualList — renders only visible items + buffer for large lists.
    *
@@ -6,20 +8,34 @@
    *  - items: T[]           — full data array
    *  - itemHeight: number   — fixed height per row (px)
    *  - buffer: number       — extra rows to render above/below viewport
+   *  - containerEl: bindable handle to the scroll viewport so parents can
+   *                 imperatively read/write scrollTop (e.g. snap-to-top on
+   *                 new entries). Defaults to null; only meaningful when the
+   *                 parent binds it.
+   *  - label: accessible name for the scroll region. The viewport is
+   *           tabbable so arrow/PageUp/PageDown/Home/End reach the data
+   *           without a pointer — rows hold no focusable elements, so
+   *           without this the whole log was unreachable by keyboard.
    *
    * Slots:
    *  - default: receives { item, index } for each visible item
-   *
-   * @type {{
-   *   items: any[],
-   *   itemHeight?: number,
-   *   buffer?: number,
-   *   children: import('svelte').Snippet<[{ item: any, index: number }]>
-   * }}
    */
-  let { items = [], itemHeight = 32, buffer = 10, children } = $props();
+  let {
+    items = [],
+    itemHeight = 32,
+    buffer = 10,
+    label = 'Scrollable list',
+    children,
+    containerEl = $bindable(null),
+  }: {
+    items?: T[];
+    itemHeight?: number;
+    buffer?: number;
+    label?: string;
+    containerEl?: HTMLElement | null;
+    children: Snippet<[{ item: T; index: number }]>;
+  } = $props();
 
-  let containerEl = $state(null);
   let scrollTop = $state(0);
   let containerHeight = $state(400);
 
@@ -54,10 +70,14 @@
   });
 </script>
 
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <div
   class="virtual-list"
   bind:this={containerEl}
   onscroll={handleScroll}
+  tabindex="0"
+  role="region"
+  aria-label={label}
 >
   <div class="virtual-list-spacer" style:height="{totalHeight}px">
     {#each visibleItems as { item, index, offsetY } (index)}
@@ -73,6 +93,11 @@
     overflow-y: auto;
     height: 100%;
     position: relative;
+  }
+
+  .virtual-list:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
   }
 
   .virtual-list-spacer {

@@ -1,0 +1,1 @@
+- **mrwatch gosec G404** (`internal/hud/mrwatch/poller.go`): annotate the poll-jitter `math/rand` use as non-security-sensitive so `security:gosec` on main goes green again.

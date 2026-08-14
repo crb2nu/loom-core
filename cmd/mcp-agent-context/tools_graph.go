@@ -328,6 +328,10 @@ func registerGraphTools(server *mcp.Server, svc *agentcontext.Service, tracer tr
 		return svc.HandleGraphQuery(ctx, args)
 	}))
 
+	// NOTE: agent_graph_find_path and the agent_reasoning_chain_* tools were
+	// removed in SIMP-4, then re-registered: the HUD bridge (GET /api/graph/path,
+	// /api/reasoning/chains, mobile graph/reasoning routes) calls them over MCP.
+
 	server.AddTool(mcp.Tool{
 		Name:        "agent_graph_find_path",
 		Description: "Find a path between two entities in the knowledge graph.",

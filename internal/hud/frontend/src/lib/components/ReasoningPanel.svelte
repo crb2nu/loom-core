@@ -1,10 +1,13 @@
-<script>
+<script lang="ts">
+  import type { ReasoningChain, ReasoningChainDetail } from '../stores/reasoning.svelte.ts';
   import { reasoningStore } from '../stores/reasoning.svelte.ts';
   import { toastStore } from '../stores/toasts.svelte.ts';
   import { formatTime, relativeTime, statusVariant, confidenceColor } from '../utils/format.ts';
   import Badge from '../widgets/Badge.svelte';
   import Modal from '../widgets/Modal.svelte';
   import EmptyState from './shared/EmptyState.svelte';
+  import PanelHeader from './shared/PanelHeader.svelte';
+  import ErrorBanner from './shared/ErrorBanner.svelte';
 
   $effect(() => {
     reasoningStore.startPolling(15000);
@@ -14,10 +17,10 @@
   let chains = $derived(reasoningStore.chains ?? []);
 
   // Chain detail expansion
-  let expandedChains = $state({});
-  let loadingChain = $state(null);
+  let expandedChains = $state<Record<string, ReasoningChainDetail>>({});
+  let loadingChain = $state<string | null>(null);
 
-  async function toggleChain(chain) {
+  async function toggleChain(chain: ReasoningChain) {
     if (expandedChains[chain.id]) {
       const next = { ...expandedChains };
       delete next[chain.id];
@@ -56,10 +59,8 @@
 </script>
 
 <div class="panel reasoning-panel">
-  <!-- Header -->
-  <div class="header-bar">
-    <div class="header-stats">
-      <span class="header-total text-mono">{chains.length} chains</span>
+  <PanelHeader title="Reasoning" icon={'⧉'} count={chains.length}>
+    {#snippet stats()}
       <span class="header-stat">
         <span class="dot dot-active"></span>
         {reasoningStore.activeChains.length} active
@@ -68,9 +69,17 @@
         <span class="dot dot-completed"></span>
         {reasoningStore.completedChains.length} completed
       </span>
-    </div>
-    <button class="btn btn-sm" onclick={() => { showCreateModal = true; }}>+ Chain</button>
-  </div>
+    {/snippet}
+    {#snippet actions()}
+      <button class="btn btn-sm" onclick={() => { showCreateModal = true; }}>+ Chain</button>
+    {/snippet}
+  </PanelHeader>
+
+  {#if reasoningStore.error}
+    <!-- A failed poll previously fell through to the "No reasoning chains"
+         empty state; surface the failure and keep stale chains visible. -->
+    <ErrorBanner prefix="Reasoning refresh failed" message={reasoningStore.error} />
+  {/if}
 
   <!-- Chain list -->
   <div class="chain-list">
@@ -156,37 +165,16 @@
     overflow: hidden;
   }
 
-  .header-bar {
-    padding: 8px 0;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .header-stats {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    font-size: 12px;
-  }
-
-  .header-total {
-    font-weight: 600;
-    color: var(--fg-primary);
-  }
-
   .header-stat {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-1);
     color: var(--fg-secondary);
   }
 
   .dot {
-    width: 8px;
-    height: 8px;
+    width: var(--space-2);
+    height: var(--space-2);
     border-radius: 50%;
   }
 
@@ -200,42 +188,60 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--space-2);
   }
 
   .chain-card {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
+    border-radius: var(--radius-md);
     overflow: hidden;
-    transition: border-color 0.15s ease;
+    transition: border-color var(--transition-fast);
+    position: relative;
+  }
+
+  .chain-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
   }
 
   .chain-card.expanded {
-    border-color: rgba(1, 135, 153, 0.3);
+    border-color: rgba(var(--info-rgb), 0.18);
+    box-shadow: var(--glow-shadow-md) var(--glow-info);
   }
 
   .chain-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-3);
     width: 100%;
-    padding: 12px 16px;
-    font-size: 13px;
+    padding: var(--space-3) var(--space-4);
+    font-size: var(--text-base);
     text-align: left;
     color: var(--fg-primary);
     cursor: pointer;
     border: none;
     background: transparent;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
+    letter-spacing: var(--tracking-normal);
   }
 
   .chain-header:hover {
-    background: var(--bg-tertiary);
+    background: var(--bg-elevated);
+  }
+
+  .chain-header:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .chain-chevron {
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--fg-muted);
     width: 14px;
     flex-shrink: 0;
@@ -254,7 +260,7 @@
   }
 
   .confidence-pill {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-family: var(--font-mono);
     font-weight: 600;
     color: var(--bg-primary);
@@ -270,17 +276,17 @@
   /* Steps */
 
   .chain-steps {
-    border-top: 1px solid var(--border);
-    padding: 12px 16px;
+    border-top: 1px solid var(--border-subtle);
+    padding: var(--space-3) var(--space-4);
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-3);
   }
 
   .step-row {
     display: flex;
     align-items: flex-start;
-    gap: 12px;
+    gap: var(--space-3);
   }
 
   .step-number {
@@ -292,7 +298,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-family: var(--font-mono);
     font-weight: 600;
     color: var(--fg-secondary);
@@ -305,13 +311,14 @@
   }
 
   .step-description {
-    font-size: 13px;
+    font-size: var(--text-base);
     color: var(--fg-primary);
     line-height: 1.4;
+    letter-spacing: var(--tracking-normal);
   }
 
   .step-evidence {
-    margin-top: 4px;
+    margin-top: var(--space-1);
     font-style: italic;
     line-height: 1.3;
   }
@@ -336,7 +343,7 @@
   .confidence-bar-fill {
     height: 100%;
     border-radius: 2px;
-    transition: width 0.3s ease;
+    transition: width var(--transition-slow);
   }
 
   .confidence-label {
@@ -344,12 +351,12 @@
   }
 
   .empty-steps {
-    padding: 8px 0;
+    padding: var(--space-2) 0;
     text-align: center;
   }
 
   .chain-loading {
-    padding: 8px 16px;
+    padding: var(--space-2) var(--space-4);
   }
 
 </style>

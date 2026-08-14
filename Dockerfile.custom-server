@@ -1,43 +1,104 @@
+# syntax=docker/dockerfile:1.25
 # Build stage
-ARG RUNTIME_REGISTRY=registry.harbor.lan
-FROM golang:1.25.5-alpine AS builder
+ARG PUBLIC_BASE_REGISTRY=docker.io
+FROM ${PUBLIC_BASE_REGISTRY}/library/golang:1.26.6-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
-
-ARG CI_JOB_TOKEN
-
-# This repo uses local `replace` directives to `../../libs/*`.
-# In Docker builds, create those sibling directories at /libs/*.
-RUN mkdir -p /libs
-RUN if [ -n "${CI_JOB_TOKEN:-}" ]; then \
-      git clone --depth 1 "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.flexinfer.ai/libs/mcp-go.git" /libs/mcp-go && \
-      git clone --depth 1 "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.flexinfer.ai/libs/fi-mcp-kit.git" /libs/fi-mcp-kit && \
-      git clone --depth 1 "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.flexinfer.ai/libs/fi-accel.git" /libs/fi-accel ; \
-    else \
-      git clone --depth 1 "https://gitlab.flexinfer.ai/libs/mcp-go.git" /libs/mcp-go && \
-      git clone --depth 1 "https://gitlab.flexinfer.ai/libs/fi-mcp-kit.git" /libs/fi-mcp-kit && \
-      git clone --depth 1 "https://gitlab.flexinfer.ai/libs/fi-accel.git" /libs/fi-accel ; \
-    fi
+ENV GOWORK=off \
+    GOPRIVATE=gitlab.flexinfer.ai/* \
+    GONOSUMDB=gitlab.flexinfer.ai/* \
+    GONOPROXY=gitlab.flexinfer.ai/*
 
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=secret,id=ci_job_token,required=false \
+    --mount=type=secret,id=gitlab_token,required=false \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eu; \
+    token=""; \
+    token_user=""; \
+    if [ -s /run/secrets/gitlab_token ]; then \
+      token="$(cat /run/secrets/gitlab_token)"; \
+      token_user="oauth2"; \
+    elif [ -s /run/secrets/ci_job_token ]; then \
+      token="$(cat /run/secrets/ci_job_token)"; \
+      token_user="gitlab-ci-token"; \
+    fi; \
+    if [ -n "$token" ]; then \
+      git config --global url."https://${token_user}:${token}@gitlab.flexinfer.ai/".insteadOf "https://gitlab.flexinfer.ai/"; \
+    fi; \
+    go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/custom-server ./cmd/custom-server
+# See Dockerfile for why the secret mount + git config is repeated on the build steps.
+ARG MCP_BUILD_JOBS=4
+RUN --mount=type=secret,id=ci_job_token,required=false \
+    --mount=type=secret,id=gitlab_token,required=false \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eu; \
+    token=""; \
+    token_user=""; \
+    if [ -s /run/secrets/gitlab_token ]; then \
+      token="$(cat /run/secrets/gitlab_token)"; \
+      token_user="oauth2"; \
+    elif [ -s /run/secrets/ci_job_token ]; then \
+      token="$(cat /run/secrets/ci_job_token)"; \
+      token_user="gitlab-ci-token"; \
+    fi; \
+    if [ -n "$token" ]; then \
+      git config --global url."https://${token_user}:${token}@gitlab.flexinfer.ai/".insteadOf "https://gitlab.flexinfer.ai/"; \
+    fi; \
+    CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o /out/custom-server ./cmd/custom-server
 
-RUN mkdir -p /out/services/loom-core/bin && \
-    for d in cmd/mcp-*; do \
-      name="$(basename "$d")"; \
-      CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o "/out/services/loom-core/bin/$name" "./$d"; \
-    done
+RUN --mount=type=secret,id=ci_job_token,required=false \
+    --mount=type=secret,id=gitlab_token,required=false \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eu; \
+    token=""; \
+    token_user=""; \
+    if [ -s /run/secrets/gitlab_token ]; then \
+      token="$(cat /run/secrets/gitlab_token)"; \
+      token_user="oauth2"; \
+    elif [ -s /run/secrets/ci_job_token ]; then \
+      token="$(cat /run/secrets/ci_job_token)"; \
+      token_user="gitlab-ci-token"; \
+    fi; \
+    if [ -n "$token" ]; then \
+      git config --global url."https://${token_user}:${token}@gitlab.flexinfer.ai/".insteadOf "https://gitlab.flexinfer.ai/"; \
+    fi; \
+    mkdir -p /out/services/loom-core/bin && \
+    find cmd -mindepth 1 -maxdepth 1 -type d -name 'mcp-*' | xargs -n1 basename | \
+      xargs -P"${MCP_BUILD_JOBS}" -I{} sh -c \
+        'CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o "/out/services/loom-core/bin/$1" "./cmd/$1"' _ {}
 
 # Runtime stage
-FROM ${RUNTIME_REGISTRY}/dockerhub-cache/library/alpine:3.21
+FROM ${PUBLIC_BASE_REGISTRY}/library/alpine:3.24
 
-RUN apk add --no-cache ca-certificates
+# CLIs the mono-binary MCP servers shell out to. Both are hard runtime
+# dependencies, not conveniences:
+#   kubectl -- mcp-k8s-ops (k8s-apps-k3s / k8s-harvester-infra / longhorn-k3s)
+#              and mcp-loki exec it directly with no API fallback.
+#   helm    -- mcp-helm execs `helm`; without it every tool returns
+#              `exec: "helm": executable file not found in $PATH`.
+#              (mcp-flux is deliberately NOT in this list: it probes for a
+#              `flux` binary but falls back to the Kubernetes API, and
+#              flux_probe reports mode=kubernetes-api in the hub.)
+#
+# helm is pinned to the 3.19 line. The major.minor pin is the part that
+# matters: Flux's helm-controller writes Helm 3 `sh.helm.release.v1` storage
+# secrets, and mcp-helm reads them back through `helm list`, so the CLI must
+# stay on the same major line as the writer. The trailing `-rN` alpine
+# revision is intentionally left fuzzy so a security rebuild of the package
+# does not hard-fail a 90-minute image build. alpine 3.24/community currently
+# resolves this to helm 3.19.0-r7. apk resolves the correct arch for the build
+# platform; this image is built single-arch amd64, matching the loom-hub
+# deployments' `nodeSelector: kubernetes.io/arch: amd64`.
+RUN apk add --no-cache ca-certificates kubectl "helm=~3.19"
 
 RUN adduser -D -u 1000 mcp
 USER mcp

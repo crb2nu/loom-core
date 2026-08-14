@@ -1,10 +1,19 @@
 package daemon
 
 import (
+	"context"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/internal/pool"
+	"github.com/crb2nu/loom/internal/process"
+	"github.com/crb2nu/loom/pkg/registry"
 )
 
 func TestDefaultHealthMonitorConfig(t *testing.T) {
@@ -30,6 +39,15 @@ func TestDefaultHealthMonitorConfig(t *testing.T) {
 	}
 	if cfg.RestartCooldown != 5*time.Minute {
 		t.Errorf("RestartCooldown = %v, want 5m", cfg.RestartCooldown)
+	}
+	if cfg.DeepProbeTimeout != 30*time.Second {
+		t.Errorf("DeepProbeTimeout = %v, want 30s", cfg.DeepProbeTimeout)
+	}
+	if cfg.RestartPressureThreshold != 3 {
+		t.Errorf("RestartPressureThreshold = %d, want 3", cfg.RestartPressureThreshold)
+	}
+	if cfg.RestartPressureWindow != 60*time.Second {
+		t.Errorf("RestartPressureWindow = %v, want 60s", cfg.RestartPressureWindow)
 	}
 }
 
@@ -300,5 +318,298 @@ func TestNewHealthMonitor_DeepProbeIntervalWired(t *testing.T) {
 	h := NewHealthMonitor(d, cfg)
 	if h.deepProbeInterval != 10*time.Minute {
 		t.Fatalf("deepProbeInterval = %v, want 10m", h.deepProbeInterval)
+	}
+}
+
+func TestNewHealthMonitor_DeepProbeTimeoutWired(t *testing.T) {
+	d := &Daemon{
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metrics: NewMetrics(),
+	}
+
+	// Explicit timeout is honored.
+	h := NewHealthMonitor(d, HealthMonitorConfig{DeepProbeTimeout: 45 * time.Second})
+	if h.deepProbeTimeout != 45*time.Second {
+		t.Fatalf("deepProbeTimeout = %v, want 45s", h.deepProbeTimeout)
+	}
+
+	// Zero/negative falls back to the 30s default so callers that build a
+	// config literal without the field don't regress to a zero timeout.
+	for _, tc := range []time.Duration{0, -1} {
+		h := NewHealthMonitor(d, HealthMonitorConfig{DeepProbeTimeout: tc})
+		if h.deepProbeTimeout != defaultDeepProbeTimeout {
+			t.Fatalf("deepProbeTimeout(%v) = %v, want %v fallback", tc, h.deepProbeTimeout, defaultDeepProbeTimeout)
+		}
+	}
+}
+
+func TestNewHealthMonitor_RestartPressureWired(t *testing.T) {
+	d := &Daemon{
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metrics: NewMetrics(),
+	}
+
+	// Explicit values are honored.
+	h := NewHealthMonitor(d, HealthMonitorConfig{
+		RestartPressureThreshold: 5,
+		RestartPressureWindow:    90 * time.Second,
+	})
+	if h.restartPressureThreshold != 5 {
+		t.Fatalf("restartPressureThreshold = %d, want 5", h.restartPressureThreshold)
+	}
+	if h.restartPressureWindow != 90*time.Second {
+		t.Fatalf("restartPressureWindow = %v, want 90s", h.restartPressureWindow)
+	}
+
+	// Threshold 0 (disabled) is passed through verbatim; a zero/negative window
+	// falls back to the 60s default so the signal stays well-defined.
+	for _, tc := range []time.Duration{0, -1} {
+		h := NewHealthMonitor(d, HealthMonitorConfig{RestartPressureThreshold: 0, RestartPressureWindow: tc})
+		if h.restartPressureThreshold != 0 {
+			t.Fatalf("restartPressureThreshold = %d, want 0 (disabled passthrough)", h.restartPressureThreshold)
+		}
+		if h.restartPressureWindow != defaultRestartPressureWindow {
+			t.Fatalf("restartPressureWindow(%v) = %v, want %v fallback", tc, h.restartPressureWindow, defaultRestartPressureWindow)
+		}
+	}
+}
+
+func TestCountRecentlyFailedServers_WindowFiltering(t *testing.T) {
+	now := time.Now()
+	h := &HealthMonitor{
+		restartPressureWindow: 60 * time.Second,
+		statuses: map[string]*ServerHealthStatus{
+			"fresh-a":   {Name: "fresh-a", LastFailure: now.Add(-5 * time.Second)},
+			"fresh-b":   {Name: "fresh-b", LastFailure: now.Add(-59 * time.Second)},
+			"stale":     {Name: "stale", LastFailure: now.Add(-2 * time.Minute)},
+			"never":     {Name: "never"}, // zero-value LastFailure
+			"on-window": {Name: "on-window", LastFailure: now.Add(-60 * time.Second)},
+		},
+	}
+
+	// fresh-a, fresh-b, and on-window (== window boundary) count; stale + never do not.
+	if got := h.countRecentlyFailedServersLocked(now); got != 3 {
+		t.Fatalf("countRecentlyFailedServersLocked = %d, want 3", got)
+	}
+}
+
+func TestCountRecentlyFailedServers_IgnoresZeroValue(t *testing.T) {
+	now := time.Now()
+	h := &HealthMonitor{
+		restartPressureWindow: 60 * time.Second,
+		statuses: map[string]*ServerHealthStatus{
+			"a": {Name: "a"},
+			"b": {Name: "b"},
+		},
+	}
+	if got := h.countRecentlyFailedServersLocked(now); got != 0 {
+		t.Fatalf("countRecentlyFailedServersLocked = %d, want 0 (all zero-value)", got)
+	}
+}
+
+func TestShouldSuppressRestart(t *testing.T) {
+	now := time.Now()
+	mkStatuses := func(n int) map[string]*ServerHealthStatus {
+		m := make(map[string]*ServerHealthStatus, n)
+		for i := 0; i < n; i++ {
+			name := string(rune('a' + i))
+			m[name] = &ServerHealthStatus{Name: name, LastFailure: now.Add(-time.Second)}
+		}
+		return m
+	}
+
+	tests := []struct {
+		name         string
+		threshold    int
+		failing      int
+		wantSuppress bool
+	}{
+		{"disabled threshold never suppresses", 0, 10, false},
+		{"below threshold restarts", 3, 2, false},
+		{"at threshold suppresses", 3, 3, true},
+		{"above threshold suppresses", 3, 5, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &HealthMonitor{
+				restartPressureThreshold: tc.threshold,
+				restartPressureWindow:    60 * time.Second,
+				statuses:                 mkStatuses(tc.failing),
+			}
+			suppress, pressure := h.shouldSuppressRestartLocked(now)
+			if suppress != tc.wantSuppress {
+				t.Fatalf("shouldSuppressRestartLocked suppress = %v, want %v (pressure=%d)", suppress, tc.wantSuppress, pressure)
+			}
+		})
+	}
+}
+
+func TestHealthRestartWithExplicitMissingGenerationPreservesNewCurrent(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	processes := newSupervisorTestProcessController()
+	supervisor := newTestServerSupervisor(
+		processes,
+		false,
+		func(context.Context, mcp.Transport) error { return nil },
+		nil,
+	)
+	_, generationID, _, err := supervisor.connection(context.Background(), "health-race")
+	if err != nil {
+		t.Fatalf("connection() error = %v", err)
+	}
+	t.Cleanup(func() { _ = supervisor.shutdown(context.Background()) })
+
+	daemon := &Daemon{
+		logger:           logger,
+		procMgr:          process.NewManager(nil, ""), // non-nil restart capability guard
+		serverSupervisor: supervisor,
+	}
+	monitor := &HealthMonitor{
+		daemon:          daemon,
+		logger:          logger,
+		maxRestarts:     3,
+		restartCooldown: time.Minute,
+	}
+
+	// The probe explicitly observed no generation. A generation that appeared
+	// while that probe was in flight must not be adopted as its failure target.
+	monitor.handleRestart("health-race", &ServerHealthStatus{}, 0)
+	if !supervisor.currentReady("health-race", generationID) {
+		t.Fatalf("generation %d was retired by a probe that observed no generation", generationID)
+	}
+	if _, stops, closed := processes.stats(); stops != 0 || closed != 0 {
+		t.Fatalf("new current resource was touched: stops=%d closed=%d", stops, closed)
+	}
+}
+
+type blockingHealthStopController struct {
+	base    *supervisorTestProcessController
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingHealthStopController) Dial(ctx context.Context, serverName string) (mcp.Transport, error) {
+	return c.base.Dial(ctx, serverName)
+}
+
+func (c *blockingHealthStopController) Stop(serverName string) error {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return c.base.Stop(serverName)
+}
+
+func TestHealthMonitorStopDoesNotWaitForBlockedGenerationRestart(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	controller := &blockingHealthStopController{
+		base:    newSupervisorTestProcessController(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	supervisor := newServerSupervisor(controller, false, logger, nil)
+	supervisor.initMCP = func(context.Context, mcp.Transport) error { return nil }
+	_, generationID, _, err := supervisor.connection(context.Background(), "blocked-health")
+	if err != nil {
+		t.Fatalf("connection() error = %v", err)
+	}
+
+	daemon := &Daemon{
+		logger:           logger,
+		procMgr:          process.NewManager(nil, ""), // non-nil restart capability guard
+		serverSupervisor: supervisor,
+	}
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	monitor := &HealthMonitor{
+		daemon:          daemon,
+		logger:          logger,
+		maxRestarts:     3,
+		restartCooldown: time.Minute,
+		done:            make(chan struct{}),
+		ctx:             monitorCtx,
+		cancel:          monitorCancel,
+	}
+	monitor.wg.Add(1)
+	go func() {
+		defer monitor.wg.Done()
+		monitor.handleRestart("blocked-health", &ServerHealthStatus{}, generationID)
+	}()
+	awaitSignal(t, controller.entered, "blocked health restart stop")
+
+	stopDone := make(chan struct{})
+	go func() {
+		monitor.Stop()
+		close(stopDone)
+	}()
+	awaitSignal(t, stopDone, "health monitor stop while process close is blocked")
+
+	close(controller.release)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+	defer cancelShutdown()
+	if err := supervisor.shutdown(shutdownCtx); err != nil {
+		t.Fatalf("supervisor shutdown after releasing stop: %v", err)
+	}
+}
+
+func TestHealthCheckDoesNotRecreateIdleReapedGeneration(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var dials atomic.Int64
+	d := newCallPipelineTestDaemon()
+	d.logger = logger
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(context.Context, string) (mcp.Transport, error) {
+			dials.Add(1)
+			return &fakeTransport{}, nil
+		},
+	})
+	t.Cleanup(func() { _ = d.pool.Close() })
+	monitor := &HealthMonitor{
+		daemon:            d,
+		logger:            logger,
+		statuses:          map[string]*ServerHealthStatus{"reaped": {Name: "reaped", LastDeepProbe: time.Now()}},
+		deepProbeInterval: time.Hour,
+	}
+
+	monitor.checkServer(context.Background(), "reaped")
+	if got := dials.Load(); got != 0 {
+		t.Fatalf("health check dialed idle-reaped server %d times, want 0", got)
+	}
+}
+
+func TestHealthSweepUsesCurrentRegistryAndPrunesRemovedServers(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	oldReg := &registry.Registry{Servers: []*registry.Server{{Name: "removed"}}}
+	newReg := &registry.Registry{Servers: []*registry.Server{{
+		Name: "added",
+		Common: &registry.TargetSpec{
+			Command: "/usr/bin/false",
+		},
+	}}}
+	d := newCallPipelineTestDaemon()
+	d.logger = logger
+	d.registry = oldReg
+	d.registrySnapshot.Store(newReg)
+	d.runningServers.Store("added", uint64(1))
+
+	monitorCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	monitor := &HealthMonitor{
+		daemon:             d,
+		logger:             logger,
+		statuses:           map[string]*ServerHealthStatus{"removed": {Name: "removed", Healthy: true}},
+		deepProbeTimeout:   time.Second,
+		unhealthyThreshold: 1,
+		restartThreshold:   100,
+		ctx:                monitorCtx,
+	}
+
+	monitor.checkAllServers()
+	if status := monitor.GetStatus("removed"); status != nil {
+		t.Fatalf("removed server health survived registry reload: %+v", status)
+	}
+	if status := monitor.GetStatus("added"); status == nil || status.Name != "added" {
+		t.Fatalf("added server was not swept from current registry: %+v", status)
 	}
 }

@@ -1,10 +1,14 @@
 // Stream store - live context stream with SSE-first data flow
 
+import { untrack } from 'svelte';
 import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface StreamEntry {
   id: string;
   entry_type: string;
+  session_id?: string;
   agent_id: string;
   agent: string;
   namespace: string;
@@ -27,7 +31,22 @@ class StreamStore {
   filterType = $state<string>('all');
   filterAgent = $state<string>('all');
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // Staleness (Slice B3) — see fleet.svelte.ts for the pattern. Stream events
+  // arrive every 5s when healthy; 90s without an update means SSE is silently
+  // failing or the daemon stopped emitting.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (!this.poller.running) return false;
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
+
+  // 60s watchdog poll — fires on SSE-down OR on stale (silent SSE failure).
+  private poller = createPoller(() => {
+    if (!eventStore.connected || this.isStale) this.fetch();
+  }, 60000);
   private lastTimestamp: string | null = null;
   private eventUnsubs: Array<() => void> = [];
   private seenIds = new Set<string>();
@@ -82,7 +101,11 @@ class StreamStore {
   }
 
   async fetch(): Promise<void> {
-    if (this.paused) return;
+    // Untracked: fetch() runs synchronously inside panel mount $effects
+    // (startPolling); a tracked `paused` read makes a pause toggle re-run
+    // those effects, restarting the poller and SSE subscription
+    // (the mills_staff pre-await-read class, MR !1474).
+    if (untrack(() => this.paused)) return;
 
     this.loading = true;
     this.error = null;
@@ -115,7 +138,7 @@ class StreamStore {
     this.seenIds.clear();
   }
 
-  startPolling(intervalMs = 30000): void {
+  startPolling(intervalMs = 60000): void {
     this.stopPolling();
 
     // Subscribe to SSE events for real-time delivery.
@@ -128,16 +151,13 @@ class StreamStore {
     });
     this.eventUnsubs.push(unsub);
 
-    // Initial HTTP fetch + slow fallback polling.
+    // Initial HTTP fetch; the poller handles the fallback watchdog.
     this.fetch();
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.poller.start(intervalMs);
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) {
       unsub();
     }
@@ -146,3 +166,4 @@ class StreamStore {
 }
 
 export const streamStore = new StreamStore();
+stalenessStore.register('stream', () => streamStore.isStale);

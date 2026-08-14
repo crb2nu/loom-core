@@ -14,9 +14,11 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/poll"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -51,17 +53,27 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-ops", logger)
+	if err != nil {
+		logger.Warn("OTel tracer init failed", "error", err)
+	}
+	defer func() { _ = shutdownTracer(ctx) }()
+	tracer := mcpotel.Tracer(tp, "mcp-ops")
+	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
+		return mcpotel.TracedToolHandler(tracer, name, h)
+	}
 	logger.Info("starting server", "name", "mcp-ops", "version", version)
 
 	server := mcp.NewServer("mcp-ops", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Operations MCP server for k3s and Harvester operations")
 
-	registerTools(server)
+	registerTools(server, wrap)
 
 	return server.Run(ctx)
 }
 
-func registerTools(server *mcp.Server) {
+func registerTools(server *mcp.Server, wrap func(string, mcp.ToolHandler) mcp.ToolHandler) {
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_get_nodes",
 		Description: "Get Kubernetes nodes with detailed information",
@@ -71,7 +83,7 @@ func registerTools(server *mcp.Server) {
 				"kubeconfig": map[string]any{"type": "string"},
 			},
 		},
-	}, handleGetNodes)
+	}, wrap("k8s_get_nodes", handleGetNodes))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_scale_deploy",
@@ -86,7 +98,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"namespace", "name", "replicas"},
 		},
-	}, handleScaleDeploy)
+	}, wrap("k8s_scale_deploy", handleScaleDeploy))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_delete_pods_by_phase",
@@ -101,7 +113,56 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"namespace", "phases"},
 		},
-	}, handleDeletePodsByPhase)
+	}, wrap("k8s_delete_pods_by_phase", handleDeletePodsByPhase))
+
+	server.AddTool(mcp.Tool{
+		Name: "k8s_rollout_restart",
+		Description: "GitOps-safe rolling restart of a workload (adds the restartedAt " +
+			"annotation; cycles pods with the same spec, so it does not drift from Git). " +
+			"Use this instead of raw 'kubectl rollout restart'.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"namespace":  map[string]any{"type": "string"},
+				"name":       map[string]any{"type": "string"},
+				"kind":       map[string]any{"type": "string", "enum": []string{"deployment", "statefulset", "daemonset"}, "description": "Workload kind (default: deployment)"},
+				"kubeconfig": map[string]any{"type": "string"},
+			},
+			Required: []string{"namespace", "name"},
+		},
+	}, wrap("k8s_rollout_restart", handleRolloutRestart))
+
+	server.AddTool(mcp.Tool{
+		Name:        "k8s_rollout_status",
+		Description: "Wait for / report a workload's rollout status (read-only).",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"namespace":      map[string]any{"type": "string"},
+				"name":           map[string]any{"type": "string"},
+				"kind":           map[string]any{"type": "string", "enum": []string{"deployment", "statefulset", "daemonset"}, "description": "Workload kind (default: deployment)"},
+				"timeoutSeconds": map[string]any{"type": "integer", "description": "Max seconds to wait (default 60)"},
+				"kubeconfig":     map[string]any{"type": "string"},
+			},
+			Required: []string{"namespace", "name"},
+		},
+	}, wrap("k8s_rollout_status", handleRolloutStatus))
+
+	server.AddTool(mcp.Tool{
+		Name: "k8s_delete_pod",
+		Description: "GitOps-safe delete of a single pod by name (the owning controller " +
+			"recreates it from the Git-managed spec). Use this to cycle one pod instead " +
+			"of raw 'kubectl delete pod'.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"namespace":  map[string]any{"type": "string"},
+				"name":       map[string]any{"type": "string"},
+				"kubeconfig": map[string]any{"type": "string"},
+			},
+			Required: []string{"namespace", "name"},
+		},
+	}, wrap("k8s_delete_pod", handleDeletePod))
 
 	server.AddTool(mcp.Tool{
 		Name:        "vip_label_node",
@@ -115,13 +176,13 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"node", "eligible"},
 		},
-	}, handleVipLabelNode)
+	}, wrap("vip_label_node", handleVipLabelNode))
 
 	server.AddTool(mcp.Tool{
 		Name:        "harvester_vms_list",
 		Description: "List Harvester virtual machines",
 		InputSchema: mcp.InputSchema{Type: "object", Properties: map[string]any{}},
-	}, handleHarvesterVMsList)
+	}, wrap("harvester_vms_list", handleHarvesterVMsList))
 
 	server.AddTool(mcp.Tool{
 		Name:        "harvester_vm_restart",
@@ -134,7 +195,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"namespace", "name"},
 		},
-	}, handleHarvesterVMRestart)
+	}, wrap("harvester_vm_restart", handleHarvesterVMRestart))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k3s_service_logs",
@@ -149,7 +210,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"host"},
 		},
-	}, handleK3sServiceLogs)
+	}, wrap("k3s_service_logs", handleK3sServiceLogs))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k3s_repair_server",
@@ -162,7 +223,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"host"},
 		},
-	}, handleK3sRepairServer)
+	}, wrap("k3s_repair_server", handleK3sRepairServer))
 
 	server.AddTool(mcp.Tool{
 		Name:        "stabilize_cluster",
@@ -177,7 +238,7 @@ func registerTools(server *mcp.Server) {
 				"kubeconfig":            map[string]any{"type": "string"},
 			},
 		},
-	}, handleStabilizeCluster)
+	}, wrap("stabilize_cluster", handleStabilizeCluster))
 
 	server.AddTool(mcp.Tool{
 		Name:        "run_repo_script",
@@ -193,27 +254,103 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"script_path"},
 		},
-	}, handleRunRepoScript)
+	}, wrap("run_repo_script", handleRunRepoScript))
 }
 
 // Helpers
 
-func runKubectl(ctx context.Context, kubeconfig string, args ...string) (string, error) {
-	return runKubectlWithStderr(ctx, kubeconfig, true, args...)
+// targetCluster names which cluster a kubectl invocation is aimed at. Every
+// call site must state one, because kubeconfig fallback is scoped per cluster:
+// see resolveKubeconfig.
+type targetCluster int
+
+const (
+	// clusterK3s is the K3s app cluster the hub itself runs in.
+	clusterK3s targetCluster = iota
+	// clusterRKE2 is the Harvester/RKE2 infrastructure cluster.
+	clusterRKE2
+)
+
+func runKubectl(ctx context.Context, cluster targetCluster, kubeconfig string, args ...string) (string, error) {
+	return runKubectlWithStderr(ctx, cluster, kubeconfig, true, args...)
 }
 
-func runKubectlStdoutOnly(ctx context.Context, kubeconfig string, args ...string) (string, error) {
-	return runKubectlWithStderr(ctx, kubeconfig, false, args...)
+func runKubectlStdoutOnly(ctx context.Context, cluster targetCluster, kubeconfig string, args ...string) (string, error) {
+	return runKubectlWithStderr(ctx, cluster, kubeconfig, false, args...)
 }
 
-func runKubectlWithStderr(ctx context.Context, kubeconfig string, includeStderrOnSuccess bool, args ...string) (string, error) {
+// resolveKubeconfig returns the first kubeconfig path that exists among the
+// candidates for the requested cluster. This makes the tools resilient when the
+// configured path is absent — e.g. the registry sets K3S_KUBECONFIG to
+// platform/gitops/.kube/k3s.yaml (present in-cluster) but the server runs
+// locally where only ~/.kube/k3s.yaml exists. When nothing exists, the
+// explicit/configured value for that cluster is returned so kubectl emits a
+// clear error.
+//
+// Candidates never cross cluster boundaries. A Harvester/RKE2 request that
+// cannot be satisfied fails closed rather than resolving to a k3s kubeconfig:
+// the RKE2 chain deliberately excludes $KUBECONFIG (ambient, and in practice
+// aimed at k3s), K3S_KUBECONFIG and ~/.kube/{k3s.yaml,config}. Before this was
+// scoped, a missing RKE2_KUBECONFIG made the mutating harvester_vm_restart —
+// which patches spec.running false then true — silently power-cycle against
+// whatever the k3s chain produced, i.e. the wrong cluster.
+func resolveKubeconfig(cluster targetCluster, explicit string) string {
+	var candidates []string
+	switch cluster {
+	case clusterRKE2:
+		candidates = []string{
+			strings.TrimSpace(explicit),
+			rke2Kubeconfig,
+			os.ExpandEnv("$HOME/.kube/harvester-admin.yaml"),
+		}
+	default:
+		candidates = []string{
+			strings.TrimSpace(explicit),
+			strings.TrimSpace(os.Getenv("KUBECONFIG")),
+			k3sKubeconfig,
+			os.ExpandEnv("$HOME/.kube/k3s.yaml"),
+			os.ExpandEnv("$HOME/.kube/config"),
+		}
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		// KUBECONFIG may be a colon-separated list; honor it verbatim if any
+		// segment exists.
+		if strings.Contains(c, string(os.PathListSeparator)) {
+			for _, seg := range filepath.SplitList(c) {
+				if seg != "" {
+					if _, err := os.Stat(seg); err == nil {
+						return c
+					}
+				}
+			}
+			continue
+		}
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	if strings.TrimSpace(explicit) != "" {
+		return explicit
+	}
+	if cluster == clusterRKE2 {
+		return rke2Kubeconfig
+	}
+	return k3sKubeconfig
+}
+
+func runKubectlWithStderr(ctx context.Context, cluster targetCluster, kubeconfig string, includeStderrOnSuccess bool, args ...string) (string, error) {
 	ctx, cancel := withDefaultTimeout(ctx, "MCP_OPS_KUBECTL_TIMEOUT_SECONDS", 55)
 	defer cancel()
 
-	if kubeconfig == "" {
-		kubeconfig = k3sKubeconfig
+	kubeconfig = resolveKubeconfig(cluster, kubeconfig)
+	cmdArgs := make([]string, len(args))
+	copy(cmdArgs, args)
+	if kubeconfig != "" {
+		cmdArgs = append(cmdArgs, "--kubeconfig", kubeconfig)
 	}
-	cmdArgs := append(args, "--kubeconfig", kubeconfig)
 	cmd := execCommand(ctx, "kubectl", cmdArgs...)
 
 	var stdout bytes.Buffer
@@ -292,7 +429,7 @@ func handleGetNodes(ctx context.Context, args map[string]any) (*mcp.CallToolResu
 		return mcp.ErrorResult(err), nil
 	}
 
-	out, err := runKubectl(ctx, kc, "get", "nodes", "-o", "wide")
+	out, err := runKubectl(ctx, clusterK3s, kc, "get", "nodes", "-o", "wide")
 	return formatResult(out, err)
 }
 
@@ -306,7 +443,7 @@ func handleScaleDeploy(ctx context.Context, args map[string]any) (*mcp.CallToolR
 		return mcp.ErrorResult(err), nil
 	}
 
-	out, err := runKubectl(ctx, kc, "-n", ns, "scale", fmt.Sprintf("deploy/%s", name), fmt.Sprintf("--replicas=%d", replicas))
+	out, err := runKubectl(ctx, clusterK3s, kc, "-n", ns, "scale", fmt.Sprintf("deploy/%s", name), fmt.Sprintf("--replicas=%d", replicas))
 	return formatResult(out, err)
 }
 
@@ -326,7 +463,7 @@ func handleDeletePodsByPhase(ctx context.Context, args map[string]any) (*mcp.Cal
 		getArgs = append(getArgs, "--selector", selector)
 	}
 
-	out, err := runKubectlStdoutOnly(ctx, kc, getArgs...)
+	out, err := runKubectlStdoutOnly(ctx, clusterK3s, kc, getArgs...)
 	if err != nil {
 		return mcp.ErrorResult(err), nil
 	}
@@ -364,7 +501,76 @@ func handleDeletePodsByPhase(ctx context.Context, args map[string]any) (*mcp.Cal
 	// Delete pods
 	delArgs := []string{"-n", ns, "delete", "pod", "--wait=false"}
 	delArgs = append(delArgs, toDelete...)
-	out, err = runKubectl(ctx, kc, delArgs...)
+	out, err = runKubectl(ctx, clusterK3s, kc, delArgs...)
+	return formatResult(out, err)
+}
+
+// normalizeWorkloadKind maps a kind input to a kubectl resource type, defaulting
+// to deployment and rejecting anything outside the GitOps-safe rollout set.
+func normalizeWorkloadKind(kind string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "", "deploy", "deployment", "deployments":
+		return "deployment", nil
+	case "sts", "statefulset", "statefulsets":
+		return "statefulset", nil
+	case "ds", "daemonset", "daemonsets":
+		return "daemonset", nil
+	default:
+		return "", fmt.Errorf("unsupported kind %q (allowed: deployment, statefulset, daemonset)", kind)
+	}
+}
+
+func handleRolloutRestart(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	ns := v.Required("namespace")
+	name := v.Required("name")
+	kindIn := v.String("kind", "deployment")
+	kc := v.String("kubeconfig", "")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	kind, err := normalizeWorkloadKind(kindIn)
+	if err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+
+	out, err := runKubectl(ctx, clusterK3s, kc, "-n", ns, "rollout", "restart", fmt.Sprintf("%s/%s", kind, name))
+	return formatResult(out, err)
+}
+
+func handleRolloutStatus(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	ns := v.Required("namespace")
+	name := v.Required("name")
+	kindIn := v.String("kind", "deployment")
+	timeoutSeconds := v.Int("timeoutSeconds", 60)
+	kc := v.String("kubeconfig", "")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	kind, err := normalizeWorkloadKind(kindIn)
+	if err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 60
+	}
+
+	out, err := runKubectl(ctx, clusterK3s, kc, "-n", ns, "rollout", "status",
+		fmt.Sprintf("%s/%s", kind, name), fmt.Sprintf("--timeout=%ds", timeoutSeconds))
+	return formatResult(out, err)
+}
+
+func handleDeletePod(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	v := validate.NewArgs(args)
+	ns := v.Required("namespace")
+	name := v.Required("name")
+	kc := v.String("kubeconfig", "")
+	if err := v.Validate(); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+
+	out, err := runKubectl(ctx, clusterK3s, kc, "-n", ns, "delete", "pod", name, "--wait=false")
 	return formatResult(out, err)
 }
 
@@ -382,12 +588,12 @@ func handleVipLabelNode(ctx context.Context, args map[string]any) (*mcp.CallTool
 		val = "true"
 	}
 
-	out, err := runKubectl(ctx, kc, "label", "node", node, fmt.Sprintf("kube-vip.io/eligible=%s", val), "--overwrite")
+	out, err := runKubectl(ctx, clusterK3s, kc, "label", "node", node, fmt.Sprintf("kube-vip.io/eligible=%s", val), "--overwrite")
 	return formatResult(out, err)
 }
 
 func handleHarvesterVMsList(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
-	out, err := runKubectl(ctx, rke2Kubeconfig, "get", "vm", "-A")
+	out, err := runKubectl(ctx, clusterRKE2, rke2Kubeconfig, "get", "vm", "-A")
 	return formatResult(out, err)
 }
 
@@ -400,7 +606,7 @@ func handleHarvesterVMRestart(ctx context.Context, args map[string]any) (*mcp.Ca
 	}
 
 	// Stop
-	out1, err := runKubectl(ctx, rke2Kubeconfig, "-n", ns, "patch", "vm", name, "--type", "merge", "-p", `{"spec":{"running":false}}`)
+	out1, err := runKubectl(ctx, clusterRKE2, rke2Kubeconfig, "-n", ns, "patch", "vm", name, "--type", "merge", "-p", `{"spec":{"running":false}}`)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("failed to stop vm: %w, output: %s", err, out1)), nil
 	}
@@ -408,7 +614,7 @@ func handleHarvesterVMRestart(ctx context.Context, args map[string]any) (*mcp.Ca
 	_ = poll.WaitWithContext(ctx, 2*time.Second)
 
 	// Start
-	out2, err := runKubectl(ctx, rke2Kubeconfig, "-n", ns, "patch", "vm", name, "--type", "merge", "-p", `{"spec":{"running":true}}`)
+	out2, err := runKubectl(ctx, clusterRKE2, rke2Kubeconfig, "-n", ns, "patch", "vm", name, "--type", "merge", "-p", `{"spec":{"running":true}}`)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("failed to start vm: %w, output: %s", err, out2)), nil
 	}
@@ -462,7 +668,7 @@ func handleStabilizeCluster(ctx context.Context, args map[string]any) (*mcp.Call
 	selectedNodes := nodesToLabel
 
 	if len(selectedNodes) == 0 {
-		out, err := runKubectl(ctx, kc, "get", "nodes", "-o", "json")
+		out, err := runKubectl(ctx, clusterK3s, kc, "get", "nodes", "-o", "json")
 		if err == nil {
 			var nodeList struct {
 				Items []struct {
@@ -506,13 +712,13 @@ func handleStabilizeCluster(ctx context.Context, args map[string]any) (*mcp.Call
 
 	// 2. Label nodes
 	for _, node := range selectedNodes {
-		out, err := runKubectl(ctx, kc, "label", "node", node, "kube-vip.io/eligible=true", "--overwrite")
+		out, err := runKubectl(ctx, clusterK3s, kc, "label", "node", node, "kube-vip.io/eligible=true", "--overwrite")
 		outputs = append(outputs, fmt.Sprintf("[vip_label_node %s]\n%s (err: %v)", node, out, err))
 	}
 
 	// 3. Scale deployment
 	if deploy != "" {
-		out, err := runKubectl(ctx, kc, "-n", ns, "scale", fmt.Sprintf("deploy/%s", deploy), "--replicas=0")
+		out, err := runKubectl(ctx, clusterK3s, kc, "-n", ns, "scale", fmt.Sprintf("deploy/%s", deploy), "--replicas=0")
 		outputs = append(outputs, fmt.Sprintf("[scale %s/%s -> 0]\n%s (err: %v)", ns, deploy, out, err))
 	}
 
@@ -522,7 +728,7 @@ func handleStabilizeCluster(ctx context.Context, args map[string]any) (*mcp.Call
 	if selector != "" {
 		getArgs = append(getArgs, "--selector", selector)
 	}
-	out, err := runKubectl(ctx, kc, getArgs...)
+	out, err := runKubectl(ctx, clusterK3s, kc, getArgs...)
 	if err == nil {
 		var podList struct {
 			Items []struct {
@@ -544,7 +750,7 @@ func handleStabilizeCluster(ctx context.Context, args map[string]any) (*mcp.Call
 			if len(toDelete) > 0 {
 				delArgs := []string{"-n", ns, "delete", "pod", "--wait=false"}
 				delArgs = append(delArgs, toDelete...)
-				out, err := runKubectl(ctx, kc, delArgs...)
+				out, err := runKubectl(ctx, clusterK3s, kc, delArgs...)
 				outputs = append(outputs, fmt.Sprintf("[cleanup deleted %d pods]\n%s (err: %v)", len(toDelete), out, err))
 			} else {
 				outputs = append(outputs, "[cleanup] No Evicted/Failed pods to delete")
@@ -553,11 +759,11 @@ func handleStabilizeCluster(ctx context.Context, args map[string]any) (*mcp.Call
 	}
 
 	// 5. Check kube-vip ds
-	out, err = runKubectl(ctx, kc, "-n", "kube-system", "get", "ds", "kube-vip", "-o", "wide")
+	out, err = runKubectl(ctx, clusterK3s, kc, "-n", "kube-system", "get", "ds", "kube-vip", "-o", "wide")
 	outputs = append(outputs, fmt.Sprintf("[kube-vip ds]\n%s (err: %v)", out, err))
 
 	// 6. Final node status
-	out, err = runKubectl(ctx, kc, "get", "nodes", "-o", "wide")
+	out, err = runKubectl(ctx, clusterK3s, kc, "get", "nodes", "-o", "wide")
 	outputs = append(outputs, fmt.Sprintf("[nodes]\n%s (err: %v)", out, err))
 
 	return mcp.TextResult(strings.Join(outputs, "\n\n====\n")), nil

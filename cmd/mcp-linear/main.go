@@ -12,10 +12,12 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -37,9 +39,27 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-linear",
+
+		logger,
+	)
+	if err !=
+		nil {
+		logger.Warn("OTel tracer init failed",
+
+			"error",
+
+			err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-linear")
+
 	logger.Info("starting server", "name", "mcp-linear", "version", version)
 
 	server := mcp.NewServer("mcp-linear", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Linear issue tracking tools. Configure with LINEAR_API_KEY.")
 
 	// Issues
@@ -75,7 +95,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListIssues)
+	}, mcpotel.TracedToolHandler(tracer, "linear_list_issues", handleListIssues))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linear_get_issue",
@@ -90,7 +110,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleGetIssue)
+	}, mcpotel.TracedToolHandler(tracer, "linear_get_issue", handleGetIssue))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linear_search_issues",
@@ -109,9 +129,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"query"},
 		},
-	}, handleSearchIssues)
+	}, mcpotel.TracedToolHandler(
 
-	// Teams
+		// Teams
+		tracer, "linear_search_issues", handleSearchIssues))
+
 	server.AddTool(mcp.Tool{
 		Name:        "linear_list_teams",
 		Description: "List all teams",
@@ -119,7 +141,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleListTeams)
+	}, mcpotel.TracedToolHandler(tracer, "linear_list_teams", handleListTeams))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linear_get_team",
@@ -134,9 +156,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"key"},
 		},
-	}, handleGetTeam)
+	}, mcpotel.TracedToolHandler(
 
-	// Projects
+		// Projects
+		tracer, "linear_get_team", handleGetTeam))
+
 	server.AddTool(mcp.Tool{
 		Name:        "linear_list_projects",
 		Description: "List all projects",
@@ -153,7 +177,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListProjects)
+	}, mcpotel.TracedToolHandler(tracer, "linear_list_projects", handleListProjects))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linear_get_project",
@@ -168,9 +192,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleGetProject)
+	}, mcpotel.TracedToolHandler(
 
-	// Cycles (Sprints)
+		// Cycles (Sprints)
+		tracer, "linear_get_project", handleGetProject))
+
 	server.AddTool(mcp.Tool{
 		Name:        "linear_list_cycles",
 		Description: "List cycles for a team",
@@ -187,9 +213,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListCycles)
+	}, mcpotel.TracedToolHandler(
 
-	// Users
+		// Users
+		tracer, "linear_list_cycles", handleListCycles))
+
 	server.AddTool(mcp.Tool{
 		Name:        "linear_list_users",
 		Description: "List all users in the workspace",
@@ -197,7 +225,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleListUsers)
+	}, mcpotel.TracedToolHandler(tracer, "linear_list_users", handleListUsers))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linear_me",
@@ -206,9 +234,11 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleMe)
+	}, mcpotel.TracedToolHandler(
 
-	// Labels
+		// Labels
+		tracer, "linear_me", handleMe))
+
 	server.AddTool(mcp.Tool{
 		Name:        "linear_list_labels",
 		Description: "List all labels",
@@ -221,9 +251,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListLabels)
+	}, mcpotel.TracedToolHandler(
 
-	// Workflow States
+		// Workflow States
+		tracer, "linear_list_labels", handleListLabels))
+
 	server.AddTool(mcp.Tool{
 		Name:        "linear_list_states",
 		Description: "List workflow states for a team",
@@ -236,7 +268,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListStates)
+	}, mcpotel.TracedToolHandler(tracer, "linear_list_states", handleListStates))
 
 	return server.Run(ctx)
 }

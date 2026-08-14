@@ -1,9 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 )
@@ -39,6 +46,38 @@ func (s *sessionStubTransport) Recv(_ context.Context) (*mcp.Message, error) {
 
 func (s *sessionStubTransport) Close() error {
 	return nil
+}
+
+type serializedSessionTransport struct {
+	sessionStubTransport
+	recvEntered         chan struct{}
+	releaseRecv         chan struct{}
+	firstRecvHook       sync.Once
+	sendDuringRecvCount atomic.Int32
+	recvActive          atomic.Bool
+}
+
+func (s *serializedSessionTransport) Send(ctx context.Context, msg *mcp.Message) error {
+	if s.recvActive.Load() {
+		s.sendDuringRecvCount.Add(1)
+	}
+	return s.sessionStubTransport.Send(ctx, msg)
+}
+
+func (s *serializedSessionTransport) Recv(ctx context.Context) (*mcp.Message, error) {
+	s.recvActive.Store(true)
+	s.firstRecvHook.Do(func() {
+		close(s.recvEntered)
+	})
+	select {
+	case <-s.releaseRecv:
+	case <-ctx.Done():
+		s.recvActive.Store(false)
+		return nil, ctx.Err()
+	}
+	resp, err := s.sessionStubTransport.Recv(ctx)
+	s.recvActive.Store(false)
+	return resp, err
 }
 
 func TestProxyOpenSession_Success(t *testing.T) {
@@ -82,6 +121,53 @@ func TestProxyOpenSession_Success(t *testing.T) {
 	}
 	if transport.sentMessages[0].Method != "loom/session/open" {
 		t.Fatalf("expected method loom/session/open, got %q", transport.sentMessages[0].Method)
+	}
+}
+
+func TestHandleProxyToolsCall_StripsProxyNamespace(t *testing.T) {
+	oldAgentHint := agentHintGlobal
+	oldSessionID := proxySessionID
+	oldSessionDisabled := proxySessionDisabled
+	defer func() {
+		agentHintGlobal = oldAgentHint
+		proxySessionID = oldSessionID
+		proxySessionDisabled = oldSessionDisabled
+	}()
+
+	agentHintGlobal = ""
+	proxySessionID = ""
+	proxySessionDisabled = false
+
+	resp, _ := mcp.NewResponse(json.RawMessage(`1`), json.RawMessage(`{"content":[{"type":"text","text":"ok"}]}`))
+	transport := &sessionStubTransport{
+		recvQueue: []*mcp.Message{resp},
+	}
+
+	msg, _ := mcp.NewRequest(1, "tools/call", map[string]any{
+		"name":      "loom/agent_context__agent_session_start",
+		"arguments": map[string]any{"agent_id": "codex-test"},
+	})
+
+	_, err := handleProxyToolsCall(context.Background(), transport, msg)
+	if err != nil {
+		t.Fatalf("handleProxyToolsCall returned error: %v", err)
+	}
+	if len(transport.sentMessages) != 1 {
+		t.Fatalf("expected 1 daemon request, got %d", len(transport.sentMessages))
+	}
+	if transport.sentMessages[0].Method != "loom/call" {
+		t.Fatalf("daemon method = %q, want loom/call", transport.sentMessages[0].Method)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(transport.sentMessages[0].Params, &payload); err != nil {
+		t.Fatalf("unmarshal daemon payload: %v", err)
+	}
+	if got := payload["server"]; got != "agent_context" {
+		t.Fatalf("server = %#v, want agent_context", got)
+	}
+	if got := payload["tool"]; got != "agent_session_start" {
+		t.Fatalf("tool = %#v, want agent_session_start", got)
 	}
 }
 
@@ -157,6 +243,199 @@ func TestProxyOpenSession_SendTimeout(t *testing.T) {
 	}
 }
 
+// --- Session heartbeat tests ---
+
+func TestProxySessionHeartbeat_ExtendsLease(t *testing.T) {
+	oldSessionID := proxySessionID
+	oldEpoch := proxyDaemonEpoch
+	oldDisabled := proxySessionDisabled
+	defer func() {
+		proxySessionID = oldSessionID
+		proxyDaemonEpoch = oldEpoch
+		proxySessionDisabled = oldDisabled
+	}()
+
+	proxySessionID = "sess-heartbeat-1"
+	proxyDaemonEpoch = 1
+	proxySessionDisabled = false
+
+	// Daemon responds with success (no error).
+	resp, _ := mcp.NewResponse(json.RawMessage(`97`), json.RawMessage(`{"ok":true}`))
+	transport := &sessionStubTransport{
+		recvQueue: []*mcp.Message{resp},
+	}
+
+	proxySessionHeartbeat(context.Background(), transport)
+
+	// Session ID should be preserved after successful heartbeat.
+	if proxySessionID != "sess-heartbeat-1" {
+		t.Fatalf("expected proxySessionID preserved, got %q", proxySessionID)
+	}
+
+	// Verify the heartbeat request was sent with correct params.
+	if len(transport.sentMessages) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(transport.sentMessages))
+	}
+	if transport.sentMessages[0].Method != "loom/session/heartbeat" {
+		t.Fatalf("expected method loom/session/heartbeat, got %q", transport.sentMessages[0].Method)
+	}
+	var params map[string]any
+	json.Unmarshal(transport.sentMessages[0].Params, &params)
+	if params["session_id"] != "sess-heartbeat-1" {
+		t.Fatalf("expected session_id 'sess-heartbeat-1', got %v", params["session_id"])
+	}
+}
+
+func TestProxySessionHeartbeat_Rejected(t *testing.T) {
+	oldSessionID := proxySessionID
+	oldEpoch := proxyDaemonEpoch
+	oldDisabled := proxySessionDisabled
+	defer func() {
+		proxySessionID = oldSessionID
+		proxyDaemonEpoch = oldEpoch
+		proxySessionDisabled = oldDisabled
+	}()
+
+	proxySessionID = "sess-expired"
+	proxyDaemonEpoch = 1
+	proxySessionDisabled = false
+
+	// Daemon responds with error (expired session).
+	errResp := &mcp.Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`97`),
+		Error: &mcp.Error{
+			Code:    mcp.InvalidRequest,
+			Message: "session not found or expired",
+		},
+	}
+	transport := &sessionStubTransport{
+		recvQueue: []*mcp.Message{errResp},
+	}
+
+	proxySessionHeartbeat(context.Background(), transport)
+
+	// Session ID should be cleared so next request re-opens.
+	if proxySessionID != "" {
+		t.Fatalf("expected proxySessionID cleared on rejection, got %q", proxySessionID)
+	}
+}
+
+// TestProxySessionHeartbeat_TransportError reproduces the stderr spam regression
+// after a loomd restart: the daemon socket FD held by the proxy goes dead, every
+// keepalive tick hits the dead transport, and a log line gets printed on each
+// tick. The fix clears proxySessionID on transport error, which makes subsequent
+// ticks short-circuit (proxySessionID == "" early-return), so only one log line
+// is emitted per session generation. ensureDaemon() re-opens the session lazily
+// on the next inbound tool call.
+func TestProxySessionHeartbeat_TransportError(t *testing.T) {
+	oldSessionID := proxySessionID
+	oldEpoch := proxyDaemonEpoch
+	oldDisabled := proxySessionDisabled
+	defer func() {
+		proxySessionID = oldSessionID
+		proxyDaemonEpoch = oldEpoch
+		proxySessionDisabled = oldDisabled
+	}()
+
+	proxySessionID = "sess-dead-fd"
+	proxyDaemonEpoch = 1
+	proxySessionDisabled = false
+
+	transport := &sessionStubTransport{
+		sendErr: io.ErrClosedPipe, // simulate dead daemon socket FD
+	}
+
+	stderr := captureStderr(t, func() {
+		// Two ticks back-to-back, mimicking the keepalive ticker after loomd dies.
+		proxySessionHeartbeat(context.Background(), transport)
+		proxySessionHeartbeat(context.Background(), transport)
+	})
+
+	if proxySessionID != "" {
+		t.Fatalf("expected proxySessionID cleared on transport error, got %q", proxySessionID)
+	}
+
+	lines := strings.Count(stderr, "loom proxy: session heartbeat failed")
+	if lines != 1 {
+		t.Fatalf("expected exactly one heartbeat-failed log line per session generation, got %d. stderr:\n%s", lines, stderr)
+	}
+
+	// Second call must short-circuit without touching the transport (only the
+	// first call's send attempt should have been recorded; with sendErr set,
+	// sentMessages stays empty regardless).
+	if got := len(transport.sentMessages); got != 0 {
+		t.Fatalf("expected 0 recorded sends (sendErr path), got %d", got)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	orig := os.Stderr
+	defer func() { os.Stderr = orig }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	fn()
+
+	_ = w.Close()
+	return <-done
+}
+
+func TestProxySessionHeartbeat_Disabled(t *testing.T) {
+	oldSessionID := proxySessionID
+	oldDisabled := proxySessionDisabled
+	defer func() {
+		proxySessionID = oldSessionID
+		proxySessionDisabled = oldDisabled
+	}()
+
+	proxySessionID = "sess-123"
+	proxySessionDisabled = true
+
+	transport := &sessionStubTransport{}
+
+	proxySessionHeartbeat(context.Background(), transport)
+
+	// No messages should be sent when disabled.
+	if len(transport.sentMessages) != 0 {
+		t.Fatalf("expected 0 sent messages when disabled, got %d", len(transport.sentMessages))
+	}
+}
+
+func TestProxySessionHeartbeat_NoSession(t *testing.T) {
+	oldSessionID := proxySessionID
+	oldDisabled := proxySessionDisabled
+	defer func() {
+		proxySessionID = oldSessionID
+		proxySessionDisabled = oldDisabled
+	}()
+
+	proxySessionID = ""
+	proxySessionDisabled = false
+
+	transport := &sessionStubTransport{}
+
+	proxySessionHeartbeat(context.Background(), transport)
+
+	// No messages should be sent when no session is active.
+	if len(transport.sentMessages) != 0 {
+		t.Fatalf("expected 0 sent messages with no session, got %d", len(transport.sentMessages))
+	}
+}
+
 func TestProxyOpenSession_PreservesPriorID(t *testing.T) {
 	// When proxySessionID is already set, it should be sent as prior_session_id.
 	oldSessionID := proxySessionID
@@ -193,5 +472,75 @@ func TestProxyOpenSession_PreservesPriorID(t *testing.T) {
 	json.Unmarshal(transport.sentMessages[0].Params, &params)
 	if params["prior_session_id"] != "prior-123" {
 		t.Fatalf("expected prior_session_id 'prior-123', got %v", params["prior_session_id"])
+	}
+}
+
+func TestProxySessionLifecycleRPCsSerializeWithForegroundCalls(t *testing.T) {
+	oldSessionID := proxySessionID
+	oldEpoch := proxyDaemonEpoch
+	oldDisabled := proxySessionDisabled
+	defer func() {
+		proxySessionID = oldSessionID
+		proxyDaemonEpoch = oldEpoch
+		proxySessionDisabled = oldDisabled
+	}()
+
+	proxySessionID = ""
+	proxyDaemonEpoch = 0
+	proxySessionDisabled = false
+
+	openResult, _ := json.Marshal(map[string]any{
+		"session_id":   "sess-serial",
+		"daemon_epoch": int64(1),
+	})
+	openResp, _ := mcp.NewResponse(json.RawMessage(`99`), json.RawMessage(openResult))
+	toolResp, _ := mcp.NewResponse(json.RawMessage(`1`), json.RawMessage(`{"ok":true}`))
+
+	transport := &serializedSessionTransport{
+		sessionStubTransport: sessionStubTransport{
+			recvQueue: []*mcp.Message{openResp, toolResp},
+		},
+		recvEntered: make(chan struct{}),
+		releaseRecv: make(chan struct{}),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		proxyOpenSession(context.Background(), transport)
+		errCh <- nil
+	}()
+
+	<-transport.recvEntered
+
+	respCh := make(chan *mcp.Message, 1)
+	go func() {
+		req, _ := mcp.NewRequest(1, "loom/status", nil)
+		resp, err := proxyDaemonRoundTrip(context.Background(), transport, req, "loom/status")
+		if err != nil {
+			t.Errorf("proxyDaemonRoundTrip error: %v", err)
+			respCh <- nil
+			return
+		}
+		respCh <- resp
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if got := transport.sendDuringRecvCount.Load(); got != 0 {
+		t.Fatalf("expected no concurrent send during recv, got %d", got)
+	}
+
+	close(transport.releaseRecv)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("proxyOpenSession returned error: %v", err)
+	}
+	if got := <-respCh; got == nil {
+		t.Fatal("expected foreground round trip response")
+	}
+	if transport.sendDuringRecvCount.Load() != 0 {
+		t.Fatalf("expected serialized daemon RPCs, got %d concurrent sends during recv", transport.sendDuringRecvCount.Load())
+	}
+	if proxySessionID != "sess-serial" {
+		t.Fatalf("expected proxySessionID to be set from open response, got %q", proxySessionID)
 	}
 }

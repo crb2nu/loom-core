@@ -1,0 +1,1 @@
+- Refactor keyed spawn admission and pod environment wiring into `internal/hud/spawn_admission.go` and `internal/hud/spawn_config.go` without changing behavior.

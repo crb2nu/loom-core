@@ -25,6 +25,10 @@ func registerSessionTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 					"type":        "string",
 					"description": "Optional project/task namespace for grouping sessions.",
 				},
+				"project": map[string]any{
+					"type":        "string",
+					"description": "Optional canonical project identifier for orchestration correlation. Defaults from namespace or pipeline project.",
+				},
 				"description": map[string]any{
 					"type":        "string",
 					"description": "Optional session description.",
@@ -36,6 +40,24 @@ func registerSessionTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 				"resume_session_id": map[string]any{
 					"type":        "string",
 					"description": "Resume an existing session instead of creating a new one.",
+				},
+				"pipeline_project": map[string]any{
+					"type":        "string",
+					"description": "Optional GitLab project path linked to the session's CI pipeline.",
+				},
+				"pipeline_id": map[string]any{
+					"type":        "integer",
+					"description": "Optional GitLab pipeline ID linked to the session.",
+				},
+				"pipeline_ref": map[string]any{
+					"type":        "object",
+					"description": "Optional explicit CI pipeline reference for session orchestration linking.",
+					"properties": map[string]any{
+						"id":      map[string]any{"type": "integer"},
+						"project": map[string]any{"type": "string"},
+						"ref":     map[string]any{"type": "string"},
+						"web_url": map[string]any{"type": "string"},
+					},
 				},
 			},
 		},
@@ -57,9 +79,17 @@ func registerSessionTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 					"type":        "boolean",
 					"description": "Generate session summary on end (default: true).",
 				},
+				"summary_async": map[string]any{
+					"type":        "boolean",
+					"description": "Run summarization in background and return immediately (default: false).",
+				},
 				"cleanup": map[string]any{
 					"type":        "boolean",
 					"description": "Auto-release file claims, deregister presence, and mark worktrees as orphaned (default: true).",
+				},
+				"post_session_retro": map[string]any{
+					"type":        "boolean",
+					"description": "Queue a non-blocking session retrospective after end (default: false).",
 				},
 			},
 			Required: []string{"session_id"},
@@ -90,6 +120,10 @@ func registerSessionTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 				"limit": map[string]any{
 					"type":        "integer",
 					"description": "Maximum sessions to return (default: 20).",
+				},
+				"light": map[string]any{
+					"type":        "boolean",
+					"description": "Return a trimmed projection (id, agent_id, namespace, project, status, started_at, ended_at, entry_count, total_tokens, parent/root session ids) and skip the per-session stat recompute. Used by the HUD fleet poller to keep large histories inside the recv budget. Default: false.",
 				},
 			},
 		},

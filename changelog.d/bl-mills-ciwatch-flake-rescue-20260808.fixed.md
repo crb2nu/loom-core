@@ -1,0 +1,1 @@
+- Retry policy-listed flaky `ci_watch` jobs once within the existing watch budget before escalating persistent failures (`pkg/mills/pipeline`, `pkg/mills/clients`, and `cmd/loom-mills-operator`).

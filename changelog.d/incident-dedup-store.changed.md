@@ -1,0 +1,1 @@
+- Persist Mills incident fingerprints with atomic first-seen, last-seen, and occurrence-count upserts in `pkg/mills/store/incidents.go`.

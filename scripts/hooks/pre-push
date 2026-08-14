@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_repo_root() {
+  if root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    printf '%s\n' "${root}"
+    return 0
+  fi
+  if root="$(git -c core.bare=false rev-parse --show-toplevel 2>/dev/null)"; then
+    printf '%s\n' "${root}"
+    return 0
+  fi
+  echo "pre-push hook: unable to resolve repo root" >&2
+  exit 1
+}
+
+REPO_ROOT="$(resolve_repo_root)"
+HOOK_SCRIPT_DIR="${REPO_ROOT}/scripts/hooks"
+STASH_WRAPPER="${HOOK_SCRIPT_DIR}/with-stashed-worktree.sh"
+
+if "${STASH_WRAPPER}" "${HOOK_SCRIPT_DIR}/run-pre-commit-hook.sh" pre-push "$@"; then
+  exit 0
+fi
+
+exec "${STASH_WRAPPER}" "${HOOK_SCRIPT_DIR}/pre-push-native.sh" "$@"

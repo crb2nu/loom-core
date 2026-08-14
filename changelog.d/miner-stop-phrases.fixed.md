@@ -1,0 +1,1 @@
+- Reject normalized generic `error occurred` candidates in the adaptive signature miner while retaining specific diagnostics (`pkg/mills/adaptive/stop_phrases.go`).

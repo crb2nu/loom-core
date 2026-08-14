@@ -1,0 +1,1 @@
+- Add council budget per-token pricing for Anthropic editors and GPT-5.6 judges, with an explicit $15 unknown-model fallback and `pricing_gap` telemetry (`pkg/mills/budget/pricing.go`, `pkg/mills/budget/pricing_test.go`).

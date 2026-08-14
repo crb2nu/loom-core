@@ -1,23 +1,79 @@
-<script>
-  let { open = $bindable(false), onclose = () => {}, onselect = () => {} } = $props();
+<script lang="ts">
+  import { fleetStore } from '../stores/fleet.svelte.ts';
+  import { taskStore } from '../stores/tasks.svelte.ts';
+  import { spawnStore } from '../stores/spawn.svelte.ts';
+  import { embedConfig } from '../stores/embedConfig.svelte.ts';
+  import { views, overviewId } from '../stores/router.svelte.ts';
+  import { focusTrap } from '../actions/focusTrap';
+
+  interface PaletteItem {
+    id: string;
+    label: string;
+    category: string;
+    icon: string;
+    entity_kind?: string;
+    detail_id?: string;
+    target_view?: string;
+    target_sub_view?: string;
+    score?: number;
+  }
+
+  let {
+    open = $bindable(false),
+    onclose = () => {},
+    onselect = () => {},
+  }: {
+    open?: boolean;
+    onclose?: () => void;
+    onselect?: (item: PaletteItem) => void;
+  } = $props();
 
   let query = $state('');
   let selectedIndex = $state(0);
-  let inputEl = $state(null);
+  let inputEl = $state<HTMLInputElement | null>(null);
+  let resultsEl = $state<HTMLElement | null>(null);
 
-  const panels = [
-    { id: 'fleet', label: 'Fleet Overview', category: 'Panels', icon: '\u2637' },
-    { id: 'servers', label: 'Server Constellation', category: 'Panels', icon: '\u26C5' },
-    { id: 'tasks', label: 'Task Command Board', category: 'Panels', icon: '\u2611' },
-    { id: 'stream', label: 'Context Stream', category: 'Panels', icon: '\u21C9' },
-    { id: 'workflows', label: 'Workflow DAG Monitor', category: 'Panels', icon: '\u2699' },
-    { id: 'feed', label: 'Knowledge Feed', category: 'Panels', icon: '\u29BE' },
-    { id: 'memory', label: 'Memory Inspector', category: 'Panels', icon: '\u29BF' },
-    { id: 'graph', label: 'Knowledge Graph', category: 'Panels', icon: '\u25C9' },
-    { id: 'presence', label: 'Agent Presence', category: 'Panels', icon: '\u25C9' },
-    { id: 'sandbox', label: 'Sandbox Dashboard', category: 'Panels', icon: '\u2B22' },
-    { id: 'reasoning', label: 'Reasoning Chains', category: 'Panels', icon: '\u2726' },
-  ];
+  const ENTITY_CAP = 30;
+
+  // Panel entries are DERIVED from the router's view/sub-view definitions, not
+  // hand-listed. The old hardcoded array covered 15 of the 37 nav-reachable
+  // panels, carried invented labels that matched no tab in the UI, and still
+  // advertised two retired ids ('pipelines', 'backlog'); every new panel
+  // shipped since was simply unreachable from the palette. Deriving means the
+  // palette can never drift from the nav again: add a sub-view, get an entry.
+  //
+  // Labels are "<View>: <Sub-view>" so the view name is fuzzy-searchable
+  // (typing "mills" surfaces every Mills panel) while the visible text still
+  // matches the tab an operator is looking for. Each item carries an explicit
+  // target_view/target_sub_view, so routing is exact rather than relying on
+  // legacy id aliasing. Filtered through the embed subset for the same reason
+  // the nav is: an operator-subset HUD must not offer a hidden view.
+  let panels = $derived.by<PaletteItem[]>(() => {
+    const items: PaletteItem[] = [
+      {
+        id: overviewId,
+        label: 'Now: Overview',
+        category: 'Panels',
+        icon: '\u25A3',
+        target_view: overviewId,
+      },
+    ];
+    for (const v of views) {
+      if (!embedConfig.isViewAllowed(v.id)) continue;
+      for (const sv of v.subViews) {
+        if (!embedConfig.isSubViewAllowed(v.id, sv.id)) continue;
+        items.push({
+          id: sv.id,
+          label: `${v.label}: ${sv.label}`,
+          category: 'Panels',
+          icon: v.icon,
+          target_view: v.id,
+          target_sub_view: sv.id,
+        });
+      }
+    }
+    return items;
+  });
 
   const actions = [
     { id: 'create-task', label: 'Create Task...', category: 'Actions', icon: '\u2795' },
@@ -31,11 +87,76 @@
     { id: 'pause-stream', label: 'Toggle Stream Pause', category: 'Actions', icon: '\u23F8' },
     { id: 'toggle-scanlines', label: 'Toggle CRT Scanlines', category: 'Actions', icon: '\u2588' },
     { id: 'refresh-all', label: 'Refresh All Data', category: 'Actions', icon: '\u21BB' },
+    { id: 'open-audit-drawer', label: 'Open Recent Actions', category: 'Actions', icon: '\u29C9' },
   ];
 
-  const allItems = [...panels, ...actions];
+  // Recent entities (sessions, tasks, spawns). Pulled at palette-open time
+  // from the existing stores so we don't pay for re-derivation on every
+  // keystroke. Capped at ENTITY_CAP per kind to keep the fuzzy index cheap.
+  let entityItems = $state<PaletteItem[]>([]);
 
-  function fuzzyMatch(str, query) {
+  function truncate(str: string | undefined, n: number) {
+    if (!str) return '';
+    return str.length > n ? str.slice(0, n - 1) + '…' : str;
+  }
+
+  function collectEntities() {
+    const items: PaletteItem[] = [];
+
+    const sessions = fleetStore.sessions ?? [];
+    for (let i = 0; i < Math.min(sessions.length, ENTITY_CAP); i++) {
+      const s = sessions[i];
+      if (!s?.id) continue;
+      const label = truncate(s.description?.trim() || s.namespace || s.id, 80);
+      items.push({
+        id: `session:${s.id}`,
+        label: `${label}  ·  ${s.agent || s.agent_id || '?'}`,
+        category: 'Sessions',
+        icon: '⧉',
+        entity_kind: 'session',
+        detail_id: s.id,
+        target_view: 'fleet',
+      });
+    }
+
+    const tasks = taskStore.tasks ?? [];
+    for (let i = 0; i < Math.min(tasks.length, ENTITY_CAP); i++) {
+      const t = tasks[i];
+      if (!t?.id) continue;
+      const label = truncate(t.title || t.description || t.id, 80);
+      items.push({
+        id: `task:${t.id}`,
+        label: `${label}  ·  ${t.status}/${t.priority}`,
+        category: 'Tasks',
+        icon: '☑',
+        entity_kind: 'task',
+        detail_id: t.id,
+        target_view: 'tasks',
+      });
+    }
+
+    const spawns = spawnStore.spawns ?? [];
+    for (let i = 0; i < Math.min(spawns.length, ENTITY_CAP); i++) {
+      const sp = spawns[i];
+      if (!sp?.spawn_id) continue;
+      const label = truncate(sp.request?.task_description || sp.spawn_id, 80);
+      items.push({
+        id: `spawn:${sp.spawn_id}`,
+        label: `${label}  ·  ${sp.status}`,
+        category: 'Spawns',
+        icon: '❖',
+        entity_kind: 'spawn',
+        detail_id: sp.spawn_id,
+        target_view: 'spawn',
+      });
+    }
+
+    return items;
+  }
+
+  let allItems = $derived([...panels, ...actions, ...entityItems]);
+
+  function fuzzyMatch(str: string, query: string) {
     const lower = str.toLowerCase();
     const q = query.toLowerCase();
     let qi = 0;
@@ -45,7 +166,7 @@
     return qi === q.length;
   }
 
-  function fuzzyScore(str, query) {
+  function fuzzyScore(str: string, query: string) {
     const lower = str.toLowerCase();
     const q = query.toLowerCase();
     let score = 0;
@@ -74,7 +195,7 @@
   });
 
   let groupedResults = $derived.by(() => {
-    const groups = {};
+    const groups: Record<string, PaletteItem[]> = {};
     filtered.forEach(item => {
       if (!groups[item.category]) groups[item.category] = [];
       groups[item.category].push(item);
@@ -82,15 +203,13 @@
     return Object.entries(groups);
   });
 
-  // Reset on open
+  // Reset on open + snapshot entities so the index is stable for this session.
+  // focusTrap on .palette-container owns focus-in and focus-restore.
   $effect(() => {
     if (open) {
       query = '';
       selectedIndex = 0;
-      // Focus input after mount
-      requestAnimationFrame(() => {
-        inputEl?.focus();
-      });
+      entityItems = collectEntities();
     }
   });
 
@@ -102,7 +221,14 @@
     }
   });
 
-  function handleKeydown(e) {
+  // Keep the arrow-key selection inside the scrolled results box — past ~8
+  // presses the highlight otherwise moves off-screen and navigation goes blind.
+  $effect(() => {
+    const el = resultsEl?.querySelector(`[data-idx="${selectedIndex}"]`);
+    el?.scrollIntoView({ block: 'nearest' });
+  });
+
+  function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       e.preventDefault();
       close();
@@ -137,20 +263,24 @@
     onclose();
   }
 
-  function handleBackdropClick(e) {
+  function handleBackdropClick(e: MouseEvent) {
     if (e.target === e.currentTarget) {
       close();
     }
   }
 
-  function selectItem(item) {
+  function selectItem(item: PaletteItem) {
     onselect(item);
     close();
   }
 
-  // Global keyboard listener
-  function handleGlobalKeydown(e) {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+  // Global keyboard listener. Cmd+K and Cmd+P both open this palette; the
+  // two shortcuts coexist with the legacy Cmd+K-only muscle memory while
+  // adding Cmd+P for users coming from Cursor / IntelliJ-style "go to
+  // anything" conventions.
+  function handleGlobalKeydown(e: KeyboardEvent) {
+    if (!(e.metaKey || e.ctrlKey)) return;
+    if (e.key === 'k' || e.key === 'p') {
       e.preventDefault();
       open = !open;
       if (!open) onclose();
@@ -163,7 +293,7 @@
   });
 
   // Track flat index across groups
-  function flatIndex(groupIdx, itemIdx) {
+  function flatIndex(groupIdx: number, itemIdx: number) {
     let idx = 0;
     const groups = groupedResults;
     for (let g = 0; g < groupIdx; g++) {
@@ -174,11 +304,22 @@
 </script>
 
 {#if open}
+  <!-- Two comments, not one: as the first child of a block Svelte 5 honours only
+       the first code in a svelte-ignore list. -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="palette-backdrop" onclick={handleBackdropClick} onkeydown={handleKeydown}>
-    <div class="palette-container">
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div class="palette-backdrop" onclick={handleBackdropClick}>
+    <div
+      class="palette-container"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Command palette"
+      use:focusTrap
+    >
       <div class="palette-input-wrap">
         <span class="palette-icon">&#9906;</span>
+        <!-- handleKeydown lives only here: on the backdrop it also fired for a
+             Tab-focused result, so Enter on the 6th result activated the 1st. -->
         <input
           bind:this={inputEl}
           type="text"
@@ -186,11 +327,15 @@
           placeholder="Type a command or search..."
           bind:value={query}
           onkeydown={handleKeydown}
+          role="combobox"
+          aria-expanded={true}
+          aria-controls="palette-listbox"
+          aria-activedescendant={`palette-opt-${selectedIndex}`}
         />
         <kbd class="palette-kbd">ESC</kbd>
       </div>
 
-      <div class="palette-results">
+      <div class="palette-results" id="palette-listbox" role="listbox" bind:this={resultsEl}>
         {#if filtered.length === 0}
           <div class="palette-empty">
             <span class="text-muted">No results found</span>
@@ -205,6 +350,11 @@
                   class:palette-item-selected={selectedIndex === flatIndex(gi, ii)}
                   onclick={() => selectItem(item)}
                   onmouseenter={() => selectedIndex = flatIndex(gi, ii)}
+                  data-idx={flatIndex(gi, ii)}
+                  id={`palette-opt-${flatIndex(gi, ii)}`}
+                  role="option"
+                  aria-selected={selectedIndex === flatIndex(gi, ii)}
+                  tabindex="-1"
                 >
                   <span class="palette-item-icon">{item.icon}</span>
                   <span class="palette-item-label">{item.label}</span>
@@ -244,7 +394,7 @@
     border-radius: var(--radius-lg);
     box-shadow:
       0 16px 48px rgba(0, 0, 0, 0.5),
-      0 0 0 1px rgba(1, 135, 153, 0.1);
+      0 0 0 1px rgba(var(--info-rgb), var(--opacity-light));
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -347,8 +497,11 @@
     background: var(--bg-tertiary);
   }
 
-  .palette-item-selected {
-    background: rgba(1, 135, 153, 0.1) !important;
+  /* Selector raised over .palette-item:hover so the highlight wins on
+     specificity instead of !important, and tinted from the same --info token
+     the rest of the app selects with. */
+  .palette-item.palette-item-selected {
+    background: color-mix(in srgb, var(--info) 12%, transparent);
     color: var(--info);
   }
 

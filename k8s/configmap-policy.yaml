@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loom-pipeline-policy
+data:
+  policy.yaml: |
+    # Keep this explicit production value pinned to
+    # policy.DefaultPipelineConcurrencyLimit.
+    max_concurrent_pipelines: 8

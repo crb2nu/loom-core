@@ -1,0 +1,1 @@
+- Add the planning incident runbook in `docs/storage-health-and-incident-classification-contracts.md`, mapping storage and external-dependency symptoms to classifications and permitted repository follow-ups.

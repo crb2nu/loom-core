@@ -94,8 +94,13 @@ func TestNewManager_CliProfilesSyncGeneratedOnly(t *testing.T) {
 		if !p.SyncGeneratedOnly {
 			t.Fatalf("profile %q SyncGeneratedOnly=%v, want true", name, p.SyncGeneratedOnly)
 		}
-		if p.GeneratedFile != "config.toml" {
-			t.Fatalf("profile %q GeneratedFile=%q, want %q", name, p.GeneratedFile, "config.toml")
+		// Kilo 1.0 reads OpenCode-style kilo.json; codex/gemini stay TOML.
+		wantFile := "config.toml"
+		if name == "kilocode" {
+			wantFile = "kilo.json"
+		}
+		if p.GeneratedFile != wantFile {
+			t.Fatalf("profile %q GeneratedFile=%q, want %q", name, p.GeneratedFile, wantFile)
 		}
 	}
 }
@@ -316,6 +321,99 @@ func TestProfile_SecretFilesAreSet(t *testing.T) {
 
 	if p.SecretFiles[0] != "auth.json" {
 		t.Errorf("SecretFiles[0] = %q, want %q", p.SecretFiles[0], "auth.json")
+	}
+}
+
+func TestAntigravityProfile_UsesAntigravity2Paths(t *testing.T) {
+	m, err := NewManager("/tmp/test-repo")
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	p := m.Get("antigravity")
+	if p == nil {
+		t.Fatal("antigravity profile not found")
+	}
+	if p.HomeDir != ".gemini" {
+		t.Fatalf("HomeDir = %q, want %q", p.HomeDir, ".gemini")
+	}
+	if p.RepoDir != ".agents" {
+		t.Fatalf("RepoDir = %q, want %q", p.RepoDir, ".agents")
+	}
+	if p.GeneratedFile != "mcp_config.json" {
+		t.Fatalf("GeneratedFile = %q, want %q", p.GeneratedFile, "mcp_config.json")
+	}
+	// Antigravity 2.0 shared central config (IDE + CLI + SDK). The pre-2.0
+	// ~/.gemini/antigravity/mcp_config.json path is legacy.
+	if p.HomeGeneratedFile != "config/mcp_config.json" {
+		t.Fatalf("HomeGeneratedFile = %q, want %q", p.HomeGeneratedFile, "config/mcp_config.json")
+	}
+	if len(p.ExtraGeneratedFiles) != 1 || p.ExtraGeneratedFiles[0] != "hooks.json" {
+		t.Fatalf("ExtraGeneratedFiles = %#v, want [hooks.json]", p.ExtraGeneratedFiles)
+	}
+	if p.HomeExtraGeneratedFiles["hooks.json"] != "config/hooks.json" {
+		t.Fatalf("HomeExtraGeneratedFiles[hooks.json] = %q, want %q", p.HomeExtraGeneratedFiles["hooks.json"], "config/hooks.json")
+	}
+	if p.SkillsTarget != "antigravity" {
+		t.Fatalf("SkillsTarget = %q, want %q", p.SkillsTarget, "antigravity")
+	}
+	if !p.SkillsDirectToHome {
+		t.Fatal("expected SkillsDirectToHome=true for antigravity")
+	}
+	if p.SkillsHomePath != "$HOME/.gemini/antigravity/skills" {
+		t.Fatalf("SkillsHomePath = %q, want %q", p.SkillsHomePath, "$HOME/.gemini/antigravity/skills")
+	}
+}
+
+func TestCodexProfile_GeneratesDirectlyToHome(t *testing.T) {
+	m, err := NewManager("/tmp/test-repo")
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	p := m.Get("codex")
+	if p == nil {
+		t.Fatal("codex profile not found")
+	}
+	if !p.GeneratedDirectToHome {
+		t.Fatal("expected GeneratedDirectToHome=true for codex")
+	}
+	if !p.SkillsDirectToHome {
+		t.Fatal("expected SkillsDirectToHome=true for codex")
+	}
+	if p.SkillsHomePath != "$HOME/.codex/skills" {
+		t.Fatalf("SkillsHomePath = %q, want %q", p.SkillsHomePath, "$HOME/.codex/skills")
+	}
+}
+
+func TestCLIProfiles_HomeManagedConfigBehavior(t *testing.T) {
+	m, err := NewManager("/tmp/test-repo")
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	kilo := m.Get("kilocode")
+	if kilo == nil {
+		t.Fatal("kilocode profile not found")
+	}
+	if !kilo.GeneratedDirectToHome {
+		t.Fatal("expected GeneratedDirectToHome=true for kilocode")
+	}
+
+	claude := m.Get("claude")
+	if claude == nil {
+		t.Fatal("claude profile not found")
+	}
+	if len(claude.HomeManagedSettingsKeys) == 0 {
+		t.Fatal("expected claude HomeManagedSettingsKeys to be populated")
+	}
+
+	gemini := m.Get("gemini")
+	if gemini == nil {
+		t.Fatal("gemini profile not found")
+	}
+	if len(gemini.HomeManagedSettingsKeys) == 0 {
+		t.Fatal("expected gemini HomeManagedSettingsKeys to be populated")
 	}
 }
 

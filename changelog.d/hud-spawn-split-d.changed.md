@@ -1,0 +1,1 @@
+- Extract the HUD spawn supervision watcher loops from `internal/hud/spawn.go` into `internal/hud/spawn_watchers.go` without changing behavior.

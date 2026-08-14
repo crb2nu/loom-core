@@ -1,0 +1,1 @@
+- Route transient-class Mills escalations through the bounded requeue claim in `pkg/mills/pipeline/escalation.go` and add reason-coded eligible/blocked counters in `pkg/telemetry/telemetry.go`.

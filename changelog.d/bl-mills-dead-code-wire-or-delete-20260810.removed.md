@@ -1,0 +1,1 @@
+- Removed unreachable Mills intake, adaptive, budget, audit, council notification, cross-repository routing, gate, overseer, pipeline state/retry, runner admission, and preflight implementations from the fabricated plan-slice merges; retained the live cross-repository stamp validation helper in `pkg/mills/crossrepo/deliver.go`.

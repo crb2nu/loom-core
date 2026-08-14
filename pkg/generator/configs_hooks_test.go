@@ -1,0 +1,1388 @@
+package generator
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestCodexNotifyCommand_ShellSyntaxValid guards the codex notify snippet
+// (which now embeds the worktree-aware nsVars + an explicit --namespace)
+// against shell-syntax regressions — `sh -n` parses without executing.
+func TestCodexNotifyCommand_ShellSyntaxValid(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, emit := range []bool{false, true} {
+		cmd := codexNotifyCommand("loom", emit)
+		if out, err := exec.CommandContext(ctx, "sh", "-n", "-c", cmd).CombinedOutput(); err != nil {
+			t.Fatalf("codex notify (telemetry=%v) invalid shell syntax: %v\n%s", emit, err, out)
+		}
+	}
+}
+
+func TestHookNamespaceVars_HandlesClaudeWorktrees(t *testing.T) {
+	got := hookNamespaceVars()
+	// Regression: prior version only matched "/.worktrees/" and treated
+	// "<repo>/.claude/worktrees/<branch>" paths as nested project roots,
+	// producing a "worktrees/<branch>/claude/<branch>" namespace instead
+	// of the parent repo's "<workspace>/<repo>/<branch>".
+	if !strings.Contains(got, "/.claude/worktrees/") {
+		t.Errorf("hookNamespaceVars() missing claude-worktrees branch; got: %q", got)
+	}
+	if !strings.Contains(got, "${WS_ROOT%%/.claude/worktrees/*}") {
+		t.Errorf("hookNamespaceVars() missing claude-worktrees parameter expansion; got: %q", got)
+	}
+	// Existing standard worktree pattern must still be supported.
+	if !strings.Contains(got, "${WS_ROOT%%/.worktrees/*}") {
+		t.Errorf("hookNamespaceVars() lost standard-worktrees parameter expansion; got: %q", got)
+	}
+}
+
+// TestHookNamespaceVars_WorkspaceRootGuard executes the nsVars snippet across a
+// range of WS_ROOT values and asserts NS_PROJECT. Healthy workspace-rooted paths
+// (incl. worktree layouts) keep their 2-level project; degenerate / non-workspace
+// roots (a detached keepalive with WS_ROOT="/", or an agent running at ~ or
+// ~/workspace) are emptied so they never mint a phantom project ("Users",
+// "cblevins", "5f1b") into the flexdeck /projects federation.
+func TestHookNamespaceVars_WorkspaceRootGuard(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	snippet := hookNamespaceVars() + `; printf '%s' "$NS_PROJECT"`
+
+	cases := []struct {
+		wsRoot string
+		want   string
+	}{
+		{"/home/u/workspace/services/loom-core", "services/loom-core"},
+		{"/home/u/workspace/libs/fi-fhir", "libs/fi-fhir"},
+		{"/home/u/workspace/labs/fractal-agents", "labs/fractal-agents"},
+		{"/home/u/workspace/private/secrets-tool", "private/secrets-tool"},
+		{"/home/u/workspace/services/loom-core/.worktrees/feat-x", "services/loom-core"},
+		{"/home/u/workspace/services/loom-core/.claude/worktrees/agent-x", "services/loom-core"},
+		// Non-workspace / degenerate roots → emptied (no phantom project).
+		{"/Users/cblevins", ""},
+		{"/Users/cblevins/workspace", ""},
+		{"/", ""},
+	}
+	for _, tc := range cases {
+		cmd := exec.CommandContext(ctx, "sh", "-c", snippet)
+		cmd.Env = append(os.Environ(), "WS_ROOT="+tc.wsRoot)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("WS_ROOT=%q: snippet failed: %v", tc.wsRoot, err)
+		}
+		if got := string(out); got != tc.want {
+			t.Errorf("WS_ROOT=%q: NS_PROJECT=%q, want %q", tc.wsRoot, got, tc.want)
+		}
+	}
+}
+
+// TestWorktreeCanonRootShell_StableHashAcrossWorktrees proves the codex identity
+// fix: hashing $WS_ROOT after worktreeCanonRootShell yields the SAME WS_HASH for
+// a repo's main checkout and its linked worktrees, so codex's workspace-anchored
+// `codex-<WS_HASH>` id stops orphaning one app into a row per worktree.
+func TestWorktreeCanonRootShell_StableHashAcrossWorktrees(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Mirrors the codex notify mint: canonicalize WS_ROOT, then cksum it.
+	hashOf := func(wsRoot string) string {
+		snippet := worktreeCanonRootShell() +
+			`; WS_HASH="$(printf '%s' "$WS_ROOT" | cksum | cut -d' ' -f1)"; printf '%s' "$WS_HASH"`
+		cmd := exec.CommandContext(ctx, "sh", "-c", snippet)
+		cmd.Env = append(os.Environ(), "WS_ROOT="+wsRoot)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("WS_ROOT=%q: snippet failed: %v", wsRoot, err)
+		}
+		return string(out)
+	}
+
+	const main = "/home/u/workspace/services/loom-core"
+	want := hashOf(main)
+	for _, wt := range []string{
+		main,
+		main + "/.worktrees/feat-x",
+		main + "/.claude/worktrees/agent-7",
+		main + "/.worktrees/fix/nested-branch",
+	} {
+		if got := hashOf(wt); got != want {
+			t.Errorf("WS_ROOT=%q: WS_HASH=%q, want %q (must fold to main repo)", wt, got, want)
+		}
+	}
+	// A genuinely different repo must NOT collide.
+	if other := hashOf("/home/u/workspace/services/flexinfer"); other == want {
+		t.Errorf("distinct repo collided with main repo hash %q", want)
+	}
+}
+
+// TestCodexNotifyCommand_CanonicalizesWorktreeRoot guards that the notify snippet
+// strips worktree segments from $WS_ROOT BEFORE the WS_HASH cksum, so the wiring
+// (arg order in the Sprintf) cannot silently regress.
+func TestCodexNotifyCommand_CanonicalizesWorktreeRoot(t *testing.T) {
+	cmd := codexNotifyCommand("loom", true)
+	if !strings.Contains(cmd, "${WS_ROOT%%/.worktrees/*}") ||
+		!strings.Contains(cmd, "${WS_ROOT%%/.claude/worktrees/*}") {
+		t.Errorf("codex notify must canonicalize WS_ROOT before hashing; got: %q", cmd)
+	}
+	canonIdx := strings.Index(cmd, "/.worktrees/*}")
+	hashIdx := strings.Index(cmd, "WS_HASH=")
+	if canonIdx < 0 || hashIdx < 0 || canonIdx > hashIdx {
+		t.Errorf("WS_ROOT canonicalization must precede WS_HASH; canonIdx=%d hashIdx=%d", canonIdx, hashIdx)
+	}
+}
+
+// TestHookAgentIDBootstrap_CodexCanonicalizesWorktreeRoot guards the SECOND
+// codex mint path (the shared bootstrap used by codex's hooks.json events): it
+// must canonicalize $WS_ROOT before the WS_HASH cksum so the scoped hooks.json id
+// agrees with the scopeless notify id and folds across worktrees. Conversation-
+// scoped vendors stay byte-for-byte unchanged (and never receive the canon
+// snippet, which is unsafe for Gemini's settings.json ${...} interpolator).
+func TestHookAgentIDBootstrap_CodexCanonicalizesWorktreeRoot(t *testing.T) {
+	codex := hookAgentIDBootstrap("codex")
+	if !strings.Contains(codex, "${WS_ROOT%%/.worktrees/*}") ||
+		!strings.Contains(codex, "${WS_ROOT%%/.claude/worktrees/*}") {
+		t.Errorf("codex bootstrap must canonicalize WS_ROOT; got: %q", codex)
+	}
+	canonIdx := strings.Index(codex, "/.worktrees/*}")
+	hashIdx := strings.Index(codex, "WS_HASH=")
+	if canonIdx < 0 || hashIdx < 0 || canonIdx > hashIdx {
+		t.Errorf("WS_ROOT canon must precede WS_HASH; canonIdx=%d hashIdx=%d", canonIdx, hashIdx)
+	}
+	for _, id := range []string{"claude-code", "gemini-cli"} {
+		if b := hookAgentIDBootstrap(id); strings.Contains(b, "/.worktrees/*}") {
+			t.Errorf("%s bootstrap must NOT canonicalize WS_ROOT; got: %q", id, b)
+		}
+	}
+	// The codex bootstrap must still be valid shell.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "sh", "-n", "-c", codex).CombinedOutput(); err != nil {
+		t.Fatalf("codex bootstrap invalid shell syntax: %v\n%s", err, out)
+	}
+}
+
+func TestSessionEndRetroHooks_ReturnsNonEmpty(t *testing.T) {
+	hooks := sessionEndRetroHooks("")
+	if len(hooks) == 0 {
+		t.Fatal("expected non-empty retro hooks")
+	}
+}
+
+func TestSessionEndRetroHooks_ContainsScript(t *testing.T) {
+	hooks := sessionEndRetroHooks("/usr/local/bin/loom")
+	if len(hooks) == 0 {
+		t.Fatal("expected non-empty retro hooks")
+	}
+
+	block, ok := hooks[0]["hooks"].([]map[string]any)
+	if !ok || len(block) == 0 {
+		t.Fatal("expected hooks block with at least one entry")
+	}
+
+	cmd, ok := block[0]["command"].(string)
+	if !ok || cmd == "" {
+		t.Fatal("expected non-empty command string")
+	}
+
+	if !strings.Contains(cmd, "session-retro.sh") {
+		t.Errorf("command should reference session-retro.sh, got: %s", cmd)
+	}
+}
+
+func TestTestHealthSessionStartHooks_Structure(t *testing.T) {
+	hooks := testHealthSessionStartHooks("/usr/local/bin/loom")
+	if len(hooks) != 1 {
+		t.Fatalf("expected 1 hook block, got %d", len(hooks))
+	}
+
+	block := hooks[0]
+	innerHooks, ok := block["hooks"].([]map[string]any)
+	if !ok {
+		t.Fatal("expected hooks key with []map[string]any value")
+	}
+	if len(innerHooks) != 1 {
+		t.Fatalf("expected 1 inner hook, got %d", len(innerHooks))
+	}
+
+	hook := innerHooks[0]
+	if hook["type"] != "command" {
+		t.Errorf("expected type=command, got %v", hook["type"])
+	}
+
+	cmd2, ok2 := hook["command"].(string)
+	if !ok2 || cmd2 == "" {
+		t.Fatal("expected non-empty command string")
+	}
+}
+
+func TestSessionEndRetroHooks_UsesLoomBinary(t *testing.T) {
+	hooks := sessionEndRetroHooks("/custom/path/loom")
+	block := hooks[0]["hooks"].([]map[string]any)
+	cmd := block[0]["command"].(string)
+
+	if !strings.Contains(cmd, "/custom/path/loom") {
+		t.Errorf("command should contain custom loom binary path, got: %s", cmd)
+	}
+}
+
+func TestSessionEndRetroHooks_DefaultLoomBinary(t *testing.T) {
+	hooks := sessionEndRetroHooks("")
+	block := hooks[0]["hooks"].([]map[string]any)
+	cmd := block[0]["command"].(string)
+
+	if !strings.Contains(cmd, "LOOM_BINARY=") {
+		t.Errorf("command should set LOOM_BINARY, got: %s", cmd)
+	}
+}
+
+func TestAppendHookExtras_Retrospective_AppendsToStop(t *testing.T) {
+	// Build base hooks with Claude's "Stop" event.
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "")
+
+	stopBefore := len(hooks["Stop"].([]map[string]any))
+
+	appendHookExtras(hooks, HookProfile{Extras: []string{"postSessionEnd_retrospective"}}, "")
+
+	stopAfter := len(hooks["Stop"].([]map[string]any))
+	if stopAfter <= stopBefore {
+		t.Errorf("expected Stop hooks to grow after appending retrospective, before=%d after=%d", stopBefore, stopAfter)
+	}
+}
+
+func TestAppendHookExtras_Retrospective_AppendsToSessionEnd(t *testing.T) {
+	// Build base hooks with Gemini's "SessionEnd" event.
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "gemini-cli",
+		AgentType:        "gemini-cli",
+		Description:      "Gemini CLI session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "AfterTool",
+		HeartbeatMatcher: "",
+	}, "")
+
+	endBefore := len(hooks["SessionEnd"].([]map[string]any))
+
+	appendHookExtras(hooks, HookProfile{Extras: []string{"postSessionEnd_retrospective"}}, "")
+
+	endAfter := len(hooks["SessionEnd"].([]map[string]any))
+	if endAfter <= endBefore {
+		t.Errorf("expected SessionEnd hooks to grow after appending retrospective, before=%d after=%d", endBefore, endAfter)
+	}
+}
+
+func TestBuildPlatformHooks_HeartbeatPassesExplicitNamespace(t *testing.T) {
+	// The heartbeat hook computes NS_PROJECT/NS_BRANCH (nsVars) and must pass
+	// them as an explicit --namespace, not rely on server-side --infer-namespace
+	// whose fallback minted "agents/<agent-id>" phantom sessions.
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "loom")
+
+	assertNativeLifecycleHook(t, hooks, "PostToolUse", "agent heartbeat")
+	assertNativeLifecycleHook(t, hooks, "PostToolUse", `--namespace "$NS_PROJECT/$NS_BRANCH"`)
+	// nsVars must be computed in the same command so $NS_PROJECT/$NS_BRANCH resolve.
+	assertNativeLifecycleHook(t, hooks, "PostToolUse", "NS_PROJECT=")
+}
+
+func TestAppendHookExtras_Retrospective_DoesNotAffectMissingEvent(t *testing.T) {
+	// Build hooks for Claude (has Stop but not SessionEnd).
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "")
+
+	appendHookExtras(hooks, HookProfile{Extras: []string{"postSessionEnd_retrospective"}}, "")
+
+	// SessionEnd should not exist because Claude uses Stop.
+	if _, ok := hooks["SessionEnd"]; ok {
+		t.Error("retrospective should not create SessionEnd key when it does not exist")
+	}
+}
+
+func TestAppendHookExtras_Retrospective_CommandContainsExitZero(t *testing.T) {
+	hooks := sessionEndRetroHooks("")
+	block := hooks[0]["hooks"].([]map[string]any)
+	cmd := block[0]["command"].(string)
+
+	if !strings.Contains(cmd, "exit 0") {
+		t.Errorf("retro hook command should end with exit 0 for safety, got: %s", cmd)
+	}
+}
+
+func TestAppendHookExtras_Retrospective_CommandContainsOrTrue(t *testing.T) {
+	hooks := sessionEndRetroHooks("")
+	block := hooks[0]["hooks"].([]map[string]any)
+	cmd := block[0]["command"].(string)
+
+	if !strings.Contains(cmd, "|| true") {
+		t.Errorf("retro hook command should contain || true for fault tolerance, got: %s", cmd)
+	}
+}
+
+func TestAppendHookExtras_SessionStartTestHealth(t *testing.T) {
+	// Build a minimal hooks map with SessionStart already populated
+	hooks := map[string]any{
+		"SessionStart": []map[string]any{
+			{
+				"hooks": []map[string]any{
+					{"type": "command", "command": "echo existing"},
+				},
+			},
+		},
+	}
+
+	appendHookExtras(hooks, HookProfile{Extras: []string{"sessionStart_testHealth"}}, "/usr/local/bin/loom")
+
+	sessionStart, ok := hooks["SessionStart"].([]map[string]any)
+	if !ok {
+		t.Fatal("SessionStart should be []map[string]any")
+	}
+
+	// Should have appended a new block (original 1 + test health 1)
+	if len(sessionStart) != 2 {
+		t.Fatalf("expected 2 SessionStart blocks after appending test health, got %d", len(sessionStart))
+	}
+
+	// Verify the appended block contains test-health-snapshot.sh
+	appendedBlock := sessionStart[1]
+	innerHooks, ok := appendedBlock["hooks"].([]map[string]any)
+	if !ok {
+		t.Fatal("appended block should have hooks key")
+	}
+	cmd, ok := innerHooks[0]["command"].(string)
+	if !ok {
+		t.Fatal("expected command string in appended hook")
+	}
+	if !strings.Contains(cmd, "test-health-snapshot.sh") {
+		t.Error("appended hook should reference test-health-snapshot.sh")
+	}
+}
+
+func TestAppendHookExtras_SessionStartTestHealth_NoExisting(t *testing.T) {
+	// If SessionStart is not present or empty, the hook should not be added
+	hooks := map[string]any{}
+
+	appendHookExtras(hooks, HookProfile{Extras: []string{"sessionStart_testHealth"}}, "/usr/local/bin/loom")
+
+	// SessionStart key should not exist since there was nothing to append to
+	if _, ok := hooks["SessionStart"]; ok {
+		t.Error("SessionStart should not be created when no existing hooks present")
+	}
+}
+
+func TestBuildPlatformHooks_OmitsSubagentStartWhenNotDeclared(t *testing.T) {
+	// Gemini does not declare subagentStart; the hook generator must not
+	// emit a SubagentStart block. Including it causes Gemini CLI to reject
+	// the entire hooks block.
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "gemini-cli",
+		AgentType:        "gemini-cli",
+		Description:      "Gemini CLI session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "AfterTool",
+		HeartbeatMatcher: "run_shell_command",
+		Events:           []string{"sessionStart", "sessionEnd", "postToolUse"},
+	}, "")
+
+	if _, ok := hooks["SubagentStart"]; ok {
+		t.Error("expected no SubagentStart hooks when subagentStart is not in events list")
+	}
+}
+
+func TestBuildPlatformHooks_EmitsSubagentStartWhenDeclared(t *testing.T) {
+	// Claude declares subagentStart; the hook generator must emit it.
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+		Events:           []string{"sessionStart", "sessionEnd", "preToolUse", "postToolUse", "subagentStart"},
+	}, "")
+
+	if _, ok := hooks["SubagentStart"]; !ok {
+		t.Error("expected SubagentStart hooks when subagentStart is in events list")
+	}
+}
+
+func TestBuildPlatformHooks_OmitsHeartbeatWhenEventEmpty(t *testing.T) {
+	// Codex sets heartbeat_event to "" because its hook payloads have no
+	// stable tool-name surface to filter on. An unmatched PostToolUse
+	// heartbeat would fork `loom agent heartbeat` on every tool call and
+	// visibly bounce the codex TUI. The notify + keepalive-wrap path
+	// already covers keepalive in the background, so buildPlatformHooks
+	// must skip the heartbeat block entirely when HeartbeatEvent == "".
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "codex",
+		AgentType:        "codex",
+		Description:      "Codex CLI session",
+		SessionEndEvent:  "",
+		HeartbeatEvent:   "",
+		HeartbeatMatcher: "",
+		Events:           []string{"sessionStart", "notify"},
+	}, "")
+
+	// No heartbeat block at any of the conventional event slots.
+	for _, evt := range []string{"PostToolUse", "AfterTool", "Stop", "SessionEnd", ""} {
+		if _, ok := hooks[evt]; ok {
+			t.Errorf("expected no heartbeat block, got entry for event %q (codex would bounce on every tool call)", evt)
+		}
+	}
+
+	// SessionStart still fires — that's the one event we want.
+	if _, ok := hooks["SessionStart"]; !ok {
+		t.Error("expected SessionStart hook to remain when heartbeat is suppressed")
+	}
+}
+
+func TestHookProfileHasEvent_CaseInsensitive(t *testing.T) {
+	hp := HookProfile{Events: []string{"SubagentStart", "preToolUse"}}
+	if !hookProfileHasEvent(hp, "subagentStart") {
+		t.Error("expected case-insensitive match for subagentStart")
+	}
+	if !hookProfileHasEvent(hp, "PRETOOLUSE") {
+		t.Error("expected case-insensitive match for preToolUse")
+	}
+	if hookProfileHasEvent(hp, "postToolUse") {
+		t.Error("expected no match for postToolUse")
+	}
+}
+
+// TestVendorLifecycleContract pins the cross-vendor agent lifecycle contract
+// so future generator refactors cannot silently drop a session-start /
+// session-end / heartbeat hook for any supported vendor. See
+// docs/architecture/agent-lifecycle.md for the prose model.
+//
+// The contract for native-hook vendors (claude, gemini) is:
+//   - A SessionStart hook that invokes `loom agent session-start`.
+//   - A session-end hook (event name varies per vendor) invoking
+//     `loom agent session-end`.
+//   - A heartbeat hook (event name + matcher varies) invoking
+//     `loom agent heartbeat` with `--ensure-session`.
+//
+// Codex has no native lifecycle hook surface beyond `notify` (which fires on
+// turn completion only), so its contract is different:
+//   - A `notify = [...]` entry in config.toml whose shell command invokes
+//     `loom agent keepalive-wrap` with `--ensure-session` and passes
+//     `--session-id`.
+//
+// Session-end for codex is not representable at the hook layer; the fleet
+// monitor's orphan reaper (internal/hud/monitor + internal/hud/fleetview)
+// catches agents left without a session after process exit.
+func TestVendorLifecycleContract(t *testing.T) {
+	t.Run("claude", func(t *testing.T) {
+		profile, err := GetPlatformProfile("claude")
+		if err != nil {
+			t.Fatalf("get claude profile: %v", err)
+		}
+		hooks := buildPlatformHooks(testRegistry(), profile.Hooks, "")
+		assertNativeLifecycleHook(t, hooks, "SessionStart", "agent session-start")
+		assertNativeLifecycleHook(t, hooks, profile.Hooks.SessionEndEvent, "agent session-end")
+		assertNativeLifecycleHook(t, hooks, profile.Hooks.HeartbeatEvent, "agent heartbeat")
+		assertEventCommandContains(t, hooks, profile.Hooks.HeartbeatEvent, "--ensure-session")
+	})
+
+	t.Run("gemini", func(t *testing.T) {
+		profile, err := GetPlatformProfile("gemini")
+		if err != nil {
+			t.Fatalf("get gemini profile: %v", err)
+		}
+		hooks := buildPlatformHooks(testRegistry(), profile.Hooks, "")
+		assertNativeLifecycleHook(t, hooks, "SessionStart", "agent session-start")
+		assertNativeLifecycleHook(t, hooks, profile.Hooks.SessionEndEvent, "agent session-end")
+		assertNativeLifecycleHook(t, hooks, profile.Hooks.HeartbeatEvent, "agent heartbeat")
+		assertEventCommandContains(t, hooks, profile.Hooks.HeartbeatEvent, "--ensure-session")
+		// Gemini-specific event names differ from Claude's: pin them so a
+		// future profile edit doesn't silently flip to Stop / PostToolUse.
+		if profile.Hooks.SessionEndEvent != "SessionEnd" {
+			t.Errorf("gemini session_end_event must be SessionEnd, got %q", profile.Hooks.SessionEndEvent)
+		}
+		if profile.Hooks.HeartbeatEvent != "AfterTool" {
+			t.Errorf("gemini heartbeat_event must be AfterTool, got %q", profile.Hooks.HeartbeatEvent)
+		}
+	})
+
+	t.Run("codex_notify_only", func(t *testing.T) {
+		// Codex doesn't go through buildPlatformHooks (notify is a top-level
+		// TOML key, not a named event). Exercise emitCodexPreamble and
+		// assert the notify shell command invokes our keepalive wrapper
+		// with the right flags.
+		var sb strings.Builder
+		emitCodexPreamble(&sb, testRegistry(), "/tmp/workspace", "")
+		got := sb.String()
+
+		if !strings.Contains(got, "notify = [\"sh\", \"-c\",") {
+			t.Fatalf("codex preamble missing notify shell entry: %s", got)
+		}
+		for _, want := range []string{
+			"agent keepalive-wrap",
+			"--ensure-session",
+			"--session-id",
+			"--agent-type codex",
+			"--infer-namespace",
+			// Codex now passes an explicit namespace (computed from WS_ROOT) so
+			// it stops falling back to the malformed "////main" the detached
+			// keepalive-wrap process produced via git inference. Checked without
+			// surrounding quotes since this `got` is the TOML-serialized config
+			// (inner quotes are escaped to \").
+			"--namespace ",
+			"$NS_PROJECT/$NS_BRANCH",
+			"NS_PROJECT=",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("codex notify command missing %q; full preamble:\n%s", want, got)
+			}
+		}
+		// Codex has no SessionStart / SessionEnd surface — make sure the
+		// preamble does not invent one (a real-vendor event name would get
+		// silently ignored by Codex and mislead readers of the config).
+		for _, forbidden := range []string{"SessionStart", "SessionEnd", "Stop =", "PostToolUse"} {
+			if strings.Contains(got, forbidden) {
+				t.Errorf("codex preamble must not mention %q (codex does not support named lifecycle events)", forbidden)
+			}
+		}
+	})
+}
+
+// assertNativeLifecycleHook asserts that `hooks[event]` is a non-empty list
+// containing at least one command matching substr. Used by the vendor
+// lifecycle contract test; pulled out so the failure message tells you
+// exactly which event / vendor / missing command tripped the check.
+func assertNativeLifecycleHook(t *testing.T, hooks map[string]any, event, substr string) {
+	t.Helper()
+	if event == "" {
+		t.Fatalf("profile declared an empty event name for substr=%q", substr)
+	}
+	entries, ok := hooks[event].([]map[string]any)
+	if !ok || len(entries) == 0 {
+		t.Fatalf("event %q missing from generated hooks; hooks=%#v", event, hooks)
+	}
+	for _, entry := range entries {
+		inner, ok := entry["hooks"].([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, cmd := range inner {
+			if s, ok := cmd["command"].(string); ok && strings.Contains(s, substr) {
+				return
+			}
+		}
+	}
+	t.Fatalf("no command under event %q contains %q", event, substr)
+}
+
+// assertEventCommandContains is like assertNativeLifecycleHook but does not
+// fail if the event is missing — it only checks commands under the event
+// when the event does exist. Useful for cross-cutting assertions (e.g.
+// heartbeat must always have --ensure-session when present).
+func assertEventCommandContains(t *testing.T, hooks map[string]any, event, substr string) {
+	t.Helper()
+	entries, ok := hooks[event].([]map[string]any)
+	if !ok {
+		return
+	}
+	for _, entry := range entries {
+		inner, ok := entry["hooks"].([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, cmd := range inner {
+			if s, ok := cmd["command"].(string); ok && strings.Contains(s, substr) {
+				return
+			}
+		}
+	}
+	t.Fatalf("event %q exists but no command contains %q", event, substr)
+}
+
+func TestAppendHookExtras_UnknownExtra(t *testing.T) {
+	hooks := map[string]any{
+		"SessionStart": []map[string]any{
+			{
+				"hooks": []map[string]any{
+					{"type": "command", "command": "echo existing"},
+				},
+			},
+		},
+	}
+
+	// Unknown extras should be silently ignored
+	appendHookExtras(hooks, HookProfile{Extras: []string{"unknown_extra"}}, "/usr/local/bin/loom")
+
+	sessionStart := hooks["SessionStart"].([]map[string]any)
+	if len(sessionStart) != 1 {
+		t.Errorf("expected 1 SessionStart block (unchanged), got %d", len(sessionStart))
+	}
+}
+
+// hooksConfigContainsRetro returns true when any command in the platform
+// hooks map references session-retro.sh. Used to assert end-to-end opt-in
+// wiring through hooksConfigFromProfile.
+func hooksConfigContainsRetro(t *testing.T, cfg map[string]any) bool {
+	t.Helper()
+	hooks, ok := cfg["hooks"].(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, v := range hooks {
+		entries, ok := v.([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, entry := range entries {
+			inner, ok := entry["hooks"].([]map[string]any)
+			if !ok {
+				continue
+			}
+			for _, h := range inner {
+				if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "session-retro.sh") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// TestCodexHooks_UpdatePlanTaskSyncBridge verifies Codex's update_plan task-sync
+// parity (the Codex counterpart of Claude's TodoWrite bridge): the codex
+// hooks.json carries a PostToolUse block matched to `update_plan` that pipes to
+// `loom agent task-sync`, and that block does NOT also carry an unmatched
+// event-emit hook (which would reintroduce the per-tool-call fork the profile
+// deliberately avoids). Also confirms the new hook is covered by a [hooks.state]
+// trust entry so Codex doesn't silently drop it.
+func TestCodexHooks_UpdatePlanTaskSyncBridge(t *testing.T) {
+	profile, err := GetPlatformProfile("codex")
+	if err != nil || profile == nil {
+		t.Fatalf("get codex profile: %v", err)
+	}
+
+	cfg := hooksConfigFromProfile(testRegistry(), profile, "loom")
+	hooks, ok := cfg["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("hooks config missing hooks map: %#v", cfg)
+	}
+	ptu, ok := hooks["PostToolUse"].([]map[string]any)
+	if !ok || len(ptu) == 0 {
+		t.Fatalf("codex PostToolUse missing (update_plan task-sync not bootstrapped); hooks=%v", hooks)
+	}
+
+	var foundUpdatePlan bool
+	for _, b := range ptu {
+		matcher, _ := b["matcher"].(string)
+		cmd := firstHookCommandString(b)
+		if matcher == "update_plan" {
+			foundUpdatePlan = true
+			if !strings.Contains(cmd, "agent task-sync") {
+				t.Errorf("update_plan block must pipe to `agent task-sync`; got: %q", cmd)
+			}
+		}
+		// No block in codex PostToolUse may carry an unmatched per-tool telemetry
+		// fork (the reason a PostToolUse heartbeat was rejected for codex).
+		if strings.Contains(cmd, "event-emit") {
+			t.Errorf("codex PostToolUse must not carry an event-emit hook (per-tool fork); matcher=%q cmd=%q", matcher, cmd)
+		}
+	}
+	if !foundUpdatePlan {
+		t.Errorf("codex PostToolUse missing `update_plan` matcher block; got %d blocks", len(ptu))
+	}
+
+	// The new hook must be self-trusted, else Codex v0.129+ silently drops it.
+	entries, err := ComputeCodexHookTrust("/home/u/.codex/hooks.json", cfg)
+	if err != nil {
+		t.Fatalf("ComputeCodexHookTrust: %v", err)
+	}
+	var trusted bool
+	for _, e := range entries {
+		if strings.Contains(strings.ToLower(e.Key), "post_tool_use") {
+			trusted = true
+			break
+		}
+	}
+	if !trusted {
+		t.Errorf("no [hooks.state] trust entry references PostToolUse; entries=%v", entries)
+	}
+}
+
+// firstHookCommandString returns the command string of a hook block's first
+// hook entry ({matcher, hooks:[{type:command, command:"..."}]}).
+func firstHookCommandString(block map[string]any) string {
+	inner, ok := block["hooks"].([]map[string]any)
+	if !ok || len(inner) == 0 {
+		return ""
+	}
+	cmd, _ := inner[0]["command"].(string)
+	return cmd
+}
+
+// TestHooksConfigFromProfile_RetroOptIn_Claude verifies the
+// postSessionEnd_retrospective extra is opt-in for Claude: absent by default,
+// present when the profile's extras list includes it. This pins the opt-in
+// contract end-to-end through hooksConfigFromProfile (the path loom sync uses
+// to materialize Claude's settings.json).
+func TestHooksConfigFromProfile_RetroOptIn_Claude(t *testing.T) {
+	profile, err := GetPlatformProfile("claude")
+	if err != nil {
+		t.Fatalf("get claude profile: %v", err)
+	}
+
+	// Default profile (no retro extra) should NOT generate the retro hook.
+	cfgDefault := hooksConfigFromProfile(testRegistry(), profile, "")
+	if hooksConfigContainsRetro(t, cfgDefault) {
+		t.Error("retro hook generated for Claude without postSessionEnd_retrospective extra")
+	}
+
+	// Clone the profile with an added extras entry; do not mutate the cached
+	// profile registry returned by GetPlatformProfile.
+	clone := *profile
+	clone.Hooks.Extras = append([]string{}, profile.Hooks.Extras...)
+	clone.Hooks.Extras = append(clone.Hooks.Extras, "postSessionEnd_retrospective")
+
+	cfgEnabled := hooksConfigFromProfile(testRegistry(), &clone, "")
+	if !hooksConfigContainsRetro(t, cfgEnabled) {
+		t.Error("retro hook missing for Claude with postSessionEnd_retrospective extra enabled")
+	}
+}
+
+// TestHooksConfigFromProfile_RetroOptIn_Gemini verifies the same opt-in
+// contract for Gemini. Gemini uses SessionEnd (not Stop), so this also
+// guards against the dispatcher only handling Claude's event name.
+func TestHooksConfigFromProfile_RetroOptIn_Gemini(t *testing.T) {
+	profile, err := GetPlatformProfile("gemini")
+	if err != nil {
+		t.Fatalf("get gemini profile: %v", err)
+	}
+
+	cfgDefault := hooksConfigFromProfile(testRegistry(), profile, "")
+	if hooksConfigContainsRetro(t, cfgDefault) {
+		t.Error("retro hook generated for Gemini without postSessionEnd_retrospective extra")
+	}
+
+	clone := *profile
+	clone.Hooks.Extras = append([]string{}, profile.Hooks.Extras...)
+	clone.Hooks.Extras = append(clone.Hooks.Extras, "postSessionEnd_retrospective")
+
+	cfgEnabled := hooksConfigFromProfile(testRegistry(), &clone, "")
+	if !hooksConfigContainsRetro(t, cfgEnabled) {
+		t.Error("retro hook missing for Gemini with postSessionEnd_retrospective extra enabled")
+	}
+
+	// Sanity: the retro hook must have landed on Gemini's SessionEnd event,
+	// not on Claude's Stop event (Gemini does not emit Stop).
+	hooks := cfgEnabled["hooks"].(map[string]any)
+	if _, ok := hooks["Stop"]; ok {
+		t.Error("Gemini hooks must not contain a Stop event (Gemini uses SessionEnd)")
+	}
+	sessionEnd, ok := hooks["SessionEnd"].([]map[string]any)
+	if !ok || len(sessionEnd) == 0 {
+		t.Fatal("Gemini hooks missing SessionEnd entries")
+	}
+	var foundRetroOnSessionEnd bool
+	for _, entry := range sessionEnd {
+		inner, ok := entry["hooks"].([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, h := range inner {
+			if cmd, ok := h["command"].(string); ok && strings.Contains(cmd, "session-retro.sh") {
+				foundRetroOnSessionEnd = true
+			}
+		}
+	}
+	if !foundRetroOnSessionEnd {
+		t.Error("retro hook did not attach to Gemini SessionEnd event")
+	}
+}
+
+// --- Phase 2.2: telemetry_eventEmit hook wiring ---
+//
+// These tests cover the new "telemetry_eventEmit" extras case that wires each
+// platform's native lifecycle hooks into `loom agent event-emit` (Phase 2.1's
+// CLI). Spec: `.loom/99-implementation-plan-agent-telemetry-spectator-2026-05-04.md`.
+
+func TestCanonicalTelemetryHookForEvent(t *testing.T) {
+	cases := map[string]string{
+		"SessionStart": "session-start",
+		"SessionEnd":   "session-end", // Per-session terminal event in Claude + Gemini.
+		// Stop is intentionally NOT mapped: it fires per-turn in both
+		// Claude and Codex, so mapping it to "session-end" caused
+		// `loom agent event-emit --hook session-end` to fire every turn.
+		// Use the platform-native SessionEnd (Claude/Gemini) or notify +
+		// keepalive-wrap (Codex) for real session terminus.
+		"Stop":          "",
+		"PreToolUse":    "pre-tool-use", // Claude
+		"PostToolUse":   "post-tool-use",
+		"BeforeTool":    "pre-tool-use",  // Gemini-native name (Phase 2.2b).
+		"AfterTool":     "post-tool-use", // Gemini-native name.
+		"SubagentStart": "",              // Subagent events are not canonical telemetry hooks.
+		"":              "",
+	}
+	for event, want := range cases {
+		if got := canonicalTelemetryHookForEvent(event); got != want {
+			t.Errorf("canonicalTelemetryHookForEvent(%q) = %q, want %q", event, got, want)
+		}
+	}
+}
+
+func TestTelemetryEventEmitPlatform_ClaudeCode(t *testing.T) {
+	if got := telemetryEventEmitPlatform(HookProfile{AgentID: "claude-code"}); got != "claude-code" {
+		t.Errorf("claude-code platform: got %q, want %q", got, "claude-code")
+	}
+}
+
+func TestTelemetryEventEmitPlatform_GeminiCLI(t *testing.T) {
+	if got := telemetryEventEmitPlatform(HookProfile{AgentID: "gemini-cli"}); got != "gemini-cli" {
+		t.Errorf("gemini-cli platform: got %q, want %q", got, "gemini-cli")
+	}
+}
+
+func TestTelemetryEventEmitPlatform_UnsupportedReturnsEmpty(t *testing.T) {
+	// Codex is wired separately via codexNotifyCommand (not the extras
+	// case), so it stays empty here. Other agents without a normalizer
+	// also stay empty so the case is a no-op rather than emitting hooks
+	// that publish broken payloads.
+	for _, agentID := range []string{"codex", "kilocode", "", "unknown"} {
+		if got := telemetryEventEmitPlatform(HookProfile{AgentID: agentID}); got != "" {
+			t.Errorf("AgentID=%q: got %q, want empty", agentID, got)
+		}
+	}
+}
+
+func TestAppendHookExtras_TelemetryEventEmit_ClaudeCodeWiresAllFourEvents(t *testing.T) {
+	// Build Claude Code base hooks (SessionEnd + PostToolUse populated by
+	// buildPlatformHooks). `Stop` is per-turn in Claude, so SessionEnd is
+	// the real per-session terminal event we wire telemetry to.
+	hp := HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+		Events:           []string{"sessionStart", "sessionEnd", "preToolUse", "postToolUse"},
+		Extras:           []string{"telemetry_eventEmit"},
+	}
+	hooks := buildPlatformHooks(testRegistry(), hp, "/usr/local/bin/loom")
+
+	// PreToolUse is not populated by buildPlatformHooks alone; Claude's
+	// PreToolUse blocks come from policy refs (gitops_flux). Inject a minimal
+	// existing block so the extras case has a slot to append to. This mirrors
+	// production where appendHookPolicies runs before appendHookExtras.
+	hooks["PreToolUse"] = []map[string]any{
+		{"hooks": []map[string]any{{"type": "command", "command": "true"}}},
+	}
+
+	appendHookExtras(hooks, hp, "/usr/local/bin/loom")
+
+	for _, event := range []string{"SessionStart", "SessionEnd", "PreToolUse", "PostToolUse"} {
+		blocks, ok := hooks[event].([]map[string]any)
+		if !ok {
+			t.Errorf("event=%s: hooks slot missing or wrong type", event)
+			continue
+		}
+		var found bool
+		for _, b := range blocks {
+			inner, ok := b["hooks"].([]map[string]any)
+			if !ok {
+				continue
+			}
+			for _, h := range inner {
+				cmd, _ := h["command"].(string)
+				if strings.Contains(cmd, "agent event-emit") && strings.Contains(cmd, "--platform claude-code") {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			t.Errorf("event=%s: telemetry_eventEmit did not inject a `loom agent event-emit --platform claude-code` hook", event)
+		}
+	}
+}
+
+func TestAppendHookExtras_TelemetryEventEmit_UsesCanonicalHookNames(t *testing.T) {
+	hp := HookProfile{
+		Enabled:     true,
+		AgentID:     "claude-code",
+		AgentType:   "claude-code",
+		Description: "Claude Code session",
+		// SessionEnd is per-session in Claude; Stop is per-turn. Telemetry
+		// `session-end` must fire on the real session-end event, not on
+		// every turn — see canonicalTelemetryHookForEvent for the mapping.
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+		Events:           []string{"sessionStart", "sessionEnd", "preToolUse", "postToolUse"},
+		Extras:           []string{"telemetry_eventEmit"},
+	}
+	hooks := buildPlatformHooks(testRegistry(), hp, "/usr/local/bin/loom")
+	hooks["PreToolUse"] = []map[string]any{
+		{"hooks": []map[string]any{{"type": "command", "command": "true"}}},
+	}
+	appendHookExtras(hooks, hp, "/usr/local/bin/loom")
+
+	expectedHookForEvent := map[string]string{
+		"SessionStart": "--hook session-start",
+		"SessionEnd":   "--hook session-end",
+		"PreToolUse":   "--hook pre-tool-use",
+		"PostToolUse":  "--hook post-tool-use",
+	}
+	for event, expectedFlag := range expectedHookForEvent {
+		blocks, _ := hooks[event].([]map[string]any)
+		var ok bool
+		for _, b := range blocks {
+			inner, _ := b["hooks"].([]map[string]any)
+			for _, h := range inner {
+				cmd, _ := h["command"].(string)
+				if strings.Contains(cmd, "agent event-emit") && strings.Contains(cmd, expectedFlag) {
+					ok = true
+					break
+				}
+			}
+			if ok {
+				break
+			}
+		}
+		if !ok {
+			t.Errorf("event=%s: did not find event-emit hook with flag %q", event, expectedFlag)
+		}
+	}
+}
+
+func TestAppendHookExtras_TelemetryEventEmit_NoOpForUnsupportedPlatform(t *testing.T) {
+	// Codex is wired separately via codexNotifyCommand (Phase 2.2c), and
+	// kilocode has no native hook surface — both must skip the extras case
+	// silently rather than emit hooks pointing at a --platform the CLI
+	// would reject.
+	hp := HookProfile{
+		Enabled:          true,
+		AgentID:          "kilocode",
+		AgentType:        "kilocode",
+		Description:      "Kilocode session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "",
+		Events:           []string{"sessionStart", "sessionEnd"},
+		Extras:           []string{"telemetry_eventEmit"},
+	}
+	hooks := buildPlatformHooks(testRegistry(), hp, "/usr/local/bin/loom")
+	startBefore := len(hooks["SessionStart"].([]map[string]any))
+	endBefore := len(hooks["SessionEnd"].([]map[string]any))
+
+	appendHookExtras(hooks, hp, "/usr/local/bin/loom")
+
+	startAfter := len(hooks["SessionStart"].([]map[string]any))
+	endAfter := len(hooks["SessionEnd"].([]map[string]any))
+	if startAfter != startBefore {
+		t.Errorf("SessionStart grew for unsupported platform: before=%d after=%d", startBefore, startAfter)
+	}
+	if endAfter != endBefore {
+		t.Errorf("SessionEnd grew for unsupported platform: before=%d after=%d", endBefore, endAfter)
+	}
+}
+
+// --- Phase 2.2b/c: Gemini and Codex generator wiring ---
+
+func TestAppendHookExtras_TelemetryEventEmit_GeminiWiresThreeEvents(t *testing.T) {
+	// Gemini emits SessionStart + SessionEnd (via session_end_event) +
+	// AfterTool (via heartbeat_event) — no PreToolUse. The extras case
+	// should inject event-emit on each of those three slots.
+	hp := HookProfile{
+		Enabled:          true,
+		AgentID:          "gemini-cli",
+		AgentType:        "gemini-cli",
+		Description:      "Gemini CLI session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "AfterTool",
+		HeartbeatMatcher: "run_shell_command",
+		Events:           []string{"sessionStart", "sessionEnd", "postToolUse"},
+		Extras:           []string{"telemetry_eventEmit"},
+	}
+	hooks := buildPlatformHooks(testRegistry(), hp, "/usr/local/bin/loom")
+	appendHookExtras(hooks, hp, "/usr/local/bin/loom")
+
+	for _, event := range []string{"SessionStart", "SessionEnd", "AfterTool"} {
+		blocks, _ := hooks[event].([]map[string]any)
+		var found bool
+		for _, b := range blocks {
+			inner, _ := b["hooks"].([]map[string]any)
+			for _, h := range inner {
+				cmd, _ := h["command"].(string)
+				if strings.Contains(cmd, "agent event-emit") && strings.Contains(cmd, "--platform gemini-cli") {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			t.Errorf("event=%s: gemini telemetry_eventEmit did not inject `--platform gemini-cli` hook", event)
+		}
+	}
+}
+
+func TestAppendHookExtras_TelemetryEventEmit_GeminiAfterToolMapsToPostToolUse(t *testing.T) {
+	// AfterTool is Gemini-native; the canonical hook flag passed to the
+	// CLI must be --hook post-tool-use so the event-emit normalizer
+	// produces tool.call.end.
+	hp := HookProfile{
+		Enabled:          true,
+		AgentID:          "gemini-cli",
+		AgentType:        "gemini-cli",
+		Description:      "Gemini CLI session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "AfterTool",
+		HeartbeatMatcher: "run_shell_command",
+		Events:           []string{"sessionStart", "sessionEnd", "postToolUse"},
+		Extras:           []string{"telemetry_eventEmit"},
+	}
+	hooks := buildPlatformHooks(testRegistry(), hp, "/usr/local/bin/loom")
+	appendHookExtras(hooks, hp, "/usr/local/bin/loom")
+
+	blocks, _ := hooks["AfterTool"].([]map[string]any)
+	var afterToolEmitsPost bool
+	for _, b := range blocks {
+		inner, _ := b["hooks"].([]map[string]any)
+		for _, h := range inner {
+			cmd, _ := h["command"].(string)
+			if strings.Contains(cmd, "agent event-emit") && strings.Contains(cmd, "--hook post-tool-use") && strings.Contains(cmd, "--platform gemini-cli") {
+				afterToolEmitsPost = true
+				break
+			}
+		}
+		if afterToolEmitsPost {
+			break
+		}
+	}
+	if !afterToolEmitsPost {
+		t.Error("AfterTool slot must inject --hook post-tool-use --platform gemini-cli")
+	}
+}
+
+func TestGeminiProfile_OptedIntoTelemetryEventEmit(t *testing.T) {
+	profiles, err := loadProfiles()
+	if err != nil {
+		t.Fatalf("loadProfiles: %v", err)
+	}
+	profile, ok := profiles["gemini"]
+	if !ok {
+		t.Fatal("gemini profile missing from registry")
+	}
+	if !containsString(profile.Hooks.Extras, "telemetry_eventEmit") {
+		t.Errorf("gemini profile extras missing telemetry_eventEmit: got %v", profile.Hooks.Extras)
+	}
+}
+
+func TestCodexNotifyCommand_TelemetryEmitDisabledByDefault(t *testing.T) {
+	// telemetryEmit=false: command is unchanged from Phase 2.1 baseline.
+	cmd := codexNotifyCommand("loom", false)
+	if strings.Contains(cmd, "agent event-emit") {
+		t.Error("codex notify must not contain event-emit when telemetryEmit=false")
+	}
+}
+
+func TestCodexNotifyCommand_TelemetryEmitWiresPostToolUse(t *testing.T) {
+	cmd := codexNotifyCommand("loom", true)
+	if !strings.Contains(cmd, "agent event-emit --hook post-tool-use --platform codex") {
+		t.Errorf("codex notify with telemetryEmit=true must pipe to event-emit --hook post-tool-use --platform codex; got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "|| true") {
+		t.Errorf("codex notify event-emit must be best-effort (|| true); got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--quiet") {
+		t.Errorf("codex notify event-emit must use --quiet (hook context); got: %s", cmd)
+	}
+}
+
+func TestCodexProfile_OptedIntoTelemetryEventEmit(t *testing.T) {
+	profiles, err := loadProfiles()
+	if err != nil {
+		t.Fatalf("loadProfiles: %v", err)
+	}
+	profile, ok := profiles["codex"]
+	if !ok {
+		t.Fatal("codex profile missing from registry")
+	}
+	if !containsString(profile.Hooks.Extras, "telemetry_eventEmit") {
+		t.Errorf("codex profile extras missing telemetry_eventEmit: got %v", profile.Hooks.Extras)
+	}
+}
+
+func TestAppendHookExtras_TelemetryEventEmit_NoOpWhenExtraAbsent(t *testing.T) {
+	hp := HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+		Events:           []string{"sessionStart", "sessionEnd", "preToolUse", "postToolUse"},
+		// No Extras; baseline should be untouched by the case.
+	}
+	hooks := buildPlatformHooks(testRegistry(), hp, "/usr/local/bin/loom")
+	startBefore := len(hooks["SessionStart"].([]map[string]any))
+	stopBefore := len(hooks["Stop"].([]map[string]any))
+	postBefore := len(hooks["PostToolUse"].([]map[string]any))
+
+	appendHookExtras(hooks, hp, "/usr/local/bin/loom")
+
+	if got := len(hooks["SessionStart"].([]map[string]any)); got != startBefore {
+		t.Errorf("SessionStart grew without telemetry_eventEmit extra: before=%d after=%d", startBefore, got)
+	}
+	if got := len(hooks["Stop"].([]map[string]any)); got != stopBefore {
+		t.Errorf("Stop grew without telemetry_eventEmit extra: before=%d after=%d", stopBefore, got)
+	}
+	if got := len(hooks["PostToolUse"].([]map[string]any)); got != postBefore {
+		t.Errorf("PostToolUse grew without telemetry_eventEmit extra: before=%d after=%d", postBefore, got)
+	}
+}
+
+func TestAppendHookExtras_TelemetryEventEmit_BestEffortOrTrue(t *testing.T) {
+	// The injected event-emit hook must end with `|| true` so a slow or down
+	// daemon never causes the platform's hook chain to fail (which could break
+	// a user's CLI session). Mirrors the existing extras' best-effort posture.
+	hp := HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "Stop",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+		Events:           []string{"sessionStart", "sessionEnd", "preToolUse", "postToolUse"},
+		Extras:           []string{"telemetry_eventEmit"},
+	}
+	hooks := buildPlatformHooks(testRegistry(), hp, "/usr/local/bin/loom")
+	appendHookExtras(hooks, hp, "/usr/local/bin/loom")
+
+	blocks, _ := hooks["SessionStart"].([]map[string]any)
+	for _, b := range blocks {
+		inner, _ := b["hooks"].([]map[string]any)
+		for _, h := range inner {
+			cmd, _ := h["command"].(string)
+			if strings.Contains(cmd, "agent event-emit") {
+				if !strings.Contains(cmd, "|| true") {
+					t.Errorf("event-emit hook is not best-effort (missing `|| true`): %s", cmd)
+				}
+				if !strings.Contains(cmd, "--quiet") {
+					t.Errorf("event-emit hook missing --quiet flag (required for hook context): %s", cmd)
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeProfile_OptedIntoTelemetryEventEmit(t *testing.T) {
+	// Lock in the YAML wiring: Claude Code's profile must carry
+	// "telemetry_eventEmit" in its extras so `loom sync claude --regen`
+	// generates the new hooks.
+	profiles, err := loadProfiles()
+	if err != nil {
+		t.Fatalf("loadProfiles: %v", err)
+	}
+	profile, ok := profiles["claude"]
+	if !ok {
+		t.Fatal("claude profile missing from registry")
+	}
+	var found bool
+	for _, e := range profile.Hooks.Extras {
+		if e == "telemetry_eventEmit" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("claude profile extras missing telemetry_eventEmit: got %v", profile.Hooks.Extras)
+	}
+}
+
+// Regression: SessionStart must stamp $PWD to a session-cwd file so later
+// hooks (SessionEnd worktree cleanup, PreToolUse git-commit drift warning)
+// can detect cwd drift caused by `cd /abs/path` persisting across Bash
+// invocations. Without the stamp, drift silently mis-targets cleanup and
+// causes commits to land on the wrong branch.
+func TestSessionStart_StampsSessionCwd(t *testing.T) {
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "")
+
+	ss, ok := hooks["SessionStart"].([]map[string]any)
+	if !ok || len(ss) == 0 {
+		t.Fatal("expected SessionStart hooks")
+	}
+	inner, ok := ss[0]["hooks"].([]map[string]any)
+	if !ok || len(inner) == 0 {
+		t.Fatal("expected SessionStart inner hooks")
+	}
+	cmd, _ := inner[0]["command"].(string)
+	if !strings.Contains(cmd, `"${AGENT_CACHE_DIR}/session-cwd-${AGENT_ID}"`) {
+		t.Errorf("SessionStart first hook should stamp $PWD to session-cwd file; got: %s", cmd)
+	}
+	if !strings.Contains(cmd, `printf '%s' "$PWD" > "${AGENT_CACHE_DIR}/session-cwd-`) {
+		t.Errorf("SessionStart first hook should write $PWD via printf; got: %s", cmd)
+	}
+}
+
+// Regression: SessionEnd must include a worktree-cleanup-self hook that
+// resolves the worktree path from the SessionStart-stamped cwd, NOT from
+// `git rev-parse --show-toplevel` on the (potentially drifted) current cwd.
+// Otherwise cleanup silently skips when the agent's cwd has wandered out
+// of the harness worktree.
+func TestSessionEnd_WorktreeCleanupUsesStampedCwd(t *testing.T) {
+	hooks := buildPlatformHooks(testRegistry(), HookProfile{
+		Enabled:          true,
+		AgentID:          "claude-code",
+		AgentType:        "claude-code",
+		Description:      "Claude Code session",
+		SessionEndEvent:  "SessionEnd",
+		HeartbeatEvent:   "PostToolUse",
+		HeartbeatMatcher: "Bash|Task",
+	}, "/usr/local/bin/loom")
+
+	se, ok := hooks["SessionEnd"].([]map[string]any)
+	if !ok || len(se) == 0 {
+		t.Fatal("expected SessionEnd hooks")
+	}
+	inner, ok := se[0]["hooks"].([]map[string]any)
+	if !ok || len(inner) < 2 {
+		t.Fatalf("expected at least 2 SessionEnd inner hooks (session-end + worktree-cleanup), got %d", len(inner))
+	}
+	// The cleanup hook is the second entry.
+	cmd, _ := inner[1]["command"].(string)
+	if !strings.Contains(cmd, "worktree-cleanup-self") {
+		t.Errorf("second SessionEnd hook should be worktree-cleanup-self; got: %s", cmd)
+	}
+	if !strings.Contains(cmd, `SESSION_CWD_FILE="${AGENT_CACHE_DIR}/session-cwd-${AGENT_ID}"`) {
+		t.Errorf("worktree-cleanup hook should read session-cwd stamp; got: %s", cmd)
+	}
+	if !strings.Contains(cmd, `/.claude/worktrees/`) {
+		t.Errorf("worktree-cleanup hook should gate on /.claude/worktrees/; got: %s", cmd)
+	}
+}
+
+// Regression: PreToolUse on a native preToolUse platform (Claude Code) must
+// include the cwd-drift warning hook for `git commit`. This catches the
+// failure mode where the agent's persisted Bash cwd has drifted out of the
+// worktree and the next commit would land on the wrong branch.
+func TestAppendHookPolicies_EmitsCwdDriftWarning(t *testing.T) {
+	hooks := map[string]any{}
+	hp := HookProfile{
+		Enabled:     true,
+		AgentID:     "claude-code",
+		AgentType:   "claude-code",
+		Enforcement: "native",
+		Events:      []string{"preToolUse", "sessionStart", "sessionEnd"},
+	}
+	appendHookPolicies(hooks, testRegistry(), hp)
+
+	pre, ok := hooks["PreToolUse"].([]map[string]any)
+	if !ok || len(pre) == 0 {
+		t.Fatal("expected PreToolUse hooks after appendHookPolicies on a native preToolUse platform")
+	}
+
+	var found bool
+	for _, block := range pre {
+		inner, ok := block["hooks"].([]map[string]any)
+		if !ok {
+			continue
+		}
+		for _, h := range inner {
+			cmd, _ := h["command"].(string)
+			if strings.Contains(cmd, "cwd drift detected") && strings.Contains(cmd, "git[[:space:]]+commit") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected PreToolUse to include git-commit cwd-drift warning hook")
+	}
+}
+
+// Negative: proxy/plugin platforms (no native preToolUse) must NOT receive
+// the drift warning hook — they have no PreToolUse to put it in. Verifies
+// the gating in appendHookPolicies stays correct.
+func TestAppendHookPolicies_NoCwdDriftWarning_WhenNoPreToolUse(t *testing.T) {
+	hooks := map[string]any{}
+	hp := HookProfile{
+		Enabled:     true,
+		AgentID:     "gemini-cli",
+		AgentType:   "gemini-cli",
+		Enforcement: "native",
+		Events:      []string{"sessionStart", "sessionEnd"}, // no preToolUse
+	}
+	appendHookPolicies(hooks, testRegistry(), hp)
+
+	if _, ok := hooks["PreToolUse"]; ok {
+		t.Errorf("expected no PreToolUse hooks for platforms without preToolUse event; got: %v", hooks["PreToolUse"])
+	}
+}
+
+// Direct unit test for the hook command shape — confirms it bootstraps
+// AGENT_ID, matches `git commit`, reads the session-cwd stamp, and only
+// emits a warning when toplevels differ.
+func TestGitCommitCwdDriftWarningHook_Shape(t *testing.T) {
+	hook := gitCommitCwdDriftWarningHook(hookAgentIDBootstrap("claude-code"))
+	if hook["matcher"] != "Bash" {
+		t.Errorf("expected matcher=Bash, got %v", hook["matcher"])
+	}
+	inner, ok := hook["hooks"].([]map[string]any)
+	if !ok || len(inner) != 1 {
+		t.Fatalf("expected 1 inner hook, got %d", len(inner))
+	}
+	cmd, _ := inner[0]["command"].(string)
+
+	requiredFragments := []string{
+		`git[[:space:]]+commit`, // matcher for `git commit`
+		`SESSION_CWD_FILE="${AGENT_CACHE_DIR}/session-cwd-${AGENT_ID}"`,
+		`SESSION_TOP=`,
+		`CURRENT_TOP=`,
+		`"$SESSION_TOP" != "$CURRENT_TOP"`,
+		`cwd drift detected`,
+		`exit 0`, // non-blocking
+	}
+	for _, f := range requiredFragments {
+		if !strings.Contains(cmd, f) {
+			t.Errorf("cwd-drift hook missing required fragment %q in command: %s", f, cmd)
+		}
+	}
+}

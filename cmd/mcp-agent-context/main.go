@@ -7,7 +7,9 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/agentcontext"
+	"github.com/crb2nu/loom/pkg/eventpub"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -49,7 +51,36 @@ func run(ctx context.Context) error {
 			svc.SetToolExecutor(toolClient.Execute)
 			defer toolClient.Close()
 			logger.Info("workflow tool executor configured", "socket", socketPath)
+
+			// Same client also backs engram command-proof verification via
+			// devbox. Project name comes from LOOM_DEVBOX_PROJECT (set by the
+			// daemon launching this server) and falls back to the cwd
+			// basename via the same heuristic the verifier uses for repo.
+			project := os.Getenv("LOOM_DEVBOX_PROJECT")
+			if project == "" {
+				project = inferProjectName()
+			}
+			if project != "" {
+				svc.SetCommandRunner(newDevboxRunner(toolClient, project))
+				logger.Info("engram command runner wired (devbox)", "project", project)
+			} else {
+				logger.Info("engram command runner not wired: project unresolved")
+			}
 		}
+	}
+
+	// Wire cross-process event publisher so session lifecycle and presence
+	// transition events reach the daemon EventBus and the /events SSE
+	// fan-out. Best-effort: if the daemon is unreachable, Publish degrades
+	// to a no-op (logged at debug). Falls back to no-op when no URL is set.
+	if daemonURL := os.Getenv("LOOM_DAEMON_HTTP_URL"); daemonURL != "" {
+		adminToken := os.Getenv("LOOM_ADMIN_TOKEN")
+		if adminToken == "" {
+			adminToken = os.Getenv("LOOM_HUD_ADMIN_TOKEN")
+		}
+		pub := eventpub.NewHTTPPublisher(daemonURL, adminToken, logger)
+		svc.SetPublisher(pub)
+		logger.Info("event publisher wired", "url", daemonURL)
 	}
 
 	// Start background services (compaction scheduler, presence cleanup)
@@ -59,6 +90,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-agent-context", "version", version)
 
 	server := mcp.NewServer("mcp-agent-context", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions(`Agent Context Management MCP Server
 
 This server provides tools for agents to manage their context efficiently:
@@ -89,7 +121,7 @@ Typical workflow:
 3. Claim files before editing with agent_file_claim_acquire
 4. Add context as you work with agent_context_add
 5. Send heartbeats with agent_presence_heartbeat (every 30-60s)
-6. Recall relevant context with agent_context_recall_enhanced
+6. Recall relevant context with agent_recall
 7. End session with agent_session_end (auto-cleans up presence, claims, worktrees)
 
 Heartbeat interval: Send heartbeats every 30-60 seconds. Agents are marked offline after 120s of no heartbeat.`)

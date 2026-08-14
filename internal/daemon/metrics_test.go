@@ -24,6 +24,9 @@ func TestNewMetrics(t *testing.T) {
 	if m.RequestDuration == nil {
 		t.Error("RequestDuration should not be nil")
 	}
+	if m.ToolCallDuration == nil {
+		t.Error("ToolCallDuration should not be nil")
+	}
 	if m.RequestsInFlight == nil {
 		t.Error("RequestsInFlight should not be nil")
 	}
@@ -68,6 +71,14 @@ func TestMetrics_RecordRequest(t *testing.T) {
 	// Should not panic
 	m.RecordRequest("test-server", "tools/call", "success", "local", 100*time.Millisecond)
 	m.RecordRequest("test-server", "tools/list", "error", "hub", 500*time.Millisecond)
+}
+
+func TestMetrics_RecordToolCall(t *testing.T) {
+	m := NewMetrics()
+
+	// Should not panic and should accept low-cardinality series labels.
+	m.RecordToolCall("test-server", "search_repos", "success", 125*time.Millisecond)
+	m.RecordToolCall("test-server", "search_repos", "error", 250*time.Millisecond)
 }
 
 func TestMetrics_RecordRequestStartEnd(t *testing.T) {
@@ -174,6 +185,9 @@ func TestMetrics_AllMetricsRegistered(t *testing.T) {
 	}
 	if m.RequestDuration == nil {
 		t.Error("RequestDuration not registered")
+	}
+	if m.ToolCallDuration == nil {
+		t.Error("ToolCallDuration not registered")
 	}
 	if m.RequestsInFlight == nil {
 		t.Error("RequestsInFlight not registered")

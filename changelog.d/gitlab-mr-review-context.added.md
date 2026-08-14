@@ -1,0 +1,1 @@
+- Add GitLab MCP tools for bounded merge request diffs, resolution-aware discussion listing, and resolving or reopening review threads.

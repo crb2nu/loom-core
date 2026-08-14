@@ -1,0 +1,31 @@
+{
+  "name": "loom-spawn-driver",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Node.js sidecar that drives headless Claude Code and Codex agents via their official SDKs and emits JSONL telemetry compatible with the loom HUD parsers.",
+  "type": "module",
+  "main": "dist/spawn-driver.js",
+  "bin": {
+    "loom-spawn-driver": "dist/spawn-driver.js"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "start": "node dist/spawn-driver.js",
+    "typecheck": "tsc --noEmit",
+    "smoke:claude": "node dist/spawn-driver.js --agent-type claude-code --task 'say hi' --spawn-id smoke-claude --dry-run",
+    "smoke:codex": "node dist/spawn-driver.js --agent-type codex --task 'say hi' --spawn-id smoke-codex --dry-run"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.0",
+    "@anthropic-ai/sdk": "^0.111.0",
+    "@openai/codex-sdk": "^0.144.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.39",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.9.3"
+  }
+}

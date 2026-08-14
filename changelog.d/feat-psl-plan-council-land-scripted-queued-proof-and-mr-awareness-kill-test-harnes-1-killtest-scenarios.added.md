@@ -1,0 +1,1 @@
+- Add fail-closed `queued-proof` and `mr-awareness` scripted scenarios to `cmd/mills-workflow-killtest/main.go`, with deterministic evidence assertions in `pkg/mills/pipeline/pipeline.go`.

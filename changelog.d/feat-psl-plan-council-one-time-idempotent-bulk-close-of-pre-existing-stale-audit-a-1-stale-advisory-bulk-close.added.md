@@ -1,0 +1,1 @@
+- Add `scripts/close_stale_audit_advisories.sh` and `pkg/mills/audit/staleness.go` for a dry-run-first, idempotent sweep of stale audit digest advisories.

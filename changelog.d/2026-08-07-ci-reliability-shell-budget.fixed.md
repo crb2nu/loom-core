@@ -1,0 +1,1 @@
+Raised the test:reliability shell budget to 1080s (job timeout 20m) and deadline-bounded the benchmark phase so the mandatory 60s mixed-load gate always gets its execution window instead of being SIGTERMd by the old 810s budget (main pipeline 22350, job 218776).

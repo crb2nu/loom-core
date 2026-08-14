@@ -1,0 +1,1 @@
+- Surface Codex `turn.failed` API errors as failed Mills spawns instead of accepting a zero process exit (`internal/hud/spawn_codex_parser.go`, `internal/hud/spawn.go`).

@@ -1,0 +1,1 @@
+- Treat total Mills audit reviewer provider outages as unavailable attempts instead of recording false critical findings, opening advisory issues, or returning a non-retryable admin API status.

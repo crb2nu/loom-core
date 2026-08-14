@@ -1,22 +1,31 @@
-<script>
-  /** @type {{ lanes: import('../stores/lifecycle.svelte.ts').SwimLane[], timeRange: { start: number, end: number }, width?: number }} */
-  let { lanes = [], timeRange, width = 900 } = $props();
+<script lang="ts">
+  import type { SwimLane } from '../stores/lifecycle.svelte.ts';
 
-  // Agent type colors (shared)
-  const AGENT_COLORS = {
-    claude: '#E95D74',
-    codex: '#22B255',
-    gemini: '#018799',
-    copilot: '#E7B312',
+  let {
+    lanes = [],
+    timeRange,
+    width = 900,
+  }: {
+    lanes?: SwimLane[];
+    timeRange: { start: number; end: number };
+    width?: number;
+  } = $props();
+
+  // Agent type colors — read from CSS tokens so the theme owns the palette.
+  const AGENT_COLORS: Record<string, string> = {
+    claude: 'var(--agent-claude)',
+    codex: 'var(--agent-codex)',
+    gemini: 'var(--agent-gemini)',
+    copilot: 'var(--agent-copilot)',
   };
 
-  function agentColor(agentType) {
-    if (!agentType) return '#5EBDC9';
+  function agentColor(agentType: string) {
+    if (!agentType) return 'var(--fg-secondary)';
     const lower = agentType.toLowerCase();
     for (const [key, color] of Object.entries(AGENT_COLORS)) {
       if (lower.includes(key)) return color;
     }
-    return '#5EBDC9';
+    return 'var(--fg-secondary)';
   }
 
   const LABEL_WIDTH = 120;
@@ -28,7 +37,7 @@
   let chartWidth = $derived(svgWidth - LABEL_WIDTH);
   let svgHeight = $derived(lanes.length * ROW_HEIGHT + AXIS_HEIGHT + PADDING_TOP);
 
-  function timeX(ts) {
+  function timeX(ts: number) {
     const { start, end } = timeRange;
     const range = end - start;
     if (range <= 0) return 0;
@@ -36,7 +45,7 @@
   }
 
   // Status icon for agent type.
-  function agentIcon(agentType) {
+  function agentIcon(agentType: string) {
     if (!agentType) return '\u25C9';
     const lower = agentType.toLowerCase();
     if (lower.includes('claude')) return '\u25CF';
@@ -45,14 +54,14 @@
     return '\u25C6';
   }
 
-  function statusDotColor(status) {
+  function statusDotColor(status: string) {
     if (status === 'active') return 'var(--success)';
     if (status === 'idle') return 'var(--warning)';
     return 'var(--fg-muted)';
   }
 
   // Event marker shapes and colors.
-  function eventMarkerColor(eventType) {
+  function eventMarkerColor(eventType: string) {
     if (eventType === 'agent.session.start') return 'var(--success)';
     if (eventType === 'agent.session.end' || eventType === 'agent.session.reaped') return 'var(--error)';
     if (eventType.includes('task')) return 'var(--info)';
@@ -60,7 +69,7 @@
     return 'var(--fg-muted)';
   }
 
-  function eventMarkerShape(eventType) {
+  function eventMarkerShape(eventType: string) {
     if (eventType === 'agent.session.start') return 'triangle';
     if (eventType === 'agent.session.end' || eventType === 'agent.session.reaped') return 'square';
     if (eventType.includes('task')) return 'circle';
@@ -80,12 +89,12 @@
     if (hours > 36) stepHours = 8;
     const stepMs = stepHours * 3600_000;
 
-    const result = [];
+    const result: Array<{ ts: number; x: number; label: string }> = [];
     // Start from the first even hour boundary.
     const firstTick = Math.ceil(start / stepMs) * stepMs;
     for (let t = firstTick; t <= end; t += stepMs) {
       const hoursAgo = Math.round((end - t) / 3600_000);
-      let label;
+      let label: string;
       if (hoursAgo === 0) label = 'now';
       else if (hoursAgo === 1) label = '1h ago';
       else label = `${hoursAgo}h ago`;
@@ -95,17 +104,17 @@
   });
 
   // Session bar opacity.
-  function sessionOpacity(status) {
+  function sessionOpacity(status: string) {
     if (status === 'active') return 1.0;
     if (status === 'ended') return 0.6;
     return 0.3;
   }
 
   // Tooltip state.
-  let tooltip = $state(null);
+  let tooltip = $state<{ text: string; x: number; y: number } | null>(null);
 
-  function showTooltip(e, text) {
-    const rect = e.currentTarget.closest('svg').getBoundingClientRect();
+  function showTooltip(e: MouseEvent, text: string) {
+    const rect = (e.currentTarget as Element).closest('svg')!.getBoundingClientRect();
     tooltip = {
       text,
       x: e.clientX - rect.left + 10,
@@ -117,7 +126,7 @@
     tooltip = null;
   }
 
-  function formatDuration(ms) {
+  function formatDuration(ms: number) {
     const hours = Math.floor(ms / 3600_000);
     const mins = Math.floor((ms % 3600_000) / 60_000);
     if (hours > 0) return `${hours}h ${mins}m`;

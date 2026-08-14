@@ -1,0 +1,1 @@
+- Add deterministic external-dependency intake classification for ClickHouse, gitlab-agent, LiteLLM, Longhorn, and GitLab CI signals in `pkg/mills/intake`, with shared contract values in `internal/contracts/signal_class.go`.

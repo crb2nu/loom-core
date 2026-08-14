@@ -1,0 +1,1 @@
+- Add a fallback-safe semantic title scorer in `pkg/mills/textsim/semantic.go` and a narrow batch embedding interface in `pkg/codebase/embed/embed.go` for merged-work grounding.

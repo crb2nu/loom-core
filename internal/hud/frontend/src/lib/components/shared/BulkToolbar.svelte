@@ -1,20 +1,33 @@
-<script>
-  /**
-   * BulkToolbar — sticky bottom toolbar for bulk actions on selected rows.
-   *
-   * @type {{
-   *   count: number,
-   *   actions: Array<{ label: string, variant?: string, onclick: () => void }>,
-   *   onClearSelection: () => void,
-   * }}
-   */
+<script lang="ts">
+  // BulkToolbar — sticky bottom toolbar for bulk actions on selected rows.
+  //
+  // A bulk pass is N sequential mutations, so it needs both guards: `confirm`
+  // gates the destructive ones through the shared ConfirmDialog, and `busy`
+  // locks every button for the duration so a second click cannot start an
+  // overlapping pass over a selection the first one is still draining.
+  import ConfirmDialog from './ConfirmDialog.svelte';
+  import type { BulkAction } from '../../utils/confirm.ts';
+
   let {
     count = 0,
     actions = [],
+    busy = false,
     onClearSelection,
+  }: {
+    count?: number;
+    actions?: BulkAction[];
+    busy?: boolean;
+    onClearSelection: () => void;
   } = $props();
 
   let visible = $derived(count > 0);
+
+  let pendingAction = $state<BulkAction | null>(null);
+
+  function invoke(action: BulkAction): void {
+    if (action.confirm) pendingAction = action;
+    else action.onclick();
+  }
 </script>
 
 <div class="bulk-toolbar" class:visible aria-live="polite">
@@ -26,11 +39,27 @@
     {#each actions as action}
       <button
         class="btn btn-sm {action.variant ? `btn-${action.variant}` : 'btn-ghost'}"
-        onclick={action.onclick}
+        disabled={busy}
+        onclick={() => invoke(action)}
       >{action.label}</button>
     {/each}
   </div>
 </div>
+
+<ConfirmDialog
+  open={pendingAction !== null}
+  title={pendingAction?.confirm?.title ?? ''}
+  message={pendingAction?.confirm?.message ?? ''}
+  confirmLabel={pendingAction?.confirm?.confirmLabel ?? 'Confirm'}
+  variant={pendingAction?.confirm?.variant
+    ?? (pendingAction?.variant === 'danger' ? 'danger' : 'default')}
+  onConfirm={() => {
+    const action = pendingAction;
+    pendingAction = null;
+    action?.onclick();
+  }}
+  onCancel={() => (pendingAction = null)}
+/>
 
 <style>
   .bulk-toolbar {

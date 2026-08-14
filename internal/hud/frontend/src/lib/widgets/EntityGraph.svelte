@@ -1,28 +1,63 @@
-<script>
+<script lang="ts">
   import { onDestroy, untrack } from 'svelte';
   import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force';
+  import type { Simulation, SimulationLinkDatum, SimulationNodeDatum } from 'd3-force';
 
-  /**
-   * @typedef {{ id: string, name: string, entity_type: string, properties: Record<string, unknown> }} Entity
-   * @typedef {{ source: string, target: string, relation_type: string }} Relation
-   * @type {{ entities: Entity[], relations: Relation[], width?: number, height?: number }}
-   */
-  let { entities = [], relations = [], width = 600, height = 400 } = $props();
+  type Entity = {
+    id: string;
+    name: string;
+    entity_type: string;
+    properties: Record<string, unknown>;
+  };
+
+  type Relation = {
+    source: string;
+    target: string;
+    relation_type: string;
+  };
+
+  type GraphNode = SimulationNodeDatum & {
+    id: string;
+    name: string;
+    entity_type: string;
+    color: string;
+  };
+
+  type GraphLink = SimulationLinkDatum<GraphNode> & {
+    relation_type: string;
+  };
+
+  type Props = {
+    entities?: Entity[];
+    relations?: Relation[];
+    width?: number;
+    height?: number;
+  };
+
+  let { entities = [], relations = [], width = 600, height = 400 }: Props = $props();
 
   const typeColors = [
-    '#018799', '#22B255', '#E95D74', '#E7B312', '#E61E3F',
-    '#4EEAFE', '#9B5CD0', '#81F0FE', '#5EBDC9', '#2A7A87',
+    'var(--info)',
+    'var(--success)',
+    'var(--accent)',
+    'var(--warning)',
+    'var(--error)',
+    'var(--tier-working)',
+    'var(--tier-short)',
+    'var(--fg-primary)',
+    'var(--fg-secondary)',
+    'var(--fg-muted)',
   ];
 
-  function getTypeColor(type, types) {
+  function getTypeColor(type: string, types: string[]): string {
     const idx = types.indexOf(type);
     return typeColors[idx % typeColors.length];
   }
 
-  let svgEl = $state(null);
-  let simulation = null;
-  let nodes = $state([]);
-  let links = $state([]);
+  let svgEl = $state<SVGSVGElement | null>(null);
+  let simulation: Simulation<GraphNode, GraphLink> | null = null;
+  let nodes = $state<GraphNode[]>([]);
+  let links = $state<GraphLink[]>([]);
   let transform = $state({ x: 0, y: 0, k: 1 });
 
   // Pan state
@@ -30,9 +65,9 @@
   let panStart = { x: 0, y: 0 };
 
   // Drag state
-  let dragNode = null;
+  let dragNode: GraphNode | null = null;
 
-  function buildGraph() {
+  function buildGraph(): void {
     if (!entities || entities.length === 0) {
       nodes = [];
       links = [];
@@ -42,7 +77,7 @@
     const types = [...new Set(entities.map((e) => e.entity_type))];
     const entityIds = new Set(entities.map((e) => e.id));
 
-    const newNodes = entities.map((e) => ({
+    const newNodes: GraphNode[] = entities.map((e) => ({
       id: e.id,
       name: e.name,
       entity_type: e.entity_type,
@@ -55,7 +90,7 @@
       (r) => entityIds.has(r.source) && entityIds.has(r.target)
     );
 
-    const newLinks = validRelations.map((r) => ({
+    const newLinks: GraphLink[] = validRelations.map((r) => ({
       source: r.source,
       target: r.target,
       relation_type: r.relation_type,
@@ -67,10 +102,10 @@
     if (simulation) simulation.stop();
 
     let lastTickUpdate = 0;
-    simulation = forceSimulation(nodes)
+    simulation = forceSimulation<GraphNode>(nodes)
       .force(
         'link',
-        forceLink(links)
+        forceLink<GraphNode, GraphLink>(links)
           .id((d) => d.id)
           .distance(80)
       )
@@ -104,7 +139,7 @@
 
   let graphFocused = $state(false);
 
-  function handleWheel(e) {
+  function handleWheel(e: WheelEvent): void {
     if (!graphFocused && !e.ctrlKey && !e.metaKey) return;
     e.preventDefault();
     const delta = e.deltaY > 0 ? 0.9 : 1.1;
@@ -112,13 +147,13 @@
     transform = { ...transform, k: newK };
   }
 
-  function handleMouseDown(e) {
-    if (e.target.closest('.graph-node')) return;
+  function handleMouseDown(e: MouseEvent): void {
+    if (e.target instanceof Element && e.target.closest('.graph-node')) return;
     isPanning = true;
     panStart = { x: e.clientX - transform.x, y: e.clientY - transform.y };
   }
 
-  function handleMouseMove(e) {
+  function handleMouseMove(e: MouseEvent): void {
     if (isPanning) {
       transform = {
         ...transform,
@@ -127,6 +162,7 @@
       };
     }
     if (dragNode && simulation) {
+      if (!svgEl) return;
       const rect = svgEl.getBoundingClientRect();
       const x = (e.clientX - rect.left - transform.x) / transform.k;
       const y = (e.clientY - rect.top - transform.y) / transform.k;
@@ -136,7 +172,7 @@
     }
   }
 
-  function handleMouseUp() {
+  function handleMouseUp(): void {
     isPanning = false;
     if (dragNode) {
       dragNode.fx = null;
@@ -148,7 +184,7 @@
     }
   }
 
-  function handleNodeMouseDown(e, node) {
+  function handleNodeMouseDown(e: MouseEvent, node: GraphNode): void {
     e.stopPropagation();
     dragNode = node;
     node.fx = node.x;

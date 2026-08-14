@@ -1,0 +1,1 @@
+- Expose agent-context deterministic embedder fallback-vector attempts, totals, and ratio in metrics snapshots and Prometheus output (`pkg/agentcontext`).

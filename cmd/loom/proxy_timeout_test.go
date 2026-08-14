@@ -202,3 +202,203 @@ func TestProxyDaemonRoundTripSendFailureReturnsTransportError(t *testing.T) {
 		t.Fatalf("expected proxyTransportError for send EPIPE, got %T: %v", err, err)
 	}
 }
+
+func TestProxyDaemonRoundTrip_RetryableDaemonTransportFailureBecomesTransportError(t *testing.T) {
+	cases := []struct {
+		name      string
+		code      string
+		stage     string
+		message   string
+		wantLabel string
+	}{
+		{
+			name:      "transport failure",
+			code:      "TRANSPORT_FAILURE",
+			stage:     "execute",
+			message:   "transport closed",
+			wantLabel: "daemon reported retryable transport failure during execute",
+		},
+		{
+			name:      "lock timeout",
+			code:      "LOCK_TIMEOUT",
+			stage:     "route",
+			message:   "acquire call lock timed out",
+			wantLabel: "daemon reported retryable lock timeout during route",
+		},
+		{
+			name:      "connection error",
+			code:      "CONNECTION_ERROR",
+			stage:     "route",
+			message:   "max connections reached for gitlab",
+			wantLabel: "daemon reported retryable connection error during route",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := mcp.NewRequest(1, "tools/call", map[string]any{"name": "noop"})
+			_, err := proxyDaemonRoundTrip(context.Background(), &stubTransport{
+				recvMsg: &mcp.Message{
+					JSONRPC: mcp.JSONRPCVersion,
+					ID:      json.RawMessage(`1`),
+					Error: &mcp.Error{
+						Code:    mcp.InternalError,
+						Message: tc.message,
+						Data: map[string]any{
+							"code":      tc.code,
+							"stage":     tc.stage,
+							"retryable": true,
+						},
+					},
+				},
+			}, req, "tools/call")
+			if err == nil {
+				t.Fatalf("expected retryable daemon %s to surface as error", tc.code)
+			}
+			var transportErr *proxyTransportError
+			if !errors.As(err, &transportErr) {
+				t.Fatalf("expected proxyTransportError, got %T: %v", err, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantLabel) {
+				t.Fatalf("unexpected error message: %q", err.Error())
+			}
+		})
+	}
+}
+
+func TestProxyDaemonRoundTrip_RetryableTimeoutDaemonErrorPassesThrough(t *testing.T) {
+	req, _ := mcp.NewRequest(1, "tools/call", map[string]any{"name": "noop"})
+	resp, err := proxyDaemonRoundTrip(context.Background(), &stubTransport{
+		recvMsg: &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			ID:      json.RawMessage(`1`),
+			Error: &mcp.Error{
+				Code:    mcp.InternalError,
+				Message: "timed out",
+				Data: map[string]any{
+					"code":      "TIMEOUT",
+					"stage":     "execute",
+					"retryable": true,
+				},
+			},
+		},
+	}, req, "tools/call")
+	if err != nil {
+		t.Fatalf("expected timeout response to pass through, got error: %v", err)
+	}
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected daemon error response")
+	}
+}
+
+func TestProxyDeriveTimeoutFromArguments(t *testing.T) {
+	tests := []struct {
+		name string
+		args json.RawMessage
+		want time.Duration
+	}{
+		{
+			name: "timeout_seconds integer",
+			args: json.RawMessage(`{"timeout_seconds": 600}`),
+			want: 600 * time.Second,
+		},
+		{
+			name: "timeoutSeconds integer",
+			args: json.RawMessage(`{"timeoutSeconds": 300}`),
+			want: 300 * time.Second,
+		},
+		{
+			name: "Go duration string",
+			args: json.RawMessage(`{"timeout": "10m"}`),
+			want: 10 * time.Minute,
+		},
+		{
+			name: "timeout as numeric seconds",
+			args: json.RawMessage(`{"timeout": 120}`),
+			want: 120 * time.Second,
+		},
+		{
+			name: "no hint returns zero",
+			args: json.RawMessage(`{"name": "some_tool"}`),
+			want: 0,
+		},
+		{
+			name: "empty args",
+			args: nil,
+			want: 0,
+		},
+		{
+			name: "negative value",
+			args: json.RawMessage(`{"timeout_seconds": -5}`),
+			want: 0,
+		},
+		{
+			name: "zero value",
+			args: json.RawMessage(`{"timeout_seconds": 0}`),
+			want: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := proxyDeriveTimeoutFromArguments(tc.args)
+			if got != tc.want {
+				t.Fatalf("proxyDeriveTimeoutFromArguments() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProxyDaemonRoundTripWithTimeout_ZeroFallsBack(t *testing.T) {
+	t.Setenv("LOOM_PROXY_TOOL_TIMEOUT", "")
+
+	req, _ := mcp.NewRequest(1, "tools/call", map[string]any{"name": "noop"})
+	resp, err := proxyDaemonRoundTripWithTimeout(
+		context.Background(),
+		&stubTransport{},
+		req,
+		"tools/call",
+		0, // zero timeout → fallback to proxyDaemonRoundTrip
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected response")
+	}
+}
+
+func TestProxyDaemonRoundTripWithTimeout_SendFailure(t *testing.T) {
+	req, _ := mcp.NewRequest(1, "tools/call", map[string]any{"name": "noop"})
+	_, err := proxyDaemonRoundTripWithTimeout(
+		context.Background(),
+		&stubTransport{sendErr: io.EOF},
+		req,
+		"tools/call",
+		5*time.Minute,
+	)
+	if err == nil {
+		t.Fatal("expected send error")
+	}
+	var transportErr *proxyTransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("expected proxyTransportError, got %T: %v", err, err)
+	}
+}
+
+func TestProxyDaemonRoundTripWithTimeout_RecvFailure(t *testing.T) {
+	req, _ := mcp.NewRequest(1, "tools/call", map[string]any{"name": "noop"})
+	_, err := proxyDaemonRoundTripWithTimeout(
+		context.Background(),
+		&stubTransport{recvErr: context.DeadlineExceeded},
+		req,
+		"tools/call",
+		5*time.Minute,
+	)
+	if err == nil {
+		t.Fatal("expected recv error")
+	}
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("expected timeout in error, got %q", err.Error())
+	}
+}

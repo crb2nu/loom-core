@@ -1,20 +1,26 @@
 // Fleet store - daemon status and sessions overview
 // v2: SSE-first with 30s fallback poll. Applies hud.fleet snapshots directly.
 import { eventStore } from './events.svelte.ts';
-import { arraysEqualById } from '../utils/diff.ts';
-
-export interface Process {
-  pid: number;
-  name: string;
-  status: string;
-}
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
+import { arraysEqualById, arraysEqualByKey } from '../utils/diff.ts';
+import { spawnStore, type SpawnState } from './spawn.svelte.ts';
+import {
+  buildUnifiedAgents,
+  summarizeUnifiedAgents,
+  rootAgentId,
+  type UnifiedAgent,
+  type UnifiedAgentSummary,
+} from '../utils/agents.ts';
 
 export interface StatusResponse {
   running: boolean;
   servers: number;
   activeConns: number;
   idleConns: number;
-  processes: Process[];
+  // Wire type is []string (monitor FleetSnapshot.Processes) — process
+  // names only, not structured records.
+  processes: string[];
 }
 
 export interface Session {
@@ -32,10 +38,33 @@ export interface Session {
   task_count: number;
   memory_items: number;
   active: boolean;
+  // Session hierarchy (subagent grouping). parent_session_id points at
+  // the directly enclosing session; root_session_id points at the top of
+  // the spawn chain (matches id for root sessions).
+  parent_session_id?: string;
+  root_session_id?: string;
 }
 
 export interface SessionsResponse {
   sessions: Session[];
+}
+
+export interface SessionTraceError {
+  source: string;
+  message: string;
+}
+
+export interface SessionTraceResponse {
+  session?: Session;
+  session_id: string;
+  agent_id?: string;
+  entries: Record<string, unknown>[];
+  events: Record<string, unknown>[];
+  traces: Record<string, unknown>[];
+  trace_enabled: boolean;
+  trace_path?: string;
+  errors?: SessionTraceError[];
+  retrieved_at: string;
 }
 
 export interface PresenceInfo {
@@ -51,6 +80,14 @@ export interface PresenceInfo {
   worktree_id?: string;
   last_heartbeat: string;
   registered_at: string;
+  source?: string;
+  has_presence?: boolean;
+  has_session?: boolean;
+  session_status?: string;
+  session_started_at?: string;
+  heartbeat_age_seconds?: number;
+  session_age_seconds?: number;
+  telemetry_status?: string;
 }
 
 export interface TaskInfo {
@@ -97,10 +134,90 @@ export interface NamespaceGroup {
   taskCount: number;
 }
 
+export interface SessionTreeNode {
+  session: Session;
+  depth: number;
+  children: SessionTreeNode[];
+}
+
+type PollingOwner = string | symbol;
+const DEFAULT_POLLING_OWNER = 'default';
+
 function extractProject(namespace: string | undefined): string {
   if (!namespace) return '(ungrouped)';
   const seg = namespace.split('/')[0];
   return seg || '(ungrouped)';
+}
+
+function isPinnedMobileSession(session: { agentType?: string; description?: string }): boolean {
+  const agentType = (session.agentType ?? '').trim().toLowerCase();
+  if (agentType === 'mobile') return true;
+  const description = (session.description ?? '').trim().toLowerCase();
+  return description.startsWith('mobile session');
+}
+
+function sortSessionsByStartedAt(sessions: Session[]): Session[] {
+  return [...sessions].sort((left, right) => {
+    const leftStarted = new Date(left.started_at ?? 0).getTime();
+    const rightStarted = new Date(right.started_at ?? 0).getTime();
+    if (leftStarted !== rightStarted) return leftStarted - rightStarted;
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function fallbackParentSessionId(session: Session): string | undefined {
+  if (session.parent_session_id) return session.parent_session_id;
+  if (session.root_session_id && session.root_session_id !== session.id) {
+    return session.root_session_id;
+  }
+  return undefined;
+}
+
+function buildSessionIndex(sessions: Session[]): {
+  sessionById: Map<string, Session>;
+  childSessionsById: Map<string, Session[]>;
+} {
+  const orderedSessions = sortSessionsByStartedAt(sessions);
+  const sessionById = new Map<string, Session>();
+  const childSessionsById = new Map<string, Session[]>();
+
+  for (const session of orderedSessions) {
+    if (session?.id) sessionById.set(session.id, session);
+  }
+
+  for (const session of orderedSessions) {
+    const parentId = fallbackParentSessionId(session);
+    if (!parentId || parentId === session.id) continue;
+    const siblings = childSessionsById.get(parentId) ?? [];
+    siblings.push(session);
+    childSessionsById.set(parentId, siblings);
+  }
+
+  return { sessionById, childSessionsById };
+}
+
+// Reference-identity memo for the store's join getters below. applySnapshot
+// hash-gates every array assignment, so a fresh array identity means the
+// content really changed — identity comparison is therefore a sound cache key.
+// These stay plain getters rather than `$derived` class fields: a `$derived`
+// read from outside a component tracking context (inbox.ts, store methods)
+// does not recompute, so it would hand back stale rows.
+function memoByDeps<R>(deps: () => readonly unknown[], compute: () => R): () => R {
+  let lastDeps: readonly unknown[] | null = null;
+  let last: R;
+  return () => {
+    const next = deps();
+    if (
+      lastDeps !== null &&
+      lastDeps.length === next.length &&
+      lastDeps.every((dep, i) => dep === next[i])
+    ) {
+      return last;
+    }
+    lastDeps = next;
+    last = compute();
+    return last;
+  };
 }
 
 class FleetStore {
@@ -117,13 +234,120 @@ class FleetStore {
   fileClaims = $state<FileClaimInfo[]>([]);
   loading = $state(false);
   error = $state<string | null>(null);
+  drawerError = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // Degraded-state (Slice 5b) — the monitor sets these on the FleetSnapshot
+  // when a sessions/presence sub-fetch failed and it carried over the prior
+  // roster. Because UpdatedAt still advances, the generic staleAfter pill never
+  // fires, so we surface an explicit "degraded since HH:MM (reason)" banner.
+  // All three reset on a healthy snapshot (degraded serialized as false).
+  degraded = $state(false);
+  degradedReason = $state('');
+  degradedSince = $state<Date | null>(null);
+
+  // Per-panel UI state (Slice B1 — moved out of FleetPanel.svelte so the
+  // panel becomes a pure composition shell). Components mutate via the
+  // setters below and read directly via getters.
+  sortKey = $state<string>('agent');
+  sortDir = $state<'asc' | 'desc'>('asc');
+  groupByRootSession = $state<boolean>(true);
+
+  // Staleness (Slice B3) — flips true when no snapshot has landed within
+  // staleAfter ms. Catches silent SSE failures where the connection stays
+  // up but the daemon stops emitting hud.fleet snapshots.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (!this.poller.running) return false;
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
+
+  setSort(key: string, dir: 'asc' | 'desc'): void {
+    this.sortKey = key;
+    this.sortDir = dir;
+  }
+
+  toggleGrouping(): void {
+    this.groupByRootSession = !this.groupByRootSession;
+  }
+
+  // Watchdog poll — fires on SSE-down OR on stale. The owner API (below)
+  // drives start/stop; the interval is the min across all polling owners.
+  // The watchdog gate is a shouldTick policy so refreshCoalesced() (the
+  // SSE-invalidation path) is not suppressed by it.
+  private poller = createPoller(() => this.fetch(), 60000, {
+    shouldTick: () => !eventStore.connected || this.isStale,
+  });
   private eventUnsubs: Array<() => void> = [];
+  private pollingOwners = new Map<PollingOwner, number>();
 
   get activeSessions(): Session[] {
     return this.sessions.filter((s) => s.status === 'active');
+  }
+
+  // Memoized joins (see memoByDeps). Each of these was recomputed on every
+  // read: the landing view reads unifiedAgents 8+ times per invalidation, and
+  // buildFleetRows re-derived the session index once per row.
+  private sessionIndexMemo = memoByDeps(
+    () => [this.sessions],
+    () => buildSessionIndex(this.sessions),
+  );
+  private get sessionIndex(): ReturnType<typeof buildSessionIndex> {
+    return this.sessionIndexMemo();
+  }
+
+  private unifiedAgentsMemo = memoByDeps(
+    () => [this.sessions, this.agents, this.tasks, this.fileClaims, spawnStore.spawns],
+    () =>
+      buildUnifiedAgents({
+        sessions: this.sessions,
+        agents: this.agents,
+        tasks: this.tasks,
+        fileClaims: this.fileClaims,
+        spawns: spawnStore.spawns,
+      }),
+  );
+  get unifiedAgents(): UnifiedAgent[] {
+    return this.unifiedAgentsMemo();
+  }
+
+  private unifiedSummaryMemo = memoByDeps(
+    () => [this.unifiedAgents],
+    () => summarizeUnifiedAgents(this.unifiedAgents),
+  );
+  get unifiedSummary(): UnifiedAgentSummary {
+    return this.unifiedSummaryMemo();
+  }
+
+  private liveAgentsMemo = memoByDeps(
+    () => [this.unifiedAgents],
+    () => this.unifiedAgents.filter((agent) => agent.status === 'active' || agent.status === 'idle'),
+  );
+  get liveAgents(): UnifiedAgent[] {
+    return this.liveAgentsMemo();
+  }
+
+  private liveAgentCountMemo = memoByDeps(
+    () => [this.liveAgents],
+    () => {
+      const roots = new Set<string>();
+      for (const agent of this.liveAgents) roots.add(rootAgentId(agent.agent_id));
+      return roots.size;
+    },
+  );
+
+  /**
+   * Distinct *logical* live agents — per-conversation agent_ids collapsed to
+   * their workspace-scoped root (see rootAgentId). This is the honest "N live
+   * agents" the status bar and badges should show; liveAgents.length counts
+   * per-session rows and over-reports when one agent runs several
+   * conversations in the same workspace.
+   */
+  get liveAgentCount(): number {
+    return this.liveAgentCountMemo();
   }
 
   get totalTokens(): number {
@@ -131,8 +355,125 @@ class FleetStore {
   }
 
   get agentCount(): number {
-    const agents = new Set(this.sessions.map((s) => s.agent_id));
-    return agents.size;
+    return this.unifiedSummary.live_agents;
+  }
+
+  get sessionById(): Map<string, Session> {
+    return this.sessionIndex.sessionById;
+  }
+
+  private sessionTreeMemo = memoByDeps<SessionTreeNode[]>(
+    () => [this.sessions],
+    () => {
+      const { childSessionsById } = this.sessionIndex;
+      const orderedSessions = sortSessionsByStartedAt(this.sessions);
+      const nodeById = new Map<string, SessionTreeNode>();
+      for (const session of orderedSessions) {
+        nodeById.set(session.id, {
+          session,
+          depth: 0,
+          children: [],
+        });
+      }
+
+      const rootNodes: SessionTreeNode[] = [];
+      for (const session of orderedSessions) {
+        const node = nodeById.get(session.id);
+        if (!node) continue;
+        const parentId = fallbackParentSessionId(session);
+        const parentNode = parentId ? nodeById.get(parentId) : undefined;
+        if (parentNode && parentNode.session.id !== node.session.id) {
+          parentNode.children.push(node);
+          continue;
+        }
+        rootNodes.push(node);
+      }
+
+      const assignDepth = (node: SessionTreeNode, depth: number, seen = new Set<string>()) => {
+        if (seen.has(node.session.id)) return;
+        seen.add(node.session.id);
+        node.depth = depth;
+        const children = childSessionsById.get(node.session.id) ?? [];
+        node.children = children
+          .map((session) => nodeById.get(session.id))
+          .filter((child): child is SessionTreeNode => !!child);
+        for (const child of node.children) assignDepth(child, depth + 1, new Set(seen));
+      };
+
+      for (const rootNode of rootNodes) assignDepth(rootNode, 0);
+      return rootNodes;
+    },
+  );
+  get sessionTree(): SessionTreeNode[] {
+    return this.sessionTreeMemo();
+  }
+
+  /** Find a session by agent_id (for cross-referencing with spawns). */
+  sessionForAgent(agentId: string): Session | undefined {
+    return this.sessions.find(s => s.agent_id === agentId);
+  }
+
+  parentSession(sessionId: string): Session | undefined {
+    const { sessionById } = this.sessionIndex;
+    const session = sessionById.get(sessionId);
+    if (!session) return undefined;
+    const parentId = fallbackParentSessionId(session);
+    if (!parentId || parentId === session.id) return undefined;
+    return sessionById.get(parentId);
+  }
+
+  childSessions(sessionId: string): Session[] {
+    const { childSessionsById } = this.sessionIndex;
+    return childSessionsById.get(sessionId) ?? [];
+  }
+
+  rootSession(sessionId: string): Session | undefined {
+    const { sessionById } = this.sessionIndex;
+    let cursor = sessionById.get(sessionId);
+    if (!cursor) return undefined;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor.id)) {
+      seen.add(cursor.id);
+      if (cursor.root_session_id && cursor.root_session_id !== cursor.id) {
+        const root = sessionById.get(cursor.root_session_id);
+        if (root) return root;
+      }
+      if (!cursor.parent_session_id || cursor.parent_session_id === cursor.id) {
+        return cursor;
+      }
+      const parent = sessionById.get(cursor.parent_session_id);
+      if (!parent) return cursor;
+      cursor = parent;
+    }
+    return cursor;
+  }
+
+  sessionLineage(sessionId: string): Session[] {
+    const { sessionById } = this.sessionIndex;
+    const lineage: Session[] = [];
+    let cursor = sessionById.get(sessionId);
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor.id)) {
+      seen.add(cursor.id);
+      lineage.unshift(cursor);
+      const parentId = fallbackParentSessionId(cursor);
+      if (!parentId || parentId === cursor.id) break;
+      const parent = sessionById.get(parentId);
+      if (!parent) break;
+      cursor = parent;
+    }
+    return lineage;
+  }
+
+  /**
+   * spawnForSession looks up the spawn linked to a given session.
+   * Finds the session by sessionId, extracts its agent_id, then queries
+   * spawnStore.spawns for a spawn with the same agent_id.
+   */
+  spawnForSession(sessionId: string): SpawnState | undefined {
+    const session = this.sessions.find(s => s.id === sessionId);
+    if (!session) return undefined;
+    return spawnStore.spawnForAgent(session.agent_id);
   }
 
   /** Group active sessions by namespace project, enriched with agent presence and linked tasks. */
@@ -191,7 +532,7 @@ class FleetStore {
       const orphans = orphansByProject.get(project) ?? [];
       const totalTasks = sessions.reduce((s, sess) => s + sess.tasks.length, 0) + orphans.length;
       const hasActive = sessions.some(
-        (s) => s.agentStatus === 'active' || s.tasks.some((t) => t.status === 'in_progress'),
+        (s) => s.agentStatus === 'active' || isPinnedMobileSession(s) || s.tasks.some((t) => t.status === 'in_progress'),
       );
 
       groups.push({
@@ -233,16 +574,10 @@ class FleetStore {
     this.loading = true;
     this.error = null;
     try {
-      const [statusRes, sessionsRes] = await Promise.all([
-        globalThis.fetch('/api/status'),
-        globalThis.fetch('/api/sessions'),
-      ]);
-      if (!statusRes.ok) throw new Error(`Status API: ${statusRes.status}`);
-      if (!sessionsRes.ok) throw new Error(`Sessions API: ${sessionsRes.status}`);
-      this.status = await statusRes.json();
-      const sessData: SessionsResponse = await sessionsRes.json();
-      this.sessions = sessData.sessions || [];
-      this.lastUpdated = new Date();
+      const res = await globalThis.fetch('/api/fleet');
+      if (!res.ok) throw new Error(`Fleet API: ${res.status}`);
+      const snapshot = await res.json();
+      this.applySnapshot(snapshot as Record<string, unknown>);
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -270,7 +605,20 @@ class FleetStore {
       }
     }
     if (data.agents) {
-      this.agents = data.agents as PresenceInfo[];
+      // Hash-gate like sessions/tasks: the monitor re-emits hud.fleet
+      // snapshots on a timer, and an unconditional replace churns identity
+      // through every derived view (unifiedAgents → FleetTable → status bar)
+      // even when nothing changed. Volatile age fields are deliberately
+      // excluded — they advance every snapshot and would defeat the gate;
+      // last_heartbeat changes whenever a real heartbeat lands, which is
+      // when displayed ages need to refresh anyway.
+      const next = data.agents as PresenceInfo[];
+      const keyAgent = (a: PresenceInfo) => a.agent_id;
+      const hashAgent = (a: PresenceInfo) =>
+        `${a.status}|${a.last_heartbeat}|${a.session_id ?? ''}|${a.session_status ?? ''}|${a.current_task}|${a.branch}|${a.telemetry_status ?? ''}`;
+      if (!arraysEqualByKey(this.agents, next, keyAgent, hashAgent)) {
+        this.agents = next;
+      }
     }
     if (data.tasks) {
       const next = data.tasks as TaskInfo[];
@@ -280,13 +628,27 @@ class FleetStore {
       }
     }
     if (data.file_claims) {
-      this.fileClaims = data.file_claims as FileClaimInfo[];
+      const next = data.file_claims as FileClaimInfo[];
+      const hashClaim = (c: FileClaimInfo) => `${c.file_path}|${c.claim_type}|${c.expires_at ?? ''}`;
+      if (!arraysEqualById(this.fileClaims, next, hashClaim)) {
+        this.fileClaims = next;
+      }
+    }
+    // Explicit degraded-state from the monitor. `degraded` is always present
+    // (serialized without omitempty), so a healthy snapshot clears it; reason
+    // and since are omitempty, present only while degraded.
+    if (data.degraded !== undefined) {
+      this.degraded = data.degraded === true;
+      this.degradedReason = this.degraded ? ((data.degraded_reason as string) ?? '') : '';
+      this.degradedSince =
+        this.degraded && data.degraded_since ? new Date(data.degraded_since as string) : null;
     }
     this.lastUpdated = new Date();
     this.error = null;
   }
 
   async fetchSessionEntries(sessionId: string, limit = 50): Promise<Record<string, unknown>[] | null> {
+    this.drawerError = null;
     try {
       const params = new URLSearchParams({ limit: String(limit) });
       const res = await globalThis.fetch(`/api/sessions/${sessionId}/entries?${params.toString()}`);
@@ -294,27 +656,41 @@ class FleetStore {
       const data = await res.json();
       return data.entries ?? [];
     } catch (e) {
-      this.error = e instanceof Error ? e.message : String(e);
+      this.drawerError = e instanceof Error ? e.message : String(e);
       return null;
     }
   }
 
-  startPolling(intervalMs = 30000): void {
-    this.stopPolling();
-    this.fetch();
-    // 30s fallback poll (SSE is the primary data source).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+  async fetchSessionTrace(sessionId: string, limit = 100): Promise<SessionTraceResponse | null> {
+    this.drawerError = null;
+    try {
+      const params = new URLSearchParams({ limit: String(limit) });
+      const res = await globalThis.fetch(`/api/sessions/${sessionId}/trace?${params.toString()}`);
+      if (!res.ok) throw new Error(`Session trace: ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      this.drawerError = e instanceof Error ? e.message : String(e);
+      return null;
+    }
+  }
 
-    // Subscribe to SSE events: apply data directly from hud.fleet snapshots.
+  clearDrawerError(): void {
+    this.drawerError = null;
+  }
+
+  private ensureEventSubscriptions(): void {
+    if (this.eventUnsubs.length > 0) return;
     this.eventUnsubs.push(
       eventStore.on('hud.fleet', (e) => this.applySnapshot(e.data)),
       // Legacy daemon events still trigger a full refresh as fallback.
-      eventStore.on('config.reload', () => this.fetch()),
-      eventStore.on('process.start', () => this.fetch()),
-      eventStore.on('process.stop', () => this.fetch()),
+      // Routed through the poller so a burst collapses into one GET /api/fleet
+      // and a hidden tab issues none at all.
+      eventStore.on('config.reload', () => this.poller.refreshCoalesced()),
+      eventStore.on('process.start', () => this.poller.refreshCoalesced()),
+      eventStore.on('process.stop', () => this.poller.refreshCoalesced()),
       // Granular agent events — fetch full session data so new sessions appear immediately.
-      eventStore.on('agent.session.start', () => this.fetch()),
-      eventStore.on('agent.session.bootstrap', () => this.fetch()),
+      eventStore.on('agent.session.start', () => this.poller.refreshCoalesced()),
+      eventStore.on('agent.session.bootstrap', () => this.poller.refreshCoalesced()),
       // Reaped sessions should be treated the same as ended.
       eventStore.on('agent.session.reaped', (e) => {
         const sessionId = (e.data as Record<string, unknown>).session_id as string;
@@ -344,17 +720,52 @@ class FleetStore {
         );
         this.lastUpdated = new Date();
       }),
+      // Live entry count updates from context additions.
+      eventStore.on('agent.context.added', (e) => {
+        const data = e.data as Record<string, unknown>;
+        const sessionId = data.session_id as string;
+        const count = (data.entry_count as number) || 0;
+        if (sessionId && count > 0) {
+          this.sessions = this.sessions.map((s) =>
+            s.id === sessionId ? { ...s, entry_count: s.entry_count + count } : s,
+          );
+          this.lastUpdated = new Date();
+        }
+      }),
+      eventStore.on('agent.task.update', () => this.poller.refreshCoalesced()),
     );
   }
 
-  stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+  private refreshPollTimer(): void {
+    if (this.pollingOwners.size === 0) {
+      this.poller.stop();
+      return;
     }
+
+    const intervalMs = Math.min(...this.pollingOwners.values());
+    this.poller.start(intervalMs);
+  }
+
+  startPolling(intervalMs = 60000, owner: PollingOwner = DEFAULT_POLLING_OWNER): void {
+    const wasIdle = this.pollingOwners.size === 0;
+    this.pollingOwners.set(owner, intervalMs);
+    this.ensureEventSubscriptions();
+    this.refreshPollTimer();
+    if (wasIdle) this.fetch();
+  }
+
+  stopPolling(owner: PollingOwner = DEFAULT_POLLING_OWNER): void {
+    this.pollingOwners.delete(owner);
+    if (this.pollingOwners.size > 0) {
+      this.refreshPollTimer();
+      return;
+    }
+
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }
 }
 
 export const fleetStore = new FleetStore();
+stalenessStore.register('fleet', () => fleetStore.isStale);

@@ -1,0 +1,1 @@
+- Retry empty reasoning-model Council evaluator responses once with a larger bounded token budget, retain both attempts' cost, and prevent degraded reviewer-quorum runs from mutating the backlog.

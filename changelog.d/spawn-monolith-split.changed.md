@@ -1,0 +1,1 @@
+- Split HUD spawn configuration and lifecycle entry points from `internal/hud/spawn.go` into cohesive modules without changing behavior.

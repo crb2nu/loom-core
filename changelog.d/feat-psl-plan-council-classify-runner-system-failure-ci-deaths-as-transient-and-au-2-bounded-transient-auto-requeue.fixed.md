@@ -1,0 +1,1 @@
+- Classify GitLab `runner_system_failure` CI deaths as transient and add bounded auto-requeue KPI and retry-exhaustion metadata across `pkg/mills/pipeline` and `pkg/mills/store`.

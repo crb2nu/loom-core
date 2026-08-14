@@ -1,0 +1,1 @@
+- Made the Mills docs guardrail and scope gates canonicalize changed paths consistently, with repeat-evaluation golden coverage for stable verdicts and ordered reasons.

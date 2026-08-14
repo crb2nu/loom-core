@@ -1,0 +1,1 @@
+- **Mills scheduler deadline handling** (`pkg/mills`): bound ghost-spark GitLab sweeps without starving tick tail work, atomically persist ghost-close state and audit events, stop promptly on parent cancellation, and record KPIs with a fresh budget only after successful ticks.

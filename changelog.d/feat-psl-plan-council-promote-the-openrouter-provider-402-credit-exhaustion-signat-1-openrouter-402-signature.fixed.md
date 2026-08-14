@@ -1,0 +1,1 @@
+- Recognize raw OpenRouter JSON `code: 402` credit-exhaustion payloads in the persisted non-retryable external-dependency signature (`pkg/mills/pipeline/failure_signatures.go`, `pkg/mills/pipeline/failure_signatures_test.go`).

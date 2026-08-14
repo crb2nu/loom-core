@@ -1,0 +1,1 @@
+- Add structured reason-coded verdicts and bounded fail-closed quorum re-evaluation for borderline path classifications in `pkg/mills/gates/docs_guardrail.go`.

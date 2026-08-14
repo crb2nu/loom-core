@@ -1,0 +1,440 @@
+import Testing
+import Foundation
+@testable import LoomCompanionKit
+
+@Suite("APIClient")
+struct APIClientTests {
+
+    @Test("Endpoint paths are correct")
+    func endpointPaths() {
+        #expect(Endpoint.ping.path == "/api/mobile/v1/ping")
+        #expect(Endpoint.dashboard.path == "/api/mobile/v1/dashboard")
+        #expect(Endpoint.controlPlane.path == "/api/mobile/v1/control-plane")
+        #expect(Endpoint.alertsPolicy.path == "/api/mobile/v1/alerts/policy")
+        #expect(Endpoint.sessions().path == "/api/mobile/v1/sessions")
+        #expect(Endpoint.sessionsTree().path == "/api/mobile/v1/sessions/tree")
+        #expect(Endpoint.sessionDetail(id: "s1").path == "/api/mobile/v1/sessions/s1")
+        #expect(Endpoint.sessionEvents(id: "s1").path == "/api/mobile/v1/sessions/s1/events")
+        #expect(Endpoint.sessionActivity(id: "s1").path == "/api/mobile/v1/sessions/s1/activity")
+        #expect(Endpoint.tasks().path == "/api/mobile/v1/tasks")
+        #expect(Endpoint.workflows().path == "/api/mobile/v1/workflows")
+        #expect(Endpoint.workflowDetail(id: "wf1").path == "/api/mobile/v1/workflows/wf1")
+        #expect(Endpoint.presence().path == "/api/mobile/v1/presence")
+        #expect(Endpoint.memoryStats.path == "/api/mobile/v1/memory/stats")
+        #expect(Endpoint.memoryItems().path == "/api/mobile/v1/memory/items")
+        #expect(Endpoint.stream().path == "/api/mobile/v1/stream")
+        #expect(Endpoint.topology.path == "/api/mobile/v1/topology")
+        #expect(Endpoint.graphStats.path == "/api/mobile/v1/graph/stats")
+        #expect(Endpoint.graphEntities().path == "/api/mobile/v1/graph/entities")
+        #expect(Endpoint.graphPath(sourceId: "a", targetId: "b").path == "/api/mobile/v1/graph/path")
+        #expect(Endpoint.reasoningChains().path == "/api/mobile/v1/reasoning/chains")
+        #expect(Endpoint.reasoningChainDetail(id: "chain-1").path == "/api/mobile/v1/reasoning/chains/chain-1")
+        #expect(Endpoint.createSession(agentId: "a1").path == "/api/mobile/v1/sessions")
+        #expect(Endpoint.endSession(id: "s1").path == "/api/mobile/v1/sessions/s1/end")
+        #expect(Endpoint.pushRegister(token: "tok", platform: .apns).path == "/api/mobile/v1/push/register")
+        #expect(Endpoint.pushUnregister(token: "tok").path == "/api/mobile/v1/push/unregister")
+        #expect(Endpoint.eventsStream.path == "/api/mobile/v1/events/stream")
+        #expect(Endpoint.sandbox.path == "/api/mobile/v1/sandbox")
+        #expect(Endpoint.sandboxStart(project: "loom-core").path == "/api/mobile/v1/sandbox/start")
+        #expect(Endpoint.sandboxStop(project: "loom-core").path == "/api/mobile/v1/sandbox/stop")
+    }
+
+    @Test("Endpoint methods are correct")
+    func endpointMethods() {
+        #expect(Endpoint.ping.method == "GET")
+        #expect(Endpoint.dashboard.method == "GET")
+        #expect(Endpoint.controlPlane.method == "GET")
+        #expect(Endpoint.alertsPolicy.method == "GET")
+        #expect(Endpoint.sessions().method == "GET")
+        #expect(Endpoint.sessionsTree().method == "GET")
+        #expect(Endpoint.sessionActivity(id: "s1").method == "GET")
+        #expect(Endpoint.tasks().method == "GET")
+        #expect(Endpoint.workflows().method == "GET")
+        #expect(Endpoint.graphPath(sourceId: "a", targetId: "b").method == "GET")
+        #expect(Endpoint.createSession(agentId: "a1").method == "POST")
+        #expect(Endpoint.endSession(id: "s1").method == "POST")
+        #expect(Endpoint.pushRegister(token: "tok", platform: .apns).method == "POST")
+        #expect(Endpoint.pushUnregister(token: "tok").method == "POST")
+        #expect(Endpoint.sandbox.method == "GET")
+        #expect(Endpoint.sandboxStart(project: "p").method == "POST")
+        #expect(Endpoint.sandboxStop(project: "p").method == "POST")
+    }
+
+    @Test("Mutation endpoints are flagged correctly")
+    func mutationFlag() {
+        #expect(Endpoint.ping.isMutation == false)
+        #expect(Endpoint.dashboard.isMutation == false)
+        #expect(Endpoint.controlPlane.isMutation == false)
+        #expect(Endpoint.alertsPolicy.isMutation == false)
+        #expect(Endpoint.stream().isMutation == false)
+        #expect(Endpoint.createSession(agentId: "a1").isMutation == true)
+        #expect(Endpoint.endSession(id: "s1").isMutation == true)
+        #expect(Endpoint.pushRegister(token: "tok", platform: .apns).isMutation == true)
+        #expect(Endpoint.pushUnregister(token: "tok").isMutation == true)
+        #expect(Endpoint.sandbox.isMutation == false)
+        #expect(Endpoint.sandboxStart(project: "p").isMutation == true)
+        #expect(Endpoint.sandboxStop(project: "p").isMutation == true)
+    }
+
+    @Test("Only admin-gated Mills mutations require the admin token")
+    func requiresAdminTokenFlag() {
+        // The two HUD admin-gated Mills mutations the app performs.
+        #expect(Endpoint.millsSpinAsync(request: MillsSpinRequest(brief: "b", frames: ["ring"])).requiresAdminToken == true)
+        #expect(Endpoint.millsPipelineEscalate(id: "run-1").requiresAdminToken == true)
+
+        // Plan advance goes through the plans domain's un-gated handler (the web
+        // frontend advances with a bare fetch), so it does NOT require admin.
+        #expect(Endpoint.planAdvance(id: "plan-1", toPhase: "planned").requiresAdminToken == false)
+        // Reads + the mobile v1 surface never require the admin token.
+        #expect(Endpoint.millsSpinRuns().requiresAdminToken == false)
+        #expect(Endpoint.millsSpinningRoomFrames.requiresAdminToken == false)
+        #expect(Endpoint.plans.requiresAdminToken == false)
+        #expect(Endpoint.ping.requiresAdminToken == false)
+        #expect(Endpoint.spawnAgent(request: MobileSpawnRequest(project: "loom-core", taskDescription: "x")).requiresAdminToken == false)
+    }
+
+    @Test("APIClient attaches X-Admin-Token only on admin-gated endpoints")
+    func adminTokenHeaderAttachment() throws {
+        let base = URL(string: "https://hud.example")!
+        let client = APIClient(baseURL: base, token: "mobile-bearer", adminToken: "hud-admin-secret")
+
+        // Admin-gated mutation → X-Admin-Token attached; the bearer still rides
+        // in Authorization (the gate accepts either, X-Admin-Token first).
+        let spin = try client.authorizedRequest(for: .millsSpinAsync(request: MillsSpinRequest(brief: "b", frames: ["ring"])))
+        #expect(spin.value(forHTTPHeaderField: "X-Admin-Token") == "hud-admin-secret")
+        #expect(spin.value(forHTTPHeaderField: "Authorization") == "Bearer mobile-bearer")
+
+        let escalate = try client.authorizedRequest(for: .millsPipelineEscalate(id: "run-1"))
+        #expect(escalate.value(forHTTPHeaderField: "X-Admin-Token") == "hud-admin-secret")
+
+        // Reads + un-gated mutations must NOT leak the admin secret.
+        let runs = try client.authorizedRequest(for: .millsSpinRuns())
+        #expect(runs.value(forHTTPHeaderField: "X-Admin-Token") == nil)
+        let advance = try client.authorizedRequest(for: .planAdvance(id: "plan-1", toPhase: "planned"))
+        #expect(advance.value(forHTTPHeaderField: "X-Admin-Token") == nil)
+        let ping = try client.authorizedRequest(for: .ping)
+        #expect(ping.value(forHTTPHeaderField: "X-Admin-Token") == nil)
+    }
+
+    @Test("No admin token configured → no X-Admin-Token header even on admin endpoints")
+    func adminTokenHeaderAbsentWhenUnset() throws {
+        let base = URL(string: "https://hud.example")!
+        let client = APIClient(baseURL: base, token: "mobile-bearer") // adminToken defaults to ""
+        let spin = try client.authorizedRequest(for: .millsSpinAsync(request: MillsSpinRequest(brief: "b", frames: ["ring"])))
+        #expect(spin.value(forHTTPHeaderField: "X-Admin-Token") == nil)
+        // Blank/whitespace admin token is treated as unset.
+        let blank = APIClient(baseURL: base, token: "t", adminToken: "   ")
+        let spin2 = try blank.authorizedRequest(for: .millsPipelineEscalate(id: "r"))
+        #expect(spin2.value(forHTTPHeaderField: "X-Admin-Token") == nil)
+    }
+
+    @Test("Sessions endpoints serialize the status query param")
+    func sessionsStatusQuery() throws {
+        let base = URL(string: "http://localhost:3333")!
+
+        let flat = try Endpoint.sessions(status: "all").urlRequest(baseURL: base)
+        #expect(flat.url?.query == "status=all")
+
+        let tree = try Endpoint.sessionsTree(status: "ended,summarized").urlRequest(baseURL: base)
+        #expect(tree.url?.query?.contains("status=ended") == true)
+
+        // No status → no query, preserving the server's active-only default.
+        let none = try Endpoint.sessions().urlRequest(baseURL: base)
+        #expect(none.url?.query == nil)
+    }
+
+    @Test("Session events endpoint includes limit query param")
+    func sessionEventsLimit() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.sessionEvents(id: "s1", limit: 50).urlRequest(baseURL: base)
+        #expect(request.url?.query?.contains("limit=50") == true)
+    }
+
+    @Test("Ops endpoints serialize query parameters")
+    func opsQueryParameters() throws {
+        let base = URL(string: "https://localhost:3333")!
+
+        let tasksReq = try Endpoint.tasks(status: .inProgress, agentId: "codex", sessionId: "sess-1", limit: 25, search: "mobile").urlRequest(baseURL: base)
+        let tasksQuery = tasksReq.url?.query ?? ""
+        #expect(tasksQuery.contains("status=in_progress"))
+        #expect(tasksQuery.contains("agent_id=codex"))
+        #expect(tasksQuery.contains("session_id=sess-1"))
+        #expect(tasksQuery.contains("limit=25"))
+
+        let memReq = try Endpoint.memoryItems(tier: .shortTerm, query: "errors", limit: 10).urlRequest(baseURL: base)
+        let memQuery = memReq.url?.query ?? ""
+        #expect(memQuery.contains("tier=short_term"))
+        #expect(memQuery.contains("query=errors"))
+        #expect(memQuery.contains("limit=10"))
+
+        let pathReq = try Endpoint.graphPath(sourceId: "ent-a", targetId: "ent-b", maxDepth: 7).urlRequest(baseURL: base)
+        let pathQuery = pathReq.url?.query ?? ""
+        #expect(pathQuery.contains("source_id=ent-a"))
+        #expect(pathQuery.contains("target_id=ent-b"))
+        #expect(pathQuery.contains("max_depth=7"))
+    }
+
+    @Test("Create session includes body")
+    func createSessionBody() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.createSession(
+            agentId: "claude-code",
+            namespace: "loom-core/main",
+            description: "Test session"
+        ).urlRequest(baseURL: base)
+
+        let body = try #require(request.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(json["agent_id"] as? String == "claude-code")
+        #expect(json["namespace"] as? String == "loom-core/main")
+        #expect(json["description"] as? String == "Test session")
+    }
+
+    @Test("End session includes body")
+    func endSessionBody() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.endSession(id: "s1", summarize: true).urlRequest(baseURL: base)
+
+        let body = try #require(request.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(json["summarize"] as? Bool == true)
+        #expect(request.url?.path.hasSuffix("/sessions/s1/end") == true)
+    }
+
+    @Test("Push register includes expected body")
+    func pushRegisterBody() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.pushRegister(token: "abc123", platform: .apns).urlRequest(baseURL: base)
+
+        let body = try #require(request.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(request.url?.path.hasSuffix("/push/register") == true)
+        #expect(json["token"] as? String == "abc123")
+        #expect(json["platform"] as? String == "apns")
+    }
+
+    @Test("Push unregister includes expected body")
+    func pushUnregisterBody() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.pushUnregister(token: "abc123").urlRequest(baseURL: base)
+
+        let body = try #require(request.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(request.url?.path.hasSuffix("/push/unregister") == true)
+        #expect(json["token"] as? String == "abc123")
+    }
+
+    @Test("Create session auto_recall field")
+    func createSessionAutoRecall() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.createSession(
+            agentId: "codex",
+            autoRecall: true
+        ).urlRequest(baseURL: base)
+
+        let body = try #require(request.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(json["agent_id"] as? String == "codex")
+        #expect(json["auto_recall"] as? Bool == true)
+        #expect(json["namespace"] == nil)
+    }
+
+    @Test("Sandbox start includes body")
+    func sandboxStartBody() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.sandboxStart(project: "loom-core", agentId: "claude-code").urlRequest(baseURL: base)
+
+        let body = try #require(request.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(json["project"] as? String == "loom-core")
+        #expect(json["agent_id"] as? String == "claude-code")
+    }
+
+    @Test("Sandbox stop includes body")
+    func sandboxStopBody() throws {
+        let base = URL(string: "https://localhost:3333")!
+        let request = try Endpoint.sandboxStop(project: "loom-core").urlRequest(baseURL: base)
+
+        let body = try #require(request.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(json["project"] as? String == "loom-core")
+    }
+
+    @Test("Error code parsing")
+    func errorCodeParsing() {
+        #expect(APIErrorCode(rawValue: "unauthorized") == .unauthorized)
+        #expect(APIErrorCode(rawValue: "token_revoked") == .tokenRevoked)
+        #expect(APIErrorCode(rawValue: "rate_limited") == .rateLimited)
+        #expect(APIErrorCode(rawValue: "not_found") == .notFound)
+        #expect(APIErrorCode(rawValue: "unknown_code") == nil)
+    }
+
+    @Test("Decode contract: successful envelope returns typed payload")
+    func decodeContractSuccess() throws {
+        let client = makeClient()
+        let payload = """
+        {
+          "ok": true,
+          "data": { "pong": true },
+          "meta": { "request_id": "req_ok", "timestamp": "2026-02-25T15:00:00Z" }
+        }
+        """
+
+        let response: TestPong = try client.decodeResponse(Data(payload.utf8), statusCode: 200)
+        #expect(response.pong == true)
+    }
+
+    @Test("Decode contract: 2xx with missing data throws decoding error")
+    func decodeContractMissingData() throws {
+        let client = makeClient()
+        let payload = """
+        {
+          "ok": true,
+          "meta": { "request_id": "req_missing_data", "timestamp": "2026-02-25T15:00:00Z" }
+        }
+        """
+
+        do {
+            let _: TestPong = try client.decodeResponse(Data(payload.utf8), statusCode: 200)
+            Issue.record("Expected decoding error for missing data payload")
+        } catch let error as LoomAPIError {
+            guard case let .decodingError(underlying) = error else {
+                Issue.record("Expected decodingError, got \(error)")
+                return
+            }
+            #expect(underlying.contains("Missing data payload"))
+        } catch {
+            Issue.record("Expected LoomAPIError, got \(error)")
+        }
+    }
+
+    @Test("Decode contract: 2xx invalid envelope throws decoding error")
+    func decodeContractInvalidEnvelopeOn2xx() throws {
+        let client = makeClient()
+        let payload = """
+        {"not":"an-envelope"}
+        """
+
+        do {
+            let _: TestPong = try client.decodeResponse(Data(payload.utf8), statusCode: 200)
+            Issue.record("Expected decoding error for invalid 2xx envelope")
+        } catch let error as LoomAPIError {
+            guard case let .decodingError(underlying) = error else {
+                Issue.record("Expected decodingError, got \(error)")
+                return
+            }
+            #expect(underlying.contains("Invalid API response contract"))
+        } catch {
+            Issue.record("Expected LoomAPIError, got \(error)")
+        }
+    }
+
+    @Test("Decode contract: envelope error maps to apiError")
+    func decodeContractEnvelopeError() throws {
+        let client = makeClient()
+        let payload = """
+        {
+          "ok": false,
+          "error": { "code": "not_found", "message": "session not found" },
+          "meta": { "request_id": "req_not_found", "timestamp": "2026-02-25T15:00:00Z" }
+        }
+        """
+
+        do {
+            let _: TestPong = try client.decodeResponse(Data(payload.utf8), statusCode: 404)
+            Issue.record("Expected API error for envelope with ok=false")
+        } catch let error as LoomAPIError {
+            guard case let .apiError(code, message, requestId) = error else {
+                Issue.record("Expected apiError, got \(error)")
+                return
+            }
+            #expect(code == .notFound)
+            #expect(message == "session not found")
+            #expect(requestId == "req_not_found")
+        } catch {
+            Issue.record("Expected LoomAPIError, got \(error)")
+        }
+    }
+
+    @Test("Decode contract: non-envelope 404 falls back to notFound API error")
+    func decodeContractNonEnvelope404Fallback() throws {
+        let client = makeClient()
+        let payload = """
+        {"message":"plain upstream 404"}
+        """
+
+        do {
+            let _: TestPong = try client.decodeResponse(Data(payload.utf8), statusCode: 404)
+            Issue.record("Expected fallback notFound API error")
+        } catch let error as LoomAPIError {
+            guard case let .apiError(code, message, _) = error else {
+                Issue.record("Expected apiError, got \(error)")
+                return
+            }
+            #expect(code == .notFound)
+            #expect(message == "Not found")
+        } catch {
+            Issue.record("Expected LoomAPIError, got \(error)")
+        }
+    }
+
+    @Test("Decode contract: non-envelope 503 falls back to upstreamError")
+    func decodeContractNonEnvelope503Fallback() throws {
+        let client = makeClient()
+        let payload = """
+        unavailable
+        """
+
+        do {
+            let _: TestPong = try client.decodeResponse(Data(payload.utf8), statusCode: 503)
+            Issue.record("Expected fallback upstreamError API error")
+        } catch let error as LoomAPIError {
+            guard case let .apiError(code, message, _) = error else {
+                Issue.record("Expected apiError, got \(error)")
+                return
+            }
+            #expect(code == .upstreamError)
+            #expect(message.contains("HTTP 503"))
+        } catch {
+            Issue.record("Expected LoomAPIError, got \(error)")
+        }
+    }
+
+    @Test("SSE request includes Cloudflare Access headers when configured")
+    func sseRequestIncludesCloudflareAccessHeaders() throws {
+        let client = APIClient(
+            baseURL: URL(string: "https://mcp.flexinfer.ai")!,
+            token: "mobile-token",
+            cloudflareAccessClientID: "cf-id",
+            cloudflareAccessClientSecret: "cf-secret"
+        )
+        let request = try client.sseRequest()
+
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer mobile-token")
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Id") == "cf-id")
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Secret") == "cf-secret")
+    }
+
+    @Test("SSE request omits Cloudflare headers when partially configured")
+    func sseRequestOmitsPartialCloudflareAccessHeaders() throws {
+        let client = APIClient(
+            baseURL: URL(string: "https://mcp.flexinfer.ai")!,
+            token: "mobile-token",
+            cloudflareAccessClientID: "cf-id",
+            cloudflareAccessClientSecret: nil
+        )
+        let request = try client.sseRequest()
+
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer mobile-token")
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Id") == nil)
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Secret") == nil)
+    }
+}
+
+private struct TestPong: Decodable {
+    let pong: Bool
+}
+
+private func makeClient() -> APIClient {
+    APIClient(baseURL: URL(string: "https://localhost:3333")!, token: "test-token")
+}

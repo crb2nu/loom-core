@@ -1,0 +1,1 @@
+- Add structured gate-evaluation events in `pkg/telemetry/events.go` and atomic telemetry instrumentation for the `docs_guardrail` and `scope` gates in `pkg/mills/gates/telemetry.go`.

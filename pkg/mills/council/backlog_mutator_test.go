@@ -1,0 +1,729 @@
+package council
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/crb2nu/loom/pkg/mills/store"
+)
+
+func newMutatorEnv(t *testing.T) (*BacklogMutator, *store.Store, string) {
+	t.Helper()
+	st := newCouncilTestStore(t)
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, ".loom"), 0o755); err != nil {
+		t.Fatalf("mkdir loom: %v", err)
+	}
+	m := &BacklogMutator{
+		Store: st,
+		Now:   func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
+	}
+	// Seed every council run id the tests pass to Apply so the
+	// backlog_items FK on council_run_id resolves. Runtime callers
+	// already persist the council run before invoking the mutator.
+	for _, id := range []string{
+		"COUNCIL-X", "COUNCIL-Y", "COUNCIL-T", "COUNCIL-C", "COUNCIL-P",
+		"COUNCIL-H", "COUNCIL-E", "COUNCIL-D", "COUNCIL-N", "COUNCIL-A",
+	} {
+		if err := st.Council.Put(context.Background(), &store.CouncilRun{
+			ID: id, Trigger: store.CouncilTriggerManual,
+			StartedAt: time.Now().UTC(), Outcome: store.CouncilOutcomeSuccess,
+		}); err != nil {
+			t.Fatalf("seed council %s: %v", id, err)
+		}
+	}
+	return m, st, repo
+}
+
+// sampleProposalTitles supplies distinct multi-token titles for
+// sampleProposals so the slice 6.2 dedup logic doesn't collapse the
+// fixture (single-char disambiguators like "proposal A" / "proposal B"
+// all normalize to {proposal} and would dedup against each other).
+var sampleProposalTitles = []string{
+	"alpha refactor pipeline starter",
+	"bravo HUD panel for backlog",
+	"charlie reconciler idle backoff",
+	"delta gate library expansion",
+	"echo eval loop attribution",
+	"foxtrot integrator fan-out",
+	"golf escalation path runbook",
+	"hotel weaver subagent dispatch",
+	"india council brief assembler",
+	"juliet roadmap intent extractor",
+	"kilo merge train automation",
+	"lima dedup canonical store",
+}
+
+func sampleProposals(n int) []BacklogProposal {
+	out := make([]BacklogProposal, n)
+	for i := 0; i < n; i++ {
+		title := "proposal sample " + string(rune('A'+i))
+		if i < len(sampleProposalTitles) {
+			title = sampleProposalTitles[i]
+		}
+		out[i] = BacklogProposal{
+			Title:    title,
+			Labels:   []string{"debt"},
+			Priority: store.P2,
+			Slices: []store.Slice{{
+				Name:  "core",
+				Files: []string{"pkg/foo/" + string(rune('a'+i)) + ".go"},
+			}},
+			Success: store.SuccessCriteria{Tests: []string{"go test ./pkg/foo/..."}},
+			Budget:  store.Budget{MaxCostUSD: 1.5},
+		}
+	}
+	return out
+}
+
+// ----- happy path -----
+
+func TestApply_PersistsAndExports(t *testing.T) {
+	m, st, repo := newMutatorEnv(t)
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(3)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{RepoRoot: repo})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.Skipped {
+		t.Fatalf("unexpected skip: %s", res.SkipReason)
+	}
+	if len(res.CreatedItems) != 3 {
+		t.Errorf("created: got %d want 3", len(res.CreatedItems))
+	}
+	if len(res.CreatedYAMLPath) != 3 {
+		t.Errorf("yaml exports: got %d want 3", len(res.CreatedYAMLPath))
+	}
+
+	// Canonical store reflects the writes.
+	q, _ := st.Backlog.ListByState(context.Background(), store.BacklogQueued)
+	if len(q) != 3 {
+		t.Errorf("queue: got %d want 3", len(q))
+	}
+
+	// Auto-IDs follow the MILLS-YYYY-MM-DD-NNN convention.
+	for i, item := range res.CreatedItems {
+		want := "MILLS-2026-04-26-00" + string(rune('1'+i))
+		if item.ID != want {
+			t.Errorf("id[%d]: got %q want %q", i, item.ID, want)
+		}
+		if item.CouncilRunID == nil || *item.CouncilRunID != "COUNCIL-X" {
+			t.Errorf("council ref: %v", item.CouncilRunID)
+		}
+		if item.CreatedBy != "council" {
+			t.Errorf("created_by: %s", item.CreatedBy)
+		}
+	}
+
+	// YAML exports are valid + carry the right fields.
+	for _, rel := range res.CreatedYAMLPath {
+		body, err := os.ReadFile(filepath.Join(repo, rel))
+		if err != nil {
+			t.Fatalf("read yaml: %v", err)
+		}
+		var bk backlogYAML
+		if err := yaml.Unmarshal(body, &bk); err != nil {
+			t.Fatalf("yaml decode %s: %v", rel, err)
+		}
+		if bk.State != "queued" {
+			t.Errorf("yaml state: %s", bk.State)
+		}
+		if bk.CouncilRunID != "COUNCIL-X" {
+			t.Errorf("yaml council ref: %s", bk.CouncilRunID)
+		}
+	}
+}
+
+func TestApply_SummaryAndCreatedIDs(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: sampleProposals(2)}
+	res, _ := m.Apply(context.Background(), "COUNCIL-Y", out, MutationOptions{})
+
+	ids := res.CreatedIDs()
+	if len(ids) != 2 {
+		t.Errorf("CreatedIDs: %v", ids)
+	}
+	if !strings.Contains(res.Summary(), "created=2") {
+		t.Errorf("summary missing created count: %s", res.Summary())
+	}
+}
+
+// ----- caps + truncation -----
+
+func TestApply_DefaultCapTruncates(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: sampleProposals(15)}
+	res, err := m.Apply(context.Background(), "COUNCIL-T", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != defaultMaxNewItems {
+		t.Errorf("expected %d created (default cap), got %d",
+			defaultMaxNewItems, len(res.CreatedItems))
+	}
+	if res.Truncated != 5 {
+		t.Errorf("truncated: %d", res.Truncated)
+	}
+}
+
+func TestApply_CustomCapTruncates(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: sampleProposals(8)}
+	res, _ := m.Apply(context.Background(), "COUNCIL-C", out, MutationOptions{MaxNewItems: 3})
+	if len(res.CreatedItems) != 3 {
+		t.Errorf("custom cap not applied: %d", len(res.CreatedItems))
+	}
+	if res.Truncated != 5 {
+		t.Errorf("truncated count: %d", res.Truncated)
+	}
+}
+
+// ----- partial-skip path -----
+
+func TestApply_SkipsWhenPartial(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: sampleProposals(3)}
+	res, _ := m.Apply(context.Background(), "COUNCIL-P", out, MutationOptions{
+		SkipBecausePartial: true,
+	})
+	if !res.Skipped {
+		t.Errorf("expected skip")
+	}
+	if res.TotalProposed != 3 {
+		t.Errorf("TotalProposed should be populated for audit: %d", res.TotalProposed)
+	}
+	if len(res.CreatedItems) != 0 {
+		t.Errorf("nothing should have been persisted: %d", len(res.CreatedItems))
+	}
+	q, _ := st.Backlog.ListByState(context.Background(), store.BacklogQueued)
+	if len(q) != 0 {
+		t.Errorf("store should be empty after skip: %d", len(q))
+	}
+	if !strings.Contains(res.Summary(), "below eval threshold") {
+		t.Errorf("summary missing skip reason: %s", res.Summary())
+	}
+}
+
+// ----- IDHint determinism -----
+
+func TestApply_HonorsIDHint(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: []BacklogProposal{{
+		IDHint:   "MILLS-CUSTOM-001",
+		Title:    "named",
+		Priority: store.P1,
+	}}}
+	res, err := m.Apply(context.Background(), "COUNCIL-H", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.CreatedItems[0].ID != "MILLS-CUSTOM-001" {
+		t.Errorf("id hint ignored: %s", res.CreatedItems[0].ID)
+	}
+}
+
+func TestApply_AutoIDCollisionAdvancesToNextFreeSequence(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	ctx := context.Background()
+	occupied := &store.BacklogItem{
+		ID: "MILLS-2026-04-26-001", Title: "occupied identity sentinel",
+		State: store.BacklogQueued, Priority: store.P3, CreatedBy: "test",
+		CreatedAt: m.Now(),
+	}
+	if err := st.Backlog.Put(ctx, occupied); err != nil {
+		t.Fatalf("seed occupied id: %v", err)
+	}
+
+	res, err := m.Apply(ctx, "COUNCIL-H", &EditorOutput{BacklogProposals: []BacklogProposal{{
+		Title: "new transaction recovery lane", Priority: store.P1,
+	}}}, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply after auto-id collision: %v", err)
+	}
+	if len(res.CreatedItems) != 1 || res.CreatedItems[0].ID != "MILLS-2026-04-26-002" {
+		t.Fatalf("created items=%+v want id MILLS-2026-04-26-002", res.CreatedItems)
+	}
+	stillOccupied, err := st.Backlog.Get(ctx, occupied.ID)
+	if err != nil {
+		t.Fatalf("load occupied id: %v", err)
+	}
+	if stillOccupied.Title != occupied.Title || stillOccupied.Revision != occupied.Revision {
+		t.Fatalf("occupied row changed: got=%+v want=%+v", stillOccupied, occupied)
+	}
+}
+
+func TestApply_ExistingIDHintUsesCurrentRevision(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	ctx := context.Background()
+	existing := &store.BacklogItem{
+		ID: "MILLS-CUSTOM-COLLISION", Title: "existing explicit identity",
+		State: store.BacklogQueued, Priority: store.P3, CreatedBy: "test",
+		CreatedAt: m.Now().Add(-time.Hour),
+	}
+	if err := st.Backlog.Put(ctx, existing); err != nil {
+		t.Fatalf("seed explicit id: %v", err)
+	}
+	originalRevision := existing.Revision
+	originalCreatedAt := existing.CreatedAt
+
+	res, err := m.Apply(ctx, "COUNCIL-H", &EditorOutput{BacklogProposals: []BacklogProposal{{
+		IDHint: "MILLS-CUSTOM-COLLISION", Title: "replacement deterministic identity",
+		Priority: store.P1,
+	}}}, MutationOptions{DedupSimilarityThreshold: 1.01})
+	if err != nil {
+		t.Fatalf("apply existing id hint: %v", err)
+	}
+	if len(res.CreatedItems) != 1 {
+		t.Fatalf("created items=%d want 1", len(res.CreatedItems))
+	}
+	got, err := st.Backlog.Get(ctx, existing.ID)
+	if err != nil {
+		t.Fatalf("load updated id: %v", err)
+	}
+	if got.Title != "replacement deterministic identity" || got.Revision != originalRevision+1 {
+		t.Fatalf("updated item=%+v want title replacement and revision %d", got, originalRevision+1)
+	}
+	if !got.CreatedAt.Equal(originalCreatedAt) {
+		t.Fatalf("created_at changed: got %s want %s", got.CreatedAt, originalCreatedAt)
+	}
+}
+
+// ----- guards + validation -----
+
+func TestApply_RejectsEmptyTitle(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: []BacklogProposal{{Title: ""}}}
+	if _, err := m.Apply(context.Background(), "COUNCIL-E", out, MutationOptions{}); err == nil {
+		t.Error("expected error for empty title")
+	}
+}
+
+func TestApply_NoConfigErrors(t *testing.T) {
+	if _, err := (&BacklogMutator{}).Apply(context.Background(), "X",
+		&EditorOutput{}, MutationOptions{}); err == nil {
+		t.Error("expected error with nil store")
+	}
+}
+
+func TestApply_NoOutputErrors(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	if _, err := m.Apply(context.Background(), "X", nil, MutationOptions{}); err == nil {
+		t.Error("expected error with nil EditorOutput")
+	}
+}
+
+func TestApply_NoRunIDErrors(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	if _, err := m.Apply(context.Background(), "", &EditorOutput{}, MutationOptions{}); err == nil {
+		t.Error("expected error with empty runID")
+	}
+}
+
+func TestApply_DefaultPriority(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: []BacklogProposal{{Title: "no prio set"}}}
+	res, err := m.Apply(context.Background(), "COUNCIL-D", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.CreatedItems[0].Priority != store.P2 {
+		t.Errorf("default priority should be P2, got %v", res.CreatedItems[0].Priority)
+	}
+}
+
+// ----- YAML export -----
+
+func TestApply_NoRepoRootSkipsYAML(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: sampleProposals(2)}
+	res, err := m.Apply(context.Background(), "COUNCIL-N", out, MutationOptions{}) // no RepoRoot
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 2 {
+		t.Errorf("created: %d", len(res.CreatedItems))
+	}
+	if len(res.CreatedYAMLPath) != 0 {
+		t.Errorf("YAML exports should be empty when RepoRoot unset: %v", res.CreatedYAMLPath)
+	}
+}
+
+func TestApply_YAMLExportIsAtomic(t *testing.T) {
+	m, _, repo := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: sampleProposals(1)}
+	if _, err := m.Apply(context.Background(), "COUNCIL-A", out, MutationOptions{RepoRoot: repo}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(repo, ".loom", "backlog"))
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") || strings.HasPrefix(e.Name(), ".council-") {
+			t.Errorf("tempfile leaked into backlog dir: %s", e.Name())
+		}
+	}
+}
+
+// ----- slice 6.2 — canonical-store dedup -----
+
+// TestApply_DedupSameBriefRunTwice is the acceptance test from the spec:
+// running the council twice with the same brief produces 0 new items on
+// the second run.
+func TestApply_DedupSameBriefRunTwice(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	// Use realistic multi-token titles so within-batch dedup doesn't
+	// confound the across-batch acceptance check.
+	out := &EditorOutput{BacklogProposals: []BacklogProposal{
+		{Title: "Add HUD panel for spawn budgets", Priority: store.P1, Budget: store.Budget{MaxCostUSD: 1}},
+		{Title: "Reconciler idle backoff throttle", Priority: store.P2, Budget: store.Budget{MaxCostUSD: 1}},
+		{Title: "Council backlog dedup with Jaccard", Priority: store.P2, Budget: store.Budget{MaxCostUSD: 1}},
+	}}
+
+	first, err := m.Apply(context.Background(), "COUNCIL-D", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if len(first.CreatedItems) != 3 {
+		t.Fatalf("first run: created=%d want 3", len(first.CreatedItems))
+	}
+	if len(first.DuplicatesSkipped) != 0 {
+		t.Fatalf("first run: dedup_skipped=%d want 0", len(first.DuplicatesSkipped))
+	}
+
+	// Second run with the same proposals — every one should dedup.
+	second, err := m.Apply(context.Background(), "COUNCIL-E", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if len(second.CreatedItems) != 0 {
+		t.Errorf("second run: created=%d want 0", len(second.CreatedItems))
+	}
+	if len(second.DuplicatesSkipped) != 3 {
+		t.Errorf("second run: dedup_skipped=%d want 3", len(second.DuplicatesSkipped))
+	}
+	for _, d := range second.DuplicatesSkipped {
+		if d.JaccardScore < 0.99 {
+			t.Errorf("identical title: jaccard=%v want ~1", d.JaccardScore)
+		}
+	}
+
+	// Canonical store still holds exactly the first three items.
+	all, _ := st.Backlog.List(context.Background())
+	if len(all) != 3 {
+		t.Errorf("backlog total after second run: got %d want 3", len(all))
+	}
+}
+
+// TestApply_DedupWithinBatch ensures two near-identical proposals in the
+// SAME Apply call dedup against each other (the second one should drop).
+func TestApply_DedupWithinBatch(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	out := &EditorOutput{BacklogProposals: []BacklogProposal{
+		{Title: "Add HUD panel for spawn budgets", Priority: store.P1, Budget: store.Budget{MaxCostUSD: 1}},
+		{Title: "Add HUD panel for the spawn budgets", Priority: store.P1, Budget: store.Budget{MaxCostUSD: 1}}, // near-identical (stopwords stripped)
+		{Title: "Reconciler idle backoff", Priority: store.P2, Budget: store.Budget{MaxCostUSD: 1}},
+	}}
+	res, err := m.Apply(context.Background(), "COUNCIL-N", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 2 {
+		t.Errorf("created=%d want 2", len(res.CreatedItems))
+	}
+	if len(res.DuplicatesSkipped) != 1 {
+		t.Errorf("dedup_skipped=%d want 1", len(res.DuplicatesSkipped))
+	}
+	if got := res.DuplicatesSkipped[0].ProposalIndex; got != 1 {
+		t.Errorf("skipped index: got %d want 1", got)
+	}
+}
+
+// TestApply_DedupRespectsThreshold proves a low threshold catches loose
+// matches and a threshold > 1 disables dedup entirely.
+func TestApply_DedupRespectsThreshold(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	loose := []BacklogProposal{
+		{Title: "Refactor pipeline starter", Priority: store.P2, Budget: store.Budget{MaxCostUSD: 1}},
+		{Title: "Refactor pipeline runner", Priority: store.P2, Budget: store.Budget{MaxCostUSD: 1}},
+	}
+	// At a low threshold these two share enough tokens to dedup.
+	res, err := m.Apply(context.Background(), "COUNCIL-T", &EditorOutput{BacklogProposals: loose},
+		MutationOptions{DedupSimilarityThreshold: 0.3})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 1 || len(res.DuplicatesSkipped) != 1 {
+		t.Errorf("low threshold: created=%d skipped=%d want 1/1", len(res.CreatedItems), len(res.DuplicatesSkipped))
+	}
+
+	// Reset env: at a threshold > 1 dedup is effectively disabled and
+	// both proposals land.
+	m2, _, _ := newMutatorEnv(t)
+	res2, err := m2.Apply(context.Background(), "COUNCIL-C", &EditorOutput{BacklogProposals: loose},
+		MutationOptions{DedupSimilarityThreshold: 1.5})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res2.CreatedItems) != 2 || len(res2.DuplicatesSkipped) != 0 {
+		t.Errorf("disabled threshold: created=%d skipped=%d want 2/0", len(res2.CreatedItems), len(res2.DuplicatesSkipped))
+	}
+}
+
+// TestApply_GrayBandBlocksRecentUnresolvedReMint pins the !970/!978/!980
+// re-mint: the same theme reworded across council runs scores BELOW the hard
+// 0.7 threshold (this live pair is Jaccard 0.6), so the flat dedup let three
+// copies through in two days. The gray band [0.55, threshold) blocks a
+// proposal whose lookalike is RECENT — any state, merged included (#308:
+// six near-identical triage runbooks in five days). Only a stale
+// lookalike never blocks (legit follow-up to long-shipped work).
+func TestApply_GrayBandBlocksRecentUnresolvedReMint(t *testing.T) {
+	// newMutatorEnv pins m.Now to 2026-04-26T12:00Z; seed ages are relative
+	// to that anchor, and the per-subtest council run id must exist for the
+	// backlog_items FK.
+	anchor := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+	env := func(t *testing.T, runID string, state store.BacklogState, age time.Duration) *BacklogMutator {
+		t.Helper()
+		m, st, _ := newMutatorEnv(t)
+		if err := st.Council.Put(context.Background(), &store.CouncilRun{
+			ID: runID, Trigger: store.CouncilTriggerManual,
+			StartedAt: time.Now().UTC(), Outcome: store.CouncilOutcomeSuccess,
+		}); err != nil {
+			t.Fatalf("seed council run: %v", err)
+		}
+		if err := st.Backlog.Put(context.Background(), &store.BacklogItem{
+			ID:        "MILLS-PRIOR-1",
+			Title:     "Add external CI incident classification for GitLab pipeline failures", // !970's item
+			State:     state,
+			Priority:  store.P2,
+			CreatedAt: anchor.Add(-age),
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		return m
+	}
+	reMint := &EditorOutput{BacklogProposals: []BacklogProposal{
+		// !978/!980's phrasing of the same theme — Jaccard 0.6 vs the seed.
+		{Title: "Add GitLab CI external dependency incident classification to Mills", Priority: store.P2, Budget: store.Budget{MaxCostUSD: 1}},
+	}}
+
+	t.Run("recent escalated lookalike blocks", func(t *testing.T) {
+		m := env(t, "COUNCIL-G1", store.BacklogEscalated, 12*time.Hour)
+		res, err := m.Apply(context.Background(), "COUNCIL-G1", reMint, MutationOptions{})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if len(res.CreatedItems) != 0 || len(res.DuplicatesSkipped) != 1 {
+			t.Fatalf("created=%d skipped=%d want 0/1", len(res.CreatedItems), len(res.DuplicatesSkipped))
+		}
+		d := res.DuplicatesSkipped[0]
+		if d.SimilarToID != "MILLS-PRIOR-1" {
+			t.Errorf("similar_to = %q want MILLS-PRIOR-1", d.SimilarToID)
+		}
+		if d.JaccardScore >= 0.7 || d.JaccardScore < 0.55 {
+			t.Errorf("score %v should sit in the gray band [0.55, 0.7)", d.JaccardScore)
+		}
+	})
+
+	t.Run("recently merged lookalike blocks", func(t *testing.T) {
+		// The council's brief doesn't know last week's item shipped, so it
+		// re-proposes the same deliverable reworded — main accumulated six
+		// near-identical CI triage runbooks in five days (#308) while merged
+		// candidates were exempt from the gray band.
+		m := env(t, "COUNCIL-G2", store.BacklogMerged, 12*time.Hour)
+		res, err := m.Apply(context.Background(), "COUNCIL-G2", reMint, MutationOptions{})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if len(res.CreatedItems) != 0 || len(res.DuplicatesSkipped) != 1 {
+			t.Errorf("created=%d skipped=%d want 0/1 (recently shipped theme = re-mint)", len(res.CreatedItems), len(res.DuplicatesSkipped))
+		}
+	})
+
+	t.Run("old merged lookalike does not block", func(t *testing.T) {
+		m := env(t, "COUNCIL-G5", store.BacklogMerged, 8*24*time.Hour)
+		res, err := m.Apply(context.Background(), "COUNCIL-G5", reMint, MutationOptions{})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if len(res.CreatedItems) != 1 || len(res.DuplicatesSkipped) != 0 {
+			t.Errorf("created=%d skipped=%d want 1/0 (successor to long-shipped work = legit follow-up)", len(res.CreatedItems), len(res.DuplicatesSkipped))
+		}
+	})
+
+	t.Run("stale unresolved lookalike does not block", func(t *testing.T) {
+		m := env(t, "COUNCIL-G3", store.BacklogEscalated, 8*24*time.Hour)
+		res, err := m.Apply(context.Background(), "COUNCIL-G3", reMint, MutationOptions{})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if len(res.CreatedItems) != 1 || len(res.DuplicatesSkipped) != 0 {
+			t.Errorf("created=%d skipped=%d want 1/0 (a week-old wedge shouldn't suppress fresh attempts)", len(res.CreatedItems), len(res.DuplicatesSkipped))
+		}
+	})
+
+	t.Run("genuinely different theme does not block", func(t *testing.T) {
+		m := env(t, "COUNCIL-G4", store.BacklogEscalated, 12*time.Hour)
+		res, err := m.Apply(context.Background(), "COUNCIL-G4", &EditorOutput{BacklogProposals: []BacklogProposal{
+			// !971's phrasing — sub-floor similarity, distinct work.
+			{Title: "Render non-speculative escalations for external dependency incidents", Priority: store.P2, Budget: store.Budget{MaxCostUSD: 1}},
+		}}, MutationOptions{})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if len(res.CreatedItems) != 1 || len(res.DuplicatesSkipped) != 0 {
+			t.Errorf("created=%d skipped=%d want 1/0", len(res.CreatedItems), len(res.DuplicatesSkipped))
+		}
+	})
+}
+
+// stubPlanAuthor records AuthorPlan calls and returns a canned id/err so
+// the S7b-γ inline-authoring tests can assert born-linked behaviour
+// without standing up the MCP hub.
+type stubPlanAuthor struct {
+	planID  string
+	err     error
+	calls   int
+	gotIDs  []string
+	project string
+}
+
+func (s *stubPlanAuthor) AuthorPlan(_ context.Context, item *store.BacklogItem, project string) (string, error) {
+	s.calls++
+	s.gotIDs = append(s.gotIDs, item.ID)
+	s.project = project
+	return s.planID, s.err
+}
+
+// TestApply_InlinePlanAuthoring_BornLinked: with a PlanAuthor set, each
+// created item is stamped with the returned plan_id and the canonical
+// store reflects the link (born linked, single write).
+func TestApply_InlinePlanAuthoring_BornLinked(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	author := &stubPlanAuthor{planID: "plan-mills-x"}
+	m.PlanAuthor = author
+	m.Project = "services/loom-core"
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(2)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if author.calls != 2 {
+		t.Fatalf("author calls: got %d want 2", author.calls)
+	}
+	if author.project != "services/loom-core" {
+		t.Errorf("project: got %q want services/loom-core", author.project)
+	}
+	for _, item := range res.CreatedItems {
+		if item.PlanID != "plan-mills-x" {
+			t.Errorf("item %s PlanID: got %q want plan-mills-x", item.ID, item.PlanID)
+		}
+		// Persisted row carries the link too (born linked).
+		got, gErr := st.Backlog.Get(context.Background(), item.ID)
+		if gErr != nil {
+			t.Fatalf("get %s: %v", item.ID, gErr)
+		}
+		if got.PlanID != "plan-mills-x" {
+			t.Errorf("stored %s PlanID: got %q want plan-mills-x", item.ID, got.PlanID)
+		}
+	}
+}
+
+// TestApply_InlinePlanAuthoring_NilAuthorNoop: without a PlanAuthor the
+// mutator behaves exactly as before (no PlanID, items still created) —
+// proving the flag-off path is zero behaviour change.
+func TestApply_InlinePlanAuthoring_NilAuthorNoop(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(1)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 1 {
+		t.Fatalf("created: got %d want 1", len(res.CreatedItems))
+	}
+	if res.CreatedItems[0].PlanID != "" {
+		t.Errorf("PlanID: got %q want empty", res.CreatedItems[0].PlanID)
+	}
+}
+
+// TestApply_InlinePlanAuthoring_AuthorErrorStillPersists: an author
+// failure is best-effort — the item still persists, just unlinked (the
+// boot backfill links it later). Authoring must never block creation.
+func TestApply_InlinePlanAuthoring_AuthorErrorStillPersists(t *testing.T) {
+	m, st, _ := newMutatorEnv(t)
+	m.PlanAuthor = &stubPlanAuthor{err: errors.New("hub unreachable")}
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(1)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 1 {
+		t.Fatalf("created: got %d want 1", len(res.CreatedItems))
+	}
+	item := res.CreatedItems[0]
+	if item.PlanID != "" {
+		t.Errorf("PlanID: got %q want empty (author failed)", item.PlanID)
+	}
+	if _, gErr := st.Backlog.Get(context.Background(), item.ID); gErr != nil {
+		t.Errorf("item not persisted after author error: %v", gErr)
+	}
+}
+
+// TestApply_InlinePlanAuthoring_EmptyPlanIDLeavesUnlinked: an author that
+// returns ("", nil) leaves the item unlinked rather than stamping an
+// empty id.
+func TestApply_InlinePlanAuthoring_EmptyPlanIDLeavesUnlinked(t *testing.T) {
+	m, _, _ := newMutatorEnv(t)
+	m.PlanAuthor = &stubPlanAuthor{planID: ""}
+
+	out := &EditorOutput{BacklogProposals: sampleProposals(1)}
+	res, err := m.Apply(context.Background(), "COUNCIL-X", out, MutationOptions{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.CreatedItems[0].PlanID != "" {
+		t.Errorf("PlanID: got %q want empty", res.CreatedItems[0].PlanID)
+	}
+}
+
+// TestApply_StripsInvalidWorkflowTemplateSelection: the S7 authoring-side
+// guard. A proposal selecting a template outside the closed registry lands as
+// a normal DAG item (selection fields stripped); a valid selection survives
+// verbatim so admission-side resolution can freeze it.
+func TestApply_StripsInvalidWorkflowTemplateSelection(t *testing.T) {
+	m, _, repo := newMutatorEnv(t)
+
+	proposals := sampleProposals(2)
+	proposals[0].Policy.WorkflowTemplate = "implement-gate"
+	proposals[0].Policy.WorkflowTemplateVersion = "v1"
+	proposals[0].Policy.WorkflowParams = map[string]float64{"budget_usd": 0.5}
+	proposals[1].Policy.WorkflowTemplate = "no-such-template"
+	proposals[1].Policy.WorkflowTemplateVersion = "v1"
+	proposals[1].Policy.WorkflowParams = map[string]float64{"budget_usd": 0.5}
+
+	out := &EditorOutput{BacklogProposals: proposals}
+	res, err := m.Apply(context.Background(), "COUNCIL-Y", out, MutationOptions{RepoRoot: repo})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.CreatedItems) != 2 {
+		t.Fatalf("created: got %d want 2 (invalid selection must strip, not drop)", len(res.CreatedItems))
+	}
+	valid, invalid := res.CreatedItems[0], res.CreatedItems[1]
+	if valid.Policy.WorkflowTemplate != "implement-gate" || valid.Policy.WorkflowTemplateVersion != "v1" {
+		t.Fatalf("valid selection did not survive: %+v", valid.Policy)
+	}
+	if invalid.Policy.WorkflowTemplate != "" || invalid.Policy.WorkflowTemplateVersion != "" ||
+		invalid.Policy.WorkflowParams != nil || invalid.Policy.WorkflowEnums != nil {
+		t.Fatalf("invalid selection was not stripped: %+v", invalid.Policy)
+	}
+}

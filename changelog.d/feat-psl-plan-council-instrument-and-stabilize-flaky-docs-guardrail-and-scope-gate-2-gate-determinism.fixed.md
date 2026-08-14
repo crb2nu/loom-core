@@ -1,0 +1,1 @@
+- Canonicalize and deduplicate gate inputs in `pkg/mills/gates/docs_guardrail.go` and `pkg/mills/gates/scope.go` so docs and scope verdicts remain stable across reordered or differently spelled paths.

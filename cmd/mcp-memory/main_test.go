@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestMemoryServer() *memoryServer {
@@ -14,6 +18,82 @@ func newTestMemoryServer() *memoryServer {
 		},
 		autoSave: false, // skip disk writes in tests
 	}
+}
+
+// TestAutoSaveDoesNotDeadlock guards against reintroducing the reentrant-lock
+// wedge: mutating handlers hold m.mu.Lock() while persisting, so the persist
+// path must not re-acquire m.mu. With autoSave=true (production default) the
+// first create_entities call would hang forever if it did. A per-run timeout
+// converts that hang into a visible failure instead of a stuck test binary.
+func TestAutoSaveDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	m := &memoryServer{
+		graph: &KnowledgeGraph{
+			Entities:  make(map[string]*Entity),
+			Relations: make([]*Relation, 0),
+		},
+		filePath: filepath.Join(dir, "graph.json"),
+		autoSave: true,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.handleCreateEntities(context.Background(), map[string]any{
+			"entities": []any{
+				map[string]any{"name": "Go", "entityType": "language"},
+			},
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("create_entities deadlocked with autoSave=true (persist path re-locked m.mu)")
+	}
+
+	// The graph must have landed atomically on disk.
+	data, err := os.ReadFile(m.filePath)
+	if err != nil {
+		t.Fatalf("graph file not written: %v", err)
+	}
+	var g KnowledgeGraph
+	if err := json.Unmarshal(data, &g); err != nil {
+		t.Fatalf("persisted graph is not valid JSON: %v", err)
+	}
+	if _, ok := g.Entities["Go"]; !ok {
+		t.Fatalf("expected persisted entity Go, got %v", g.Entities)
+	}
+}
+
+// TestLoadNullMapsReinitializes guards the nil-map panic path: a file with
+// JSON null maps must load into usable (non-nil) maps.
+func TestLoadNullMapsReinitializes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph.json")
+	if err := os.WriteFile(path, []byte(`{"entities": null, "relations": null}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m := &memoryServer{
+		graph:    &KnowledgeGraph{},
+		filePath: path,
+		autoSave: false,
+	}
+	if err := m.load(); err != nil {
+		t.Fatalf("load returned error: %v", err)
+	}
+	if m.graph.Entities == nil || m.graph.Relations == nil {
+		t.Fatalf("expected non-nil maps after load, got entities=%v relations=%v", m.graph.Entities, m.graph.Relations)
+	}
+	// Assigning into the map must not panic.
+	m.graph.Entities["x"] = &Entity{Name: "x", EntityType: "t"}
 }
 
 func TestHandleCreateEntities(t *testing.T) {

@@ -10,9 +10,11 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/pathsec"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -37,9 +39,27 @@ func run(ctx context.Context) error {
 	}
 
 	logger := mcplog.NewDefault()
+	tp,
+		shutdownTracer,
+
+		err :=
+		mcpotel.InitTracer(ctx, "mcp-git-worktree",
+
+			logger)
+	if err != nil {
+		logger.
+			Warn("OTel tracer init failed", "error",
+				err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-git-worktree")
+
 	logger.Info("starting server", "name", "mcp-git-worktree", "version", version, "repo", defaultRepo)
 
 	server := mcp.NewServer("mcp-git-worktree", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Git worktree management")
 
 	// Tools
@@ -55,7 +75,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleList)
+	}, mcpotel.TracedToolHandler(tracer, "git_worktree_list", handleList))
 
 	server.AddTool(mcp.Tool{
 		Name:        "git_worktree_add",
@@ -64,7 +84,7 @@ func run(ctx context.Context) error {
 			Type: "object",
 			Properties: map[string]any{
 				"repo_path":     map[string]any{"type": "string", "description": "Path to the git repository. Defaults to server default."},
-				"path":          map[string]any{"type": "string", "description": "Relative path for worktree"},
+				"path":          map[string]any{"type": "string", "description": "Worktree path relative to the repo root. Sibling paths like ../repo-feature are allowed."},
 				"branch":        map[string]any{"type": "string", "description": "Branch to check out"},
 				"create_branch": map[string]any{"type": "boolean", "description": "Create branch from start_point"},
 				"start_point":   map[string]any{"type": "string", "description": "Commit/branch/tag to base new branch on"},
@@ -72,7 +92,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"path"},
 		},
-	}, handleAdd)
+	}, mcpotel.TracedToolHandler(tracer, "git_worktree_add", handleAdd))
 
 	server.AddTool(mcp.Tool{
 		Name:        "git_worktree_remove",
@@ -81,12 +101,12 @@ func run(ctx context.Context) error {
 			Type: "object",
 			Properties: map[string]any{
 				"repo_path": map[string]any{"type": "string", "description": "Path to the git repository. Defaults to server default."},
-				"path":      map[string]any{"type": "string", "description": "Relative path to remove"},
+				"path":      map[string]any{"type": "string", "description": "Worktree path relative to the repo root. Sibling paths like ../repo-feature are allowed."},
 				"force":     map[string]any{"type": "boolean", "description": "Force removal"},
 			},
 			Required: []string{"path"},
 		},
-	}, handleRemove)
+	}, mcpotel.TracedToolHandler(tracer, "git_worktree_remove", handleRemove))
 
 	server.AddTool(mcp.Tool{
 		Name:        "git_worktree_prune",
@@ -98,7 +118,7 @@ func run(ctx context.Context) error {
 				"dry_run":   map[string]any{"type": "boolean", "description": "Show what would be pruned"},
 			},
 		},
-	}, handlePrune)
+	}, mcpotel.TracedToolHandler(tracer, "git_worktree_prune", handlePrune))
 
 	return server.Run(ctx)
 }
@@ -146,6 +166,25 @@ func runGit(ctx context.Context, repoPath string, args ...string) (string, error
 		return "", fmt.Errorf("git %s failed: %v, output: %s", args[0], err, string(out))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func resolveWorktreePath(repoPath, worktreePath string) (string, error) {
+	targetPath := worktreePath
+	if !filepath.IsAbs(targetPath) {
+		targetPath = filepath.Join(repoPath, worktreePath)
+	}
+
+	absPath, err := filepath.Abs(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid worktree path: %w", err)
+	}
+
+	allowedRoot := filepath.Dir(repoPath)
+	if err := pathsec.ValidatePath(absPath, allowedRoot); err != nil {
+		return "", fmt.Errorf("path must stay within repository parent %q: %w", allowedRoot, err)
+	}
+
+	return absPath, nil
 }
 
 func sanitizedGitEnv(envVars []string) []string {
@@ -239,10 +278,9 @@ func handleAdd(ctx context.Context, args map[string]any) (*mcp.CallToolResult, e
 		return mcp.ErrorResult(err), nil
 	}
 
-	// Validate path is inside repo
-	absPath := filepath.Join(resolvedRepoPath, path)
-	if err := pathsec.ValidatePath(absPath, resolvedRepoPath); err != nil {
-		return mcp.ErrorResult(fmt.Errorf("path must be inside repository: %w", err)), nil
+	absPath, err := resolveWorktreePath(resolvedRepoPath, path)
+	if err != nil {
+		return mcp.ErrorResult(err), nil
 	}
 	if absPath == resolvedRepoPath {
 		return mcp.ErrorResult(fmt.Errorf("cannot add worktree at repository root")), nil
@@ -300,9 +338,9 @@ func handleRemove(ctx context.Context, args map[string]any) (*mcp.CallToolResult
 		return mcp.ErrorResult(err), nil
 	}
 
-	absPath := filepath.Join(resolvedRepoPath, path)
-	if err := pathsec.ValidatePath(absPath, resolvedRepoPath); err != nil {
-		return mcp.ErrorResult(fmt.Errorf("path must be inside repository: %w", err)), nil
+	absPath, err := resolveWorktreePath(resolvedRepoPath, path)
+	if err != nil {
+		return mcp.ErrorResult(err), nil
 	}
 	if absPath == resolvedRepoPath {
 		return mcp.ErrorResult(fmt.Errorf("cannot remove main repository worktree")), nil

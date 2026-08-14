@@ -2,12 +2,26 @@
 package daemon
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// validAuthTypes lists accepted values for HTTP.Auth.Type.
+var validAuthTypes = map[string]bool{
+	"":       true, // none / localhost-only
+	"token":  true,
+	"oidc":   true,
+	"mtls":   true,
+	"oauth2": true,
+}
 
 // FileConfig represents the daemon configuration file structure.
 // This file can be updated by the VS Code extension to control daemon behavior.
@@ -55,8 +69,141 @@ type FileConfig struct {
 	// Routing controls per-server routing preferences
 	Routing RoutingConfig `yaml:"routing,omitempty"`
 
+	// HUD configures agent HUD connectivity for CLI commands
+	HUD HUDConfig `yaml:"hud,omitempty"`
+
+	// SchemaValidation controls input schema validation for tool calls.
+	SchemaValidation SchemaValidationConfig `yaml:"schema_validation,omitempty"`
+
+	// OutputScanning controls PII/secret scanning of tool responses.
+	OutputScanning OutputScanningConfig `yaml:"output_scanning,omitempty"`
+
+	// OTel configures OpenTelemetry trace export for daemon lifecycle and call pipeline.
+	OTel OTelConfig `yaml:"otel,omitempty"`
+
+	// HubDelegate controls which servers are delegated to the hub instead of
+	// running as local subprocesses. When the hub is healthy and a server is
+	// in the delegate list, calls are routed through the hub automatically.
+	HubDelegate HubDelegateConfig `yaml:"hub_delegate,omitempty"`
+
+	// EmbeddedHUD controls the embedded HUD application within the daemon process.
+	EmbeddedHUD EmbeddedHUDConfig `yaml:"embedded_hud,omitempty"`
+
 	// Debug enables debug logging
 	Debug bool `yaml:"debug"`
+}
+
+// EmbeddedHUDConfig controls the embedded HUD application within the daemon.
+type EmbeddedHUDConfig struct {
+	Enabled                           bool    `yaml:"enabled"`
+	AdminToken                        string  `yaml:"admin_token,omitempty"`
+	MobileOperatorToken               string  `yaml:"mobile_operator_token,omitempty"`
+	MobileOperatorScopes              string  `yaml:"mobile_operator_scopes,omitempty"`
+	SpawnEnabled                      bool    `yaml:"spawn_enabled"`
+	SpawnControllerID                 string  `yaml:"spawn_controller_id,omitempty"`
+	SpawnRecoveryAuthority            bool    `yaml:"spawn_recovery_authority,omitempty"`
+	SpawnNamespace                    string  `yaml:"spawn_namespace,omitempty"`
+	SpawnRegistry                     string  `yaml:"spawn_registry,omitempty"`
+	SpawnSyncMode                     string  `yaml:"spawn_sync_mode,omitempty"`
+	SpawnGitBaseURL                   string  `yaml:"spawn_git_base_url,omitempty"`
+	SpawnGitSecret                    string  `yaml:"spawn_git_secret,omitempty"`
+	SpawnGitCloneImage                string  `yaml:"spawn_git_clone_image,omitempty"`
+	SpawnProjects                     string  `yaml:"spawn_projects,omitempty"`
+	SpawnDefaultCPU                   float64 `yaml:"spawn_default_cpu,omitempty"`
+	SpawnDefaultMemory                int     `yaml:"spawn_default_memory_mb,omitempty"`
+	SpawnMaxConcurrent                int     `yaml:"spawn_max_concurrent,omitempty"`
+	SpawnMaxConcurrentBuilds          int     `yaml:"spawn_max_concurrent_builds,omitempty"`
+	SpawnBuildCPURequest              string  `yaml:"spawn_build_cpu_request,omitempty"`
+	SpawnBuildCPULimit                string  `yaml:"spawn_build_cpu_limit,omitempty"`
+	SpawnBuildMemoryRequest           string  `yaml:"spawn_build_memory_request,omitempty"`
+	SpawnBuildMemoryLimit             string  `yaml:"spawn_build_memory_limit,omitempty"`
+	SpawnBuildEphemeralStorageRequest string  `yaml:"spawn_build_ephemeral_storage_request,omitempty"`
+	SpawnBuildEphemeralStorageLimit   string  `yaml:"spawn_build_ephemeral_storage_limit,omitempty"`
+	SpawnBuildAvoidNodes              string  `yaml:"spawn_build_avoid_nodes,omitempty"`
+
+	// harvester-vm substrate (Slice 2d / harvester-vm rollout). Empty
+	// SpawnHarvesterKubeconfig leaves the substrate unregistered and all
+	// harvester-vm spawns fall back to k8s. These mirror the hud.Config
+	// fields the `loom hud` command wires in cmd/loom/hud.go so the
+	// prod daemon path (loomd → startEmbeddedHUD) can register the
+	// substrate from SPAWN_HARVESTER_* env injection.
+	SpawnHarvesterKubeconfig       string `yaml:"spawn_harvester_kubeconfig,omitempty"`
+	SpawnHarvesterBaseImage        string `yaml:"spawn_harvester_base_image,omitempty"`
+	SpawnHarvesterNamespace        string `yaml:"spawn_harvester_namespace,omitempty"`
+	SpawnHarvesterStorageClass     string `yaml:"spawn_harvester_storage_class,omitempty"`
+	SpawnHarvesterNetworkAttachDef string `yaml:"spawn_harvester_network_attach_def,omitempty"`
+	SpawnHarvesterDefaultVCPUs     int    `yaml:"spawn_harvester_default_vcpus,omitempty"`
+	SpawnHarvesterDefaultMemMi     int    `yaml:"spawn_harvester_default_mem_mi,omitempty"`
+	SpawnHarvesterDefaultDiskGi    int    `yaml:"spawn_harvester_default_disk_gi,omitempty"`
+	SpawnHarvesterSSHUser          string `yaml:"spawn_harvester_ssh_user,omitempty"`
+
+	PipelineProjects string `yaml:"pipeline_projects,omitempty"`
+	BindAddress      string `yaml:"bind_address,omitempty"`
+
+	// MetricsAddr is the daemon's Prometheus /metrics + /events host:port
+	// (e.g., "127.0.0.1:9876"), which the embedded HUD proxies for the
+	// Request Metrics card (GET /api/daemon-metrics). loomd serves this at
+	// `--metrics-addr` (default 127.0.0.1:9876, always also exposed as a
+	// compat endpoint). Empty ⇒ buildEmbeddedHUDConfig falls back to
+	// LOOM_DAEMON_METRICS_ADDR, then the 127.0.0.1:9876 default.
+	MetricsAddr string `yaml:"metrics_addr,omitempty"`
+
+	FlexInferURL      string `yaml:"flexinfer_url,omitempty"`
+	FlexInferProxyURL string `yaml:"flexinfer_proxy_url,omitempty"`
+	FlexInferKey      string `yaml:"flexinfer_key,omitempty"`
+	CoordinatorModel  string `yaml:"coordinator_model,omitempty"`
+
+	// AutofixEnabled turns on the LLM-powered pipeline auto-fix engine
+	// (/api/autofix/* mutations). Default off until soak; the routes serve
+	// honest empty/503 states while disabled. Env fallback: HUD_AUTOFIX_ENABLED.
+	AutofixEnabled bool `yaml:"autofix_enabled"`
+
+	// Inbound webhook receiver — feeds the GitLab/GitHub CI failure
+	// routing path in internal/hud/domain/webhook. Disabled by default
+	// because the endpoint accepts unauthenticated POSTs from external
+	// systems and depends on token / HMAC verification for safety.
+	WebhookInboundEnabled bool   `yaml:"webhook_inbound_enabled"`
+	WebhookGitLabSecret   string `yaml:"webhook_gitlab_secret,omitempty"`
+	WebhookGitHubSecret   string `yaml:"webhook_github_secret,omitempty"`
+}
+
+// OTelConfig controls OpenTelemetry trace export.
+// Environment variables (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS)
+// take precedence over file-based settings when set.
+type OTelConfig struct {
+	// Endpoint is the OTLP collector endpoint (e.g., "https://cloud.langfuse.com/api/public/otel").
+	Endpoint string `yaml:"endpoint,omitempty"`
+
+	// Protocol selects the OTLP transport: "http" (default) or "grpc".
+	Protocol string `yaml:"protocol,omitempty"`
+
+	// Headers are additional HTTP headers sent with each export (e.g., "Authorization=Basic ...").
+	Headers map[string]string `yaml:"headers,omitempty"`
+
+	// SampleRate is the trace sampling ratio (0.0–1.0). Default: 1.0 (sample all).
+	SampleRate *float64 `yaml:"sample_rate,omitempty"`
+
+	// ServiceName overrides the default service name ("loomd").
+	ServiceName string `yaml:"service_name,omitempty"`
+}
+
+// HUDConfig controls how `loom agent` CLI commands connect to the HUD.
+type HUDConfig struct {
+	// URL is the full HUD base URL (e.g., "https://192.168.50.227").
+	// When set, overrides the default http://127.0.0.1:{port}.
+	URL string `yaml:"url,omitempty"`
+
+	// Host is the Host header override for internal ingress access.
+	// Required when URL points to an IP-based ingress (e.g., "hud.flexinfer.ai").
+	Host string `yaml:"host,omitempty"`
+
+	// CFAccessClientID for Cloudflare Access authentication to the HUD.
+	// Falls back to hub.cf_access_client_id if not set.
+	CFAccessClientID string `yaml:"cf_access_client_id,omitempty"`
+
+	// CFAccessClientSecret for Cloudflare Access authentication to the HUD.
+	// Falls back to hub.cf_access_client_secret if not set.
+	CFAccessClientSecret string `yaml:"cf_access_client_secret,omitempty"`
 }
 
 // HTTPConfig controls the Streamable HTTP listener.
@@ -175,8 +322,11 @@ type ResourceConfig struct {
 	// PoolMaxIdle is the maximum idle connections per server for the local pool (default: 2)
 	PoolMaxIdle int `yaml:"pool_max_idle,omitempty"`
 
-	// PoolMaxOpen is the maximum open connections per server for the local pool (default: 10)
+	// PoolMaxOpen is the maximum open connections per server for the local pool (default: 25)
 	PoolMaxOpen int `yaml:"pool_max_open,omitempty"`
+
+	// PoolWaitTimeout is the duration to wait when pool is exhausted before returning error (default: 5s, 0 = immediate error)
+	PoolWaitTimeout string `yaml:"pool_wait_timeout,omitempty"`
 
 	// PoolIdleTimeoutMinutes is the idle timeout for local pool connections (default: 5)
 	PoolIdleTimeoutMinutes int `yaml:"pool_idle_timeout_minutes,omitempty"`
@@ -192,6 +342,23 @@ type ResourceConfig struct {
 
 	// RefreshConcurrency is the max parallel server refreshes during tool cache updates (default: 6)
 	RefreshConcurrency int `yaml:"refresh_concurrency,omitempty"`
+
+	// MaxConcurrentCalls is the daemon-wide cap on simultaneous in-flight tool calls (0 = unlimited)
+	MaxConcurrentCalls int `yaml:"max_concurrent_calls,omitempty"`
+
+	// PoolStaleThresholdSeconds is how long an idle pool connection can sit before
+	// being discarded on next Get. Default 120 (2 min). Set to -1 to disable.
+	PoolStaleThresholdSeconds int `yaml:"pool_stale_threshold_seconds,omitempty"`
+
+	// ResidentServers are server names exempt from idle-reaping because they
+	// hold long-lived in-memory working state or run continuous background
+	// reconciliation (e.g. agent_context's session reaper / presence cleanup,
+	// codebase_memory's file watches). Reaping them on idle only causes
+	// reload/respawn churn and can strand background work. When unset, defaults
+	// to agent_context + codebase_memory. Override here or via
+	// LOOM_RESIDENT_SERVERS (comma-separated); a single value of "none"
+	// disables the exemption entirely.
+	ResidentServers []string `yaml:"resident_servers,omitempty"`
 }
 
 // ContextConfig controls tool filtering and profile selection.
@@ -238,6 +405,12 @@ type HubConfig struct {
 	// PingIntervalSeconds for keepalive pings (default: 30)
 	PingIntervalSeconds int `yaml:"ping_interval_seconds,omitempty"`
 
+	// MaxMissedPongs retires a connection after this many unanswered probes (default: 2).
+	MaxMissedPongs int `yaml:"max_missed_pongs,omitempty"`
+
+	// MaxReconnectBackoffSeconds caps exponential reconnect delay (default: 30).
+	MaxReconnectBackoffSeconds int `yaml:"max_reconnect_backoff_seconds,omitempty"`
+
 	// MaxRetries before giving up on hub connection (default: 3)
 	MaxRetries int `yaml:"max_retries,omitempty"`
 }
@@ -251,6 +424,11 @@ type HealthConfig struct {
 	// Between deep probes, lightweight pool-based probes are used to reduce
 	// CPU/memory churn. Set to 0 to always use deep probes.
 	DeepProbeIntervalMinutes int `yaml:"deep_probe_interval_minutes,omitempty"`
+
+	// DeepProbeTimeoutSeconds bounds a single deep (process-spawning) probe
+	// (default: 30). A higher value tolerates slow subprocess starts under load
+	// without falsely marking a healthy server unhealthy.
+	DeepProbeTimeoutSeconds int `yaml:"deep_probe_timeout_seconds,omitempty"`
 
 	// HealthyThreshold consecutive successes to mark healthy (default: 2)
 	HealthyThreshold int `yaml:"healthy_threshold,omitempty"`
@@ -266,6 +444,16 @@ type HealthConfig struct {
 
 	// RestartCooldownMinutes between restart attempts (default: 5)
 	RestartCooldownMinutes int `yaml:"restart_cooldown_minutes,omitempty"`
+
+	// RestartPressureThreshold is the number of distinct servers failing a probe
+	// within RestartPressureWindowSeconds that suppresses auto-restart as
+	// systemic rather than a single broken process (default: 3). Set to a
+	// negative value to disable hysteresis (always restart on threshold).
+	RestartPressureThreshold int `yaml:"restart_pressure_threshold,omitempty"`
+
+	// RestartPressureWindowSeconds is the rolling window for the systemic
+	// failure-pressure signal (default: 60).
+	RestartPressureWindowSeconds int `yaml:"restart_pressure_window_seconds,omitempty"`
 }
 
 // ToHealthMonitorConfig converts HealthConfig to HealthMonitorConfig,
@@ -298,6 +486,17 @@ func (c *HealthConfig) ToHealthMonitorConfig() HealthMonitorConfig {
 	} else if c.DeepProbeIntervalMinutes < 0 {
 		cfg.DeepProbeInterval = 0 // explicit disable → always deep probe
 	}
+	if c.DeepProbeTimeoutSeconds > 0 {
+		cfg.DeepProbeTimeout = time.Duration(c.DeepProbeTimeoutSeconds) * time.Second
+	}
+	if c.RestartPressureThreshold > 0 {
+		cfg.RestartPressureThreshold = c.RestartPressureThreshold
+	} else if c.RestartPressureThreshold < 0 {
+		cfg.RestartPressureThreshold = 0 // explicit disable → always restart on threshold
+	}
+	if c.RestartPressureWindowSeconds > 0 {
+		cfg.RestartPressureWindow = time.Duration(c.RestartPressureWindowSeconds) * time.Second
+	}
 	return cfg
 }
 
@@ -315,8 +514,28 @@ type ProxyConfig struct {
 	// HeartbeatIntervalMs is the minimum interval between proxy heartbeats (default: 5000)
 	HeartbeatIntervalMs int `yaml:"heartbeat_interval_ms,omitempty"`
 
+	// IdleHeartbeatIntervalMs is the session keepalive interval when the proxy
+	// has been idle (no forwarded calls) for more than 30 seconds (default: 30000).
+	IdleHeartbeatIntervalMs int `yaml:"idle_heartbeat_interval_ms,omitempty"`
+
 	// IdleExitSeconds is how long an idle proxy waits for MCP messages before exiting (default: 1800)
 	IdleExitSeconds int `yaml:"idle_exit_seconds,omitempty"`
+
+	// ToolCaps overrides MaxToolResultBytes for specific proxied tools or
+	// whole servers. The most specific match wins: an entry with both
+	// server and tool beats a server-wide entry (Tool empty or "*"), which
+	// beats the global MaxToolResultBytes. Use it to cap a verbose tool
+	// flagged by the flightdeck bench (e.g. gitlab/list_pipeline_jobs)
+	// without lowering the global limit.
+	ToolCaps []ToolCap `yaml:"tool_caps,omitempty"`
+}
+
+// ToolCap caps the text size of a single proxied tool's result, or of all
+// tools on a server when Tool is empty or "*". MaxBytes <= 0 is ignored.
+type ToolCap struct {
+	Server   string `yaml:"server"`
+	Tool     string `yaml:"tool,omitempty"`
+	MaxBytes int    `yaml:"max_bytes"`
 }
 
 // RoutingConfig controls per-server routing preferences.
@@ -324,15 +543,20 @@ type RoutingConfig struct {
 	// Preferences maps server names to routing preference strings.
 	// Valid values: "local-only", "hub-only", "prefer-local", "prefer-hub", "health-based"
 	Preferences map[string]string `yaml:"preferences,omitempty"`
+
+	// Timeouts maps server names to tool-call timeout durations.
+	// Overrides the default 60s daemon RPC timeout for long-running servers.
+	// Values are Go duration strings (e.g., "5m", "300s").
+	Timeouts map[string]string `yaml:"timeouts,omitempty"`
 }
 
 // GetPoolConfig returns a pool.Config for the local connection pool.
-func (c *ResourceConfig) GetPoolConfig() (maxIdle, maxOpen int, idleTimeout time.Duration) {
+func (c *ResourceConfig) GetPoolConfig() (maxIdle, maxOpen int, idleTimeout, waitTimeout time.Duration) {
 	maxIdle = 2
 	if c.PoolMaxIdle > 0 {
 		maxIdle = c.PoolMaxIdle
 	}
-	maxOpen = 10
+	maxOpen = 25
 	if c.PoolMaxOpen > 0 {
 		maxOpen = c.PoolMaxOpen
 	}
@@ -340,16 +564,22 @@ func (c *ResourceConfig) GetPoolConfig() (maxIdle, maxOpen int, idleTimeout time
 	if c.PoolIdleTimeoutMinutes > 0 {
 		idleTimeout = time.Duration(c.PoolIdleTimeoutMinutes) * time.Minute
 	}
+	waitTimeout = 5 * time.Second
+	if c.PoolWaitTimeout != "" {
+		if d, err := time.ParseDuration(c.PoolWaitTimeout); err == nil {
+			waitTimeout = d
+		}
+	}
 	return
 }
 
 // GetHubPoolConfig returns a pool.Config for the hub connection pool.
-func (c *ResourceConfig) GetHubPoolConfig() (maxIdle, maxOpen int, idleTimeout time.Duration) {
+func (c *ResourceConfig) GetHubPoolConfig() (maxIdle, maxOpen int, idleTimeout, waitTimeout time.Duration) {
 	maxIdle = 2
 	if c.HubPoolMaxIdle > 0 {
 		maxIdle = c.HubPoolMaxIdle
 	}
-	maxOpen = 10
+	maxOpen = 25
 	if c.HubPoolMaxOpen > 0 {
 		maxOpen = c.HubPoolMaxOpen
 	}
@@ -357,6 +587,7 @@ func (c *ResourceConfig) GetHubPoolConfig() (maxIdle, maxOpen int, idleTimeout t
 	if c.HubPoolIdleTimeoutMinutes > 0 {
 		idleTimeout = time.Duration(c.HubPoolIdleTimeoutMinutes) * time.Minute
 	}
+	waitTimeout = 5 * time.Second
 	return
 }
 
@@ -368,17 +599,41 @@ func (c *ResourceConfig) GetRefreshConcurrency() int {
 	return 6
 }
 
+// GetMaxConcurrentCalls returns the daemon-wide concurrent call limit.
+// Returns 0 for unlimited (the default).
+func (c *ResourceConfig) GetMaxConcurrentCalls() int {
+	if c.MaxConcurrentCalls < 0 {
+		return 0
+	}
+	return c.MaxConcurrentCalls
+}
+
+// GetPoolStaleThreshold returns the duration after which an idle pool connection
+// is considered stale and discarded before use. Default is 2 minutes.
+// Returns 0 (disabled) when explicitly set to -1.
+func (c *ResourceConfig) GetPoolStaleThreshold() time.Duration {
+	if c.PoolStaleThresholdSeconds < 0 {
+		return 0
+	}
+	if c.PoolStaleThresholdSeconds == 0 {
+		return 2 * time.Minute
+	}
+	return time.Duration(c.PoolStaleThresholdSeconds) * time.Second
+}
+
 // DefaultFileConfig returns the default configuration.
 func DefaultFileConfig() FileConfig {
 	return FileConfig{
 		Hub: HubConfig{
-			URL:                      "wss://mcp.flexinfer.ai/ws",
-			Enabled:                  true,
-			PreferHub:                false,
-			Profile:                  "codex",
-			ReconnectIntervalSeconds: 5,
-			PingIntervalSeconds:      30,
-			MaxRetries:               3,
+			URL:                        "wss://mcp.flexinfer.ai/ws",
+			Enabled:                    true,
+			PreferHub:                  false,
+			Profile:                    "codex",
+			ReconnectIntervalSeconds:   5,
+			PingIntervalSeconds:        30,
+			MaxMissedPongs:             2,
+			MaxReconnectBackoffSeconds: 30,
+			MaxRetries:                 3,
 		},
 		Resources: ResourceConfig{
 			MaxProcesses:       0, // Unlimited
@@ -399,7 +654,10 @@ func DefaultFileConfig() FileConfig {
 		Policy: DefaultGatewayPolicyConfig(),
 		Audit:  DefaultAuditConfig(),
 		Cost:   DefaultCostConfig(),
-		Debug:  false,
+		HubDelegate: HubDelegateConfig{
+			Servers: DefaultHubDelegateServers(),
+		},
+		Debug: false,
 	}
 }
 
@@ -419,33 +677,159 @@ func (c *ResourceConfig) GetManifestTTL() time.Duration {
 	return time.Duration(c.ManifestTTLMinutes) * time.Minute
 }
 
+// defaultResidentServers are exempt from idle-reaping unless overridden. These
+// servers hold long-lived in-memory state or run continuous background work, so
+// reaping them on idle only causes reload/respawn churn.
+var defaultResidentServers = []string{"agent_context", "codebase_memory"}
+
+// GetResidentServers returns the set of server names exempt from idle-reaping.
+// Precedence: LOOM_RESIDENT_SERVERS env (comma-separated) > config
+// ResidentServers > built-in defaults. A single "none" (any source, case-
+// insensitive) disables the exemption entirely.
+func (c *ResourceConfig) GetResidentServers() map[string]bool {
+	names := defaultResidentServers
+	if len(c.ResidentServers) > 0 {
+		names = c.ResidentServers
+	}
+	if env := strings.TrimSpace(os.Getenv("LOOM_RESIDENT_SERVERS")); env != "" {
+		names = strings.Split(env, ",")
+	}
+
+	set := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if strings.EqualFold(n, "none") {
+			return map[string]bool{}
+		}
+		set[n] = true
+	}
+	return set
+}
+
 // LoadConfigFile loads configuration from ~/.config/loom/config.yaml.
 // If the file doesn't exist, it returns the default configuration.
 func LoadConfigFile() (FileConfig, error) {
+	cfg, warnings, err := LoadConfigFileWithWarnings()
+	for _, w := range warnings {
+		slog.Warn(w)
+	}
+	return cfg, err
+}
+
+// LoadConfigFileWithWarnings loads configuration and returns any validation
+// warnings separately (useful for testing without slog side-effects).
+func LoadConfigFileWithWarnings() (FileConfig, []string, error) {
 	configPath := getConfigPath()
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return DefaultFileConfig(), nil
+			cfg := DefaultFileConfig()
+			warnings := applyFileConfigEnvOverrides(&cfg, nil)
+			return cfg, warnings, nil
 		}
-		return FileConfig{}, err
+		return FileConfig{}, nil, err
 	}
 
+	cfg, warnings, err := parseAndValidateConfig(data)
+	if err != nil {
+		return cfg, warnings, err
+	}
+	warnings = applyFileConfigEnvOverrides(&cfg, warnings)
+	return cfg, warnings, nil
+}
+
+func applyFileConfigEnvOverrides(cfg *FileConfig, warnings []string) []string {
+	if cfg == nil {
+		return warnings
+	}
+
+	if value := strings.TrimSpace(os.Getenv("LOOM_AUDIT_ENABLED")); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			warnings = append(warnings,
+				fmt.Sprintf("config: invalid LOOM_AUDIT_ENABLED %q (expected boolean)", value))
+		} else {
+			cfg.Audit.Enabled = enabled
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("LOOM_AUDIT_LOG_PATH")); value != "" {
+		cfg.Audit.LogPath = value
+	}
+
+	return warnings
+}
+
+// parseAndValidateConfig decodes YAML data into FileConfig and returns
+// validation warnings for unknown keys and invalid field values.
+func parseAndValidateConfig(data []byte) (FileConfig, []string, error) {
+	var warnings []string
+
+	// First pass: strict decode to detect unknown keys.
+	var strict FileConfig
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&strict); err != nil {
+		// If the error is about unknown fields, collect it as a warning
+		// and fall through to a lenient parse so the daemon still starts.
+		if strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "unknown") {
+			warnings = append(warnings,
+				fmt.Sprintf("config: unknown key in config.yaml: %v", err))
+		} else {
+			// True syntax error — hard fail.
+			return FileConfig{}, nil, err
+		}
+	}
+
+	// Second pass (or reuse strict result): lenient decode so unknown
+	// keys don't block startup.
 	var cfg FileConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return FileConfig{}, err
+	if len(warnings) == 0 {
+		cfg = strict
+	} else {
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			return FileConfig{}, warnings, err
+		}
 	}
 
-	// Apply defaults for missing values
+	// Apply defaults for missing values.
 	if cfg.Hub.URL == "" {
 		cfg.Hub.URL = "wss://mcp.flexinfer.ai/ws"
 	}
 	if cfg.Hub.Profile == "" {
 		cfg.Hub.Profile = "codex"
 	}
+	if cfg.Hub.ReconnectIntervalSeconds <= 0 {
+		cfg.Hub.ReconnectIntervalSeconds = 5
+	}
+	if cfg.Hub.PingIntervalSeconds <= 0 {
+		cfg.Hub.PingIntervalSeconds = 30
+	}
+	if cfg.Hub.MaxMissedPongs <= 0 {
+		cfg.Hub.MaxMissedPongs = 2
+	}
+	if cfg.Hub.MaxReconnectBackoffSeconds < cfg.Hub.ReconnectIntervalSeconds {
+		cfg.Hub.MaxReconnectBackoffSeconds = 30
+		if cfg.Hub.MaxReconnectBackoffSeconds < cfg.Hub.ReconnectIntervalSeconds {
+			cfg.Hub.MaxReconnectBackoffSeconds = cfg.Hub.ReconnectIntervalSeconds
+		}
+	}
+	if cfg.Hub.MaxRetries <= 0 {
+		cfg.Hub.MaxRetries = 3
+	}
 
-	return cfg, nil
+	// Validate HTTP auth type.
+	if !validAuthTypes[cfg.HTTP.Auth.Type] {
+		warnings = append(warnings,
+			fmt.Sprintf("config: unknown http.auth.type %q (valid: token, oidc, mtls, oauth2, or empty)",
+				cfg.HTTP.Auth.Type))
+	}
+
+	return cfg, warnings, nil
 }
 
 // SaveConfigFile saves configuration to ~/.config/loom/config.yaml.
@@ -466,6 +850,9 @@ func SaveConfigFile(cfg FileConfig) error {
 }
 
 func getConfigPath() string {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		slog.Warn("config: unable to determine home directory, using current directory", "error", err)
+	}
 	return filepath.Join(home, ".config", "loom", "config.yaml")
 }

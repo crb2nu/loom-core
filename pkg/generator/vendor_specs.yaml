@@ -1,0 +1,233 @@
+# vendor_specs.yaml — vendor documentation drift check manifest.
+#
+# Each vendor declares what its current public docs MUST contain and what
+# deprecated/invalid tokens they MUST NOT contain. The `loom vendor-specs
+# check` command fetches `docs_url` (+ optional `extra_urls`), asserts those
+# substrings, and verifies that every `emitted_keys` token appears in
+# pkg/generator/configs_test.go so our fixtures cannot drift away from docs
+# without a failing signal.
+#
+# History:
+#   - Slice G (2026-04-18) shipped after a Codex regression where the
+#     generator emitted `approval_mode = "always"` — not a valid Codex key.
+#   - Refreshed 2026-05-11 against current vendor docs. Replaced the
+#     marketing-only Claude README with the authoritative settings docs page
+#     (code.claude.com/docs/en/settings), pointed Gemini at its docs/hooks
+#     reference, and tightened Codex assertions against the developer portal
+#     config-advanced page.
+#   - Refreshed 2026-07-14 (core-tooling audit). Codex docs 308-redirect from
+#     developers.openai.com/codex/* to learn.chatgpt.com — pins updated to the
+#     new canonical host; Codex removed `approval_policy = "on-failure"` and
+#     made hooks default-on (4 new events: SubagentStart/SubagentStop/
+#     PreCompact/PostCompact). Gemini added `policyPaths`/`adminPolicyPaths`
+#     top-level settings keys (schema root still additionalProperties:false).
+#     Added vscode + opencode vendors; VS Code's mcp.json root key is
+#     "servers", not "mcpServers".
+#
+# Keep this file human-editable. Populate a vendor once you have verified the
+# exact strings in upstream docs, and leave a comment pointing at the anchor
+# if the docs page is long.
+#
+# Operational note: prefer docs URLs that serve the relevant content as
+# static HTML / plain text. Many vendor doc sites are JS-rendered SPAs
+# where a curl fetch returns only a skeleton shell without the keyword
+# content. WebFetch (used by `loom vendor-specs check`) extracts content
+# from SPAs reasonably well, but raw GitHub markdown is the most reliable.
+
+vendors:
+  codex:
+    # Original drift anchor: the feature-request issue where the canonical
+    # default_tools_approval_mode key landed.
+    docs_url: https://github.com/openai/codex/issues/16501
+    extra_urls:
+      # Advanced config reference. developers.openai.com/codex/* 308-redirects
+      # here since ~2026-07; pin the canonical host directly. Authoritative for
+      # approval_policy, sandbox_mode, notify, mcp_servers. NOTE (2026-07-14):
+      # `approval_policy = "on-failure"` was REMOVED in the 0.143 window
+      # (openai/codex#28418) — never emit it; we emit "never".
+      - https://learn.chatgpt.com/docs/config-file/config-advanced
+      # Hooks reference. Hooks are enabled by DEFAULT since ~0.124; the
+      # [features] hooks=true we emit is a harmless no-op. Events grew to 10
+      # (added SubagentStart/SubagentStop/PreCompact/PostCompact); the
+      # ~/.codex/hooks.json Claude-shape JSON is unchanged. Non-managed
+      # command hooks are gated behind a per-hash trust review — see
+      # pkg/generator/codex_hooks_trust.go.
+      - https://learn.chatgpt.com/docs/hooks
+      # Repo README — keep as a stable anchor even though it's terse.
+      - https://raw.githubusercontent.com/openai/codex/main/README.md
+    must_contain:
+      - default_tools_approval_mode
+      - mcp_servers
+      - approval_policy
+      - sandbox_mode
+      - notify
+      # [hooks] block GA in v0.129.0 (2026-05-07) — Claude-shape JSON read
+      # from ~/.codex/hooks.json when [features] hooks = true. We emit
+      # SessionStart + PostToolUse only. `Stop` is intentionally omitted
+      # because Codex `Stop` is per-turn, not session-end.
+      - hooks
+      - SessionStart
+      - PostToolUse
+    must_not_contain:
+      # Invalid/deprecated keys the generator must not regress to.
+      - 'approval_mode = "always"'
+    emitted_keys:
+      - 'default_tools_approval_mode = "approve"'
+      - '[mcp_servers.loom]'
+      - 'approval_policy = "never"'
+      - 'notify ='
+      # Codex hooks.json emitted alongside config.toml (Claude-shape JSON,
+      # asserted in pkg/generator/configs_test.go: TestGenerateHooksConfig_CodexEmitsHooksJSON).
+      - '"SessionStart"'
+      - '"PostToolUse"'
+
+  kilocode:
+    # Kilo 1.0 (extension kilocode.kilo-code v7.x, rebuilt on the OpenCode
+    # engine) reads kilo.json / .kilo/kilo.json / ~/.config/kilo/kilo.json:
+    # top-level `mcp` map (type local/remote, array command, `environment`,
+    # ms timeouts) and a `permission` map keyed by {server}_{tool} globs.
+    # Positive evidence (fetched 2026-07-14): docs pages below contain
+    # kilo.json, .kilo/kilo.json, ~/.config/kilo, mcp, local, remote,
+    # permission. Negative evidence: the same pages contain NONE of
+    # always_allow / mcp_settings.json / .kilocode/mcp.json (legacy surface).
+    # Runtime evidence: v7.4.5 extension bundle — globalConfigDir() =
+    # $XDG_CONFIG_HOME/kilo, MODERN=["kilo.jsonc","kilo.json"],
+    # LEGACY=["opencode.jsonc","opencode.json"], normalizeMcpEntry
+    # local/remote, SCHEMA="https://app.kilo.ai/config.json"; zero
+    # references to config.toml — the old ~/.kilocode/config.toml emission
+    # was read by nothing.
+    docs_url: https://kilo.ai/docs/automate/mcp/using-in-kilo-code
+    extra_urls:
+      - https://kilo.ai/docs/automate/mcp/using-in-cli
+      # OpenCode-engine migration doc (legacy → kilo.json mapping).
+      - https://raw.githubusercontent.com/Kilo-Org/kilo/dev/packages/opencode/src/kilocode/docs/migration.md
+    must_contain:
+      - kilo.json
+      - mcp
+      - local
+      - remote
+      - permission
+    must_not_contain:
+      # Legacy keys the generator must not regress to.
+      - always_allow
+    emitted_keys:
+      - 'https://app.kilo.ai/config.json'
+      - '"permission"'
+      - '"loom_*"'
+
+  claude_code:
+    # Authoritative settings.json schema doc (was previously the marketing
+    # README, which did not mention MCP or hooks at all). Note the settings
+    # page is JS-rendered: tokens listed below appear in the static server
+    # response. SessionStart/Stop/SubagentStop only appear in the static
+    # hooks reference, so it's included as a second URL.
+    docs_url: https://code.claude.com/docs/en/settings
+    extra_urls:
+      - https://code.claude.com/docs/en/hooks
+      - https://raw.githubusercontent.com/anthropics/claude-code/main/README.md
+    must_contain:
+      # Hook events Claude emits and the generator wires.
+      - PreToolUse
+      - PostToolUse
+      - SessionStart
+      - Stop
+      - SubagentStop
+      - matcher
+      # permissions block keys consumed by claudePermissions().
+      - allow
+      - additionalDirectories
+      - defaultMode
+      - disableBypassPermissionsMode
+    emitted_keys:
+      # Strings asserted in pkg/generator/configs_test.go for the Claude path.
+      - '"PreToolUse"'
+      - '"PostToolUse"'
+      - '"SessionStart"'
+      - '"hooks"'
+      - '"permissions"'
+
+  gemini_cli:
+    # docs/hooks/reference.md is the richest stable source for Gemini's hook
+    # event names. The CLI README is too sparse to assert against.
+    # 2026-07-14: full event set is still 11 (BeforeTool, AfterTool,
+    # BeforeAgent, AfterAgent, BeforeModel, AfterModel, BeforeToolSelection,
+    # SessionStart, SessionEnd, Notification, PreCompress). settings.json
+    # schema added top-level policyPaths + adminPolicyPaths; root remains
+    # additionalProperties:false so unknown keys (e.g. agentConfig) stay
+    # invalid.
+    docs_url: https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/hooks/reference.md
+    extra_urls:
+      - https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/cli/settings.md
+      - https://raw.githubusercontent.com/google-gemini/gemini-cli/main/README.md
+    must_contain:
+      - SessionStart
+      - SessionEnd
+      - BeforeTool
+      - AfterTool
+      - hooks
+      - matcher
+      - mcp
+    emitted_keys:
+      - '"SessionStart"'
+      - '"SessionEnd"'
+      - '"AfterTool"'
+
+  vscode:
+    # Authoritative MCP authoring doc for .vscode/mcp.json + the user-profile
+    # mcp.json. The schema's top-level key is "servers" — "mcpServers" is
+    # silently ignored by VS Code (fixed in the generator 2026-07-14 after a
+    # long-standing mcpServers emission).
+    docs_url: https://code.visualstudio.com/docs/copilot/customization/mcp-servers
+    extra_urls:
+      # Full authoring schema (servers/inputs) lives on the reference page.
+      - https://code.visualstudio.com/docs/agents/reference/mcp-configuration
+    must_contain:
+      - servers
+      - mcp.json
+      - inputs
+    must_not_contain: []
+    emitted_keys:
+      - '"servers"'
+
+  opencode:
+    # OpenCode config reference: opencode.json with a top-level "mcp" map,
+    # local entries use type:"local" + array command + millisecond timeouts.
+    docs_url: https://opencode.ai/docs/mcp-servers/
+    extra_urls:
+      - https://opencode.ai/docs/config/
+    must_contain:
+      - mcp
+      - local
+      - remote
+      - opencode.json
+    emitted_keys:
+      - '"$schema": "https://opencode.ai/config.json"'
+      - '"type": "local"'
+
+  zed:
+    # Raw GitHub markdown — zed.dev serves 404s to non-browser fetchers, so
+    # the docs source of truth for the drift check is the repo copy. Verified
+    # 2026-07-14: Zed configures MCP via the "context_servers" settings key;
+    # local (stdio) servers use the FLAT {"command", "args", "env"} shape
+    # (ContextServerCommand in crates/settings_content/src/project.rs renames
+    # `path` to "command"); remote servers use "url" + "headers"; approvals
+    # via agent.tool_permissions. The pre-2026 nested
+    # {"command": {"path", "arguments"}} shape no longer parses as a stdio
+    # server (serde(untagged): a string "command" is required).
+    docs_url: https://raw.githubusercontent.com/zed-industries/zed/main/docs/src/ai/mcp.md
+    must_contain:
+      - context_servers
+      - '"command"'
+      - '"args"'
+      - '"env"'
+      - '"url"'
+      - '"headers"'
+      - tool_permissions
+    must_not_contain:
+      # Zed never read an mcp.json / mcpServers config; a docs mention would
+      # signal a format change worth re-verifying.
+      - mcpServers
+    emitted_keys:
+      # Strings asserted in pkg/generator/configs_test.go for the zed path.
+      - '"context_servers"'
+      - '"context_servers.json"'

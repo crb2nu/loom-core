@@ -1,0 +1,1 @@
+- Add the cross-platform `backlog-burndown` skill to `mcp/context/skills-registry.yaml`, including evidence-cited triage, review gates, and revision-safe operator updates.

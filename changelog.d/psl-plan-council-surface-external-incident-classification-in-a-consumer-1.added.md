@@ -1,0 +1,1 @@
+- Publish structured external CI incident classifications through `internal/visibility/contracts/incident_classification.go` for Loom visibility consumers.

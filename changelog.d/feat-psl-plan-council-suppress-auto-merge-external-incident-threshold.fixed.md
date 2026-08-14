@@ -1,0 +1,1 @@
+- Suppress auto-merge when a ref exceeds its configured 24-hour external-dependency incident threshold, with structured verdicts and KPI emission in `pkg/mills/pipeline/incident_threshold.go`, `pkg/mills/store/store.go`, and `pkg/policy/policy.go`.

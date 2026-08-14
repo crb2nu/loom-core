@@ -1,0 +1,1 @@
+- Refactor the HUD spawn terminal and teardown path into internal/hud/spawn_terminal.go without changing behavior.

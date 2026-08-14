@@ -1,14 +1,38 @@
-<script>
+<script lang="ts">
   import { eventStore } from '../stores/events.svelte.ts';
+  import { stalenessStore } from '../stores/staleness.svelte.ts';
+  import { fleetStore } from '../stores/fleet.svelte.ts';
 
   /**
    * ConnectionBanner shows daemon connection state below the header.
-   * Hidden when connected (zero chrome when healthy).
-   * States: reconnecting (amber), disconnected (red), circuit-open (amber).
+   * Hidden when connected AND no stores are stale (zero chrome when healthy).
+   *
+   * States:
+   *   reconnecting   (amber)  — SSE dropped, retry in progress
+   *   disconnected   (red)    — SSE is down
+   *   circuit-open   (amber)  — repeated reconnect failures, backing off
+   *   degraded       (amber)  — SSE connected, but the monitor flagged a
+   *                             sessions/presence sub-fetch failure and carried
+   *                             over the prior roster (Slice 5b — the honest,
+   *                             specific form of the generic stale pill below)
+   *   stale          (amber)  — SSE connected but no snapshot from one or
+   *                             more registered stores within staleAfter
+   *                             (Slice B3 — catches silent SSE failures)
    */
   let state = $derived(eventStore.connectionState);
   let retryIn = $derived(eventStore.retryCountdown);
-  let visible = $derived(state !== 'connected');
+  let staleStores = $derived(stalenessStore.staleStores);
+  let connectionVisible = $derived(state !== 'connected');
+  // Degraded is the more specific signal: when the monitor explicitly reports a
+  // partial fetch, show it instead of the generic staleness message.
+  let degradedVisible = $derived(!connectionVisible && fleetStore.degraded);
+  let degradedSinceLabel = $derived(
+    fleetStore.degradedSince
+      ? fleetStore.degradedSince.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '',
+  );
+  let staleVisible = $derived(!connectionVisible && !degradedVisible && staleStores.length > 0);
+  let visible = $derived(connectionVisible || degradedVisible || staleVisible);
 </script>
 
 {#if visible}
@@ -17,6 +41,8 @@
     class:connection-reconnecting={state === 'reconnecting'}
     class:connection-disconnected={state === 'disconnected'}
     class:connection-circuit-open={state === 'circuit-open'}
+    class:connection-degraded={degradedVisible}
+    class:connection-stale={staleVisible}
     role="status"
     aria-live="polite"
   >
@@ -35,6 +61,16 @@
       {#if retryIn > 0}
         <span class="banner-countdown">{retryIn}s</span>
       {/if}
+    {:else if degradedVisible}
+      <span class="banner-icon">◐</span>
+      <span class="banner-text"
+        >Degraded{degradedSinceLabel ? ` since ${degradedSinceLabel}` : ''}{fleetStore.degradedReason
+          ? ` — ${fleetStore.degradedReason}`
+          : ''}</span
+      >
+    {:else if staleVisible}
+      <span class="banner-icon">◷</span>
+      <span class="banner-text">Stale data — no recent updates from {staleStores.join(', ')}</span>
     {/if}
   </div>
 {/if}

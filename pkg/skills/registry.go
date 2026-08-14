@@ -21,6 +21,7 @@ type Registry struct {
 type Skill struct {
 	Name       string                 `yaml:"name"`
 	Categories []string               `yaml:"categories,omitempty"`
+	Priority   *int                   `yaml:"priority,omitempty"` // Lower = first in composite output. Nil = after explicit priorities.
 	Common     *SkillSpec             `yaml:"common,omitempty"`
 	Targets    map[string]*TargetSpec `yaml:"targets,omitempty"`
 }
@@ -33,6 +34,11 @@ type SkillSpec struct {
 	References   []string  `yaml:"references,omitempty"`
 	Assets       []string  `yaml:"assets,omitempty"`
 	AlwaysAllow  []string  `yaml:"always_allow,omitempty"`
+	// WhenToUse holds extra trigger phrases emitted as the `when_to_use`
+	// frontmatter field on targets that support it (Claude Agent Skills).
+	// The host appends it to the description in skill listings; the combined
+	// length is capped at 1536 characters (validated at generation time).
+	WhenToUse string `yaml:"when_to_use,omitempty"`
 }
 
 // Script defines a bundled script in a skill.
@@ -48,6 +54,19 @@ type TargetSpec struct {
 	OutputFormat       string `yaml:"output_format,omitempty"`       // "markdown" for Claude
 	Type               string `yaml:"type,omitempty"`                // "command", "skill", "rule", "instruction", "workflow"
 	InstructionsAppend string `yaml:"instructions_append,omitempty"` // platform-specific additive instruction block
+	// WhenToUse overrides common.when_to_use for this target only. Lets
+	// Claude carry richer trigger phrases without inflating the shared
+	// Codex metadata budget.
+	WhenToUse string `yaml:"when_to_use,omitempty"`
+	// DisableModelInvocation emits `disable-model-invocation: true` in Claude
+	// SKILL.md frontmatter: the skill becomes user-only (/name) and its
+	// description leaves the model's context. Use for side-effectful ship
+	// loops that must never fire autonomously.
+	DisableModelInvocation *bool `yaml:"disable_model_invocation,omitempty"`
+	// Context emits the `context:` frontmatter field for Claude Agent Skills
+	// (currently only "fork" is meaningful: run the skill in a forked
+	// subagent).
+	Context string `yaml:"context,omitempty"`
 }
 
 // Load reads and parses a skills registry YAML file.
@@ -68,15 +87,18 @@ func Load(path string) (*Registry, error) {
 // FindRegistry locates the skills registry file.
 // It searches in the following order:
 // 1. Current directory: mcp/context/skills-registry.yaml
-// 2. Platform gitops: platform/gitops/mcp/context/skills-registry.yaml
-// 3. Home config: ~/.config/loom/skills-registry.yaml
+// 2. Workspace root: services/loom-core/mcp/context/skills-registry.yaml
+// 3. Legacy GitOps path: platform/gitops/mcp/context/skills-registry.yaml
+// 4. Home workspace paths, then ~/.config/loom/skills-registry.yaml
 func FindRegistry() (string, bool) {
 	cwd, _ := os.Getwd()
 	home, _ := os.UserHomeDir()
 
 	paths := []string{
 		filepath.Join(cwd, "mcp", "context", "skills-registry.yaml"),
+		filepath.Join(cwd, "services", "loom-core", "mcp", "context", "skills-registry.yaml"),
 		filepath.Join(cwd, "platform", "gitops", "mcp", "context", "skills-registry.yaml"),
+		filepath.Join(home, "workspace", "services", "loom-core", "mcp", "context", "skills-registry.yaml"),
 		filepath.Join(home, "workspace", "platform", "gitops", "mcp", "context", "skills-registry.yaml"),
 		filepath.Join(home, ".config", "loom", "skills-registry.yaml"),
 	}
@@ -133,7 +155,8 @@ func (s *Skill) GetOutputFormat(target string) string {
 }
 
 // GetType returns the output type for a target, using platform-specific defaults.
-// Default types: claude → "command", codex → "skill", kilocode → "rule", gemini → "instruction".
+// Default types: claude -> "command", codex -> "skill", kilocode -> "rule",
+// gemini/antigravity -> "skill".
 func (s *Skill) GetType(target string) string {
 	if s.Targets != nil {
 		if spec, ok := s.Targets[target]; ok && spec.Type != "" {
@@ -149,18 +172,66 @@ func (s *Skill) GetType(target string) string {
 		return "skill"
 	case "kilocode":
 		return "rule"
-	case "gemini":
+	case "gemini", "antigravity":
 		return "skill"
 	default:
 		return "skill"
 	}
 }
 
+// GetWhenToUse returns the effective when_to_use trigger phrases for a target:
+// the target override when set, otherwise the common value.
+func (s *Skill) GetWhenToUse(target string) string {
+	if s.Targets != nil {
+		if spec, ok := s.Targets[target]; ok && strings.TrimSpace(spec.WhenToUse) != "" {
+			return spec.WhenToUse
+		}
+	}
+	if s.Common != nil {
+		return s.Common.WhenToUse
+	}
+	return ""
+}
+
+// GetDisableModelInvocation reports whether the skill is user-only for the
+// target (Claude `disable-model-invocation` frontmatter). Defaults to false.
+func (s *Skill) GetDisableModelInvocation(target string) bool {
+	if s.Targets == nil {
+		return false
+	}
+	spec, ok := s.Targets[target]
+	if !ok || spec.DisableModelInvocation == nil {
+		return false
+	}
+	return *spec.DisableModelInvocation
+}
+
+// GetContext returns the `context:` frontmatter value for the target
+// (e.g. "fork"), or "" when unset.
+func (s *Skill) GetContext(target string) string {
+	if s.Targets == nil {
+		return ""
+	}
+	spec, ok := s.Targets[target]
+	if !ok {
+		return ""
+	}
+	return spec.Context
+}
+
+// escapeSentinel is a placeholder used during template resolution to protect
+// escaped variable references (\${...}) from substitution. It is replaced
+// back to a literal "${" after all variables have been resolved.
+const escapeSentinel = "\x00LOOM_ESC_DOLLAR_BRACE\x00"
+
 // ResolveInstructions replaces template variables in instructions.
 // Supported variables:
-// - ${SKILL_PATH}: Path to skill directory (Codex: $CODEX_HOME/skills/<name>, Claude: direct paths)
-// - ${CODEX_HOME}: Codex home directory (~/.codex)
-// - ${HOME}: User home directory
+//   - ${SKILL_PATH}: Path to skill directory (Codex: $CODEX_HOME/skills/<name>, Claude: direct paths)
+//   - ${CODEX_HOME}: Codex home directory (~/.codex)
+//   - ${HOME}: User home directory
+//
+// To emit a literal ${VARIABLE} in the generated output, escape it as
+// \${VARIABLE} in the registry YAML.
 func (s *Skill) ResolveInstructions(target, codexHome, skillSourceDir string) string {
 	if s.Common == nil {
 		return ""
@@ -172,6 +243,9 @@ func (s *Skill) ResolveInstructions(target, codexHome, skillSourceDir string) st
 			instructions = strings.TrimRight(instructions, "\n") + "\n\n" + strings.TrimLeft(spec.InstructionsAppend, "\n")
 		}
 	}
+
+	// Protect escaped references (\${...}) from substitution.
+	instructions = strings.ReplaceAll(instructions, "\\${", escapeSentinel)
 
 	switch target {
 	case "codex":
@@ -185,10 +259,20 @@ func (s *Skill) ResolveInstructions(target, codexHome, skillSourceDir string) st
 	case "kilocode":
 		// For Kilocode, use actual paths (similar to Claude)
 		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", skillSourceDir)
-	case "gemini":
-		// For Gemini, use actual paths (similar to Claude)
+	case "gemini", "antigravity":
+		// For Gemini-style bundles, callers pass the final skill path so
+		// generated references stay stable after sync.
 		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", skillSourceDir)
+	case "zed":
+		// Zed reads SKILL.md bundles from $HOME/.config/zed/skills/<name>.
+		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", fmt.Sprintf("$HOME/.config/zed/skills/%s", s.Name))
+	case "opencode":
+		// OpenCode reads SKILL.md bundles from $HOME/.config/opencode/skills/<name>.
+		instructions = strings.ReplaceAll(instructions, "${SKILL_PATH}", fmt.Sprintf("$HOME/.config/opencode/skills/%s", s.Name))
 	}
+
+	// Restore escaped references to literal ${...}.
+	instructions = strings.ReplaceAll(instructions, escapeSentinel, "${")
 
 	return instructions
 }

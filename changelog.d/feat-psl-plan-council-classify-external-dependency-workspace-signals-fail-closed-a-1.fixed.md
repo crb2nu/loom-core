@@ -1,0 +1,1 @@
+- Classify ClickHouse MergeTree, Redis `ECONNREFUSED`, Longhorn scheduling, and GitLab runner-infrastructure signals in `pkg/mills/intake/classifier.go`, with fail-closed triage coverage in `pkg/mills/intake/classifier_test.go`.

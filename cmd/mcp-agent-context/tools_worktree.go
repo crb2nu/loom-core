@@ -45,6 +45,10 @@ func registerWorktreeTools(server *mcp.Server, svc *agentcontext.Service, tracer
 					"type":        "string",
 					"description": "Custom worktree path (default: auto-generated).",
 				},
+				"repo_path": map[string]any{
+					"type":        "string",
+					"description": "Absolute path to the git repository to allocate from. Overrides session.working_dir and AGENT_CONTEXT_GIT_REPO_PATH/REPO_PATH.",
+				},
 				"ttl_hours": map[string]any{
 					"type":        "integer",
 					"description": "Max lifetime in hours. Worktree is auto-orphaned after this period (0 = no limit).",
@@ -114,51 +118,12 @@ func registerWorktreeTools(server *mcp.Server, svc *agentcontext.Service, tracer
 		return svc.HandleWorktreeList(ctx, args)
 	})
 
-	server.AddTool(mcp.Tool{
-		Name:        "agent_worktree_status",
-		Description: "Get detailed status of a worktree assignment including git info.",
-		InputSchema: mcp.InputSchema{
-			Type: "object",
-			Properties: map[string]any{
-				"assignment_id": map[string]any{
-					"type":        "string",
-					"description": "Worktree assignment ID.",
-				},
-			},
-			Required: []string{"assignment_id"},
-		},
-	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-		return svc.HandleWorktreeStatus(ctx, args)
-	})
-
-	server.AddTool(mcp.Tool{
-		Name:        "agent_worktree_cleanup",
-		Description: "Clean up orphaned worktrees. Use dry_run=true (default) to preview.",
-		InputSchema: mcp.InputSchema{
-			Type: "object",
-			Properties: map[string]any{
-				"dry_run": map[string]any{
-					"type":        "boolean",
-					"description": "Preview what would be cleaned up (default: true).",
-				},
-				"force": map[string]any{
-					"type":        "boolean",
-					"description": "Force removal of worktrees with uncommitted changes.",
-				},
-			},
-		},
-	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-		return svc.HandleWorktreeCleanup(ctx, args)
-	})
-
-	server.AddTool(mcp.Tool{
-		Name:        "agent_worktree_reconcile",
-		Description: "Manually trigger worktree lifecycle reconciliation: disk scan, TTL expiration, orphan removal, untracked detection, and git prune.",
-		InputSchema: mcp.InputSchema{
-			Type:       "object",
-			Properties: map[string]any{},
-		},
-	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-		return svc.HandleWorktreeReconcile(ctx, args)
-	})
+	// NOTE: agent_worktree_status removed — agent_worktree_list with
+	// include_git_status/include_disk_usage returns the same fields.
+	//
+	// NOTE: agent_worktree_cleanup and agent_worktree_reconcile removed. Both
+	// were manual triggers for the always-on background WorktreeReconciler
+	// (AGENT_CONTEXT_WORKTREE_RECONCILER_ENABLED, default true), which performs
+	// the same disk scan / TTL expiry / orphan sweep on an interval. Disk-level
+	// GC of the git worktrees themselves lives in `loom worktree gc`.
 }

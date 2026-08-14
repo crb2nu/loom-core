@@ -1,0 +1,1 @@
+- Made Mills pipeline terminal classifications write-once in `pkg/mills/store/store.go`, with deterministic conflict coverage in `pkg/mills/store/store_test.go` and a bounded rejection counter in `pkg/telemetry/telemetry.go`.

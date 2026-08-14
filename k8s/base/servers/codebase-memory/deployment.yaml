@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: codebase-memory
+    component: mcp-server
+    mcp.server/name: codebase_memory
+    mcp.server/type: custom
+  name: codebase-memory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: codebase-memory
+  template:
+    metadata:
+      annotations:
+        mcp.server/categories: dev,code,search
+        mcp.server/description: Semantic codebase indexing + search (Go native)
+      labels:
+        app: codebase-memory
+        component: mcp-server
+        mcp.server/name: codebase_memory
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - env:
+            - name: CODEBASE_QDRANT_COLLECTION
+              value: codebase_memory_v1
+            - name: LOG_LEVEL
+              value: info
+            # Emit JSON in MCP CallToolResult content (vs the mcp-go default
+            # TOON). Consumers like project-management's ICC bridge expect
+            # a stable JSON schema; the ICC parser auto-detects JSON vs
+            # TOON so this flip is safe to roll out once the parser update
+            # ships. See agent-context task 3e0a89e4bcbd7050 (session
+            # f26fa5da3ea96cd8, namespace loom-core/codebase-memory).
+            - name: LOOM_MCP_OUTPUT_FORMAT
+              value: json
+            - name: MORPH_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: MORPH_API_KEY
+                  name: loom-secrets
+            - name: MORPH_BASE_URL
+              value: https://api.morphllm.com/v1
+            - name: MORPH_EMBED_MODEL
+              value: morph-embedding-v3
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: QDRANT_API_KEY
+                  name: loom-secrets
+            # Switched from the Harvester VM Qdrant (192.168.50.176:6333,
+            # shared 8c/8GB on Harvester storage) to qdrant-fast (gitops!160) —
+            # a dedicated Qdrant pinned to cblevins-7900xtx (24c/65GB) on
+            # local NVMe via local-path provisioner. Expected ~3-5x faster
+            # upserts for codebase indexing (local disk + node-local network
+            # + no contention with news-analyzer / other writers).
+            #
+            # The old collection on the Harvester instance is still around;
+            # re-indexing devoted-core writes a fresh codebase_memory_v1
+            # collection on qdrant-fast.
+            - name: QDRANT_URL
+              value: http://qdrant-fast.loom-hub.svc.cluster.local:6333
+            # Default HTTP_TIMEOUT (30s) was insufficient for large
+            # qdrant upsert batches with wait=true — the codebase_memory_v1
+            # collection has 50K+ points and HNSW reindexing on each
+            # upsert pushed batches over 30s, causing index runs to
+            # fail with "context deadline exceeded". 5min headroom.
+            # NOTE: pkg/httpclient parses this as bare integer seconds
+            # (strconv.Atoi); the "s" suffix would silently fall back
+            # to the default 30s.
+            - name: HTTP_TIMEOUT
+              value: "300"
+            # Larger upsert batches are safe because all bulk batches
+            # run with wait=false; durability of the indexing run is
+            # established by a single trailing Flush() call after the
+            # run completes (failure of which is logged as
+            # flush_warnings but does NOT mark the job failed — data is
+            # durable via Qdrant's WAL fsync regardless). HTTP_TIMEOUT=300
+            # is retained as headroom for that trailing round-trip.
+            # Bumped from 32 back to 128 to amortize round-trip overhead.
+            # Rollback hatch: set CODEBASE_UPSERT_BLOCKING=true (or the
+            # legacy CODEBASE_UPSERT_WAIT=true) to force wait=true on
+            # every batch without a code change.
+            - name: CODEBASE_UPSERT_BATCH_SIZE
+              value: "128"
+            - name: MCP_TRANSPORT
+              value: websocket
+            - name: MCP_WS_PORT
+              value: "8080"
+            - name: MCP_SERVER_NAME
+              value: codebase_memory
+            - name: MCP_SERVER_COMMAND
+              value: /app/services/loom-core/bin/mcp-codebase-memory
+          image: registry.harbor.lan/mcp/custom-server:latest
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          name: codebase-memory
+          ports:
+            - containerPort: 8080
+              name: websocket
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            # Workspace mount so the indexer can read codebases on disk
+            # (e.g. /workspace/services/loom-core). Backed by the Longhorn PVC
+            # `loom-hub-workspace` (storageClass loom-ws-1r), staged with the
+            # workspace repos and already consumed by mobile-hud. Replaces the
+            # `loom-hub-workspace-nfs` export on storage-vm-linux-nas-pilot
+            # (192.168.50.211), halted during the 2026-06-21 storage-fault
+            # incident (two dying SAS disks). Mounted read-only — the indexer
+            # only reads codebases here, never writes.
+            #
+            # The prior emptyDir was an incident stopgap that kept the server
+            # online but left the index empty; this restores real indexing.
+            # `loom-hub-workspace` is ReadWriteOnce, so it attaches to a single
+            # node at a time. The podAffinity below pins this pod to mobile-hud's
+            # node (the primary consumer) so both share the volume without a
+            # multi-attach error — RWO permits multiple pods on the attached node.
+            - name: workspace
+              mountPath: /workspace
+              readOnly: true
+      # Co-locate with mobile-hud so this pod lands on the node holding the
+      # ReadWriteOnce `loom-hub-workspace` attachment (see the workspace volume
+      # above). Required, not preferred: a pod on any other node cannot attach
+      # the RWO volume and would fail with a multi-attach error. Composes with
+      # the services-core nodeAffinity injected by the gitops `loom-hub-servers`
+      # patch (different affinity sub-key, so the strategic merge keeps both).
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mobile-hud
+              topologyKey: kubernetes.io/hostname
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: loom-hub-workspace
+            readOnly: true
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000

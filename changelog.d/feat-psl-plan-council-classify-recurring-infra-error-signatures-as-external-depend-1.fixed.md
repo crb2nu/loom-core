@@ -1,0 +1,1 @@
+- Classify allowlisted ClickHouse Code 432, Longhorn replica scheduling, LiteLLM missing API key, and Postgres missing-role workspace-log signatures as external dependency incidents in `pkg/mills/council/classifier.go`, with regression coverage in `pkg/mills/council/classifier_test.go`.

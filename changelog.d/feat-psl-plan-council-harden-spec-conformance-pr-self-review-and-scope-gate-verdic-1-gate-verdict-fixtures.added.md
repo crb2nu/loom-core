@@ -1,0 +1,1 @@
+- Add a canonical 12-case verdict fixture corpus for `spec_conformance`, `pr_self_review`, and `scope` in `pkg/mills/gates/verdict_fixtures_test.go`.

@@ -1,120 +1,330 @@
-:root {
-  /* ---- Color Palette ---- */
+/* ═══════════════════════════════════════════════════════════════
+   Loom HUD — Instrument Panel Theme
+   Rich, data-forward dark interface with layered depth
+   ═══════════════════════════════════════════════════════════════ */
 
-  /* Base — deep teal */
-  --bg-primary: #00171A;
-  --bg-secondary: #002227;
-  --bg-tertiary: #002E34;
-  --fg-primary: #81F0FE;
-  --fg-secondary: #5EBDC9;
-  --fg-muted: #2A7A87;
-  --border: #035964;
-  --border-focus: #007180;
+/* Fonts (IBM Plex Sans + IBM Plex Mono) are loaded via <link rel="preconnect">
+   + stylesheet in index.html — faster first paint than a render-blocking
+   @import, and keeps the cohesive instrument-panel pairing in one place. */
+
+:root {
+  /* The HUD is committed dark-only, so tell the UA. Without this every native
+     <select> option list, checkbox glyph, scrollbar corner and autofilled
+     input paints in the UA light default over a #060C10 canvas. */
+  color-scheme: dark;
+
+  /* ── Color Palette ──────────────────────────────────────────── */
+
+  /* Base — deep ocean with teal undertone */
+  --bg-primary:   #060C10;
+  --bg-secondary: #0D161B;
+  --bg-tertiary:  #142127;
+  --bg-elevated:  #1B2B33;
+  --bg-surface:   #101C22;
+
+  /* Foreground — high contrast hierarchy (all clear WCAG AA 4.5:1 on every --bg-*) */
+  --fg-primary:   #D4EEF4;
+  --fg-secondary: #8CC0CC;
+  --fg-muted:     #77B1C0; /* was #5C8A96 — failed AA (3.84:1) on --bg-elevated/tertiary */
+  --fg-dim:       #689BA8; /* was #355B66 — failed AA (1.97:1); kept below --fg-muted to preserve tiering */
+
+  /* Borders — layered depth */
+  --border:        #1A3038;
+  --border-subtle: #12242B;
+  --border-focus:  #2F6170;
+  --border-active: #4693A6;
+
+  /* Focus indicator — WCAG 2.4.11/1.4.11 non-text contrast >=3:1 on every --bg-*.
+     --border-focus (#2F6170) only reaches 2.1–2.9:1, so focus outlines use this token. */
+  --focus-ring:    var(--info);
 
   /* Semantic */
-  --success: #22B255;
-  --warning: #E7B312;
-  --error: #E61E3F;
-  --info: #018799;
-  --accent: #E95D74;
+  --success: #22E076;
+  --warning: #FFB830;
+  --error:   #FF3D71;
+  --info:    #00C8FF;
+  --accent:  #FF6B35;
+  /* Mills — the autonomous-loop control plane gets its own lavender so
+     Mills-attributed metrics/links read distinctly from info-cyan. */
+  --mills:   #96BEFA;
 
-  /* Status */
-  --status-running: #22B255;
-  --status-pending: #E7B312;
-  --status-completed: #018799;
-  --status-failed: #E61E3F;
-  --status-waiting: #E7B312;
+  /* Semantic dims (12% opacity fills) */
+  --accent-dim:  rgba(255, 107, 53, 0.12);
+  --accent-glow: rgba(255, 107, 53, 0.2);
+  --info-dim:    rgba(0, 200, 255, 0.1);
+  --info-glow:   rgba(0, 200, 255, 0.18);
+  --success-dim: rgba(34, 224, 118, 0.1);
+  --error-dim:   rgba(255, 61, 113, 0.1);
+  --warning-dim: rgba(255, 184, 48, 0.1);
+
+  /* Status colors are NOT tokens here. They resolve through one function —
+     statusColor() in utils/format.ts, over STATUS_VARIANTS in utils/tokens.ts
+     — which maps a status to a semantic variant and then to the variables
+     above. A parallel --status-* tier used to shadow that map and drifted
+     from it (running read green here and cyan there, completed the reverse),
+     so it was removed once the last consumer moved to statusColor(). Add a
+     status to STATUS_VARIANTS, not a variable here. */
 
   /* Memory tiers */
-  --tier-working: #4EEAFE;
-  --tier-short: #9B5CD0;
-  --tier-long: #22B255;
+  --tier-working: #00E5FF;
+  --tier-short:   #B06CDE;
+  --tier-long:    var(--success);
 
-  /* Agent type */
-  --agent-claude: #E95D74;
-  --agent-codex: #22B255;
-  --agent-gemini: #018799;
-  --agent-copilot: #E7B312;
+  /* Agent type — derived from --accent so all agents share the same visual family.
+     Earlier hues (#FF6B9D / #22E076 / #00C8FF / #FFB830) competed with semantic
+     status colors and made every panel look like a four-team color war. The accent
+     ramp keeps slots distinguishable without re-using success/info/warning hues. */
+  --agent-claude:  var(--accent);
+  --agent-codex:   color-mix(in srgb, var(--accent) 76%, var(--fg-secondary));
+  --agent-gemini:  color-mix(in srgb, var(--accent) 54%, var(--fg-secondary));
+  --agent-copilot: color-mix(in srgb, var(--accent) 32%, var(--fg-secondary));
 
-  /* ---- Type Scale ---- */
+  /* ── Typography ─────────────────────────────────────────────── */
 
-  --font-mono: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', ui-monospace, 'JetBrains Mono', monospace;
 
-  --text-xs: 10px;
-  --text-sm: 12px;
-  --text-base: 14px;
-  --text-lg: 16px;
-  --text-xl: 20px;
-  --text-2xl: 24px;
+  --text-2xs:  10px;
+  --text-xs:  11px;
+  --text-sm:  13px;
+  --text-base: 15px;
+  --text-lg:  18px;
+  --text-xl:  22px;
+  --text-2xl: 30px;
+  --text-3xl: 34px;
 
-  --leading-tight: 1.2;
+  /* In-between steps. The T-shirt ladder above skips 12/14/20px, so
+     components kept hardcoding those sizes (audit 2026-07: 12px ×20,
+     14px ×11, 20px ×4, plus ~150 rem workarounds). Numeric names — the
+     ladder has no free T-shirt slots between xs/sm/base. */
+  --text-12: 12px;
+  --text-14: 14px;
+  --text-20: 20px;
+
+  --leading-tight:  1.15;
   --leading-normal: 1.5;
+  --leading-loose:  1.7;
 
-  --tracking-tight: 0.01em;
-  --tracking-normal: 0.02em;
-  --tracking-wide: 0.08em;
+  --tracking-tight:  -0.02em;
+  --tracking-normal: -0.005em;
+  --tracking-wide:   0.06em;
+  --tracking-wider:  0.1em;
 
-  /* ---- Spacing Scale (4px base) ---- */
+  /* ── Spacing Scale (4px base) ───────────────────────────────── */
 
-  --space-1: 4px;
-  --space-2: 8px;
+  --space-1:  4px;
+  --space-2:  8px;
   --space-3: 12px;
   --space-4: 16px;
+  --space-5: 20px;
   --space-6: 24px;
   --space-8: 32px;
+  --space-10: 40px;
   --space-12: 48px;
 
-  /* ---- Layout ---- */
+  /* ── Breakpoints ────────────────────────────────────────────── */
 
-  --header-height: 40px;
-  --statusbar-height: 28px;
-  --panel-padding: var(--space-3);
-  --drawer-width: 400px;
+  --bp-mobile:  480px;
+  --bp-tablet:  768px;
+  --bp-desktop: 1024px;
 
-  /* ---- Radius Scale ---- */
+  /* ── Layout ─────────────────────────────────────────────────── */
 
-  --radius-sm: 4px;
-  --radius-md: 8px;
+  --header-height:   52px;
+  --statusbar-height: 32px;
+  --panel-padding: clamp(16px, 1.6vw, 24px);
+  --content-gutter: clamp(10px, 1.8vw, 24px);
+  --content-max-width: 1480px;
+  --drawer-width: 420px;
+
+  /* ── Radius Scale ───────────────────────────────────────────── */
+
+  --radius-xs:  3px;
+  --radius-sm:  6px;
+  --radius-md: 10px;
   --radius-lg: 12px;
   --radius-xl: 16px;
+  --radius-2xl: 20px;
+  --radius-full: 9999px;
 
   /* legacy alias */
   --border-radius: var(--radius-md);
 
-  /* ---- Elevation ---- */
+  /* ── Elevation ──────────────────────────────────────────────── */
 
-  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.2);
-  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.25), 0 0 1px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.2);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.2);
+  --shadow-xl: 0 16px 64px rgba(0, 0, 0, 0.5), 0 4px 16px rgba(0, 0, 0, 0.3);
 
-  --elevation-1: var(--shadow-sm);   /* cards */
-  --elevation-2: var(--shadow-md);   /* dropdowns, drawers */
-  --elevation-3: var(--shadow-lg);   /* modals, overlays */
+  /* ── Stacking ───────────────────────────────────────────────── */
+  /* One ladder for every fixed viewport-level overlay. A layer's scrim
+     takes the token; its panel sits at calc(token + 1). New overlays
+     pick a token instead of minting a fresh number. Surfaces still on
+     historical hardcoded values slot between these rungs: nav/status
+     chrome 100, mobile tab bar 200, SpinningRoomTray 998/999,
+     CommandPalette + keyboard help 1000, blocking dialogs
+     (ConfirmDialog & co.) 9999, toasts 10001. */
 
-  /* ---- Glass ---- */
+  --z-drawer:    200;   /* DetailDrawer scrim; drawer panel = +1 */
+  --z-modal:     900;   /* centered modals: BoltArchive, ShiftReport, widgets/Modal */
+  --z-takeover:  950;   /* fullscreen takeovers: AndonMode */
+  --z-grain:   10000;   /* body::after noise overlay — above all chrome */
 
-  --glass-bg: rgba(0, 34, 39, 0.65);
-  --glass-bg-subtle: rgba(0, 34, 39, 0.4);
-  --glass-blur: 12px;
-  --glass-blur-heavy: 20px;
-  --glass-border: rgba(3, 89, 100, 0.4);
+  --elevation-1: var(--shadow-sm);
+  --elevation-2: var(--shadow-md);
+  --elevation-3: var(--shadow-lg);
 
-  /* ---- Motion ---- */
+  /* ── Glass / Surface Effects ────────────────────────────────── */
 
-  --transition-fast: 0.1s ease;
-  --transition-normal: 0.2s ease;
-  --duration-fast: 100ms;
+  --glass-bg:        rgba(12, 21, 25, 0.72);
+  --glass-bg-subtle: rgba(12, 21, 25, 0.45);
+  --glass-blur:      16px;
+  --glass-blur-heavy: 24px;
+  --glass-border:    rgba(21, 42, 50, 0.6);
+
+  /* Top-edge highlight for cards (gives a "lit from above" feel) */
+  --surface-highlight: linear-gradient(
+    180deg,
+    rgba(0, 200, 255, 0.05) 0%,
+    transparent 50%
+  );
+  --surface-highlight-accent: linear-gradient(
+    180deg,
+    rgba(255, 107, 53, 0.07) 0%,
+    transparent 50%
+  );
+  --surface-highlight-warning: linear-gradient(
+    180deg,
+    rgba(255, 184, 48, 0.07) 0%,
+    transparent 50%
+  );
+
+  /* ── Motion ─────────────────────────────────────────────────── */
+
+  --transition-instant: 0.05s ease;
+  --transition-fast:    0.1s ease;
+  --transition-normal:  0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-slow:    0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-spring:  0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --duration-fast:   100ms;
   --duration-normal: 200ms;
-  --duration-slow: 350ms;
+  --duration-slow:   350ms;
 
-  /* ---- Effects ---- */
+  /* ── Effects ────────────────────────────────────────────────── */
 
-  --scanline-opacity: 0.03;
-  --glow-accent: rgba(233, 93, 116, 0.15);
-  --glow-success: rgba(34, 178, 85, 0.12);
-  --glow-error: rgba(230, 30, 63, 0.12);
+  --noise-opacity:    0.022;
+  --scanline-opacity: 0.015;
+  /* Glow tokens. Alert glows (accent/error/warning) keep a colored halo so
+     they read as "look here". Healthy/decorative glows (success/info) collapse
+     to a near-neutral fg tint so they preserve box-shadow geometry without
+     adding color noise — glow now signals attention, not state. */
+  --glow-accent:  rgba(255, 107, 53, 0.18);
+  --glow-error:   rgba(255, 61, 113, 0.12);
+  --glow-warning: rgba(255, 184, 48, 0.12);
+  --glow-success: rgba(212, 238, 244, 0.05);
+  --glow-info:    rgba(212, 238, 244, 0.05);
+
+  /* Glow geometry. Pair with a glow color token:
+       box-shadow: var(--glow-shadow-md) var(--glow-accent);
+     Replaces the ad-hoc `0 0 Npx` spreads scattered across components
+     (audit 2026-07: 4px ×20, 6px ×35, 8px ×10, 12px ×4). */
+  --glow-shadow-sm: 0 0 4px;
+  --glow-shadow-md: 0 0 6px;
+  --glow-shadow-lg: 0 0 8px;
+  --glow-shadow-xl: 0 0 12px;
+
+  /* ── Alpha Composition ──────────────────────────────────────── */
+  /* RGB channel triplets of the semantic palette, for tokenized alpha
+     fills without new hex literals:
+       background: rgba(var(--error-rgb), var(--opacity-light));
+     Channel values must stay in sync with the semantic colors above. */
+  --accent-rgb:  255, 107, 53;
+  --info-rgb:    0, 200, 255;
+  --success-rgb: 34, 224, 118;
+  --warning-rgb: 255, 184, 48;
+  --error-rgb:   255, 61, 113;
+  --mills-rgb:   150, 190, 250;
+  --fg-rgb:      212, 238, 244;
+
+  /* Opacity scale for the alpha fills components kept hardcoding
+     (audit 2026-07: 0.08 ×15, 0.12 ×20, 0.15 ×30, 0.18 ×20, 0.25 ×25). */
+  --opacity-faint:  0.05;
+  --opacity-subtle: 0.08;
+  --opacity-light:  0.12;
+  --opacity-medium: 0.18;
+  --opacity-strong: 0.25;
+  --opacity-heavy:  0.35;
+
+  /* ── Phantom Token Aliases ──────────────────────────────────── */
+  /* Alias block: phantom tokens used across panels (Mills, LiveSessionsCard,
+     AlertsPanel, SpawnDetailPanel, ConfirmDialog, WeaverPanel, etc.)
+     resolve to canonical brand tokens instead of silently rendering
+     hardcoded hex fallbacks. See audit !641-followup, slice 1. */
+  --text-primary:   var(--fg-primary);
+  --text-secondary: var(--fg-secondary);
+  --text-muted:     var(--fg-muted);
+  --text-default:   var(--fg-primary);
+  --text-dim:       var(--fg-dim);
+  --color-success:  var(--success);
+  --color-info:     var(--info);
+  --color-warn:     var(--warning);
+  --color-warning:  var(--warning);
+  --color-error:    var(--error);
+  --color-danger:   var(--error);
+  --color-muted:    var(--fg-muted);
+  --surface-1:      var(--bg-secondary);
+  --surface-2:      var(--bg-tertiary);
+  --surface-3:      var(--bg-elevated);
+  --bg-subtle:      var(--bg-tertiary);
+  --danger:         var(--error);
+  --scrim:          rgba(6, 12, 16, 0.6);
+
+  /* Accent hues — previously undefined; components rendered their
+     GitHub-Primer hex fallbacks. Mapping to brand hues is an
+     intended visual change. */
+  --accent-blue:    var(--info);
+  --accent-green:   var(--success);
+  --accent-amber:   var(--warning);
+  --accent-red:     var(--error);
+  --status-error:   var(--error);
+  --danger-text:    color-mix(in srgb, var(--error) 55%, var(--fg-primary));
+  --text-link:      var(--info);
+
+  /* Text */
+  --text:            var(--fg-primary);
+  --fg-default:      var(--fg-primary);
+  --fg-tertiary:     var(--fg-dim);
+  --font-size-lg:    var(--text-14);
+  --leading-relaxed: var(--leading-loose);
+
+  /* Surfaces & backgrounds */
+  --surface:         var(--bg-elevated);
+  --surface-subtle:  var(--bg-tertiary);
+  --bg-default:      var(--bg-secondary);
+  --bg-deep:         var(--bg-primary);
+  --bg-hover:        var(--bg-tertiary);
+  --bg-row:          rgba(var(--fg-rgb), 0.02);
+  --bg-row-hover:    rgba(var(--fg-rgb), var(--opacity-faint));
+  --bg-warning-soft: rgba(var(--warning-rgb), var(--opacity-subtle));
+  --bg-success-soft: rgba(var(--success-rgb), var(--opacity-subtle));
+  --bg-danger-soft:  rgba(var(--error-rgb), var(--opacity-light));
+
+  /* Borders */
+  --border-default: var(--border);
+  --border-strong:  var(--border-active);
+
+  /* Spacing */
+  --space-xs: var(--space-1);
+  --space-sm: var(--space-2);
+  --space-md: var(--space-3);
+  --space-lg: var(--space-4);
 }
+
+
+/* ═══ Reset ═══════════════════════════════════════════════════ */
 
 *,
 *::before,
@@ -128,16 +338,40 @@ html {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 body {
   font-family: var(--font-sans);
-  background: var(--bg-primary);
+  font-feature-settings: 'kern' 1, 'liga' 1, 'calt' 1;
+  /* Atmosphere: one wide cyan horizon glow above the fold (instrument light),
+     a faint warm floor glow, and a canvas that deepens toward the bottom.
+     Replaces the two small radial blobs — the orange one competed with
+     accent-as-attention, and the tight cyan circle read as a stain at
+     ultrawide widths. */
+  background:
+    radial-gradient(120% 55% at 50% -12%, rgba(0, 200, 255, 0.05), transparent 60%),
+    radial-gradient(70% 38% at 88% 112%, rgba(255, 107, 53, 0.028), transparent 65%),
+    linear-gradient(180deg, #081015 0%, var(--bg-primary) 30%, #04080C 100%);
   color: var(--fg-primary);
   line-height: 1.5;
   overflow: hidden;
   height: 100vh;
   width: 100vw;
+  letter-spacing: var(--tracking-normal);
+}
+
+/* Noise grain overlay */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: var(--z-grain);
+  opacity: var(--noise-opacity);
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 256px 256px;
 }
 
 #app {
@@ -147,12 +381,17 @@ body {
   flex-direction: column;
 }
 
+
+/* ═══ Base Elements ═══════════════════════════════════════════ */
+
 a {
   color: var(--info);
   text-decoration: none;
+  transition: color var(--transition-fast);
 }
 
 a:hover {
+  color: var(--fg-primary);
   text-decoration: underline;
 }
 
@@ -163,22 +402,30 @@ button {
   background: none;
   color: var(--fg-primary);
   font-size: inherit;
+  letter-spacing: inherit;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: inherit;
 }
 
 input, select, textarea {
   font-family: var(--font-mono);
-  font-size: 12px;
-  background: var(--bg-primary);
+  font-size: 13px;
+  background: var(--bg-surface);
   color: var(--fg-primary);
   border: 1px solid var(--border);
-  border-radius: var(--border-radius);
-  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
   outline: none;
-  transition: border-color 0.15s ease;
+  transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
 }
 
 input:focus, select:focus, textarea:focus {
-  border-color: var(--border-focus);
+  border-color: var(--border-active);
+  box-shadow: 0 0 0 2px rgba(0, 200, 255, 0.08);
 }
 
 code, pre {
@@ -186,62 +433,78 @@ code, pre {
   font-size: 12px;
 }
 
-/* Scrollbar styling */
+
+/* ═══ Scrollbar ═══════════════════════════════════════════════ */
+
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--bg-tertiary);
-  border-radius: 4px;
+  background: var(--border);
+  border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--fg-muted);
 }
 
-/* Selection */
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+
+/* ═══ Selection ═══════════════════════════════════════════════ */
+
 ::selection {
-  background: rgba(1, 135, 153, 0.3);
+  background: rgba(0, 200, 255, 0.2);
   color: var(--fg-primary);
 }
 
-/* Typography enhancements */
+
+/* ═══ Typography Utilities ════════════════════════════════════ */
+
 .tabular-nums {
   font-feature-settings: 'tnum';
   font-variant-numeric: tabular-nums;
 }
 
-/* Apply tabular nums to all metric values for stable column alignment */
 .metric-value, .text-mono {
   font-feature-settings: 'tnum';
 }
 
-/* Primary cyan text glow for headings */
+/* Cyan text glow for headings */
 .text-glow {
-  text-shadow: 0 0 8px rgba(129, 240, 254, 0.3);
+  text-shadow: 0 0 12px rgba(212, 238, 244, 0.15);
 }
 
-/* ---- Shared Drawer / Detail Utilities ---- */
+/* Accent text glow */
+.text-glow-accent {
+  text-shadow: 0 0 12px var(--glow-accent);
+}
 
-/* Horizontal stat chip row (used in DetailDrawer headers) */
+
+/* ═══ Shared Drawer / Detail Utilities ════════════════════════ */
+
 .detail-stats {
   display: flex;
   align-items: center;
-  gap: var(--space-2, 8px);
+  gap: var(--space-2);
   flex-wrap: wrap;
 }
 
 .stat-chip {
   display: flex;
   align-items: center;
-  gap: var(--space-1, 4px);
-  font-size: var(--text-sm, 12px);
+  gap: var(--space-1);
+  font-size: var(--text-sm);
 }
 
 .stat-chip-value {
@@ -251,36 +514,35 @@ code, pre {
 }
 
 .stat-chip-label {
-  font-size: var(--text-xs, 10px);
+  font-size: var(--text-xs);
   color: var(--fg-muted);
 }
 
-/* Generic section block (drawer content sections) */
 .section {
   margin-bottom: 12px;
 }
 
-/* Section title: uppercase label for drawer/card sections */
 .section-title, .card-title {
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: var(--tracking-wide);
   color: var(--fg-muted);
   margin-bottom: 4px;
 }
 
-/* Preformatted detail text */
 .detail-pre {
   font-family: var(--font-mono);
-  font-size: var(--text-sm, 12px);
+  font-size: var(--text-sm);
   color: var(--fg-secondary);
   white-space: pre-wrap;
   word-break: break-word;
   margin: 0;
 }
 
-/* Transition utility */
+
+/* ═══ Animations ══════════════════════════════════════════════ */
+
 .fade-in {
   animation: fadeIn 0.15s ease-in;
 }
@@ -295,19 +557,19 @@ code, pre {
   50%      { opacity: 0.4; }
 }
 
-/* Breathing animation for active agent status dots */
+/* Breathing animation — ambient glow for active indicators */
 @keyframes breathe {
   0%, 100% { box-shadow: 0 0 4px currentColor; opacity: 1; }
-  50%      { box-shadow: 0 0 10px currentColor, 0 0 20px currentColor; opacity: 0.85; }
+  50%      { box-shadow: 0 0 12px currentColor, 0 0 24px currentColor; opacity: 0.85; }
 }
 
 .status-breathe {
   animation: breathe 2.5s ease-in-out infinite;
 }
 
-/* Subtle pulse on data refresh — flash highlight on updated values */
+/* Data flash on value update */
 @keyframes dataFlash {
-  0%   { background-color: rgba(129, 240, 254, 0.12); }
+  0%   { background-color: rgba(0, 200, 255, 0.1); }
   100% { background-color: transparent; }
 }
 
@@ -315,7 +577,7 @@ code, pre {
   animation: dataFlash 0.6s ease-out;
 }
 
-/* Error shake animation */
+/* Error shake */
 @keyframes shake {
   0%, 100% { transform: translateX(0); }
   10%, 50%, 90% { transform: translateX(-3px); }
@@ -326,7 +588,7 @@ code, pre {
   animation: shake 0.4s ease-in-out;
 }
 
-/* Skeleton shimmer loading placeholder */
+/* Skeleton shimmer */
 @keyframes shimmer {
   0%   { background-position: -200% 0; }
   100% { background-position: 200% 0; }
@@ -353,32 +615,70 @@ code, pre {
   height: 24px;
 }
 
-/* Crossfade panel transition (used with panel-enter) */
+/* Panel crossfade */
 @keyframes crossfadeIn {
-  from { opacity: 0; transform: translateY(4px) scale(0.995); }
+  from { opacity: 0; transform: translateY(6px) scale(0.998); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 
-/* Connection state banner colors */
+/* Number roll animation */
+@keyframes numberRoll {
+  from { transform: translateY(-8px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+
+/* Ambient ring pulse for instrument readouts */
+@keyframes ringPulse {
+  0%, 100% { opacity: 0.6; }
+  50%      { opacity: 1; }
+}
+
+/* Glow pulse for alert borders */
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 8px var(--glow-accent); }
+  50%      { box-shadow: 0 0 16px var(--glow-accent), 0 0 24px rgba(255, 107, 53, 0.08); }
+}
+
+
+/* ═══ Connection Banners ══════════════════════════════════════ */
+
 .connection-reconnecting {
-  background: rgba(231, 179, 18, 0.12);
-  border-bottom: 1px solid rgba(231, 179, 18, 0.25);
+  background: var(--warning-dim);
+  border-bottom: 1px solid rgba(255, 184, 48, 0.2);
   color: var(--warning);
 }
 
 .connection-disconnected {
-  background: rgba(230, 30, 63, 0.12);
-  border-bottom: 1px solid rgba(230, 30, 63, 0.25);
+  background: var(--error-dim);
+  border-bottom: 1px solid rgba(255, 61, 113, 0.2);
   color: var(--error);
 }
 
 .connection-circuit-open {
-  background: rgba(231, 179, 18, 0.08);
-  border-bottom: 1px solid rgba(231, 179, 18, 0.2);
+  background: rgba(255, 184, 48, 0.06);
+  border-bottom: 1px solid rgba(255, 184, 48, 0.15);
   color: var(--warning);
 }
 
-/* Animated dots for "Reconnecting..." text */
+/* Slice 5b — shown when SSE is connected but the monitor explicitly reported a
+   sessions/presence sub-fetch failure and carried over the prior roster. The
+   honest, specific form of the generic stale pill; medium prominence since it
+   is a real backend degradation, not a client-side staleness guess. */
+.connection-degraded {
+  background: rgba(255, 184, 48, 0.06);
+  border-bottom: 1px solid rgba(255, 184, 48, 0.15);
+  color: var(--warning);
+}
+
+/* Slice B3 — shown when SSE is connected but one or more decomposed stores
+   haven't received a snapshot within their staleAfter window (silent SSE
+   failure). Lower-prominence than reconnecting/disconnected. */
+.connection-stale {
+  background: rgba(255, 184, 48, 0.04);
+  border-bottom: 1px solid rgba(255, 184, 48, 0.12);
+  color: var(--warning);
+}
+
 @keyframes ellipsis {
   0%   { content: '.'; }
   33%  { content: '..'; }
@@ -388,4 +688,26 @@ code, pre {
 .animated-dots::after {
   content: '...';
   animation: ellipsis 1.5s steps(3) infinite;
+}
+
+
+/* ═══ Reduced Motion ══════════════════════════════════════════ */
+
+/* WCAG 2.3.3 (Animation from Interactions). When the OS reports a
+   reduced-motion preference, neutralize every animation and transition
+   so the ambient loops (pulse, breathe, shimmer, ringPulse, glowPulse,
+   dataFlash, shake, the animated-dots ellipsis) stop and transitions
+   collapse to near-instant. Duration is 0.01ms rather than `none` so any
+   JS awaiting transitionend/animationend still fires once. Global by
+   design — a single rule covers the whole HUD, including future
+   components. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

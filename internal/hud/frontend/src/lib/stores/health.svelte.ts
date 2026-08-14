@@ -1,7 +1,9 @@
 // Health store - server health, latency sparklines
-// v2: SSE-first with 30s fallback poll. Applies hud.health snapshots directly.
+// v2: SSE-first with 60s fallback poll. Applies hud.health snapshots directly.
 import { eventStore } from './events.svelte.ts';
+import { isStaleFromTimestamp, stalenessStore } from './staleness.svelte.ts';
 import { arraysEqualByKey } from '../utils/diff.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface HealthEndpoint {
   healthy: boolean;
@@ -14,6 +16,7 @@ export interface ServerHealth {
   local: HealthEndpoint;
   hub: HealthEndpoint;
   target: string;
+  transport: string;
 }
 
 export interface HealthResponse {
@@ -25,6 +28,7 @@ export interface ServerInfo {
   categories: string[];
   description: string;
   running: boolean;
+  tool_count?: number;
 }
 
 export interface ServersResponse {
@@ -44,7 +48,18 @@ export interface TunnelInfo {
 export interface CacheStats {
   entries: number;
   size?: string;
+  size_bytes?: number;
+  max_bytes?: number;
+  enabled?: boolean;
   hit_rate: number;
+  /**
+   * True when the HUD could not reach the daemon's cache RPC and fell back to
+   * its own local counters (internal/hud/app_routes_observability.go). The
+   * `hit_rate` is then a placeholder 0.0, NOT a measured 0% — without this flag
+   * a daemon outage and a stone-cold cache render identically. Absent on HUD
+   * builds older than the flag, which is correctly read as "not degraded".
+   */
+  degraded?: boolean;
 }
 
 export interface MergedServer {
@@ -58,8 +73,10 @@ export interface MergedServer {
   status: ServerStatus;
   latency: number;
   target: string;
+  transport: string;
   error_message: string;
   tool_count: number;
+  consec_fails: number;
 }
 
 const SPARKLINE_BUFFER_SIZE = 60;
@@ -70,7 +87,46 @@ class HealthStore {
   error = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // Per-panel UI state (Slice B2.2 — moved out of ServersPanel.svelte so the
+  // panel becomes a pure composition shell).
+  searchQuery = $state<string>('');
+  categoryFilter = $state<string>('');
+  statusFilter = $state<string>('');
+  sortKey = $state<string>('name');
+  sortDir = $state<'asc' | 'desc'>('asc');
+
+  setSearch(value: string): void { this.searchQuery = value; }
+  setCategoryFilter(value: string): void { this.categoryFilter = value; }
+  setStatusFilter(value: string): void { this.statusFilter = value; }
+  setSort(key: string, dir: 'asc' | 'desc'): void { this.sortKey = key; this.sortDir = dir; }
+  clearFilters(): void {
+    this.searchQuery = '';
+    this.categoryFilter = '';
+    this.statusFilter = '';
+  }
+
+  // Staleness (Slice B3) — see fleet.svelte.ts for the pattern. Daemon emits
+  // hud.health every 5s, so 90s gives ~18 cycles of grace before we flag stale.
+  staleAfter = 90_000;
+  get isStale(): boolean {
+    // Staleness only applies while polling is active (page mounted). An
+    // unmounted page's store keeps a frozen lastUpdated forever; reporting
+    // it stale would pin the global "Stale data" banner permanently.
+    if (!this.poller.running) return false;
+    return isStaleFromTimestamp(this.lastUpdated, this.staleAfter);
+  }
+
+  // 60s watchdog poll (SSE is the primary data source). A tick only fetches
+  // when SSE is disconnected OR the store has gone stale despite a healthy
+  // SSE. The latter handles the "SSE connected but quiet" case — e.g. no
+  // fleet activity to push for staleAfter ms — which previously left the
+  // staleness banner false-firing forever. A successful fetch bumps
+  // lastUpdated and clears the banner; a failure surfaces an honest error.
+  // The watchdog gate lives in shouldTick so the SSE-invalidation path
+  // (refreshCoalesced) is not suppressed by it.
+  private poller = createPoller(() => this.fetch(), 60000, {
+    shouldTick: () => !eventStore.connected || this.isStale,
+  });
   private latencyBuffers: Map<string, number[]> = new Map();
   private eventUnsubs: Array<() => void> = [];
 
@@ -148,15 +204,15 @@ class HealthStore {
           status,
           latency,
           target: health?.target ?? '',
+          transport: health?.transport ?? '',
           error_message: health?.local?.errorMessage ?? '',
-          // tool_count is only available via SSE hud.health snapshots from the monitor.
-          // The REST /api/health endpoint doesn't include it, so default to 0 for fallback.
-          tool_count: 0,
+          tool_count: srv.tool_count ?? 0,
+          consec_fails: health?.local?.consecFails ?? 0,
         };
       });
 
       const keyFn = (s: MergedServer) => s.name;
-      const hashFn = (s: MergedServer) => `${s.status}|${s.latency}|${s.tool_count}|${s.error_message}`;
+      const hashFn = (s: MergedServer) => `${s.status}|${s.latency}|${s.tool_count}|${s.error_message}|${s.consec_fails}`;
       if (!arraysEqualByKey(this.servers, merged, keyFn, hashFn)) {
         this.servers = merged;
       }
@@ -234,44 +290,53 @@ class HealthStore {
         status,
         latency,
         target: (entry.target as string) ?? '',
+        transport: (entry.transport as string) ?? '',
         error_message: (entry.error_message as string) ?? '',
         tool_count: (entry.tool_count as number) ?? 0,
+        consec_fails: (entry.consec_fails as number) ?? 0,
       };
     });
 
-    const hashFn = (s: MergedServer) => `${s.status}|${s.latency}|${s.tool_count}|${s.error_message}`;
-    if (!arraysEqualById(this.servers, merged, hashFn)) {
+    const keyFn = (s: MergedServer) => s.name;
+    const hashFn = (s: MergedServer) => `${s.status}|${s.latency}|${s.tool_count}|${s.error_message}|${s.consec_fails}`;
+    if (!arraysEqualByKey(this.servers, merged, keyFn, hashFn)) {
       this.servers = merged;
-      this.lastUpdated = new Date();
     }
+    // lastUpdated must advance on EVERY snapshot, not only when data
+    // changes — otherwise a steady-state SSE feed (same statuses, same
+    // latencies push after push) makes the staleness watchdog think we
+    // haven't heard from the server after staleAfter ms, and the
+    // "Stale data — no recent updates from servers" banner fires
+    // even though SSE is healthy.
+    this.lastUpdated = new Date();
     this.error = null;
   }
 
-  startPolling(intervalMs = 30000): void {
+  startPolling(intervalMs = 60000): void {
     this.stopPolling();
     this.fetch();
-    // 30s fallback poll (SSE is the primary data source).
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.poller.start(intervalMs);
 
     // Subscribe to SSE events: apply data directly from hud.health snapshots.
     this.eventUnsubs.push(
       eventStore.on('hud.health', (e) => this.applySnapshot(e.data)),
-      // Legacy daemon events still trigger a full refresh as fallback.
-      eventStore.on('server.health', () => this.fetch()),
-      eventStore.on('config.reload', () => this.fetch()),
-      eventStore.on('process.start', () => this.fetch()),
-      eventStore.on('process.stop', () => this.fetch()),
+      // Legacy daemon events still trigger a full refresh as fallback, routed
+      // through the poller so a burst collapses into one fetch.
+      eventStore.on('server.health', () => this.poller.refreshCoalesced()),
+      eventStore.on('config.reload', () => this.poller.refreshCoalesced()),
+      eventStore.on('process.start', () => this.poller.refreshCoalesced()),
+      eventStore.on('process.stop', () => this.poller.refreshCoalesced()),
     );
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }
 }
 
 export const healthStore = new HealthStore();
+// Registered under "servers" so the stale pill reads naturally in the UI
+// (the panel that consumes this store is ServersPanel).
+stalenessStore.register('servers', () => healthStore.isStale);

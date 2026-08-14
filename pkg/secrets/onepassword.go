@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -19,19 +20,31 @@ type OnePasswordBackend struct {
 // NewOnePasswordBackend creates a new 1Password backend.
 // vault can be empty to use the default vault.
 func NewOnePasswordBackend(vault string) (*OnePasswordBackend, error) {
-	return NewOnePasswordBackendWithExecutor(vault, defaultExecutor)
+	return NewOnePasswordBackendContext(context.Background(), vault)
+}
+
+// NewOnePasswordBackendContext creates a backend with cancellable CLI
+// authentication discovery.
+func NewOnePasswordBackendContext(ctx context.Context, vault string) (*OnePasswordBackend, error) {
+	return NewOnePasswordBackendWithExecutorContext(ctx, vault, defaultExecutor)
 }
 
 // NewOnePasswordBackendWithExecutor creates a new 1Password backend with a custom executor.
 // This is useful for testing.
 func NewOnePasswordBackendWithExecutor(vault string, exec CommandExecutor) (*OnePasswordBackend, error) {
+	return NewOnePasswordBackendWithExecutorContext(context.Background(), vault, exec)
+}
+
+// NewOnePasswordBackendWithExecutorContext creates a backend with a custom
+// executor and cancellable CLI authentication discovery.
+func NewOnePasswordBackendWithExecutorContext(ctx context.Context, vault string, exec CommandExecutor) (*OnePasswordBackend, error) {
 	// Check if op CLI is available
 	if _, err := exec.LookPath("op"); err != nil {
 		return nil, fmt.Errorf("1Password CLI (op) not found: %w", err)
 	}
 
 	// Verify we're signed in by running a simple command
-	_, stderr, err := exec.Run("op", "whoami", "--format=json")
+	_, stderr, err := runCommandContext(ctx, exec, "op", "whoami", "--format=json")
 	if err != nil {
 		return nil, fmt.Errorf("1Password CLI not authenticated: %s", string(stderr))
 	}
@@ -61,6 +74,17 @@ type opItem struct {
 // Get retrieves a secret from 1Password.
 // The key format is: "item/field" or just "item" (defaults to "password" field).
 func (b *OnePasswordBackend) Get(key string) (string, error) {
+	return b.GetContext(context.Background(), key)
+}
+
+// GetContext retrieves a secret from 1Password with cancellation.
+func (b *OnePasswordBackend) GetContext(ctx context.Context, key string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	b.mu.RLock()
 	if val, ok := b.cache[key]; ok {
 		b.mu.RUnlock()
@@ -77,7 +101,7 @@ func (b *OnePasswordBackend) Get(key string) (string, error) {
 		args = append(args, "--vault", b.vault)
 	}
 
-	stdout, stderr, err := b.executor.Run("op", args...)
+	stdout, stderr, err := runCommandContext(ctx, b.executor, "op", args...)
 	if err != nil {
 		// Item not found is not an error, just return empty
 		if strings.Contains(string(stderr), "not found") {

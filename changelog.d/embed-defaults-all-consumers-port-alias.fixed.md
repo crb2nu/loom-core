@@ -1,0 +1,1 @@
+- Fixed the remaining copies of the FlexInfer embedding defaults (agent-context, codebase, mills clients, HUD coordinator) to the proxy's implicit port 80 and the `embeddings-1536` serving alias — !1584 fixed only `pkg/pm`, so deployed agent-context kept dialing the unreachable `:8080` with an unserved model id.

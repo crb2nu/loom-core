@@ -1,0 +1,1 @@
+- Harden overseer dry-run soak telemetry so only successfully persisted decisions are counted, with bounded verdict and production-divergence labels documented in `pkg/mills/overseer/overseer.go`, `pkg/telemetry/telemetry.go`, and `docs/mill-staff-s2-soak.md`.

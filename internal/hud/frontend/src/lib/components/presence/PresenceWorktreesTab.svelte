@@ -1,21 +1,24 @@
-<script>
+<script lang="ts">
+  import type { BadgeVariant } from '../../utils/tokens.ts';
+  import type { WorktreeAssignment } from '../../stores/presence.svelte.ts';
   import { formatTime } from '../../utils/format.ts';
   import Badge from '../../widgets/Badge.svelte';
   import DataTable from '../shared/DataTable.svelte';
   import EmptyState from '../shared/EmptyState.svelte';
 
-  let { worktrees = [] } = $props();
+  let { worktrees = [] }: { worktrees?: WorktreeAssignment[] } = $props();
 
   const worktreeColumns = [
-    { key: 'branch', label: 'Branch' },
-    { key: 'agent_id', label: 'Agent', width: '100px' },
+    { key: 'branch', label: 'Branch', width: '180px' },
+    { key: 'agent_id', label: 'Agent', width: '120px' },
     { key: 'status', label: 'Status', width: '90px' },
+    { key: 'git_status', label: 'Git', width: '100px', hideBelow: 740 },
     { key: 'purpose', label: 'Purpose' },
-    { key: 'created_at', label: 'Created', width: '90px' },
+    { key: 'created_at', label: 'Created', width: '90px', hideBelow: 860 },
   ];
 
-  function worktreeVariant(status) {
-    const map = {
+  function worktreeVariant(status: string): BadgeVariant {
+    const map: Record<string, BadgeVariant> = {
       active: 'success',
       released: 'info',
       orphaned: 'error',
@@ -36,13 +39,19 @@
       columns={worktreeColumns}
       rows={worktrees}
       idKey="assignment_id"
+      stableLayout={true}
     >
-      {#snippet row({ row: wt })}
+      {#snippet row({ row: wt, hiddenColumns })}
         <td class="text-mono">{wt.branch}</td>
         <td class="text-mono">{wt.agent_id}</td>
         <td><Badge text={wt.status} variant={worktreeVariant(wt.status)} /></td>
+        {#if !hiddenColumns.has('git_status')}
+        <td class="text-mono text-muted text-xs" title={wt.git_status}>{wt.git_status || 'clean'}</td>
+        {/if}
         <td class="truncate text-muted" title={wt.purpose}>{wt.purpose || '---'}</td>
+        {#if !hiddenColumns.has('created_at')}
         <td class="text-mono text-muted">{formatTime(wt.created_at)}</td>
+        {/if}
       {/snippet}
     </DataTable>
   {/if}

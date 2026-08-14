@@ -5,16 +5,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
+
+	"github.com/crb2nu/loom/internal/hud/bridge"
+	presencectr "github.com/crb2nu/loom/internal/visibility/contracts/presence"
+	statusctr "github.com/crb2nu/loom/internal/visibility/contracts/status"
 )
 
-func showStatus(socketPath string) error {
-	result, err := call(socketPath, "loom/status", nil)
-	if err != nil {
-		fmt.Println("Daemon: not running")
-		return nil
+func showStatus(socketPath, hudPort string, jsonOutput bool) error {
+	ps := collectPlatformStatus(socketPath, hudPort)
+
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(ps)
 	}
 
-	var status struct {
+	printPlatformStatus(ps, socketPath)
+
+	if !ps.Daemon.Running {
+		return fmt.Errorf("daemon not running")
+	}
+	return nil
+}
+
+func collectPlatformStatus(socketPath, hudPort string) statusctr.PlatformStatus {
+	ps := statusctr.PlatformStatus{}
+
+	// 1. Daemon status via socket RPC.
+	result, err := call(socketPath, "loom/status", nil)
+	if err != nil {
+		return ps // daemon not running — everything zeroed
+	}
+
+	var raw struct {
 		Running             bool     `json:"running"`
 		Servers             int      `json:"servers"`
 		ActiveConns         int      `json:"activeConns"`
@@ -22,25 +47,274 @@ func showStatus(socketPath string) error {
 		Processes           []string `json:"processes"`
 		ActiveRPCs          int64    `json:"activeRPCs"`
 		DrainReady          bool     `json:"drainReady"`
+		Draining            bool     `json:"draining"`
 		DaemonEpoch         int64    `json:"daemonEpoch"`
 		ActiveProxySessions int      `json:"activeProxySessions"`
+		Health              *struct {
+			Servers         map[string]statusctr.DaemonHealthServer `json:"servers"`
+			DegradedServers []string                                `json:"degraded_servers"`
+		} `json:"health"`
+		Observability *statusctr.DaemonObservabilityStatus `json:"observability"`
+	}
+	if err := json.Unmarshal(result, &raw); err != nil {
+		return ps
 	}
 
-	if err := json.Unmarshal(result, &status); err != nil {
-		return fmt.Errorf("parse status: %w", err)
+	ps.Daemon = statusctr.DaemonStatus{
+		Running:             true,
+		Servers:             raw.Servers,
+		ActiveConns:         raw.ActiveConns,
+		IdleConns:           raw.IdleConns,
+		ActiveRPCs:          raw.ActiveRPCs,
+		ActiveProxySessions: raw.ActiveProxySessions,
+		DaemonEpoch:         raw.DaemonEpoch,
+		DrainReady:          raw.DrainReady,
+		Draining:            raw.Draining,
+		Processes:           raw.Processes,
+	}
+	if raw.Health != nil && (len(raw.Health.Servers) > 0 || len(raw.Health.DegradedServers) > 0) {
+		ps.Health = &statusctr.DaemonHealthSnapshot{
+			Servers:         raw.Health.Servers,
+			DegradedServers: append([]string(nil), raw.Health.DegradedServers...),
+		}
+	}
+	if raw.Observability != nil {
+		ps.Observability = raw.Observability
+	}
+	ps.Healthy = true
+
+	// 2. Agent presence from HUD (best-effort).
+	needDaemonAgents := false
+	needDaemonSessions := false
+	presenceData, err := hudGetFast(hudPort, "/api/presence", 2*defaultHUDTimeout/5)
+	if err == nil {
+		ps.HUD.Reachable = true
+		var presence struct {
+			ActiveAgents  int `json:"active_agents"`
+			IdleAgents    int `json:"idle_agents"`
+			OfflineAgents int `json:"offline_agents"`
+			Total         int `json:"total"`
+		}
+		if json.Unmarshal(presenceData, &presence) == nil {
+			ps.Agents = statusctr.AgentStatus{
+				Active:  presence.ActiveAgents,
+				Idle:    presence.IdleAgents,
+				Offline: presence.OfflineAgents,
+				Total:   presence.Total,
+			}
+		} else {
+			needDaemonAgents = true
+		}
+	} else {
+		needDaemonAgents = true
 	}
 
-	fmt.Println("Daemon: running")
-	fmt.Printf("Socket: %s\n", socketPath)
-	fmt.Printf("Epoch: %d, Proxy Sessions: %d\n", status.DaemonEpoch, status.ActiveProxySessions)
-	fmt.Printf("Servers: %d registered\n", status.Servers)
-	fmt.Printf("Connections: %d active, %d idle\n", status.ActiveConns, status.IdleConns)
-	fmt.Printf("RPCs: %d active, drain_ready=%v\n", status.ActiveRPCs, status.DrainReady)
-	if len(status.Processes) > 0 {
-		fmt.Printf("Processes: %v\n", status.Processes)
+	// 3. Session counts from HUD (best-effort).
+	if ps.HUD.Reachable {
+		sessData, err := hudGetFast(hudPort, "/api/sessions", 2*defaultHUDTimeout/5)
+		if err == nil {
+			var sessResp struct {
+				Sessions []bridge.SessionInfo `json:"sessions"`
+			}
+			if json.Unmarshal(sessData, &sessResp) == nil {
+				ps.Sessions = countSessionStatuses(sessResp.Sessions)
+			} else {
+				needDaemonSessions = true
+			}
+		} else {
+			needDaemonSessions = true
+		}
+
+		pipeData, err := hudGetFast(hudPort, "/api/mobile/v1/pipelines", 2*defaultHUDTimeout/5)
+		if err == nil {
+			var pipeResp struct {
+				Available bool                     `json:"available"`
+				Summary   statusctr.PipelineStatus `json:"summary"`
+			}
+			if json.Unmarshal(pipeData, &pipeResp) == nil && pipeResp.Available {
+				pipeResp.Summary.Available = true
+				ps.Pipelines = pipeResp.Summary
+			}
+		}
+	} else {
+		needDaemonSessions = true
 	}
 
-	return nil
+	if needDaemonAgents || needDaemonSessions {
+		if agents, sessions, err := collectPlatformStatusFromDaemon(socketPath); err == nil {
+			if needDaemonAgents {
+				ps.Agents = agents
+			}
+			if needDaemonSessions {
+				ps.Sessions = sessions
+			}
+		}
+	}
+
+	return ps
+}
+
+func collectPlatformStatusFromDaemon(socketPath string) (statusctr.AgentStatus, statusctr.SessionCount, error) {
+	client := bridge.NewDaemonClient(socketPath, nil)
+	if err := client.Connect(); err != nil {
+		return statusctr.AgentStatus{}, statusctr.SessionCount{}, err
+	}
+	defer client.Close()
+
+	agentBridge := bridge.NewAgentBridge(client)
+
+	agents, err := agentBridge.PresenceList(true)
+	if err != nil {
+		return statusctr.AgentStatus{}, statusctr.SessionCount{}, err
+	}
+
+	sessionsRaw, err := agentBridge.ListSessions(map[string]any{"limit": 1000})
+	if err != nil {
+		return statusctr.AgentStatus{}, statusctr.SessionCount{}, err
+	}
+
+	var sessionEnvelope struct {
+		Sessions []bridge.SessionInfo `json:"sessions"`
+	}
+	if err := json.Unmarshal(sessionsRaw, &sessionEnvelope); err != nil {
+		return statusctr.AgentStatus{}, statusctr.SessionCount{}, err
+	}
+
+	return countPresenceStatuses(agents), countSessionStatuses(sessionEnvelope.Sessions), nil
+}
+
+func countPresenceStatuses(agents []presencectr.PresenceInfo) statusctr.AgentStatus {
+	counts := statusctr.AgentStatus{Total: len(agents)}
+	for _, agent := range agents {
+		switch agent.Status {
+		case "active":
+			counts.Active++
+		case "idle":
+			counts.Idle++
+		default:
+			counts.Offline++
+		}
+	}
+	return counts
+}
+
+func countSessionStatuses(sessions []bridge.SessionInfo) statusctr.SessionCount {
+	counts := statusctr.SessionCount{Total: len(sessions)}
+	seen := make(map[string]struct{})
+	for _, session := range sessions {
+		if !isActiveSession(session) {
+			continue
+		}
+		if !hasSessionIdentity(session) {
+			counts.Active++
+			continue
+		}
+		key := sessionIdentityKey(session.AgentID, session.Namespace)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		counts.Active++
+	}
+	return counts
+}
+
+func isActiveSession(session bridge.SessionInfo) bool {
+	return strings.TrimSpace(session.Status) == "active" || strings.TrimSpace(session.EndedAt) == ""
+}
+
+func hasSessionIdentity(session bridge.SessionInfo) bool {
+	return strings.TrimSpace(session.AgentID) != "" || strings.TrimSpace(session.Namespace) != ""
+}
+
+func sessionIdentityKey(agentID, namespace string) string {
+	return strings.TrimSpace(agentID) + "\x00" + strings.TrimSpace(namespace)
+}
+
+func printPlatformStatus(ps statusctr.PlatformStatus, socketPath string) {
+	if !ps.Daemon.Running {
+		fmt.Println("Daemon:   not running")
+		fmt.Printf("Socket:   %s\n", socketPath)
+		return
+	}
+
+	fmt.Println("Daemon:   running")
+	fmt.Printf("Servers:  %d registered\n", ps.Daemon.Servers)
+	fmt.Printf("Agents:   %d active, %d idle, %d offline\n",
+		ps.Agents.Active, ps.Agents.Idle, ps.Agents.Offline)
+	fmt.Printf("Sessions: %d active, %d total\n",
+		ps.Sessions.Active, ps.Sessions.Total)
+	if ps.Daemon.Draining {
+		fmt.Println("Readiness: draining")
+	} else if ps.Daemon.DrainReady {
+		fmt.Println("Readiness: drain ready")
+	} else {
+		fmt.Println("Readiness: waiting on active work")
+	}
+	if ps.Health != nil {
+		if len(ps.Health.DegradedServers) > 0 {
+			fmt.Printf("Health:   degraded servers: %s\n", strings.Join(ps.Health.DegradedServers, ", "))
+		} else {
+			fmt.Println("Health:   all monitored servers healthy")
+		}
+		if degradedHealthDetails := degradedHealthServers(ps.Health.Servers); len(degradedHealthDetails) > 0 {
+			fmt.Printf("Health:   %s\n", strings.Join(degradedHealthDetails, "; "))
+		}
+	}
+	if ps.Pipelines.Available {
+		fmt.Printf("Pipelines: %d running, %d pending, %d passed, %d failed\n",
+			ps.Pipelines.Running, ps.Pipelines.Pending, ps.Pipelines.Passed, ps.Pipelines.Failed)
+		if ps.Pipelines.LastActivity != "" {
+			fmt.Printf("Pipelines: last activity %s\n", ps.Pipelines.LastActivity)
+		}
+	} else {
+		fmt.Println("Pipelines: unavailable")
+	}
+
+	if ps.Observability != nil {
+		if len(ps.Observability.Warnings) > 0 {
+			fmt.Printf("OTel:     warning: %s\n", strings.Join(ps.Observability.Warnings, "; "))
+		} else if ps.Observability.OTLPConfigured || ps.Observability.JSONLogsEnabled {
+			otelSummary := ps.Observability.OTLPEndpoint
+			if otelSummary == "" {
+				otelSummary = "otlp disabled"
+			}
+			logState := "text"
+			if ps.Observability.JSONLogsEnabled {
+				logState = "json"
+			}
+			fmt.Printf("OTel:     %s, logs=%s\n", otelSummary, logState)
+		}
+	}
+
+	hudLabel := "unavailable"
+	if ps.HUD.Reachable {
+		hudLabel = "running"
+	}
+	fmt.Printf("HUD:      %s\n", hudLabel)
+}
+
+func degradedHealthServers(servers map[string]statusctr.DaemonHealthServer) []string {
+	if len(servers) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(servers))
+	for name, status := range servers {
+		if status.Healthy && status.ConsecutiveFails == 0 && status.LastError == "" && !status.AutoRestartFailed {
+			continue
+		}
+		names = append(names, fmt.Sprintf("%s(restarts=%d, latency=%.0fms, error=%s)",
+			name, status.RestartCount, status.AvgLatencyMs, compactHealthError(status.LastError)))
+	}
+	sort.Strings(names)
+	return names
+}
+
+func compactHealthError(err string) string {
+	if err == "" {
+		return "none"
+	}
+	return err
 }
 
 func showTunnelStatus(socketPath string, jsonOutput bool) error {

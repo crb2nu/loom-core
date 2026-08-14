@@ -1,0 +1,772 @@
+<script lang="ts">
+  import { coordinationStore } from '../stores/coordination.svelte.ts';
+  import { presenceActionsStore } from '../stores/presenceActions.svelte.ts';
+  import { router } from '../stores/router.svelte.ts';
+  import { mergeQueueStore } from '../stores/mergeQueue.svelte.ts';
+  import { shuttleStore } from '../stores/shuttle.svelte.ts';
+  import PanelShell from './shared/PanelShell.svelte';
+  import EmptyState from './shared/EmptyState.svelte';
+  import MetricCard from './shared/MetricCard.svelte';
+  import DispatchTaskModal from './presence/DispatchTaskModal.svelte';
+  import { parseNamespace } from '../utils/namespace.ts';
+  import RecommendationsSection from './dispatch/RecommendationsSection.svelte';
+  import MergeQueueSection from './dispatch/MergeQueueSection.svelte';
+  import FileConflictsSection from './dispatch/FileConflictsSection.svelte';
+  import DispatchHistorySection from './dispatch/DispatchHistorySection.svelte';
+
+  $effect(() => {
+    coordinationStore.startPolling(15000);
+    mergeQueueStore.startPolling(30000);
+    shuttleStore.startPolling(30000);
+    return () => {
+      coordinationStore.stopPolling();
+      mergeQueueStore.stopPolling();
+      shuttleStore.stopPolling();
+    };
+  });
+
+  let summary = $derived(coordinationStore.summary);
+  let agents = $derived(coordinationStore.agents);
+  let blockers = $derived(coordinationStore.activeBlockers);
+  let namespaces = $derived(coordinationStore.riskyNamespaces);
+  let relations = $derived(coordinationStore.relations);
+  let attentionAgents = $derived(coordinationStore.topAttentionAgents);
+
+  let recsCollapsed = $state(!shuttleStore.hasRecommendations);
+  let mergeCollapsed = $state(mergeQueueStore.totalCount === 0);
+  let conflictsCollapsed = $state(!mergeQueueStore.hasConflicts);
+  let historyCollapsed = $state(true);
+
+  let sortKey = $state('attention');
+  let sortDir = $state<'asc' | 'desc'>('desc');
+
+  // Namespace focus deep-link: Lifecycle's risky-namespace / relation
+  // cards navigate here with the namespace as the router detail segment
+  // (#agents/dispatch/<namespace>). While set, the roster shows only that
+  // namespace's agents plus a clearable focus chip; clearing drops the
+  // detail so the URL stays shareable.
+  let focusNamespace = $derived(router.detail ? decodeURIComponent(router.detail) : null);
+  function clearFocus() {
+    router.navigateDetail(null);
+  }
+
+  let sortedAgents = $derived.by(() => {
+    let items = [...agents];
+    const ns = focusNamespace;
+    if (ns) {
+      const matched = items.filter((a) => (a.namespace ?? '').includes(ns));
+      // Fall back to the full roster if the focused namespace matches
+      // nothing (stale link) — an empty table with no explanation would
+      // read as "no agents registered".
+      if (matched.length > 0) items = matched;
+    }
+    items.sort((a, b) => {
+      let cmp = 0;
+      if (sortKey === 'attention') {
+        cmp = (a.needs_attention === b.needs_attention ? 0 : a.needs_attention ? -1 : 1);
+        if (cmp === 0) cmp = (b.blocking_others + b.blocked_tasks) - (a.blocking_others + a.blocked_tasks);
+      } else if (sortKey === 'agent_id') {
+        cmp = a.agent_id.localeCompare(b.agent_id);
+      } else if (sortKey === 'tasks') {
+        cmp = b.task_count - a.task_count;
+      } else if (sortKey === 'blockers') {
+        cmp = (b.blocking_others + b.blocked_by_others) - (a.blocking_others + a.blocked_by_others);
+      }
+      return sortDir === 'asc' ? -cmp : cmp;
+    });
+    return items;
+  });
+
+  function handleSort(key: string) {
+    if (sortKey === key) {
+      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      sortKey = key;
+      sortDir = 'desc';
+    }
+  }
+
+  // ariaSortFor returns the WAI-ARIA `aria-sort` token for a header so
+  // screen-reader users can tell which column is sorted and in which
+  // direction. Inactive columns return 'none' rather than null so the
+  // attribute is still emitted (helps test assertions).
+  function ariaSortFor(key: string) {
+    if (sortKey !== key) return 'none';
+    return sortDir === 'asc' ? 'ascending' : 'descending';
+  }
+
+  // onSortKeydown lets keyboard users invoke a sortable header with
+  // Enter or Space, matching the established BacklogPanel pattern.
+  function onSortKeydown(ev: KeyboardEvent, key: string) {
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      handleSort(key);
+    }
+  }
+
+  function dispatchTo(agentId: string) {
+    presenceActionsStore.onOpenDispatch(agentId);
+  }
+
+  function agentStatusColor(status: string) {
+    if (status === 'active') return 'var(--success)';
+    if (status === 'idle') return 'var(--warning)';
+    return 'var(--fg-muted)';
+  }
+</script>
+
+<PanelShell
+  title="Dispatch"
+  icon={'\u2692'}
+  count={agents.length}
+  loading={coordinationStore.loading}
+  error={coordinationStore.error}
+  empty={agents.length === 0}
+  emptyIcon={'\u25C8'}
+  emptyMessage="No agents registered"
+  emptyHint="Start agents to see coordination and dispatch signals"
+>
+  {#snippet header()}
+    <div class="dispatch-intro">
+      <div class="dispatch-summary">
+        <div class="dispatch-summary-eyebrow">Coordination now</div>
+        <!-- Headline carries only the attention count; blockers/conflicts
+             already live in the MetricCards below — repeating them here
+             just made the hero shout the same numbers twice. -->
+        <div class="dispatch-summary-line">
+          {summary.agents_needing_attention} agent{summary.agents_needing_attention === 1 ? '' : 's'} need attention
+        </div>
+        <div class="dispatch-summary-copy">
+          Route work where it can move, keep blockers visible, and watch for namespaces that need a human nudge before they stall.
+        </div>
+      </div>
+      <!-- Zero values render dim so live counts carry the visual weight —
+           six full-brightness zeros otherwise shout as loudly as real
+           signal and contradict the "N need attention" headline above. -->
+      <div class="dispatch-metrics">
+        <MetricCard label="Active Namespaces" value={summary.active_namespaces} color={summary.active_namespaces > 0 ? 'var(--fg-primary)' : 'var(--fg-dim)'} />
+        <MetricCard label="At Risk" value={summary.namespaces_at_risk} color={summary.namespaces_at_risk > 0 ? 'var(--warning)' : 'var(--fg-dim)'} />
+        <MetricCard label="Conflicts" value={summary.conflict_files} color={summary.conflict_files > 0 ? 'var(--error)' : 'var(--fg-dim)'} />
+        <MetricCard label="X-Agent Blockers" value={summary.cross_agent_blockers} color={summary.cross_agent_blockers > 0 ? 'var(--warning)' : 'var(--fg-dim)'} />
+        <MetricCard label="Orphan Tasks" value={summary.orphan_tasks} color={summary.orphan_tasks > 0 ? 'var(--warning)' : 'var(--fg-dim)'} />
+        <MetricCard label="Idle Holders" value={summary.idle_claim_holders} color={summary.idle_claim_holders > 0 ? 'var(--warning)' : 'var(--fg-dim)'} />
+        <MetricCard label="Merge Ready" value={summary.merge_ready_branches ?? 0} color={(summary.merge_ready_branches ?? 0) > 0 ? 'var(--success)' : 'var(--fg-dim)'} />
+        <MetricCard label="System Load" value={shuttleStore.systemLoadPct} color={shuttleStore.systemLoad > 0.8 ? 'var(--error)' : shuttleStore.systemLoad > 0.5 ? 'var(--warning)' : shuttleStore.systemLoad > 0 ? 'var(--fg-primary)' : 'var(--fg-dim)'} />
+      </div>
+    </div>
+  {/snippet}
+
+  <div class="dispatch-layout">
+    <RecommendationsSection bind:collapsed={recsCollapsed} />
+
+    <section class="dispatch-section">
+      <div class="section-head">
+        <h3 class="section-title">Agent roster</h3>
+        {#if focusNamespace}
+          <button class="focus-chip" onclick={clearFocus} title="Clear namespace focus">
+            focused: <span class="focus-ns text-mono">{focusNamespace}</span> ✕
+          </button>
+        {/if}
+        <div class="section-subtitle">
+          {attentionAgents.length} attention agent{attentionAgents.length === 1 ? '' : 's'} · {namespaces.length} risky namespace{namespaces.length === 1 ? '' : 's'}
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="dispatch-table">
+          <thead>
+            <tr>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('agent_id')}
+                onclick={() => handleSort('agent_id')}
+                onkeydown={(ev) => onSortKeydown(ev, 'agent_id')}
+              >
+                Agent {sortKey === 'agent_id' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
+              </th>
+              <th>Status</th>
+              <th>Namespace</th>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('tasks')}
+                onclick={() => handleSort('tasks')}
+                onkeydown={(ev) => onSortKeydown(ev, 'tasks')}
+              >
+                Tasks {sortKey === 'tasks' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
+              </th>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('blockers')}
+                onclick={() => handleSort('blockers')}
+                onkeydown={(ev) => onSortKeydown(ev, 'blockers')}
+              >
+                Blockers {sortKey === 'blockers' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
+              </th>
+              <th>Claims</th>
+              <th>Merge</th>
+              <th
+                class="sortable"
+                role="button"
+                tabindex="0"
+                aria-sort={ariaSortFor('attention')}
+                onclick={() => handleSort('attention')}
+                onkeydown={(ev) => onSortKeydown(ev, 'attention')}
+              >
+                Attention {sortKey === 'attention' ? (sortDir === 'asc' ? '\u25B2' : '\u25BC') : ''}
+              </th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each sortedAgents as agent (agent.agent_id)}
+              {@const ns = parseNamespace(agent.namespace)}
+              <tr class:attention={agent.needs_attention}>
+                <td class="cell-agent" title={agent.agent_id}>{agent.agent_id}</td>
+                <td>
+                  <span class="status-pill" style="color: {agentStatusColor(agent.status)}">{agent.status}</span>
+                </td>
+                <td class="cell-ns" title={agent.namespace || 'No repository resolved (synthetic/fallback namespace).'}>
+                  {#if ns.synthetic}
+                    <span class="ns-muted">{'\u2014'}</span>
+                  {:else}
+                    {ns.repo}{#if ns.branch}<span class="ns-branch">/{ns.branch}</span>{/if}
+                  {/if}
+                </td>
+                <td class="cell-num">
+                  {agent.task_count}
+                  {#if agent.blocked_tasks > 0}
+                    <span class="blocked-badge">{agent.blocked_tasks} blocked</span>
+                  {/if}
+                </td>
+                <td class="cell-num">
+                  {#if agent.blocking_others > 0}
+                    <span class="blocking-badge">{agent.blocking_others} blocking</span>
+                  {/if}
+                  {#if agent.blocked_by_others > 0}
+                    <span class="blocked-badge">{agent.blocked_by_others} blocked by</span>
+                  {/if}
+                  {#if agent.blocking_others === 0 && agent.blocked_by_others === 0}
+                    {'\u2014'}
+                  {/if}
+                </td>
+                <td class="cell-num">
+                  {agent.claim_count}
+                  {#if agent.conflict_files > 0}
+                    <span class="conflict-badge">{agent.conflict_files} conflict</span>
+                  {/if}
+                </td>
+                <td class="cell-num">
+                  {#if agent.merge_ready}
+                    <span class="merge-ready-badge">{'\u2713'} ready</span>
+                  {:else if agent.merge_blockers?.length}
+                    <span class="merge-blocked-badge">{agent.merge_blockers.length} blocker{agent.merge_blockers.length === 1 ? '' : 's'}</span>
+                  {:else}
+                    {'\u2014'}
+                  {/if}
+                </td>
+                <td>
+                  {#if agent.needs_attention}
+                    <span
+                      class="attention-indicator"
+                      role="img"
+                      aria-label={agent.attention_reasons?.join(', ') || 'Needs attention'}
+                      title={agent.attention_reasons?.join(', ') || 'Needs attention'}
+                    >
+                      {'\u26A0'}
+                    </span>
+                  {:else}
+                    <span class="ok-indicator" role="img" aria-label="No attention needed">{'\u2713'}</span>
+                  {/if}
+                </td>
+                <td>
+                  <button class="btn btn-sm btn-dispatch" onclick={() => dispatchTo(agent.agent_id)}>
+                    Dispatch
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="dispatch-section">
+      <div class="section-head">
+        <h3 class="section-title">Blocking chains</h3>
+        <div class="section-subtitle">Dependencies that may need a human nudge or reroute</div>
+      </div>
+      {#if blockers.length > 0}
+        <div class="blocker-list">
+          {#each blockers as blocker (blocker.task_id + blocker.blocked_by_task_id)}
+            <div class="blocker-card" class:cross-agent={blocker.cross_agent}>
+              <div class="blocker-task">{blocker.task_title || blocker.task_id}</div>
+              <div class="blocker-arrow">{'\u2190'} blocked by</div>
+              <div class="blocker-dep">{blocker.blocked_by_task_title || blocker.blocked_by_task_id}</div>
+              {#if blocker.cross_agent}
+                <div class="blocker-meta">
+                  {blocker.task_agent_id || '?'} {'\u2192'} {blocker.blocked_by_agent_id || '?'}
+                  <span class="cross-agent-tag">cross-agent</span>
+                </div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <EmptyState
+          icon={'\u2713'}
+          heading="No active blockers"
+          description="The current dependency graph is clear enough for direct dispatch."
+          compact
+        />
+      {/if}
+    </section>
+
+    <section class="dispatch-section">
+      <div class="section-head">
+        <h3 class="section-title">Relation map</h3>
+        <div class="section-subtitle">Cross-links and pressure points worth checking before work expands</div>
+      </div>
+      {#if relations.length > 0}
+        <div class="relation-list">
+          {#each relations.slice(0, 8) as rel}
+            <div class="relation-card" class:severe={rel.severity === 'high'}>
+              <span class="relation-kind">{rel.kind}</span>
+              <span class="relation-edge">{rel.source_label} {'\u2192'} {rel.target_label}</span>
+              {#if rel.detail}
+                <span class="relation-detail">{rel.detail}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <EmptyState
+          icon={'\u25C8'}
+          heading="No active relations"
+          description="There are no pressure points that need a coordination review right now."
+          compact
+        />
+      {/if}
+    </section>
+
+    <MergeQueueSection bind:collapsed={mergeCollapsed} />
+    <FileConflictsSection bind:collapsed={conflictsCollapsed} />
+    <DispatchHistorySection bind:collapsed={historyCollapsed} />
+  </div>
+</PanelShell>
+
+<DispatchTaskModal />
+
+<style>
+  /* Wrap instead of overflow-x: eight cards in a hidden scroll region
+     clipped silently on typical widths with no scroll affordance. */
+  .dispatch-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: 0;
+  }
+
+  .dispatch-intro {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3) var(--space-3);
+  }
+
+  .dispatch-summary {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--bg-tertiary) 72%, transparent), var(--bg-secondary));
+    position: relative;
+  }
+
+  .dispatch-summary::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
+  }
+
+  .dispatch-summary-eyebrow {
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-muted);
+    font-weight: 600;
+  }
+
+  .dispatch-summary-line {
+    font-size: var(--text-base);
+    font-weight: 600;
+    color: var(--fg-primary);
+  }
+
+  .dispatch-summary-copy {
+    font-size: var(--text-sm);
+    color: var(--fg-muted);
+    max-width: 72ch;
+    line-height: var(--leading-normal);
+  }
+
+  .dispatch-layout {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding: 0 var(--space-3) var(--space-3);
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .dispatch-section {
+    flex-shrink: 0;
+  }
+
+  .section-title {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-muted);
+    margin: 0 0 var(--space-2) 0;
+    padding: 0;
+  }
+
+  .section-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+    position: relative;
+  }
+
+  .section-head::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 10%;
+    right: 10%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(var(--info-rgb), 0.06) 50%, transparent);
+    pointer-events: none;
+  }
+
+  .focus-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-size: var(--text-xs);
+    color: var(--info);
+    background: rgba(var(--info-rgb), 0.08);
+    border: 1px solid rgba(var(--info-rgb), 0.3);
+    border-radius: var(--radius-full);
+    padding: 2px var(--space-2);
+    cursor: pointer;
+    transition: border-color var(--transition-fast);
+  }
+  .focus-chip:hover { border-color: var(--info); }
+  .focus-chip .focus-ns { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .section-subtitle {
+    font-size: var(--text-xs);
+    color: var(--fg-dim);
+    text-align: right;
+    line-height: var(--leading-tight);
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+  }
+
+  .dispatch-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+  }
+
+  .dispatch-table thead {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bg-secondary);
+  }
+
+  .dispatch-table th {
+    text-align: left;
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-muted);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  .dispatch-table th.sortable {
+    cursor: pointer;
+    transition: color var(--transition-fast);
+  }
+
+  .dispatch-table th.sortable:hover {
+    color: var(--fg-primary);
+  }
+
+  .dispatch-table th.sortable:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  .dispatch-table td {
+    padding: var(--space-1) var(--space-2);
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--fg-secondary);
+    vertical-align: middle;
+  }
+
+  /* No row hover highlight: rows aren't clickable (only the Dispatch
+     button acts), so a hover cue was a false affordance. */
+  .dispatch-table tr.attention {
+    border-left: 2px solid var(--warning);
+    background: var(--warning-dim);
+  }
+
+  .cell-agent {
+    font-family: var(--font-mono);
+    font-weight: 500;
+    color: var(--fg-primary);
+    white-space: nowrap;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .cell-ns {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg-dim);
+  }
+
+  .ns-muted {
+    color: var(--fg-muted);
+    opacity: 0.6;
+  }
+
+  .ns-branch {
+    color: var(--fg-muted);
+    opacity: 0.7;
+  }
+
+  .cell-num {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+  }
+
+  .status-pill {
+    font-size: var(--text-xs);
+    font-family: var(--font-mono);
+    font-weight: 500;
+  }
+
+  .blocked-badge,
+  .blocking-badge,
+  .conflict-badge {
+    display: inline-block;
+    font-size: var(--text-2xs);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
+    margin-left: var(--space-1);
+    font-weight: 600;
+    letter-spacing: var(--tracking-wide);
+  }
+
+  .blocked-badge {
+    background: var(--error-dim);
+    color: var(--error);
+  }
+
+  .blocking-badge {
+    background: var(--warning-dim);
+    color: var(--warning);
+  }
+
+  .conflict-badge {
+    background: var(--error-dim);
+    color: var(--error);
+  }
+
+  .merge-ready-badge {
+    display: inline-block;
+    font-size: var(--text-2xs);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
+    background: var(--success-dim);
+    color: var(--success);
+    font-weight: 600;
+  }
+
+  .merge-blocked-badge {
+    display: inline-block;
+    font-size: var(--text-2xs);
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-sm);
+    background: var(--warning-dim);
+    color: var(--warning);
+    font-weight: 600;
+  }
+
+  .attention-indicator {
+    color: var(--warning);
+    cursor: help;
+  }
+
+  .ok-indicator {
+    color: var(--success);
+  }
+
+  .btn-dispatch {
+    font-size: var(--text-xs);
+    padding: 2px var(--space-2);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    transition: background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  .btn-dispatch:hover {
+    background: var(--accent);
+    color: var(--bg-primary);
+    box-shadow: 0 0 6px var(--glow-accent);
+  }
+
+  /* Blockers */
+  .blocker-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .blocker-card {
+    padding: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+    font-size: var(--text-xs);
+    position: relative;
+    transition: border-color var(--transition-fast);
+  }
+
+  .blocker-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
+  }
+
+  .blocker-card.cross-agent {
+    border-color: var(--warning);
+    box-shadow: 0 0 6px var(--glow-warning);
+  }
+
+  .blocker-task {
+    font-weight: 600;
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+  }
+
+  .blocker-arrow {
+    color: var(--fg-dim);
+    margin: 2px 0;
+  }
+
+  .blocker-dep {
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+  }
+
+  .blocker-meta {
+    margin-top: var(--space-1);
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+  }
+
+  .cross-agent-tag {
+    display: inline-block;
+    padding: 0 var(--space-1);
+    border-radius: var(--radius-xs);
+    background: var(--warning-dim);
+    color: var(--warning);
+    font-size: var(--text-2xs);
+    margin-left: var(--space-1);
+    font-weight: 600;
+    letter-spacing: var(--tracking-wide);
+  }
+
+  /* Relations */
+  .relation-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .relation-card {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+    font-size: var(--text-xs);
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  /* Relation cards are informational, not clickable — no hover state. */
+  .relation-card.severe {
+    border-color: var(--error);
+    box-shadow: 0 0 6px var(--glow-error);
+  }
+
+  .relation-kind {
+    font-weight: 600;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    font-size: var(--text-2xs);
+    min-width: 60px;
+    letter-spacing: var(--tracking-wide);
+  }
+
+  .relation-edge {
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+  }
+
+  .relation-detail {
+    color: var(--fg-dim);
+    flex: 1;
+    text-align: right;
+  }
+</style>

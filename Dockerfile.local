@@ -6,7 +6,7 @@
 #
 # CI should continue to use `services/loom-core/Dockerfile`.
 
-FROM golang:1.25.5-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 
@@ -17,28 +17,36 @@ WORKDIR /src
 RUN mkdir -p /src/libs
 COPY libs/mcp-go /src/libs/mcp-go
 COPY libs/fi-mcp-kit /src/libs/fi-mcp-kit
+COPY libs/fi-accel /src/libs/fi-accel
 
 WORKDIR /src/services/loom-core
 
 COPY services/loom-core/go.mod services/loom-core/go.sum ./
+
+# Add replace directives so go mod download uses local copies instead of
+# trying to fetch from private GitLab (no credentials available here).
+RUN go mod edit \
+      -replace gitlab.flexinfer.ai/libs/mcp-go=/src/libs/mcp-go \
+      -replace gitlab.flexinfer.ai/libs/fi-mcp-kit=/src/libs/fi-mcp-kit \
+      -replace gitlab.flexinfer.ai/libs/fi-accel=/src/libs/fi-accel
 RUN go mod download
 
 COPY services/loom-core/ ./
+# Re-apply replace directives so the build uses local copies.
+RUN go mod edit \
+      -replace gitlab.flexinfer.ai/libs/mcp-go=/src/libs/mcp-go \
+      -replace gitlab.flexinfer.ai/libs/fi-mcp-kit=/src/libs/fi-mcp-kit \
+      -replace gitlab.flexinfer.ai/libs/fi-accel=/src/libs/fi-accel
 
-# Build all binaries
+# Build only the binaries required by the mobile-hud deployment.
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o /bin/loomd ./cmd/loomd
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o /bin/loom ./cmd/loom
-
-# Build all MCP servers
-RUN mkdir -p /bin && \
-    for d in cmd/mcp-*; do \
-      name="$(basename "$d")"; \
-      CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o "/bin/$name" "./$d"; \
-    done
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${VERSION}" -o /bin/loomd ./cmd/loomd
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${VERSION}" -o /bin/loom ./cmd/loom
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o /bin/mcp-agent-context ./cmd/mcp-agent-context
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o /bin/mcp-hub-wrapper ./cmd/mcp-hub-wrapper
 
 # Runtime stage - minimal image
-FROM registry.harbor.lan/dockerhub-cache/library/alpine:3.21
+FROM registry.harbor.lan/dockerhub-cache/library/alpine:3.24
 
 RUN apk add --no-cache ca-certificates git
 
@@ -46,8 +54,8 @@ RUN apk add --no-cache ca-certificates git
 RUN adduser -D -u 1000 mcp
 USER mcp
 
-# Copy binaries
-COPY --from=builder /bin/loomd /bin/loom /bin/mcp-* /usr/local/bin/
+# Copy only the binaries mobile-hud needs locally.
+COPY --from=builder /bin/loomd /bin/loom /bin/mcp-agent-context /bin/mcp-hub-wrapper /usr/local/bin/
 
 # Default to running the daemon
 ENTRYPOINT ["/usr/local/bin/loomd"]

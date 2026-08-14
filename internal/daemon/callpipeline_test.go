@@ -1,15 +1,16 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,6 +56,41 @@ func (f *fakeTransport) Recv(ctx context.Context) (*mcp.Message, error) {
 }
 
 func (f *fakeTransport) Close() error { return nil }
+
+// interleavingHubTransport simulates a shared hub transport where concurrent
+// send/recv pairs can cross wires. Recv always returns the most recently sent
+// request ID, which causes deterministic mismatches when requests overlap.
+type interleavingHubTransport struct {
+	mu        sync.Mutex
+	lastID    any
+	sendCount int
+}
+
+func (t *interleavingHubTransport) Send(_ context.Context, msg *mcp.Message) error {
+	t.mu.Lock()
+	t.lastID = msg.ID
+	t.sendCount++
+	sendCount := t.sendCount
+	t.mu.Unlock()
+
+	if sendCount == 1 {
+		time.Sleep(25 * time.Millisecond)
+	}
+	return nil
+}
+
+func (t *interleavingHubTransport) Recv(_ context.Context) (*mcp.Message, error) {
+	t.mu.Lock()
+	id := t.lastID
+	t.mu.Unlock()
+	return &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      id,
+		Result:  json.RawMessage(`{"ok":true}`),
+	}, nil
+}
+
+func (t *interleavingHubTransport) Close() error { return nil }
 
 func newCallPipelineTestDaemon() *Daemon {
 	return &Daemon{
@@ -114,23 +150,9 @@ func enableAuditAndCostForTest(t *testing.T, d *Daemon) string {
 func readAuditEntries(t *testing.T, path string) []AuditEntry {
 	t.Helper()
 
-	f, err := os.Open(path)
+	entries, err := ReadAuditEntries(path, AuditReadOptions{})
 	if err != nil {
-		t.Fatalf("open audit log: %v", err)
-	}
-	defer f.Close()
-
-	var entries []AuditEntry
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		var entry AuditEntry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			t.Fatalf("decode audit entry: %v", err)
-		}
-		entries = append(entries, entry)
-	}
-	if err := scanner.Err(); err != nil {
-		t.Fatalf("scan audit log: %v", err)
+		t.Fatalf("read audit log: %v", err)
 	}
 	return entries
 }
@@ -574,6 +596,363 @@ func TestCallPipelineRouteAndConnect_HubSuccess(t *testing.T) {
 	}
 }
 
+func TestCallPipelineRouteAndConnect_HubLockOrdering(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{HubEnabled: true})
+
+	poolGetCalled := false
+	lockNotHeldDuringDial := false
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     2,
+		MaxOpen:     2,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			poolGetCalled = true
+			// The call lock should NOT be held during pool dial to prevent
+			// cascade timeouts for concurrent callers (heartbeats, task-sync).
+			mu := d.callLock("hub_lock_test")
+			lockNotHeldDuringDial = mu.TryLock()
+			if lockNotHeldDuringDial {
+				mu.Unlock()
+			}
+			return &fakeTransport{}, nil
+		},
+	})
+	defer func() { _ = d.hubPool.Close() }()
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "hub-lock-order"},
+		serverName: "hub_lock_test",
+	}
+	resp := p.routeAndConnect()
+	if resp != nil {
+		t.Fatalf("unexpected route error: %+v", resp.Error)
+	}
+	defer p.releaseConnection()
+
+	if !poolGetCalled {
+		t.Fatal("hub pool.Get was never called")
+	}
+	if !lockNotHeldDuringDial {
+		t.Fatal("callLock should not be held during pool dial (prevents heartbeat contention)")
+	}
+}
+
+func TestCallPipelineRouteAndConnect_PreferHubConnectFailureRetriesLocal(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{
+		HubEnabled: true,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{
+					Name:       "agent_context",
+					Categories: []string{"local-only"},
+				},
+			},
+		},
+	})
+	d.routingPreferences = map[string]RoutingPreference{
+		"agent_context": RoutingPreferHub,
+	}
+
+	hubDials := 0
+	localDials := 0
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			hubDials++
+			return nil, errors.New("hub connect failed")
+		},
+	})
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			localDials++
+			return &fakeTransport{}, nil
+		},
+	})
+	defer func() {
+		_ = d.hubPool.Close()
+		_ = d.pool.Close()
+	}()
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "hub-connect-fallback"},
+		serverName: "agent_context",
+	}
+	resp := p.routeAndConnect()
+	if resp != nil {
+		t.Fatalf("unexpected route error: %+v", resp.Error)
+	}
+	defer p.releaseConnection()
+
+	if hubDials != 1 {
+		t.Fatalf("hub dials = %d, want 1", hubDials)
+	}
+	if localDials != 1 {
+		t.Fatalf("local dials = %d, want 1", localDials)
+	}
+	if p.target != router.TargetLocal {
+		t.Fatalf("target = %v, want %v", p.target, router.TargetLocal)
+	}
+	if !p.localRetryUsed {
+		t.Fatal("expected local retry to be marked used")
+	}
+	if active, _ := d.preferHubBackoffActive("agent_context"); !active {
+		t.Fatal("expected prefer-hub backoff to be active after hub connect failure")
+	}
+}
+
+func TestCallPipelineHubDelegateTransportFailureRetriesFreshHub(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{
+		HubEnabled: true,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{
+					Name:       "agent_context",
+					Categories: []string{"local-only"},
+				},
+			},
+		},
+	})
+	d.fileCfg.HubDelegate.Servers = []string{"agent_context"}
+	d.hubClient = mcp.NewWebSocketClient(mcp.WebSocketConfig{})
+
+	hubDials := 0
+	localDials := 0
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			hubDials++
+			if hubDials == 1 {
+				return &fakeTransport{sendErr: errors.New("transport closed")}, nil
+			}
+			return &fakeTransport{
+				recvMsg: &mcp.Message{
+					JSONRPC: mcp.JSONRPCVersion,
+					ID:      "delegated-call",
+					Result:  json.RawMessage(`{"ok":true}`),
+				},
+			}, nil
+		},
+	})
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			localDials++
+			return &fakeTransport{
+				recvMsg: &mcp.Message{
+					JSONRPC: mcp.JSONRPCVersion,
+					ID:      "delegated-call",
+					Result:  json.RawMessage(`{"ok":true}`),
+				},
+			}, nil
+		},
+	})
+	defer func() {
+		_ = d.hubPool.Close()
+		_ = d.pool.Close()
+	}()
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "delegated-call"},
+		serverName: "agent_context",
+		toolName:   "agent_session_list",
+		method:     "tools/call",
+		params:     callParams{Method: "tools/call"},
+		auditStart: time.Now(),
+	}
+
+	if resp := p.routeAndConnect(); resp != nil {
+		t.Fatalf("unexpected route error: %+v", resp.Error)
+	}
+	if p.target != router.TargetHub {
+		t.Fatalf("initial target = %v, want %v", p.target, router.TargetHub)
+	}
+	if !p.hubDelegateActive {
+		t.Fatal("expected delegated hub call to mark hubDelegateActive")
+	}
+	if p.preferHubRetryEligible {
+		t.Fatal("delegated hub call must not be eligible for local retry")
+	}
+
+	req, buildErr := p.buildForwardRequest()
+	if buildErr != nil {
+		p.releaseConnection()
+		t.Fatalf("unexpected build error: %+v", buildErr.Error)
+	}
+	resp := p.execute(req)
+	p.releaseConnection()
+
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("expected hub retry success, got response: %+v", resp)
+	}
+	if p.target != router.TargetHub {
+		t.Fatalf("target after retry = %v, want %v", p.target, router.TargetHub)
+	}
+	if !p.hubTransportRetryUsed {
+		t.Fatal("expected hub retry to be marked used")
+	}
+	if p.localRetryUsed {
+		t.Fatal("did not expect local fallback when hub reconnect succeeds")
+	}
+	if hubDials != 2 {
+		t.Fatalf("hub dials = %d, want 2", hubDials)
+	}
+	if localDials != 0 {
+		t.Fatalf("local dials = %d, want 0", localDials)
+	}
+}
+
+func TestCallPipelineHubDelegateTransportFailureDoesNotFallBackLocal(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{
+		HubEnabled: true,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{
+					Name:       "agent_context",
+					Categories: []string{"local-only"},
+				},
+			},
+		},
+	})
+	d.fileCfg.HubDelegate.Servers = []string{"agent_context"}
+	d.hubClient = mcp.NewWebSocketClient(mcp.WebSocketConfig{})
+
+	hubDials := 0
+	localDials := 0
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			hubDials++
+			return &fakeTransport{sendErr: errors.New("transport closed")}, nil
+		},
+	})
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			localDials++
+			return &fakeTransport{
+				recvMsg: &mcp.Message{
+					JSONRPC: mcp.JSONRPCVersion,
+					ID:      "delegated-call",
+					Result:  json.RawMessage(`{"wrong_path":true}`),
+				},
+			}, nil
+		},
+	})
+	defer func() {
+		_ = d.hubPool.Close()
+		_ = d.pool.Close()
+	}()
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "delegated-call"},
+		serverName: "agent_context",
+		toolName:   "agent_session_list",
+		method:     "tools/call",
+		params:     callParams{Method: "tools/call"},
+		auditStart: time.Now(),
+	}
+
+	if resp := p.routeAndConnect(); resp != nil {
+		t.Fatalf("unexpected route error: %+v", resp.Error)
+	}
+	req, buildErr := p.buildForwardRequest()
+	if buildErr != nil {
+		p.releaseConnection()
+		t.Fatalf("unexpected build error: %+v", buildErr.Error)
+	}
+	resp := p.execute(req)
+	p.releaseConnection()
+
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected hub transport error, got response: %+v", resp)
+	}
+	if !strings.Contains(resp.Error.Message, "transport closed") {
+		t.Fatalf("unexpected error message: %q", resp.Error.Message)
+	}
+	if p.target != router.TargetHub {
+		t.Fatalf("target after failure = %v, want %v", p.target, router.TargetHub)
+	}
+	if !p.hubTransportRetryUsed {
+		t.Fatal("expected hub retry to be marked used")
+	}
+	if p.localRetryUsed {
+		t.Fatal("did not expect local fallback for delegated hub call")
+	}
+	if hubDials != 2 {
+		t.Fatalf("hub dials = %d, want 2", hubDials)
+	}
+	if localDials != 0 {
+		t.Fatalf("local dials = %d, want 0", localDials)
+	}
+	if active, _ := d.preferHubBackoffActive("agent_context"); active {
+		t.Fatal("did not expect prefer-hub backoff for delegated hub call")
+	}
+}
+
+func TestConnectTargetWithTransportRetryRetriesClosedLocalDial(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+
+	dials := 0
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			dials++
+			if dials == 1 {
+				return nil, errors.New("initialize transport: send init (2024-11-05): transport closed")
+			}
+			return &fakeTransport{}, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "local-connect-retry"},
+		serverName: "agent_context",
+		toolName:   "agent_session_list",
+		method:     "tools/call",
+	}
+	if err := p.connectTargetWithTransportRetry(router.TargetLocal, "test local retry"); err != nil {
+		t.Fatalf("connectTargetWithTransportRetry error: %v", err)
+	}
+	defer p.releaseConnection()
+
+	if dials != 2 {
+		t.Fatalf("dials = %d, want 2", dials)
+	}
+	if p.target != router.TargetLocal {
+		t.Fatalf("target = %v, want %v", p.target, router.TargetLocal)
+	}
+}
+
 func TestCallPipelineRouteAndConnect_LocalDialFailureEmitsAuditAndCost(t *testing.T) {
 	d := newCallPipelineTestDaemon()
 	auditPath := enableAuditAndCostForTest(t, d)
@@ -879,6 +1258,67 @@ func TestCallPipelineExecute_SuccessCachesResponse(t *testing.T) {
 	}
 }
 
+func TestCallPipelineExecute_LocalSendFailureRetriesOnce(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{HubEnabled: false})
+	localDials := 0
+	var reqID any
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			localDials++
+			return &fakeTransport{
+				sendFn: func(_ context.Context, msg *mcp.Message) error {
+					reqID = msg.ID
+					return nil
+				},
+				recvFn: func(_ context.Context) (*mcp.Message, error) {
+					return &mcp.Message{
+						JSONRPC: mcp.JSONRPCVersion,
+						ID:      reqID,
+						Result:  json.RawMessage(`{"retried":true}`),
+					}, nil
+				},
+			}, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "local-send-retry"},
+		serverName: "gitlab",
+		toolName:   "list_pipelines",
+		method:     "tools/call",
+		conn: &pool.Conn{
+			ServerName: "gitlab",
+			Transport:  &fakeTransport{sendErr: io.EOF},
+			Healthy:    true,
+		},
+		target:    router.TargetLocal,
+		targetStr: router.TargetLocal.String(),
+	}
+	defer p.releaseConnection()
+
+	req := &mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: "local-send-retry", Method: "tools/call"}
+	resp := p.execute(req)
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("expected successful retry response, got %+v", resp)
+	}
+	if string(resp.Result) != `{"retried":true}` {
+		t.Fatalf("result = %s, want retry success result", string(resp.Result))
+	}
+	if localDials != 1 {
+		t.Fatalf("local dials = %d, want 1", localDials)
+	}
+	if !p.localTransportRetryUsed {
+		t.Fatal("expected local transport retry flag to be set")
+	}
+}
+
 func TestCallPipelineTransportFailure_LocalClearsIdleAndStopsServer(t *testing.T) {
 	d := newCallPipelineTestDaemon()
 	d.pool = newTestPool(t)
@@ -920,6 +1360,56 @@ func TestCallPipelineTransportFailure_LocalClearsIdleAndStopsServer(t *testing.T
 	stats := d.pool.Stats()
 	if stats.IdleConns != 0 {
 		t.Fatalf("idle conns = %d, want 0 after ClearServer", stats.IdleConns)
+	}
+}
+
+func TestCallPipelineTransportFailure_HubPreservesUnrelatedPoolEntries(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.hubPool = newTestPool(t)
+	defer func() { _ = d.hubPool.Close() }()
+
+	// Seed idle connections so hub recovery has something to clear.
+	d.hubPool.Put(&pool.Conn{
+		ServerName: "hub_srv",
+		Transport:  &fakeTransport{},
+		Healthy:    true,
+	})
+	d.hubPool.Put(&pool.Conn{
+		ServerName: "hub_srv",
+		Transport:  &fakeTransport{},
+		Healthy:    true,
+	})
+
+	stats := d.hubPool.Stats()
+	if stats.IdleConns != 2 {
+		t.Fatalf("idle conns before = %d, want 2", stats.IdleConns)
+	}
+
+	p := &callPipeline{
+		daemon:     d,
+		msg:        &mcp.Message{ID: "transport-hub-clear"},
+		serverName: "hub_srv",
+		method:     "tools/call",
+		target:     router.TargetHub,
+		targetStr:  router.TargetHub.String(),
+		conn: &pool.Conn{
+			ServerName: "hub_srv",
+			Transport:  &fakeTransport{},
+			Healthy:    true,
+		},
+	}
+
+	resp := p.transportFailure("recv", errors.New("connection reset"), time.Now())
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected transport error response")
+	}
+	if p.conn.Healthy {
+		t.Fatal("expected connection marked unhealthy on transport failure")
+	}
+
+	stats = d.hubPool.Stats()
+	if stats.IdleConns != 2 {
+		t.Fatalf("idle conns = %d, want 2 unrelated physical connections preserved", stats.IdleConns)
 	}
 }
 
@@ -1042,14 +1532,21 @@ func TestHandleCall_RequestPolicyDeniedEmitsAuditAndCost(t *testing.T) {
 	if !strings.Contains(resp.Error.Message, "policy denied") {
 		t.Fatalf("unexpected denial message: %q", resp.Error.Message)
 	}
-	data, ok := resp.Error.Data.(map[string]any)
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
 	if !ok {
-		t.Fatalf("expected error data map, got %T", resp.Error.Data)
+		t.Fatalf("expected *PipelineErrorData, got %T", resp.Error.Data)
 	}
-	if got := data["policy_rule_id"]; got != "deny-force-delete" {
+	if ped.Code != "POLICY_DENIED" {
+		t.Fatalf("PipelineErrorData.Code = %q, want POLICY_DENIED", ped.Code)
+	}
+	details, ok := ped.Details.(map[string]any)
+	if !ok {
+		t.Fatalf("expected Details map, got %T", ped.Details)
+	}
+	if got := details["policy_rule_id"]; got != "deny-force-delete" {
 		t.Fatalf("policy_rule_id = %v, want %q", got, "deny-force-delete")
 	}
-	if got := data["policy_reason_code"]; got != "POLICY_FORCE_DELETE_BLOCKED" {
+	if got := details["policy_reason_code"]; got != "POLICY_FORCE_DELETE_BLOCKED" {
 		t.Fatalf("policy_reason_code = %v, want %q", got, "POLICY_FORCE_DELETE_BLOCKED")
 	}
 
@@ -1206,6 +1703,88 @@ func TestHandleCall_TransportFailureEmitsSingleAudit(t *testing.T) {
 	}
 }
 
+func TestHandleCall_PreferHubRecvFailureRetriesLocal(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{
+		HubEnabled: true,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{
+					Name:       "agent_context",
+					Categories: []string{"local-only"},
+				},
+			},
+		},
+	})
+	d.routingPreferences = map[string]RoutingPreference{
+		"agent_context": RoutingPreferHub,
+	}
+
+	hubDials := 0
+	localDials := 0
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			hubDials++
+			return &fakeTransport{recvErr: errors.New("hub recv failed")}, nil
+		},
+	})
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			localDials++
+			var reqID any
+			return &fakeTransport{
+				sendFn: func(_ context.Context, msg *mcp.Message) error {
+					reqID = msg.ID
+					return nil
+				},
+				recvFn: func(_ context.Context) (*mcp.Message, error) {
+					return &mcp.Message{
+						JSONRPC: mcp.JSONRPCVersion,
+						ID:      reqID,
+						Result:  json.RawMessage(`{"local":true}`),
+					}, nil
+				},
+			}, nil
+		},
+	})
+	defer func() {
+		_ = d.hubPool.Close()
+		_ = d.pool.Close()
+	}()
+
+	msg := newCallMessage(t, map[string]any{
+		"server": "agent_context",
+		"tool":   "query",
+	})
+	msg.ID = "prefer-hub-fallback"
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Error != nil {
+		t.Fatalf("expected successful local fallback, got %+v", resp)
+	}
+	if string(resp.Result) != `{"local":true}` {
+		t.Fatalf("result = %s, want local fallback result", string(resp.Result))
+	}
+	if hubDials != 1 {
+		t.Fatalf("hub dials = %d, want 1", hubDials)
+	}
+	if localDials != 1 {
+		t.Fatalf("local dials = %d, want 1", localDials)
+	}
+	if active, _ := d.preferHubBackoffActive("agent_context"); !active {
+		t.Fatal("expected prefer-hub backoff to be active after hub recv failure")
+	}
+}
+
 func TestHandleCall_RBACDenialEmitsAuditAndCost(t *testing.T) {
 	d := newCallPipelineTestDaemon()
 	auditPath := enableAuditAndCostForTest(t, d)
@@ -1258,8 +1837,8 @@ func TestHandleCall_RBACDenialEmitsAuditAndCost(t *testing.T) {
 }
 
 // TestCallPipeline_ErrorResponseEnvelopeStructure validates that the unified
-// errorResponse helper produces correct JSON-RPC error envelopes with and
-// without the optional Data field.
+// errorResponse helper produces correct JSON-RPC error envelopes with
+// PipelineErrorData in the Data field.
 func TestCallPipeline_ErrorResponseEnvelopeStructure(t *testing.T) {
 	d := newCallPipelineTestDaemon()
 	p := newCallPipeline(d, context.Background(), &mcp.Message{
@@ -1267,7 +1846,7 @@ func TestCallPipeline_ErrorResponseEnvelopeStructure(t *testing.T) {
 		ID:      "envelope-test",
 	})
 
-	// Error without Data.
+	// invalidParamsError now carries PipelineErrorData.
 	resp := p.invalidParamsError("bad input")
 	if resp.JSONRPC != mcp.JSONRPCVersion {
 		t.Fatalf("JSONRPC = %q, want %q", resp.JSONRPC, mcp.JSONRPCVersion)
@@ -1278,8 +1857,12 @@ func TestCallPipeline_ErrorResponseEnvelopeStructure(t *testing.T) {
 	if resp.Error.Code != mcp.InvalidParams {
 		t.Fatalf("Code = %d, want %d", resp.Error.Code, mcp.InvalidParams)
 	}
-	if resp.Error.Data != nil {
-		t.Fatalf("expected nil Data for plain error, got %v", resp.Error.Data)
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("expected *PipelineErrorData, got %T", resp.Error.Data)
+	}
+	if ped.Code != "INVALID_INPUT" {
+		t.Fatalf("PipelineErrorData.Code = %q, want INVALID_INPUT", ped.Code)
 	}
 
 	// Error with Data (policy denial).
@@ -1293,21 +1876,28 @@ func TestCallPipeline_ErrorResponseEnvelopeStructure(t *testing.T) {
 	if policyResp.Error.Code != mcp.InvalidRequest {
 		t.Fatalf("Code = %d, want %d", policyResp.Error.Code, mcp.InvalidRequest)
 	}
-	data, ok := policyResp.Error.Data.(map[string]any)
+	policyPED, ok := policyResp.Error.Data.(*PipelineErrorData)
 	if !ok {
-		t.Fatalf("expected Data map, got %T", policyResp.Error.Data)
+		t.Fatalf("expected *PipelineErrorData, got %T", policyResp.Error.Data)
 	}
-	if data["policy_rule_id"] != "rule-1" {
-		t.Fatalf("policy_rule_id = %v, want rule-1", data["policy_rule_id"])
+	if policyPED.Code != "POLICY_DENIED" {
+		t.Fatalf("PipelineErrorData.Code = %q, want POLICY_DENIED", policyPED.Code)
 	}
-	if data["policy_reason_code"] != "BLOCKED" {
-		t.Fatalf("policy_reason_code = %v, want BLOCKED", data["policy_reason_code"])
+	details, ok := policyPED.Details.(map[string]any)
+	if !ok {
+		t.Fatalf("expected Details map, got %T", policyPED.Details)
 	}
-	if data["policy_stage"] != "request" {
-		t.Fatalf("policy_stage = %v, want request", data["policy_stage"])
+	if details["policy_rule_id"] != "rule-1" {
+		t.Fatalf("policy_rule_id = %v, want rule-1", details["policy_rule_id"])
 	}
-	if data["policy_action"] != "deny" {
-		t.Fatalf("policy_action = %v, want deny", data["policy_action"])
+	if details["policy_reason_code"] != "BLOCKED" {
+		t.Fatalf("policy_reason_code = %v, want BLOCKED", details["policy_reason_code"])
+	}
+	if details["policy_stage"] != "request" {
+		t.Fatalf("policy_stage = %v, want request", details["policy_stage"])
+	}
+	if details["policy_action"] != "deny" {
+		t.Fatalf("policy_action = %v, want deny", details["policy_action"])
 	}
 }
 
@@ -1370,7 +1960,7 @@ func TestHandleStatus_NotDrainReady_DuringCall(t *testing.T) {
 					case <-recvGate:
 						return &mcp.Message{
 							JSONRPC: mcp.JSONRPCVersion,
-							ID:      "ok",
+							ID:      "test-id",
 							Result:  json.RawMessage(`{"ok":true}`),
 						}, nil
 					case <-ctx.Done():
@@ -1477,7 +2067,7 @@ func TestCallPipeline_TransportFailureThenRecovery(t *testing.T) {
 					},
 					recvMsg: &mcp.Message{
 						JSONRPC: mcp.JSONRPCVersion,
-						ID:      "ok",
+						ID:      "test-id",
 						Result:  json.RawMessage(`{"ok":true}`),
 					},
 				}, nil
@@ -1486,7 +2076,7 @@ func TestCallPipeline_TransportFailureThenRecovery(t *testing.T) {
 			return &fakeTransport{
 				recvMsg: &mcp.Message{
 					JSONRPC: mcp.JSONRPCVersion,
-					ID:      "recovered",
+					ID:      "test-id",
 					Result:  json.RawMessage(`{"recovered":true}`),
 				},
 			}, nil
@@ -1508,25 +2098,26 @@ func TestCallPipeline_TransportFailureThenRecovery(t *testing.T) {
 		t.Fatalf("call 1: unexpected error response: %+v", resp1.Error)
 	}
 
-	// Call 2: same connection reused from pool, send fails (sendCount=2).
+	// Call 2: same connection reused from pool, send fails (sendCount=2),
+	// then daemon retries once with a fresh local connection in the same call.
 	resp2, err2 := d.handleCall(context.Background(), msg)
 	if err2 != nil {
 		t.Fatalf("call 2: unexpected error: %v", err2)
 	}
-	if resp2.Error == nil {
-		t.Fatal("call 2: expected transport failure error response")
+	if resp2.Error != nil {
+		t.Fatalf("call 2: expected retry success, got error: %+v", resp2.Error)
 	}
-	if !strings.Contains(resp2.Error.Message, "broken pipe") {
-		t.Fatalf("call 2: expected broken pipe in error, got %q", resp2.Error.Message)
+	if string(resp2.Result) != `{"recovered":true}` {
+		t.Fatalf("call 2: result = %s, want in-call recovery response", string(resp2.Result))
 	}
 
-	// Pool should be cleared after transport failure.
+	// Pool should still have a healthy connection after in-call recovery.
 	stats := d.pool.Stats()
-	if stats.IdleConns != 0 {
-		t.Fatalf("pool idle conns = %d, want 0 after transport failure", stats.IdleConns)
+	if stats.IdleConns == 0 {
+		t.Fatalf("pool idle conns = %d, want > 0 after in-call recovery", stats.IdleConns)
 	}
 
-	// Call 3: recovery with fresh connection from new dial.
+	// Call 3: subsequent calls continue succeeding after recovery.
 	resp3, err3 := d.handleCall(context.Background(), msg)
 	if err3 != nil {
 		t.Fatalf("call 3: unexpected error: %v", err3)
@@ -1578,7 +2169,7 @@ func TestCallPipeline_ConsecutiveTimeoutsThenRecovery(t *testing.T) {
 			return &fakeTransport{
 				recvMsg: &mcp.Message{
 					JSONRPC: mcp.JSONRPCVersion,
-					ID:      "ok",
+					ID:      "test-id",
 					Result:  json.RawMessage(`{"finally":true}`),
 				},
 			}, nil
@@ -1648,7 +2239,7 @@ func TestCallPipeline_RecvEOFTriggersServerRestart(t *testing.T) {
 			return &fakeTransport{
 				recvMsg: &mcp.Message{
 					JSONRPC: mcp.JSONRPCVersion,
-					ID:      "ok",
+					ID:      "test-id",
 					Result:  json.RawMessage(`{"restarted":true}`),
 				},
 			}, nil
@@ -1686,5 +2277,2623 @@ func TestCallPipeline_RecvEOFTriggersServerRestart(t *testing.T) {
 	}
 	if string(resp2.Result) != `{"restarted":true}` {
 		t.Fatalf("recovery call: result = %s, want restarted response", string(resp2.Result))
+	}
+}
+
+// --- Response ID correlation tests ---
+
+// TestCallPipelineExecute_ResponseIDMismatch verifies that execute() detects
+// when the response ID does not match the request ID and treats it as a
+// transport failure. This catches the root cause of stale responses from
+// shared stdio transports.
+func TestCallPipelineExecute_ResponseIDMismatch(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.procMgr = process.NewManager(nil, "codex")
+
+	// Transport returns a response with a different ID than the request.
+	tr := &fakeTransport{
+		recvMsg: &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			ID:      "stale-99",
+			Result:  json.RawMessage(`{"wrong":true}`),
+		},
+	}
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "req-42"},
+		serverName: "test_srv",
+		toolName:   "query",
+		method:     "tools/call",
+		conn: &pool.Conn{
+			ServerName: "test_srv",
+			Transport:  tr,
+			Healthy:    true,
+		},
+		target:    router.TargetHub,
+		targetStr: router.TargetHub.String(),
+	}
+
+	req := &mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: "req-42", Method: "tools/call"}
+	resp := p.execute(req)
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected error response for ID mismatch")
+	}
+	if resp.Error.Code != mcp.InternalError {
+		t.Fatalf("error code = %d, want %d", resp.Error.Code, mcp.InternalError)
+	}
+	if !strings.Contains(resp.Error.Message, "response ID mismatch") {
+		t.Fatalf("error message = %q, want response ID mismatch", resp.Error.Message)
+	}
+	if !strings.Contains(resp.Error.Message, "stale-99") {
+		t.Fatalf("error message should contain mismatched ID, got %q", resp.Error.Message)
+	}
+	if p.conn.Healthy {
+		t.Fatal("expected connection to be marked unhealthy after ID mismatch")
+	}
+}
+
+func TestHandleCall_LocalConcurrencyNoIDMismatchWithLock(t *testing.T) {
+	// Two concurrent callers share a single transport — the production
+	// reality for stdio servers, where kitprocess.Manager.Dial returns the
+	// same *Process (and so the same *StdioTransport) for every pool entry
+	// sharing a serverName. Without per-server serialization the
+	// interleaving transport's broken Recv would deliver the wrong response
+	// ID; the pipeline catches that mismatch as transport corruption and
+	// triggers a full process teardown. With the per-server callLock the
+	// two calls serialize, each Send→Recv pair completes atomically, and
+	// both callers see the correct response. This is the property the
+	// daemon's per-server callLock continues to guarantee for TargetLocal.
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{
+		HubEnabled: true,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{
+					Name:       "local_concurrency_test",
+					Categories: []string{"local-only"},
+				},
+			},
+		},
+	})
+
+	shared := &interleavingHubTransport{}
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     2,
+		MaxOpen:     2,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			return shared, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	makeMsg := func(id string) *mcp.Message {
+		msg := newCallMessage(t, map[string]any{
+			"server": "local_concurrency_test",
+			"tool":   "query",
+		})
+		msg.ID = id
+		return msg
+	}
+
+	type result struct {
+		resp *mcp.Message
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, id := range []string{"req-1", "req-2"} {
+		wg.Add(1)
+		go func(callID string) {
+			defer wg.Done()
+			<-start
+			resp, err := d.handleCall(context.Background(), makeMsg(callID))
+			results <- result{resp: resp, err: err}
+		}(id)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("unexpected call error: %v", res.err)
+		}
+		if res.resp == nil || res.resp.Error != nil {
+			t.Fatalf("expected success response, got %+v", res.resp)
+		}
+		if !strings.Contains(string(res.resp.Result), `"ok":true`) {
+			t.Fatalf("unexpected response result: %s", string(res.resp.Result))
+		}
+	}
+}
+
+// TestHandleCall_HubConcurrentCallsRunInParallel verifies that hub-routed
+// calls to the same server name complete in parallel — the per-server
+// callLock applies to TargetLocal only. Each hub pool dial returns a fresh
+// transport, mirroring the post-mcp-go!3 (commit aa57e61) WebSocketClient
+// behaviour where every Dial builds a new *WebSocketTransport with its own
+// websocket.Conn. Concurrent callers therefore each hold an exclusive
+// transport via the pool and must not serialize on the per-server lock.
+//
+// Regression: the cascade reported in daemon.err on 2026-05-19 was caused
+// by the lock being acquired around send/recv for hub-routed calls — a
+// slow upstream recv held the per-server lock for up to the 30s tool RPC
+// timeout, queueing every heartbeat/refresh caller until they exhausted
+// the 15s LOOM_DAEMON_CALL_LOCK_TIMEOUT budget. With the lock skipped for
+// hub, this cascade cannot recur as long as each pool Conn has its own
+// transport.
+func TestHandleCall_HubConcurrentCallsRunInParallel(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{HubEnabled: true})
+
+	const perCallLatency = 100 * time.Millisecond
+	const callers = 10
+
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     callers,
+		MaxOpen:     callers,
+		IdleTimeout: time.Minute,
+		// Fresh transport per dial mirrors post-mcp-go!3 WebSocketClient.Dial.
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			return &slowEchoTransport{sendDelay: perCallLatency}, nil
+		},
+	})
+	defer func() { _ = d.hubPool.Close() }()
+
+	makeMsg := func(id string) *mcp.Message {
+		msg := newCallMessage(t, map[string]any{
+			"server": "hub_parallel_test",
+			"tool":   "echo",
+		})
+		msg.ID = id
+		return msg
+	}
+
+	type result struct {
+		resp *mcp.Message
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			resp, err := d.handleCall(context.Background(), makeMsg(fmt.Sprintf("req-%d", idx)))
+			results <- result{resp: resp, err: err}
+		}(i)
+	}
+
+	beginAt := time.Now()
+	close(start)
+	wg.Wait()
+	elapsed := time.Since(beginAt)
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("unexpected call error: %v", res.err)
+		}
+		if res.resp == nil || res.resp.Error != nil {
+			t.Fatalf("expected success, got %+v", res.resp)
+		}
+	}
+
+	// If hub were still serialized on the per-server lock, wall-clock would
+	// be ~callers*perCallLatency = 1000ms. Allow generous slack (3×) for CI
+	// scheduling jitter but still catch serialization (would be ~10×).
+	parallelBudget := perCallLatency * 3
+	if elapsed > parallelBudget {
+		t.Fatalf("hub calls appear serialized: %d concurrent callers took %v, want < %v",
+			callers, elapsed, parallelBudget)
+	}
+}
+
+// TestHandleCall_ConcurrentCallsCompleteWithoutLockTimeout is the original
+// regression for the "acquire call lock for agent_context after 15s:
+// context deadline exceeded" cascade reported in loom-agent-hooks.log.
+// Post-fix the hub path no longer takes the per-server lock at all, so
+// this test now serves as defense-in-depth: many concurrent hub callers
+// must complete without any lock-acquire failure even when individual
+// calls take non-trivial time.
+func TestHandleCall_ConcurrentCallsCompleteWithoutLockTimeout(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{HubEnabled: true})
+
+	d.hubPool = pool.New(pool.Config{
+		MaxIdle:     8,
+		MaxOpen:     8,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			// Per-call latency well under the default 5s callLock acquire
+			// timeout: 4 callers serialized = 60ms total, plenty of headroom.
+			return &slowEchoTransport{sendDelay: 15 * time.Millisecond}, nil
+		},
+	})
+	defer func() { _ = d.hubPool.Close() }()
+
+	makeMsg := func(id string) *mcp.Message {
+		msg := newCallMessage(t, map[string]any{
+			"server": "lock_fairness_test",
+			"tool":   "echo",
+		})
+		msg.ID = id
+		return msg
+	}
+
+	const callers = 4
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			_, err := d.handleCall(context.Background(), makeMsg(fmt.Sprintf("req-%d", idx)))
+			errs <- err
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("unexpected call error (lock-acquire timeout regression?): %v", err)
+		}
+	}
+}
+
+// slowEchoTransport simulates an MCP server with an artificial Send
+// delay. Instances are designed for use as fixture: each call's
+// Send→Recv must be serialized by the caller (matching production
+// shared-transport semantics).
+type slowEchoTransport struct {
+	mu        sync.Mutex
+	lastID    any
+	sendDelay time.Duration
+}
+
+func (t *slowEchoTransport) Send(_ context.Context, msg *mcp.Message) error {
+	t.mu.Lock()
+	t.lastID = msg.ID
+	delay := t.sendDelay
+	t.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	return nil
+}
+
+func (t *slowEchoTransport) Recv(_ context.Context) (*mcp.Message, error) {
+	t.mu.Lock()
+	id := t.lastID
+	t.mu.Unlock()
+	return &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      id,
+		Result:  json.RawMessage(`{"ok":true}`),
+	}, nil
+}
+
+func (t *slowEchoTransport) Close() error { return nil }
+
+// TestCallPipelineExecute_ResponseIDMatchSucceeds verifies that execute()
+// passes when the response ID matches the request ID.
+func TestCallPipelineExecute_ResponseIDMatchSucceeds(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	tr := &fakeTransport{
+		recvMsg: &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			ID:      "match-1",
+			Result:  json.RawMessage(`{"ok":true}`),
+		},
+	}
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "match-1"},
+		serverName: "test_srv",
+		toolName:   "query",
+		method:     "tools/call",
+		conn: &pool.Conn{
+			ServerName: "test_srv",
+			Transport:  tr,
+			Healthy:    true,
+		},
+		target:    router.TargetHub,
+		targetStr: router.TargetHub.String(),
+	}
+
+	req := &mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: "match-1", Method: "tools/call"}
+	resp := p.execute(req)
+	if resp == nil {
+		t.Fatal("expected response")
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error response: %+v", resp.Error)
+	}
+	if string(resp.Result) != `{"ok":true}` {
+		t.Fatalf("result = %s, want ok", string(resp.Result))
+	}
+}
+
+// TestCallPipelineExecute_ResponseIDNilAccepted verifies that a nil response
+// ID (e.g., for notifications) does not trigger a mismatch error.
+func TestCallPipelineExecute_ResponseIDNilAccepted(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	tr := &fakeTransport{
+		recvMsg: &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			// ID is nil (notification-style response)
+			Result: json.RawMessage(`{"notif":true}`),
+		},
+	}
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: "req-notif"},
+		serverName: "test_srv",
+		toolName:   "query",
+		method:     "tools/call",
+		conn: &pool.Conn{
+			ServerName: "test_srv",
+			Transport:  tr,
+			Healthy:    true,
+		},
+		target:    router.TargetHub,
+		targetStr: router.TargetHub.String(),
+	}
+
+	req := &mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: "req-notif", Method: "tools/call"}
+	resp := p.execute(req)
+	if resp == nil {
+		t.Fatal("expected response")
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error for nil response ID: %+v", resp.Error)
+	}
+}
+
+// TestCallPipelineExecute_NumericIDCorrelation verifies that numeric IDs
+// (which can be float64 after JSON round-trip) are correctly correlated
+// with their string representations.
+func TestCallPipelineExecute_NumericIDCorrelation(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+
+	// Simulate JSON round-trip: numeric ID becomes float64.
+	tr := &fakeTransport{
+		recvMsg: &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			ID:      float64(42),
+			Result:  json.RawMessage(`{"ok":true}`),
+		},
+	}
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: float64(42)},
+		serverName: "test_srv",
+		toolName:   "query",
+		method:     "tools/call",
+		conn: &pool.Conn{
+			ServerName: "test_srv",
+			Transport:  tr,
+			Healthy:    true,
+		},
+		target:    router.TargetHub,
+		targetStr: router.TargetHub.String(),
+	}
+
+	req := &mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: float64(42), Method: "tools/call"}
+	resp := p.execute(req)
+	if resp == nil {
+		t.Fatal("expected response")
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error for matching numeric IDs: %+v", resp.Error)
+	}
+}
+
+// TestCallPipelineExecute_NumericIDMismatch verifies that numeric ID
+// mismatches are detected.
+func TestCallPipelineExecute_NumericIDMismatch(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.procMgr = process.NewManager(nil, "codex")
+
+	tr := &fakeTransport{
+		recvMsg: &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			ID:      float64(999),
+			Result:  json.RawMessage(`{"wrong":true}`),
+		},
+	}
+
+	p := &callPipeline{
+		daemon:     d,
+		ctx:        context.Background(),
+		msg:        &mcp.Message{ID: float64(42)},
+		serverName: "test_srv",
+		toolName:   "query",
+		method:     "tools/call",
+		conn: &pool.Conn{
+			ServerName: "test_srv",
+			Transport:  tr,
+			Healthy:    true,
+		},
+		target:    router.TargetHub,
+		targetStr: router.TargetHub.String(),
+	}
+
+	req := &mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: float64(42), Method: "tools/call"}
+	resp := p.execute(req)
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected error for numeric ID mismatch")
+	}
+	if !strings.Contains(resp.Error.Message, "response ID mismatch") {
+		t.Fatalf("expected mismatch error, got %q", resp.Error.Message)
+	}
+	if p.conn.Healthy {
+		t.Fatal("expected connection marked unhealthy")
+	}
+}
+
+// --- Concurrent call correlation tests ---
+
+// TestHandleCall_ConcurrentCallsGetCorrectResponses verifies that multiple
+// concurrent calls through the daemon each get the response meant for them,
+// not a stale response from another caller. This is the test that directly
+// exercises the bug discovered via the Python reproduction script.
+func TestHandleCall_ConcurrentCallsGetCorrectResponses(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.procMgr = process.NewManager(nil, "codex")
+
+	d.router = router.New(router.Config{
+		HubEnabled:       false,
+		FailureThreshold: 100,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{Name: "concurrent_srv", Categories: []string{"local-only"}},
+			},
+		},
+	})
+
+	// Each call gets a transport that echoes back the request ID in the response.
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     10,
+		MaxOpen:     10,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			return &fakeTransport{
+				sendFn: func(_ context.Context, _ *mcp.Message) error { return nil },
+				recvFn: func(_ context.Context) (*mcp.Message, error) {
+					// Simulate a correct server: response ID echoes the request ID.
+					// Since the callLock serializes calls, we can safely use a
+					// per-transport counter here.
+					return &mcp.Message{
+						JSONRPC: mcp.JSONRPCVersion,
+						ID:      "test-id",
+						Result:  json.RawMessage(`{"ok":true}`),
+					}, nil
+				},
+			}, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	const concurrency = 20
+	errs := make(chan error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			msg := newCallMessage(t, map[string]any{
+				"server": "concurrent_srv",
+				"tool":   "echo",
+			})
+
+			resp, err := d.handleCall(context.Background(), msg)
+			if err != nil {
+				errs <- fmt.Errorf("call %d: %w", idx, err)
+				return
+			}
+			if resp.Error != nil {
+				errs <- fmt.Errorf("call %d: error response: %s", idx, resp.Error.Message)
+				return
+			}
+			errs <- nil
+		}(i)
+	}
+
+	for i := 0; i < concurrency; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("%v", err)
+		}
+	}
+}
+
+// TestHandleCall_ResponseIDMismatchEndToEnd verifies the full handleCall path
+// detects and rejects a response with a mismatched ID.
+func TestHandleCall_ResponseIDMismatchEndToEnd(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.procMgr = process.NewManager(nil, "codex")
+
+	d.router = router.New(router.Config{
+		HubEnabled:       false,
+		FailureThreshold: 10,
+		Registry: &kitregistry.Registry{
+			Servers: []*kitregistry.Server{
+				{Name: "mismatch_srv", Categories: []string{"local-only"}},
+			},
+		},
+	})
+
+	// Transport returns a stale response with a wrong ID.
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     2,
+		MaxOpen:     2,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			return &fakeTransport{
+				recvMsg: &mcp.Message{
+					JSONRPC: mcp.JSONRPCVersion,
+					ID:      "stale-from-hud",
+					Result:  json.RawMessage(`{"stale":true}`),
+				},
+			}, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	msg := newCallMessage(t, map[string]any{
+		"server": "mismatch_srv",
+		"tool":   "query",
+	})
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected error response for ID mismatch")
+	}
+	if !strings.Contains(resp.Error.Message, "response ID mismatch") {
+		t.Fatalf("expected mismatch error, got %q", resp.Error.Message)
+	}
+}
+
+// --- Lock ordering tests ---
+
+// TestFetchServerToolsViaPool_LockOrdering verifies that fetchServerToolsViaPool
+// acquires the callLock before pool.Get, preventing deadlock with callPipeline.
+// The test installs a DialFunc that checks whether the callLock is already held
+// (via TryLock) when pool.Get triggers a new dial. If lock ordering is correct
+// (lock→pool), TryLock must fail because the lock is held by the caller.
+func TestFetchServerToolsViaPool_LockOrdering(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+
+	poolGetCalled := false
+	var lockHeldDuringDial bool
+
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     2,
+		MaxOpen:     2,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			poolGetCalled = true
+			// If the callLock is properly acquired BEFORE pool.Get, then
+			// TryLock from the same goroutine will fail (returns false)
+			// because the mutex is already held by our caller.
+			mu := d.callLock("order_test")
+			lockHeldDuringDial = !mu.TryLock()
+			if !lockHeldDuringDial {
+				// TryLock succeeded, meaning lock was NOT held. Unlock it.
+				mu.Unlock()
+			}
+			return &fakeTransport{
+				recvMsg: &mcp.Message{
+					JSONRPC: mcp.JSONRPCVersion,
+					ID:      float64(1),
+					Result:  json.RawMessage(`{"tools":[]}`),
+				},
+			}, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	_, _ = d.fetchServerToolsViaPool(context.Background(), "order_test")
+
+	if !poolGetCalled {
+		t.Fatal("pool.Get was never called")
+	}
+	if !lockHeldDuringDial {
+		t.Fatal("callLock was NOT held when pool.Get dialed - lock ordering violation (should be lock→pool, not pool→lock)")
+	}
+}
+
+// TestFetchServerResources_LockOrdering verifies that fetchServerResources
+// also acquires callLock before pool.Get.
+func TestFetchServerResources_LockOrdering(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+
+	poolGetCalled := false
+	var lockHeldDuringDial bool
+
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     2,
+		MaxOpen:     2,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			poolGetCalled = true
+			mu := d.callLock("res_order_test")
+			lockHeldDuringDial = !mu.TryLock()
+			if !lockHeldDuringDial {
+				mu.Unlock()
+			}
+			return &fakeTransport{
+				recvMsg: &mcp.Message{
+					JSONRPC: mcp.JSONRPCVersion,
+					ID:      float64(1),
+					Result:  json.RawMessage(`{"resources":[]}`),
+				},
+			}, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	_, _ = d.fetchServerResources(context.Background(), "res_order_test")
+
+	if !poolGetCalled {
+		t.Fatal("pool.Get was never called")
+	}
+	if !lockHeldDuringDial {
+		t.Fatal("callLock was NOT held when pool.Get dialed - lock ordering violation")
+	}
+}
+
+func TestFetchServerToolsViaPool_CallLockTimeout(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	mu := d.callLock("lock_timeout_srv")
+	mu.Lock()
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		mu.Unlock()
+	}()
+
+	t.Setenv("LOOM_DAEMON_CALL_LOCK_TIMEOUT", "50ms")
+
+	start := time.Now()
+	_, err := d.fetchServerToolsViaPool(context.Background(), "lock_timeout_srv")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected call lock timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "acquire call lock") {
+		t.Fatalf("expected acquire call lock error, got %v", err)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("lock timeout path took too long: %v", elapsed)
+	}
+}
+
+func TestCallPipelineConnectTarget_CallLockTimeout(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	mu := d.callLock("lock_timeout_srv")
+	mu.Lock()
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		mu.Unlock()
+	}()
+
+	t.Setenv("LOOM_DAEMON_CALL_LOCK_TIMEOUT", "50ms")
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "lock-timeout",
+	})
+	p.serverName = "lock_timeout_srv"
+
+	start := time.Now()
+	err := p.connectTarget(router.TargetLocal, "test lock timeout")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected call lock timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "acquire call lock") {
+		t.Fatalf("expected acquire call lock error, got %v", err)
+	}
+	if p.lockHeld {
+		t.Fatal("lock should not be marked as held when acquisition fails")
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("lock timeout path took too long: %v", elapsed)
+	}
+}
+
+// TestHandleCall_StageBoundaryAuditRegression verifies that every pipeline stage
+// that emits an audit entry populates the PipelineStage field with the correct
+// constant. Parse failures produce no audit entry (pre-audit), so they are only
+// verified to not emit. This is the primary regression guard for DEBT-016.
+func TestHandleCall_StageBoundaryAuditRegression(t *testing.T) {
+	t.Run("parse_no_audit", func(t *testing.T) {
+		d := newCallPipelineTestDaemon()
+		auditPath := enableAuditAndCostForTest(t, d)
+		msg := &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			ID:      "stage-parse",
+			Method:  "loom/call",
+			Params:  json.RawMessage(`{`),
+		}
+
+		resp, err := d.handleCall(context.Background(), msg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.Error == nil || resp.Error.Code != mcp.InvalidParams {
+			t.Fatalf("expected InvalidParams, got %+v", resp.Error)
+		}
+
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) != 0 {
+			t.Fatalf("parse failure should emit 0 audit entries, got %d", len(entries))
+		}
+	})
+
+	t.Run("authorize_stage", func(t *testing.T) {
+		d := newCallPipelineTestDaemon()
+		auditPath := enableAuditAndCostForTest(t, d)
+		d.rbac = NewRBACEnforcer(RBACConfig{
+			Enabled:       true,
+			DefaultPolicy: "deny",
+		}, d.logger)
+
+		msg := newCallMessage(t, map[string]any{
+			"server":   "github",
+			"tool":     "delete_repo",
+			"agent_id": "agent-stage-auth",
+		})
+
+		resp, _ := d.handleCall(context.Background(), msg)
+		if resp.Error == nil {
+			t.Fatal("expected RBAC denial")
+		}
+
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) != 1 {
+			t.Fatalf("audit entries = %d, want 1", len(entries))
+		}
+		if entries[0].PipelineStage != stageAuth {
+			t.Fatalf("pipeline_stage = %q, want %q", entries[0].PipelineStage, stageAuth)
+		}
+		if entries[0].Status != "denied" {
+			t.Fatalf("status = %q, want denied", entries[0].Status)
+		}
+	})
+
+	t.Run("policy_stage", func(t *testing.T) {
+		d := newCallPipelineTestDaemon()
+		auditPath := enableAuditAndCostForTest(t, d)
+		d.policy = NewGatewayPolicyEnforcer(GatewayPolicyConfig{
+			Enabled: true,
+			Request: []GatewayRequestPolicyRule{
+				{
+					ID:                 "deny-test",
+					Server:             "github",
+					Tool:               "delete_*",
+					ForbiddenArguments: []string{"force"},
+					ReasonCode:         "STAGE_TEST",
+				},
+			},
+		}, d.logger)
+
+		msg := newCallMessage(t, map[string]any{
+			"server":    "github",
+			"tool":      "delete_repo",
+			"arguments": json.RawMessage(`{"force":true}`),
+			"agent_id":  "agent-stage-policy",
+		})
+
+		resp, _ := d.handleCall(context.Background(), msg)
+		if resp.Error == nil {
+			t.Fatal("expected policy denial")
+		}
+
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) != 1 {
+			t.Fatalf("audit entries = %d, want 1", len(entries))
+		}
+		if entries[0].PipelineStage != stagePolicy {
+			t.Fatalf("pipeline_stage = %q, want %q", entries[0].PipelineStage, stagePolicy)
+		}
+		if entries[0].Status != "denied" {
+			t.Fatalf("status = %q, want denied", entries[0].Status)
+		}
+	})
+
+	t.Run("cache_stage", func(t *testing.T) {
+		d := newCallPipelineTestDaemon()
+		auditPath := enableAuditAndCostForTest(t, d)
+		d.respCache = NewResponseCache(CacheConfig{Enabled: true})
+
+		args := json.RawMessage(`{"query":"up"}`)
+		key := d.respCache.Key("prometheus", "query", args)
+		d.respCache.Set(key, json.RawMessage(`{"cached":true}`), "prometheus", "query")
+
+		msg := newCallMessage(t, map[string]any{
+			"server":    "prometheus",
+			"tool":      "query",
+			"arguments": json.RawMessage(`{"query":"up"}`),
+			"agent_id":  "agent-stage-cache",
+		})
+
+		resp, _ := d.handleCall(context.Background(), msg)
+		if resp.Error != nil {
+			t.Fatalf("unexpected error: %v", resp.Error)
+		}
+
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) != 1 {
+			t.Fatalf("audit entries = %d, want 1", len(entries))
+		}
+		if entries[0].PipelineStage != stageCache {
+			t.Fatalf("pipeline_stage = %q, want %q", entries[0].PipelineStage, stageCache)
+		}
+		if !entries[0].Cached {
+			t.Fatal("expected cached=true in audit entry")
+		}
+	})
+
+	t.Run("route_stage", func(t *testing.T) {
+		d := newCallPipelineTestDaemon()
+		auditPath := enableAuditAndCostForTest(t, d)
+		d.router = router.New(router.Config{HubEnabled: false})
+
+		msg := newCallMessage(t, map[string]any{
+			"server":   "unknown_server",
+			"tool":     "query",
+			"agent_id": "agent-stage-route",
+		})
+
+		resp, _ := d.handleCall(context.Background(), msg)
+		if resp.Error == nil {
+			t.Fatal("expected route failure")
+		}
+
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) != 1 {
+			t.Fatalf("audit entries = %d, want 1", len(entries))
+		}
+		if entries[0].PipelineStage != stageRoute {
+			t.Fatalf("pipeline_stage = %q, want %q", entries[0].PipelineStage, stageRoute)
+		}
+		if entries[0].Status != "error" {
+			t.Fatalf("status = %q, want error", entries[0].Status)
+		}
+	})
+
+	t.Run("build_stage", func(t *testing.T) {
+		d := newCallPipelineTestDaemon()
+		auditPath := enableAuditAndCostForTest(t, d)
+		p := newCallPipeline(d, context.Background(), &mcp.Message{
+			JSONRPC: mcp.JSONRPCVersion,
+			ID:      make(chan int),
+			Method:  "loom/call",
+		})
+		p.serverName = "github"
+		p.toolName = "query"
+		p.method = "tools/call"
+		p.params.Arguments = json.RawMessage(`{`)
+		p.targetStr = "local"
+		p.auditStart = time.Now()
+
+		_, resp := p.buildForwardRequest()
+		if resp.Error == nil {
+			t.Fatal("expected build failure")
+		}
+
+		ped, ok := resp.Error.Data.(*PipelineErrorData)
+		if !ok {
+			t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+		}
+		if ped.Stage != stageBuild {
+			t.Fatalf("stage = %q, want %q", ped.Stage, stageBuild)
+		}
+		if ped.Code != "SERVER_ERROR" {
+			t.Fatalf("code = %q, want SERVER_ERROR", ped.Code)
+		}
+
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) != 1 {
+			t.Fatalf("audit entries = %d, want 1", len(entries))
+		}
+		if entries[0].PipelineStage != stageBuild {
+			t.Fatalf("pipeline_stage = %q, want %q", entries[0].PipelineStage, stageBuild)
+		}
+		if entries[0].Status != "error" {
+			t.Fatalf("status = %q, want error", entries[0].Status)
+		}
+	})
+
+	t.Run("execute_stage", func(t *testing.T) {
+		d := newCallPipelineTestDaemon()
+		auditPath := enableAuditAndCostForTest(t, d)
+		d.procMgr = process.NewManager(nil, "codex")
+		d.hubPool = pool.New(pool.Config{
+			MaxIdle:     1,
+			MaxOpen:     1,
+			IdleTimeout: time.Second,
+			DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+				return &fakeTransport{sendErr: fmt.Errorf("stage-test send failure")}, nil
+			},
+		})
+		defer func() { _ = d.hubPool.Close() }()
+
+		msg := newCallMessage(t, map[string]any{
+			"server":   "hub_server",
+			"tool":     "query",
+			"agent_id": "agent-stage-exec",
+		})
+
+		resp, _ := d.handleCall(context.Background(), msg)
+		if resp.Error == nil {
+			t.Fatal("expected transport failure")
+		}
+
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) != 1 {
+			t.Fatalf("audit entries = %d, want 1", len(entries))
+		}
+		if entries[0].PipelineStage != stageExecute {
+			t.Fatalf("pipeline_stage = %q, want %q", entries[0].PipelineStage, stageExecute)
+		}
+		if entries[0].Status != "error" {
+			t.Fatalf("status = %q, want error", entries[0].Status)
+		}
+	})
+}
+
+func TestResolveToolCallTimeout(t *testing.T) {
+	t.Setenv("LOOM_DAEMON_TOOL_TIMEOUT", "")
+
+	tests := []struct {
+		name string
+		p    callParams
+		want time.Duration
+	}{
+		{
+			name: "explicit _timeout field",
+			p:    callParams{Method: "tools/call", Timeout: "5m"},
+			want: 5 * time.Minute,
+		},
+		{
+			name: "explicit _timeout honors short caller deadline below daemon default",
+			p:    callParams{Method: "tools/call", Timeout: "3s"},
+			want: 3 * time.Second,
+		},
+		{
+			name: "explicit _timeout clamped up to minCallerTimeoutOverride floor",
+			p:    callParams{Method: "tools/call", Timeout: "100ms"},
+			want: minCallerTimeoutOverride,
+		},
+		{
+			name: "explicit _timeout capped at max",
+			p:    callParams{Method: "tools/call", Timeout: "30m"},
+			want: maxDaemonToolRPCTimeout,
+		},
+		{
+			name: "explicit _timeout invalid falls through to default",
+			p:    callParams{Method: "tools/call", Timeout: "garbage"},
+			want: defaultDaemonToolRPCTimeout,
+		},
+		{
+			name: "explicit _timeout zero falls through to default",
+			p:    callParams{Method: "tools/call", Timeout: "0s"},
+			want: defaultDaemonToolRPCTimeout,
+		},
+		{
+			name: "auto-derive timeout_seconds from arguments",
+			p: callParams{
+				Method:    "tools/call",
+				Arguments: json.RawMessage(`{"timeout_seconds": 600}`),
+			},
+			want: 600*time.Second + autoDeriveDaemonTimeoutBuffer,
+		},
+		{
+			name: "auto-derive timeoutSeconds from arguments",
+			p: callParams{
+				Method:    "tools/call",
+				Arguments: json.RawMessage(`{"timeoutSeconds": 300}`),
+			},
+			want: 300*time.Second + autoDeriveDaemonTimeoutBuffer,
+		},
+		{
+			name: "auto-derive Go duration string from arguments",
+			p: callParams{
+				Method:    "tools/call",
+				Arguments: json.RawMessage(`{"timeout": "10m"}`),
+			},
+			want: 10*time.Minute + autoDeriveDaemonTimeoutBuffer,
+		},
+		{
+			name: "auto-derive capped at max",
+			p: callParams{
+				Method:    "tools/call",
+				Arguments: json.RawMessage(`{"timeout_seconds": 3600}`),
+			},
+			want: maxDaemonToolRPCTimeout,
+		},
+		{
+			name: "no hint returns default",
+			p:    callParams{Method: "tools/call"},
+			want: defaultDaemonToolRPCTimeout,
+		},
+		{
+			name: "explicit _timeout beats auto-derived",
+			p: callParams{
+				Method:    "tools/call",
+				Timeout:   "3m",
+				Arguments: json.RawMessage(`{"timeout_seconds": 600}`),
+			},
+			want: 3 * time.Minute,
+		},
+		{
+			name: "non-tool method uses standard timeout",
+			p:    callParams{Method: "loom/status"},
+			want: defaultDaemonControlRPCTimeout,
+		},
+		{
+			name: "empty method defaults to tools/call path",
+			p:    callParams{},
+			want: defaultDaemonToolRPCTimeout,
+		},
+		{
+			name: "auto-derive from nested params with arguments",
+			p: callParams{
+				Method: "tools/call",
+				Params: json.RawMessage(`{"name":"poll_pipeline","arguments":{"timeout_seconds":120}}`),
+			},
+			want: 120*time.Second + autoDeriveDaemonTimeoutBuffer,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveToolCallTimeout(tc.p)
+			if got != tc.want {
+				t.Fatalf("resolveToolCallTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeriveTimeoutFromArguments(t *testing.T) {
+	tests := []struct {
+		name string
+		args json.RawMessage
+		want time.Duration
+	}{
+		{
+			name: "empty args",
+			args: nil,
+			want: 0,
+		},
+		{
+			name: "negative value",
+			args: json.RawMessage(`{"timeout_seconds": -10}`),
+			want: 0,
+		},
+		{
+			name: "zero value",
+			args: json.RawMessage(`{"timeout_seconds": 0}`),
+			want: 0,
+		},
+		{
+			name: "invalid json",
+			args: json.RawMessage(`{bad`),
+			want: 0,
+		},
+		{
+			name: "timeout as numeric seconds",
+			args: json.RawMessage(`{"timeout": 120}`),
+			want: 120 * time.Second,
+		},
+		{
+			name: "nested arguments",
+			args: json.RawMessage(`{"arguments":{"timeoutSeconds":180}}`),
+			want: 180 * time.Second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveTimeoutFromArguments(tc.args)
+			if got != tc.want {
+				t.Fatalf("deriveTimeoutFromArguments() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClampTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		d        time.Duration
+		min, max time.Duration
+		want     time.Duration
+	}{
+		{"below min", 10 * time.Second, 30 * time.Second, 5 * time.Minute, 30 * time.Second},
+		{"above max", 20 * time.Minute, 30 * time.Second, 15 * time.Minute, 15 * time.Minute},
+		{"in range", 5 * time.Minute, 30 * time.Second, 15 * time.Minute, 5 * time.Minute},
+		{"equal to min", 30 * time.Second, 30 * time.Second, 15 * time.Minute, 30 * time.Second},
+		{"equal to max", 15 * time.Minute, 30 * time.Second, 15 * time.Minute, 15 * time.Minute},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := clampTimeout(tc.d, tc.min, tc.max)
+			if got != tc.want {
+				t.Fatalf("clampTimeout(%v, %v, %v) = %v, want %v", tc.d, tc.min, tc.max, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// emitDecompHintIfLarge — decomposition hint emission
+// ---------------------------------------------------------------------------
+
+func TestEmitDecompHintIfLarge_AboveThreshold(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	eb := NewEventBus(d.logger)
+	d.eventBus = eb
+
+	subID, ch := eb.Subscribe()
+	defer eb.Unsubscribe(subID)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "decomp-test",
+	})
+	p.serverName = "llm"
+	p.toolName = "chat"
+
+	// Create a response exceeding decompHintTokenThreshold (8000 tokens * 4 bytes = 32000 bytes).
+	bigResult := make(json.RawMessage, 40000)
+	for i := range bigResult {
+		bigResult[i] = 'x'
+	}
+	resp := &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "decomp-test",
+		Result:  bigResult,
+	}
+
+	p.emitDecompHintIfLarge(resp)
+
+	select {
+	case evt := <-ch:
+		if evt.Type != EventDecompHint {
+			t.Fatalf("event type = %q, want %q", evt.Type, EventDecompHint)
+		}
+		data, ok := evt.Data.(map[string]any)
+		if !ok {
+			t.Fatalf("event data type = %T, want map[string]any", evt.Data)
+		}
+		if data["server"] != "llm" {
+			t.Errorf("server = %v, want llm", data["server"])
+		}
+		if data["tool"] != "chat" {
+			t.Errorf("tool = %v, want chat", data["tool"])
+		}
+		if data["response_bytes"] != len(bigResult) {
+			t.Errorf("response_bytes = %v, want %d", data["response_bytes"], len(bigResult))
+		}
+		estTokens, _ := data["estimated_tokens"].(int)
+		if estTokens < decompHintTokenThreshold {
+			t.Errorf("estimated_tokens = %d, want >= %d", estTokens, decompHintTokenThreshold)
+		}
+		if data["workflow"] != "recursive-context" {
+			t.Errorf("workflow = %v, want recursive-context", data["workflow"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for decomp.hint event")
+	}
+}
+
+func TestEmitDecompHintIfLarge_BelowThreshold(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	eb := NewEventBus(d.logger)
+	d.eventBus = eb
+
+	subID, ch := eb.Subscribe()
+	defer eb.Unsubscribe(subID)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "decomp-small",
+	})
+	p.serverName = "git"
+	p.toolName = "status"
+
+	// Small response: 100 bytes ~ 25 tokens, well below threshold.
+	resp := &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "decomp-small",
+		Result:  json.RawMessage(`{"status":"ok"}`),
+	}
+
+	p.emitDecompHintIfLarge(resp)
+
+	select {
+	case evt := <-ch:
+		t.Fatalf("unexpected event emitted: %+v", evt)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: no event.
+	}
+}
+
+func TestEmitDecompHintIfLarge_NilGuards(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	// No eventBus set — should not panic.
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "nil-guard",
+	})
+
+	// nil response.
+	p.emitDecompHintIfLarge(nil)
+
+	// Response with nil result.
+	p.emitDecompHintIfLarge(&mcp.Message{JSONRPC: mcp.JSONRPCVersion})
+
+	// Response with result but no event bus.
+	p.emitDecompHintIfLarge(&mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		Result:  json.RawMessage(strings.Repeat("x", 40000)),
+	})
+	// No panic = pass.
+}
+
+// ---------------------------------------------------------------------------
+// Nil guard pass-through: authorize, enforceRequestPolicy, tryCachedResponse
+// ---------------------------------------------------------------------------
+
+func TestCallPipelineAuthorize_NilRBACPassesThrough(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.rbac = nil // Explicitly nil.
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "auth-nil",
+	})
+	p.params = callParams{Server: "git", Tool: "status"}
+	p.auditStart = time.Now()
+
+	if resp := p.authorize(); resp != nil {
+		t.Fatalf("expected nil response when RBAC is nil, got %+v", resp)
+	}
+}
+
+func TestCallPipelineEnforceRequestPolicy_NilPolicyPassesThrough(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.policy = nil // Explicitly nil.
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "policy-nil",
+	})
+	p.params = callParams{Server: "git", Tool: "status"}
+	p.auditStart = time.Now()
+
+	if resp := p.enforceRequestPolicy(); resp != nil {
+		t.Fatalf("expected nil response when policy is nil, got %+v", resp)
+	}
+}
+
+func TestCallPipelineTryCachedResponse_NilCachePassesThrough(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.respCache = nil // Explicitly nil.
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "cache-nil",
+	})
+	p.params = callParams{Server: "git", Tool: "status"}
+
+	if resp := p.tryCachedResponse(); resp != nil {
+		t.Fatalf("expected nil response when cache is nil, got %+v", resp)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Error envelope exhaustive: all constructors produce consistent structure
+// ---------------------------------------------------------------------------
+
+func TestCallPipeline_ErrorEnvelopeExhaustive(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	msgID := "exhaust-test"
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      msgID,
+	})
+
+	assertEnvelope := func(t *testing.T, resp *mcp.Message, wantCode int) {
+		t.Helper()
+		if resp.JSONRPC != mcp.JSONRPCVersion {
+			t.Errorf("JSONRPC = %q, want %q", resp.JSONRPC, mcp.JSONRPCVersion)
+		}
+		if resp.ID != msgID {
+			t.Errorf("ID = %v, want %v", resp.ID, msgID)
+		}
+		if resp.Error == nil {
+			t.Fatal("Error is nil")
+		}
+		if resp.Error.Code != wantCode {
+			t.Errorf("Error.Code = %d, want %d", resp.Error.Code, wantCode)
+		}
+		if resp.Error.Message == "" {
+			t.Error("Error.Message is empty")
+		}
+	}
+
+	t.Run("invalidParamsError", func(t *testing.T) {
+		resp := p.invalidParamsError("bad")
+		assertEnvelope(t, resp, mcp.InvalidParams)
+		ped, ok := resp.Error.Data.(*PipelineErrorData)
+		if !ok {
+			t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+		}
+		if ped.Code != "INVALID_INPUT" {
+			t.Errorf("Code = %q, want INVALID_INPUT", ped.Code)
+		}
+		if ped.Retryable {
+			t.Error("expected Retryable=false for invalid params")
+		}
+	})
+
+	t.Run("internalError", func(t *testing.T) {
+		resp := p.internalError(errors.New("boom"))
+		assertEnvelope(t, resp, mcp.InternalError)
+		ped, ok := resp.Error.Data.(*PipelineErrorData)
+		if !ok {
+			t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+		}
+		if ped.Code != "SERVER_ERROR" {
+			t.Errorf("Code = %q, want SERVER_ERROR", ped.Code)
+		}
+	})
+
+	t.Run("rbacDeniedError", func(t *testing.T) {
+		resp := p.rbacDeniedError(AccessDecision{
+			AgentID: "agent-1",
+			Role:    "viewer",
+			Server:  "git",
+			Tool:    "push",
+			Reason:  "not allowed",
+		})
+		assertEnvelope(t, resp, mcp.InvalidRequest)
+		ped, ok := resp.Error.Data.(*PipelineErrorData)
+		if !ok {
+			t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+		}
+		if ped.Code != "RBAC_DENIED" {
+			t.Errorf("Code = %q, want RBAC_DENIED", ped.Code)
+		}
+		if ped.Stage != "authorize" {
+			t.Errorf("Stage = %q, want authorize", ped.Stage)
+		}
+		if !strings.Contains(resp.Error.Message, "agent-1") {
+			t.Errorf("message should contain agent_id, got %q", resp.Error.Message)
+		}
+		if !strings.Contains(resp.Error.Message, "viewer") {
+			t.Errorf("message should contain role, got %q", resp.Error.Message)
+		}
+		if !strings.Contains(resp.Error.Message, "git__push") {
+			t.Errorf("message should contain server__tool, got %q", resp.Error.Message)
+		}
+	})
+
+	t.Run("policyDeniedError", func(t *testing.T) {
+		resp := p.policyDeniedError(GatewayPolicyDecision{
+			RuleID:     "rule-42",
+			ReasonCode: "RATE_LIMIT",
+			Reason:     "exceeded quota",
+			Stage:      "request",
+			Action:     "deny",
+		})
+		assertEnvelope(t, resp, mcp.InvalidRequest)
+		ped, ok := resp.Error.Data.(*PipelineErrorData)
+		if !ok {
+			t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+		}
+		if ped.Code != "POLICY_DENIED" {
+			t.Errorf("Code = %q, want POLICY_DENIED", ped.Code)
+		}
+		if ped.Stage != "policy" {
+			t.Errorf("Stage = %q, want policy", ped.Stage)
+		}
+		details, ok := ped.Details.(map[string]any)
+		if !ok {
+			t.Fatalf("Details type = %T, want map[string]any", ped.Details)
+		}
+		// All four policy detail fields must be present.
+		for _, key := range []string{"policy_rule_id", "policy_reason_code", "policy_stage", "policy_action"} {
+			if _, exists := details[key]; !exists {
+				t.Errorf("Details missing key %q", key)
+			}
+		}
+	})
+
+	t.Run("internalErrorWithAudit", func(t *testing.T) {
+		auditPath := enableAuditAndCostForTest(t, d)
+		p.serverName = "git"
+		p.toolName = "status"
+		p.auditStart = time.Now()
+
+		resp := p.internalErrorWithAudit("local", errors.New("dial failed"))
+		assertEnvelope(t, resp, mcp.InternalError)
+
+		// Verify audit entry was written.
+		entries := readAuditEntries(t, auditPath)
+		if len(entries) == 0 {
+			t.Fatal("expected audit entry for internalErrorWithAudit")
+		}
+		last := entries[len(entries)-1]
+		if last.Status != "error" {
+			t.Errorf("audit status = %q, want error", last.Status)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Error envelope focused tests: specific error scenarios
+// ---------------------------------------------------------------------------
+
+func TestCallPipeline_ErrorEnvelope_RBACDenied(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "rbac-denied-envelope",
+	})
+	p.serverName = "github"
+	p.toolName = "delete_repo"
+	p.stage = stageAuth
+
+	resp := p.rbacDeniedError(AccessDecision{
+		AgentID:    "agent-1",
+		Role:       "viewer",
+		Server:     "github",
+		Tool:       "delete_repo",
+		Reason:     "denied by pattern",
+		ReasonCode: "role_deny",
+	})
+
+	if resp.Error == nil {
+		t.Fatal("expected error response")
+	}
+	if resp.Error.Code != mcp.InvalidRequest {
+		t.Fatalf("Error.Code = %d, want %d", resp.Error.Code, mcp.InvalidRequest)
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "RBAC_DENIED" {
+		t.Errorf("Code = %q, want RBAC_DENIED", ped.Code)
+	}
+	if ped.Server != "github" {
+		t.Errorf("Server = %q, want github", ped.Server)
+	}
+	if ped.Tool != "delete_repo" {
+		t.Errorf("Tool = %q, want delete_repo", ped.Tool)
+	}
+	if ped.Stage != "authorize" {
+		t.Errorf("Stage = %q, want authorize", ped.Stage)
+	}
+	if ped.Retryable {
+		t.Error("expected Retryable=false for RBAC denial")
+	}
+	details, ok := ped.Details.(map[string]any)
+	if !ok {
+		t.Fatalf("Details type = %T, want map[string]any", ped.Details)
+	}
+	if details["reason_code"] != "role_deny" {
+		t.Errorf("details.reason_code = %v, want role_deny", details["reason_code"])
+	}
+	if details["agent_id"] != "agent-1" {
+		t.Errorf("details.agent_id = %v, want agent-1", details["agent_id"])
+	}
+}
+
+func TestCallPipeline_ErrorEnvelope_RateLimited(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "rate-limited-envelope",
+	})
+	p.serverName = "github"
+	p.toolName = "search"
+	p.stage = stageAuth
+
+	resp := p.rbacDeniedError(AccessDecision{
+		AgentID:    "agent-1",
+		Role:       "user",
+		Server:     "github",
+		Tool:       "search",
+		Reason:     "rate limit exceeded",
+		ReasonCode: "rate_limited",
+	})
+
+	if resp.Error == nil {
+		t.Fatal("expected error response")
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "RATE_LIMITED" {
+		t.Errorf("Code = %q, want RATE_LIMITED", ped.Code)
+	}
+	if !ped.Retryable {
+		t.Error("expected Retryable=true for rate limit")
+	}
+	if ped.RetryAfter == "" {
+		t.Error("expected non-empty RetryAfter for rate limit")
+	}
+	if ped.RetryAfter != "60s" {
+		t.Errorf("RetryAfter = %q, want 60s", ped.RetryAfter)
+	}
+}
+
+func TestCallPipeline_ErrorEnvelope_TransportTimeout(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+	d.procMgr = process.NewManager(nil, "codex")
+
+	d.pool.Put(&pool.Conn{
+		ServerName: "slow-server",
+		Transport:  &fakeTransport{},
+		Healthy:    true,
+	})
+
+	p := &callPipeline{
+		daemon:     d,
+		msg:        &mcp.Message{ID: "timeout-envelope"},
+		serverName: "slow-server",
+		toolName:   "query",
+		method:     "tools/call",
+		target:     router.TargetLocal,
+		targetStr:  router.TargetLocal.String(),
+		stage:      stageExecute,
+		conn: &pool.Conn{
+			ServerName: "slow-server",
+			Transport:  &fakeTransport{},
+			Healthy:    true,
+		},
+	}
+
+	resp := p.transportFailure("recv", context.DeadlineExceeded, time.Now())
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected error response")
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "TIMEOUT" {
+		t.Errorf("Code = %q, want TIMEOUT", ped.Code)
+	}
+	if !ped.Retryable {
+		t.Error("expected Retryable=true for timeout")
+	}
+	if ped.Stage != "execute" {
+		t.Errorf("Stage = %q, want execute", ped.Stage)
+	}
+	if ped.Server != "slow-server" {
+		t.Errorf("Server = %q, want slow-server", ped.Server)
+	}
+}
+
+func TestCallPipeline_ErrorEnvelope_ToolNotFound(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "tool-not-found-envelope",
+	})
+	p.stage = stageParse
+	p.toolName = "nonexistent_tool"
+
+	resp := p.invalidParamsError("could not resolve server for tool: nonexistent_tool")
+	if resp.Error == nil {
+		t.Fatal("expected error response")
+	}
+	if resp.Error.Code != mcp.InvalidParams {
+		t.Fatalf("Error.Code = %d, want %d", resp.Error.Code, mcp.InvalidParams)
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "TOOL_NOT_FOUND" {
+		t.Errorf("Code = %q, want TOOL_NOT_FOUND", ped.Code)
+	}
+	if ped.Stage != "parse" {
+		t.Errorf("Stage = %q, want parse", ped.Stage)
+	}
+	if ped.Retryable {
+		t.Error("expected Retryable=false for tool not found")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildForwardRequest: raw Params path
+// ---------------------------------------------------------------------------
+
+func TestCallPipelineBuildForwardRequest_FromRawParams(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "build-raw",
+	})
+	p.toolName = "search"
+	p.method = "tools/call"
+	p.params = callParams{
+		Params: json.RawMessage(`{"name":"search","arguments":{"query":"hello"}}`),
+	}
+
+	req, errResp := p.buildForwardRequest()
+	if errResp != nil {
+		t.Fatalf("unexpected error response: %+v", errResp)
+	}
+	if req == nil {
+		t.Fatal("expected non-nil request")
+	}
+
+	// When Params is set, it should be forwarded verbatim.
+	var params map[string]any
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if params["name"] != "search" {
+		t.Errorf("forwarded name = %v, want search", params["name"])
+	}
+}
+
+func TestCallPipelineBuildForwardRequest_EmptyArguments(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "build-empty",
+	})
+	p.toolName = "ping"
+	p.method = "tools/call"
+	p.params = callParams{} // No Arguments, no Params.
+
+	req, errResp := p.buildForwardRequest()
+	if errResp != nil {
+		t.Fatalf("unexpected error response: %+v", errResp)
+	}
+	if req == nil {
+		t.Fatal("expected non-nil request")
+	}
+
+	// Should produce {"name":"ping","arguments":{}}
+	var params map[string]any
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if params["name"] != "ping" {
+		t.Errorf("forwarded name = %v, want ping", params["name"])
+	}
+	args, ok := params["arguments"].(map[string]any)
+	if !ok || len(args) != 0 {
+		t.Errorf("expected empty arguments map, got %v", params["arguments"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// releaseConnection edge cases
+// ---------------------------------------------------------------------------
+
+func TestCallPipelineReleaseConnection_NoConnNoLock(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "release-nil",
+	})
+	// Neither conn nor lock are set.
+	p.releaseConnection() // Should not panic.
+}
+
+func TestCallPipelineReleaseConnection_LockHeldNoConn(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "release-lock-only",
+	})
+	p.callMu = d.callLock("test-server")
+	p.callMu.Lock()
+	p.lockHeld = true
+
+	p.releaseConnection()
+
+	if p.lockHeld {
+		t.Error("expected lockHeld to be false after release")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isRPCTimeout edge cases
+// ---------------------------------------------------------------------------
+
+func TestIsRPCTimeout_Comprehensive(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"deadline exceeded", context.DeadlineExceeded, true},
+		{"os deadline exceeded", os.ErrDeadlineExceeded, true},
+		{"plain error", errors.New("connection refused"), false},
+		{"i/o timeout in message", errors.New("read tcp: i/o timeout"), true},
+		{"wrapped deadline", fmt.Errorf("call: %w", context.DeadlineExceeded), true},
+		{"context canceled", context.Canceled, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isRPCTimeout(tc.err)
+			if got != tc.want {
+				t.Fatalf("isRPCTimeout(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShouldResetDaemonTransport_WebSocketServiceRestart(t *testing.T) {
+	err := errors.New("read message: websocket: close 1012 (service restart): backend rotating")
+	if !shouldResetDaemonTransport(err) {
+		t.Fatal("websocket 1012 must reset the owned physical transport")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseAndResolve: server resolved via router
+// ---------------------------------------------------------------------------
+
+func TestCallPipelineParseAndResolve_ServerResolvedViaSmartRoute(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	// Register a tool in the router's registry and build tool index.
+	reg := &kitregistry.Registry{
+		Servers: []*kitregistry.Server{
+			{
+				Name: "time",
+				Common: &kitregistry.TargetSpec{
+					Tools: []kitregistry.ToolSchema{
+						{Name: "current_time"},
+					},
+				},
+			},
+		},
+	}
+	d.router = router.New(router.Config{Registry: reg})
+	d.router.BuildToolIndex()
+
+	msg := newCallMessage(t, map[string]any{
+		"tool":      "current_time",
+		"arguments": map[string]any{},
+	})
+
+	p := newCallPipeline(d, context.Background(), msg)
+	resp := p.parseAndResolve()
+	if resp != nil {
+		t.Fatalf("expected nil (success), got error: %s", resp.Error.Message)
+	}
+	if p.serverName != "time" {
+		t.Errorf("serverName = %q, want time", p.serverName)
+	}
+	if p.toolName != "current_time" {
+		t.Errorf("toolName = %q, want current_time", p.toolName)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// emitResponseAudit: both success and error paths
+// ---------------------------------------------------------------------------
+
+func TestEmitResponseAudit_SuccessAndError(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	auditPath := enableAuditAndCostForTest(t, d)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "audit-test",
+	})
+	p.serverName = "git"
+	p.toolName = "status"
+	p.targetStr = "local"
+	p.stage = stageExecute
+	p.auditStart = time.Now()
+
+	// Emit success audit.
+	p.emitResponseAudit(&mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: "audit-test"})
+
+	// Emit error audit.
+	p.emitResponseAudit(&mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "audit-test",
+		Error:   &mcp.Error{Code: mcp.InternalError, Message: "something broke"},
+	})
+
+	entries := readAuditEntries(t, auditPath)
+	if len(entries) < 2 {
+		t.Fatalf("expected at least 2 audit entries, got %d", len(entries))
+	}
+	if entries[0].Status != "success" {
+		t.Errorf("first entry status = %q, want success", entries[0].Status)
+	}
+	if entries[1].Status != "error" {
+		t.Errorf("second entry status = %q, want error", entries[1].Status)
+	}
+	if entries[1].Error != "something broke" {
+		t.Errorf("second entry error = %q, want 'something broke'", entries[1].Error)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// cacheSuccessResponse: guards and successful caching
+// ---------------------------------------------------------------------------
+
+func TestCacheSuccessResponse_Guards(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "cache-guard",
+	})
+
+	// No cache key → should be a no-op.
+	p.cacheKey = ""
+	p.cacheSuccessResponse(&mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		Result:  json.RawMessage(`"ok"`),
+	})
+
+	// Nil response → no-op.
+	p.cacheKey = "some-key"
+	p.cacheSuccessResponse(nil)
+
+	// Error response → no-op.
+	p.cacheSuccessResponse(&mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		Error:   &mcp.Error{Code: -1, Message: "err"},
+	})
+
+	// Nil result → no-op.
+	p.cacheSuccessResponse(&mcp.Message{JSONRPC: mcp.JSONRPCVersion})
+
+	// No panics = pass.
+}
+
+// ---------------------------------------------------------------------------
+// resolveToolCallTimeout: negative _timeout
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DEBT-016: classifyInternalError consistency
+// ---------------------------------------------------------------------------
+
+func TestClassifyInternalError_StageRouteErrorCodes(t *testing.T) {
+	tests := []struct {
+		name          string
+		errMsg        string
+		wantCode      string
+		wantRetryable bool
+	}{
+		{"server unavailable", "server unavailable for myserver", "SERVER_UNAVAILABLE", false},
+		{"lock timeout", "acquire call lock for server: context deadline exceeded", "LOCK_TIMEOUT", true},
+		{"generic route", "connection refused", "CONNECTION_ERROR", true},
+		{"transport corruption", "response id mismatch on recv", "TRANSPORT_CORRUPTION", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			code, retryable := classifyInternalError(fmt.Errorf("%s", tc.errMsg), stageRoute)
+			if code != tc.wantCode {
+				t.Errorf("code = %q, want %q", code, tc.wantCode)
+			}
+			if retryable != tc.wantRetryable {
+				t.Errorf("retryable = %v, want %v", retryable, tc.wantRetryable)
+			}
+		})
+	}
+}
+
+func TestClassifyInternalError_StageExecute(t *testing.T) {
+	code, retryable := classifyInternalError(fmt.Errorf("send failed"), stageExecute)
+	if code != "TRANSPORT_FAILURE" {
+		t.Errorf("code = %q, want TRANSPORT_FAILURE", code)
+	}
+	if !retryable {
+		t.Error("expected retryable=true for execute stage")
+	}
+}
+
+func TestClassifyInternalError_StageBuild(t *testing.T) {
+	code, retryable := classifyInternalError(fmt.Errorf("marshal error"), stageBuild)
+	if code != "SERVER_ERROR" {
+		t.Errorf("code = %q, want SERVER_ERROR", code)
+	}
+	if retryable {
+		t.Error("expected retryable=false for build stage")
+	}
+}
+
+func TestClassifyInternalError_TimeoutOverridesStage(t *testing.T) {
+	for _, stage := range []string{stageRoute, stageExecute, stageBuild, stagePolicy} {
+		t.Run(stage, func(t *testing.T) {
+			code, retryable := classifyInternalError(context.DeadlineExceeded, stage)
+			if code != "TIMEOUT" {
+				t.Errorf("code = %q, want TIMEOUT for stage %s", code, stage)
+			}
+			if !retryable {
+				t.Error("expected retryable=true for timeout")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEBT-016: internalError and internalErrorWithAudit produce identical codes
+// ---------------------------------------------------------------------------
+
+func TestInternalError_AndWithAudit_ProduceSameCodes(t *testing.T) {
+	cases := []struct {
+		name   string
+		errMsg string
+		stage  string
+	}{
+		{"route lock timeout", "acquire call lock: context deadline exceeded", stageRoute},
+		{"route connection error", "dial tcp: connection refused", stageRoute},
+		{"route server unavailable", "server unavailable for myserver", stageRoute},
+		{"execute transport failure", "send failed: broken pipe", stageExecute},
+		{"build marshal error", "json: unsupported type", stageBuild},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newCallPipelineTestDaemon()
+			auditPath := enableAuditAndCostForTest(t, d)
+
+			p := newCallPipeline(d, context.Background(), &mcp.Message{
+				JSONRPC: mcp.JSONRPCVersion,
+				ID:      "code-match",
+			})
+			p.serverName = "test-server"
+			p.toolName = "test-tool"
+			p.stage = tc.stage
+			p.auditStart = time.Now()
+
+			resp1 := p.internalError(fmt.Errorf("%s", tc.errMsg))
+			resp2 := p.internalErrorWithAudit("local", fmt.Errorf("%s", tc.errMsg))
+
+			ped1 := resp1.Error.Data.(*PipelineErrorData)
+			ped2 := resp2.Error.Data.(*PipelineErrorData)
+
+			if ped1.Code != ped2.Code {
+				t.Errorf("code mismatch: internalError=%q, internalErrorWithAudit=%q",
+					ped1.Code, ped2.Code)
+			}
+			if ped1.Retryable != ped2.Retryable {
+				t.Errorf("retryable mismatch: internalError=%v, internalErrorWithAudit=%v",
+					ped1.Retryable, ped2.Retryable)
+			}
+			if ped1.Stage != ped2.Stage {
+				t.Errorf("stage mismatch: internalError=%q, internalErrorWithAudit=%q",
+					ped1.Stage, ped2.Stage)
+			}
+
+			// internalErrorWithAudit should have emitted an audit entry.
+			entries := readAuditEntries(t, auditPath)
+			if len(entries) == 0 {
+				t.Error("internalErrorWithAudit should emit an audit entry")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEBT-016: handleCall stage short-circuit with error code verification
+// ---------------------------------------------------------------------------
+
+func TestHandleCall_ParseErrorCodeAndShortCircuit(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	auditPath := enableAuditAndCostForTest(t, d)
+
+	// Set up RBAC to catch if auth stage runs (it shouldn't).
+	d.rbac = NewRBACEnforcer(RBACConfig{
+		Enabled:       true,
+		DefaultPolicy: "deny",
+	}, d.logger)
+
+	msg := &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "parse-sc",
+		Method:  "loom/call",
+		Params:  json.RawMessage(`{`), // Invalid JSON.
+	}
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should be a parse-stage error.
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Stage != stageParse {
+		t.Errorf("Stage = %q, want %q", ped.Stage, stageParse)
+	}
+	if ped.Code != "INVALID_INPUT" {
+		t.Errorf("Code = %q, want INVALID_INPUT", ped.Code)
+	}
+
+	// No audit means auth/route/execute never ran.
+	entries := readAuditEntries(t, auditPath)
+	if len(entries) != 0 {
+		t.Fatalf("parse failure short-circuit broken: got %d audit entries", len(entries))
+	}
+}
+
+func TestHandleCall_AuthDenialShortCircuitsRouteAndExecute(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	auditPath := enableAuditAndCostForTest(t, d)
+
+	// RBAC deny-all.
+	d.rbac = NewRBACEnforcer(RBACConfig{
+		Enabled:       true,
+		DefaultPolicy: "deny",
+	}, d.logger)
+
+	// Set up a pool that would fail loudly if route/execute ran.
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			t.Fatal("pool dial should not be called after auth denial")
+			return nil, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	msg := newCallMessage(t, map[string]any{
+		"server":   "github",
+		"tool":     "push",
+		"agent_id": "restricted-agent",
+	})
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected RBAC denial")
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "RBAC_DENIED" {
+		t.Errorf("Code = %q, want RBAC_DENIED", ped.Code)
+	}
+	if ped.Stage != stageAuth {
+		t.Errorf("Stage = %q, want %q", ped.Stage, stageAuth)
+	}
+
+	// Only 1 audit entry from auth stage, none from route/execute.
+	entries := readAuditEntries(t, auditPath)
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	if entries[0].PipelineStage != stageAuth {
+		t.Errorf("audit pipeline_stage = %q, want %q", entries[0].PipelineStage, stageAuth)
+	}
+}
+
+func TestHandleCall_CacheHitShortCircuitsBuildAndExecute(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	auditPath := enableAuditAndCostForTest(t, d)
+	d.respCache = NewResponseCache(CacheConfig{Enabled: true})
+
+	args := json.RawMessage(`{"q":"test"}`)
+	key := d.respCache.Key("prometheus", "query", args)
+	d.respCache.Set(key, json.RawMessage(`{"cached":true}`), "prometheus", "query")
+
+	// Set up pools that would fail loudly if route/build/execute ran.
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			t.Fatal("pool dial should not be called after cache hit")
+			return nil, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	msg := newCallMessage(t, map[string]any{
+		"server":    "prometheus",
+		"tool":      "query",
+		"arguments": json.RawMessage(`{"q":"test"}`),
+		"agent_id":  "agent-cache-sc",
+	})
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if string(resp.Result) != `{"cached":true}` {
+		t.Errorf("result = %s, want cached response", string(resp.Result))
+	}
+
+	// Cache hit audit at cache stage, no route/execute audit.
+	entries := readAuditEntries(t, auditPath)
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	if entries[0].PipelineStage != stageCache {
+		t.Errorf("audit pipeline_stage = %q, want %q", entries[0].PipelineStage, stageCache)
+	}
+	if !entries[0].Cached {
+		t.Error("expected cached=true")
+	}
+}
+
+func TestHandleCall_RouteFailureErrorCodeFromClassifyInternalError(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.router = router.New(router.Config{HubEnabled: false})
+
+	msg := newCallMessage(t, map[string]any{
+		"server":   "nonexistent",
+		"tool":     "query",
+		"agent_id": "agent-route-code",
+	})
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected route failure")
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Stage != stageRoute {
+		t.Errorf("Stage = %q, want %q", ped.Stage, stageRoute)
+	}
+
+	// Verify the code matches what classifyInternalError would produce.
+	expectedCode, expectedRetryable := classifyInternalError(
+		fmt.Errorf("%s", resp.Error.Message), stageRoute)
+	if ped.Code != expectedCode {
+		t.Errorf("Code = %q, want %q (from classifyInternalError)", ped.Code, expectedCode)
+	}
+	if ped.Retryable != expectedRetryable {
+		t.Errorf("Retryable = %v, want %v", ped.Retryable, expectedRetryable)
+	}
+}
+
+func TestResolveToolCallTimeout_NegativeExplicit(t *testing.T) {
+	t.Setenv("LOOM_DAEMON_TOOL_TIMEOUT", "")
+
+	// Negative duration strings are parsed by time.ParseDuration but d > 0 fails.
+	got := resolveToolCallTimeout(callParams{Method: "tools/call", Timeout: "-5m"})
+	if got != defaultDaemonToolRPCTimeout {
+		t.Fatalf("expected default timeout for negative _timeout, got %v", got)
+	}
+}
+
+func TestResolveToolCallTimeout_WhitespaceOnly(t *testing.T) {
+	t.Setenv("LOOM_DAEMON_TOOL_TIMEOUT", "")
+
+	got := resolveToolCallTimeout(callParams{Method: "tools/call", Timeout: "   "})
+	if got != defaultDaemonToolRPCTimeout {
+		t.Fatalf("expected default timeout for whitespace _timeout, got %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEBT-016: Gate-stage error envelope consistency (draining + concurrency)
+// ---------------------------------------------------------------------------
+
+func TestHandleCall_DrainingReturnsPipelineErrorData(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.draining.Store(true)
+
+	msg := &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "drain-test",
+		Method:  "loom/call",
+		Params:  json.RawMessage(`{"server":"s","tool":"t"}`),
+	}
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected error response when draining")
+	}
+	if resp.Error.Code != mcp.InternalError {
+		t.Errorf("Code = %d, want %d", resp.Error.Code, mcp.InternalError)
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "DAEMON_DRAINING" {
+		t.Errorf("Code = %q, want DAEMON_DRAINING", ped.Code)
+	}
+	if ped.Stage != "gate" {
+		t.Errorf("Stage = %q, want gate", ped.Stage)
+	}
+	if !ped.Retryable {
+		t.Error("expected Retryable=true for draining")
+	}
+}
+
+func TestHandleCall_ConcurrencyLimitReturnsPipelineErrorData(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.callSem = make(chan struct{}, 1)
+	d.callSem <- struct{}{} // Fill the semaphore.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	msg := &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "sem-test",
+		Method:  "loom/call",
+		Params:  json.RawMessage(`{"server":"s","tool":"t"}`),
+	}
+
+	resp, err := d.handleCall(ctx, msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected error response when concurrency limit reached")
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "CONCURRENCY_LIMIT" {
+		t.Errorf("Code = %q, want CONCURRENCY_LIMIT", ped.Code)
+	}
+	if ped.Stage != "gate" {
+		t.Errorf("Stage = %q, want gate", ped.Stage)
+	}
+	if !ped.Retryable {
+		t.Error("expected Retryable=true for concurrency limit")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEBT-016: Policy denial short-circuits route and execute
+// ---------------------------------------------------------------------------
+
+func TestHandleCall_PolicyDenialShortCircuitsRouteAndExecute(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	auditPath := enableAuditAndCostForTest(t, d)
+
+	d.policy = NewGatewayPolicyEnforcer(GatewayPolicyConfig{
+		Enabled: true,
+		Request: []GatewayRequestPolicyRule{
+			{
+				ID:                 "deny-delete",
+				Server:             "github",
+				Tool:               "delete_*",
+				ForbiddenArguments: []string{"force"},
+				ReasonCode:         "FORBIDDEN_ARG",
+			},
+		},
+	}, d.logger)
+
+	// Set up a pool that would fail loudly if route/execute ran.
+	d.pool = pool.New(pool.Config{
+		MaxIdle:     1,
+		MaxOpen:     1,
+		IdleTimeout: time.Minute,
+		DialFunc: func(_ context.Context, _ string) (mcp.Transport, error) {
+			t.Fatal("pool dial should not be called after policy denial")
+			return nil, nil
+		},
+	})
+	defer func() { _ = d.pool.Close() }()
+
+	msg := newCallMessage(t, map[string]any{
+		"server":    "github",
+		"tool":      "delete_repo",
+		"arguments": json.RawMessage(`{"force":true}`),
+		"agent_id":  "policy-sc-agent",
+	})
+
+	resp, err := d.handleCall(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected policy denial")
+	}
+
+	ped, ok := resp.Error.Data.(*PipelineErrorData)
+	if !ok {
+		t.Fatalf("Data type = %T, want *PipelineErrorData", resp.Error.Data)
+	}
+	if ped.Code != "POLICY_DENIED" {
+		t.Errorf("Code = %q, want POLICY_DENIED", ped.Code)
+	}
+	if ped.Stage != stagePolicy {
+		t.Errorf("Stage = %q, want %q", ped.Stage, stagePolicy)
+	}
+
+	// Only 1 audit entry from policy stage.
+	entries := readAuditEntries(t, auditPath)
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	if entries[0].PipelineStage != stagePolicy {
+		t.Errorf("audit pipeline_stage = %q, want %q", entries[0].PipelineStage, stagePolicy)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEBT-016: All error paths produce PipelineErrorData with required fields
+// ---------------------------------------------------------------------------
+
+func TestErrorEnvelope_AllPathsProducePipelineErrorData(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "envelope-test",
+	})
+	p.serverName = "test-server"
+	p.toolName = "test-tool"
+	p.stage = stageExecute
+	p.auditStart = time.Now()
+
+	cases := []struct {
+		name string
+		resp *mcp.Message
+	}{
+		{"invalidParams", p.invalidParamsError("bad input")},
+		{"internalError", p.internalError(errors.New("something broke"))},
+		{"internalErrorWithAudit", p.internalErrorWithAudit("local", errors.New("transport died"))},
+		{"rbacDenied", p.rbacDeniedError(AccessDecision{
+			Allowed:    false,
+			Reason:     "not authorized",
+			ReasonCode: "no_rule",
+			AgentID:    "agent-x",
+			Role:       "viewer",
+			Server:     "test-server",
+			Tool:       "test-tool",
+		})},
+		{"policyDenied", p.policyDeniedError(GatewayPolicyDecision{
+			Action:     "deny",
+			Reason:     "forbidden",
+			ReasonCode: "BLOCKED",
+			RuleID:     "rule-1",
+			Stage:      "request",
+		})},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.resp.Error == nil {
+				t.Fatal("expected Error in response")
+			}
+			if tc.resp.JSONRPC != mcp.JSONRPCVersion {
+				t.Errorf("JSONRPC = %q, want %q", tc.resp.JSONRPC, mcp.JSONRPCVersion)
+			}
+			if tc.resp.ID != "envelope-test" {
+				t.Errorf("ID = %v, want envelope-test", tc.resp.ID)
+			}
+
+			ped, ok := tc.resp.Error.Data.(*PipelineErrorData)
+			if !ok {
+				t.Fatalf("Data type = %T, want *PipelineErrorData", tc.resp.Error.Data)
+			}
+			if ped.Code == "" {
+				t.Error("PipelineErrorData.Code is empty")
+			}
+			if ped.Stage == "" {
+				t.Error("PipelineErrorData.Stage is empty")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEBT-016: newPipelineError constructor produces correct fields
+// ---------------------------------------------------------------------------
+
+func TestNewPipelineError(t *testing.T) {
+	ped := newPipelineError("TIMEOUT", "my-server", "my-tool", stageExecute, true)
+	if ped.Code != "TIMEOUT" {
+		t.Errorf("Code = %q, want TIMEOUT", ped.Code)
+	}
+	if ped.Server != "my-server" {
+		t.Errorf("Server = %q, want my-server", ped.Server)
+	}
+	if ped.Tool != "my-tool" {
+		t.Errorf("Tool = %q, want my-tool", ped.Tool)
+	}
+	if ped.Stage != stageExecute {
+		t.Errorf("Stage = %q, want %q", ped.Stage, stageExecute)
+	}
+	if !ped.Retryable {
+		t.Error("expected Retryable=true")
+	}
+	if ped.RetryAfter != "" {
+		t.Errorf("RetryAfter = %q, want empty", ped.RetryAfter)
+	}
+	if ped.Details != nil {
+		t.Errorf("Details = %v, want nil", ped.Details)
+	}
+}
+
+// TestTransportFailure_LocalRecvTimeoutKeepsSubprocessAlive is the
+// regression for the cluster's /api/agent/heartbeat → 502 cascade we
+// surfaced after fixing the LocalCaller duplicate-id race. Once unique
+// ids stopped the send-side collision, a NEW failure mode became
+// visible: a single >3s call to agent_context would time out on recv,
+// and transportFailure would tear down the entire subprocess via
+// stopServerProc + runningServers.Delete. Every other concurrent
+// caller on the shared muxstdio.Transport then drained with
+// `transport closed`, which the heartbeat handler turned into 5xx →
+// Cloudflare 502. The subprocess was alive the whole time — just slow.
+//
+// transportFailure must now short-circuit the nuke path when the
+// failure is a recv-side context.DeadlineExceeded: mark the conn
+// unhealthy (so the pool discards it on next Get), but do not stop
+// the subprocess and do not delete its runningServers entry.
+func TestTransportFailure_LocalRecvTimeoutKeepsSubprocessAlive(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.muxStdio = true
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	// Seed the running-server marker that the nuke path would delete.
+	const serverName = "agent_context"
+	d.runningServers.Store(serverName, true)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "timeout-test",
+	})
+	p.serverName = serverName
+	p.toolName = "agent_session_list"
+	p.target = router.TargetLocal
+	p.targetStr = "local"
+
+	timeoutErr := fmt.Errorf(
+		"tools/call timeout during recv after 3s (recoverable: daemon will reconnect upstream transport and retry on the next request): %w",
+		context.DeadlineExceeded,
+	)
+	resp := p.transportFailure("recv", timeoutErr, time.Now())
+
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected JSON-RPC error response, got %+v", resp)
+	}
+	if _, ok := d.runningServers.Load(serverName); !ok {
+		t.Fatalf("subprocess marker was deleted; transportFailure must not stop the process on a per-call timeout")
+	}
+}
+
+// TestTransportFailure_LocalRecvTransportErrorStillKillsSubprocess
+// pins the OTHER half of the discriminator: a genuine transport fault
+// (EOF, broken pipe, muxstdio: transport closed) still tears down the
+// subprocess so a stale-pipe state can't poison subsequent calls.
+func TestTransportFailure_LocalRecvTransportErrorStillKillsSubprocess(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	const serverName = "agent_context"
+	d.runningServers.Store(serverName, true)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "transport-err-test",
+	})
+	p.serverName = serverName
+	p.toolName = "agent_session_list"
+	p.target = router.TargetLocal
+	p.targetStr = "local"
+
+	// Non-timeout error — simulates muxstdio's `transport closed`,
+	// EOF, broken pipe, etc.
+	resp := p.transportFailure("recv", io.ErrUnexpectedEOF, time.Now())
+
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected JSON-RPC error response, got %+v", resp)
+	}
+	if _, ok := d.runningServers.Load(serverName); ok {
+		t.Fatalf("subprocess marker should have been deleted on a transport-fault error")
+	}
+}
+
+// TestTransportFailure_LocalSendTimeoutStillKillsSubprocess pins the
+// stage discriminator: even a send-side timeout still tears down the
+// subprocess. A timeout on send means we couldn't write into the
+// stdio pipe at all (extremely unusual), implying the process or
+// pipe is in a stuck state — the conservative response is to
+// respawn.
+func TestTransportFailure_LocalSendTimeoutStillKillsSubprocess(t *testing.T) {
+	d := newCallPipelineTestDaemon()
+	d.pool = newTestPool(t)
+	defer func() { _ = d.pool.Close() }()
+
+	const serverName = "agent_context"
+	d.runningServers.Store(serverName, true)
+
+	p := newCallPipeline(d, context.Background(), &mcp.Message{
+		JSONRPC: mcp.JSONRPCVersion,
+		ID:      "send-timeout-test",
+	})
+	p.serverName = serverName
+	p.toolName = "agent_session_list"
+	p.target = router.TargetLocal
+	p.targetStr = "local"
+
+	timeoutErr := fmt.Errorf(
+		"tools/call timeout during send after 3s: %w",
+		context.DeadlineExceeded,
+	)
+	resp := p.transportFailure("send", timeoutErr, time.Now())
+
+	if resp == nil || resp.Error == nil {
+		t.Fatalf("expected JSON-RPC error response, got %+v", resp)
+	}
+	if _, ok := d.runningServers.Load(serverName); ok {
+		t.Fatalf("subprocess marker should have been deleted on a send-stage failure")
 	}
 }

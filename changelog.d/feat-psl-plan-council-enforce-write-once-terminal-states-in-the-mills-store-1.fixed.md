@@ -1,0 +1,1 @@
+- Enforce write-once `done` and `escalated` Mills pipeline outcomes in `pkg/mills/store` and count rejected terminal writes with bounded telemetry in `pkg/telemetry`.

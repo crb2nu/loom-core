@@ -1,0 +1,1 @@
+- **Add a dry-run-first stale audit-advisory cleanup** (`scripts/bulk_close_audit_advisories.sh`, `pkg/mills/audit/audit.go`, `docs/MILLS.md`): operators can narrowly list old bot-authored digest issues and close them only with explicit `--execute`, with paginated fail-safe discovery, repeat-run idempotency, verification, and rollback guidance.

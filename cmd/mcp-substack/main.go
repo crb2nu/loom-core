@@ -12,10 +12,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
+	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -26,6 +29,7 @@ type substackServer struct {
 	userID     int
 	httpClient *httpclient.Client
 	logger     *slog.Logger
+	configErr  error
 }
 
 func main() {
@@ -37,37 +41,54 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp,
+		shutdownTracer,
+		err := mcpotel.InitTracer(
+		ctx, "mcp-substack",
 
-	token := env.StringWithFallbacks("SUBSTACK_SESSION_TOKEN", "SUBSTACK_TOKEN", "SUBSTACK_COOKIE")
-	if token == "" {
-		return fmt.Errorf("SUBSTACK_SESSION_TOKEN environment variable is required (or SUBSTACK_TOKEN, SUBSTACK_COOKIE)")
+		logger)
+	if err !=
+		nil {
+		logger.Warn("OTel tracer init failed",
+
+			"error", err)
 	}
-
-	subdomain := env.String("SUBSTACK_SUBDOMAIN", "")
-	if subdomain == "" {
-		return fmt.Errorf("SUBSTACK_SUBDOMAIN environment variable is required")
-	}
-
-	cookieName := env.String("SUBSTACK_COOKIE_NAME", "substack.sid")
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-substack")
 
 	client := httpclient.NewDefault()
-	client.SetHeader("Cookie", cookieName+"="+token)
-
 	s := &substackServer{
-		baseURL:    fmt.Sprintf("https://%s.substack.com/api/v1", subdomain),
 		httpClient: client,
 		logger:     logger,
 	}
+	token := env.StringWithFallbacks("SUBSTACK_SESSION_TOKEN", "SUBSTACK_TOKEN", "SUBSTACK_COOKIE")
+	subdomain := env.String("SUBSTACK_SUBDOMAIN", "")
+	if token == "" || subdomain == "" {
+		s.configErr = mcperror.NotConfigured(
+			"SUBSTACK_SESSION_TOKEN/SUBSTACK_SUBDOMAIN",
+			"set SUBSTACK_SESSION_TOKEN (or SUBSTACK_TOKEN/SUBSTACK_COOKIE) and SUBSTACK_SUBDOMAIN",
+		)
+		logger.Warn("substack server running in degraded mode", "error", s.configErr.Error())
+	} else {
+		cookieName := env.String("SUBSTACK_COOKIE_NAME", "substack.sid")
+		client.SetHeader("Cookie", cookieName+"="+token)
+		s.baseURL = fmt.Sprintf("https://%s.substack.com/api/v1", subdomain)
+	}
 
 	// Fetch user ID from a published post for draft byline attribution.
-	if err := s.resolveUserID(ctx); err != nil {
-		logger.Warn("could not resolve user ID (draft creation may fail)", "error", err)
+	if s.configErr == nil {
+		if err := s.resolveUserID(ctx); err != nil {
+			logger.Warn("could not resolve user ID (draft creation may fail)", "error", err)
+		}
 	}
 
 	logger.Info("starting server", "name", "mcp-substack", "version", version,
 		"subdomain", subdomain, "user_id", s.userID)
 
 	server := mcp.NewServer("mcp-substack", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Substack publication management. Create drafts, publish posts, and read archives for your newsletter.")
 
 	server.AddTool(mcp.Tool{
@@ -80,7 +101,7 @@ func run(ctx context.Context) error {
 				"limit":  map[string]any{"type": "integer", "description": "Number of drafts to return (default: 25)"},
 			},
 		},
-	}, s.handleListDrafts)
+	}, mcpotel.TracedToolHandler(tracer, "substack_list_drafts", s.handleListDrafts))
 
 	server.AddTool(mcp.Tool{
 		Name:        "substack_create_draft",
@@ -96,7 +117,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"title", "body"},
 		},
-	}, s.handleCreateDraft)
+	}, mcpotel.TracedToolHandler(tracer, "substack_create_draft", s.handleCreateDraft))
 
 	server.AddTool(mcp.Tool{
 		Name:        "substack_update_draft",
@@ -113,7 +134,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"draft_id"},
 		},
-	}, s.handleUpdateDraft)
+	}, mcpotel.TracedToolHandler(tracer, "substack_update_draft", s.handleUpdateDraft))
 
 	server.AddTool(mcp.Tool{
 		Name:        "substack_publish",
@@ -127,7 +148,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"draft_id"},
 		},
-	}, s.handlePublish)
+	}, mcpotel.TracedToolHandler(tracer, "substack_publish", s.handlePublish))
 
 	server.AddTool(mcp.Tool{
 		Name:        "substack_list_posts",
@@ -139,7 +160,7 @@ func run(ctx context.Context) error {
 				"limit":  map[string]any{"type": "integer", "description": "Number of posts to return (default: 25)"},
 			},
 		},
-	}, s.handleListPosts)
+	}, mcpotel.TracedToolHandler(tracer, "substack_list_posts", s.handleListPosts))
 
 	server.AddTool(mcp.Tool{
 		Name:        "substack_get_post",
@@ -151,7 +172,7 @@ func run(ctx context.Context) error {
 				"id":   map[string]any{"type": "integer", "description": "Post ID"},
 			},
 		},
-	}, s.handleGetPost)
+	}, mcpotel.TracedToolHandler(tracer, "substack_get_post", s.handleGetPost))
 
 	return server.Run(ctx)
 }
@@ -181,6 +202,10 @@ func (s *substackServer) resolveUserID(ctx context.Context) error {
 
 // doRequest performs an HTTP request against the Substack API and returns the raw response body.
 func (s *substackServer) doRequest(ctx context.Context, method, path string, body any) ([]byte, error) {
+	if s.configErr != nil {
+		return nil, s.configErr
+	}
+
 	reqURL := s.baseURL + path
 
 	var reqBody io.Reader

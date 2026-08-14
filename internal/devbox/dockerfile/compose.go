@@ -1,12 +1,23 @@
 package dockerfile
 
-import "github.com/crb2nu/loom/internal/devbox/detect"
+import (
+	"strconv"
+	"strings"
+
+	"github.com/crb2nu/loom/internal/devbox/baseimage"
+	"github.com/crb2nu/loom/internal/devbox/detect"
+)
+
+const defaultGoVersion = "1.25.10"
 
 // templateData holds parameters for Go templates.
 type templateData struct {
 	Hash       string
 	SystemDeps []string
 	Env        map[string]string
+
+	// BaseImage overrides the FROM line when a pre-built base is available.
+	BaseImage string
 
 	// Go-specific
 	GoVersion string
@@ -27,6 +38,7 @@ type templateData struct {
 type multiTemplateData struct {
 	Hash                 string
 	BaseImage            string
+	GoBase               bool
 	PackageManager       string
 	PackageInstallCmd    string
 	SystemDeps           []string
@@ -38,10 +50,7 @@ type multiTemplateData struct {
 
 // buildGoData creates template data from a Go LanguageSpec.
 func buildGoData(spec detect.LanguageSpec, fp *detect.EnvFingerprint) templateData {
-	version := spec.Version
-	if version == "" {
-		version = "1.25"
-	}
+	version := normalizeGoVersion(spec.Version)
 
 	var tools []string
 	for _, t := range spec.Tools {
@@ -57,6 +66,7 @@ func buildGoData(spec detect.LanguageSpec, fp *detect.EnvFingerprint) templateDa
 
 	return templateData{
 		Hash:          fp.Hash,
+		BaseImage:     baseimage.Lookup("go", version),
 		GoVersion:     version,
 		SystemDeps:    fp.SystemDeps,
 		Tools:         tools,
@@ -74,6 +84,7 @@ func buildPythonData(spec detect.LanguageSpec, fp *detect.EnvFingerprint) templa
 
 	return templateData{
 		Hash:          fp.Hash,
+		BaseImage:     baseimage.Lookup("python", version),
 		PythonVersion: version,
 		SystemDeps:    fp.SystemDeps,
 		DepManager:    spec.DepManager,
@@ -91,6 +102,7 @@ func buildNodeData(spec detect.LanguageSpec, fp *detect.EnvFingerprint) template
 
 	return templateData{
 		Hash:          fp.Hash,
+		BaseImage:     baseimage.Lookup("node", version),
 		NodeVersion:   version,
 		SystemDeps:    fp.SystemDeps,
 		DepManager:    spec.DepManager,
@@ -122,14 +134,18 @@ func buildMultiData(fp *detect.EnvFingerprint) multiTemplateData {
 	}
 
 	if hasGo {
-		goVer := "1.25"
+		data.GoBase = true
+		goVer := defaultGoVersion
 		for _, l := range fp.Languages {
 			if l.Language == "go" && l.Version != "" {
-				goVer = l.Version
+				goVer = normalizeGoVersion(l.Version)
 				break
 			}
 		}
-		data.BaseImage = "golang:" + goVer + "-alpine"
+		data.BaseImage = baseimage.Lookup("go", goVer)
+		if data.BaseImage == "" {
+			data.BaseImage = "golang:" + goVer + "-alpine"
+		}
 		data.PackageManager = "apk add --no-cache"
 		data.PackageInstallCmd = "ca-certificates git make bash curl"
 
@@ -166,6 +182,27 @@ func buildMultiData(fp *detect.EnvFingerprint) multiTemplateData {
 	}
 
 	return data
+}
+
+func normalizeGoVersion(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return defaultGoVersion
+	}
+
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 || parts[0] != "1" || parts[1] != "25" {
+		return version
+	}
+
+	if len(parts) < 3 {
+		return defaultGoVersion
+	}
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil || patch < 10 {
+		return defaultGoVersion
+	}
+	return version
 }
 
 // nodeDepStep returns Dockerfile lines for Node.js dependency installation.

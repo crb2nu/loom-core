@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: confluence
+    component: mcp-server
+    mcp.server/name: confluence
+    mcp.server/type: custom
+  name: confluence
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: confluence
+  template:
+    metadata:
+      annotations:
+        mcp.server/categories: docs,collaboration
+        mcp.server/description: Atlassian Confluence wiki (read-only)
+      labels:
+        app: confluence
+        component: mcp-server
+        mcp.server/name: confluence
+    spec:
+      containers:
+        - env:
+            - name: CONFLUENCE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: CONFLUENCE_API_TOKEN
+                  name: loom-secrets
+            - name: CONFLUENCE_URL
+              valueFrom:
+                secretKeyRef:
+                  key: CONFLUENCE_URL
+                  name: loom-secrets
+            - name: CONFLUENCE_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  key: CONFLUENCE_EMAIL
+                  name: loom-secrets
+            - name: MCP_TRANSPORT
+              value: websocket
+            - name: MCP_WS_PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: info
+            - name: MCP_SERVER_NAME
+              value: confluence
+            - name: MCP_SERVER_COMMAND
+              value: /app/services/loom-core/bin/mcp-confluence
+          image: registry.harbor.lan/mcp/custom-server:latest
+          imagePullPolicy: Always
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          name: confluence
+          ports:
+            - containerPort: 8080
+              name: websocket
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000

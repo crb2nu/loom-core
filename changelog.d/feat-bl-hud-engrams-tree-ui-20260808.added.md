@@ -1,0 +1,1 @@
+- Add the HUD engram tech-tree view and per-pattern stamp provenance in `internal/hud/frontend/src/lib/components/mills/PatternsPanel.svelte`.

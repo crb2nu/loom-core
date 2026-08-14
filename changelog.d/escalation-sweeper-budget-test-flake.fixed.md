@@ -1,0 +1,1 @@
+- De-flake the escalation-sweeper ghost-allocation regression test: its 30ms pass budget left the auto-requeue phase ~10ms of real wall clock, which reliably expired under -race on loaded CI runners and turned main red (22848/22888/22898).

@@ -64,14 +64,25 @@ func extractPackageNames(line string) []string {
 	parts := strings.Fields(line[start:])
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
-		// Skip flags and common non-package tokens
-		if p == "" || strings.HasPrefix(p, "-") || strings.HasPrefix(p, "&&") ||
-			strings.HasPrefix(p, "||") || strings.HasPrefix(p, ";") ||
-			strings.HasPrefix(p, "\\") || strings.HasPrefix(p, "#") ||
-			p == "RUN" || p == "rm" || p == "rf" {
-			continue
+		// A shell separator ends the install command; everything after it
+		// (adduser, rm, chmod, ...) belongs to a different command.
+		p, terminated := splitAtShellSeparator(p)
+		if p != "" && !strings.HasPrefix(p, "-") && !strings.HasPrefix(p, "\\") &&
+			!strings.HasPrefix(p, "#") && !strings.HasPrefix(p, "$") {
+			packages = append(packages, p)
 		}
-		packages = append(packages, p)
+		if terminated {
+			break
+		}
 	}
 	return packages
+}
+
+// splitAtShellSeparator truncates a token at the first shell command separator
+// (&&, ||, ;, |, >, <) and reports whether one was found.
+func splitAtShellSeparator(token string) (string, bool) {
+	if idx := strings.IndexAny(token, "&|;<>"); idx >= 0 {
+		return token[:idx], true
+	}
+	return token, false
 }

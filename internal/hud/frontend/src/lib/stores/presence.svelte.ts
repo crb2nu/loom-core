@@ -1,5 +1,6 @@
 // Presence store - agent presence registry, file claims, and worktree assignments
 import { eventStore } from './events.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface AgentPresence {
   agent_id: string;
@@ -70,7 +71,12 @@ class PresenceStore {
   error = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // 30s fallback poll — fires only when SSE is disconnected. The gate lives in
+  // shouldTick so the SSE-invalidation path (refreshCoalesced) is not
+  // suppressed by it.
+  private poller = createPoller(() => this.fetch(), 30000, {
+    shouldTick: () => !eventStore.connected,
+  });
   private eventUnsubs: Array<() => void> = [];
 
   get liveAgents(): AgentPresence[] {
@@ -132,11 +138,13 @@ class PresenceStore {
   startPolling(intervalMs = 30000): void {
     this.stopPolling();
     this.fetch();
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.poller.start(intervalMs);
 
     this.eventUnsubs.push(
-      eventStore.on('process.start', () => this.fetch()),
-      eventStore.on('process.stop', () => this.fetch()),
+      // Routed through the poller so a burst collapses into one refresh and a
+      // hidden tab issues none at all.
+      eventStore.on('process.start', () => this.poller.refreshCoalesced()),
+      eventStore.on('process.stop', () => this.poller.refreshCoalesced()),
       // Granular agent events — update presence in real-time.
       eventStore.on('agent.heartbeat', (e) => {
         const data = e.data as Record<string, unknown>;
@@ -161,17 +169,14 @@ class PresenceStore {
         this.lastUpdated = new Date();
       }),
       // Session start/end/bootstrap — trigger full refresh for complete data.
-      eventStore.on('agent.session.start', () => this.fetch()),
-      eventStore.on('agent.session.end', () => this.fetch()),
-      eventStore.on('agent.session.bootstrap', () => this.fetch()),
+      eventStore.on('agent.session.start', () => this.poller.refreshCoalesced()),
+      eventStore.on('agent.session.end', () => this.poller.refreshCoalesced()),
+      eventStore.on('agent.session.bootstrap', () => this.poller.refreshCoalesced()),
     );
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }

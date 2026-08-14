@@ -1,0 +1,1 @@
+- Expose the engram catalog and tech-tree graph plus per-pattern stamp history through CORS-enabled HUD REST endpoints (`internal/hud/bridge`, `internal/hud`).

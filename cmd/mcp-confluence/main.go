@@ -18,7 +18,7 @@ import (
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
-	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/strutil"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -40,8 +40,15 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-confluence", version,
+		mcpscaffold.WithInstructions("Confluence wiki MCP server. Search and access wiki pages, spaces, and content. Read-only by default; page create/update tools require CONFLUENCE_MCP_WRITE_ENABLED=1."),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cleanup(ctx) }()
 
+	// Custom env var setup for Confluence credentials.
 	baseURL := os.Getenv("CONFLUENCE_URL")
 	if baseURL == "" {
 		return mcperror.NotConfigured("CONFLUENCE_URL", "set CONFLUENCE_URL environment variable")
@@ -62,13 +69,20 @@ func run(ctx context.Context) error {
 		httpClient: httpclient.NewDefault(),
 	}
 
-	logger.Info("starting server", "name", "mcp-confluence", "version", version, "url", baseURL)
+	writesEnabled := os.Getenv("CONFLUENCE_MCP_WRITE_ENABLED") == "1"
 
-	server := mcp.NewServer("mcp-confluence", version)
-	server.SetInstructions("Confluence wiki MCP server. Search and access wiki pages, spaces, and content.")
+	srv.Logger.Info("confluence config", "url", baseURL, "writes_enabled", writesEnabled)
 
+	registerTools(srv, cs, writesEnabled)
+
+	return srv.Run(ctx)
+}
+
+// registerTools registers the read tools unconditionally; the page
+// create/update tools are only registered when CONFLUENCE_MCP_WRITE_ENABLED=1.
+func registerTools(srv *mcpscaffold.Server, cs *confluenceServer, writesEnabled bool) {
 	// confluence_search
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_search",
 		Description: "Search Confluence content using CQL (Confluence Query Language)",
 		InputSchema: mcp.InputSchema{
@@ -92,7 +106,7 @@ func run(ctx context.Context) error {
 	}, cs.handleSearch)
 
 	// confluence_get_page
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_get_page",
 		Description: "Get a Confluence page by ID",
 		InputSchema: mcp.InputSchema{
@@ -112,7 +126,7 @@ func run(ctx context.Context) error {
 	}, cs.handleGetPage)
 
 	// confluence_get_page_by_title
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_get_page_by_title",
 		Description: "Get a Confluence page by space key and title",
 		InputSchema: mcp.InputSchema{
@@ -136,7 +150,7 @@ func run(ctx context.Context) error {
 	}, cs.handleGetPageByTitle)
 
 	// confluence_list_spaces
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_list_spaces",
 		Description: "List Confluence spaces",
 		InputSchema: mcp.InputSchema{
@@ -159,7 +173,7 @@ func run(ctx context.Context) error {
 	}, cs.handleListSpaces)
 
 	// confluence_get_space
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_get_space",
 		Description: "Get details of a Confluence space",
 		InputSchema: mcp.InputSchema{
@@ -179,7 +193,7 @@ func run(ctx context.Context) error {
 	}, cs.handleGetSpace)
 
 	// confluence_list_pages
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_list_pages",
 		Description: "List pages in a Confluence space",
 		InputSchema: mcp.InputSchema{
@@ -203,7 +217,7 @@ func run(ctx context.Context) error {
 	}, cs.handleListPages)
 
 	// confluence_get_children
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_get_children",
 		Description: "Get child pages of a Confluence page",
 		InputSchema: mcp.InputSchema{
@@ -223,7 +237,7 @@ func run(ctx context.Context) error {
 	}, cs.handleGetChildren)
 
 	// confluence_get_ancestors
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_get_ancestors",
 		Description: "Get ancestor (parent) pages of a Confluence page",
 		InputSchema: mcp.InputSchema{
@@ -238,8 +252,12 @@ func run(ctx context.Context) error {
 		},
 	}, cs.handleGetAncestors)
 
+	if !writesEnabled {
+		return
+	}
+
 	// confluence_create_page
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_create_page",
 		Description: "Create a new Confluence page",
 		InputSchema: mcp.InputSchema{
@@ -267,7 +285,7 @@ func run(ctx context.Context) error {
 	}, cs.handleCreatePage)
 
 	// confluence_update_page
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "confluence_update_page",
 		Description: "Update an existing Confluence page",
 		InputSchema: mcp.InputSchema{
@@ -293,8 +311,6 @@ func run(ctx context.Context) error {
 			Required: []string{"page_id", "content"},
 		},
 	}, cs.handleUpdatePage)
-
-	return server.Run(ctx)
 }
 
 func (s *confluenceServer) request(ctx context.Context, method, path string, body any) (map[string]any, error) {

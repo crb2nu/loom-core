@@ -1,0 +1,1 @@
+- **Fail closed when delivering cross-repo stamps** (`pkg/mills/crossrepo/deliver.go`, `pkg/telemetry/metrics.go`): authorize the exact explicit target before writing, reject missing, malformed, or denied destinations without fallback, and count bounded delivery outcomes.

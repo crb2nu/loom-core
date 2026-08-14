@@ -39,6 +39,10 @@ func registerTaskTools(server *mcp.Server, svc *agentcontext.Service, tracer tra
 								"type":        "string",
 								"description": "Additional context about the task.",
 							},
+							"project": map[string]any{
+								"type":        "string",
+								"description": "Optional canonical project identifier. Defaults from the owning session namespace or pipeline project.",
+							},
 							"priority": map[string]any{
 								"type":        "string",
 								"enum":        []string{"low", "medium", "high", "critical"},
@@ -61,6 +65,28 @@ func registerTaskTools(server *mcp.Server, svc *agentcontext.Service, tracer tra
 								"type":        "array",
 								"items":       map[string]any{"type": "string"},
 								"description": "IDs of tasks blocking this one.",
+							},
+							"pipeline_ref": map[string]any{
+								"type":        "object",
+								"description": "Optional CI pipeline reference linked to the task.",
+								"properties": map[string]any{
+									"id":      map[string]any{"type": "integer"},
+									"project": map[string]any{"type": "string"},
+									"ref":     map[string]any{"type": "string"},
+									"web_url": map[string]any{"type": "string"},
+								},
+							},
+							"workflow_id": map[string]any{
+								"type":        "string",
+								"description": "Optional workflow instance linked to the task.",
+							},
+							"plan_id": map[string]any{
+								"type":        "string",
+								"description": "Optional plan this task belongs to (plan store convergence).",
+							},
+							"slice_id": map[string]any{
+								"type":        "string",
+								"description": "Optional plan slice this task is a TODO under.",
 							},
 						},
 						"required": []string{"title"},
@@ -91,6 +117,24 @@ func registerTaskTools(server *mcp.Server, svc *agentcontext.Service, tracer tra
 				"resolution": map[string]any{
 					"type":        "string",
 					"description": "Resolution description (for completed tasks).",
+				},
+				"project": map[string]any{
+					"type":        "string",
+					"description": "Optional canonical project identifier override.",
+				},
+				"pipeline_ref": map[string]any{
+					"type":        "object",
+					"description": "Optional CI pipeline reference linked to the task.",
+					"properties": map[string]any{
+						"id":      map[string]any{"type": "integer"},
+						"project": map[string]any{"type": "string"},
+						"ref":     map[string]any{"type": "string"},
+						"web_url": map[string]any{"type": "string"},
+					},
+				},
+				"workflow_id": map[string]any{
+					"type":        "string",
+					"description": "Optional workflow instance linked to the task.",
 				},
 			},
 			Required: []string{"task_id"},
@@ -148,5 +192,32 @@ func registerTaskTools(server *mcp.Server, svc *agentcontext.Service, tracer tra
 		},
 	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		return svc.HandleTaskDelete(ctx, args)
+	})
+
+	// =========================================================================
+	// Fleet Dispatch (F6): capability-aware routing decision (v1 returns choice
+	// only, does not actually spawn).
+	// =========================================================================
+
+	server.AddTool(mcp.Tool{
+		Name:        "agent_task_dispatch",
+		Description: "Choose the best fleet agent for a task based on required capabilities and active presence. v1 returns the decision only (no spawn). Seeds live at mcp/context/agent-capabilities.yaml.",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"capability_needed": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Capabilities the candidate agent must advertise. Empty = any active agent (lowest load wins).",
+				},
+				"scope": map[string]any{
+					"type":        "string",
+					"enum":        []string{"session", "fleet"},
+					"description": "Dispatch scope. Default: session.",
+				},
+			},
+		},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		return svc.HandleTaskDispatch(ctx, args)
 	})
 }

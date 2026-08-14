@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"strings"
@@ -39,7 +40,12 @@ func NewKeychainBackendWithExecutor(exec CommandExecutor) (*KeychainBackend, err
 
 // Get retrieves a secret from macOS Keychain.
 func (b *KeychainBackend) Get(key string) (string, error) {
-	stdout, stderr, err := b.executor.Run("security", "find-generic-password",
+	return b.GetContext(context.Background(), key)
+}
+
+// GetContext retrieves a secret from macOS Keychain with cancellation.
+func (b *KeychainBackend) GetContext(ctx context.Context, key string) (string, error) {
+	stdout, stderr, err := runCommandContext(ctx, b.executor, "security", "find-generic-password",
 		"-s", b.service,
 		"-a", key,
 		"-w", // Output password only
@@ -60,12 +66,17 @@ func (b *KeychainBackend) Get(key string) (string, error) {
 
 // Set stores a secret in macOS Keychain.
 func (b *KeychainBackend) Set(key, value string) error {
+	return b.SetContext(context.Background(), key, value)
+}
+
+// SetContext stores a secret in macOS Keychain with cancellation.
+func (b *KeychainBackend) SetContext(ctx context.Context, key, value string) error {
 	// First try to delete any existing entry (ignore errors)
-	_ = b.Delete(key)
+	_ = b.DeleteContext(ctx, key)
 
 	// Use -A to allow access from any application without prompting
 	// This is necessary for loomd (daemon) to access secrets stored by CLI
-	_, stderr, err := b.executor.Run("security", "add-generic-password",
+	_, stderr, err := runCommandContext(ctx, b.executor, "security", "add-generic-password",
 		"-s", b.service,
 		"-a", key,
 		"-w", value,
@@ -82,7 +93,12 @@ func (b *KeychainBackend) Set(key, value string) error {
 
 // Delete removes a secret from macOS Keychain.
 func (b *KeychainBackend) Delete(key string) error {
-	_, stderr, err := b.executor.Run("security", "delete-generic-password",
+	return b.DeleteContext(context.Background(), key)
+}
+
+// DeleteContext removes a secret from macOS Keychain with cancellation.
+func (b *KeychainBackend) DeleteContext(ctx context.Context, key string) error {
+	_, stderr, err := runCommandContext(ctx, b.executor, "security", "delete-generic-password",
 		"-s", b.service,
 		"-a", key,
 	)

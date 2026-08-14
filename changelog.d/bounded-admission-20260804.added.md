@@ -1,0 +1,1 @@
+- Add rolling council and pipeline spend evaluation, atomic runner admission permits, and a fail-closed intake dispatch gate in `pkg/mills/budget/budget.go`, `pkg/mills/runner/admission.go`, and `pkg/mills/intake/intake.go`.

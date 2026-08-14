@@ -1,0 +1,1 @@
+- Add the fail-closed `max_concurrent_pipelines` policy field in `pkg/policy/policy.go`, consume it through `pkg/mills/pipeline/pipeline.go`, and document the production default in `k8s/configmap-policy.yaml`.

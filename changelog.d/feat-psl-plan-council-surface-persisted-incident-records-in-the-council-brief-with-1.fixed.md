@@ -1,0 +1,1 @@
+- Surface deterministically aggregated persisted incident records, dispositions, occurrence counts, and external-dependency guidance in `pkg/mills/store/incidents.go`, `pkg/mills/council/brief.go`, and `pkg/mills/council/brief_test.go`.

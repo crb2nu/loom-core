@@ -12,12 +12,15 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/validate"
 
 	_ "github.com/lib/pq"
+
+	"github.com/crb2nu/loom/pkg/mcpotel"
 )
 
 var version = "1.0.0"
@@ -36,6 +39,25 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx,
+		"mcp-postgres",
+
+		logger,
+	)
+	if err !=
+		nil {
+		logger.
+			Warn("OTel tracer init failed",
+
+				"error",
+				err,
+			)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp,
+		"mcp-postgres")
 
 	pgURL := os.Getenv("POSTGRES_URL")
 	if pgURL == "" {
@@ -73,6 +95,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-postgres", "version", version)
 
 	server := mcp.NewServer("mcp-postgres", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("PostgreSQL MCP server. Inspect schemas and run read-only queries.")
 
 	// pg_list_databases
@@ -83,9 +106,11 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, pg.handleListDatabases)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// pg_list_tables
+		// pg_list_tables
+		"pg_list_databases", pg.handleListDatabases))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pg_list_tables",
 		Description: "List tables in a schema",
@@ -98,9 +123,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, pg.handleListTables)
+	}, mcpotel.TracedToolHandler(
 
-	// pg_describe_table
+		// pg_describe_table
+		tracer, "pg_list_tables", pg.handleListTables))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pg_describe_table",
 		Description: "Describe table structure including columns, types, constraints, and indexes",
@@ -118,9 +145,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"table"},
 		},
-	}, pg.handleDescribeTable)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// pg_query
+		// pg_query
+		"pg_describe_table", pg.handleDescribeTable))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pg_query",
 		Description: "Execute a read-only SQL query (SELECT statements only)",
@@ -138,9 +167,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"query"},
 		},
-	}, pg.handleQuery)
+	}, mcpotel.TracedToolHandler(
 
-	// pg_explain
+		// pg_explain
+		tracer, "pg_query", pg.handleQuery))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pg_explain",
 		Description: "Get query execution plan",
@@ -162,9 +193,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"query"},
 		},
-	}, pg.handleExplain)
+	}, mcpotel.TracedToolHandler(
 
-	// pg_active_queries
+		// pg_active_queries
+		tracer, "pg_explain", pg.handleExplain))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pg_active_queries",
 		Description: "Show currently running queries",
@@ -177,9 +210,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, pg.handleActiveQueries)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// pg_table_stats
+		// pg_table_stats
+		"pg_active_queries", pg.handleActiveQueries))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pg_table_stats",
 		Description: "Get table statistics including row count, size, and bloat",
@@ -197,7 +232,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"table"},
 		},
-	}, pg.handleTableStats)
+	}, mcpotel.TracedToolHandler(tracer, "pg_table_stats", pg.handleTableStats))
 
 	return server.Run(ctx)
 }

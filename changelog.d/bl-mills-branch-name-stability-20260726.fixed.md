@@ -1,0 +1,1 @@
+- Stabilize Mills retry branch contracts and reuse exact open GitLab merge requests while sweeping verified closed-MR branch husks (`pkg/mills/pipeline`, `pkg/mills/clients/gitlab.go`).

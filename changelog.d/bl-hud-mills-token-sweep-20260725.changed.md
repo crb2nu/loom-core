@@ -1,0 +1,1 @@
+- Standardized legacy HUD mills panel typography, radii, and theme color aliases in `internal/hud/frontend/src/lib/components/mills`, and tokenized the shared panel shell they render inside (`internal/hud/frontend/src/lib/components/shared/PanelShell.svelte`).

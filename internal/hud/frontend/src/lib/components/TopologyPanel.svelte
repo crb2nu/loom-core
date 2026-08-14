@@ -1,10 +1,13 @@
-<script>
+<script lang="ts">
+  import type { BadgeVariant } from '../utils/tokens.ts';
   import { topologyStore } from '../stores/topology.svelte.ts';
   import { presenceStore } from '../stores/presence.svelte.ts';
   import { truncatePath } from '../utils/format.ts';
   import AgentTopology from '../widgets/AgentTopology.svelte';
   import StatusDot from '../widgets/StatusDot.svelte';
   import Badge from '../widgets/Badge.svelte';
+  import EmptyState from './shared/EmptyState.svelte';
+  import PanelHeader from './shared/PanelHeader.svelte';
 
   $effect(() => {
     topologyStore.startPolling(30000);
@@ -15,6 +18,16 @@
   let edges = $derived(topologyStore.edges);
   let clusters = $derived(topologyStore.clusters);
   let selected = $derived(topologyStore.selectedNode);
+
+  // Render precedence: error > loading > empty > graph. The graph (and the
+  // detail sidebar) only render when we actually have nodes; otherwise an
+  // EmptyState explains *which* of those three states we're in. Without
+  // this, a /topology fetch failure rendered an indistinguishable blank
+  // canvas — operators could not tell a cold-start error from "no agents
+  // registered yet".
+  let topologyLoading = $derived(topologyStore.loading);
+  let topologyError = $derived(topologyStore.error);
+  let hasTopologyData = $derived(nodes.length > 0);
 
   // Find the selected node details.
   let selectedAgent = $derived.by(() => {
@@ -34,41 +47,50 @@
     return edges.filter((e) => e.source === selected || e.target === selected);
   });
 
-  function presenceStatus(status) {
-    const map = { active: 'healthy', idle: 'degraded', offline: 'down' };
+  function presenceStatus(status: string): 'healthy' | 'degraded' | 'down' {
+    const map: Record<string, 'healthy' | 'degraded' | 'down'> = { active: 'healthy', idle: 'degraded', offline: 'down' };
     return map[status] ?? 'down';
   }
 
-  function edgeTypeLabel(type) {
-    const map = { handoff: 'Handoff', shared_file: 'Shared File', shared_branch: 'Shared Branch' };
+  function edgeTypeLabel(type: string) {
+    const map: Record<string, string> = { handoff: 'Handoff', shared_file: 'Shared File', shared_branch: 'Shared Branch' };
     return map[type] ?? type;
   }
 
-  function edgeTypeVariant(type) {
-    const map = { handoff: 'accent', shared_file: 'warning', shared_branch: 'info' };
+  function edgeTypeVariant(type: string): BadgeVariant {
+    const map: Record<string, BadgeVariant> = { handoff: 'accent', shared_file: 'warning', shared_branch: 'info' };
     return map[type] ?? 'info';
   }
 
-  function shortPath(path) {
+  function shortPath(path: string) {
     return truncatePath(path, 50);
   }
 </script>
 
 <div class="panel topology-panel">
-  <div class="topology-layout" class:has-sidebar={!!selected}>
+  <PanelHeader title="Topology" icon={'⬡'} count={nodes.length} />
+  <div class="topology-layout" class:has-sidebar={!!selected && hasTopologyData}>
     <!-- Graph area -->
     <div class="topology-graph">
-      <AgentTopology
-        {nodes}
-        {edges}
-        {clusters}
-        selectedNode={selected}
-        onselect={(id) => topologyStore.selectNode(id)}
-      />
+      {#if topologyError && !hasTopologyData}
+        <EmptyState icon={'⚠'} heading="Topology unavailable" description={topologyError} />
+      {:else if topologyLoading && !hasTopologyData}
+        <EmptyState icon={'◯'} heading="Loading topology..." compact />
+      {:else if !hasTopologyData}
+        <EmptyState icon={'□'} heading="No agents registered" description="Agents will appear here once they register presence." />
+      {:else}
+        <AgentTopology
+          {nodes}
+          {edges}
+          {clusters}
+          selectedNode={selected}
+          onselect={(id) => topologyStore.selectNode(id)}
+        />
+      {/if}
     </div>
 
     <!-- Detail sidebar (shown when node selected) -->
-    {#if selectedAgent}
+    {#if selectedAgent && hasTopologyData}
       <aside class="topology-sidebar">
         <div class="sidebar-header">
           <h3 class="sidebar-title">{selectedAgent.agent_id}</h3>
@@ -191,18 +213,39 @@
     border-left: 1px solid var(--border);
     background: var(--bg-secondary);
     overflow-y: auto;
-    padding: 12px;
+    padding: var(--space-3);
+    position: relative;
+  }
+
+  .topology-sidebar::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--surface-highlight);
+    pointer-events: none;
   }
 
   .sidebar-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 12px;
+    margin-bottom: var(--space-3);
+    position: relative;
+  }
+
+  .sidebar-header::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 10%;
+    right: 10%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(var(--info-rgb), 0.06) 50%, transparent);
+    pointer-events: none;
   }
 
   .sidebar-title {
-    font-size: 14px;
+    font-size: var(--text-base);
     font-weight: 600;
     font-family: var(--font-mono);
     color: var(--fg-primary);
@@ -210,9 +253,9 @@
   }
 
   .sidebar-section {
-    margin-bottom: 16px;
-    padding-bottom: 12px;
-    border-bottom: 1px solid var(--border);
+    margin-bottom: var(--space-4);
+    padding-bottom: var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
   }
 
   .sidebar-section:last-child {
@@ -220,39 +263,42 @@
   }
 
   .section-title {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: var(--tracking-wide);
     color: var(--fg-muted);
-    margin: 0 0 8px;
+    margin: 0 0 var(--space-2);
   }
 
   .detail-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 4px 0;
-    font-size: 12px;
+    padding: var(--space-1) 0;
+    font-size: var(--text-sm);
   }
 
   .detail-label {
     color: var(--fg-muted);
-    font-size: 11px;
+    font-size: var(--text-xs);
+    letter-spacing: var(--tracking-wide);
+    text-transform: uppercase;
   }
 
   .detail-value {
     color: var(--fg-primary);
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-1);
     max-width: 160px;
   }
 
   .status-text {
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-family: var(--font-mono);
     text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
   }
 
   .connection-row {
@@ -273,21 +319,23 @@
   .link {
     color: var(--accent);
     text-decoration: none;
-    font-size: 11px;
+    font-size: var(--text-xs);
     overflow: hidden;
     text-overflow: ellipsis;
+    transition: color var(--transition-fast);
   }
 
   .link:hover {
     text-decoration: underline;
+    color: var(--fg-primary);
   }
 
   /* Legend */
   .topology-legend {
     display: flex;
     align-items: center;
-    gap: 20px;
-    padding: 6px 12px;
+    gap: var(--space-5);
+    padding: 6px var(--space-3);
     border-top: 1px solid var(--border);
     background: var(--bg-secondary);
     flex-shrink: 0;
@@ -296,23 +344,24 @@
   .legend-section {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-3);
   }
 
   .legend-label {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.3px;
+    letter-spacing: var(--tracking-wide);
     color: var(--fg-muted);
   }
 
   .legend-item {
     display: flex;
     align-items: center;
-    gap: 4px;
-    font-size: 11px;
+    gap: var(--space-1);
+    font-size: var(--text-xs);
     color: var(--fg-secondary);
+    letter-spacing: var(--tracking-normal);
   }
 
   .legend-line {
@@ -346,6 +395,11 @@
 
   .btn-xs {
     padding: 2px 6px;
-    font-size: 11px;
+    font-size: var(--text-xs);
+    transition: background var(--transition-fast);
+  }
+
+  .btn-xs:hover {
+    background: var(--bg-elevated);
   }
 </style>

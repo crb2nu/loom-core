@@ -1,0 +1,45 @@
+apiVersion: v1
+data:
+  server.yaml: |
+    always_allow:
+        - k8s.get
+        - k8s.describe
+        - k8s.getPods
+        - k8s.logs
+        - k8s.apply
+    categories:
+        - storage
+        - kubernetes
+        - operations
+    description: Longhorn storage operations on the k3s cluster (volumes, replicas, attachments)
+    name: longhorn_k3s
+    timeout: 90
+  # In-cluster kubeconfig -- see servers/flux/configmap.yaml. mcp-k8s-ops shells
+  # out to kubectl, which silently falls back to the pod's default
+  # ServiceAccount when MCP_K8S_KUBECONFIG points at a missing file; that turned
+  # the missing-kubeconfig bug into "Forbidden: ... serviceaccount:loom-hub:default"
+  # instead of a clear config error.
+  kubeconfig.yaml: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: in-cluster
+        cluster:
+          server: https://kubernetes.default.svc
+          certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+      - name: service-account
+        user:
+          tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+      - name: in-cluster
+        context:
+          cluster: in-cluster
+          user: service-account
+    current-context: in-cluster
+kind: ConfigMap
+metadata:
+  labels:
+    app: longhorn-k3s
+    component: mcp-server
+  name: longhorn-k3s-config

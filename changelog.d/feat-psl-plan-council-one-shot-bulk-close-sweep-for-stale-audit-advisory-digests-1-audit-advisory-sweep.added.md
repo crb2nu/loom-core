@@ -1,0 +1,1 @@
+- Add a dry-run-by-default, configurable one-shot sweep for stale bot-authored audit-advisory digests in `pkg/mills/audit/sweep.go`, with the `scripts/audit-advisory-sweep.sh` operator entrypoint and stable selectors in `pkg/mills/audit/audit.go`.

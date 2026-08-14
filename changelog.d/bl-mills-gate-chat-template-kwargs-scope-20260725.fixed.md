@@ -1,0 +1,1 @@
+- **Mills external chat requests no longer send vLLM-only template options** (`pkg/mills/clients/flexinfer.go`): gateway-routed `oa/*` and `or/*` models omit `chat_template_kwargs`, while local FlexInfer models retain the Qwen thinking control.

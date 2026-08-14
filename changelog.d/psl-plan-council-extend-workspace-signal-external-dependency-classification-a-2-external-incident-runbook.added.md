@@ -1,0 +1,1 @@
+- Document the `external_dependency_incident` non-action policy, the allowed repository-owned follow-up classes, and the ClickHouse MergeTree, Langfuse Redis `ECONNREFUSED`, and Longhorn replica-scheduling recurring clusters in `docs/operator-runbook-external-dependency-incidents.md`.

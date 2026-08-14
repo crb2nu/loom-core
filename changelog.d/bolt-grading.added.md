@@ -1,0 +1,1 @@
+- Add Bolt grade storage and the authenticated pipeline-run grading API in `pkg/mills` and `cmd/loom-mills-operator`.

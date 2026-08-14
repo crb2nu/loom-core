@@ -3,11 +3,34 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/crb2nu/loom/internal/hud"
+	"github.com/crb2nu/loom/pkg/env"
 )
+
+// envInt reads an integer from an environment variable, falling back to a default.
+func envInt(key string, defaultVal int) int {
+	if raw := os.Getenv(key); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil {
+			return v
+		}
+	}
+	return defaultVal
+}
+
+func envBoolValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 func newHudCmd(socketPath string) *cobra.Command {
 	var dev bool
@@ -19,23 +42,84 @@ func newHudCmd(socketPath string) *cobra.Command {
 	var overlayOpacity float64
 	var overlayCornerRadius float64
 	var flexinferURL string
+	var flexinferProxyURL string
 	var flexinferKey string
 	var coordinatorModel string
 	var webhookURL string
 	var webhookToken string
 	var webhookResolve string
 	var adminToken string
+	var cfAccessTeamDomain string
+	var cfAccessAUD string
+	var cfAccessAdminEmails string
+	var adminTrustedCIDRs string
 	var mobileOperatorToken string
 	var mobileOperatorScopes string
+	var mobileRateLimitMutation int
+	var mobileRateLimitRead int
+	var tlsCert string
+	var tlsKey string
+	var bindAddress string
+	var cacheBackend string
 	var ghosttyConfig bool
 	var installShader bool
 	var tui bool
+	var embed bool
+	var embedSubset string
+
+	// Pipeline monitor flags.
+	var pipelineProjects string
+
+	// Auto-fix engine flag.
+	var autofixEnabled bool
+
+	// Spawn orchestrator flags.
+	var spawnEnabled bool
+	var spawnControllerID string
+	var spawnRecoveryAuthority bool
+	var spawnKubeconfig string
+	var spawnNamespace string
+	var spawnRegistry string
+	var spawnSyncMode string
+	var spawnGitBaseURL string
+	var spawnGitSecret string
+	var spawnGitCloneImage string
+	var spawnProjects string
+	var spawnDefaultCPU float64
+	var spawnDefaultMemory int
+	var spawnMaxConcurrent int
+	var spawnMaxConcurrentBuilds int
+	var spawnBuildCPURequest string
+	var spawnBuildCPULimit string
+	var spawnBuildMemoryRequest string
+	var spawnBuildMemoryLimit string
+	var spawnBuildEphemeralStorageRequest string
+	var spawnBuildEphemeralStorageLimit string
+	var spawnBuildAvoidNodes string
+
+	// Harvester KubeVirt VM substrate (Mills harvester-vm backend, Slice 2d).
+	// All optional. Empty SpawnHarvesterKubeconfig leaves the substrate
+	// unregistered; HUD runs k8s-only and any Mills request with
+	// Substrate="harvester-vm" falls back to k8s with a warning log.
+	var spawnHarvesterKubeconfig string
+	var spawnHarvesterBaseImage string
+	var spawnHarvesterNamespace string
+	var spawnHarvesterStorageClass string
+	var spawnHarvesterNetworkAttachDef string
+	var spawnHarvesterDefaultVCPUs int
+	var spawnHarvesterDefaultMemMi int
+	var spawnHarvesterDefaultDiskGi int
+	var spawnHarvesterSSHUser string
 
 	cmd := &cobra.Command{
 		Use:   "hud",
 		Short: "Launch the Agent HUD (command center)",
 		Long: `Launch an interactive dashboard for managing AI coding agents,
 MCP servers, workflows, memory, and the knowledge graph.
+
+DEPRECATED: The HUD is now embedded in loomd. Use 'loomd --hud-port 3333'
+instead of running a separate 'loom hud' process. This command remains
+functional for backward compatibility but will be removed in a future release.
 
 The HUD connects to the running loom daemon and provides real-time
 monitoring and control of the entire agent ecosystem.
@@ -61,7 +145,136 @@ Use --install-shader to install the loom-vibrancy.glsl shader to
 
 Use --metrics-addr to connect to the daemon's SSE event stream for
 real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
+		Deprecated: "use 'loomd --hud-port 3333' instead (HUD is now embedded in the daemon)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Load optional env file (secrets for launchd, etc.).
+			homeDir, _ := os.UserHomeDir()
+			envFile := os.Getenv("LOOM_HUD_ENV_FILE")
+			if envFile == "" {
+				if homeDir != "" {
+					envFile = filepath.Join(homeDir, ".config", "loom", "hud.env")
+				}
+			}
+			if envFile != "" {
+				_ = env.LoadFile(envFile)
+			}
+			// Re-apply environment-backed defaults after loading hud.env.
+			// Cobra flag defaults are evaluated before RunE executes, so values
+			// loaded from hud.env must be copied into flag vars explicitly.
+			applyEnvString := func(flagName, envKey string, target *string) {
+				if cmd.Flags().Changed(flagName) {
+					return
+				}
+				if v := os.Getenv(envKey); v != "" {
+					*target = v
+				}
+			}
+			applyEnvInt := func(flagName, envKey string, target *int) {
+				if cmd.Flags().Changed(flagName) {
+					return
+				}
+				if raw := os.Getenv(envKey); raw != "" {
+					if v, err := strconv.Atoi(raw); err == nil {
+						*target = v
+					}
+				}
+			}
+			applyEnvFloat := func(flagName, envKey string, target *float64) {
+				if cmd.Flags().Changed(flagName) {
+					return
+				}
+				if raw := os.Getenv(envKey); raw != "" {
+					if v, err := strconv.ParseFloat(raw, 64); err == nil {
+						*target = v
+					}
+				}
+			}
+			applyEnvString("metrics-addr", "DAEMON_METRICS_ADDR", &metricsAddr)
+			applyEnvString("flexinfer-url", "FLEXINFER_URL", &flexinferURL)
+			applyEnvString("flexinfer-proxy-url", "FLEXINFER_PROXY_URL", &flexinferProxyURL)
+			applyEnvString("flexinfer-key", "FLEXINFER_API_KEY", &flexinferKey)
+			applyEnvString("coordinator-model", "COORDINATOR_MODEL", &coordinatorModel)
+			applyEnvString("webhook-url", "HUD_WEBHOOK_URL", &webhookURL)
+			applyEnvString("webhook-token", "HUD_WEBHOOK_TOKEN", &webhookToken)
+			applyEnvString("webhook-resolve", "HUD_WEBHOOK_RESOLVE", &webhookResolve)
+			applyEnvString("admin-token", "HUD_ADMIN_TOKEN", &adminToken)
+			applyEnvString("cf-access-team-domain", "HUD_CF_ACCESS_TEAM_DOMAIN", &cfAccessTeamDomain)
+			applyEnvString("cf-access-aud", "HUD_CF_ACCESS_AUD", &cfAccessAUD)
+			applyEnvString("admin-emails", "HUD_ADMIN_EMAILS", &cfAccessAdminEmails)
+			applyEnvString("admin-trusted-cidrs", "HUD_ADMIN_TRUSTED_CIDRS", &adminTrustedCIDRs)
+			applyEnvString("mobile-operator-token", "HUD_MOBILE_OPERATOR_TOKEN", &mobileOperatorToken)
+			applyEnvString("mobile-operator-scopes", "HUD_MOBILE_OPERATOR_SCOPES", &mobileOperatorScopes)
+			applyEnvString("tls-cert", "HUD_TLS_CERT", &tlsCert)
+			applyEnvString("tls-key", "HUD_TLS_KEY", &tlsKey)
+			applyEnvString("bind", "HUD_BIND_ADDRESS", &bindAddress)
+			applyEnvString("cache-backend", "CACHE_BACKEND", &cacheBackend)
+			applyEnvInt("mobile-rate-limit-mutation", "HUD_MOBILE_RATE_LIMIT_MUTATION", &mobileRateLimitMutation)
+			applyEnvInt("mobile-rate-limit-read", "HUD_MOBILE_RATE_LIMIT_READ", &mobileRateLimitRead)
+			applyEnvString("spawn-controller-id", "SPAWN_CONTROLLER_ID", &spawnControllerID)
+			applyEnvString("spawn-kubeconfig", "SPAWN_KUBECONFIG", &spawnKubeconfig)
+			applyEnvString("spawn-namespace", "SPAWN_NAMESPACE", &spawnNamespace)
+			applyEnvString("spawn-registry", "SPAWN_REGISTRY", &spawnRegistry)
+			applyEnvString("spawn-sync-mode", "SPAWN_SYNC_MODE", &spawnSyncMode)
+			applyEnvString("spawn-git-base-url", "SPAWN_GIT_BASE_URL", &spawnGitBaseURL)
+			applyEnvString("spawn-git-secret", "SPAWN_GIT_SECRET", &spawnGitSecret)
+			applyEnvString("spawn-git-clone-image", "SPAWN_GIT_CLONE_IMAGE", &spawnGitCloneImage)
+			applyEnvString("spawn-projects", "SPAWN_PROJECTS", &spawnProjects)
+			applyEnvFloat("spawn-default-cpu", "SPAWN_DEFAULT_CPU", &spawnDefaultCPU)
+			applyEnvInt("spawn-default-memory-mb", "SPAWN_DEFAULT_MEMORY_MB", &spawnDefaultMemory)
+			applyEnvInt("spawn-max-concurrent", "SPAWN_MAX_CONCURRENT", &spawnMaxConcurrent)
+			applyEnvInt("spawn-max-concurrent-builds", "SPAWN_MAX_CONCURRENT_BUILDS", &spawnMaxConcurrentBuilds)
+			applyEnvString("spawn-build-cpu-request", "SPAWN_BUILD_CPU_REQUEST", &spawnBuildCPURequest)
+			applyEnvString("spawn-build-cpu-limit", "SPAWN_BUILD_CPU_LIMIT", &spawnBuildCPULimit)
+			applyEnvString("spawn-build-memory-request", "SPAWN_BUILD_MEMORY_REQUEST", &spawnBuildMemoryRequest)
+			applyEnvString("spawn-build-memory-limit", "SPAWN_BUILD_MEMORY_LIMIT", &spawnBuildMemoryLimit)
+			applyEnvString("spawn-build-ephemeral-storage-request", "SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST", &spawnBuildEphemeralStorageRequest)
+			applyEnvString("spawn-build-ephemeral-storage-limit", "SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT", &spawnBuildEphemeralStorageLimit)
+			applyEnvString("spawn-build-avoid-nodes", "SPAWN_BUILD_AVOID_NODES", &spawnBuildAvoidNodes)
+			applyEnvString("spawn-harvester-kubeconfig", "SPAWN_HARVESTER_KUBECONFIG", &spawnHarvesterKubeconfig)
+			applyEnvString("spawn-harvester-base-image", "SPAWN_HARVESTER_BASE_IMAGE", &spawnHarvesterBaseImage)
+			applyEnvString("spawn-harvester-namespace", "SPAWN_HARVESTER_NAMESPACE", &spawnHarvesterNamespace)
+			applyEnvString("spawn-harvester-storage-class", "SPAWN_HARVESTER_STORAGE_CLASS", &spawnHarvesterStorageClass)
+			applyEnvString("spawn-harvester-network-attach-def", "SPAWN_HARVESTER_NAD", &spawnHarvesterNetworkAttachDef)
+			applyEnvInt("spawn-harvester-default-vcpus", "SPAWN_HARVESTER_DEFAULT_VCPUS", &spawnHarvesterDefaultVCPUs)
+			applyEnvInt("spawn-harvester-default-mem-mi", "SPAWN_HARVESTER_DEFAULT_MEM_MI", &spawnHarvesterDefaultMemMi)
+			applyEnvInt("spawn-harvester-default-disk-gi", "SPAWN_HARVESTER_DEFAULT_DISK_GI", &spawnHarvesterDefaultDiskGi)
+			applyEnvString("spawn-harvester-ssh-user", "SPAWN_HARVESTER_SSH_USER", &spawnHarvesterSSHUser)
+			// SPAWN_ENABLED env var (boolean).
+			if !cmd.Flags().Changed("spawn-enabled") {
+				if v := os.Getenv("SPAWN_ENABLED"); v == "true" || v == "1" {
+					spawnEnabled = true
+				}
+			}
+			if !cmd.Flags().Changed("autofix-enabled") {
+				autofixEnabled = envBoolValue(os.Getenv("HUD_AUTOFIX_ENABLED"))
+			}
+			if !cmd.Flags().Changed("spawn-recovery-authority") {
+				spawnRecoveryAuthority = envBoolValue(os.Getenv("SPAWN_RECOVERY_AUTHORITY"))
+			}
+			// Launchd/mobile-dev compatibility: if no token is provided directly,
+			// fall back to the persisted token file used by make mobile-dev.
+			if !cmd.Flags().Changed("mobile-operator-token") && strings.TrimSpace(mobileOperatorToken) == "" {
+				tokenFile := os.Getenv("HUD_MOBILE_OPERATOR_TOKEN_FILE")
+				if tokenFile == "" && homeDir != "" {
+					tokenFile = filepath.Join(homeDir, ".config", "loom", "mobile-operator-token")
+				}
+				if tokenFile != "" {
+					if tokenRaw, err := os.ReadFile(tokenFile); err == nil {
+						if token := strings.TrimSpace(string(tokenRaw)); token != "" {
+							mobileOperatorToken = token
+						}
+					}
+				}
+			}
+			if !cmd.Flags().Changed("mobile-operator-scopes") && strings.TrimSpace(mobileOperatorScopes) == "" {
+				mobileOperatorScopes = "mobile:read,mobile:session:create,mobile:session:end,mobile:push"
+			}
+
+			// Apply --cache-backend flag to env (read later by cache.LoadConfigFromEnv).
+			if cacheBackend != "" {
+				os.Setenv("CACHE_BACKEND", cacheBackend)
+			}
+
 			// Standalone utility commands (no daemon connection needed).
 			if ghosttyConfig {
 				fmt.Print(hud.GenerateGhosttyConfig())
@@ -71,33 +284,82 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 				return hud.InstallShader()
 			}
 
-			return hud.Run(hud.Config{
-				SocketPath:           socketPath,
-				Dev:                  dev,
-				Port:                 port,
-				MetricsAddr:          metricsAddr,
-				Overlay:              overlay,
-				OverlayEdge:          overlayEdge,
-				OverlayWidth:         overlayWidth,
-				OverlayOpacity:       overlayOpacity,
-				OverlayCornerRadius:  overlayCornerRadius,
-				FlexInferURL:         flexinferURL,
-				FlexInferKey:         flexinferKey,
-				CoordinatorModel:     coordinatorModel,
-				WebhookURL:           webhookURL,
-				WebhookToken:         webhookToken,
-				WebhookResolve:       webhookResolve,
-				AdminToken:           adminToken,
-				MobileOperatorToken:  mobileOperatorToken,
-				MobileOperatorScopes: mobileOperatorScopes,
-				TUI:                  tui,
-			})
+			cfg := hud.Config{
+				SocketPath:                        socketPath,
+				Dev:                               dev,
+				Port:                              port,
+				MetricsAddr:                       metricsAddr,
+				Overlay:                           overlay,
+				OverlayEdge:                       overlayEdge,
+				OverlayWidth:                      overlayWidth,
+				OverlayOpacity:                    overlayOpacity,
+				OverlayCornerRadius:               overlayCornerRadius,
+				FlexInferURL:                      flexinferURL,
+				FlexInferProxyURL:                 flexinferProxyURL,
+				FlexInferKey:                      flexinferKey,
+				CoordinatorModel:                  coordinatorModel,
+				WebhookURL:                        webhookURL,
+				WebhookToken:                      webhookToken,
+				WebhookResolve:                    webhookResolve,
+				AdminToken:                        adminToken,
+				CFAccessTeamDomain:                cfAccessTeamDomain,
+				CFAccessAUD:                       cfAccessAUD,
+				CFAccessAdminEmails:               cfAccessAdminEmails,
+				AdminTrustedCIDRs:                 adminTrustedCIDRs,
+				MobileOperatorToken:               mobileOperatorToken,
+				MobileOperatorScopes:              mobileOperatorScopes,
+				MobileRateLimitMutation:           mobileRateLimitMutation,
+				MobileRateLimitRead:               mobileRateLimitRead,
+				TLSCert:                           tlsCert,
+				TLSKey:                            tlsKey,
+				BindAddress:                       bindAddress,
+				TUI:                               tui,
+				PipelineProjects:                  pipelineProjects,
+				AutofixEnabled:                    autofixEnabled,
+				SpawnEnabled:                      spawnEnabled,
+				SpawnControllerID:                 spawnControllerID,
+				SpawnRecoveryAuthority:            spawnRecoveryAuthority,
+				SpawnKubeconfig:                   spawnKubeconfig,
+				SpawnNamespace:                    spawnNamespace,
+				SpawnRegistry:                     spawnRegistry,
+				SpawnSyncMode:                     spawnSyncMode,
+				SpawnGitBaseURL:                   spawnGitBaseURL,
+				SpawnGitSecret:                    spawnGitSecret,
+				SpawnGitCloneImage:                spawnGitCloneImage,
+				SpawnProjects:                     spawnProjects,
+				SpawnDefaultCPU:                   spawnDefaultCPU,
+				SpawnDefaultMemory:                spawnDefaultMemory,
+				SpawnMaxConcurrent:                spawnMaxConcurrent,
+				SpawnMaxConcurrentBuilds:          spawnMaxConcurrentBuilds,
+				SpawnBuildCPURequest:              spawnBuildCPURequest,
+				SpawnBuildCPULimit:                spawnBuildCPULimit,
+				SpawnBuildMemoryRequest:           spawnBuildMemoryRequest,
+				SpawnBuildMemoryLimit:             spawnBuildMemoryLimit,
+				SpawnBuildEphemeralStorageRequest: spawnBuildEphemeralStorageRequest,
+				SpawnBuildEphemeralStorageLimit:   spawnBuildEphemeralStorageLimit,
+				SpawnBuildAvoidNodes:              spawnBuildAvoidNodes,
+				SpawnHarvesterKubeconfig:          spawnHarvesterKubeconfig,
+				SpawnHarvesterBaseImage:           spawnHarvesterBaseImage,
+				SpawnHarvesterNamespace:           spawnHarvesterNamespace,
+				SpawnHarvesterStorageClass:        spawnHarvesterStorageClass,
+				SpawnHarvesterNetworkAttachDef:    spawnHarvesterNetworkAttachDef,
+				SpawnHarvesterDefaultVCPUs:        spawnHarvesterDefaultVCPUs,
+				SpawnHarvesterDefaultMemMi:        spawnHarvesterDefaultMemMi,
+				SpawnHarvesterDefaultDiskGi:       spawnHarvesterDefaultDiskGi,
+				SpawnHarvesterSSHUser:             spawnHarvesterSSHUser,
+				EmbedSubset:                       embedSubset,
+			}
+
+			if embed {
+				return runEmbeddedHUDFromCLI(cfg, tui)
+			}
+			return hud.Run(cfg)
 		},
 	}
 
 	cmd.Flags().BoolVar(&dev, "dev", false, "Development mode (CORS enabled, no embed)")
 	cmd.Flags().IntVar(&port, "port", 0, "Port to listen on (0 = random)")
-	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "Daemon metrics/events address (e.g., 127.0.0.1:9090)")
+	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", os.Getenv("DAEMON_METRICS_ADDR"), "Daemon metrics/events address (e.g., 127.0.0.1:9090) [$DAEMON_METRICS_ADDR]")
 	cmd.Flags().BoolVar(&overlay, "overlay", false, "Enable native macOS overlay panel (Cmd+Shift+L to toggle)")
 	cmd.Flags().StringVar(&overlayEdge, "edge", "right", "Screen edge for overlay panel: 'right' or 'left'")
 	cmd.Flags().IntVar(&overlayWidth, "width", 380, "Overlay panel width in points")
@@ -107,7 +369,8 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 	// Coordinator (FlexInfer LLM integration).
 	// Defaults from env vars so the coordinator auto-enables when the
 	// environment is configured (e.g., in .zshrc or launchd plist).
-	cmd.Flags().StringVar(&flexinferURL, "flexinfer-url", os.Getenv("FLEXINFER_URL"), "FlexInfer proxy URL (enables coordinator) [$FLEXINFER_URL]")
+	cmd.Flags().StringVar(&flexinferURL, "flexinfer-url", os.Getenv("FLEXINFER_URL"), "LiteLLM gateway URL used by the coordinator [$FLEXINFER_URL]")
+	cmd.Flags().StringVar(&flexinferProxyURL, "flexinfer-proxy-url", os.Getenv("FLEXINFER_PROXY_URL"), "FlexInfer proxy URL used by the aimodels endpoint for live /v1/models registry [$FLEXINFER_PROXY_URL]")
 	cmd.Flags().StringVar(&flexinferKey, "flexinfer-key", os.Getenv("FLEXINFER_API_KEY"), "FlexInfer API key [$FLEXINFER_API_KEY]")
 	cmd.Flags().StringVar(&coordinatorModel, "coordinator-model", os.Getenv("COORDINATOR_MODEL"), "Default model for coordinator (e.g., fast-chat) [$COORDINATOR_MODEL]")
 
@@ -116,15 +379,87 @@ real-time updates (e.g., --metrics-addr 127.0.0.1:9090).`,
 	cmd.Flags().StringVar(&webhookToken, "webhook-token", os.Getenv("HUD_WEBHOOK_TOKEN"), "Bearer token for webhook auth [$HUD_WEBHOOK_TOKEN]")
 	cmd.Flags().StringVar(&webhookResolve, "webhook-resolve", os.Getenv("HUD_WEBHOOK_RESOLVE"), "Override DNS for webhook hostname (e.g., 192.168.50.227) [$HUD_WEBHOOK_RESOLVE]")
 	cmd.Flags().StringVar(&adminToken, "admin-token", os.Getenv("HUD_ADMIN_TOKEN"), "Admin token required for protected HUD mutations [$HUD_ADMIN_TOKEN]")
+	cmd.Flags().StringVar(&cfAccessTeamDomain, "cf-access-team-domain", os.Getenv("HUD_CF_ACCESS_TEAM_DOMAIN"), "Cloudflare Access team domain (e.g. team.cloudflareaccess.com); enables SSO→admin with --admin-emails [$HUD_CF_ACCESS_TEAM_DOMAIN]")
+	cmd.Flags().StringVar(&cfAccessAUD, "cf-access-aud", os.Getenv("HUD_CF_ACCESS_AUD"), "Cloudflare Access application AUD tag; scopes the SSO token to this app (recommended) [$HUD_CF_ACCESS_AUD]")
+	cmd.Flags().StringVar(&cfAccessAdminEmails, "admin-emails", os.Getenv("HUD_ADMIN_EMAILS"), "Comma-separated emails granted HUD admin via Cloudflare Access SSO [$HUD_ADMIN_EMAILS]")
+	cmd.Flags().StringVar(&adminTrustedCIDRs, "admin-trusted-cidrs", os.Getenv("HUD_ADMIN_TRUSTED_CIDRS"), "Comma-separated client CIDRs granted HUD admin without a token (LAN trusted-network path) [$HUD_ADMIN_TRUSTED_CIDRS]")
 	cmd.Flags().StringVar(&mobileOperatorToken, "mobile-operator-token", os.Getenv("HUD_MOBILE_OPERATOR_TOKEN"), "Bearer token for /api/mobile/v1 routes [$HUD_MOBILE_OPERATOR_TOKEN]")
 	cmd.Flags().StringVar(&mobileOperatorScopes, "mobile-operator-scopes", os.Getenv("HUD_MOBILE_OPERATOR_SCOPES"), "Comma-separated scopes for mobile operator token [$HUD_MOBILE_OPERATOR_SCOPES]")
+	cmd.Flags().IntVar(&mobileRateLimitMutation, "mobile-rate-limit-mutation", envInt("HUD_MOBILE_RATE_LIMIT_MUTATION", 10), "Max mobile mutation requests per actor per minute (0 = disabled) [$HUD_MOBILE_RATE_LIMIT_MUTATION]")
+	cmd.Flags().IntVar(&mobileRateLimitRead, "mobile-rate-limit-read", envInt("HUD_MOBILE_RATE_LIMIT_READ", 60), "Max mobile read requests per actor per minute (0 = disabled) [$HUD_MOBILE_RATE_LIMIT_READ]")
+
+	// TLS and bind address (gateway mode).
+	cmd.Flags().StringVar(&tlsCert, "tls-cert", os.Getenv("HUD_TLS_CERT"), "Path to TLS certificate PEM file [$HUD_TLS_CERT]")
+	cmd.Flags().StringVar(&tlsKey, "tls-key", os.Getenv("HUD_TLS_KEY"), "Path to TLS private key PEM file [$HUD_TLS_KEY]")
+	cmd.Flags().StringVar(&bindAddress, "bind", os.Getenv("HUD_BIND_ADDRESS"), "Listen address (default: 127.0.0.1) [$HUD_BIND_ADDRESS]")
 
 	// Ghostty integration.
 	cmd.Flags().BoolVar(&ghosttyConfig, "ghostty-config", false, "Print Ghostty config snippet to stdout and exit")
 	cmd.Flags().BoolVar(&installShader, "install-shader", false, "Install loom-vibrancy.glsl shader to ~/.config/loom/ and exit")
 
+	// Cache backend override (normally set via CACHE_BACKEND env var or launchd plist).
+	cmd.Flags().StringVar(&cacheBackend, "cache-backend", "", "Cache backend: memory or redis [$CACHE_BACKEND]")
+
 	// TUI mode.
 	cmd.Flags().BoolVar(&tui, "tui", false, "Launch terminal UI dashboard (bubbletea)")
+
+	// Embed mode (UNIFY-2b): run HUD in-process via LocalCaller (no separate
+	// daemon). Lifetime bound to the CLI process; SIGINT/SIGTERM tears it down.
+	// Combine with --tui to co-host both surfaces in one process. See
+	// docs/HUD_EMBEDDING.md.
+	cmd.Flags().BoolVar(&embed, "embed", false, "Run HUD in-process (LocalCaller, no separate daemon). Lifetime tied to this CLI process.")
+	// --subset gates the HUD UI to a curated set of views when embedded
+	// inside another product (typically via iframe). "operator" exposes
+	// Overview + Fleet + Stream only. See internal/hud/app.go EmbedSubset.
+	cmd.Flags().StringVar(&embedSubset, "subset", "", "HUD view subset for embedded surfaces: 'full' (default) or 'operator' (Overview + Fleet + Stream).")
+
+	// Spawn orchestrator (headless agent spawning via devbox K8s pods).
+	// Pipeline monitoring (GitLab CI via mcp-gitlab).
+	cmd.Flags().StringVar(&pipelineProjects, "pipeline-projects", os.Getenv("HUD_PIPELINE_PROJECTS"), "Comma-separated GitLab project paths to monitor pipelines (e.g., group/project1,group/project2) [$HUD_PIPELINE_PROJECTS]")
+
+	cmd.Flags().BoolVar(&autofixEnabled, "autofix-enabled", false, "Enable the LLM-powered pipeline auto-fix engine [$HUD_AUTOFIX_ENABLED]")
+	cmd.Flags().BoolVar(&spawnEnabled, "spawn-enabled", false, "Enable headless agent spawn endpoints [$SPAWN_ENABLED]")
+	cmd.Flags().StringVar(&spawnControllerID, "spawn-controller-id", os.Getenv("SPAWN_CONTROLLER_ID"), "Stable logical owner for shared spawn-state recovery [$SPAWN_CONTROLLER_ID]")
+	cmd.Flags().BoolVar(&spawnRecoveryAuthority, "spawn-recovery-authority", envBoolValue(os.Getenv("SPAWN_RECOVERY_AUTHORITY")), "Claim legacy shared spawn rows and rowless orphan pods (enable on exactly one controller) [$SPAWN_RECOVERY_AUTHORITY]")
+	cmd.Flags().StringVar(&spawnKubeconfig, "spawn-kubeconfig", os.Getenv("SPAWN_KUBECONFIG"), "Kubeconfig for spawn K8s backend [$SPAWN_KUBECONFIG]")
+	cmd.Flags().StringVar(&spawnNamespace, "spawn-namespace", os.Getenv("SPAWN_NAMESPACE"), "K8s namespace for spawn pods (default: devbox) [$SPAWN_NAMESPACE]")
+	cmd.Flags().StringVar(&spawnRegistry, "spawn-registry", os.Getenv("SPAWN_REGISTRY"), "Image registry for spawn builds [$SPAWN_REGISTRY]")
+	cmd.Flags().StringVar(&spawnSyncMode, "spawn-sync-mode", os.Getenv("SPAWN_SYNC_MODE"), "Workspace sync mode: git-clone or nfs [$SPAWN_SYNC_MODE]")
+	cmd.Flags().StringVar(&spawnGitBaseURL, "spawn-git-base-url", os.Getenv("SPAWN_GIT_BASE_URL"), "Git base URL for git-clone sync [$SPAWN_GIT_BASE_URL]")
+	cmd.Flags().StringVar(&spawnGitSecret, "spawn-git-secret", os.Getenv("SPAWN_GIT_SECRET"), "K8s secret with git token [$SPAWN_GIT_SECRET]")
+	cmd.Flags().StringVar(&spawnGitCloneImage, "spawn-git-clone-image", os.Getenv("SPAWN_GIT_CLONE_IMAGE"), "Git image for spawn git-clone init containers [$SPAWN_GIT_CLONE_IMAGE]")
+	cmd.Flags().StringVar(&spawnProjects, "spawn-projects", os.Getenv("SPAWN_PROJECTS"), "Comma-separated project names for spawn picker [$SPAWN_PROJECTS]")
+	cmd.Flags().Float64Var(&spawnDefaultCPU, "spawn-default-cpu", 0, "Default CPU limit for spawned agent pods [$SPAWN_DEFAULT_CPU]")
+	cmd.Flags().IntVar(&spawnDefaultMemory, "spawn-default-memory-mb", 0, "Default memory limit for spawned agent pods in MB [$SPAWN_DEFAULT_MEMORY_MB]")
+	cmd.Flags().IntVar(&spawnMaxConcurrent, "spawn-max-concurrent", 0, "Maximum active spawned agents [$SPAWN_MAX_CONCURRENT]")
+	cmd.Flags().IntVar(&spawnMaxConcurrentBuilds, "spawn-max-concurrent-builds", 0, "Maximum concurrent spawn image builds [$SPAWN_MAX_CONCURRENT_BUILDS]")
+	cmd.Flags().StringVar(&spawnBuildCPURequest, "spawn-build-cpu-request", os.Getenv("SPAWN_BUILD_CPU_REQUEST"), "Buildah CPU request for spawn image builds [$SPAWN_BUILD_CPU_REQUEST]")
+	cmd.Flags().StringVar(&spawnBuildCPULimit, "spawn-build-cpu-limit", os.Getenv("SPAWN_BUILD_CPU_LIMIT"), "Buildah CPU limit for spawn image builds [$SPAWN_BUILD_CPU_LIMIT]")
+	cmd.Flags().StringVar(&spawnBuildMemoryRequest, "spawn-build-memory-request", os.Getenv("SPAWN_BUILD_MEMORY_REQUEST"), "Buildah memory request for spawn image builds [$SPAWN_BUILD_MEMORY_REQUEST]")
+	cmd.Flags().StringVar(&spawnBuildMemoryLimit, "spawn-build-memory-limit", os.Getenv("SPAWN_BUILD_MEMORY_LIMIT"), "Buildah memory limit for spawn image builds [$SPAWN_BUILD_MEMORY_LIMIT]")
+	cmd.Flags().StringVar(&spawnBuildEphemeralStorageRequest, "spawn-build-ephemeral-storage-request", os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST"), "Buildah ephemeral-storage request for spawn image builds [$SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST]")
+	cmd.Flags().StringVar(&spawnBuildEphemeralStorageLimit, "spawn-build-ephemeral-storage-limit", os.Getenv("SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT"), "Buildah ephemeral-storage limit for spawn image builds [$SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT]")
+	cmd.Flags().StringVar(&spawnBuildAvoidNodes, "spawn-build-avoid-nodes", os.Getenv("SPAWN_BUILD_AVOID_NODES"), "Comma-separated node names to avoid for spawn image builds [$SPAWN_BUILD_AVOID_NODES]")
+
+	// Harvester KubeVirt VM substrate (Mills harvester-vm backend, Slice 2d).
+	cmd.Flags().StringVar(&spawnHarvesterKubeconfig, "spawn-harvester-kubeconfig", os.Getenv("SPAWN_HARVESTER_KUBECONFIG"), "Kubeconfig for the Harvester cluster. Empty leaves the harvester-vm substrate unregistered. [$SPAWN_HARVESTER_KUBECONFIG]")
+	cmd.Flags().StringVar(&spawnHarvesterBaseImage, "spawn-harvester-base-image", os.Getenv("SPAWN_HARVESTER_BASE_IMAGE"), "VirtualMachineImage name for harvester-vm spawns (e.g. mills-devbox-base-2026-05-25) [$SPAWN_HARVESTER_BASE_IMAGE]")
+	cmd.Flags().StringVar(&spawnHarvesterNamespace, "spawn-harvester-namespace", os.Getenv("SPAWN_HARVESTER_NAMESPACE"), "Harvester namespace for VMs + PVCs (default: default) [$SPAWN_HARVESTER_NAMESPACE]")
+	cmd.Flags().StringVar(&spawnHarvesterStorageClass, "spawn-harvester-storage-class", os.Getenv("SPAWN_HARVESTER_STORAGE_CLASS"), "Storage class for per-VM PVCs (e.g. longhorn-image-<id>); required when --spawn-harvester-kubeconfig is set [$SPAWN_HARVESTER_STORAGE_CLASS]")
+	cmd.Flags().StringVar(&spawnHarvesterNetworkAttachDef, "spawn-harvester-network-attach-def", os.Getenv("SPAWN_HARVESTER_NAD"), "Multus NetworkAttachmentDefinition reference (default: default/lan10g) [$SPAWN_HARVESTER_NAD]")
+	cmd.Flags().IntVar(&spawnHarvesterDefaultVCPUs, "spawn-harvester-default-vcpus", 0, "Per-VM vCPU count (default: 2) [$SPAWN_HARVESTER_DEFAULT_VCPUS]")
+	cmd.Flags().IntVar(&spawnHarvesterDefaultMemMi, "spawn-harvester-default-mem-mi", 0, "Per-VM memory in MiB (default: 4096) [$SPAWN_HARVESTER_DEFAULT_MEM_MI]")
+	cmd.Flags().IntVar(&spawnHarvesterDefaultDiskGi, "spawn-harvester-default-disk-gi", 0, "Per-VM OS disk in GiB (default: 20) [$SPAWN_HARVESTER_DEFAULT_DISK_GI]")
+	cmd.Flags().StringVar(&spawnHarvesterSSHUser, "spawn-harvester-ssh-user", os.Getenv("SPAWN_HARVESTER_SSH_USER"), "Cloud-init-provisioned SSH user inside the VM (default: agent, matching the spawn pod's uid-1000 user for home-parity) [$SPAWN_HARVESTER_SSH_USER]")
+
+	// Service management subcommands.
+	cmd.AddCommand(
+		newHudInstallCmd(),
+		newHudUninstallCmd(),
+		newHudStartCmd(),
+		newHudStopCmd(),
+		newHudStatusCmd(),
+	)
 
 	return cmd
 }

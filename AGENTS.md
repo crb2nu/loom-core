@@ -26,17 +26,20 @@ gitlab.flexinfer.ai/
 
 Deployment (GitOps)
 
-MCP servers can be deployed to Kubernetes via Flux. Manifests live in:
+MCP servers deploy to Kubernetes via Flux. Manifests live in this repo:
 
-- `platform/gitops/k3s/mcp-hub/servers/` - Individual MCP server deployments
+- `k8s/base/` - All server deployment manifests (47 servers)
+- `k8s/base/kustomization.yaml` - Shared kustomize patches (JSON logging, OTel export for all `component=mcp-server` deployments)
+- `platform/gitops/clusters/k3s/flux-system/kustomization-loom-hub-servers.yaml` - Image tags, node affinity
 
-To deploy an MCP server:
+The base kustomization injects `MCP_LOG_FORMAT=json` and `OTEL_EXPORTER_OTLP_ENDPOINT` (Langfuse in-cluster) into all MCP server pods. Keep cross-cutting env vars in `k8s/base/kustomization.yaml` patches to avoid drift across repos.
 
-1. Build binaries: `make build`
-2. Build container: `docker build -t registry.harbor.lan/library/loom:TAG .`
-3. Push to Harbor
-4. Update image tag in `platform/gitops/k3s/mcp-hub/servers/<server>/`
-5. Commit and push to `platform/gitops`
+To deploy: `make deploy` (builds, pushes, updates image tag in gitops, reconciles Flux)
+
+To update images only: `make deploy-update-images` (updates single Flux Kustomization CRD)
+
+To add a new server: create `k8s/base/servers/<name>/` with deployment.yaml, configmap.yaml, service.yaml,
+then add to `k8s/base/kustomization.yaml` and `k8s/base/servers/gateway/registry-configmap.yaml`.
 
 Local Usage
 
@@ -47,10 +50,13 @@ The CLI and daemon typically run on developer machines:
 make build
 
 # Generate MCP configs for all targets
-./bin/loom generate configs --target all
+./bin/loom generate configs --target all --hub-mode
 
 # Sync configs to home directory
-./bin/loom sync all --regen
+for profile in vscode antigravity codex claude gemini kilocode; do
+  ./bin/loom sync "$profile" --regen --hub-mode --all-projects --skip-worktrees
+done
+./bin/loom sync skills all
 
 # Start daemon (manages MCP server processes)
 ./bin/loomd
@@ -79,7 +85,7 @@ make dev-reload
 Both targets execute the same pipeline:
 1. Build `loom` + `loomd` binaries
 2. Atomic install to `~/.local/bin` (no window where binaries are missing)
-3. Regenerate + sync platform configs (`loom sync all --regen --loom-mode`)
+3. Regenerate + sync platform configs (hub mode + all projects, skipping `.worktrees/`)
 4. Restart daemon (`dev-upgrade` skips if busy; `dev-reload` always restarts)
 5. Restart HUD if running on port 3333
 6. Smoke test (proxy initialize round-trip)
@@ -104,11 +110,13 @@ make bootstrap-local    # Build + install + sync + environment check
 ### Individual platform config sync
 
 ```bash
-loom sync claude --regen      # Regenerate .claude/mcp.json + .claude/settings.json
-loom sync codex --regen       # Regenerate .codex/config.toml
-loom sync gemini --regen      # Regenerate .gemini/config.toml + .gemini/settings.json
-loom sync zed --regen         # Regenerate .zed/mcp.json
-loom sync all --regen         # All platforms at once
+loom sync claude --regen --hub-mode --all-projects --skip-worktrees
+loom sync codex --regen --hub-mode --all-projects --skip-worktrees
+loom sync gemini --regen --hub-mode --all-projects --skip-worktrees
+loom sync vscode --regen --hub-mode --all-projects --skip-worktrees
+loom sync antigravity --regen --hub-mode --all-projects --skip-worktrees
+loom sync kilocode --regen --hub-mode --all-projects --skip-worktrees
+loom sync skills all
 ```
 
 ### Platform permissions
@@ -126,6 +134,23 @@ The daemon includes a HealthMonitor that:
 - Auto-restarts failed servers with exponential backoff
 - Tracks uptime, restart counts, and error messages
 - Exposes status via `/health` HTTP endpoint and `loom/health` IPC
+
+### OTel Status
+
+The daemon reports observability configuration via `loom/otel-status` IPC.
+Resolution order for the OTLP endpoint:
+1. `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable
+2. `otel.endpoint` in `~/.config/loom/config.yaml`
+
+Example `config.yaml`:
+```yaml
+otel:
+  endpoint: "https://langfuse.flexinfer.ai/api/public/otel"
+  protocol: "http"
+  service_name: "loomd"
+```
+
+The companion app and HUD read this to display OTel on/off status.
 
 ### SSH Tunnel Management
 
@@ -182,7 +207,7 @@ The `mcp-agent-context` server provides persistent memory for AI agents across s
 ```
 1. agent_presence_register(agent_id="claude-1", agent_type="claude-code", description="Working on auth")
 2. agent_session_start(namespace="project/feature-x")
-3. agent_context_recall_enhanced(query="previous work on this feature")
+3. agent_recall(query="previous work on this feature", scope="context")
 4. agent_task_add(tasks=[{title: "...", context: "...", priority: "high", file_path: "..."}])
 5. agent_task_update(task_id="...", status="in_progress")
 6. agent_context_add(entries=[{entry_type: "decision", title: "...", content: "..."}])
@@ -202,19 +227,14 @@ The `mcp-agent-context` server provides persistent memory for AI agents across s
 #### Context Storage
 | Tool | Description |
 |------|-------------|
-| `agent_context_add` | Add entries (file_read, decision, finding, etc.). |
-| `agent_context_get` | Retrieve entries by ID. |
-| `agent_context_delete` | Delete entries (requires confirm=true). |
+| `agent_context_add` | Add entries (file_read, decision, finding, annotation, code_context, ...). |
 | `agent_context_summarize` | Generate summary of session context. |
-| `agent_context_link_codebase` | Link to codebase-memory entries. |
-| `agent_context_stats` | Get storage statistics. |
 
 #### Context Retrieval
 | Tool | Description |
 |------|-------------|
 | `agent_context_search` | Semantic search across entries. |
-| `agent_context_recall` | Token-efficient retrieval (prioritizes decisions/summaries). |
-| `agent_context_recall_enhanced` | Enhanced recall with tasks, recency weighting, symbol context. |
+| `agent_recall` | Unified recall across context/memory/graph (`scope=context|memory|graph|all`). |
 
 #### Task Tracking
 | Tool | Description |
@@ -222,26 +242,33 @@ The `mcp-agent-context` server provides persistent memory for AI agents across s
 | `agent_task_add` | Add tasks with priority, context, file_path, line_number, tags, blocked_by. |
 | `agent_task_update` | Update status (pending/in_progress/completed/blocked) with resolution. |
 | `agent_task_list` | List tasks, filter by status. |
+| `agent_task_delete` | Delete tasks (requires confirm=true). |
+| `agent_task_dispatch` | Route a task to a capable, present agent (see `mcp/context/agent-capabilities.yaml`). |
 
 #### Code Annotations
-| Tool | Description |
-|------|-------------|
-| `agent_code_annotate` | Create annotation at file:line (todo, fixme, bug, etc.). |
-| `agent_code_annotations_get` | Get annotations for file/range. |
+
+There are no dedicated annotation tools. Write annotations with
+`agent_context_add` using `entry_type="annotation"` plus `annotation_type`,
+`file_path`, `line_start`, and `symbol`; read them back with
+`agent_context_search`.
 
 #### Cross-Agent Coordination
 | Tool | Description |
 |------|-------------|
-| `agent_context_share` | Share entries with other agents. |
-| `agent_context_query_shared` | Query context shared by others. |
 | `agent_handoff_create` | Create handoff package (full, selective, summary_only). |
 | `agent_handoff_accept` | Accept handoff, optionally import entries. |
+| `agent_handoff_inbox` / `agent_handoff_reject` | Inspect and decline pending handoffs. |
+| `agent_message_send` / `agent_message_inbox` | Direct agent-to-agent messages. |
+| `agent_vendor_session_list` / `agent_vendor_session_search` | Read other vendors' local CLI transcripts. |
 
-#### Templates
-| Tool | Description |
-|------|-------------|
-| `agent_template_create` | Create reusable session template. |
-| `agent_template_list` | List available templates. |
+> **Removed surface.** `agent_context_get/delete/share/query_shared/stats/link_codebase`,
+> `agent_code_annotate(_get)`, `agent_context_recall(_enhanced|_since)`,
+> `agent_memory_recall`, `agent_memory_promote/demote/compress/merge/policy_set/export/import`,
+> `agent_recipe_*`, `agent_template_*`, `agent_compaction_*`, `agent_reconcile_trigger`,
+> `agent_graph_find_path`, `agent_reasoning_chain_*`, and
+> `agent_worktree_status/cleanup/reconcile` are **not** registered. Do not add them
+> back to an `always_allow` list — `cmd/mcp-agent-context` has a drift test
+> (`TestRegistryAlwaysAllow_MatchesRegisteredTools`) that fails on stale entries.
 
 ### Entry Types
 
@@ -263,11 +290,49 @@ The `mcp-agent-context` server provides persistent memory for AI agents across s
 4. **Add tasks as you discover them**: Track TODOs/FIXMEs in the task system
 5. **End sessions with summary**: Generates compressed context for future recall
 
+## Contract Tests (Golden Files)
+
+Golden-file tests in `internal/contracts/` guard API response shapes consumed by
+sibling repos (loom VS Code extension, loom-zed). Run them with:
+
+```bash
+make ci-contracts                                    # Verify golden files match (CI mode)
+go test ./internal/contracts/... -update-golden       # Accept intentional changes
+```
+
+Any golden file diff in a MR signals a contract change — review it and notify
+sibling consumers. See `docs/CONTRACT_TESTING.md` for the full workflow.
+
+## Changelog Entries (write a fragment, do NOT edit CHANGELOG.md)
+
+Do **not** edit `CHANGELOG.md`'s `## [Unreleased]` section directly — concurrent
+MRs all editing it collide (GitLab flags a server-side conflict and drops
+auto-merge; the union merge driver only exists client-side). Instead, every MR
+that needs a changelog entry adds a **per-MR fragment file**:
+
+```
+changelog.d/<slug>.<category>.md
+```
+
+- `<category>` ∈ `added|changed|deprecated|removed|fixed|security` (Keep a Changelog).
+- `<slug>` is unique per MR — use the branch name (e.g. `changelog-fragments`) or
+  a `date-topic` string. Unique slugs are what keep two MRs from colliding.
+- The file body is the markdown bullet exactly as it should appear in `CHANGELOG.md`
+  (start with `- `; multi-line bullets are fine).
+
+A fragment **satisfies the docs guardrail** (`scripts/ci/check_docs_guardrails.sh`
+and the Mills `docs_guardrail` gate both accept `changelog.d/*.md`), so a
+code-facing MR that adds a fragment passes CI without touching `CHANGELOG.md`.
+Validate with `make changelog-check`. Fragments are folded into `CHANGELOG.md` at
+release time via `make changelog-fold` (assembler: `scripts/changelog/`). This
+applies to human, AI, and Mills-authored changes alike. See
+[`changelog.d/README.md`](changelog.d/README.md) and `docs/DOCS_MAINTENANCE.md`.
+
 Code Style
 
 - Run `golangci-lint run` before committing
 - Run `go test ./...` to verify changes
-- In restricted/sandboxed environments, prefer `make test-sandbox` to force `GOCACHE`/`GOMODCACHE` into `/tmp`.
+- In restricted/sandboxed environments, prefer `make test-sandbox`, then run `../../bin/workspace-clean --tmp-agent` to clear temporary Go caches.
 - Keep MCP server implementations in `cmd/mcp-*/main.go`
 - Shared non-server utilities live under `pkg/` (configs, registry, profiles, sync, validation)
 
@@ -429,6 +494,71 @@ The middleware automatically:
 - Records errors and sets span status on failure
 - Compatible with Jaeger, Langfuse, and any OTLP-compatible collector
 
+In k8s, `OTEL_EXPORTER_OTLP_ENDPOINT` is injected into all MCP server pods via the kustomize patch in `k8s/base/kustomization.yaml`. Locally, the daemon reads `otel.endpoint` from `~/.config/loom/config.yaml` as a fallback (see Daemon Features → OTel Status above).
+
+### `pkg/journalengine` - Long-Context Agent Memory
+```go
+import "github.com/crb2nu/loom/pkg/journalengine"
+
+j := journalengine.New("agent-id", nil)
+j.RecordTurn(epoch, situation, journalengine.SortedUtterances(inbox), reply)
+prefix := systemPrompt + "\n\n" + j.Render()   // byte-stable, cacheable
+prompt := prefix + "\n\n" + nowBlock           // volatile: only this is cold
+
+// Reclaim budget instead of stopping. The LLM call stays on your side of the
+// Consolidator interface; a failure leaves the journal completely untouched.
+if j.NeedsConsolidation(budgetTokens, 0.9) {
+    _, dropped, err := journalengine.Consolidate(ctx, j, myConsolidator, 0.5)
+}
+
+j.Ledger().Calibrate(len(prompt), usage.PromptTokens) // self-correcting estimate
+snapshot := j.Snapshot()                              // durable, JSON-safe
+```
+
+Append-only memory whose render is a strict prefix of the next render, so the
+serving engine's prefix cache turns a deep prompt into a per-turn delta
+(measured 79.3% hit rate, warm repeats 99% cached at 7-14x). Assert the contract
+in your own tests with `journalengine.CheckPrefixExtension(earlier, later)` — the
+failure mode is silent and just gets expensive.
+
+Complements `pkg/agentloop` rather than replacing it: agentloop is a bounded
+ReAct tool loop that stops when the budget would overflow; journalengine is for
+agents that outlive their window and must distil instead of stop. **Staged, not
+wired** — see `docs/JOURNAL_ENGINE.md` for the adoption plan.
+
+### `pkg/llmusage` - Completion Token Accounting
+
+```go
+import "github.com/crb2nu/loom/pkg/llmusage"
+
+// Parse the cached share of a prompt, whichever dialect the lane speaks.
+type usage struct {
+    PromptTokens        int              `json:"prompt_tokens"`
+    PromptTokensDetails llmusage.Details `json:"prompt_tokens_details"`  // chat completions
+    InputTokensDetails  llmusage.Details `json:"input_tokens_details"`   // responses API
+}
+cached := llmusage.CachedTokens(u.PromptTokensDetails, u.InputTokensDetails)
+
+// Emit it. Sink is optional — nil for components with no metrics registry.
+obs := llmusage.Observer{Logger: logger, Component: "my-caller", Sink: myMetrics}
+obs.Observe(ctx, servedModel, llmusage.Usage{PromptTokens: …, CachedPromptTokens: cached})
+
+// One client, several callers: narrow the label at the call site.
+ctx = llmusage.WithComponent(ctx, "mills-judge")
+```
+
+Read-only observation of `usage.prompt_tokens_details.cached_tokens` on every
+OpenAI-compatible completion, so the prefix-cache question can be settled from
+loom-core's own traffic instead of psyche's numbers. **Every new chat client
+should route its usage block through this** — one log message (`llm usage`), one
+set of field names, one place to fix a wrong JSON tag.
+
+A zero cached count means "the engine did not report it" as often as it means
+"nothing hit"; the API keeps the two distinguishable (`CachedShare()` returns
+`-1` for unknown, log fields are omitted rather than zeroed). Do not collapse
+them. See `docs/JOURNAL_ENGINE.md` → "Reading the cache data" for the log/metric
+queries and what a healthy warm share looks like.
+
 Agent Tips
 
 - Tool-call deadlines: many clients time out around ~60s; prefer bounded operations and use `tail` for logs.
@@ -447,11 +577,12 @@ Agent Tips
 
 - Pre-existing uncommitted/untracked files are baseline context, not an automatic blocker.
 - Continue on the current branch/worktree by default.
+- Before creating another multi-file worktree, inspect existing linked trees with `git worktree list` or `workspace-clean --report --worktrees`.
 - Stage and commit only files intentionally changed for the active task.
 - Escalate only when new unexpected changes appear in files you are editing, or when a branch/worktree switch is explicitly requested.
 - Dirty-worktree mode: `continue_scoped_commits`.
 
 Canonical nudge for CLI hooks:
-> Dirty worktree detected. Treat pre-existing changes as baseline context, continue work, and stage/commit only files for the active task. Escalate only if new unexpected changes appear in files you are editing.
+> Dirty worktree detected. Treat pre-existing changes as baseline context, continue work, and stage/commit only files for the active task. Before creating another multi-file worktree, inspect existing linked trees with git -C <repo> worktree list or workspace-clean --report --worktrees. For multi-file work, create repo-local linked trees under <repo>/.worktrees/<branch>; do not create sibling repos under services/, libs/, labs/, or the workspace root. Escalate only if new unexpected changes appear in files you are editing.
 
 <!-- END LOOM:AGENT-SAFETY -->

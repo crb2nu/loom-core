@@ -1,0 +1,1 @@
+- Add a fail-closed non-empty MR gate in `pkg/mills/gates/nonempty_mr.go` and distinct `no_diff`/`branch_unpushed` pipeline classifications in `pkg/mills/pipeline/states.go`; unavailable forge evidence now blocks merging.

@@ -1,0 +1,1 @@
+- Classify structured GitLab `runner_system_failure` CI job-death signatures as transient and retryable in `pkg/mills/pipeline/classifier.go`, with focused incident and near-miss coverage in `pkg/mills/pipeline/classifier_test.go`.

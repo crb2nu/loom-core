@@ -13,11 +13,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/strutil"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -39,6 +41,23 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(
+		ctx, "mcp-tavily",
+
+		logger,
+	)
+	if err !=
+		nil {
+		logger.Warn("OTel tracer init failed",
+
+			"error",
+			err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+
+	tracer := mcpotel.Tracer(tp, "mcp-tavily")
 
 	apiKey := os.Getenv("TAVILY_API_KEY")
 	if apiKey == "" {
@@ -61,6 +80,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-tavily", "version", version)
 
 	server := mcp.NewServer("mcp-tavily", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Fast Go-native Tavily AI search MCP server. Web search, news search, and content extraction.")
 
 	// search
@@ -103,9 +123,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"query"},
 		},
-	}, tav.handleSearch)
+	}, mcpotel.TracedToolHandler(
 
-	// search_news
+		// search_news
+		tracer, "search", tav.handleSearch))
+
 	server.AddTool(mcp.Tool{
 		Name:        "search_news",
 		Description: "Search for recent news articles using Tavily AI",
@@ -127,9 +149,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"query"},
 		},
-	}, tav.handleSearchNews)
+	}, mcpotel.TracedToolHandler(
 
-	// extract
+		// extract
+		tracer, "search_news", tav.handleSearchNews))
+
 	server.AddTool(mcp.Tool{
 		Name:        "extract",
 		Description: "Extract content from URLs using Tavily AI",
@@ -144,9 +168,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"urls"},
 		},
-	}, tav.handleExtract)
+	}, mcpotel.TracedToolHandler(
 
-	// search_context
+		// search_context
+		tracer, "extract", tav.handleExtract))
+
 	server.AddTool(mcp.Tool{
 		Name:        "search_context",
 		Description: "Get search results optimized for LLM context (returns more content)",
@@ -168,7 +194,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"query"},
 		},
-	}, tav.handleSearchContext)
+	}, mcpotel.TracedToolHandler(tracer, "search_context", tav.handleSearchContext))
 
 	return server.Run(ctx)
 }

@@ -1,0 +1,1 @@
+- Classify ClickHouse MergeTree merge-task failures, Langfuse Redis connection refusals, and Longhorn replica-scheduling failures as external dependency incidents in `pkg/mills/intake/signals.go`, with regression coverage in `pkg/mills/intake/signals_test.go`.

@@ -1,14 +1,15 @@
-<script>
+<script lang="ts">
+  import type { ToastType } from '../stores/toasts.svelte.ts';
   import { toastStore } from '../stores/toasts.svelte.ts';
 
-  const typeColors = {
+  const typeColors: Record<ToastType, string> = {
     info: 'var(--info)',
     success: 'var(--success)',
     warning: 'var(--warning)',
     error: 'var(--error)',
   };
 
-  const typeIcons = {
+  const typeIcons: Record<ToastType, string> = {
     info: 'ℹ',
     success: '✓',
     warning: '⚠',
@@ -16,31 +17,36 @@
   };
 </script>
 
-{#if toastStore.items.length > 0}
-  <div class="toast-container">
-    {#each toastStore.items as toast (toast.id)}
-      <div
-        class="toast"
-        style="border-left-color: {typeColors[toast.type]};"
-        role="alert"
-      >
-        <span class="toast-icon" style="color: {typeColors[toast.type]};">{typeIcons[toast.type]}</span>
-        <span class="toast-message">{toast.message}</span>
-        <button class="toast-dismiss" onclick={() => toastStore.dismiss(toast.id)}>✕</button>
-      </div>
-    {/each}
-  </div>
-{/if}
+<!-- Persistent live region: always in the DOM so screen readers announce
+     toasts as they are added (polite, additions only). -->
+<div class="toast-container" role="status" aria-live="polite" aria-atomic="false">
+  {#each toastStore.items as toast (toast.id)}
+    <div
+      class="toast"
+      style="border-left-color: {typeColors[toast.type]};"
+    >
+      <span class="toast-icon" style="color: {typeColors[toast.type]};">{typeIcons[toast.type]}</span>
+      <span class="toast-message">{toast.message}</span>
+      <button class="toast-dismiss" aria-label="Dismiss notification" onclick={() => toastStore.dismiss(toast.id)}>✕</button>
+    </div>
+  {/each}
+</div>
 
 <style>
   .toast-container {
     position: fixed;
-    top: 52px;
+    top: var(--header-height);
     right: 16px;
     display: flex;
     flex-direction: column;
     gap: 8px;
-    z-index: 1000;
+    /* Toasts are the topmost transient layer: they must render ABOVE every
+       modal dialog (backdrops are z-index 9999 — SpinPlanDialog,
+       PlanDispatchDialog, BootstrapRepoDialog, ConfirmDialog) and the noise
+       grain overlay (body::after, 10000). At the old z-index 1000 an error
+       toast fired from an open dialog rendered BEHIND the dialog, so the user
+       never saw it (e.g. a failed "Spin up a repo"). */
+    z-index: 10001;
     pointer-events: none;
   }
   .toast {

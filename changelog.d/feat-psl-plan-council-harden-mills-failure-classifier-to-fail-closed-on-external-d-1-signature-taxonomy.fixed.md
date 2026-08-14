@@ -1,0 +1,1 @@
+- Add a fail-closed external-dependency signature taxonomy in `pkg/mills/guard/classifier.go` and apply it at the Mills intake boundary in `pkg/mills/intake/intake.go`.

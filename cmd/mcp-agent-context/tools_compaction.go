@@ -10,11 +10,12 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-func registerCompactionTools(server *mcp.Server, svc *agentcontext.Service, tracer trace.Tracer) {
-	// =========================================================================
-	// Compaction Tools
-	// =========================================================================
-
+// NOTE: agent_compaction_trigger and agent_reconcile_trigger removed in
+// SIMP-6. Background schedulers continue running automatically; manual
+// triggering is available via CLI: loom agent compaction / reconcile.
+// agent_compaction_status was re-registered: the HUD memory panel compaction
+// tile calls it over MCP.
+func registerCompactionTools(server *mcp.Server, svc *agentcontext.Service, _ trace.Tracer) {
 	server.AddTool(mcp.Tool{
 		Name:        "agent_compaction_status",
 		Description: "Get compaction scheduler status and last run statistics.",
@@ -25,26 +26,4 @@ func registerCompactionTools(server *mcp.Server, svc *agentcontext.Service, trac
 	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		return svc.HandleCompactionStatus(ctx, args)
 	})
-
-	server.AddTool(mcp.Tool{
-		Name:        "agent_compaction_trigger",
-		Description: "Manually trigger a compaction cycle. Returns statistics about what was processed.",
-		InputSchema: mcp.InputSchema{
-			Type:       "object",
-			Properties: map[string]any{},
-		},
-	}, traced(tracer, "agent_compaction_trigger", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-		return svc.HandleCompactionTrigger(ctx, args)
-	}))
-
-	server.AddTool(mcp.Tool{
-		Name:        "agent_reconcile_trigger",
-		Description: "Manually trigger a task reconciliation cycle. Runs GC, orphan cleanup, auto-unblock, and stale detection.",
-		InputSchema: mcp.InputSchema{
-			Type:       "object",
-			Properties: map[string]any{},
-		},
-	}, traced(tracer, "agent_reconcile_trigger", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-		return svc.HandleReconcileTrigger(ctx, args)
-	}))
 }

@@ -1,0 +1,1 @@
+- Route classifier-tagged external-dependency failures out of the code escalation class and expose the bounded `external_dependency` bucket in pipeline KPI telemetry (`pkg/mills/pipeline/escalate.go`, `pkg/mills/pipeline/runner.go`, and `pkg/telemetry/metrics.go`).

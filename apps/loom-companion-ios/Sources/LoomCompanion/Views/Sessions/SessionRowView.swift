@@ -1,0 +1,164 @@
+import SwiftUI
+import LoomCompanionKit
+
+struct SessionRowView: View {
+    let session: SessionInfo
+    var depth: Int = 0
+    var childCount: Int = 0
+    var activeChildCount: Int = 0
+    var isOrphan: Bool = false
+
+    private var isLive: Bool { session.status == .active }
+    private var isChild: Bool { depth > 0 || session.parentSessionId != nil }
+
+    private var subtitle: String {
+        // Compose one scannable context line: namespace · description (if present)
+        if session.description.isEmpty {
+            return session.namespace
+        }
+        return "\(session.namespace) · \(session.description)"
+    }
+
+    /// Choose the single most actionable metric to surface on the right.
+    /// Live sessions highlight token count (active work indicator).
+    /// Terminal sessions show start time for recency scanning.
+    @ViewBuilder
+    private var primaryMetric: some View {
+        if isLive {
+            LoomRowMetric(
+                LoomFormat.compact(session.totalTokens),
+                unit: nil,
+                color: LoomColors.statusHealthy
+            )
+        } else {
+            LoomRowMetric(
+                LoomFormat.relativeCompact(fromISO: session.startedAt),
+                color: LoomColors.textTertiary
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var footerPills: some View {
+        if isLive {
+            LoomPill(
+                "live",
+                icon: "bolt.fill",
+                color: LoomColors.statusActive,
+                weight: .micro
+            )
+        }
+        LoomPill(
+            hierarchyLabel,
+            icon: hierarchyIcon,
+            color: hierarchyColor,
+            style: .outlined,
+            weight: .micro
+        )
+        if childCount > 0 {
+            LoomPill(
+                "\(activeChildCount)/\(childCount) child active",
+                icon: "point.3.connected.trianglepath.dotted",
+                color: LoomColors.statusInfo,
+                style: .outlined,
+                weight: .micro
+            )
+        }
+        LoomPill(
+            "\(session.entryCount) entries",
+            icon: "doc.text",
+            color: LoomColors.accent,
+            style: .outlined,
+            weight: .micro
+        )
+        if !isLive {
+            LoomPill(
+                LoomFormat.compact(session.totalTokens),
+                color: LoomColors.textSecondary,
+                style: .outlined,
+                weight: .micro
+            )
+        }
+    }
+
+    var body: some View {
+        LoomListRow(
+            accentColor: LoomColors.sessionStatusColor(session.status),
+            title: session.agentId,
+            subtitle: subtitle,
+            isLive: isLive,
+            emphasizeTitle: isLive,
+            leading: {
+                LoomRowIcon(
+                    systemName: LoomColors.agentTypeIcon(session.agentId),
+                    color: LoomColors.agentTypeColor(session.agentId)
+                )
+            },
+            trailing: { primaryMetric },
+            footer: { footerPills }
+        )
+        .padding(.leading, CGFloat(min(depth, 3)) * 18)
+        .loomShareContextMenu(.session(id: session.id))
+    }
+
+    private var hierarchyLabel: String {
+        if isOrphan { return "orphan" }
+        if isChild { return "child" }
+        if childCount > 0 { return "root" }
+        return "session"
+    }
+
+    private var hierarchyIcon: String {
+        if isOrphan { return "questionmark.folder" }
+        if isChild { return "arrow.turn.down.right" }
+        if childCount > 0 { return "point.3.connected.trianglepath.dotted" }
+        return "circle"
+    }
+
+    private var hierarchyColor: Color {
+        if isOrphan { return LoomColors.statusDegraded }
+        if isChild { return LoomColors.statusInfo }
+        if childCount > 0 { return LoomColors.accent }
+        return LoomColors.textSecondary
+    }
+}
+
+#Preview("SessionRowView · states") {
+    VStack(spacing: 0) {
+        SessionRowView(session: SessionInfo(
+            id: "s1",
+            agentId: "claude-code",
+            namespace: "services/loom-core",
+            status: .active,
+            description: "Frontend UX craft slice 1",
+            startedAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(-420)),
+            entryCount: 42,
+            totalTokens: 12_400
+        ))
+        Divider().overlay(LoomColors.border)
+        SessionRowView(session: SessionInfo(
+            id: "s2",
+            agentId: "codex",
+            namespace: "platform/gitops",
+            status: .summarized,
+            description: "Reconcile Flux drift",
+            startedAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(-7200)),
+            entryCount: 18,
+            totalTokens: 3_200
+        ))
+        Divider().overlay(LoomColors.border)
+        SessionRowView(session: SessionInfo(
+            id: "s3",
+            agentId: "gemini",
+            namespace: "libs/svg-sdk",
+            status: .ended,
+            description: "",
+            startedAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(-86_400)),
+            entryCount: 5,
+            totalTokens: 820
+        ))
+    }
+    .padding(.horizontal, 12)
+    .background(LoomColors.bgPrimary)
+    .preferredColorScheme(.dark)
+}

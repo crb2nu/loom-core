@@ -1,0 +1,1 @@
+- Add transient intake retry classification in `pkg/mills/pipeline/retry.go` with default-two bounded auto-requeues and explicit `auto_requeues` / `retry_cost_usd` run accounting in `pkg/mills/store/run_state.go`.

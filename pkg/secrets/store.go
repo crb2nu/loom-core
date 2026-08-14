@@ -4,6 +4,8 @@
 package secrets
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -27,6 +29,13 @@ type Backend interface {
 
 	// ReadOnly returns true if this backend doesn't support writes.
 	ReadOnly() bool
+}
+
+// ContextBackend is the optional cancellation-aware read extension for a
+// Backend. Backends that perform external I/O should implement it; in-memory
+// and legacy backends continue to work through Backend.Get.
+type ContextBackend interface {
+	GetContext(ctx context.Context, key string) (string, error)
 }
 
 // ErrNotFound is returned when a secret is not found in any backend.
@@ -66,12 +75,38 @@ func NewManager(backends ...Backend) *Manager {
 // Get retrieves a secret, searching backends in priority order.
 // Returns the value and which backend it came from.
 func (m *Manager) Get(key string) (string, string, error) {
+	return m.GetContext(context.Background(), key)
+}
+
+// GetContext retrieves a secret while allowing subprocess-backed stores to be
+// canceled. Backends without ContextBackend retain their synchronous behavior.
+func (m *Manager) GetContext(ctx context.Context, key string) (string, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	for _, b := range m.backends {
-		val, err := b.Get(key)
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
+		var (
+			val string
+			err error
+		)
+		if contextual, ok := b.(ContextBackend); ok {
+			val, err = contextual.GetContext(ctx, key)
+		} else {
+			val, err = b.Get(key)
+		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				if contextErr := ctx.Err(); contextErr != nil {
+					return "", "", contextErr
+				}
+				return "", "", err
+			}
 			continue // Try next backend
 		}
 		if val != "" {
@@ -86,6 +121,12 @@ func (m *Manager) Get(key string) (string, string, error) {
 func (m *Manager) GetValue(key string) string {
 	val, _, _ := m.Get(key)
 	return val
+}
+
+// GetValueContext is the cancellation-aware form of GetValue.
+func (m *Manager) GetValueContext(ctx context.Context, key string) (string, error) {
+	val, _, err := m.GetContext(ctx, key)
+	return val, err
 }
 
 // Set stores a secret in the primary backend.
@@ -155,6 +196,18 @@ func (m *Manager) PrimaryBackend() Backend {
 // 2. macOS Keychain (if available)
 // 3. Encrypted file store (fallback, writable)
 func DefaultManager() (*Manager, error) {
+	return DefaultManagerContext(context.Background())
+}
+
+// DefaultManagerContext creates the default manager while allowing
+// subprocess-backed backend discovery and file-key setup to be canceled.
+func DefaultManagerContext(ctx context.Context) (*Manager, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var backends []Backend
 
 	// Environment variables - highest priority, allows runtime override
@@ -166,13 +219,21 @@ func DefaultManager() (*Manager, error) {
 	}
 
 	// 1Password CLI - if configured (uses default vault)
-	if op, err := NewOnePasswordBackend(""); err == nil {
+	if op, err := NewOnePasswordBackendContext(ctx, ""); err == nil {
 		backends = append(backends, op)
+	} else if contextErr := ctx.Err(); contextErr != nil {
+		return nil, contextErr
 	}
 
 	// Encrypted file store - fallback
-	if fb, err := NewFileBackend(""); err == nil {
+	if fb, err := NewFileBackendContext(ctx, ""); err == nil {
 		backends = append(backends, fb)
+	} else if contextErr := ctx.Err(); contextErr != nil {
+		return nil, contextErr
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	if len(backends) == 0 {

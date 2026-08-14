@@ -1,0 +1,1 @@
+- Add a behavior-neutral pipeline concurrency policy knob and supervision wiring in `pkg/policy/policy.go`, `pkg/mills/pipeline/pipeline.go`, and `internal/loomconcurrency/limit.go`; the default remains 8 pending the gated S2 soak follow-up.

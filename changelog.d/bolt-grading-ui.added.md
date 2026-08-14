@@ -1,0 +1,1 @@
+- Add one-tap keep, meh, and regret grading with optional notes to the HUD Bolt Archive and Shift Report, backed by the admin-gated Mills grade proxy.

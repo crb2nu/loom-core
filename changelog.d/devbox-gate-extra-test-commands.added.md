@@ -1,0 +1,1 @@
+- Add declared test-command execution to the devbox quality gate with cold-cache-safe Go sandbox settings (`cmd/mcp-devbox`).

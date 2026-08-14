@@ -52,6 +52,22 @@ func initTestRepo(t *testing.T) string {
 	return dir
 }
 
+// gitRun runs a raw git command in dir, failing the test on error.
+func gitRun(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.CommandContext(context.Background(), "git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(sanitizedGitEnv(os.Environ()),
+		"GIT_AUTHOR_NAME=Test",
+		"GIT_AUTHOR_EMAIL=test@test.com",
+		"GIT_COMMITTER_NAME=Test",
+		"GIT_COMMITTER_EMAIL=test@test.com",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %s\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
 func withPath(path string, args map[string]any) map[string]any {
 	out := make(map[string]any, len(args)+1)
 	for k, v := range args {
@@ -214,6 +230,73 @@ func TestHandleGitBranch(t *testing.T) {
 			t.Errorf("expected main branch, got: %s", text)
 		}
 	})
+}
+
+func TestHandleGitBranch_ListsNonCurrentBranches(t *testing.T) {
+	dir := initTestRepo(t)
+	gitRun(t, dir, "branch", "dev")       // local, no upstream
+	gitRun(t, dir, "branch", "feature/x") // local, no upstream
+
+	result, err := handleGitBranch(context.Background(), withPath(dir, map[string]any{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success, got error: %v", result.Content)
+	}
+	text := result.Content[0].Text
+	// Regression: upstream-less non-current branches used to be dropped by the
+	// strings.Fields parse that collapsed the %(HEAD) space column.
+	for _, want := range []string{"main", "dev", "feature/x"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected branch %q in output, got: %s", want, text)
+		}
+	}
+}
+
+func TestHandleGitBranch_RejectsOptionInjection(t *testing.T) {
+	dir := initTestRepo(t)
+	for _, field := range []string{"create", "delete"} {
+		result, err := handleGitBranch(context.Background(), withPath(dir, map[string]any{
+			field: "--force",
+		}))
+		if err != nil {
+			t.Fatalf("%s: unexpected Go error: %v", field, err)
+		}
+		if result == nil || !result.IsError {
+			t.Fatalf("%s: expected error result for option-like value, got %+v", field, result)
+		}
+	}
+}
+
+func TestHandleGitDiff_RejectsOptionInjection(t *testing.T) {
+	dir := initTestRepo(t)
+	sentinel := filepath.Join(t.TempDir(), "pwned")
+	result, err := handleGitDiff(context.Background(), withPath(dir, map[string]any{
+		"commit": "--output=" + sentinel,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("expected error result for option-like commit, got %+v", result)
+	}
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		t.Fatalf("option injection wrote %s — guard failed", sentinel)
+	}
+}
+
+func TestHandleGitCheckout_RejectsOptionInjection(t *testing.T) {
+	dir := initTestRepo(t)
+	result, err := handleGitCheckout(context.Background(), withPath(dir, map[string]any{
+		"branch": "-f",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("expected error result for option-like branch, got %+v", result)
+	}
 }
 
 func TestHandleGitShow(t *testing.T) {

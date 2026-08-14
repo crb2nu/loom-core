@@ -1,0 +1,1 @@
+- Bound merged-work semantic similarity embedding calls and verify the batch-document fallback telemetry contract in `pkg/mills/textsim/semantic.go` and `pkg/codebase/embed/embed.go`.

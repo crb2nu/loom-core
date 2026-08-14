@@ -1,0 +1,1 @@
+- Refactor HUD spawn telemetry, session persistence, and lifecycle broadcast helpers from `internal/hud/spawn.go` into `internal/hud/spawn_telemetry.go` without changing behavior.

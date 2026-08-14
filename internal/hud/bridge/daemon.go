@@ -12,7 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -20,6 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	costpkg "github.com/crb2nu/loom/internal/visibility/contracts/cost"
+	healthpkg "github.com/crb2nu/loom/internal/visibility/contracts/health"
+	statuspkg "github.com/crb2nu/loom/internal/visibility/contracts/status"
+	"github.com/crb2nu/loom/pkg/launchctl"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 )
 
@@ -137,7 +140,7 @@ func (c *DaemonClient) maybeAutostart(err error) bool {
 		return false
 	}
 	c.lastAutostart = time.Now()
-	_ = exec.Command("launchctl", "start", "com.loom.daemon").Run() //nolint:noctx // best-effort
+	_ = launchctl.Start(context.Background(), "com.loom.daemon")
 	return true
 }
 
@@ -186,16 +189,16 @@ func (c *DaemonClient) reconnect() error {
 	return fmt.Errorf("failed to reconnect after %d attempts", maxRetries)
 }
 
-// call sends a JSON-RPC request and returns the result. It handles
+// Call sends a JSON-RPC request and returns the result. It handles
 // auto-reconnection on transport errors and circuit-breaking on downstream
 // server failures. Caller must NOT hold c.mu.
-func (c *DaemonClient) call(method string, params any) (json.RawMessage, error) {
-	return c.callOpt(method, params, 0)
+func (c *DaemonClient) Call(method string, params any) (json.RawMessage, error) {
+	return c.CallWithTimeout(method, params, 0)
 }
 
-// callOpt is like call but accepts an optional per-call timeout override.
+// CallWithTimeout is like Call but accepts an optional per-call timeout override.
 // A zero or negative timeout uses the client's default callTimeout.
-func (c *DaemonClient) callOpt(method string, params any, timeout time.Duration) (json.RawMessage, error) {
+func (c *DaemonClient) CallWithTimeout(method string, params any, timeout time.Duration) (json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -330,6 +333,10 @@ func (c *DaemonClient) CircuitOpen() bool {
 }
 
 // callLocked performs the actual send/recv. Caller must hold c.mu.
+// It skips any interleaved notifications from the daemon (e.g.
+// notifications/tools/list_changed) and matches the response ID to
+// prevent response-ordering bugs when notifications arrive between
+// a request and its response.
 func (c *DaemonClient) callLocked(method string, params any) (json.RawMessage, error) {
 	if c.transport == nil {
 		return nil, fmt.Errorf("not connected")
@@ -353,48 +360,44 @@ func (c *DaemonClient) callLocked(method string, params any) (json.RawMessage, e
 		return nil, fmt.Errorf("send: %w", err)
 	}
 
-	resp, err := c.transport.Recv(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("recv: %w", err)
-	}
+	// Read messages until we get the response matching our request ID.
+	// The daemon may send async notifications (e.g. tools/list_changed)
+	// on the same transport; skip those to avoid response mismatches.
+	idStr := fmt.Sprint(id)
+	for {
+		resp, err := c.transport.Recv(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("recv %s (id %s): %w", method, idStr, err)
+		}
 
-	if resp.Error != nil {
-		return nil, fmt.Errorf("daemon error (%d): %s", resp.Error.Code, resp.Error.Message)
-	}
+		// Skip notifications (no ID, has Method).
+		if resp.ID == nil && resp.Method != "" {
+			continue
+		}
 
-	return resp.Result, nil
+		// Match response ID to our request.
+		if fmt.Sprint(resp.ID) != idStr {
+			c.logger.Debug("skipping mismatched response",
+				"method", method, "expected_id", idStr, "got_id", fmt.Sprint(resp.ID))
+			continue
+		}
+
+		if resp.Error != nil {
+			return nil, fmt.Errorf("daemon error (%d): %s", resp.Error.Code, resp.Error.Message)
+		}
+
+		return resp.Result, nil
+	}
 }
 
 // --- Typed RPC result structs ---
 
-// StatusResult holds the response from loom/status.
-type StatusResult struct {
-	Running     bool     `json:"running"`
-	Servers     int      `json:"servers"`
-	ActiveConns int      `json:"activeConns"`
-	IdleConns   int      `json:"idleConns"`
-	Processes   []string `json:"processes"`
-}
-
-// HealthEntry describes the health of one endpoint (local or hub).
-type HealthEntry struct {
-	Healthy      bool    `json:"healthy"`
-	ConsecFails  int     `json:"consecFails"`
-	AvgLatencyMs float64 `json:"avgLatencyMs"`
-	ErrorMessage string  `json:"errorMessage,omitempty"`
-}
-
-// ServerHealth contains local and hub health plus the target.
-type ServerHealth struct {
-	Local  HealthEntry `json:"local"`
-	Hub    HealthEntry `json:"hub"`
-	Target string      `json:"target"`
-}
-
-// HealthResult holds the response from loom/health.
-type HealthResult struct {
-	Servers map[string]ServerHealth `json:"servers"`
-}
+// EPIC 2 close-out (UNIFY-1d): all bridge.* type aliases for visibility
+// contracts have been removed. Consumers (cmd/, internal/, pkg/) use the
+// canonical types in internal/visibility/contracts/{status,health,cost,
+// presence} directly. bridge.DaemonClient.CostStats() returns
+// *costpkg.CostStatsResult and bridge.AgentBridge.PresenceList() returns
+// []presencepkg.PresenceInfo.
 
 // ServerInfo describes a registered MCP server.
 type ServerInfo struct {
@@ -402,6 +405,8 @@ type ServerInfo struct {
 	Categories  []string `json:"categories,omitempty"`
 	Description string   `json:"description,omitempty"`
 	Running     bool     `json:"running"`
+	ToolCount   int      `json:"tool_count,omitempty"`
+	Transport   string   `json:"transport,omitempty"`
 }
 
 // ServersResult holds the response from loom/servers.
@@ -442,12 +447,12 @@ type CacheStatsResult struct {
 // --- Typed RPC methods ---
 
 // Status returns the daemon status.
-func (c *DaemonClient) Status() (*StatusResult, error) {
-	raw, err := c.call("loom/status", nil)
+func (c *DaemonClient) Status() (*statuspkg.DaemonRPCStatus, error) {
+	raw, err := c.Call("loom/status", nil)
 	if err != nil {
 		return nil, err
 	}
-	var result StatusResult
+	var result statuspkg.DaemonRPCStatus
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("unmarshal status: %w", err)
 	}
@@ -455,12 +460,12 @@ func (c *DaemonClient) Status() (*StatusResult, error) {
 }
 
 // Health returns the health of all servers.
-func (c *DaemonClient) Health() (*HealthResult, error) {
-	raw, err := c.call("loom/health", nil)
+func (c *DaemonClient) Health() (*healthpkg.HealthResult, error) {
+	raw, err := c.Call("loom/health", nil)
 	if err != nil {
 		return nil, err
 	}
-	var result HealthResult
+	var result healthpkg.HealthResult
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("unmarshal health: %w", err)
 	}
@@ -469,7 +474,7 @@ func (c *DaemonClient) Health() (*HealthResult, error) {
 
 // Servers returns the list of registered servers.
 func (c *DaemonClient) Servers() (*ServersResult, error) {
-	raw, err := c.call("loom/servers", nil)
+	raw, err := c.Call("loom/servers", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -482,7 +487,7 @@ func (c *DaemonClient) Servers() (*ServersResult, error) {
 
 // Tools returns the aggregated tool list.
 func (c *DaemonClient) Tools() (*ToolsResult, error) {
-	raw, err := c.call("loom/tools", nil)
+	raw, err := c.Call("loom/tools", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -495,7 +500,7 @@ func (c *DaemonClient) Tools() (*ToolsResult, error) {
 
 // Tunnels returns the SSH tunnel status.
 func (c *DaemonClient) Tunnels() (*TunnelsResult, error) {
-	raw, err := c.call("loom/tunnels", nil)
+	raw, err := c.Call("loom/tunnels", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +513,7 @@ func (c *DaemonClient) Tunnels() (*TunnelsResult, error) {
 
 // CacheStats returns response cache statistics.
 func (c *DaemonClient) CacheStats() (*CacheStatsResult, error) {
-	raw, err := c.call("loom/cache/stats", nil)
+	raw, err := c.Call("loom/cache/stats", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -519,20 +524,145 @@ func (c *DaemonClient) CacheStats() (*CacheStatsResult, error) {
 	return &result, nil
 }
 
-// CallTool invokes an MCP tool through the daemon's tools/call method.
-func (c *DaemonClient) CallTool(name string, args map[string]any) (json.RawMessage, error) {
+// CostStats returns cost/usage tracking statistics.
+func (c *DaemonClient) CostStats() (*costpkg.CostStatsResult, error) {
+	raw, err := c.Call("loom/cost-stats", nil)
+	if err != nil {
+		return nil, err
+	}
+	var result costpkg.CostStatsResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal cost-stats: %w", err)
+	}
+	return &result, nil
+}
+
+// RBACConfigResult holds the response from loom/rbac-config.
+type RBACConfigResult struct {
+	Enabled       bool                `json:"enabled"`
+	AuditEnabled  bool                `json:"audit_enabled"`
+	DefaultPolicy string              `json:"default_policy,omitempty"`
+	Roles         []RBACRoleInfo      `json:"roles,omitempty"`
+	Bindings      []RBACBindingInfo   `json:"bindings,omitempty"`
+	GlobalDeny    []string            `json:"global_deny,omitempty"`
+	RateLimits    []RBACRateLimitInfo `json:"rate_limits,omitempty"`
+	DeniedCount   int                 `json:"denied_count,omitempty"`
+	RecentDenied  []RBACDeniedEntry   `json:"recent_denied,omitempty"`
+}
+
+// RBACRoleInfo describes a role definition.
+type RBACRoleInfo struct {
+	Name  string   `json:"name"`
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+// RBACBindingInfo describes an agent-to-role binding.
+type RBACBindingInfo struct {
+	AgentID   string `json:"agent_id,omitempty"`
+	AgentType string `json:"agent_type,omitempty"`
+	Role      string `json:"role"`
+}
+
+// RBACRateLimitInfo describes a rate limit rule.
+type RBACRateLimitInfo struct {
+	AgentID           string `json:"agent_id,omitempty"`
+	Tool              string `json:"tool,omitempty"`
+	RequestsPerMinute int    `json:"requests_per_minute"`
+}
+
+// RBACDeniedEntry describes a recently denied tool call.
+type RBACDeniedEntry struct {
+	AgentID   string `json:"agent_id"`
+	Server    string `json:"server"`
+	Tool      string `json:"tool"`
+	Role      string `json:"role,omitempty"`
+	Reason    string `json:"reason"`
+	Timestamp string `json:"timestamp"`
+}
+
+// RBACConfig returns RBAC configuration and recent denied calls.
+func (c *DaemonClient) RBACConfig() (*RBACConfigResult, error) {
+	raw, err := c.Call("loom/rbac-config", nil)
+	if err != nil {
+		return nil, err
+	}
+	var result RBACConfigResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal rbac-config: %w", err)
+	}
+	return &result, nil
+}
+
+// OTelStatusResult holds the response from loom/otel-status.
+type OTelStatusResult struct {
+	OTLPEndpoint         string          `json:"otlp_endpoint"`
+	OTLPConfigured       bool            `json:"otlp_configured"`
+	LogFormat            string          `json:"log_format"`
+	JSONLogsEnabled      bool            `json:"json_logs_enabled"`
+	TracedServers        int             `json:"traced_servers"`
+	TotalServers         int             `json:"total_servers"`
+	TraceCoverage        string          `json:"trace_coverage"`
+	RuntimeConfigured    bool            `json:"runtime_otlp_configured"`
+	RuntimeEnabled       bool            `json:"runtime_otlp_enabled"`
+	RuntimeEndpoint      string          `json:"runtime_otlp_endpoint"`
+	RuntimeProtocol      string          `json:"runtime_otlp_protocol"`
+	RuntimeServiceName   string          `json:"runtime_otlp_service_name"`
+	RuntimeSampleRate    float64         `json:"runtime_otlp_sample_rate"`
+	RuntimeError         string          `json:"runtime_otlp_error"`
+	RuntimeMeterEnabled  bool            `json:"runtime_meter_enabled"`
+	RuntimeTraceSurfaces map[string]bool `json:"runtime_trace_surfaces"`
+	RuntimeTraceCoverage string          `json:"runtime_trace_coverage"`
+}
+
+// OTelStatus returns observability/OTel configuration status.
+func (c *DaemonClient) OTelStatus() (*OTelStatusResult, error) {
+	raw, err := c.Call("loom/otel-status", nil)
+	if err != nil {
+		return nil, err
+	}
+	var result OTelStatusResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal otel-status: %w", err)
+	}
+	return &result, nil
+}
+
+// buildToolCallParams builds the tools/call params map for a tool invocation.
+// Caller must provide `timeout`: the deadline to propagate to the daemon via
+// the `_timeout` params field so the daemon can cap its own recv deadline and
+// release the per-server call mutex when the caller gives up. Without this
+// propagation the daemon falls back to `LOOM_DAEMON_TOOL_TIMEOUT` (60s),
+// starving other callers with shorter deadlines queued on the same mutex.
+// A zero `timeout` omits `_timeout` and lets the daemon use its own default.
+func buildToolCallParams(name string, args map[string]any, timeout time.Duration) map[string]any {
 	params := map[string]any{
 		"name":      name,
 		"arguments": args,
 	}
-	return c.call("tools/call", params)
+	if timeout > 0 {
+		params["_timeout"] = timeout.String()
+	}
+	return params
+}
+
+// defaultToolTimeout returns the client's configured default RPC timeout,
+// held behind the daemon-client mutex.
+func (c *DaemonClient) defaultToolTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.callTimeout
+}
+
+// CallTool invokes an MCP tool through the daemon's tools/call method.
+// The client's default call timeout is propagated to the daemon so the
+// per-server mutex is held no longer than the caller is willing to wait.
+func (c *DaemonClient) CallTool(name string, args map[string]any) (json.RawMessage, error) {
+	return c.Call("tools/call", buildToolCallParams(name, args, c.defaultToolTimeout()))
 }
 
 // CallToolWithTimeout is like CallTool but uses a per-call timeout override.
+// See buildToolCallParams for why the timeout is propagated to the daemon.
 func (c *DaemonClient) CallToolWithTimeout(name string, args map[string]any, timeout time.Duration) (json.RawMessage, error) {
-	params := map[string]any{
-		"name":      name,
-		"arguments": args,
-	}
-	return c.callOpt("tools/call", params, timeout)
+	return c.CallWithTimeout("tools/call", buildToolCallParams(name, args, timeout), timeout)
 }

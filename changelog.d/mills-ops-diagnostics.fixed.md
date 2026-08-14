@@ -1,0 +1,1 @@
+- Fix Mills operational diagnostics to render nested pipeline details, authenticate and bound public snapshot reads, and use the current REST/metrics listener contracts.

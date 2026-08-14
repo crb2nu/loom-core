@@ -12,7 +12,7 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
 	"github.com/crb2nu/loom/pkg/lifecycle"
-	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -26,14 +26,16 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
-	logger.Info("starting server", "name", "mcp-time", "version", version)
-
-	server := mcp.NewServer("mcp-time", version)
-	server.SetInstructions("Fast Go-native time server. Tools: get_current_time, convert_timezone, add_duration, list_timezones, wait")
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-time", version,
+		mcpscaffold.WithInstructions("Fast Go-native time server. Tools: get_current_time, convert_timezone, add_duration, list_timezones, wait"),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cleanup(ctx) }()
 
 	// get_current_time - Get current time in a timezone
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "get_current_time",
 		Description: "Get the current time in a specified timezone",
 		InputSchema: mcp.InputSchema{
@@ -48,7 +50,7 @@ func run(ctx context.Context) error {
 	}, handleGetCurrentTime)
 
 	// convert_timezone - Convert time between timezones
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "convert_timezone",
 		Description: "Convert a time from one timezone to another",
 		InputSchema: mcp.InputSchema{
@@ -72,7 +74,7 @@ func run(ctx context.Context) error {
 	}, handleConvertTimezone)
 
 	// add_duration - Add or subtract duration from a time
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "add_duration",
 		Description: "Add or subtract a duration from a time",
 		InputSchema: mcp.InputSchema{
@@ -96,7 +98,7 @@ func run(ctx context.Context) error {
 	}, handleAddDuration)
 
 	// list_timezones - List common timezones
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "list_timezones",
 		Description: "List common IANA timezone names",
 		InputSchema: mcp.InputSchema{
@@ -106,7 +108,7 @@ func run(ctx context.Context) error {
 	}, handleListTimezones)
 
 	// wait - Sleep for a duration
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "wait",
 		Description: "Wait (sleep) for a duration",
 		InputSchema: mcp.InputSchema{
@@ -121,7 +123,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleWait)
 
-	return server.Run(ctx)
+	return srv.Run(ctx)
 }
 
 func parseDurationWithDays(durationStr string) (time.Duration, error) {

@@ -1,0 +1,1 @@
+- Scope-overlap serialization no longer counts `changelog.d` toward an item's directory envelope: every backlog item declares `changelog.d/*.md`, and slug-unique fragments never conflict, so the shared directory was deferring every queued admission behind any running item (total queue serialization). Identical literal fragment paths still collide.

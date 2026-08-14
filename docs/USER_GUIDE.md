@@ -1,6 +1,8 @@
 # Loom Core User Guide
 
 This guide is for day-to-day usage on a developer machine: setup, config sync, daemon operations, HUD visibility, and sandbox execution.
+The main shared HUD is the Kubernetes deployment `loom-hub/mobile-hud`, exposed at `https://hud.flexinfer.ai`.
+Run `loom hud` locally only for development, smoke tests, or isolated debugging.
 
 For architecture details, see `docs/ARCHITECTURE.md`.
 
@@ -51,9 +53,15 @@ make dev-reload
 # Health check
 curl http://localhost:9876/health
 
-# Launch HUD
+# Launch local development HUD
 ./bin/loom hud --port 3333
+
+# Local HUD launchd/service health (macOS)
+./bin/loom hud status
 ```
+
+`make dev-upgrade` now also attempts to restart a local development HUD when launchd service is installed or a HUD process is already bound to port `3333`.
+It does not deploy the main shared HUD; use the Kubernetes rollout checks in the HUD section for that path.
 
 ## Config Generation and Sync
 
@@ -73,6 +81,11 @@ Common targets: `codex`, `vscode`, `kilocode`, `claude`, `claude_desktop`, `gemi
 
 `sync --regen` resolves registries from the nearest workspace tree first (including ancestor `platform/gitops/mcp/context/registry.yaml`), then falls back to home defaults.
 
+Claude Desktop uses the `claude_desktop` target and writes `~/Library/Application Support/Claude/claude_desktop_config.json`.
+Its generated `loom` MCP entry includes `--agent-hint claude-desktop`, the shared `llm-core` tool profile, and `LOOM_PROXY_IDLE_EXIT_SECONDS=0` so Claude Desktop can keep the MCP proxy process open without seeing a stale idle-exit disconnect.
+
+Antigravity 2.0 sync writes `.agents/mcp_config.json` and `.agents/hooks.json` in workspaces, plus `~/.gemini/antigravity/mcp_config.json` and `~/.gemini/config/hooks.json` at home. The generated hooks keep Loom session tracking active and auto-allow the `mcp(loom/*)` tool namespace through Antigravity's native permission hook. PreToolUse hooks always return an explicit Antigravity decision JSON object, including telemetry-only hooks, and emit it as a parseable JSON line. Skills use Antigravity-specific registry overrides while emitting Gemini-style `SKILL.md` bundles under `~/.gemini/antigravity/skills/`.
+
 ## Daemon Operations
 
 ### launchd commands (macOS)
@@ -84,6 +97,24 @@ Common targets: `codex`, `vscode`, `kilocode`, `claude`, `claude_desktop`, `gemi
 ./bin/loom restart
 ./bin/loom stop
 ```
+
+`./bin/loom install` now installs both daemon and HUD launchd plists when available.
+
+### Agent token sync (macOS)
+
+```bash
+./bin/loom sync agent-tokens install
+./bin/loom sync agent-tokens status
+./bin/loom sync agent-tokens run --apply
+```
+
+This installs the `com.loom.agent-token-sync` launchd job, which delegates to the GitOps-side
+`bin/sync-agent-tokens` helper and refreshes `k3s/devbox/agent-auth-tokens.yaml` from the local
+Codex and Gemini auth files on your Mac.
+
+Claude is intentionally not part of this file sync. Cluster Claude agents use
+`ANTHROPIC_API_KEY` from `k3s/devbox/agent-api-keys.yaml`, and HUD/devbox worker launches consume
+that key-based path directly instead of a `~/.claude/auth.json` blob.
 
 ### Health and logs
 
@@ -98,11 +129,33 @@ Default log files:
 
 ## HUD (Agent Command Center)
 
-Launch HUD:
+The main shared HUD runs in Kubernetes:
+
+```bash
+kubectl -n loom-hub rollout status deployment/mobile-hud
+kubectl -n loom-hub get pods -l app=mobile-hud
+kubectl -n loom-hub get ingress mobile-hud
+```
+
+Operator URL: `https://hud.flexinfer.ai`
+
+Use this Kubernetes deployment for normal fleet/session triage. The local command below is for HUD development, smoke testing, or offline debugging only:
 
 ```bash
 ./bin/loom hud --port 3333
 ```
+
+Install/manage the local HUD launchd service (auto-start on login):
+
+```bash
+./bin/loom hud install
+./bin/loom hud start
+./bin/loom hud status
+./bin/loom hud stop
+```
+
+`loom hud install` creates `~/.config/loom/hud.env` (if missing) for launchd-loaded local HUD secrets such as FlexInfer, webhook, admin, and mobile operator tokens.
+The default local launchd HUD profile enables Redis cache (`CACHE_BACKEND=redis`, `REDIS_URL=redis://localhost:6379`).
 
 Optional modes:
 
@@ -115,9 +168,41 @@ Optional modes:
 HUD calls `devbox_summary` via `/api/sandbox`.
 If `mcp-devbox` is unavailable, HUD shows `available=false`.
 
+### Traces panel
+
+HUD now includes a `Traces` activity view backed by `GET /api/traces`.
+It summarizes recent tool calls from the daemon audit log with status, server, tool name, total duration, and stage timing breakdowns (`route`, `build`, `execute`, `send`, `recv`).
+Use it to separate slow routing/pool acquisition from slow MCP execution when debugging latency or transport regressions.
+The shared Kubernetes HUD deployment enables the backing daemon audit log with `LOOM_AUDIT_ENABLED=true`, writing recent trace data to `/home/mcp/.config/loom/audit.jsonl` inside the `loom-hub/mobile-hud` pod.
+When opened from Fleet or Presence, the view is pre-filtered to the selected agent so you can jump from a live operator row straight to that agent's recent tool-call trail.
+Overview attention lanes and Lifecycle side-rail cards now use the same drilldown path: if the highlighted agent has a live session, the HUD opens Fleet session detail first; otherwise it falls back to the agent-filtered `Traces` view.
+
+### Fleet and Presence views
+
+Desktop HUD agent surfaces now use one merged live-agent model:
+
+- `Fleet` focuses on live operational rows and merges presence heartbeats, active sessions, and spawned-agent metadata into a single table.
+- `Fleet` can group rows by root session so spawned subagents stay attached to the workflow that created them instead of appearing as unrelated flat entries.
+- `Presence` shows the same agent population, but keeps the broader coordination tabs for claims, worktrees, handoffs, and diagnostics.
+- Rows expose explicit evidence chips (`presence`, `session`, `spawn`) so you can see whether an agent is backed by a live session, only a heartbeat, or only a spawn record.
+- `Session` and `Traces` buttons are available directly from agent rows, which makes it easier to understand why an agent is visible even when session state and heartbeat state disagree.
+- Fleet session detail now includes a session-path breadcrumb and child-session list so you can traverse parent/root/current relationships without leaving the drawer.
+- Fleet session detail reads `GET /api/sessions/{id}/trace`, which composes session metadata, lifecycle events, context entries, and daemon audit traces. If context entries fail, for example because agent-context returns `transport closed`, the drawer still shows the available lifecycle/audit evidence and labels the partial source error inline.
+- Mobile clients can read the same resilient payload from `GET /api/mobile/v1/sessions/{session_id}/trace`, wrapped in the standard mobile envelope for bearer-token access.
+- Fleet session detail and Spawn detail now include recent trace previews inline, so you can inspect the last few routed tool calls before deciding whether to open the full `Traces` panel.
+- Overview and Lifecycle pressure cards are actionable now: attention agents jump into session detail or filtered traces, while namespace and relation hotspots jump into Dispatch.
+
 ## Devbox Sandbox Workflows
 
 `mcp-devbox` provides project-aware, persistent sandbox execution.
+
+### Weaver panel
+
+The `Infrastructure > Weaver` HUD view now reads from dedicated Weaver status, history, and metrics endpoints.
+
+- Domain rows can render either legacy string-only domain payloads or richer domain objects with descriptions and tool counts.
+- Recent queries are ordered newest-first.
+- Metrics cards are backed by lifetime Weaver counters when the `mcp-weaver` server is available, instead of staying at placeholder zeroes.
 
 Key tools:
 
@@ -156,9 +241,51 @@ Validate local setup:
 ./bin/loom check
 ```
 
+### Zero-downtime GitLab token rotation
+
+Use the two-phase rotation command for a shared GitLab personal access token. It
+creates an overlapping replacement, updates local consumers and an optional
+SOPS-encrypted GitOps Secret, and keeps the old token active until the rollout is
+verified. Token values are passed through stdin or secret backends and are never
+printed or placed in process arguments.
+
+Preview the affected consumers, then start the overlap window:
+
+```bash
+./bin/loom secrets rotate-gitlab start \
+  --sops-file ~/workspace/platform/gitops/k3s/loom-hub/secrets.yaml
+./bin/loom secrets rotate-gitlab start --apply \
+  --sops-file ~/workspace/platform/gitops/k3s/loom-hub/secrets.yaml
+```
+
+The command stores mode-`0600` recovery state under
+`~/.config/loom/recovery/`. If consumer installation is interrupted, fix the
+cause and resume from that state:
+
+```bash
+./bin/loom secrets rotate-gitlab status
+./bin/loom secrets rotate-gitlab resume --apply \
+  --sops-file ~/workspace/platform/gitops/k3s/loom-hub/secrets.yaml
+```
+
+Commit and reconcile the SOPS change, replace workloads that consume the
+Secret, and verify GitLab access from CI, services, and agents. Only then preview
+and apply revocation of the old token:
+
+```bash
+./bin/loom secrets rotate-gitlab finish
+./bin/loom secrets rotate-gitlab finish --apply
+```
+
+Both `start` and `finish` are dry runs unless `--apply` is supplied. Never put a
+token value in a command-line flag.
+
 ## Agent Hooks and Lifecycle (Advanced)
 
 `loom agent ...` commands prefer HUD API calls (default port `3333`) and fall back to daemon socket tool calls when HUD is unavailable.
+
+Session lookup/list/prune, task-update, dispatch, context-inspect, and nudge-queue policy flows now share canonical request contracts from `internal/hud/bridge/agent_contracts.go`.
+That shared layer keeps CLI defaults, normalization, endpoint paths, and fallback payload shapes aligned between direct HUD HTTP calls and daemon bridge execution, which reduces transport-specific drift in hooks and wrapper scripts.
 
 For hook-only clients that do not emit explicit session-start events (for example Codex `notify`), use heartbeat bootstrap mode:
 
@@ -166,10 +293,30 @@ For hook-only clients that do not emit explicit session-start events (for exampl
 loom agent heartbeat --agent-id codex --status active --ensure-session --agent-type codex --quiet
 ```
 
+The generated Codex config now bootstraps a background keepalive wrapper from `notify` instead of relying on turn-completion heartbeats alone. For manual launches or custom wrappers, use:
+
+```bash
+loom agent keepalive-wrap --agent-id codex --session-id <session-id> --status active --ensure-session --agent-type codex -- codex
+```
+
+That wrapper keeps heartbeats flowing while the child process is running or idle, then deregisters when the wrapped command exits. The managed Codex TOML still cannot express a true top-level process wrapper, so Loom uses `notify` to start the background keepalive helper when needed.
+
+When `loom agent session-start` runs with `--auto-recall`, the JSON response now includes a bounded `startup_briefing` field (and `recalled_context` as a compatibility alias) so hooks and wrappers can inject compressed recall instead of a full raw context dump.
+Startup recall now queries `scope=all` by default and includes memory tiers automatically: `working` + `short_term` for the `fast` strategy, and `working` + `short_term` + `long_term` for `balanced` and `deep`.
+
+When callers use `agent_context_add` without an explicit `durability`, high-value entry types such as `decision`, `finding`, `question`, `summary`, `error`, and `handoff` are now mirrored into persistent memory while still remaining available as normal session context entries.
+Persistent context writes now land in the `short_term` memory tier first instead of skipping straight to `long_term`, which makes default recall more useful and gives later promotion/compaction policies something to work with.
+When the HUD coordinator is enabled, HUD and mobile session-end flows now treat the coordinator as the canonical summary owner: they disable `agent_session_end` summarization for that request and let the coordinator produce the post-session summary asynchronously.
+Coordinator-driven compaction now also inspects a small set of active sessions for high prompt estimates and can start memory compaction earlier when live context pressure is rising, instead of waiting only for tier token totals to grow large.
+Coordinator summary completion events now include before/after prompt estimates for the summarized session as well, which makes it easier to distinguish “summary stored successfully” from “summary materially changed live prompt pressure.”
+Compaction completion events now include before/after prompt estimates for the session that triggered pressure-aware compaction, so dashboards and alerts can distinguish “compaction ran” from “compaction actually reduced pressure.” Merge-only compaction runs now emit the same completion event, which keeps telemetry accurate when summaries are consolidated without needing per-item recompression.
+Coordinator Prometheus metrics now expose compaction effectiveness too: `loom_coordinator_compaction_outcomes_total{trigger,effect}` tracks `reduced`, `flat_or_increased`, and `unmeasured` outcomes, while `loom_coordinator_compaction_prompt_delta_tokens{trigger}` records positive prompt-token reductions for alerting and dashboards.
+
 Optional environment overrides:
 
 - `LOOM_HUD_PORT`: HUD API port
 - `LOOM_SOCKET`: daemon socket path (fallback path)
+- `LOOM_HUD_GIT_REMOTE_URL`: upstream forge project URL (e.g. `https://gitlab.flexinfer.ai/services/loom-core`) used to build merge-queue deep links (`Branch ↗` and `New MR ↗`) in the HUD Dispatch → Merge queue panel. When unset, the daemon auto-detects the URL by running `git remote get-url origin` from its working directory (2s timeout, fails gracefully when the daemon is not inside a git checkout). Embedded credentials (`user:password@host` and `oauth2:token@host`) are stripped before the URL reaches the frontend, and only `http(s)` schemes are emitted. Set this explicitly when the daemon runs outside a git checkout (e.g. in Kubernetes). Forge URL pattern is GitLab-style; GitHub support is a follow-up.
 
 Context budget inspection:
 
@@ -177,11 +324,30 @@ Context budget inspection:
 loom agent context-inspect --agent-id codex --detail --limit 200
 ```
 
+HUD agent context telemetry:
+
+- Scrape Prometheus-formatted samples from `GET /api/agent/metrics`.
+- Query the latest in-memory snapshots from `GET /api/agent/context-telemetry`.
+- Current gauges include prompt estimate, context-entry tokens, tool-schema tokens, file-injection tokens, system-prompt tokens, response-budget tokens, entry count, and total memory tokens.
+- Samples are labeled by low-cardinality dimensions: `agent_type`, `session_status`, and `reason`.
+- Sampling currently happens on `session_start`, `context_add`, and `heartbeat`; heartbeat samples are throttled to avoid noisy series.
+- Each successful sample also emits an `agent.context.telemetry` event into the HUD timeline stream for per-agent debugging.
+- Unified `agent_recall` responses now include `recall_meta` and `_warnings` fields, and Prometheus output includes backend-scoped `agent_context_recall_duration_seconds` summary series for `context`, `memory`, and `graph`.
+- Generated Claude Code and Codex loom-proxy configs now default to the reduced `llm-core` tool profile with `--max-tools 160`; operators can still opt back into the full surface by overriding `--tool-profile` or `--max-tools`.
+- ICC-focused sessions (the `icc-*` workflow skills) can opt into the dedicated `icc-core` profile (`loom proxy --tool-profile icc-core`), which pairs a slim developer core with the full `icc`, `icc-capture`, and `pm` surfaces inside a 100-tool ceiling — usable on Antigravity, whose default `antigravity-core` profile intentionally excludes the ICC block. Note the `icc` server must also be enabled in `catalog-state.yaml` for its tools to exist at all.
+- Repo-local proxy overrides (`.loom/proxy.yaml`): platforms whose MCP config is home-level (Antigravity reads a single `~/.gemini/config/mcp_config.json`) pass the same `--tool-profile` for every repo. `loom proxy` therefore resolves `<repo>/.loom/proxy.yaml` from its working directory at startup (walking upward, bounded) and lets it shadow the CLI flags. Schema: optional top-level `tool_profile`/`max_tools` applying to every session, plus per-`--agent-hint` entries under `agents:` (e.g. `agents.antigravity.tool_profile: icc-core`). Overridden profiles must be one of the known names (`antigravity-core`, `llm-core`, `icc-core`); unknown names are logged to stderr and ignored so a typo cannot expose the unfiltered tool list to a 100-tool-ceiling client. When an override applies, `max_tools: 0` (or omitted) re-derives the new profile's default cap instead of carrying the CLI cap over. `LOOM_PROXY_TOOL_PROFILE=<profile>` overrides both file and flags for a single session. Example — `private/icc-project-workspaces/.loom/proxy.yaml` remaps only Antigravity sessions in that repo to `icc-core`, keeping `antigravity-core` everywhere else.
+
 Hook reliability diagnostics:
 
 ```bash
 loom agent hook-status --agent-id codex --window 5m
 curl "http://127.0.0.1:3333/api/timeline?agent_id=codex&event_type=agent.heartbeat&limit=50"
+```
+
+For the main HUD, prefer the Kubernetes route and an operator token when querying HTTP endpoints directly:
+
+```bash
+curl "https://hud.flexinfer.ai/api/timeline?agent_id=codex&event_type=agent.heartbeat&limit=50"
 ```
 
 Nudge queue status and policy:
@@ -234,6 +400,92 @@ Gemini CLI has several unique behaviors that Loom manages automatically:
 - **Duplicate Skills Error:** A known quirk/bug in Gemini CLI causes it to error if the same skill name is discovered in both the workspace and user directories, even if the content is identical.
 - **Loom Solution:** To avoid duplication errors, the `gemini` profile in Loom sets `SkillsDirectToHome: true`. This ensures skills are only generated into the user directory (`~/.gemini/skills/`) and are automatically cleaned from the repository's `.gemini/skills/` directory during sync operations.
 
+### Antigravity 2.0
+
+Antigravity uses the same `SKILL.md` bundle shape as Gemini, but Loom treats `antigravity` as a distinct skill target. This lets `targets.antigravity` enable skills that Gemini disables and keeps generated skills in `~/.gemini/antigravity/skills/` instead of the Gemini CLI skill root.
+
+## Mobile Companion (iOS/iPadOS)
+
+The Loom Companion app provides fleet monitoring, session management, and real-time alerts from an iPhone or iPad.
+For a full physical-device workflow, see `docs/MOBILE_COMPANION_IPHONE_TESTING.md`.
+
+### Connection Modes
+
+| Mode | Transport | When to Use |
+|------|-----------|-------------|
+| **Gateway** | HTTPS through `mcp.flexinfer.ai` | Default path for the shared Kubernetes HUD |
+| **LAN** | HTTP to local IP | Development only, when testing a local HUD server on the same network as the device |
+
+### Pairing
+
+1. For normal use, rotate and publish the Kubernetes mobile token:
+   ```bash
+   make mobile-gateway-dev
+   ```
+   This patches `loom-hub/loom-secrets`, restarts `deployment/mobile-hud`, and verifies `https://mcp.flexinfer.ai/api/mobile/v1/ping`.
+2. Open Loom Companion on your device.
+3. Select **Gateway** mode.
+4. Enter the gateway URL `https://mcp.flexinfer.ai`.
+5. Enter the mobile operator bearer token.
+6. Tap **Connect**. The app probes `/api/mobile/v1/ping` to verify the connection.
+
+For local development only, start a local HUD server with mobile auth enabled:
+
+```bash
+export HUD_MOBILE_OPERATOR_TOKEN="$(openssl rand -hex 32)"
+export HUD_MOBILE_OPERATOR_SCOPES="mobile:read,mobile:session:create,mobile:session:end,mobile:push"
+loom hud --bind 0.0.0.0 --port 3333 \
+  --mobile-operator-token "$HUD_MOBILE_OPERATOR_TOKEN" \
+  --mobile-operator-scopes "$HUD_MOBILE_OPERATOR_SCOPES"
+```
+
+Use `make mobile-hud` after exporting the token/scopes when you explicitly need the local LAN path.
+
+Gateway bootstrap shortcut:
+
+```bash
+make mobile-gateway-dev
+```
+
+This is the preferred shared-system path because it updates the Kubernetes deployment instead of a local HUD process.
+
+### iOS Local Network Permission (LAN Mode)
+
+When using LAN mode, iOS requires **Local Network** permission for the app to reach devices on your local network.
+
+- The permission dialog appears on the first connection attempt.
+- If denied, the app cannot reach the server and shows a "Local Network Access Required" banner.
+- To fix: Go to **Settings > Privacy & Security > Local Network** and enable Loom Companion.
+- The app distinguishes this error from other connection failures and provides targeted guidance.
+
+### Real-Time Updates
+
+The app uses Server-Sent Events (SSE) for real-time dashboard and alert updates. If the SSE connection degrades (e.g., network switch), the app automatically falls back to 30-second polling and recovers SSE when the connection stabilizes.
+
+### Mobile API Scopes
+
+The mobile operator token requires these scopes (configured via `HUD_MOBILE_OPERATOR_SCOPES`):
+
+| Scope | Grants |
+|-------|--------|
+| `mobile:read` | Dashboard, sessions, session detail, session events, session trace, audit, alerts policy |
+| `mobile:session:create` | Create new agent sessions |
+| `mobile:session:end` | End active agent sessions |
+| `mobile:push` | Register/unregister push notification tokens |
+
+### Troubleshooting Mobile Connection
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| "Cannot reach server" in LAN mode | Local Network permission denied | Settings > Privacy & Security > Local Network |
+| "Cannot reach server" in Gateway mode | Kubernetes HUD unavailable or ingress route broken | Check `kubectl -n loom-hub rollout status deployment/mobile-hud` and verify `https://mcp.flexinfer.ai/api/mobile/v1/ping` |
+| "Cannot reach server" in LAN mode | Wrong IP or port | Verify server URL matches your local `loom hud --bind ... --port ...` settings |
+| "[unauthorized]" error | Token mismatch | Verify `HUD_MOBILE_OPERATOR_TOKEN` matches |
+| "[forbidden]" error | Missing scope | Add required scope to `HUD_MOBILE_OPERATOR_SCOPES` |
+| Dashboard not updating | SSE disconnected | Check Connection tab; polling fallback is active |
+| `[not_found] mobile API route not configured on gateway` | Gateway path split missing | Ensure ingress routes `/api/mobile/v1` to `mobile-hud` |
+| `unknown flag: --serve` | Using an outdated command | Use `loom hud --bind ... --port ...` (there is no `--serve` flag) |
+
 ## Troubleshooting
 
 - Daemon offline: `loom status`, then `loom restart`
@@ -241,4 +493,4 @@ Gemini CLI has several unique behaviors that Loom manages automatically:
 - Stale tool list: `loom reload`
 - Client cannot find servers: `loom sync all --regen --loom-mode`
 - GUI apps miss shell env vars: run `loom check` and move secrets into `loom secrets`
-- Hook calls fail with both HUD and daemon errors: verify either `loom hud` is reachable (`LOOM_HUD_PORT`) or daemon socket exists (`LOOM_SOCKET` / `~/.config/loom/loom.sock`)
+- Hook calls fail with both HUD and daemon errors: for the main system, verify `loom-hub/mobile-hud` rollout and ingress first; for local development, verify either `loom hud` is reachable (`LOOM_HUD_PORT`) or daemon socket exists (`LOOM_SOCKET` / `~/.config/loom/loom.sock`)

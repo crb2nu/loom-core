@@ -14,11 +14,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/strutil"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -39,6 +41,12 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-alertmanager", logger)
+	if err != nil {
+		logger.Warn("OTel tracer init failed", "error", err)
+	}
+	defer func() { _ = shutdownTracer(ctx) }()
+	tracer := mcpotel.Tracer(tp, "mcp-alertmanager")
 
 	amURL := strings.TrimSuffix(env.String("ALERTMANAGER_URL", "http://alertmanager.monitoring.svc.cluster.local:9093"), "/")
 
@@ -50,7 +58,11 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-alertmanager", "version", version, "url", amURL)
 
 	server := mcp.NewServer("mcp-alertmanager", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Alertmanager MCP server. Manage alerts and silences.")
+	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
+		return mcpotel.TracedToolHandler(tracer, name, h)
+	}
 
 	// list_alerts
 	server.AddTool(mcp.Tool{
@@ -73,7 +85,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, am.handleListAlerts)
+	}, wrap("am_list_alerts", am.handleListAlerts))
 
 	// list_silences
 	server.AddTool(mcp.Tool{
@@ -88,7 +100,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, am.handleListSilences)
+	}, wrap("am_list_silences", am.handleListSilences))
 
 	// create_silence
 	server.AddTool(mcp.Tool{
@@ -125,7 +137,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"matchers", "comment"},
 		},
-	}, am.handleCreateSilence)
+	}, wrap("am_create_silence", am.handleCreateSilence))
 
 	// delete_silence
 	server.AddTool(mcp.Tool{
@@ -141,7 +153,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, am.handleDeleteSilence)
+	}, wrap("am_delete_silence", am.handleDeleteSilence))
 
 	// status
 	server.AddTool(mcp.Tool{
@@ -151,7 +163,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, am.handleStatus)
+	}, wrap("am_status", am.handleStatus))
 
 	return server.Run(ctx)
 }

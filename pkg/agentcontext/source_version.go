@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+type SourceVersionSvc struct{ *Service }
+
 // SourceVersionProvider provides source version information
 type SourceVersionProvider struct {
 	workingDir string
@@ -134,7 +136,7 @@ func (svp *SourceVersionProvider) GenerateStalenessReport(entry *ContextEntry) (
 // Service methods for source versioning
 
 // HandleCheckStale handles the agent_context_check_stale tool
-func (s *Service) HandleCheckStale(ctx context.Context, args map[string]any) (map[string]any, error) {
+func (s *SourceVersionSvc) HandleCheckStale(ctx context.Context, args map[string]any) (map[string]any, error) {
 	entryIDs := toStringSlice(args["entry_ids"])
 	filePath := toString(args["file_path"])
 	sessionID := toString(args["session_id"])
@@ -145,7 +147,7 @@ func (s *Service) HandleCheckStale(ctx context.Context, args map[string]any) (ma
 	if len(entryIDs) > 0 {
 		// Check specific entries by ID
 		for _, id := range entryIDs {
-			p, err := s.contextQdrant.GetPoint(ctx, id, false)
+			p, err := s.qdrant.Get(CollContext).GetPoint(ctx, id, false)
 			if err != nil || p.Payload == nil {
 				continue
 			}
@@ -158,7 +160,7 @@ func (s *Service) HandleCheckStale(ctx context.Context, args map[string]any) (ma
 	} else if filePath != "" {
 		// Find entries by file path
 		filter := FilterMust(Match("file_path", filePath))
-		entries, err = s.contextQdrant.Scroll(ctx, filter, 100)
+		entries, err = s.qdrant.Get(CollContext).Scroll(ctx, filter, 100)
 		if err != nil {
 			return nil, fmt.Errorf("find entries: %w", err)
 		}
@@ -168,7 +170,7 @@ func (s *Service) HandleCheckStale(ctx context.Context, args map[string]any) (ma
 			Match("session_id", sessionID),
 			Match("entry_type", string(EntryTypeFileRead)),
 		)
-		entries, err = s.contextQdrant.Scroll(ctx, filter, 100)
+		entries, err = s.qdrant.Get(CollContext).Scroll(ctx, filter, 100)
 		if err != nil {
 			return nil, fmt.Errorf("find entries: %w", err)
 		}
@@ -222,7 +224,7 @@ func (s *Service) HandleCheckStale(ctx context.Context, args map[string]any) (ma
 }
 
 // HandleRefreshStale handles refreshing stale entries
-func (s *Service) HandleRefreshStale(ctx context.Context, args map[string]any) (map[string]any, error) {
+func (s *SourceVersionSvc) HandleRefreshStale(ctx context.Context, args map[string]any) (map[string]any, error) {
 	entryIDs := toStringSlice(args["entry_ids"])
 	if len(entryIDs) == 0 {
 		return nil, fmt.Errorf("entry_ids is required")
@@ -239,7 +241,7 @@ func (s *Service) HandleRefreshStale(ctx context.Context, args map[string]any) (
 
 	for _, id := range entryIDs {
 		// Get the entry
-		p, err := s.contextQdrant.GetPoint(ctx, id, true)
+		p, err := s.qdrant.Get(CollContext).GetPoint(ctx, id, true)
 		if err != nil || p.Payload == nil {
 			failed++
 			errors = append(errors, fmt.Sprintf("%s: not found", id))
@@ -297,7 +299,7 @@ func (s *Service) HandleRefreshStale(ctx context.Context, args map[string]any) (
 			Payload: EntryToPayload(*entry, s.cfg.EmbedModel),
 		}
 
-		if err := s.contextQdrant.Upsert(ctx, []Point{point}, true); err != nil {
+		if err := s.qdrant.Get(CollContext).Upsert(ctx, []Point{point}, true); err != nil {
 			failed++
 			errors = append(errors, fmt.Sprintf("%s: upsert failed", id))
 			continue
@@ -343,7 +345,7 @@ type AskSourceEntry struct {
 
 // HandleAskSource handles the agent_context_ask_source tool
 // This combines context recall with live codebase search and freshness checking
-func (s *Service) HandleAskSource(ctx context.Context, args map[string]any) (map[string]any, error) {
+func (s *SourceVersionSvc) HandleAskSource(ctx context.Context, args map[string]any) (map[string]any, error) {
 	query := toString(args["query"])
 	if query == "" {
 		return nil, fmt.Errorf("query is required")
@@ -366,19 +368,25 @@ func (s *Service) HandleAskSource(ctx context.Context, args map[string]any) (map
 		limit = 10
 	}
 
-	// Phase 1: Recall from context
-	recallOpts := RecallOptions{
-		Query:            query,
-		AgentID:          agentID,
-		SessionID:        sessionID,
-		Namespace:        namespace,
-		TokenBudget:      tokenBudget,
-		IncludeSummaries: true,
-		IncludeDecisions: true,
-		FileContext:      fileContext,
+	// Phase 1: Recall from context (unified recall path).
+	recallOpts := EnhancedRecallOptions{
+		RecallOptions: RecallOptions{
+			Query:            query,
+			AgentID:          agentID,
+			SessionID:        sessionID,
+			Namespace:        namespace,
+			TokenBudget:      tokenBudget,
+			IncludeSummaries: true,
+			IncludeDecisions: true,
+			FileContext:      fileContext,
+		},
+		RecencyWeight: s.cfg.DefaultRecencyWeight,
+		IncludeTasks:  false,
+		IncludeMemory: false,
+		IncludeGraph:  false,
 	}
 
-	contextEntries, err := s.recallContext(ctx, recallOpts)
+	contextEntries, _, err := s.enhancedRecallContext(ctx, recallOpts)
 	if err != nil {
 		return nil, fmt.Errorf("recall context: %w", err)
 	}
@@ -429,7 +437,7 @@ func (s *Service) HandleAskSource(ctx context.Context, args map[string]any) (map
 								freshness = "refreshed"
 
 								// Re-fetch the updated entry
-								p, _ := s.contextQdrant.GetPoint(ctx, entry.ID, false)
+								p, _ := s.qdrant.Get(CollContext).GetPoint(ctx, entry.ID, false)
 								if p.Payload != nil {
 									if updated, _ := PayloadToEntry(p.Payload); updated != nil {
 										entry = *updated

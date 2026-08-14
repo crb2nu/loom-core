@@ -30,9 +30,11 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -56,9 +58,21 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-browserkit",
+		logger,
+	)
+	if err != nil {
+		logger.Warn("OTel tracer init failed", "error", err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-browserkit")
+
 	logger.Info("starting server", "name", "mcp-browserkit", "version", version)
 
 	server := mcp.NewServer("mcp-browserkit", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions(strings.TrimSpace(`
 BrowserKit screenshot server (local-only).
 
@@ -146,7 +160,7 @@ Prerequisites (run once on the host):
 			},
 			Required: []string{"url"},
 		},
-	}, handleScreenshot)
+	}, mcpotel.TracedToolHandler(tracer, "screenshot", handleScreenshot))
 
 	return server.Run(ctx)
 }
@@ -262,14 +276,14 @@ func handleScreenshot(ctx context.Context, args map[string]any) (*mcp.CallToolRe
 	if out.Format == "jpeg" {
 		mimeType = "image/jpeg"
 	}
-	imageDataURL, err := normalizeImageDataURL(mimeType, out.Base64)
+	imageB64, err := normalizeImageBase64(out.Base64)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("helper returned invalid image data: %w", err)), nil
 	}
 
 	result := &mcp.CallToolResult{
 		Content: []mcp.Content{
-			{Type: "image", MimeType: mimeType, Data: imageDataURL},
+			{Type: "image", MimeType: mimeType, Data: imageB64},
 			{Type: "text", Text: fmt.Sprintf("Captured %s (%s). Title: %s", out.FinalURL, out.Format, out.Title)},
 		},
 	}
@@ -479,9 +493,49 @@ func getReqInt(req map[string]any, key string) (int, bool) {
 	return 0, false
 }
 
+var (
+	pythonMu       sync.Mutex
+	resolvedPython string
+)
+
+// browserkitPython picks the first candidate interpreter that can actually
+// import the deps the helper needs, so a stale BROWSERKIT_PYTHON (e.g. a
+// generated config forcing bare python3) still heals over to the managed
+// venv. Only a successful probe is cached: a failed resolution is retried on
+// the next call, so installing deps fixes the server without a restart.
 func browserkitPython() string {
+	pythonMu.Lock()
+	defer pythonMu.Unlock()
+	if resolvedPython != "" {
+		return resolvedPython
+	}
+
+	firstAvailable := ""
+	for _, cand := range pythonCandidates() {
+		path, err := exec.LookPath(cand)
+		if err != nil {
+			continue
+		}
+		if firstAvailable == "" {
+			firstAvailable = cand
+		}
+		if pythonHasDeps(path) {
+			resolvedPython = cand
+			return cand
+		}
+	}
+	if firstAvailable != "" {
+		return firstAvailable
+	}
+	return "python3"
+}
+
+// pythonCandidates returns interpreters in preference order: explicit
+// override, managed venv, then whatever python3 is on PATH.
+func pythonCandidates() []string {
+	var out []string
 	if py := strings.TrimSpace(os.Getenv("BROWSERKIT_PYTHON")); py != "" {
-		return py
+		out = append(out, py)
 	}
 
 	home, _ := os.UserHomeDir()
@@ -490,15 +544,23 @@ func browserkitPython() string {
 		venvDir = filepath.Join(home, ".config", "loom", "browserkit-venv")
 	}
 	if venvDir != "" {
-		if p := filepath.Join(venvDir, "bin", "python3"); fileExists(p) {
-			return p
-		}
-		if p := filepath.Join(venvDir, "bin", "python"); fileExists(p) {
-			return p
+		for _, name := range []string{"python3", "python"} {
+			if p := filepath.Join(venvDir, "bin", name); fileExists(p) {
+				out = append(out, p)
+			}
 		}
 	}
 
-	return "python3"
+	out = append(out, "python3")
+	return out
+}
+
+// pythonHasDeps mirrors the helper's import so the probe fails exactly when
+// the helper would.
+func pythonHasDeps(py string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, py, "-c", "from browser_kit.browser import BrowserConfig, BrowserManager").Run() == nil
 }
 
 func fileExists(path string) bool {
@@ -506,14 +568,17 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func normalizeImageDataURL(mimeType, data string) (string, error) {
+// normalizeImageBase64 validates the helper's image payload and returns raw
+// standard base64, as required for MCP image content (data URLs are not
+// valid there — spec-compliant clients reject the "data:" prefix). Accepts
+// either raw base64 or a base64 data URL from the helper.
+func normalizeImageBase64(data string) (string, error) {
 	data = strings.TrimSpace(data)
 	if data == "" {
 		return "", errors.New("empty image payload")
 	}
 
-	lower := strings.ToLower(data)
-	if strings.HasPrefix(lower, "data:image/") {
+	if strings.HasPrefix(strings.ToLower(data), "data:image/") {
 		comma := strings.Index(data, ",")
 		if comma <= 0 || comma == len(data)-1 {
 			return "", errors.New("invalid data URL image payload")
@@ -522,18 +587,10 @@ func normalizeImageDataURL(mimeType, data string) (string, error) {
 		if !strings.Contains(strings.ToLower(meta), ";base64") {
 			return "", errors.New("image data URL must use base64 encoding")
 		}
-		b64, err := normalizeBase64(data[comma+1:])
-		if err != nil {
-			return "", err
-		}
-		return meta + "," + b64, nil
+		data = data[comma+1:]
 	}
 
-	b64, err := normalizeBase64(data)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("data:%s;base64,%s", mimeType, b64), nil
+	return normalizeBase64(data)
 }
 
 func normalizeBase64(data string) (string, error) {

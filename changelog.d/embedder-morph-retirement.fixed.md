@@ -1,0 +1,1 @@
+- Migrated PM, agent-context, and codebase embeddings from retired Morph defaults to the 1536-dimensional FlexInfer model, added fail-closed dimension checks, and marked degraded vectors for bounded resumable backfill.

@@ -1,0 +1,1 @@
+- Extract HUD spawn recovery and resume paths into the focused `spawn_recovery.go` file; terminal teardown remains a follow-up slice to keep the change within the review-size gate.

@@ -1,0 +1,1 @@
+- Split `cmd/loom/cmd_sync.go` into sync, project propagation, pull, and backup command slices while preserving CLI behavior.

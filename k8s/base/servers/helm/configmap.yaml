@@ -1,0 +1,44 @@
+apiVersion: v1
+data:
+  server.yaml: |
+    always_allow:
+        - helm_list
+        - helm_status
+        - helm_values
+        - helm_history
+        - helm_search
+        - helm_show
+        - helm_template
+        - helm_repo_list
+    categories:
+        - kubernetes
+        - deployment
+    description: Helm chart management (list, status, values, search)
+    name: helm
+    timeout: 90
+  # In-cluster kubeconfig -- see servers/flux/configmap.yaml for why the local
+  # target's macOS HELM_KUBECONFIG path cannot work inside the hub container.
+  kubeconfig.yaml: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: in-cluster
+        cluster:
+          server: https://kubernetes.default.svc
+          certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+      - name: service-account
+        user:
+          tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+      - name: in-cluster
+        context:
+          cluster: in-cluster
+          user: service-account
+    current-context: in-cluster
+kind: ConfigMap
+metadata:
+  labels:
+    app: helm
+    component: mcp-server
+  name: helm-config

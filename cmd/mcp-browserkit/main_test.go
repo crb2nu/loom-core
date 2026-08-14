@@ -2,43 +2,90 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 )
 
-func TestNormalizeImageDataURL_RawBase64(t *testing.T) {
-	got, err := normalizeImageDataURL("image/png", "AQID")
+func TestNormalizeImageBase64_RawBase64(t *testing.T) {
+	got, err := normalizeImageBase64("AQID")
 	if err != nil {
-		t.Fatalf("normalizeImageDataURL returned error: %v", err)
+		t.Fatalf("normalizeImageBase64 returned error: %v", err)
 	}
-	want := "data:image/png;base64,AQID"
-	if got != want {
-		t.Fatalf("unexpected data URL\nwant: %q\ngot:  %q", want, got)
+	if got != "AQID" {
+		t.Fatalf("unexpected payload\nwant: %q\ngot:  %q", "AQID", got)
 	}
 }
 
-func TestNormalizeImageDataURL_ExistingDataURL(t *testing.T) {
-	got, err := normalizeImageDataURL("image/png", "data:image/jpeg;base64,AQID")
+func TestNormalizeImageBase64_StripsDataURL(t *testing.T) {
+	got, err := normalizeImageBase64("data:image/jpeg;base64,AQID")
 	if err != nil {
-		t.Fatalf("normalizeImageDataURL returned error: %v", err)
+		t.Fatalf("normalizeImageBase64 returned error: %v", err)
 	}
-	want := "data:image/jpeg;base64,AQID"
-	if got != want {
-		t.Fatalf("unexpected data URL\nwant: %q\ngot:  %q", want, got)
+	if got != "AQID" {
+		t.Fatalf("expected raw base64 without data URL prefix\nwant: %q\ngot:  %q", "AQID", got)
 	}
 }
 
-func TestNormalizeImageDataURL_InvalidData(t *testing.T) {
-	if _, err := normalizeImageDataURL("image/png", "not-base64@@@"); err == nil {
+func TestNormalizeImageBase64_RawUnpadded(t *testing.T) {
+	got, err := normalizeImageBase64("AQIDBA")
+	if err != nil {
+		t.Fatalf("normalizeImageBase64 returned error: %v", err)
+	}
+	if got != "AQIDBA==" {
+		t.Fatalf("expected re-padded standard base64\nwant: %q\ngot:  %q", "AQIDBA==", got)
+	}
+}
+
+func TestNormalizeImageBase64_InvalidData(t *testing.T) {
+	if _, err := normalizeImageBase64("not-base64@@@"); err == nil {
 		t.Fatalf("expected error for invalid base64 payload")
 	}
 }
 
-func TestNormalizeImageDataURL_InvalidDataURL(t *testing.T) {
-	if _, err := normalizeImageDataURL("image/png", "data:image/png,abc"); err == nil {
+func TestNormalizeImageBase64_InvalidDataURL(t *testing.T) {
+	if _, err := normalizeImageBase64("data:image/png,abc"); err == nil {
 		t.Fatalf("expected error for non-base64 data URL payload")
+	}
+}
+
+func TestPythonCandidates_Order(t *testing.T) {
+	venv := t.TempDir()
+	binDir := filepath.Join(venv, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	venvPy := filepath.Join(binDir, "python3")
+	if err := os.WriteFile(venvPy, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BROWSERKIT_PYTHON", "/custom/python")
+	t.Setenv("BROWSERKIT_VENV_DIR", venv)
+
+	got := pythonCandidates()
+	want := []string{"/custom/python", venvPy, "python3"}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected candidates: %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidate[%d] = %q, want %q (all: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestPythonCandidates_NoOverride(t *testing.T) {
+	t.Setenv("BROWSERKIT_PYTHON", "")
+	t.Setenv("BROWSERKIT_VENV_DIR", filepath.Join(t.TempDir(), "missing"))
+
+	got := pythonCandidates()
+	want := []string{"python3"}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("unexpected candidates: %v, want %v", got, want)
 	}
 }
 

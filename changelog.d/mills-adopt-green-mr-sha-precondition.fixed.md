@@ -1,0 +1,1 @@
+- SHA-precondition Mills green-MR adoption in `pkg/mills/clients/gitlab.go` so GitLab refuses a merge when the validated head moves, leaving the next reconciler sweep to re-evaluate it without an in-adoption retry.

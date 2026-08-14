@@ -1,17 +1,14 @@
-<script>
-  /**
-   * FilterBar — reusable search + filter dropdown bar with result count.
-   *
-   * @type {{
-   *   search?: string,
-   *   placeholder?: string,
-   *   filters?: Array<{ key: string, label: string, options: Array<{ value: string, label: string }>, value?: string }>,
-   *   resultCount?: number | null,
-   *   onSearch?: (value: string) => void,
-   *   onFilter?: (key: string, value: string) => void,
-   *   actions?: import('svelte').Snippet,
-   * }}
-   */
+<script lang="ts">
+  import type { Snippet } from 'svelte';
+
+  interface FilterDef {
+    key: string;
+    label: string;
+    options: Array<{ value: string; label: string }>;
+    value?: string;
+  }
+
+  // FilterBar — reusable search + filter dropdown bar with result count.
   let {
     search = '',
     placeholder = 'Search\u2026',
@@ -19,35 +16,74 @@
     resultCount = null,
     onSearch,
     onFilter,
+    onClear,
+    showShortcutHint = true,
+    shortcutKey = '/',
     actions,
+  }: {
+    search?: string;
+    placeholder?: string;
+    filters?: FilterDef[];
+    resultCount?: number | null;
+    onSearch?: (value: string) => void;
+    onFilter?: (key: string, value: string) => void;
+    onClear?: () => void;
+    showShortcutHint?: boolean;
+    shortcutKey?: string;
+    actions?: Snippet;
   } = $props();
 
-  let debounceTimer;
+  let debounceTimer: ReturnType<typeof setTimeout>;
+  let activeFilterCount = $derived.by(() => {
+    let count = search.trim() ? 1 : 0;
+    for (const filter of filters) {
+      const value = filter.value;
+      if (typeof value === 'string' ? value.trim() !== '' : Boolean(value)) {
+        count += 1;
+      }
+    }
+    return count;
+  });
+  let canClear = $derived(!!onClear && activeFilterCount > 0);
 
-  function handleSearchInput(e) {
-    const val = e.target.value;
+  function handleSearchInput(e: Event) {
+    const val = (e.target as HTMLInputElement).value;
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       if (onSearch) onSearch(val);
     }, 150);
   }
 
-  function handleFilterChange(key, e) {
-    if (onFilter) onFilter(key, e.target.value);
+  function handleFilterChange(key: string, e: Event) {
+    if (onFilter) onFilter(key, (e.target as HTMLSelectElement).value);
   }
 </script>
 
 <div class="filter-bar" role="search" aria-label="Filter">
   <div class="filter-bar-search">
     <span class="filter-bar-search-icon">{'\u{1F50D}'}</span>
-    <input
-      class="filter-bar-input panel-search-input"
-      type="text"
-      value={search}
-      {placeholder}
-      oninput={handleSearchInput}
-      aria-label={placeholder}
-    />
+    <div class="filter-bar-search-field">
+      <input
+        class="filter-bar-input panel-search-input"
+        type="text"
+        value={search}
+        {placeholder}
+        oninput={handleSearchInput}
+        aria-label={placeholder}
+        autocomplete="off"
+        spellcheck="false"
+        enterkeyhint="search"
+        data-panel-search="primary"
+      />
+      {#if search}
+        <button class="filter-bar-clear-search" onclick={() => { if (onSearch) onSearch(''); }} aria-label="Clear search" title="Clear search">
+          &times;
+        </button>
+      {/if}
+      {#if showShortcutHint && !search}
+        <kbd class="filter-bar-shortcut">{shortcutKey}</kbd>
+      {/if}
+    </div>
   </div>
 
   {#each filters as filter}
@@ -66,13 +102,31 @@
 
   <div class="filter-bar-spacer"></div>
 
-  {#if resultCount != null}
-    <span class="filter-bar-count">{resultCount} result{resultCount !== 1 ? 's' : ''}</span>
-  {/if}
+  <div class="filter-bar-meta">
+    <!-- One polite region for the whole meta row; the visual counts below are
+         aria-hidden so a filter change is announced once, not twice. -->
+    <span class="sr-only" role="status" aria-live="polite" aria-atomic="true"
+      >{resultCount != null ? `${resultCount} results` : ''}{activeFilterCount ? `, ${activeFilterCount} filters active` : ''}</span
+    >
+    {#if activeFilterCount > 0}
+      <span class="filter-bar-active" aria-hidden="true">{activeFilterCount} active</span>
+    {/if}
+    {#if resultCount != null}
+      <span class="filter-bar-count" aria-hidden="true">{resultCount} result{resultCount !== 1 ? 's' : ''}</span>
+    {/if}
 
-  {#if actions}
-    {@render actions()}
-  {/if}
+    {#if canClear}
+      <button class="btn btn-ghost btn-sm filter-bar-clear" onclick={onClear}>
+        Clear filters
+      </button>
+    {/if}
+
+    {#if actions}
+      <div class="filter-bar-actions">
+        {@render actions()}
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>
@@ -83,14 +137,21 @@
     padding: var(--space-2) 0;
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
+    flex-wrap: wrap;
   }
 
   .filter-bar-search {
     display: flex;
     align-items: center;
     gap: var(--space-1);
-    flex: 0 1 240px;
-    min-width: 120px;
+    flex: 1 1 260px;
+    min-width: 180px;
+  }
+
+  .filter-bar-search-field {
+    position: relative;
+    flex: 1;
+    min-width: 0;
   }
 
   .filter-bar-search-icon {
@@ -100,9 +161,9 @@
   }
 
   .filter-bar-input {
-    flex: 1;
+    width: 100%;
     font-size: var(--text-sm);
-    padding: var(--space-1) var(--space-2);
+    padding: var(--space-1) calc(var(--space-2) + 2.5rem) var(--space-1) var(--space-2);
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -111,11 +172,52 @@
   }
 
   .filter-bar-input:focus {
-    border-color: var(--border-focus);
+    border-color: var(--info);
     outline: none;
+    box-shadow: 0 0 4px var(--glow-info);
+  }
+
+  .filter-bar-shortcut {
+    position: absolute;
+    right: var(--space-2);
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    line-height: 1;
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 3px 5px;
+    background: color-mix(in srgb, var(--bg-secondary) 85%, transparent);
+    pointer-events: none;
+  }
+
+  .filter-bar-clear-search {
+    position: absolute;
+    right: var(--space-2);
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--fg-muted);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .filter-bar-clear-search:hover {
+    color: var(--fg-primary);
+    background: var(--bg-tertiary);
   }
 
   .filter-bar-select {
+    flex: 0 1 180px;
+    min-width: 140px;
     font-size: var(--text-sm);
     padding: var(--space-1) var(--space-2);
     background: var(--bg-primary);
@@ -127,12 +229,36 @@
   }
 
   .filter-bar-select:focus {
-    border-color: var(--border-focus);
+    border-color: var(--info);
     outline: none;
+    box-shadow: 0 0 4px var(--glow-info);
   }
 
   .filter-bar-spacer {
-    flex: 1;
+    flex: 1 1 auto;
+  }
+
+  .filter-bar-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-left: auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  /* No .sr-only utility in lib/styles yet — declared locally rather than
+     widening the global sheet from a component slice. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
 
   .filter-bar-count {
@@ -140,5 +266,50 @@
     color: var(--fg-muted);
     font-family: var(--font-mono);
     white-space: nowrap;
+  }
+
+  .filter-bar-active {
+    font-size: var(--text-xs);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: var(--radius-full);
+    border: 1px solid rgba(255, 107, 53, 0.25);
+    background: var(--accent-dim);
+    white-space: nowrap;
+    box-shadow: 0 0 6px var(--glow-accent);
+  }
+
+  .filter-bar-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .filter-bar-clear {
+    white-space: nowrap;
+  }
+
+  @media (max-width: 900px) {
+    .filter-bar-meta {
+      width: 100%;
+      margin-left: 0;
+      justify-content: space-between;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .filter-bar-search {
+      flex-basis: 100%;
+    }
+
+    .filter-bar-select {
+      flex: 1 1 160px;
+    }
+
+    .filter-bar-shortcut {
+      display: none;
+    }
   }
 </style>

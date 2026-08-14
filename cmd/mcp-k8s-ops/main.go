@@ -12,9 +12,11 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -33,17 +35,27 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-k8s-ops", logger)
+	if err != nil {
+		logger.Warn("OTel tracer init failed", "error", err)
+	}
+	defer func() { _ = shutdownTracer(ctx) }()
+	tracer := mcpotel.Tracer(tp, "mcp-k8s-ops")
+	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
+		return mcpotel.TracedToolHandler(tracer, name, h)
+	}
 	logger.Info("starting server", "name", "mcp-k8s-ops", "version", version)
 
 	server := mcp.NewServer("mcp-k8s-ops", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Kubernetes operations via kubectl")
 
-	registerTools(server)
+	registerTools(server, wrap)
 
 	return server.Run(ctx)
 }
 
-func registerTools(server *mcp.Server) {
+func registerTools(server *mcp.Server, wrap func(string, mcp.ToolHandler) mcp.ToolHandler) {
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_apply",
 		Description: "Apply a configuration file",
@@ -58,7 +70,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"file"},
 		},
-	}, handleApply)
+	}, wrap("k8s_apply", handleApply))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_getPods",
@@ -77,7 +89,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"namespace"},
 		},
-	}, handleGetPods)
+	}, wrap("k8s_getPods", handleGetPods))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_logs",
@@ -98,7 +110,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"namespace", "target"},
 		},
-	}, handleLogs)
+	}, wrap("k8s_logs", handleLogs))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_get",
@@ -121,7 +133,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"kind"},
 		},
-	}, handleGet)
+	}, wrap("k8s_get", handleGet))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_describe",
@@ -140,7 +152,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"namespace", "kind", "name"},
 		},
-	}, handleDescribe)
+	}, wrap("k8s_describe", handleDescribe))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_exec",
@@ -160,7 +172,7 @@ func registerTools(server *mcp.Server) {
 			},
 			Required: []string{"namespace", "pod", "command"},
 		},
-	}, handleExec)
+	}, wrap("k8s_exec", handleExec))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_listNamespaces",
@@ -175,7 +187,7 @@ func registerTools(server *mcp.Server) {
 				"context": map[string]any{"type": "string"},
 			},
 		},
-	}, handleListNamespaces)
+	}, wrap("k8s_listNamespaces", handleListNamespaces))
 
 	server.AddTool(mcp.Tool{
 		Name:        "k8s_listContexts",
@@ -189,30 +201,53 @@ func registerTools(server *mcp.Server) {
 				},
 			},
 		},
-	}, handleListContexts)
+	}, wrap("k8s_listContexts", handleListContexts))
 }
 
 // Kubectl Helper
 
 func getKubeConfig() string {
 	if v := os.Getenv("MCP_K8S_KUBECONFIG"); v != "" {
-		return v
+		if kc := firstExistingPath(v); kc != "" {
+			return kc
+		}
 	}
 	if v := os.Getenv("KUBECONFIG"); v != "" {
-		return v
+		if kc := firstExistingPath(v); kc != "" {
+			return kc
+		}
 	}
 
+	// Check well-known paths; return "" to let kubectl use in-cluster config.
 	home, _ := os.UserHomeDir()
 	if home != "" {
 		k3s := filepath.Join(home, ".kube", "k3s.yaml")
 		if _, err := os.Stat(k3s); err == nil {
 			return k3s
 		}
-		return filepath.Join(home, ".kube", "config")
+		def := filepath.Join(home, ".kube", "config")
+		if _, err := os.Stat(def); err == nil {
+			return def
+		}
 	}
 
-	cwd, _ := os.Getwd()
-	return filepath.Join(cwd, ".kube", "config")
+	return "" // in-cluster or kubectl default
+}
+
+// firstExistingPath returns the first existing file path from a list.
+// KUBECONFIG can contain multiple paths (OS-specific list separator).
+func firstExistingPath(raw string) string {
+	for _, candidate := range filepath.SplitList(raw) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func runKubectl(ctx context.Context, contextName string, args ...string) (string, error) {
@@ -225,14 +260,17 @@ func runKubectl(ctx context.Context, contextName string, args ...string) (string
 		}
 	}
 
-	baseArgs := []string{"--kubeconfig", getKubeConfig()}
-	if contextName != "" {
-		baseArgs = append(baseArgs, "--context", contextName)
-	} else if v := os.Getenv("KUBECONTEXT"); v != "" {
-		baseArgs = append(baseArgs, "--context", v)
+	// Place --kubeconfig and --context after handler args to avoid
+	// kubectl v1.34+ "flags cannot be placed before plugin name" error.
+	finalArgs := append([]string{}, args...)
+	if kc := getKubeConfig(); kc != "" {
+		finalArgs = append(finalArgs, "--kubeconfig", kc)
 	}
-
-	finalArgs := append(baseArgs, args...)
+	if contextName != "" {
+		finalArgs = append(finalArgs, "--context", contextName)
+	} else if v := os.Getenv("KUBECONTEXT"); v != "" {
+		finalArgs = append(finalArgs, "--context", v)
+	}
 	cmd := execCommand(ctx, "kubectl", finalArgs...)
 	out, err := cmd.CombinedOutput()
 	outStr := strings.TrimSpace(string(out))
@@ -295,7 +333,7 @@ func handleGetPods(ctx context.Context, args map[string]any) (*mcp.CallToolResul
 	ctx, cancel := withTimeoutSecondsArg(ctx, args)
 	defer cancel()
 
-	cmdArgs := []string{"-n", ns, "get", "pods"}
+	cmdArgs := []string{"get", "pods", "-n", ns}
 	if sel != "" {
 		cmdArgs = append(cmdArgs, "-l", sel)
 	}
@@ -323,7 +361,7 @@ func handleLogs(ctx context.Context, args map[string]any) (*mcp.CallToolResult, 
 	ctx, cancel := withTimeoutSecondsArg(ctx, args)
 	defer cancel()
 
-	cmdArgs := []string{"-n", ns, "logs", target}
+	cmdArgs := []string{"logs", target, "-n", ns}
 	if container != "" {
 		cmdArgs = append(cmdArgs, "-c", container)
 	}
@@ -357,14 +395,13 @@ func handleGet(ctx context.Context, args map[string]any) (*mcp.CallToolResult, e
 	ctx, cancel := withTimeoutSecondsArg(ctx, args)
 	defer cancel()
 
-	cmdArgs := []string{}
+	cmdArgs := []string{"get", kind}
 	if ns != "" && !allNs {
 		cmdArgs = append(cmdArgs, "-n", ns)
 	}
 	if allNs {
 		cmdArgs = append(cmdArgs, "-A")
 	}
-	cmdArgs = append(cmdArgs, "get", kind)
 	if name != "" {
 		cmdArgs = append(cmdArgs, name)
 	}
@@ -395,7 +432,7 @@ func handleDescribe(ctx context.Context, args map[string]any) (*mcp.CallToolResu
 	ctx, cancel := withTimeoutSecondsArg(ctx, args)
 	defer cancel()
 
-	out, err := runKubectl(ctx, contextName, "-n", ns, "describe", kind, name)
+	out, err := runKubectl(ctx, contextName, "describe", kind, name, "-n", ns)
 	if err != nil {
 		return mcp.ErrorResult(err), nil
 	}
@@ -414,7 +451,7 @@ func handleExec(ctx context.Context, args map[string]any) (*mcp.CallToolResult, 
 		return mcp.ErrorResult(err), nil
 	}
 
-	cmdArgs := []string{"-n", ns, "exec", pod}
+	cmdArgs := []string{"exec", pod, "-n", ns}
 	if container != "" {
 		cmdArgs = append(cmdArgs, "-c", container)
 	}

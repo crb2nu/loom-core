@@ -1,0 +1,1 @@
+- Mechanically split spawn configuration and lifecycle helpers from `internal/hud/spawn.go` into `internal/hud/spawn_config.go` and `internal/hud/spawn_lifecycle.go`.

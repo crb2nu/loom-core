@@ -1,0 +1,1 @@
+- Persist and atomically cap transient Mills auto-requeues in `pkg/mills/store/store.go`, fail closed in `pkg/mills/pipeline/pipeline.go`, and preserve exhaustion evidence through `pkg/mills/runner/runner.go`.

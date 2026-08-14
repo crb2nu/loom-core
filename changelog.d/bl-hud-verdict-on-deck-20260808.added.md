@@ -1,0 +1,1 @@
+- Surface corrected Mills run verdicts in `InspectDock.svelte`, share verdict gating through `runVerdict.ts`, and render merged verdicts with settled deck severity in `operatorHelpers.ts`.

@@ -1,0 +1,1 @@
+- iOS companion: Mills spawn-pod roster rows tag by spawn-id tail and show the work branch's item slug instead of the prompt head; conversation-fold member rows title by workspace (namespace tail/branch) instead of repeating one identical title; new Transcripts browser (Sessions tab) lights up the vendor-session bridge — recent claude/codex transcripts with in-transcript search.

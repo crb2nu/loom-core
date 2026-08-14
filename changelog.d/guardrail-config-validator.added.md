@@ -1,0 +1,1 @@
+- Add deterministic repo-local validation for the Mills guardrail pipeline configuration in `pkg/mills/gates/config_validate.go`, with a pre-merge entry point at `scripts/validate-guardrails.sh`.

@@ -1,0 +1,1 @@
+- Validate explicit pipeline concurrency limits in `pkg/policy/policy.go` and reject invalid configuration in the runner and pipeline concurrency consumers.

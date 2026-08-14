@@ -1,0 +1,1 @@
+- Make `mills-workflow-killtest` preserve queued-proof target projects, resume the same admitted run after interruption, verify non-empty target MRs, and distinguish external-dependency verdicts; document the live procedure in `docs/MILLS.md`.

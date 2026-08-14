@@ -1,0 +1,1 @@
+- Generate Codex lifecycle hooks through the profile-selected shared `pkg/generator/templates/hooks.tmpl` while preserving the existing JSON output and specialized platform hook behavior.

@@ -1,0 +1,1 @@
+- Fixed HUD MR watch state rendering, live-work counts, retained merge history, and shepherd-disabled status.

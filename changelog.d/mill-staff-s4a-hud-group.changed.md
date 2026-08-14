@@ -1,0 +1,1 @@
+Mill Staff S4a: the HUD now presents the three judgment lanes as their own "Mill staff" tab group between Mill floor and Governance — Drawing Office (council), Drawing-in (squads), and The Alley (overseers) — per the docs/FACTORY_MODEL.md Mill Staff charter. Labels and panel titles only: tab ids, hotkeys (d/f/v), API paths, and event actors are unchanged.

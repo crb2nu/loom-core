@@ -1,0 +1,1 @@
+- Mills now walks configured model fallbacks when LiteLLM/OpenRouter rejects a resolved provider route as incompatible with the completions endpoint, while continuing to surface unrelated HTTP 400 responses immediately.

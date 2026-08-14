@@ -57,7 +57,7 @@ func registerWorkflowTools(server *mcp.Server, svc *agentcontext.Service, tracer
 							},
 							"step_type": map[string]any{
 								"type":        "string",
-								"enum":        []string{"tool", "approval", "gate", "parallel", "subflow"},
+								"enum":        []string{"tool", "approval", "auto_verify", "gate", "parallel", "subflow"},
 								"description": "Type of step (default: tool).",
 							},
 							"tool_name": map[string]any{

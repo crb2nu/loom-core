@@ -1,51 +1,153 @@
 # Loom CI/CD Pipeline
 # Provides lint, test, build, and deploy stages with comprehensive testing
+#
+# iOS signing/distribution secret contract (mirrors streamslate pattern):
+#   APPLE_CERTIFICATE            - Base64 .p12 or File variable path
+#   APPLE_CERTIFICATE_PASSWORD   - .p12 password
+#   APPLE_TEAM_ID                - Apple Developer Team ID
+#   APPLE_PROVISIONING_PROFILE   - Base64 .mobileprovision or File variable path
+#   APPLE_API_ISSUER             - App Store Connect issuer ID (upload lanes)
+#   APPLE_API_KEY                - App Store Connect key ID (upload lanes)
+#   APPLE_API_KEY_BASE64         - Base64 .p8 key contents (upload lanes)
+#
+# Helper scripts:
+#   scripts/mobile/import-certificate.sh
+#   scripts/mobile/cleanup-signing.sh
 
 include:
   - project: platform/gitops
     ref: main
     file:
       - /k3s/ci/caches/gitlab-ci-cache.yml
+  - project: "services/tech-radar"
+    file: "/ci/radar.yml"
 
 # This GitLab instance intermittently creates detached MR pipelines with
 # refs/merge-requests/*/head that fail immediately with no jobs. Run the
 # branch/tag pipeline as the canonical CI signal for merge requests.
 workflow:
+  auto_cancel:
+    # Cancel older running pipelines on the same ref when a newer commit
+    # arrives. This is the FEATURE-BRANCH policy only — the default-branch rule
+    # below overrides it with `none`.
+    on_new_commit: interruptible
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       when: never
+    # Default-branch pipelines are the deploy path and must never be
+    # auto-canceled. On 2026-08-07 five consecutive main pipelines
+    # (22296→22332) never reached their deploy stage: Mills factory merges
+    # landed every ~10 minutes and each new merge auto-canceled its
+    # predecessor mid-validation, so the cluster ran a 10+ hour old
+    # operator/HUD image while the fixes sat merged on main.
+    #
+    # Exempting only the deploy jobs via `interruptible: false` cannot fix
+    # this class: the image jobs are stage-gated behind lint/test, so
+    # canceling any upstream validation job kills the not-yet-started deploy
+    # stage anyway. The pipeline as a whole must be uncancelable. Each main
+    # pipeline now runs to completion; the buildkit image jobs stay
+    # serialized per ref via their resource_group, and their `changes:`
+    # gates still skip builds whose inputs did not change.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      auto_cancel:
+        on_new_commit: none
     - if: '$CI_COMMIT_BRANCH'
     - if: '$CI_COMMIT_TAG'
 
 stages:
+  - prepare
   - lint
   - build
   - test
   - deploy
 
+# Infra-class failure reasons: the job never got a fair chance to run, so an
+# automatic re-run is honest rather than a way of hiding a red gate.
+# script_failure is deliberately absent — a genuinely failing job must stay red.
+#
+# 2026-08-01 22:39Z–2026-08-02 12:47Z, 119 jobs in this project died with
+# runner_system_failure. All of them carried the same error: the apiserver's
+# streaming proxy could not reach the kubelet on the node hosting the job pod
+# ("error dialing backend: proxy error from 127.0.0.1:6443 while dialing
+# 192.168.50.125:10250, code 502"). The Kubernetes executor's attach strategy
+# needs that exec/attach stream at every stage boundary, so jobs died at
+# whatever stage they happened to be in, seconds after start. Jobs that
+# inherited .go-template's retry stanza re-ran automatically within ~60s; jobs
+# without one sat red for 3–6h until a human pressed retry and they passed
+# untouched. This list exists so no job is in the second group.
+.ci-infra-failure-reasons: &ci-infra-failure-reasons
+  - runner_system_failure
+  - stuck_or_timeout_failure
+  - api_failure
+  - scheduler_failure
+  - unknown_failure
+
+default:
+  # Allow newer commits to preempt in-flight non-release work and free runner
+  # slots. Feature branches only in effect: default-branch pipelines opt out of
+  # auto-cancel wholesale via the workflow rule above, so this flag never
+  # cancels anything on main.
+  interruptible: true
+  retry:
+    max: 2
+    when: *ci-infra-failure-reasons
+
 variables:
   AUTO_DEVOPS_ENABLED: "false"
-  GO_VERSION: "1.25.5"
+  GO_VERSION: "1.26.6"
   BINARY_NAME: "loom"
+  # Limit static-analysis scans to first-party packages.
+  GO_APP_PKGS: "./cmd/... ./internal/... ./pkg/..."
   # Ensure private modules never go to public proxies/sumdb.
   GOPRIVATE: "gitlab.flexinfer.ai/*"
   # Athens is the preferred in-cluster proxy; fall back to public proxy then direct
   # to reduce transient infra outages breaking CI.
-  GOPROXY: "http://athens.ci.svc.cluster.local:3000,https://proxy.golang.org,direct"
+  #
+  # This value used to say `https://proxy.golang.org|direct` — the comment above
+  # described Athens-first, but the value skipped it, so every module download
+  # left the LAN and the in-cluster Athens (which the before_script below waits
+  # on) was never consulted. `|` falls through on ANY error, so an Athens outage
+  # still degrades to the public proxy rather than failing the job.
+  GOPROXY: "http://athens.ci.svc.cluster.local:3000|https://proxy.golang.org|direct"
+  # Pull-through mirror for Docker Hub images (Harbor proxy-cache project).
+  # Keeps `image:` resolution on the LAN and off Docker Hub's rate limiter.
+  # Every tag referenced below was verified present through this mirror before
+  # the cutover; a tag missing upstream surfaces as a 404 in runner prepare, so
+  # new tags must be checked (see docs/ci-external-endpoints.md).
+  PUBLIC_IMAGE_REGISTRY: "registry.harbor.lan/dockerhub-cache"
+  # Base images for the buildkit image jobs, passed through as a build-arg by
+  # scripts/ci/buildkit-build.sh (Dockerfile* default this ARG to docker.io).
+  PUBLIC_BASE_REGISTRY: "registry.harbor.lan/dockerhub-cache"
   # Work around occasional runner fetch failures for ephemeral pipeline refs by
   # disabling shallow clones (fetch full history).
   GIT_DEPTH: "0"
+  # CI should resolve pinned module versions, not the local workspace overlays
+  # used on developer machines.
+  GOWORK: "off"
+  # Disable CGo globally — CI runners don't have fi-accel C headers, and all
+  # binaries are statically linked for container deployment.
+  CGO_ENABLED: "0"
   # GitLab Runner intermittently attempts to fetch `refs/pipelines/<id>`, which
   # is not reliably available on this GitLab instance. Skip the built-in
   # checkout and fetch sources explicitly inside jobs instead.
   GIT_STRATEGY: "none"
   # Minimum test coverage threshold (percentage)
-  # Lowered from 30% to accommodate SSH tunnel code which requires actual SSH server to test
-  COVERAGE_THRESHOLD: "24"
+  # Original was 30%, lowered to 24% for SSH tunnel code, then raised to 35% in
+  # Cycle 3 debt remediation (2026-03-27).
+  #
+  # Actual coverage is 60.6% as of 2026-08-04 (the "~39.4%" this comment used to
+  # claim was stale). The gap went unnoticed partly because the gate could never
+  # fail: until the `total:`-anchored fix that ships with this flake-quarantine
+  # change, the extracted value was a multi-line string and the comparison
+  # silently short-circuited. Raising the threshold toward the real number is a
+  # separate, deliberate decision — left at 35 here.
+  COVERAGE_THRESHOLD: "35"
   IMAGE_REGISTRY: registry.flexinfer.ai
   IMAGE_REGISTRIES: "registry.harbor.lan registry.flexinfer.ai"
   CUSTOM_SERVER_IMAGE_REPO: mcp/custom-server
-  DOCKER_CONFIG: /kaniko/.docker
+  BUILDKIT_HOST: "tcp://buildkitd-central.ci-build.svc.cluster.local:1234"
+  BUILDKIT_FALLBACK_HOSTS: "tcp://buildkitd-central.ci-build.svc.cluster.local:1234,tcp://buildkitd.ci-build.svc.cluster.local:1234"
+  BUILDKIT_CLI_IMAGE: "${PUBLIC_IMAGE_REGISTRY}/moby/buildkit:v0.12.5"
   # The CI runner injects a pre-build step that waits for a Docker daemon when DOCKER_HOST is tcp://localhost:2375.
   # This repo doesn't use DinD for its Go jobs; disable that wait globally to prevent jobs hanging.
   DOCKER_HOST: ""
@@ -54,62 +156,134 @@ variables:
 cache:
   key: ${CI_COMMIT_REF_SLUG}
   paths:
-    - .go/pkg/mod/
+    # Cache Go-installed tooling (golangci-lint, etc.) to avoid reinstalling
+    # large toolchains on every job.
+    - .go/bin/
+    # Cache the module download ZIP/index cache (not extracted modules).
+    # This stays well under the runner's 512MB cache upload limit.
+    - .go/pkg/mod/cache/download/
     - .go-build/
   # Pull cache everywhere, but only push from selected jobs to avoid repeatedly
   # archiving tens of thousands of small Go cache files on every job.
   policy: pull
 
+# Shared source-fetch anchor. Idempotent: skips when already inside a git work
+# tree, otherwise initialises one and fetches `${CI_COMMIT_SHA}`. Mirrors the
+# `.clone_repo` pattern used by sister services (flexdeck, jobsearch-app) so
+# every job's source-fetch path is consistent regardless of whether the runner
+# pre-checks-out, downloads via tarball, or starts from a clean container.
+# Backports services/loom-core#80.
+#
+# Hardened 2026-08-02 after job #212512 died here:
+#   error: RPC failed; curl 92 HTTP/2 stream 7 was not closed cleanly: INTERNAL_ERROR
+#   fetch-pack: unexpected disconnect while reading sideband packet
+#   fatal: early EOF
+# CI job pods reach GitLab over the LAN (the runner chart pins
+# gitlab.flexinfer.ai to 192.168.50.227 via `host_aliases`), so a router or
+# flow-cache storm lands on this exact step — and because the fetch runs inside
+# the job script, GitLab reports `script_failure`, indistinguishable from a real
+# code failure to both human triage and the mills ci_watch classifier.
+#
+# Ladder: HTTP/2 -> HTTP/1.1 -> HTTP/1.1 against the in-cluster GitLab service
+# (which never leaves the pod network). Attempts 2 and 3 both drop to HTTP/1.1
+# because the observed failure is an HTTP/2 stream reset, and HTTP/1.1 does not
+# multiplex, so one reset cannot poison the whole transfer.
+.clone_repo: &clone_repo
+  - |
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "Fetching repository sources (git)..."
+      if [ -z "${CI_JOB_TOKEN:-}" ]; then
+        echo "ERROR: CI_JOB_TOKEN is not set; cannot fetch via git"
+        exit 1
+      fi
+      # Die fast on a stalled transfer instead of hanging to the job timeout:
+      # abort if throughput stays under 1000 B/s for 30s.
+      export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}"
+      export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-30}"
+
+      # Avoid printing the token in logs.
+      git init -q
+      CLONE_PRIMARY="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      # `origin` stays pinned to the primary remote: later job steps
+      # (guardrails:docs-cli fetches the base branch) address it by name.
+      git remote add origin "$CLONE_PRIMARY"
+
+      # Last-attempt fallback route. Set CI_GIT_INTERNAL_URL="" to disable.
+      CLONE_INTERNAL_URL="${CI_GIT_INTERNAL_URL-http://gitlab-vm.gitlab.svc.cluster.local}"
+
+      clone_ok=0
+      for attempt in 1 2 3; do
+        clone_remote="$CLONE_PRIMARY"
+        clone_http="HTTP/2"
+        clone_label="primary HTTP/2"
+        if [ "$attempt" -ge 2 ]; then
+          clone_http="HTTP/1.1"
+          clone_label="primary HTTP/1.1"
+        fi
+        if [ "$attempt" -eq 3 ] && [ -n "$CLONE_INTERNAL_URL" ]; then
+          clone_scheme="${CLONE_INTERNAL_URL%%://*}"
+          clone_hostpath="${CLONE_INTERNAL_URL#*://}"
+          clone_remote="${clone_scheme}://gitlab-ci-token:${CI_JOB_TOKEN}@${clone_hostpath%/}/${CI_PROJECT_PATH}.git"
+          clone_label="in-cluster HTTP/1.1"
+        fi
+        echo "source-fetch attempt ${attempt}/3 (${clone_label})"
+        # Fetch the exact commit SHA (not just branch tip) so checkout always
+        # works even when the branch has advanced since the pipeline was created.
+        if git -c "http.version=${clone_http}" fetch -q "$clone_remote" "${CI_COMMIT_SHA}"; then
+          clone_ok=1
+          break
+        fi
+        if [ "$attempt" -lt 3 ]; then
+          if [ "$attempt" -eq 1 ]; then clone_backoff=2; else clone_backoff=8; fi
+          echo "source-fetch attempt ${attempt} failed; retrying in ${clone_backoff}s"
+          sleep "$clone_backoff"
+        fi
+      done
+
+      if [ "$clone_ok" -ne 1 ]; then
+        echo "source-fetch exhausted 3 attempts against ${CI_SERVER_HOST}" >&2
+        # Machine-greppable marker, emitted as the LAST line of job output: this
+        # job died on infrastructure, not on the code under test. GitLab reports
+        # `script_failure` either way, so triage (human and mills ci_watch)
+        # keys on this sentinel instead.
+        echo "CI-INFRA-FAILURE: source-fetch"
+        exit 1
+      fi
+      git checkout -q -f "${CI_COMMIT_SHA}"
+    fi
+
 # Base template for Go jobs
 .go-template: &go-template
-  image: golang:${GO_VERSION}
+  # Pulled through Harbor's Docker Hub proxy-cache (PUBLIC_IMAGE_REGISTRY), not
+  # docker.io directly. Caveat that motivated the earlier bypass: the mirror
+  # 404s in runner prepare for tags that do not exist upstream, before CI
+  # scripts can run — so bumping GO_VERSION means checking the new tag resolves
+  # through the mirror first.
+  image: ${PUBLIC_IMAGE_REGISTRY}/library/golang:${GO_VERSION}
+  # retry: intentionally omitted — a job-level stanza replaces the top-level
+  # default: retry wholesale, and this one was narrower (2 reasons vs 5).
+  variables:
+    GO_WARM_MOD_CACHE: "false"
   before_script:
     - |
       # Ensure required OS tools exist (golang image may not include them).
       if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        # Route Debian package fetches through the in-cluster apt-cacher-ng
+        # instead of deb.debian.org. CI_APT_CACHE_URL comes from the shared
+        # platform/gitops cache include at the top of this file.
+        if [ -n "${CI_APT_CACHE_URL:-}" ]; then
+          echo "Acquire::http::Proxy \"${CI_APT_CACHE_URL}\";" > /etc/apt/apt.conf.d/01proxy || true
+        fi
         apt-get update -qq
         apt-get install -y --no-install-recommends git curl ca-certificates
         rm -rf /var/lib/apt/lists/*
       fi
+    - *clone_repo
     - |
-      if [ ! -f go.mod ]; then
-        echo "Fetching repository sources (archive)..."
-        URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/archive.tar.gz?sha=${CI_COMMIT_SHA}"
-        # Some GitLab deployments return 404 for archive downloads when using
-        # CI_JOB_TOKEN (JOB-TOKEN header). If the archive fetch fails for any reason,
-        # fall back to a normal git fetch using CI_JOB_TOKEN in the remote URL.
-        if curl -fsSL -H "JOB-TOKEN: ${CI_JOB_TOKEN}" "$URL" | tar -xz --strip-components=1; then
-          :
-        else
-          echo "Archive fetch failed; falling back to git fetch..."
-          if [ -z "${CI_JOB_TOKEN:-}" ]; then
-            echo "ERROR: CI_JOB_TOKEN is not set; cannot fetch via git"
-            exit 1
-          fi
-
-          # Avoid printing the token in logs.
-          git init -q
-          git remote add origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-          # Fetch the exact commit SHA (not just branch tip) so checkout always works,
-          # even when the branch has advanced since the pipeline was created.
-          git fetch -q origin "${CI_COMMIT_SHA}"
-          git checkout -q -f "${CI_COMMIT_SHA}"
-        fi
-      fi
-    - |
-      # This repo uses local `replace` directives to `../../libs/*`.
-      # In CI, ensure those sibling repos exist so `go mod download` and builds work.
-      LIBS_DIR="$(realpath "${CI_PROJECT_DIR}/../../libs")"
-      mkdir -p "${LIBS_DIR}"
-      if [ ! -d "${LIBS_DIR}/mcp-go" ]; then
-        git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.flexinfer.ai/libs/mcp-go.git" "${LIBS_DIR}/mcp-go"
-      fi
-      if [ ! -d "${LIBS_DIR}/fi-mcp-kit" ]; then
-        git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.flexinfer.ai/libs/fi-mcp-kit.git" "${LIBS_DIR}/fi-mcp-kit"
-      fi
-      if [ ! -d "${LIBS_DIR}/fi-accel" ]; then
-        git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.flexinfer.ai/libs/fi-accel.git" "${LIBS_DIR}/fi-accel"
-      fi
+      # Authenticate direct Git module fetches for private libs/* modules without
+      # recloning sibling repositories into the workspace.
+      git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/".insteadOf "https://${CI_SERVER_HOST}/"
+      git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.flexinfer.ai/".insteadOf "https://gitlab.flexinfer.ai/"
     - export GOPATH="$CI_PROJECT_DIR/.go"
     - export GOCACHE="$CI_PROJECT_DIR/.go-build"
     - mkdir -p "$GOPATH" "$GOCACHE"
@@ -124,15 +298,91 @@ cache:
         sleep 2
       done
     - |
-      # Go module downloads are occasionally flaky on the homelab runner; retry a few times.
-      for i in 1 2 3; do
-        if go mod download; then
-          exit 0
+      if [ "${GO_WARM_MOD_CACHE:-true}" = "true" ]; then
+        # Go module downloads are occasionally flaky on the homelab runner; retry a few times.
+        download_ok=0
+        for i in 1 2 3; do
+          if go mod download; then
+            download_ok=1
+            break
+          fi
+          echo "go mod download failed (attempt ${i}/3); retrying..."
+          sleep 3
+        done
+        if [ "$download_ok" -ne 1 ]; then
+          exit 1
         fi
-        echo "go mod download failed (attempt ${i}/3); retrying..."
-        sleep 3
-      done
-      exit 1
+      else
+        echo "Skipping eager go mod download (GO_WARM_MOD_CACHE=false); resolving modules on demand."
+      fi
+
+# =============================================================================
+# PREPARE STAGE
+# Seed shared Go module/build cache once so lint/test jobs avoid repeating
+# network-heavy dependency downloads.
+# =============================================================================
+
+prepare:go-cache:
+  <<: *go-template
+  stage: prepare
+  variables:
+    GO_WARM_MOD_CACHE: "true"
+    KUBERNETES_CPU_REQUEST: "1"
+    KUBERNETES_CPU_LIMIT: "2"
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .go/bin/
+      - .go/pkg/mod/cache/download/
+      - .go-build/
+    policy: pull-push
+  script:
+    - echo "Seeding shared Go cache/tooling"
+    - |
+      LINT_BIN="$(go env GOPATH)/bin/golangci-lint"
+      if [ -x "$LINT_BIN" ] && "$LINT_BIN" version 2>/dev/null | grep -q 'version v2.8.0'; then
+        echo "Using cached golangci-lint v2.8.0"
+      else
+        go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0
+      fi
+    - |
+      # gotestsum drives test:unit's flake quarantine. Seed it into the shared
+      # branch cache here so test:unit does not pay a network install on every
+      # pipeline; test:unit re-installs on its own if the cache misses.
+      TESTSUM_BIN="$(go env GOPATH)/bin/gotestsum"
+      if [ -x "$TESTSUM_BIN" ] && "$TESTSUM_BIN" --version 2>/dev/null | grep -q 'v1.13.0'; then
+        echo "Using cached gotestsum v1.13.0"
+      else
+        go install gotest.tools/gotestsum@v1.13.0
+      fi
+    - go env GOPATH GOCACHE
+  artifacts:
+    paths:
+      - .go/bin/golangci-lint
+    expire_in: 1 week
+
+# Transport probe for the source-fetch failure class (job #212512: curl 92
+# HTTP/2 INTERNAL_ERROR -> early EOF, reported as script_failure). Never runs
+# automatically — trigger with RUN_FETCH_PROBE=true on a pipeline, ideally
+# during a suspected LAN storm, to measure the HTTP/2 failure rate, whether an
+# immediate in-pod retry recovers it, and whether the in-cluster fallback route
+# is reachable. Evidence for the retry ladder in `.clone_repo`.
+diag:source-fetch-probe:
+  <<: *go-template
+  stage: prepare
+  needs: []
+  timeout: 30 minutes
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    PROBE_ITERATIONS: "50"
+    PROBE_HTTP11_ITERATIONS: "10"
+    PROBE_DEADLINE_SECONDS: "900"
+  cache: []
+  script:
+    - bash scripts/ci/source_fetch_probe.sh
+  rules:
+    - if: '$RUN_FETCH_PROBE == "true"'
+    - when: never
 
 # =============================================================================
 # LINT STAGE
@@ -141,20 +391,64 @@ cache:
 lint:
   <<: *go-template
   stage: lint
+  needs:
+    - job: prepare:go-cache
+      artifacts: true
+  dependencies:
+    - prepare:go-cache
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    KUBERNETES_CPU_REQUEST: "1"
+    KUBERNETES_CPU_LIMIT: "2"
+    KUBERNETES_MEMORY_REQUEST: "4Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
-    - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0
-    - $(go env GOPATH)/bin/golangci-lint run --timeout 5m ./...
-  allow_failure: true
+    - |
+      if [ ! -x "$(go env GOPATH)/bin/golangci-lint" ]; then
+        echo "ERROR: expected golangci-lint artifact from prepare:go-cache"
+        ls -la "$(go env GOPATH)/bin" || true
+        exit 1
+      fi
+    # Fail fast on config schema drift (issue #240): a v1-keyed config under a
+    # v2 binary is silently ignored by `run`, so verify the schema explicitly.
+    - $(go env GOPATH)/bin/golangci-lint config verify
+    # 45m, not 30m: golangci-lint completed in 29m47s on pipeline 7923's
+    # retry of job 86562 (right at the wire, after slice 5.1 added ~1.3k
+    # LOC). Earlier the same pipeline failed with `Timeout exceeded` at
+    # exactly 30m and emitted "0 issues" — i.e. partial completion. The
+    # gitlab job timeout is 1h30m, so 45m leaves runway for the next
+    # phase 5 slice's surface area.
+    - $(go env GOPATH)/bin/golangci-lint run --timeout 45m ${GO_APP_PKGS}
 
 vet:
   <<: *go-template
   stage: lint
+  needs:
+    - job: prepare:go-cache
+      artifacts: true
+  dependencies:
+    - prepare:go-cache
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    KUBERNETES_CPU_REQUEST: "1"
+    KUBERNETES_CPU_LIMIT: "2"
+    # vet has to load every package + dep into memory to typecheck.
+    # Without the cache artifacts AND a memory bump, the runner OOMs at
+    # exit 137 partway through `go mod download` (pipeline 9872 jobs
+    # 104271 + 104295 both died here at ~5min). Match the lint job's
+    # memory profile since vet has comparable working-set requirements.
+    KUBERNETES_MEMORY_REQUEST: "4Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
     - go vet ./...
 
 fmt:
   <<: *go-template
   stage: lint
+  variables:
+    GIT_STRATEGY: fetch
+    GO_WARM_MOD_CACHE: "false"
+  before_script: []
   script:
     - |
       UNFORMATTED=$(gofmt -l . 2>/dev/null | grep -v '^vendor/' | grep -v '^\.go/' | grep -v '\.pb\.go$' || true)
@@ -165,32 +459,108 @@ fmt:
         exit 1
       fi
 
+# Regression guards for this file's own network behaviour. Pure bash — no Go
+# build, no module download, no clone_repo — so it returns a verdict in seconds.
+#
+#   check_ci_external_endpoints  a job must not reach a public package/image
+#                                endpoint that an in-cluster cache already
+#                                fronts (table: docs/ci-external-endpoints.md)
+#   clone_repo_retry_test        the `.clone_repo` retry ladder still escalates
+#                                HTTP/2 -> HTTP/1.1 -> in-cluster host and still
+#                                emits the CI-INFRA-FAILURE sentinel last. That
+#                                block runs before every Go job and cannot be
+#                                exercised by running CI, so it is driven here
+#                                against a stub git.
+lint:ci-guards:
+  <<: *go-template
+  stage: lint
+  needs: []
+  variables:
+    GIT_STRATEGY: fetch
+    GO_WARM_MOD_CACHE: "false"
+  cache: []
+  before_script: []
+  script:
+    - bash scripts/ci/check_ci_external_endpoints.sh
+    - bash scripts/ci/check_ci_external_endpoints_test.sh
+    - bash scripts/ci/clone_repo_retry_test.sh
+
+lint:rbac-policy:
+  <<: *go-template
+  stage: lint
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+  script:
+    - go run ./cmd/loom validate rbac --source repo
+
 guardrails:docs-cli:
   <<: *go-template
   stage: lint
+  variables:
+    GO_WARM_MOD_CACHE: "false"
   script:
     - |
-      # The shared template may fetch sources via archive (no .git metadata).
-      # Recreate a minimal git checkout so docs drift checks can diff against base.
-      if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git init -q
-        git remote add origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-        git fetch -q origin "${CI_COMMIT_SHA}"
-        git checkout -q -f "${CI_COMMIT_SHA}"
-      fi
+      # .go-template's before_script ran *clone_repo, so .git metadata is
+      # available here. Fetch the base branch so docs-drift diffs work.
       BASE_BRANCH="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_DEFAULT_BRANCH}"
       git fetch -q origin "${BASE_BRANCH}:${BASE_BRANCH}" || true
       DOCS_CHECK_BASE_REF="${BASE_BRANCH}" bash scripts/ci/check_docs_guardrails.sh
+      bash scripts/ci/check_docs_guardrails_test.sh
+      WORKFLOW_DRAIN_BASE_REF="${BASE_BRANCH}" bash scripts/ci/check_workflow_drain_gate.sh
+      bash scripts/ci/check_workflow_drain_gate_test.sh
       bash scripts/ci/check_flexinfer_site_integration.sh
+      bash mcp/skills/mills-ops/scripts/mills_status_snapshot_test.sh
+    # Validate per-MR changelog fragments (changelog.d/<slug>.<category>.md).
+    # A fragment counts as the docs update the guardrail above requires; this
+    # lints category/body/slug. Folded into CHANGELOG.md at release time.
+    - go run ./scripts/changelog --check
     - go run ./cmd/loom --help >/dev/null
     - go run ./cmd/loom proxy --help >/dev/null
 
 security:gosec:
   <<: *go-template
   stage: lint
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - when: never
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    GOMEMLIMIT: "6GiB"
+    # These values are the CEILING, not a preference. Both gitlab-runner and
+    # gitlab-runner-overflow set memory_request_overwrite_max_allowed = "4Gi"
+    # and memory_limit_overwrite_max_allowed = "8Gi" (the ci/gitlab-runner*
+    # ConfigMaps, from platform/gitops helmrelease-runner*.yaml). Asking for
+    # more does not get more: the runner rejects the job before the pod
+    # starts — "invalid build requests specified: the resource MemoryRequest
+    # requested 6Gi is higher than limit allowed 4Gi" — and the job dies in
+    # ~15s (pipeline 21199). Raising these needs a platform/gitops change to
+    # the runner chart first; do not raise them here alone.
+    KUBERNETES_MEMORY_REQUEST: "4Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - api_failure
+      - scheduler_failure
+      - unknown_failure
   script:
     - go install github.com/securego/gosec/v2/cmd/gosec@latest
-    - $(go env GOPATH)/bin/gosec -fmt json -out gosec-report.json ./...
+    # Exclude rules that are false positives or intentional patterns:
+    #   G101: env var key names, not credentials  G104: best-effort error handling
+    #   G106: SSH config flag  G115: safe int conversions  G117: struct field names
+    #   G118: intentional context.Background  G120: local-only OAuth handler
+    #   G122: CLI filepath.Walk  G204/G304: core CLI/MCP functionality
+    #   G301/G302/G306: intentional permissions  G401/G501/G505: crypto tool functionality
+    #   G402: internal LAN TLS  G702/G703/G704: core server-launch/file-read functionality
+    - >-
+      $(go env GOPATH)/bin/gosec -concurrency=2
+      -exclude=G101,G104,G106,G115,G117,G118,G120,G122,G204,G301,G302,G304,G306,G401,G402,G501,G505,G702,G703,G704
+      -exclude-dir=.go -exclude-dir=vendor
+      -fmt json -out gosec-report.json ${GO_APP_PKGS}
   artifacts:
     when: always
     paths:
@@ -200,9 +570,53 @@ security:gosec:
 security:govulncheck:
   <<: *go-template
   stage: lint
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - when: never
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    GOMEMLIMIT: "6GiB"
+    # These values are the CEILING, not a preference. Both gitlab-runner and
+    # gitlab-runner-overflow set memory_request_overwrite_max_allowed = "4Gi"
+    # and memory_limit_overwrite_max_allowed = "8Gi" (the ci/gitlab-runner*
+    # ConfigMaps, from platform/gitops helmrelease-runner*.yaml). Asking for
+    # more does not get more: the runner rejects the job before the pod
+    # starts — "invalid build requests specified: the resource MemoryRequest
+    # requested 6Gi is higher than limit allowed 4Gi" — and the job dies in
+    # ~15s (pipeline 21199). Raising these needs a platform/gitops change to
+    # the runner chart first; do not raise them here alone.
+    KUBERNETES_MEMORY_REQUEST: "4Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
     - go install golang.org/x/vuln/cmd/govulncheck@latest
-    - $(go env GOPATH)/bin/govulncheck ./... > govulncheck-report.txt
+    # -scan=package, not the default symbol mode. Precision runs
+    # module < package < symbol: module gates on a module merely being
+    # REQUIRED, package on the vulnerable package being IMPORTED, symbol on a
+    # vulnerable symbol being REACHABLE. Symbol is the most precise and
+    # therefore the most permissive.
+    #
+    # Symbol mode does not fit here. It builds SSA for the whole module and
+    # peaks at 6.9-8.4 GiB (measured locally, macOS arm64) against a hard 8Gi
+    # container cap this file cannot raise, so it OOMKilled main repeatedly
+    # (pipelines 21181/21184/21194/21204, exit 137 after 150-720s). GOMAXPROCS
+    # is not a lever — 8.41 GiB at 4, 8.32 GiB at 2; the peak is the retained
+    # package graph, not concurrency. Package mode needs 0.07 GiB and 1.3s.
+    #
+    # This is a STRICTER gate, not a weaker one: package mode also fails on
+    # vulnerabilities in packages we import but never call, which symbol mode
+    # lets through. It caught GO-2026-5841 (klauspost/compress s2 OOB read)
+    # that symbol mode had been passing over.
+    #
+    # It does NOT reintroduce the module-mode trap: GO-2026-5932
+    # (x/crypto/openpgp, "Fixed in: N/A") turned main red on 2026-07-08 under
+    # module mode because openpgp is merely required. Package mode does not
+    # flag it — nothing imports it — verified clean on a4bfe019.
+    #
+    # Restore symbol mode only alongside a platform/gitops runner-chart bump
+    # to memory_limit_overwrite_max_allowed.
+    - $(go env GOPATH)/bin/govulncheck -scan=package ./... > govulncheck-report.txt
     - cat govulncheck-report.txt
   artifacts:
     when: always
@@ -211,8 +625,12 @@ security:govulncheck:
     expire_in: 1 week
 
 lint:mcp-godot:
-  image: node:20
+  image: ${PUBLIC_IMAGE_REGISTRY}/library/node:20
   stage: lint
+  variables:
+    # This job needs repository files under tools/mcp-godot.
+    # Global GIT_STRATEGY is "none", so override to fetch sources here.
+    GIT_STRATEGY: fetch
   rules:
     - changes:
         - tools/mcp-godot/**/*
@@ -230,9 +648,63 @@ lint:mcp-godot:
 # Build binaries before tests to enable integration testing
 # =============================================================================
 
+# Build the Svelte HUD frontend bundle (vite). The bundle is embedded into the
+# loom/loomd binaries via //go:embed all:frontend/dist but is NOT committed to
+# git (its content-hashed filenames churned on every build, conflicting on every
+# concurrent HUD MR). Every Go build job that embeds it pulls this job's `dist/`
+# artifact; the Docker image builds the bundle in its own frontend stage.
+build:frontend:
+  image: ${PUBLIC_IMAGE_REGISTRY}/library/node:20
+  stage: lint
+  variables:
+    # Global GIT_STRATEGY is "none"; this job needs the frontend sources.
+    GIT_STRATEGY: fetch
+  before_script: []
+  cache:
+    key: hud-frontend-pnpm-${CI_COMMIT_REF_SLUG}
+    paths:
+      - internal/hud/frontend/node_modules/
+  script:
+    # pnpm 10 — the frontend's pnpm-workspace.yaml uses pnpm-10 settings semantics
+    # (ignoredBuiltDependencies, no `packages:` field); pnpm 9 rejects it.
+    - npm install -g pnpm@10
+    - cd internal/hud/frontend
+    - pnpm install --frozen-lockfile
+    # Static type check (svelte-check, strict tsconfig) runs first — it's the
+    # cheapest gate and catches template/prop/wire-shape drift that vitest's
+    # store-level tests can't see. Warnings don't fail; errors do.
+    - pnpm check
+    # Unit tests (vitest) run before the bundle so a store regression fails fast
+    # rather than shipping a green-but-broken dist (e.g. the pipeline-detail
+    # drawer fetch-timeout/abort guarantees).
+    - pnpm test
+    - pnpm build
+    - test -s dist/index.html
+    # `|| true`: head exiting after 20 lines SIGPIPEs ls once dist/assets has
+    # enough entries (code-split panel chunks) — this line is a log summary,
+    # not a gate; the bundle gate is the `test -s` above.
+    - echo "HUD bundle built:" && { ls -la dist dist/assets | head -20 || true; }
+  artifacts:
+    paths:
+      - internal/hud/frontend/dist/
+    expire_in: 1 day
+
 build:binaries:
   <<: *go-template
   stage: build
+  needs:
+    - job: prepare:go-cache
+      artifacts: false
+    - job: build:frontend
+      artifacts: true
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    # Keep generous limits, but lower requests so bursty branch pipelines fit
+    # more cleanly on the shared runner pool during agent-heavy development.
+    KUBERNETES_CPU_REQUEST: "1500m"
+    KUBERNETES_CPU_LIMIT: "4"
+    KUBERNETES_MEMORY_REQUEST: "3Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   cache:
     # Keep Go module/build caches shared per-branch, but keep compiled binaries
     # scoped per-commit to avoid stale/incorrect reuse.
@@ -240,7 +712,9 @@ build:binaries:
       paths:
         - .go/pkg/mod/
         - .go-build/
-      policy: pull-push
+      # Uploading this cache adds several minutes of archive time in practice
+      # (40k+ files). Keep pull-only to avoid CI wall-clock bottlenecks.
+      policy: pull
     - key: ${CI_COMMIT_SHA}-bin
       paths:
         - bin/
@@ -249,25 +723,38 @@ build:binaries:
     - |
       VERSION="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
       LDFLAGS="-s -w -X main.version=${VERSION}"
+      export LDFLAGS
 
       echo "Building all binaries..."
       mkdir -p bin
 
-      # Build main binaries
-      CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o bin/loom ./cmd/loom
-      CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o bin/loomd ./cmd/loomd
+      # The HUD bundle is embedded into cmd/loom via //go:embed and arrives as the
+      # build:frontend artifact (it is not committed). Fail loudly if it is missing
+      # rather than silently shipping a stub HUD.
+      if [ ! -s internal/hud/frontend/dist/index.html ]; then
+        echo "ERROR: internal/hud/frontend/dist/index.html missing — build:frontend artifact not present" >&2
+        exit 1
+      fi
 
-      # Build MCP servers for integration tests
-      failures=0
-      for pkg in $(ls cmd/ | grep '^mcp-'); do
-        echo "Building $pkg..."
-        if ! CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o "bin/$pkg" "./cmd/$pkg"; then
-          echo "ERROR: Failed to build $pkg"
-          failures=$((failures + 1))
-        fi
-      done
-      if [ "$failures" -ne 0 ]; then
-        echo "ERROR: $failures MCP server(s) failed to build"
+      # Build main binaries
+      go build -ldflags="$LDFLAGS" -o bin/loom ./cmd/loom
+      go build -ldflags="$LDFLAGS" -o bin/loomd ./cmd/loomd
+
+      # Build MCP servers for integration tests in parallel to reduce wall time.
+      # Cap parallelism to avoid exhausting /tmp with per-process Go build caches
+      # when building 60+ servers. Also redirect GOTMPDIR to the workspace volume
+      # which has more space than the runner's tmpfs.
+      mapfile -t MCP_PKGS < <(find cmd -mindepth 1 -maxdepth 1 -type d -name 'mcp-*' | xargs -n1 basename | sort)
+      MCP_BUILD_JOBS="${MCP_BUILD_JOBS:-4}"
+      export GOTMPDIR="${CI_PROJECT_DIR:-.}/.go-tmp"
+      mkdir -p "$GOTMPDIR"
+      echo "Building ${#MCP_PKGS[@]} MCP servers with ${MCP_BUILD_JOBS} parallel jobs..."
+      if ! printf '%s\n' "${MCP_PKGS[@]}" | xargs -P "${MCP_BUILD_JOBS}" -I{} bash -c '
+        pkg="$1"
+        echo "Building ${pkg}..."
+        go build -ldflags="$LDFLAGS" -o "bin/${pkg}" "./cmd/${pkg}"
+      ' _ {}; then
+        echo "ERROR: one or more MCP server builds failed"
         exit 1
       fi
 
@@ -280,56 +767,124 @@ build:binaries:
 # TEST STAGE
 # =============================================================================
 
+# Regression tests for the pre-commit/pre-push stash wrapper
+# (scripts/hooks/with-stashed-worktree.sh): concurrency safety (two linked
+# worktrees through the wrapper concurrently, no shared refs/stash leak or
+# cross-contamination) and rename safety (staged rename + unstaged edits
+# restores byte-exact, no merge conflicts, guarded commit succeeds).
+# Lightweight (bash + git only): skip the Go module
+# warm-up and run independently of the cache prepare job for fast feedback.
+test:hooks:
+  <<: *go-template
+  stage: test
+  needs: []
+  variables:
+    GIT_STRATEGY: fetch
+    GO_WARM_MOD_CACHE: "false"
+  before_script: []
+  script:
+    - bash scripts/hooks/with-stashed-worktree_test.sh
+    - bash scripts/hooks/with-stashed-worktree_rename_test.sh
+
+# Unit tests under flake quarantine with HONEST reruns.
+#
+# A test that fails once and passes on rerun keeps this job green — one
+# timing-dependent test must never again block every image build for 10 hours
+# the way TestStopSpawnLateStartCleanupFailureRetainsRetryablePod did on
+# 2026-08-02. But the rerun is NOT swallowed: the after_script reporter prints
+# a FLAKY-TEST-DETECTED line per rerun-pass and files/updates a deduplicated
+# `flaky-test` GitLab issue, and the rerun report ships as an artifact. A test
+# that fails every attempt still reds the job.
+#
+# This job deliberately does NOT use `retry:` for script failures — a
+# job-level retry would re-run the whole suite and hide which test flaked.
+# See docs/FLAKE_QUARANTINE.md for the unit-vs-reliability split.
 test:unit:
   <<: *go-template
   stage: test
+  needs:
+    - job: prepare:go-cache
+      artifacts: false
+  variables:
+    CGO_ENABLED: "0"
+    GO_WARM_MOD_CACHE: "false"
+    KUBERNETES_CPU_REQUEST: "1500m"
+    KUBERNETES_CPU_LIMIT: "4"
+    KUBERNETES_MEMORY_REQUEST: "3Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
+    # Verify gotestsum's rerun/coverage contract against a hermetic fixture
+    # BEFORE trusting it with the real suite. Cheap (~5s) and it is the only
+    # thing standing between a GOTESTSUM_VERSION bump and a silent regression
+    # to the coverage-clobbering behaviour documented in run_unit_tests.sh.
+    - bash scripts/ci/run_unit_tests_test.sh
+    - bash scripts/ci/run_unit_tests.sh
+  after_script:
+    # Runs on green AND red: a pipeline can absorb a flake and still hard-fail
+    # on a different test, and that flake must be recorded either way. Nothing
+    # here can change the job's verdict — GitLab ignores after_script exit
+    # codes, and the reporter exits 0 on every API problem by design.
     - |
-      echo "Selecting packages with tests..."
-      mapfile -t PKGS < <(go list -f '{{if or (gt (len .TestGoFiles) 0) (gt (len .XTestGoFiles) 0)}}{{.ImportPath}}{{end}}' ./... | sed '/^$/d')
-      echo "Packages with tests: ${#PKGS[@]}"
-
-      echo "Running unit tests with race detector..."
-      go test -race -coverprofile=coverage.out -covermode=atomic "${PKGS[@]}"
-
-      # Convert Go coverprofile to Cobertura XML for GitLab coverage reports
-      go install github.com/boumenot/gocover-cobertura@v1.4.0
-      $(go env GOPATH)/bin/gocover-cobertura < coverage.out > coverage.xml
-
-      echo ""
-      echo "Coverage Summary:"
-      go tool cover -func=coverage.out | tail -20
-
-      # Extract total coverage
-      TOTAL=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
-      echo ""
-      echo "Total Coverage: ${TOTAL}%"
-
-      # Check coverage threshold
-      if [ -n "$COVERAGE_THRESHOLD" ]; then
-        THRESHOLD_INT=$(echo "$COVERAGE_THRESHOLD" | cut -d. -f1)
-        TOTAL_INT=$(echo "$TOTAL" | cut -d. -f1)
-        if [ "$TOTAL_INT" -lt "$THRESHOLD_INT" ]; then
-          echo "ERROR: Coverage ${TOTAL}% is below threshold ${COVERAGE_THRESHOLD}%"
-          exit 1
-        fi
+      REPORTER="$CI_PROJECT_DIR/.go/bin/flakereport"
+      if [ ! -x "$REPORTER" ]; then
+        echo "flakereport not built (job ended before the test step); skipping flake reporting."
+      else
+        "$REPORTER" report --rerun-report rerun-report.txt || true
       fi
   coverage: '/total:\s+\(statements\)\s+(\d+.\d+)%/'
   artifacts:
+    # `always`: the rerun report and coverage are most valuable on a red run.
+    when: always
     paths:
       - coverage.out
       - coverage.xml
+      - rerun-report.txt
+      - junit-unit.xml
     expire_in: 1 week
     reports:
       coverage_report:
         coverage_format: cobertura
         path: coverage.xml
+      # Surfaces the flaked test in the MR test widget even when the job is
+      # green — the point is that an absorbed flake stays visible.
+      junit: junit-unit.xml
+
+# Weekly flake digest — lists every open `flaky-test` issue with its recurrence
+# count and refreshes the single rolling digest issue, feeding groomer/backlog
+# triage. Drive it from a GitLab pipeline schedule (weekly) carrying the
+# variable FLAKE_DIGEST=true; the manual rule is for on-demand refreshes.
+#
+# allow_failure + non-blocking manual mirrors ios:archive-export: an
+# un-triggered manual job must not park the pipeline in "blocked", and a
+# GitLab API hiccup must not red a scheduled pipeline.
+flake:digest:
+  <<: *go-template
+  stage: test
+  needs: []
+  allow_failure: true
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+  script:
+    - go run ./scripts/flakereport digest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $FLAKE_DIGEST == "true"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+    - when: never
 
 test:integration:
   <<: *go-template
   stage: test
   needs:
     - build:binaries
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    CGO_ENABLED: "1"
+    KUBERNETES_CPU_REQUEST: "1500m"
+    KUBERNETES_CPU_LIMIT: "4"
+    KUBERNETES_MEMORY_REQUEST: "3Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   cache:
     - key: ${CI_COMMIT_SHA}-bin
       paths:
@@ -350,13 +905,113 @@ test:integration:
       echo "Running integration tests..."
       go test -v -race ./internal/integration/...
 
+# Required feature-branch reliability contract. This is intentionally one
+# bounded job: exact scenario verification, fake-hub close/reset, targeted
+# race/crash tests, contracts/OpenAPI, same-runner benchmarks, and a 60s load.
+#
+# DELIBERATELY RERUN-FREE — do not add gotestsum --rerun-fails here.
+# The unit/reliability split is the whole point of the flake policy:
+#   test:unit        green-keeping WITH honesty. Reruns absorb a flake so one
+#                    timing bug cannot block every deploy, and each rerun-pass
+#                    is recorded as a `flaky-test` issue.
+#   test:reliability flake-HUNTING. This job exists to make races reproduce,
+#                    under load, on the shared runner. A rerun here would
+#                    destroy the signal it is built to produce.
+# The `retry:` below is scoped to runner/infra contention, not to test outcomes.
+# See docs/FLAKE_QUARANTINE.md.
+test:reliability:
+  <<: *go-template
+  stage: test
+  needs:
+    - job: prepare:go-cache
+      artifacts: false
+  # Under concurrent MR pipelines the shared runner can SIGTERM the build step
+  # (script exit 143 → script_failure), which the template's infra-only retry
+  # never catches; every such flake passed on manual retry (jobs 192219/192276/
+  # 192388/192371, 2026-07-18). One automatic retry absorbs the contention at
+  # the cost of a single re-run when the gate is genuinely red.
+  retry:
+    # Keep max at 1: script_failure is in scope here, so a genuinely red gate
+    # costs one extra 15-minute re-run and no more.
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - api_failure
+      - scheduler_failure
+      - unknown_failure
+      - script_failure
+  # Eleven paired benchmark rounds plus the mandatory 60s mixed-load test can
+  # exceed the old 810s shell budget on the shared Xeon runner even when every
+  # scenario passes. The 1080s shell deadline leaves 120s of the 20-minute job
+  # timeout for artifact upload and teardown.
+  timeout: 20 minutes
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    KUBERNETES_CPU_REQUEST: "2"
+    KUBERNETES_CPU_LIMIT: "4"
+    KUBERNETES_MEMORY_REQUEST: "4Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
+  script:
+    - timeout 1080s make ci-reliability
+  artifacts:
+    when: always
+    paths:
+      - .loom/local/evidence/fleet-reliability/
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+    - when: never
+
+test:enterprise-smoke:
+  <<: *go-template
+  stage: test
+  needs:
+    - job: prepare:go-cache
+      artifacts: false
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+  script:
+    - bash scripts/ci/enterprise_smoke_suite.sh
+
 test:race:
   <<: *go-template
   stage: test
+  needs:
+    - job: prepare:go-cache
+      artifacts: false
+  variables:
+    GO_WARM_MOD_CACHE: "false"
+    CGO_ENABLED: "1"
+    KUBERNETES_CPU_REQUEST: "1500m"
+    KUBERNETES_CPU_LIMIT: "4"
+    KUBERNETES_MEMORY_REQUEST: "3Gi"
+    KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
-    - go test -race -short ./...
+    - |
+      mapfile -t PKGS < <(bash scripts/ci/select_go_test_packages.sh --all)
+      if [ "${#PKGS[@]}" -eq 0 ]; then
+        echo "ERROR: package selector returned zero race-test packages"
+        exit 1
+      fi
+
+      # NOTE: pkg/mills/pipeline was previously quarantined here (DEBT-079,
+      # issue #176) for leaking runner goroutines under the race scheduler
+      # (double-start + "database is closed" symptoms). Fixed by
+      # Runner.Wait()/RunnerStarter.Wait() deterministic joins + the
+      # reconciler same-tick double-count fix; the package now carries race
+      # coverage like the rest of pkg/.
+
+      go test -race -short "${PKGS[@]}"
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # NB: do NOT add `if: $CI_PIPELINE_SOURCE == "merge_request_event"` here.
+    # The top-level `workflow.rules` blocks all merge_request_event pipelines
+    # (this repo runs branch pipelines), so that rule never actually runs this
+    # job — but its mere presence makes GitLab spawn a *merge request pipeline*
+    # on MR open, which the workflow then empties into a `failed` 0-job pipeline.
+    # That empty pipeline becomes the MR's head_pipeline and blocks merge with a
+    # 405 under `only_allow_merge_if_pipeline_succeeds` (the Mills autonomous-merge
+    # north-star blocker; the green branch pipeline is ignored). Branch-only here.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 # Benchmark tests - run on demand
@@ -392,7 +1047,10 @@ build:linux-amd64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-linux-amd64 ./cmd/loom
   artifacts:
     paths:
@@ -406,7 +1064,10 @@ build:linux-arm64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-linux-arm64 ./cmd/loom
   artifacts:
     paths:
@@ -420,7 +1081,10 @@ build:darwin-amd64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-darwin-amd64 ./cmd/loom
   artifacts:
     paths:
@@ -434,7 +1098,10 @@ build:darwin-arm64:
   stage: test
   needs:
     - test:unit
+    - job: build:frontend
+      artifacts: true
   script:
+    - 'test -s internal/hud/frontend/dist/index.html || { echo "ERROR: HUD dist missing (build:frontend artifact)" >&2; exit 1; }'
     - GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o ${BINARY_NAME}-darwin-arm64 ./cmd/loom
   artifacts:
     paths:
@@ -470,9 +1137,11 @@ release:
 
 deploy:homebrew:
   stage: deploy
-  image: alpine:latest
-  before_script:
-    - apk add --no-cache git curl
+  image: ${PUBLIC_IMAGE_REGISTRY}/library/alpine:3.24
+  # No before_script: this job is a placeholder that echoes. The `apk add git
+  # curl` it used to run reached dl-cdn.alpinelinux.org (no in-cluster mirror)
+  # to install tools nothing here calls. Reinstate it — behind a mirror — when
+  # the tap update is actually implemented.
   script:
     - echo "Homebrew tap update would go here"
     - echo "Update formula with new version $CI_COMMIT_TAG"
@@ -480,177 +1149,203 @@ deploy:homebrew:
     - if: $CI_COMMIT_TAG
   when: manual
 
-build:image:loom-core:
+ios:archive-export:
   stage: deploy
-  # Avoid concurrent Kaniko builds piling up ephemeral storage across nodes.
-  resource_group: kaniko
-  retry:
-    max: 1
-    when:
-      - runner_system_failure
-      - stuck_or_timeout_failure
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
-    entrypoint: [""]
-  # This repo sets GIT_STRATEGY=none globally; Kaniko jobs need a checked-out
-  # working tree, and the GitLab archive API has been returning 404.
+  tags:
+    - macos
+  needs: []
+  # This job runs repo-local signing/export scripts, so it must opt out of the
+  # global no-checkout mode and fetch a working tree first.
   variables:
     GIT_STRATEGY: fetch
   script:
-    - mkdir -p "$DOCKER_CONFIG"
-    - test -f /docker-secrets/config.json || (echo "missing /docker-secrets/config.json (Harbor auth)" && exit 1)
-    - cp /docker-secrets/config.json "$DOCKER_CONFIG/config.json"
-    - |
-      REGISTRY_CANDIDATES="${IMAGE_REGISTRIES:-$IMAGE_REGISTRY}"
-      SUCCESS=0
-      LAST_RC=1
-
-      for REGISTRY in $REGISTRY_CANDIDATES; do
-        PROBE_LOG="$CI_PROJECT_DIR/.probe-${REGISTRY//[^a-zA-Z0-9_.-]/_}.log"
-        rm -f "$PROBE_LOG"
-        if command -v wget >/dev/null 2>&1; then
-          if ! wget -q --spider --timeout=5 --tries=1 "https://$REGISTRY/v2/" >"$PROBE_LOG" 2>&1; then
-            if grep -Eqi "401|403|unauthorized|forbidden" "$PROBE_LOG"; then
-              echo "Registry host $REGISTRY is reachable (auth challenge)."
-            else
-              echo "Registry host $REGISTRY is unreachable; skipping."
-              cat "$PROBE_LOG"
-              rm -f "$PROBE_LOG"
-              continue
-            fi
-          fi
-        fi
-        rm -f "$PROBE_LOG"
-
-        IMAGE="$REGISTRY/mcp/loom-core"
-        DESTINATIONS="--destination $IMAGE:$CI_COMMIT_SHORT_SHA"
-        if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
-          DESTINATIONS="$DESTINATIONS --destination $IMAGE:latest"
-        fi
-        if [ -n "$CI_COMMIT_TAG" ]; then
-          DESTINATIONS="$DESTINATIONS --destination $IMAGE:$CI_COMMIT_TAG"
-        fi
-
-        echo "Attempting build/push via registry host: $REGISTRY"
-        echo "Building with destinations: $DESTINATIONS"
-        LOG_FILE="$CI_PROJECT_DIR/.kaniko-${REGISTRY//[^a-zA-Z0-9_.-]/_}.log"
-        rm -f "$LOG_FILE"
-        if /kaniko/executor \
-          --context "$CI_PROJECT_DIR" \
-          --dockerfile "$CI_PROJECT_DIR/Dockerfile" \
-          $DESTINATIONS \
-          --cleanup \
-          --build-arg "RUNTIME_REGISTRY=$REGISTRY" \
-          --build-arg "VERSION=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}" \
-          --build-arg "CI_JOB_TOKEN=$CI_JOB_TOKEN" >"$LOG_FILE" 2>&1; then
-          cat "$LOG_FILE"
-          rm -f "$LOG_FILE"
-          SUCCESS=1
-          break
-        fi
-
-        LAST_RC=$?
-        cat "$LOG_FILE"
-        if grep -Eqi "x509|certificate|tls handshake timeout|unknown authority|connection refused|i/o timeout|no route to host|context deadline exceeded|temporary failure in name resolution|unauthorized|denied" "$LOG_FILE"; then
-          echo "Registry host $REGISTRY failed; trying next configured host."
-          rm -f "$LOG_FILE"
-          continue
-        fi
-
-        rm -f "$LOG_FILE"
-        exit "$LAST_RC"
-      done
-
-      if [ "$SUCCESS" -ne 1 ]; then
-        echo "All registry hosts failed: $REGISTRY_CANDIDATES"
-        exit "$LAST_RC"
-      fi
+    - chmod +x scripts/mobile/import-certificate.sh scripts/mobile/archive_export.sh scripts/mobile/cleanup-signing.sh
+    - ./scripts/mobile/import-certificate.sh
+    - set -a && source build.env && set +a
+    - ./scripts/mobile/archive_export.sh
+  after_script:
+    - ./scripts/mobile/cleanup-signing.sh || true
+  artifacts:
+    when: always
+    paths:
+      - build/mobile/LoomCompanion.xcarchive
+      - build/mobile/export/app-store/*.ipa
+      - build/mobile/ExportOptions.app-store.plist
+    expire_in: 1 week
+  # allow_failure keeps this manual job non-blocking: an un-triggered iOS
+  # archive must not leave every main pipeline stuck in "blocked/manual".
+  # The server image builds (below) run on_success regardless, but a blocking
+  # manual job prevents the pipeline from ever reaching "success", which
+  # confuses operators and any pipeline-success automation. The job stays
+  # manually triggerable for actual App Store builds.
   rules:
-    - if: '$CI_COMMIT_BRANCH'
     - if: '$CI_COMMIT_TAG'
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+    - when: never
+
+build:image:loom-core:
+  stage: deploy
+  interruptible: true
+  timeout: 90 minutes
+  # Image jobs do not use language caches; skip restore/upload overhead.
+  cache: []
+  # Keep serialization within a ref, but don't let feature/MR pipelines block main.
+  resource_group: "buildkit-images-loom-core-${CI_COMMIT_REF_SLUG}"
+  retry:
+    # Keep max at 1: a 90-minute image build is expensive to re-run twice.
+    max: 1
+    when: *ci-infra-failure-reasons
+  image:
+    name: $BUILDKIT_CLI_IMAGE
+    entrypoint: [""]
+  # GIT_STRATEGY overrides the global "none" because image jobs need a working tree.
+  # DOCKER_HOST="" prevents the runner from waiting for a DinD daemon.
+  variables:
+    GIT_STRATEGY: fetch
+    DOCKER_HOST: ""
+  script:
+    - chmod +x scripts/ci/buildkit-build.sh
+    # FRONTEND_TREE pins the Dockerfile's frontend stage to the exact git
+    # content of internal/hud/frontend. BuildKit's context checksum falsely
+    # CACHED the frontend COPY+build on 2026-07-27 (pipeline 21165 → image
+    # 20260727-161926), deploying a stale HUD bundle that was missing 9 merged
+    # frontend commits. Fall back to the commit SHA (always-rebuild) if the
+    # buildkit CLI image has no git — correctness beats cache reuse here.
+    - FRONTEND_TREE=$(git rev-parse "HEAD:internal/hud/frontend" 2>/dev/null || echo "$CI_COMMIT_SHA")
+    - echo "FRONTEND_TREE=${FRONTEND_TREE}"
+    - scripts/ci/buildkit-build.sh mcp/loom-core Dockerfile loom-core --opt "build-arg:FRONTEND_TREE=${FRONTEND_TREE}"
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    # Default branch: only (re)build + publish the Flux-deployable
+    # `:YYYYMMDD-HHMMSS` tag when the image's real inputs change. Without this
+    # gate every main merge (docs, Mills, CI config, unrelated services) minted
+    # a fresh timestamp tag, which Flux Image Automation deployed — rolling the
+    # whole shared-image loom-hub fleet on every publish (loom-core backs
+    # mobile-hud; custom-server backs ~45 MCP servers). Mirrors the
+    # feature-branch `changes:` list below so main and MR builds gate on the
+    # same inputs. Investigation: loom-hub image-churn, 2026-07-04.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - .gitlab-ci.yml
+        - .dockerignore
+        - Dockerfile
+        - scripts/ci/buildkit-build.sh
+        - go.mod
+        - go.sum
+        - cmd/**/*
+        - internal/**/*
+        - pkg/**/*
+    - if: '$CI_COMMIT_BRANCH'
+      changes:
+        - .gitlab-ci.yml
+        - .dockerignore
+        - Dockerfile
+        - scripts/ci/buildkit-build.sh
+        - go.mod
+        - go.sum
+        - cmd/**/*
+        - internal/**/*
+        - pkg/**/*
+      allow_failure: true
+    - when: never
 
 build:image:custom-server:
   stage: deploy
-  # Avoid concurrent Kaniko builds piling up ephemeral storage across nodes.
-  resource_group: kaniko
+  interruptible: true
+  timeout: 90 minutes
+  cache: []
+  resource_group: "buildkit-images-custom-server-${CI_COMMIT_REF_SLUG}"
   retry:
+    # Keep max at 1: a 90-minute image build is expensive to re-run twice.
     max: 1
-    when:
-      - runner_system_failure
-      - stuck_or_timeout_failure
+    when: *ci-infra-failure-reasons
   image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    name: $BUILDKIT_CLI_IMAGE
     entrypoint: [""]
   variables:
     GIT_STRATEGY: fetch
+    DOCKER_HOST: ""
   script:
-    - mkdir -p "$DOCKER_CONFIG"
-    - test -f /docker-secrets/config.json || (echo "missing /docker-secrets/config.json (Harbor auth)" && exit 1)
-    - cp /docker-secrets/config.json "$DOCKER_CONFIG/config.json"
-    - |
-      REGISTRY_CANDIDATES="${IMAGE_REGISTRIES:-$IMAGE_REGISTRY}"
-      SUCCESS=0
-      LAST_RC=1
-
-      for REGISTRY in $REGISTRY_CANDIDATES; do
-        PROBE_LOG="$CI_PROJECT_DIR/.probe-${REGISTRY//[^a-zA-Z0-9_.-]/_}.log"
-        rm -f "$PROBE_LOG"
-        if command -v wget >/dev/null 2>&1; then
-          if ! wget -q --spider --timeout=5 --tries=1 "https://$REGISTRY/v2/" >"$PROBE_LOG" 2>&1; then
-            if grep -Eqi "401|403|unauthorized|forbidden" "$PROBE_LOG"; then
-              echo "Registry host $REGISTRY is reachable (auth challenge)."
-            else
-              echo "Registry host $REGISTRY is unreachable; skipping."
-              cat "$PROBE_LOG"
-              rm -f "$PROBE_LOG"
-              continue
-            fi
-          fi
-        fi
-        rm -f "$PROBE_LOG"
-
-        IMAGE="$REGISTRY/$CUSTOM_SERVER_IMAGE_REPO"
-        DESTINATIONS="--destination $IMAGE:$CI_COMMIT_SHORT_SHA"
-        if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
-          DESTINATIONS="$DESTINATIONS --destination $IMAGE:latest"
-        fi
-        if [ -n "$CI_COMMIT_TAG" ]; then
-          DESTINATIONS="$DESTINATIONS --destination $IMAGE:$CI_COMMIT_TAG"
-        fi
-
-        echo "Attempting build/push via registry host: $REGISTRY"
-        echo "Building with destinations: $DESTINATIONS"
-        LOG_FILE="$CI_PROJECT_DIR/.kaniko-${REGISTRY//[^a-zA-Z0-9_.-]/_}.log"
-        rm -f "$LOG_FILE"
-        if /kaniko/executor \
-          --context "$CI_PROJECT_DIR" \
-          --dockerfile "$CI_PROJECT_DIR/Dockerfile.custom-server" \
-          $DESTINATIONS \
-          --cleanup \
-          --build-arg "RUNTIME_REGISTRY=$REGISTRY" \
-          --build-arg "CI_JOB_TOKEN=$CI_JOB_TOKEN" >"$LOG_FILE" 2>&1; then
-          cat "$LOG_FILE"
-          rm -f "$LOG_FILE"
-          SUCCESS=1
-          break
-        fi
-
-        LAST_RC=$?
-        cat "$LOG_FILE"
-        if grep -Eqi "x509|certificate|tls handshake timeout|unknown authority|connection refused|i/o timeout|no route to host|context deadline exceeded|temporary failure in name resolution|unauthorized|denied" "$LOG_FILE"; then
-          echo "Registry host $REGISTRY failed; trying next configured host."
-          rm -f "$LOG_FILE"
-          continue
-        fi
-
-        rm -f "$LOG_FILE"
-        exit "$LAST_RC"
-      done
-
-      if [ "$SUCCESS" -ne 1 ]; then
-        echo "All registry hosts failed: $REGISTRY_CANDIDATES"
-        exit "$LAST_RC"
-      fi
+    - chmod +x scripts/ci/buildkit-build.sh
+    - scripts/ci/buildkit-build.sh "$CUSTOM_SERVER_IMAGE_REPO" Dockerfile.custom-server custom-server
   rules:
-    - if: '$CI_COMMIT_BRANCH'
     - if: '$CI_COMMIT_TAG'
+    # Default branch: only (re)build + publish the Flux-deployable
+    # `:YYYYMMDD-HHMMSS` tag when the image's real inputs change. Without this
+    # gate every main merge (docs, Mills, CI config, unrelated services) minted
+    # a fresh timestamp tag, which Flux Image Automation deployed — rolling the
+    # whole shared-image loom-hub fleet on every publish (custom-server backs
+    # ~45 MCP servers via one mono-binary). Mirrors the feature-branch
+    # `changes:` list below so main and MR builds gate on the same inputs.
+    # Investigation: loom-hub image-churn, 2026-07-04.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - .gitlab-ci.yml
+        - .dockerignore
+        - Dockerfile.custom-server
+        - scripts/ci/buildkit-build.sh
+        - go.mod
+        - go.sum
+        - cmd/**/*
+        - internal/**/*
+        - pkg/**/*
+    - if: '$CI_COMMIT_BRANCH'
+      changes:
+        - .gitlab-ci.yml
+        - .dockerignore
+        - Dockerfile.custom-server
+        - scripts/ci/buildkit-build.sh
+        - go.mod
+        - go.sum
+        - cmd/**/*
+        - internal/**/*
+        - pkg/**/*
+      allow_failure: true
+    - when: never
+
+# Loom Mills operator image — the always-on cluster control plane (council
+# scheduler + pipeline reconciler). Built from Dockerfile.loom-mills-operator
+# which produces a distroless single-binary image. The platform/gitops
+# k3s/mills deployment pins this image by short-sha; main-branch builds
+# also tag :latest for flux force-reconcile in dev environments.
+build:image:loom-mills-operator:
+  stage: deploy
+  interruptible: true
+  timeout: 90 minutes
+  cache: []
+  resource_group: "buildkit-images-loom-mills-operator-${CI_COMMIT_REF_SLUG}"
+  retry:
+    # Keep max at 1: a 90-minute image build is expensive to re-run twice.
+    max: 1
+    when: *ci-infra-failure-reasons
+  image:
+    name: $BUILDKIT_CLI_IMAGE
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: fetch
+    DOCKER_HOST: ""
+  script:
+    - chmod +x scripts/ci/buildkit-build.sh
+    - scripts/ci/buildkit-build.sh mcp/loom-mills-operator Dockerfile.loom-mills-operator loom-mills-operator
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH'
+      changes:
+        - .gitlab-ci.yml
+        - .dockerignore
+        - Dockerfile.loom-mills-operator
+        - scripts/ci/buildkit-build.sh
+        - go.mod
+        - go.sum
+        - cmd/loom-mills-operator/**/*
+        - pkg/mills/**/*
+      allow_failure: true
+    - when: never
+
+radar-scan:
+  extends: .radar-scan

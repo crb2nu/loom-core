@@ -1,11 +1,24 @@
-<script>
-  let { open = false, title = '', onClose = () => {}, children } = $props();
+<script lang="ts">
+  import type { Snippet } from 'svelte';
+  import { focusTrap } from '../actions/focusTrap';
 
-  function handleBackdropClick(e) {
+  let {
+    open = false,
+    title = '',
+    onClose = () => {},
+    children,
+  }: {
+    open?: boolean;
+    title?: string;
+    onClose?: () => void;
+    children?: Snippet;
+  } = $props();
+
+  function handleBackdropClick(e: MouseEvent) {
     if (e.target === e.currentTarget) onClose();
   }
 
-  function handleKeydown(e) {
+  function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
   }
 </script>
@@ -13,20 +26,16 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open}
-  <div
-    class="modal-backdrop"
-    role="button"
-    tabindex="0"
-    aria-label="Close modal"
-    onclick={handleBackdropClick}
-    onkeydown={(e) => {
-      if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') handleBackdropClick(e);
-    }}
-  >
-    <div class="modal" role="dialog" aria-modal="true" aria-label={title}>
+  <!-- Backdrop is presentational: click-outside closes, but keyboard users
+       dismiss via Escape (window handler) or the labelled close button, so the
+       backdrop is not itself a focusable control. -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div class="modal-backdrop" onclick={handleBackdropClick}>
+    <div class="modal" role="dialog" aria-modal="true" aria-label={title} use:focusTrap>
       <div class="modal-header">
         <h3 class="modal-title">{title}</h3>
-        <button class="modal-close" onclick={onClose}>✕</button>
+        <button class="modal-close" aria-label="Close" onclick={onClose}>✕</button>
       </div>
       <div class="modal-body">
         {@render children?.()}
@@ -45,7 +54,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 900;
+    z-index: var(--z-modal);
     animation: backdropFadeIn 0.15s ease;
   }
   .modal {
@@ -54,8 +63,10 @@
     -webkit-backdrop-filter: blur(var(--glass-blur));
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-lg);
-    min-width: 380px;
-    max-width: 540px;
+    /* min() keeps the desktop width but never exceeds the viewport on
+       phones — a fixed 380px overflowed a 360px screen (WCAG 1.4.10). */
+    min-width: min(380px, calc(100vw - 32px));
+    max-width: min(540px, calc(100vw - 32px));
     max-height: 80vh;
     display: flex;
     flex-direction: column;

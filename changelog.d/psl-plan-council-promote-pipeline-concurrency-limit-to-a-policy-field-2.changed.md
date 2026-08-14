@@ -1,0 +1,1 @@
+- Make `pkg/mills/runner/runner.go` consume the pipeline concurrency policy through the safe limiter in `internal/loomconcurrency/concurrency.go`.

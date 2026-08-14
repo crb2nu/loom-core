@@ -14,11 +14,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -45,9 +47,26 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-sentry",
+		logger,
+	)
+	if err !=
+		nil {
+		logger.Warn("OTel tracer init failed",
+
+			"error",
+			err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.
+		Tracer(tp, "mcp-sentry")
+
 	logger.Info("starting server", "name", "mcp-sentry", "version", version, "url", sentryURL)
 
 	server := mcp.NewServer("mcp-sentry", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Sentry error tracking tools. Configure with SENTRY_AUTH_TOKEN and SENTRY_ORG. Optionally set SENTRY_URL for self-hosted instances.")
 
 	// Organizations and Projects
@@ -63,7 +82,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListProjects)
+	}, mcpotel.TracedToolHandler(tracer, "sentry_list_projects", handleListProjects))
 
 	server.AddTool(mcp.Tool{
 		Name:        "sentry_get_project",
@@ -82,9 +101,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project"},
 		},
-	}, handleGetProject)
+	}, mcpotel.TracedToolHandler(
 
-	// Issues
+		// Issues
+		tracer, "sentry_get_project", handleGetProject))
+
 	server.AddTool(mcp.Tool{
 		Name:        "sentry_list_issues",
 		Description: "List issues for a project",
@@ -115,7 +136,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project"},
 		},
-	}, handleListIssues)
+	}, mcpotel.TracedToolHandler(tracer, "sentry_list_issues", handleListIssues))
 
 	server.AddTool(mcp.Tool{
 		Name:        "sentry_get_issue",
@@ -130,7 +151,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"issue_id"},
 		},
-	}, handleGetIssue)
+	}, mcpotel.TracedToolHandler(tracer, "sentry_get_issue", handleGetIssue))
 
 	server.AddTool(mcp.Tool{
 		Name:        "sentry_list_issue_events",
@@ -149,9 +170,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"issue_id"},
 		},
-	}, handleListIssueEvents)
+	}, mcpotel.TracedToolHandler(tracer,
 
-	// Events
+		// Events
+		"sentry_list_issue_events", handleListIssueEvents))
+
 	server.AddTool(mcp.Tool{
 		Name:        "sentry_get_event",
 		Description: "Get event details including stacktrace",
@@ -173,9 +196,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project", "event_id"},
 		},
-	}, handleGetEvent)
+	}, mcpotel.TracedToolHandler(
 
-	// Stats
+		// Stats
+		tracer, "sentry_get_event", handleGetEvent))
+
 	server.AddTool(mcp.Tool{
 		Name:        "sentry_project_stats",
 		Description: "Get project error statistics",
@@ -203,9 +228,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project"},
 		},
-	}, handleProjectStats)
+	}, mcpotel.TracedToolHandler(
 
-	// Releases
+		// Releases
+		tracer, "sentry_project_stats", handleProjectStats))
+
 	server.AddTool(mcp.Tool{
 		Name:        "sentry_list_releases",
 		Description: "List releases for a project",
@@ -227,7 +254,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project"},
 		},
-	}, handleListReleases)
+	}, mcpotel.TracedToolHandler(tracer, "sentry_list_releases", handleListReleases))
 
 	return server.Run(ctx)
 }

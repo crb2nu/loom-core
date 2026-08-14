@@ -1,0 +1,1 @@
+- Expose the local BrowserKit screenshot tool through the `llm-core` proxy profile used by Codex, Claude, and Kilo.

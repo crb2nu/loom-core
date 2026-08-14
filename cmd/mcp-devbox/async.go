@@ -16,14 +16,15 @@ import (
 
 // asyncExec represents a running or completed async exec.
 type asyncExec struct {
-	ID        string              `json:"id"`
-	Project   string              `json:"project"`
-	Command   string              `json:"command"`
-	Status    string              `json:"status"` // "running", "completed", "failed"
-	Result    *backend.ExecResult `json:"result,omitempty"`
-	Error     string              `json:"error,omitempty"`
-	StartedAt time.Time           `json:"started_at"`
-	cancel    context.CancelFunc
+	ID          string              `json:"id"`
+	Project     string              `json:"project"`
+	Command     string              `json:"command"`
+	Status      string              `json:"status"` // "running", "completed", "failed"
+	Result      *backend.ExecResult `json:"result,omitempty"`
+	Error       string              `json:"error,omitempty"`
+	StartedAt   time.Time           `json:"started_at"`
+	CompletedAt *time.Time          `json:"completed_at,omitempty"`
+	cancel      context.CancelFunc
 }
 
 // asyncRegistry tracks in-flight and recently completed async execs.
@@ -56,7 +57,15 @@ func (r *asyncRegistry) cleanup(maxAge time.Duration) {
 	defer r.mu.Unlock()
 	cutoff := time.Now().Add(-maxAge)
 	for id, e := range r.execs {
-		if e.Status != "running" && e.StartedAt.Before(cutoff) {
+		if e.Status == "running" {
+			continue
+		}
+
+		completedAt := e.StartedAt
+		if e.CompletedAt != nil {
+			completedAt = *e.CompletedAt
+		}
+		if completedAt.Before(cutoff) {
 			delete(r.execs, id)
 		}
 	}
@@ -102,7 +111,8 @@ func (m *manager) handleExecAsync(ctx context.Context, args map[string]any) (*mc
 		return mcp.ErrorResult(err), nil
 	}
 
-	mu := m.projectLock(projectName)
+	key := storeKey(projectName, agentID)
+	mu := m.projectLock(key)
 	mu.Lock()
 	containerID, err := m.ensureRunning(ctx, projectDir, projectName, agentID)
 	mu.Unlock()
@@ -110,6 +120,7 @@ func (m *manager) handleExecAsync(ctx context.Context, args map[string]any) (*mc
 		return mcp.ErrorResult(fmt.Errorf("ensure sandbox: %w", err)), nil
 	}
 
+	m.totalExecs.Add(1)
 	execID := generateExecID()
 	execCtx, cancel := context.WithTimeout(context.Background(), timeout)
 
@@ -122,13 +133,19 @@ func (m *manager) handleExecAsync(ctx context.Context, args map[string]any) (*mc
 		cancel:    cancel,
 	}
 	m.asyncExecs.add(ae)
+	if m.events != nil {
+		m.events.Emit(ctx, "exec", projectName,
+			fmt.Sprintf("queued exec_id=%s cmd=%s", execID, command))
+	}
 
 	// Touch before exec so reaper won't kill the container
-	_ = m.store.TouchLastUsed(projectName)
-	m.incActiveExecs(projectName)
+	_ = m.store.TouchLastUsed(key)
+	m.incActiveExecs(key)
 
+	m.asyncWg.Add(1)
 	go func() {
-		defer m.decActiveExecs(projectName)
+		defer m.asyncWg.Done()
+		defer m.decActiveExecs(key)
 		defer cancel()
 
 		result, err := m.backend.Exec(execCtx, backend.ExecOpts{
@@ -139,16 +156,26 @@ func (m *manager) handleExecAsync(ctx context.Context, args map[string]any) (*mc
 			MaxLines:    100, // async gets more output
 		})
 
-		_ = m.store.TouchLastUsed(projectName)
+		_ = m.store.TouchLastUsed(key)
 
 		m.asyncExecs.mu.Lock()
 		defer m.asyncExecs.mu.Unlock()
+		completedAt := time.Now()
+		ae.CompletedAt = &completedAt
 		if err != nil {
 			ae.Status = "failed"
 			ae.Error = err.Error()
+			if m.events != nil {
+				m.events.Emit(context.Background(), "exec", projectName,
+					fmt.Sprintf("failed exec_id=%s cmd=%s error=%s", execID, command, err))
+			}
 		} else {
 			ae.Status = "completed"
 			ae.Result = result
+			if m.events != nil {
+				m.events.Emit(context.Background(), "exec", projectName,
+					fmt.Sprintf("completed exec_id=%s exit=%d duration=%dms cmd=%s", execID, result.ExitCode, result.DurationMs, command))
+			}
 		}
 	}()
 
@@ -179,6 +206,9 @@ func (m *manager) handleExecPoll(_ context.Context, args map[string]any) (*mcp.C
 		"command":    ae.Command,
 		"started_at": ae.StartedAt.Format(time.RFC3339),
 		"elapsed_ms": time.Since(ae.StartedAt).Milliseconds(),
+	}
+	if ae.CompletedAt != nil {
+		result["completed_at"] = ae.CompletedAt.Format(time.RFC3339)
 	}
 
 	if ae.Result != nil {

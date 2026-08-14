@@ -10,18 +10,20 @@ import (
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
+type WorkflowSvc struct{ *Service }
+
 // SetToolExecutor sets the callback for executing MCP tools from workflows
-func (s *Service) SetToolExecutor(executor ToolExecutor) {
+func (s *WorkflowSvc) SetToolExecutor(executor ToolExecutor) {
 	s.workflowEngine.toolExecutor = executor
 }
 
 // GetWorkflowEngine returns the workflow engine for direct access
-func (s *Service) GetWorkflowEngine() *WorkflowEngine {
+func (s *WorkflowSvc) GetWorkflowEngine() *WorkflowEngine {
 	return s.workflowEngine
 }
 
 // HandleWorkflowDefine registers a new workflow definition
-func (s *Service) HandleWorkflowDefine(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowDefine(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	id := v.String("id", "")
 	name := v.Required("name")
@@ -42,51 +44,9 @@ func (s *Service) HandleWorkflowDefine(ctx context.Context, args map[string]any)
 		return mcp.ErrorResult(fmt.Errorf("steps array is required")), nil
 	}
 
-	steps := make([]WorkflowStep, len(stepsArr))
-	for i, stepRaw := range stepsArr {
-		stepMap, ok := stepRaw.(map[string]any)
-		if !ok {
-			return mcp.ErrorResult(fmt.Errorf("step %d must be an object", i)), nil
-		}
-
-		step := WorkflowStep{
-			ID:               toString(stepMap["id"]),
-			Name:             toString(stepMap["name"]),
-			Description:      toString(stepMap["description"]),
-			StepType:         StepType(toString(stepMap["step_type"])),
-			ToolName:         toString(stepMap["tool_name"]),
-			ServerName:       toString(stepMap["server_name"]),
-			RequiresApproval: getBool(stepMap["requires_approval"], false),
-			ApprovalMessage:  toString(stepMap["approval_message"]),
-			Condition:        toString(stepMap["condition"]),
-			MaxRetries:       toInt(stepMap["max_retries"]),
-			RetryDelay:       toInt(stepMap["retry_delay_ms"]),
-			Timeout:          toInt(stepMap["timeout_seconds"]),
-			RollbackStepID:   toString(stepMap["rollback_step_id"]),
-			SubflowID:        toString(stepMap["subflow_id"]),
-		}
-
-		if step.ID == "" {
-			step.ID = fmt.Sprintf("step-%d", i+1)
-		}
-		if step.StepType == "" {
-			step.StepType = StepTypeTool
-		}
-
-		// Parse tool args
-		if toolArgs, ok := stepMap["tool_args"].(map[string]any); ok {
-			step.ToolArgs = toolArgs
-		}
-
-		// Parse depends_on
-		if deps, ok := stepMap["depends_on"].([]any); ok {
-			step.DependsOn = make([]string, len(deps))
-			for j, dep := range deps {
-				step.DependsOn[j] = toString(dep)
-			}
-		}
-
-		steps[i] = step
+	steps, err := parseWorkflowSteps(stepsArr)
+	if err != nil {
+		return mcp.ErrorResult(err), nil
 	}
 
 	def := &WorkflowDefinition{
@@ -117,8 +77,97 @@ func (s *Service) HandleWorkflowDefine(ctx context.Context, args map[string]any)
 	})
 }
 
+// parseWorkflowSteps converts a JSON/YAML-decoded []any into typed steps.
+// Errors carry the failing index so definition authors can find the step.
+func parseWorkflowSteps(stepsArr []any) ([]WorkflowStep, error) {
+	steps := make([]WorkflowStep, len(stepsArr))
+	for i, stepRaw := range stepsArr {
+		stepMap, ok := stepRaw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("step %d must be an object", i)
+		}
+		step, err := parseWorkflowStepMap(stepMap)
+		if err != nil {
+			return nil, fmt.Errorf("step %d: %w", i, err)
+		}
+		if step.ID == "" {
+			step.ID = fmt.Sprintf("step-%d", i+1)
+		}
+		steps[i] = step
+	}
+	return steps, nil
+}
+
+// parseWorkflowStepMap parses one step object, recursing into
+// parallel_steps and map_step_template so parallel and map_reduce steps
+// are definable through the public define path (they previously parsed
+// to bare steps that failed at execution time).
+func parseWorkflowStepMap(stepMap map[string]any) (WorkflowStep, error) {
+	step := WorkflowStep{
+		ID:                     toString(stepMap["id"]),
+		Name:                   toString(stepMap["name"]),
+		Description:            toString(stepMap["description"]),
+		StepType:               StepType(toString(stepMap["step_type"])),
+		ToolName:               toString(stepMap["tool_name"]),
+		ServerName:             toString(stepMap["server_name"]),
+		RequiresApproval:       getBool(stepMap["requires_approval"], false),
+		ApprovalMessage:        toString(stepMap["approval_message"]),
+		ApprovalTimeoutSeconds: toInt(stepMap["approval_timeout_seconds"]),
+		Condition:              toString(stepMap["condition"]),
+		MaxRetries:             toInt(stepMap["max_retries"]),
+		RetryDelay:             toInt(stepMap["retry_delay_ms"]),
+		Timeout:                toInt(stepMap["timeout_seconds"]),
+		RollbackStepID:         toString(stepMap["rollback_step_id"]),
+		SubflowID:              toString(stepMap["subflow_id"]),
+		MapInputKey:            toString(stepMap["map_input_key"]),
+		ReduceToolName:         toString(stepMap["reduce_tool_name"]),
+		ReduceServerName:       toString(stepMap["reduce_server_name"]),
+		MaxConcurrency:         toInt(stepMap["max_concurrency"]),
+	}
+
+	if step.StepType == "" {
+		step.StepType = StepTypeTool
+	}
+
+	// Parse tool args
+	if toolArgs, ok := stepMap["tool_args"].(map[string]any); ok {
+		step.ToolArgs = toolArgs
+	}
+	if reduceArgs, ok := stepMap["reduce_tool_args"].(map[string]any); ok {
+		step.ReduceToolArgs = reduceArgs
+	}
+
+	// Parse depends_on
+	if deps, ok := stepMap["depends_on"].([]any); ok {
+		step.DependsOn = make([]string, len(deps))
+		for j, dep := range deps {
+			step.DependsOn[j] = toString(dep)
+		}
+	}
+
+	// Recurse: map_reduce template step.
+	if tmplRaw, ok := stepMap["map_step_template"].(map[string]any); ok {
+		tmpl, err := parseWorkflowStepMap(tmplRaw)
+		if err != nil {
+			return step, fmt.Errorf("map_step_template: %w", err)
+		}
+		step.MapStepTemplate = &tmpl
+	}
+
+	// Recurse: parallel child steps.
+	if parRaw, ok := stepMap["parallel_steps"].([]any); ok {
+		children, err := parseWorkflowSteps(parRaw)
+		if err != nil {
+			return step, fmt.Errorf("parallel_steps: %w", err)
+		}
+		step.ParallelSteps = children
+	}
+
+	return step, nil
+}
+
 // HandleWorkflowStart starts a new workflow instance
-func (s *Service) HandleWorkflowStart(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowStart(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	definitionID := v.Required("definition_id")
 	sessionID := v.Required("session_id")
@@ -150,7 +199,7 @@ func (s *Service) HandleWorkflowStart(ctx context.Context, args map[string]any) 
 }
 
 // HandleWorkflowStatus gets the status of a workflow
-func (s *Service) HandleWorkflowStatus(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowStatus(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	workflowID := v.Required("workflow_id")
 
@@ -173,13 +222,18 @@ func (s *Service) HandleWorkflowStatus(ctx context.Context, args map[string]any)
 	for _, step := range wf.Definition.Steps {
 		state := wf.StepStates[step.ID]
 		summary := map[string]any{
-			"id":     step.ID,
-			"name":   step.Name,
-			"type":   string(step.StepType),
-			"status": string(state.Status),
+			"id":          step.ID,
+			"name":        step.Name,
+			"type":        string(step.StepType),
+			"status":      string(state.Status),
+			"retry_count": state.RetryCount,
+			"max_retries": state.MaxRetries,
 		}
 		if state.Error != "" {
 			summary["error"] = state.Error
+		}
+		if state.Result != nil {
+			summary["result"] = state.Result
 		}
 		if state.ApprovalInfo != nil {
 			summary["approval_status"] = string(state.ApprovalInfo.Status)
@@ -218,7 +272,7 @@ func (s *Service) HandleWorkflowStatus(ctx context.Context, args map[string]any)
 }
 
 // HandleWorkflowList lists workflows with filtering
-func (s *Service) HandleWorkflowList(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowList(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	sessionID := v.String("session_id", "")
 	agentID := v.String("agent_id", s.cfg.DefaultAgentID)
@@ -251,7 +305,7 @@ func (s *Service) HandleWorkflowList(ctx context.Context, args map[string]any) (
 }
 
 // HandleWorkflowApprove approves a pending step
-func (s *Service) HandleWorkflowApprove(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowApprove(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	workflowID := v.Required("workflow_id")
 	stepID := v.Required("step_id")
@@ -280,7 +334,7 @@ func (s *Service) HandleWorkflowApprove(ctx context.Context, args map[string]any
 }
 
 // HandleWorkflowReject rejects a pending step
-func (s *Service) HandleWorkflowReject(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowReject(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	workflowID := v.Required("workflow_id")
 	stepID := v.Required("step_id")
@@ -309,7 +363,7 @@ func (s *Service) HandleWorkflowReject(ctx context.Context, args map[string]any)
 }
 
 // HandleWorkflowCancel cancels a running workflow
-func (s *Service) HandleWorkflowCancel(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowCancel(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	workflowID := v.Required("workflow_id")
 	reason := v.String("reason", "cancelled by user")
@@ -335,7 +389,7 @@ func (s *Service) HandleWorkflowCancel(ctx context.Context, args map[string]any)
 }
 
 // HandleWorkflowEvents gets events for a workflow
-func (s *Service) HandleWorkflowEvents(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowEvents(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	workflowID := v.Required("workflow_id")
 
@@ -372,7 +426,7 @@ func (s *Service) HandleWorkflowEvents(ctx context.Context, args map[string]any)
 }
 
 // HandleWorkflowDefinitionList lists workflow definitions
-func (s *Service) HandleWorkflowDefinitionList(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *WorkflowSvc) HandleWorkflowDefinitionList(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	namespace := v.String("namespace", "")
 

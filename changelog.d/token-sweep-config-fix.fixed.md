@@ -1,0 +1,1 @@
+- HUD Mills: add a typed `MillsPanel` shell, semantic Mills design-token aliases, and deterministic frontend lint/validation scripts while applying the aliases to the shared `PanelShell`.

@@ -1,0 +1,1 @@
+- Classify GitLab-unreachable gate errors in `pkg/mills/gates/gates.go` as retryable external dependencies, keep their verdicts fail-closed, expose a dedicated counter, and document recovery in `docs/MILLS.md`.

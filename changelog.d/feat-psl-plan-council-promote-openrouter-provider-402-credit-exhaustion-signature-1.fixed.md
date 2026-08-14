@@ -1,0 +1,1 @@
+- Add a persisted, narrowly scoped OpenRouter HTTP 402 credit-exhaustion signature classified as non-retryable `external_dependency_incident` in `pkg/mills/pipeline/failure_signatures.go`, with focused positive and near-miss coverage in `pkg/mills/pipeline/failure_signatures_test.go`.

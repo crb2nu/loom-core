@@ -1,0 +1,1 @@
+- Make Mills auto-requeue state transitions and retry-cap audit events atomic so concurrent requeues cannot double-count and failed event writes cannot bypass unattended retry caps.

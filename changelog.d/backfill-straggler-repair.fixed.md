@@ -1,0 +1,1 @@
+- Repair deterministic agent-context embedding backfill failures by safely bounding long UTF-8 inputs and report rate-capped per-row warnings with a failure-reason histogram (`pkg/agentcontext/embed_fallback.go`, `pkg/agentcontext/svc_context.go`, and `pkg/agentcontext/svc_patterns.go`).

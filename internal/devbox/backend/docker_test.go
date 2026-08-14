@@ -135,3 +135,102 @@ func TestDockerStart_PassesMountsAndNetworkFlags(t *testing.T) {
 		t.Fatalf("missing --network none in args: %q", runLine)
 	}
 }
+
+func TestDockerStart_DefaultManagedByLabel(t *testing.T) {
+	dockerPath, logPath := writeFakeDocker(t)
+	d := &DockerBackend{dockerPath: dockerPath}
+
+	_, err := d.Start(context.Background(), StartOpts{
+		Name:     "devbox-test",
+		ImageTag: "test:latest",
+		Network:  true,
+	})
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	lines := readLogLines(t, logPath)
+	runLine := lines[len(lines)-1]
+	if !strings.Contains(runLine, "--label app.kubernetes.io/managed-by=mcp-devbox") {
+		t.Fatalf("missing default managed-by label in args: %q", runLine)
+	}
+	if !strings.Contains(runLine, "--label devbox/project=devbox-test") {
+		t.Fatalf("missing devbox/project label in args: %q", runLine)
+	}
+}
+
+func TestDockerStart_ManagedByOverrideAndExtraLabels(t *testing.T) {
+	dockerPath, logPath := writeFakeDocker(t)
+	d := &DockerBackend{dockerPath: dockerPath}
+
+	_, err := d.Start(context.Background(), StartOpts{
+		Name:              "spawn-abc123",
+		ImageTag:          "test:latest",
+		Network:           true,
+		AgentID:           "agent-1",
+		ManagedByOverride: "loom-spawn",
+		ExtraLabels: map[string]string{
+			"loom.dev/spawn-id": "spawn-abc123",
+			"loom.dev/agent-id": "agent-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	lines := readLogLines(t, logPath)
+	runLine := lines[len(lines)-1]
+	if !strings.Contains(runLine, "--label app.kubernetes.io/managed-by=loom-spawn") {
+		t.Fatalf("missing overridden managed-by label in args: %q", runLine)
+	}
+	if !strings.Contains(runLine, "--label devbox/agent-id=agent-1") {
+		t.Fatalf("missing agent-id label in args: %q", runLine)
+	}
+	if !strings.Contains(runLine, "--label loom.dev/spawn-id=spawn-abc123") {
+		t.Fatalf("missing spawn-id extra label in args: %q", runLine)
+	}
+	if !strings.Contains(runLine, "--label loom.dev/agent-id=agent-1") {
+		t.Fatalf("missing agent-id extra label in args: %q", runLine)
+	}
+}
+
+// writeFakeDockerInspectMemory builds a docker stub whose `inspect` prints a
+// fixed HostConfig.Memory byte count, which is what containerMemoryLimit reads.
+func writeFakeDockerInspectMemory(t *testing.T, memBytes string) string {
+	t.Helper()
+	dir := t.TempDir()
+	dockerPath := filepath.Join(dir, "docker")
+	script := "#!/bin/sh\nset -eu\ncase \"${1:-}\" in\n  inspect) echo " + memBytes + " ;;\n  *) ;;\nesac\n"
+	if err := os.WriteFile(dockerPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake docker script: %v", err)
+	}
+	return dockerPath
+}
+
+func TestDockerContainerMemoryLimit(t *testing.T) {
+	tests := []struct {
+		name     string
+		memBytes string
+		want     string
+	}{
+		{"4Gi limit", "4294967296", "4096Mi"},
+		{"1Gi limit", "1073741824", "1024Mi"},
+		{"docker reports 0 for unlimited", "0", ""},
+		{"unparseable output", "not-a-number", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &DockerBackend{dockerPath: writeFakeDockerInspectMemory(t, tt.memBytes)}
+			if got := d.containerMemoryLimit(context.Background(), "devbox-foo"); got != tt.want {
+				t.Errorf("containerMemoryLimit() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDockerContainerMemoryLimit_DockerUnreachable(t *testing.T) {
+	d := &DockerBackend{dockerPath: filepath.Join(t.TempDir(), "does-not-exist")}
+	if got := d.containerMemoryLimit(context.Background(), "devbox-foo"); got != "" {
+		t.Errorf("unreachable docker should yield empty limit, got %q", got)
+	}
+}

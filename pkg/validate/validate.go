@@ -4,6 +4,7 @@ package validate
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 )
@@ -90,9 +91,9 @@ func (a *Args) Int(field string, defaultVal int) int {
 func asInt(v any) (int, bool) {
 	switch n := v.(type) {
 	case float64:
-		return int(n), true
+		return floatToInt(n)
 	case float32:
-		return int(n), true
+		return floatToInt(float64(n))
 	case int:
 		return n, true
 	case int64:
@@ -114,6 +115,21 @@ func asInt(v any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// floatToInt converts a JSON number (decoded as float64) to int. It truncates
+// the fractional part toward zero — the long-standing, tested contract for
+// this helper — but rejects NaN/Inf and any magnitude that would overflow
+// int64 on conversion, where Go's float→int result is implementation-defined
+// (in practice a garbage extreme like math.MinInt64 for 1e300).
+func floatToInt(n float64) (int, bool) {
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0, false
+	}
+	if n >= math.MaxInt64 || n <= math.MinInt64 {
+		return 0, false
+	}
+	return int(n), true
 }
 
 // IntRange validates an integer is within a range.
@@ -270,6 +286,67 @@ func (a *Args) Validate() error {
 		return a.errors
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Standalone helpers (operate on raw map[string]any without Args wrapper)
+// ---------------------------------------------------------------------------
+
+// StringFromArgs extracts a trimmed string from a map[string]any field.
+// Returns defaultVal if the field is absent, not a string, or empty after trimming.
+func StringFromArgs(args map[string]any, key string, defaultVal string) string {
+	if v, ok := args[key].(string); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return defaultVal
+}
+
+// Float64FromArgs extracts a float64 from a map[string]any field.
+// Returns defaultVal if the field is absent or not a float64.
+func Float64FromArgs(args map[string]any, key string, defaultVal float64) float64 {
+	if v, ok := args[key].(float64); ok {
+		return v
+	}
+	return defaultVal
+}
+
+// StringSliceFromArgs extracts a string slice from a map[string]any field.
+// JSON arrays arrive as []any; each element is converted to string.
+// Non-string elements are silently skipped. Returns nil if the field is
+// absent or not a []any.
+func StringSliceFromArgs(args map[string]any, key string) []string {
+	raw, ok := args[key].([]any)
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// BoolFromArgs extracts a bool from a map[string]any field.
+// Returns defaultVal if the field is absent or not a bool.
+func BoolFromArgs(args map[string]any, key string, defaultVal bool) bool {
+	if v, ok := args[key].(bool); ok {
+		return v
+	}
+	return defaultVal
+}
+
+// IntFromArgs extracts an int from a map[string]any field, handling the
+// float64 values that arrive from JSON unmarshalling. Returns defaultVal
+// if the field is absent or not convertible to int.
+func IntFromArgs(args map[string]any, key string, defaultVal int) int {
+	if v, ok := asInt(args[key]); ok {
+		return v
+	}
+	return defaultVal
 }
 
 // Common validation patterns

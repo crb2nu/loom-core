@@ -1,0 +1,1 @@
+S1c killtest process probe re-visits an absent-but-identity-bound original hold/driver through the full match contract after the inventory enumeration, healing the single-sample inventory miss caused by a process-tree transition (reaper exit / orphan reparenting) straddling the multi-read snapshot (v5 run 1, sample 313).

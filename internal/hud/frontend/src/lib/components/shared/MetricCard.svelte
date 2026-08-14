@@ -1,21 +1,9 @@
-<script>
-  /**
-   * MetricCard — stat display with label, value, optional trend sparkline and badge.
-   *
-   * @type {{
-   *   label: string,
-   *   value: string | number,
-   *   color?: string,
-   *   badge?: string,
-   *   badgeVariant?: 'info' | 'success' | 'warning' | 'error' | 'accent' | 'muted',
-   *   trend?: number[],
-   *   trendColor?: string,
-   *   compact?: boolean,
-   *   onclick?: () => void,
-   * }}
-   */
+<script lang="ts">
+  import type { BadgeVariant } from '../../utils/tokens.ts';
+  import type { Snippet } from 'svelte';
   import SparkLine from '../../widgets/SparkLine.svelte';
 
+  // MetricCard — stat display with label, value, optional trend sparkline and badge.
   let {
     label,
     value,
@@ -25,33 +13,82 @@
     trend,
     trendColor = 'var(--info)',
     compact = false,
+    proxy = false,
+    proxyTitle = 'This metric is a proxy — see the Mills plan doc for the canonical definition.',
+    hint = '',
+    sub = '',
+    element = 'div',
+    children,
     onclick,
+  }: {
+    label: string;
+    value?: string | number;
+    color?: string;
+    badge?: string;
+    badgeVariant?: BadgeVariant;
+    trend?: number[];
+    trendColor?: string;
+    compact?: boolean;
+    proxy?: boolean;
+    proxyTitle?: string;
+    hint?: string;
+    sub?: string;
+    /**
+     * Root tag. Defaults to a plain `div`; pass `article` when the card is a
+     * self-contained, independently meaningful unit (an evidence report, a
+     * summary block) so assistive tech keeps the implicit region boundary.
+     */
+    element?: 'div' | 'article' | 'section' | 'li';
+    children?: Snippet;
+    onclick?: () => void;
   } = $props();
+
+  // Typed explicitly: `<svelte:element>` has a dynamic tag, so the event
+  // parameter of an inline handler would otherwise be an implicit `any`.
+  function handleKeydown(e: KeyboardEvent) {
+    if (onclick && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      onclick();
+    }
+  }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
+<svelte:element
+  this={element}
   class="metric-card"
   class:compact
   class:clickable={!!onclick}
+  title={hint || undefined}
   onclick={onclick}
-  onkeydown={(e) => { if (onclick && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onclick(); }}}
+  onkeydown={handleKeydown}
   tabindex={onclick ? 0 : undefined}
   role={onclick ? 'button' : undefined}
 >
   <div class="metric-card-top">
-    <span class="metric-card-label">{label}</span>
+    <span class="metric-card-label">
+      {label}
+      {#if proxy}
+        <span class="metric-card-proxy" title={proxyTitle}>(proxy)</span>
+      {/if}
+    </span>
     {#if badge}
       <span class="metric-card-badge badge-{badgeVariant}">{badge}</span>
     {/if}
   </div>
-  <div class="metric-card-value" style:color={color}>{value}</div>
+  {#if value !== undefined}
+    <div class="metric-card-value" style:color={color}>{value}</div>
+  {/if}
+  {@render children?.()}
+  {#if sub}
+    <div class="metric-card-sub">{sub}</div>
+  {/if}
   {#if trend && trend.length > 1}
     <div class="metric-card-trend">
       <SparkLine data={trend} width={compact ? 48 : 80} height={compact ? 14 : 18} color={trendColor} />
     </div>
   {/if}
-</div>
+</svelte:element>
 
 <style>
   .metric-card {
@@ -79,7 +116,7 @@
   }
 
   .metric-card.clickable:focus-visible {
-    outline: 2px solid var(--border-focus);
+    outline: 2px solid var(--focus-ring);
     outline-offset: -2px;
   }
 
@@ -98,18 +135,31 @@
     color: var(--fg-muted);
   }
 
+  .metric-card-proxy {
+    margin-left: 4px;
+    font-size: var(--text-2xs);
+    font-weight: 500;
+    text-transform: lowercase;
+    letter-spacing: 0;
+    color: var(--fg-dim);
+    cursor: help;
+  }
+
   .metric-card-badge {
-    font-size: 9px;
+    font-size: var(--text-2xs);
     padding: 1px 5px;
     border-radius: var(--radius-lg);
     font-weight: 500;
+    /* Matches Badge.svelte's `.badge`: a status pill must never break mid-text
+       when it shares a flex row with a long label. */
+    white-space: nowrap;
   }
 
-  .badge-info { background: rgba(1, 135, 153, 0.15); color: var(--info); }
-  .badge-success { background: rgba(34, 178, 85, 0.15); color: var(--success); }
-  .badge-warning { background: rgba(231, 179, 18, 0.15); color: var(--warning); }
-  .badge-error { background: rgba(230, 30, 63, 0.15); color: var(--error); }
-  .badge-accent { background: rgba(233, 93, 116, 0.15); color: var(--accent); }
+  .badge-info { background: var(--info-dim); color: var(--info); }
+  .badge-success { background: var(--success-dim); color: var(--success); }
+  .badge-warning { background: var(--warning-dim); color: var(--warning); }
+  .badge-error { background: var(--error-dim); color: var(--error); }
+  .badge-accent { background: var(--accent-dim); color: var(--accent); }
   .badge-muted { background: var(--bg-tertiary); color: var(--fg-muted); }
 
   .metric-card-value {
@@ -122,6 +172,11 @@
 
   .metric-card.compact .metric-card-value {
     font-size: var(--text-lg);
+  }
+
+  .metric-card-sub {
+    font-size: var(--text-xs);
+    color: var(--fg-muted);
   }
 
   .metric-card-trend {

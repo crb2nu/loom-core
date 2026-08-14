@@ -1,0 +1,155 @@
+name: LoomCompanion
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+configs:
+  Debug: debug
+  Release: release
+targets:
+  LoomCompanionKit:
+    type: framework
+    platform: iOS
+    sources:
+      - Sources/LoomCompanionKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.flexinfer.loom.companion.kit
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+      configs:
+        # LoomCompanionKitTests uses `@testable import LoomCompanionKit`.
+        Debug:
+          ENABLE_TESTABILITY: YES
+  LoomCompanion:
+    type: application
+    platform: iOS
+    sources:
+      - Sources/LoomCompanion
+    dependencies:
+      - target: LoomCompanionKit
+      - target: LoomCompanionWidget
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.flexinfer.loom.companion
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: BX8243HJHS
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: Sources/LoomCompanion/Info.plist
+      properties:
+        CFBundleDisplayName: Loom Companion
+        UIApplicationSupportsIndirectInputEvents: YES
+        UILaunchScreen:
+          UIColorName: ""
+          UIImageName: ""
+        NSLocalNetworkUsageDescription: Loom Companion needs local network access to connect to your local Loom HUD server.
+        NSBonjourServices:
+          - _http._tcp
+        NSSupportsLiveActivities: YES
+        UIBackgroundModes:
+          - remote-notification
+        CFBundleURLTypes:
+          - CFBundleURLName: ai.flexinfer.loom.companion.deeplink
+            CFBundleURLSchemes:
+              - loom
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: NO
+          UISceneConfigurations: {}
+    entitlements:
+      path: Entitlements/LoomCompanion.entitlements
+      properties:
+        aps-environment: development
+        com.apple.security.application-groups:
+          - group.ai.flexinfer.loom.companion
+  LoomCompanionWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Sources/LoomCompanionWidget
+    dependencies:
+      - target: LoomCompanionKit
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    info:
+      path: Sources/LoomCompanionWidget/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.flexinfer.loom.companion.widget
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: BX8243HJHS
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    entitlements:
+      path: Entitlements/LoomCompanionWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.ai.flexinfer.loom.companion
+  # Unit tests for the shared kit (view models, networking, models, Mills /
+  # Weaver clients, deep links). These previously existed only as a SwiftPM
+  # test target, so they never ran in the Xcode project or its scheme — 400+
+  # tests were invisible to `xcodebuild test`.
+  #
+  # Fixtures/ is added as a folder reference (`type: folder`) so the JSON files
+  # land in the bundle under `Fixtures/`, matching the `subdirectory:` lookup
+  # in Tests/LoomCompanionKitTests/Fixtures.swift.
+  LoomCompanionKitTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/LoomCompanionKitTests
+        excludes:
+          - "Fixtures/**"
+      - path: Tests/LoomCompanionKitTests/Fixtures
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: LoomCompanionKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.flexinfer.loom.companion.kittests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+  LoomCompanionUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - Tests/LoomCompanionUITests
+    dependencies:
+      - target: LoomCompanion
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.flexinfer.loom.companion.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TEST_TARGET_NAME: LoomCompanion
+schemes:
+  LoomCompanion:
+    build:
+      targets:
+        LoomCompanion: all
+        LoomCompanionKit: all
+        LoomCompanionWidget: all
+        LoomCompanionKitTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - LoomCompanionKitTests
+        - LoomCompanionUITests
+    profile:
+      config: Release
+    archive:
+      config: Release

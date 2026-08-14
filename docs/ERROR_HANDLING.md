@@ -113,7 +113,6 @@ scripts/ci/check_error_handling.sh
 | mcp-tavily | 10 | Yes (8 handler, 2 helper) | Pending |
 | mcp-gcp | 10 | Mixed | Pending |
 | mcp-grafana | 8 | Helper only | Done |
-| mcp-morph-embeddings | 8 | Mixed | Pending |
 | mcp-substack | 7 | Mixed | Pending |
 | mcp-godot | 7 | Mixed | Pending |
 | mcp-cloudflare | 6 | Helper only | Done |

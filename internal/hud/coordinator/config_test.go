@@ -2,15 +2,94 @@ package coordinator
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
 
+func TestValidate_DefaultConfigPasses(t *testing.T) {
+	cfg := DefaultConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default config should be valid, got: %v", err)
+	}
+}
+
+func TestValidate_ZeroMaxConcurrentLLM(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxConcurrentLLM = 0
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for MaxConcurrentLLM=0")
+	}
+	if !strings.Contains(err.Error(), "MaxConcurrentLLM") {
+		t.Errorf("error should mention MaxConcurrentLLM, got: %v", err)
+	}
+}
+
+func TestValidate_CompressorRatioBounds(t *testing.T) {
+	cfg := DefaultConfig()
+
+	cfg.CompressorRatio = 0.0
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for CompressorRatio=0.0")
+	}
+
+	cfg.CompressorRatio = -0.1
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for CompressorRatio=-0.1")
+	}
+
+	cfg.CompressorRatio = 1.5
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for CompressorRatio=1.5")
+	}
+
+	cfg.CompressorRatio = 1.0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("CompressorRatio=1.0 should be valid, got: %v", err)
+	}
+}
+
+func TestValidate_SubsystemTimeoutExceedsPollInterval(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PollInterval = 10 * time.Second
+	cfg.SubsystemTimeout = 20 * time.Second
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when SubsystemTimeout > PollInterval")
+	}
+	if !strings.Contains(err.Error(), "SubsystemTimeout") {
+		t.Errorf("error should mention SubsystemTimeout, got: %v", err)
+	}
+}
+
+func TestValidate_MultipleErrors(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxConcurrentLLM = 0
+	cfg.CircuitBreakerThreshold = 0
+	cfg.SummarizerMaxTokens = 0
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for multiple invalid fields")
+	}
+	// Should report all three issues.
+	msg := err.Error()
+	if !strings.Contains(msg, "MaxConcurrentLLM") {
+		t.Error("missing MaxConcurrentLLM in error")
+	}
+	if !strings.Contains(msg, "CircuitBreakerThreshold") {
+		t.Error("missing CircuitBreakerThreshold in error")
+	}
+	if !strings.Contains(msg, "SummarizerMaxTokens") {
+		t.Error("missing SummarizerMaxTokens in error")
+	}
+}
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
-	if cfg.DefaultModel != "qwen3-8b" {
-		t.Fatalf("expected default model qwen3-8b, got %s", cfg.DefaultModel)
+	if cfg.DefaultModel != "gemma4-26b-a4b-gptq" {
+		t.Fatalf("expected default model gemma4-26b-a4b-gptq, got %s", cfg.DefaultModel)
 	}
 	if cfg.PollInterval != 30*time.Second {
 		t.Fatalf("expected 30s poll interval, got %s", cfg.PollInterval)

@@ -1,0 +1,1 @@
+- Added reusable storage-health and incident-classification contracts with deterministic capacity thresholds in `pkg/mills/gates/health_policy.go` and unit coverage in `pkg/mills/gates/health_policy_test.go`.

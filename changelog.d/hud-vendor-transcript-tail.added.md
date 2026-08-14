@@ -1,0 +1,1 @@
+- Add a bounded vendor-transcript tail bridge and `GET /api/vendor-sessions/tail` HUD endpoint for mobile full-conversation views.

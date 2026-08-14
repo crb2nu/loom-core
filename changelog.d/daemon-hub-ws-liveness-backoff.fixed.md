@@ -1,0 +1,1 @@
+- Correlate daemon hub WebSocket keepalives, retire connections after missed pongs, add capped jittered reconnect retries, and remove the unused HUD bridge client (`internal/daemon`, `internal/hud/bridge`, `pkg/transport`).

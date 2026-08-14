@@ -1,0 +1,627 @@
+import SwiftUI
+import LoomCompanionKit
+
+/// Work section: tasks, legacy workflows/approvals, and session controls.
+struct OpsWorkSection: View {
+    @Bindable var viewModel: OpsViewModel
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    var taskFilter: NavigationCoordinator.TasksFilter?
+    var clearTaskFilter: () -> Void = {}
+    @State private var taskDisplayLimit = 8
+    @State private var workflowDisplayLimit = 8
+    @State private var showLegacyWorkflows = false
+    @State private var showSessionControls = false
+
+    @State private var createAgentID = ""
+    @State private var createProject: String = ""
+    @State private var createNamespaceOverride: String = ""
+    @State private var useCustomNamespace = false
+    @State private var createDescription = ""
+    @State private var createAutoRecall = true
+    @State private var endSessionID = ""
+    @State private var endWithSummary = false
+    @State private var showCreateConfirmation = false
+    @State private var showEndConfirmation = false
+
+    var prefillEndSession: (String) -> Void = { _ in }
+
+    private var resolvedCreateNamespace: String {
+        useCustomNamespace ? createNamespaceOverride : createProject
+    }
+
+    private var canStartSession: Bool {
+        !createAgentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !viewModel.isMutatingSession
+    }
+
+    private var queueSummary: String {
+        if viewModel.taskCounts.blocked > 0 {
+            return "\(viewModel.taskCounts.blocked) blockers need attention. Active and pending work follows."
+        }
+        if viewModel.taskCounts.inProgress > 0 {
+            return "Active work is moving. Pending tasks are queued behind it."
+        }
+        if viewModel.taskCounts.pending > 0 {
+            return "No blockers. Pending work is ready to pick up."
+        }
+        return "No queued work needs attention right now."
+    }
+
+    private var filteredTasks: [MobileTask] {
+        guard let taskFilter else { return viewModel.tasks }
+        return viewModel.tasks.filter { task in
+            if let status = taskFilter.status?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !status.isEmpty,
+               task.status.rawValue != status {
+                return false
+            }
+            if let agentId = taskFilter.agentId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !agentId.isEmpty,
+               task.agentId != agentId {
+                return false
+            }
+            if let sessionId = taskFilter.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !sessionId.isEmpty,
+               task.sessionId != sessionId {
+                return false
+            }
+            return true
+        }
+    }
+
+    private var taskFilterLabel: String? {
+        guard let taskFilter else { return nil }
+        var parts: [String] = []
+        if let status = taskFilter.status, !status.isEmpty {
+            parts.append(status.replacingOccurrences(of: "_", with: " "))
+        }
+        if let agentId = taskFilter.agentId, !agentId.isEmpty {
+            parts.append(agentId)
+        }
+        if let sessionId = taskFilter.sessionId, !sessionId.isEmpty {
+            parts.append(sessionId)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// Dedupe projects by name so ForEach below never hits an Identifiable-id
+    /// collision when the server returns the same project twice (happens when
+    /// nested worktrees share a directory name).
+    private var uniqueSpawnProjects: [SpawnProjectInfo] {
+        guard let projects = viewModel.spawnConfig?.projects else { return [] }
+        var seen = Set<String>()
+        return projects.filter { seen.insert($0.name).inserted }
+    }
+
+    var body: some View {
+        VStack(spacing: LoomSpacing.cardSpacing) {
+            tasksCard
+                .cardAppear(index: 0)
+
+            if viewModel.pendingApprovals > 0 || !viewModel.workflows.isEmpty {
+                legacyApprovalsCard
+                    .cardAppear(index: 1)
+            }
+
+            sessionControlsCard
+        }
+        .confirmationDialog("Start Session?", isPresented: $showCreateConfirmation, titleVisibility: .visible) {
+            Button("Start Session") {
+                Task {
+                    await viewModel.createSession(
+                        agentID: createAgentID,
+                        namespace: resolvedCreateNamespace,
+                        description: createDescription,
+                        autoRecall: createAutoRecall
+                    )
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This binds a new agent-context session to an agent that is already running on your fleet.")
+        }
+        .confirmationDialog("End Session?", isPresented: $showEndConfirmation, titleVisibility: .visible) {
+            Button("End Session", role: .destructive) {
+                Task { await viewModel.endSession(sessionID: endSessionID, summarize: endWithSummary) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(endWithSummary ? "This will end the session and request a summary." : "This will end the session without summary.")
+        }
+    }
+
+    /// Accept an external prefill for the end-session field.
+    func prefillEndSessionID(_ sessionID: String) {
+        let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        endSessionID = trimmed
+    }
+
+    // MARK: - Tasks Card
+
+    private var tasksCard: some View {
+        LoomCard {
+            VStack(alignment: .leading, spacing: LoomSpacing.sm) {
+                Text("Operator Queue")
+                    .font(LoomTypography.headlineMedium)
+                    .foregroundStyle(LoomColors.textPrimary)
+
+                Text(queueSummary)
+                    .font(LoomTypography.caption)
+                    .foregroundStyle(LoomColors.textTertiary)
+                    .accessibilityIdentifier("work.queue.summary")
+
+                if let taskFilterLabel {
+                    HStack(spacing: LoomSpacing.xs) {
+                        Label(taskFilterLabel, systemImage: "line.3.horizontal.decrease.circle")
+                            .font(LoomTypography.caption)
+                            .foregroundStyle(LoomColors.statusInfo)
+                            .lineLimit(1)
+                        Spacer()
+                        Button {
+                            clearTaskFilter()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(LoomColors.textTertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear task filter")
+                    }
+                }
+
+                queueMetrics
+
+                let visibleTasks = filteredTasks
+
+                if visibleTasks.isEmpty {
+                    Text(taskFilter == nil ? "No tasks" : "No matching tasks")
+                        .font(LoomTypography.bodyRegular)
+                        .foregroundStyle(LoomColors.textTertiary)
+                } else {
+                    ForEach(Array(visibleTasks.prefix(taskDisplayLimit))) { task in
+                        NavigationLink {
+                            OpsTaskDetailView(task: task)
+                        } label: {
+                            taskRow(task)
+                        }
+                        .contextMenu {
+                            Button {
+                                prefillEndSession(task.sessionId)
+                            } label: {
+                                Label("Prefill End Session", systemImage: "arrowshape.turn.up.left")
+                            }
+                            .disabled(task.sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                    if visibleTasks.count > taskDisplayLimit {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                taskDisplayLimit += 8
+                            }
+                            HapticManager.light()
+                        } label: {
+                            Text("Show \(min(8, visibleTasks.count - taskDisplayLimit)) More")
+                                .font(LoomTypography.caption)
+                                .foregroundStyle(LoomColors.accent)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 6)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var queueMetrics: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: LoomSpacing.sm) {
+                opsMetric(label: "Pending", value: viewModel.taskCounts.pending, icon: "clock", color: LoomColors.statusIdle)
+                opsMetric(label: "Active", value: viewModel.taskCounts.inProgress, icon: "bolt.fill", color: LoomColors.statusActive)
+                opsMetric(label: "Blocked", value: viewModel.taskCounts.blocked, icon: "exclamationmark.triangle.fill", color: LoomColors.statusBlocked)
+                opsMetric(label: "Done", value: viewModel.taskCounts.completed, icon: "checkmark.circle.fill", color: LoomColors.statusHealthy)
+            }
+        } else {
+            HStack {
+                opsMetric(label: "Pending", value: viewModel.taskCounts.pending, icon: "clock", color: LoomColors.statusIdle)
+                Spacer()
+                opsMetric(label: "Active", value: viewModel.taskCounts.inProgress, icon: "bolt.fill", color: LoomColors.statusActive)
+                Spacer()
+                opsMetric(label: "Blocked", value: viewModel.taskCounts.blocked, icon: "exclamationmark.triangle.fill", color: LoomColors.statusBlocked)
+                Spacer()
+                opsMetric(label: "Done", value: viewModel.taskCounts.completed, icon: "checkmark.circle.fill", color: LoomColors.statusHealthy)
+            }
+        }
+    }
+
+    private func taskRow(_ task: MobileTask) -> some View {
+        HStack(alignment: .top, spacing: LoomSpacing.sm) {
+            StatusAccentBar(color: taskStatusColor(task.status))
+            VStack(alignment: .leading, spacing: LoomSpacing.xxs) {
+                taskHeader(task)
+                taskMetadata(task)
+                if let linkage = task.linkageSummary {
+                    Text(linkage)
+                        .font(LoomTypography.caption)
+                        .foregroundStyle(LoomColors.textTertiary)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func taskHeader(_ task: MobileTask) -> some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: LoomSpacing.xxs) {
+                taskTitle(task)
+                StatusBadge(taskStatusLabel(task.status), color: taskStatusColor(task.status))
+            }
+        } else {
+            HStack(spacing: 6) {
+                taskTitle(task)
+                StatusBadge(taskStatusLabel(task.status), color: taskStatusColor(task.status))
+            }
+        }
+    }
+
+    private func taskTitle(_ task: MobileTask) -> some View {
+        Text(task.title)
+            .font(LoomTypography.bodyMedium)
+            .foregroundStyle(LoomColors.textPrimary)
+            .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 1)
+    }
+
+    @ViewBuilder
+    private func taskMetadata(_ task: MobileTask) -> some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: LoomSpacing.xxs) {
+                Text(task.agentId.isEmpty ? "Unknown agent" : task.agentId)
+                HStack(spacing: LoomSpacing.xs) {
+                    Text(task.priority)
+                    if let sourceLabel = task.sourceLabel {
+                        StatusBadge(sourceLabel, color: LoomColors.statusInfo)
+                    }
+                }
+            }
+            .font(LoomTypography.caption)
+            .foregroundStyle(LoomColors.textSecondary)
+        } else {
+            HStack(spacing: 6) {
+                Text(task.agentId.isEmpty ? "Unknown agent" : task.agentId)
+                Text("\u{2022}")
+                    .foregroundStyle(LoomColors.textTertiary)
+                Text(task.priority)
+                if let sourceLabel = task.sourceLabel {
+                    StatusBadge(sourceLabel, color: LoomColors.statusInfo)
+                }
+            }
+            .font(LoomTypography.caption)
+            .foregroundStyle(LoomColors.textSecondary)
+            .lineLimit(1)
+        }
+    }
+
+    // MARK: - Legacy Approvals Card
+
+    private var legacyApprovalsCard: some View {
+        LoomCard {
+            VStack(alignment: .leading, spacing: LoomSpacing.sm) {
+                HStack(spacing: LoomSpacing.xs) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(LoomColors.statusDegraded)
+                    Text("Legacy approvals")
+                        .font(LoomTypography.headlineMedium)
+                        .foregroundStyle(LoomColors.textSecondary)
+                    Spacer()
+                    if viewModel.pendingApprovals > 0 {
+                        AnimatedCounter(viewModel.pendingApprovals)
+                            .font(LoomTypography.counterMedium)
+                            .foregroundStyle(LoomColors.statusDegraded)
+                    }
+                }
+
+                Text(viewModel.workflowsDeprecationMessage ?? "Deprecated approvals only. Use tasks and pipelines for active work.")
+                    .font(LoomTypography.caption)
+                    .foregroundStyle(LoomColors.textTertiary)
+
+                DisclosureGroup(isExpanded: $showLegacyWorkflows) {
+                    VStack(alignment: .leading, spacing: LoomSpacing.sm) {
+                        HStack {
+                            Text("Approvals in queue")
+                                .font(LoomTypography.bodyRegular)
+                                .foregroundStyle(LoomColors.textTertiary)
+                            Spacer()
+                            AnimatedCounter(viewModel.pendingApprovals)
+                                .font(LoomTypography.counterMedium)
+                                .foregroundStyle(viewModel.pendingApprovals > 0 ? LoomColors.statusDegraded : LoomColors.textTertiary)
+                        }
+
+                        if viewModel.workflows.isEmpty {
+                            Text("No legacy workflows")
+                                .font(LoomTypography.bodyRegular)
+                                .foregroundStyle(LoomColors.textTertiary)
+                        } else {
+                            ForEach(Array(viewModel.workflows.prefix(workflowDisplayLimit))) { workflow in
+                                NavigationLink {
+                                    OpsWorkflowDetailView(
+                                        workflow: workflow,
+                                        loadDetail: viewModel.loadWorkflowDetail(id:)
+                                    )
+                                } label: {
+                                    HStack(spacing: LoomSpacing.sm) {
+                                        StatusAccentBar(color: workflowStatusColor(workflow.status))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            HStack(spacing: 6) {
+                                                Text(workflow.name ?? workflow.id)
+                                                    .font(LoomTypography.bodyMedium)
+                                                    .foregroundStyle(LoomColors.textSecondary)
+                                                    .lineLimit(1)
+                                                StatusBadge(
+                                                    workflow.status.rawValue,
+                                                    color: workflowStatusColor(workflow.status)
+                                                )
+                                            }
+                                            Text(workflow.currentStep ?? "No current step")
+                                                .font(LoomTypography.caption)
+                                                .foregroundStyle(LoomColors.textTertiary)
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                            if viewModel.workflows.count > workflowDisplayLimit {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.25)) {
+                                        workflowDisplayLimit += 8
+                                    }
+                                    HapticManager.light()
+                                } label: {
+                                    Text("Show \(min(8, viewModel.workflows.count - workflowDisplayLimit)) More")
+                                        .font(LoomTypography.caption)
+                                        .foregroundStyle(LoomColors.accent)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Text(showLegacyWorkflows ? "Hide legacy approvals" : "Show legacy approvals")
+                            .font(LoomTypography.caption)
+                            .foregroundStyle(LoomColors.accent)
+                        Spacer()
+                        Image(systemName: showLegacyWorkflows ? "chevron.up" : "chevron.down")
+                            .font(.caption2)
+                            .foregroundStyle(LoomColors.accent)
+                    }
+                    .contentShape(Rectangle())
+                }
+            }
+        }
+    }
+
+    // MARK: - Session Controls Card
+
+    private var sessionControlsCard: some View {
+        LoomCard {
+            VStack(alignment: .leading, spacing: LoomSpacing.sm) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showSessionControls.toggle()
+                    }
+                    HapticManager.selection()
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Session controls")
+                                .font(LoomTypography.headlineMedium)
+                                .foregroundStyle(LoomColors.textPrimary)
+                            Text("Attach a session to an agent that is already running, or end a stale one.")
+                                .font(LoomTypography.caption)
+                                .foregroundStyle(LoomColors.textTertiary)
+                                .multilineTextAlignment(.leading)
+                        }
+                        Spacer()
+                        Image(systemName: showSessionControls ? "chevron.up" : "chevron.down")
+                            .font(.caption2)
+                            .foregroundStyle(LoomColors.accent)
+                            .dynamicTypeSize(.xSmall ... .accessibility1)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(showSessionControls ? "Expanded" : "Collapsed")
+                .accessibilityHint("Shows controls for starting and ending sessions")
+
+                if showSessionControls {
+                    sessionControlsExpandedContent
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityIdentifier("work.session-controls")
+    }
+
+    // Content is only built when the disclosure is open, so the eager-render
+    // path on Work-tab entry stays lightweight. Prevents the 4558c12a crash
+    // that forced MR !220.
+    private var sessionControlsExpandedContent: some View {
+        VStack(alignment: .leading, spacing: LoomSpacing.md) {
+            Text("Start Session")
+                .font(LoomTypography.bodyMedium)
+            Text("Binds a session to an agent-context server so a live agent can record work against it.")
+                .font(LoomTypography.caption)
+                .foregroundStyle(LoomColors.textTertiary)
+
+            TextField("Agent ID (e.g. claude-code-…)", text: $createAgentID)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+
+            projectPicker
+
+            TextField("Description (optional)", text: $createDescription)
+                .textFieldStyle(.roundedBorder)
+            Toggle("Auto recall", isOn: $createAutoRecall)
+
+            Button {
+                viewModel.clearMutationMessages()
+                showCreateConfirmation = true
+            } label: {
+                if viewModel.isMutatingSession {
+                    ProgressView().frame(maxWidth: .infinity)
+                } else {
+                    Text("Start Session").frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!canStartSession)
+
+            if createAgentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !viewModel.isMutatingSession {
+                Text("Enter an Agent ID to start a session.")
+                    .font(LoomTypography.caption)
+                    .foregroundStyle(LoomColors.textTertiary)
+            }
+
+            Divider()
+
+            Text("End Session")
+                .font(LoomTypography.bodyMedium)
+            TextField("Session ID", text: $endSessionID)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+            Toggle("Include summary", isOn: $endWithSummary)
+
+            Button(role: .destructive) {
+                viewModel.clearMutationMessages()
+                showEndConfirmation = true
+            } label: {
+                if viewModel.isMutatingSession {
+                    ProgressView().frame(maxWidth: .infinity)
+                } else {
+                    Text("End Session").frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(endSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isMutatingSession)
+        }
+    }
+
+
+    // Dedupes by name via `uniqueSpawnProjects` and keys ForEach on array index
+    // so duplicate server-side project names can't trigger an Identifiable-id
+    // collision crash inside the Menu.
+    @ViewBuilder
+    private var projectPicker: some View {
+        let projects = uniqueSpawnProjects
+        if !projects.isEmpty {
+            Menu {
+                Button("No namespace") {
+                    createProject = ""
+                    useCustomNamespace = false
+                }
+                ForEach(Array(projects.enumerated()), id: \.offset) { _, project in
+                    Button(project.name) {
+                        createProject = project.name
+                        useCustomNamespace = false
+                    }
+                }
+                Divider()
+                Button("Custom namespace…") {
+                    useCustomNamespace = true
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "folder")
+                        .foregroundStyle(LoomColors.accent)
+                    Text(projectPickerLabel)
+                        .foregroundStyle(LoomColors.textPrimary)
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(LoomColors.textTertiary)
+                }
+                .padding(.horizontal, LoomSpacing.sm)
+                .padding(.vertical, 10)
+                .background(LoomColors.bgElevated, in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            if useCustomNamespace {
+                TextField("Namespace", text: $createNamespaceOverride)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+            }
+        } else {
+            TextField("Namespace (optional)", text: $createNamespaceOverride)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+        }
+    }
+
+    private var projectPickerLabel: String {
+        if useCustomNamespace {
+            return createNamespaceOverride.isEmpty ? "Custom: enter namespace" : "Custom: \(createNamespaceOverride)"
+        }
+        return createProject.isEmpty ? "Select project" : createProject
+    }
+
+    // MARK: - Helpers
+
+    private func opsMetric(label: String, value: Int, icon: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.caption2)
+                    .foregroundStyle(color)
+                AnimatedCounter(value)
+                    .font(LoomTypography.counterSmall)
+                    .foregroundStyle(LoomColors.textPrimary)
+            }
+            Text(label)
+                .font(LoomTypography.caption)
+                .foregroundStyle(LoomColors.textSecondary)
+        }
+    }
+
+    private func taskStatusColor(_ status: MobileTaskStatus) -> Color {
+        switch status {
+        case .pending: return LoomColors.statusIdle
+        case .inProgress: return LoomColors.statusActive
+        case .blocked: return LoomColors.statusBlocked
+        case .completed: return LoomColors.statusHealthy
+        case .unknown: return LoomColors.statusIdle
+        }
+    }
+
+    private func taskStatusLabel(_ status: MobileTaskStatus) -> String {
+        status.rawValue.replacingOccurrences(of: "_", with: " ")
+    }
+
+    private func workflowStatusColor(_ status: MobileWorkflowStatus) -> Color {
+        switch status {
+        case .running: return LoomColors.statusActive
+        case .completed: return LoomColors.statusHealthy
+        case .failed: return LoomColors.statusCritical
+        case .waitingApproval: return LoomColors.statusDegraded
+        case .cancelled: return LoomColors.statusIdle
+        case .unknown: return LoomColors.statusIdle
+        }
+    }
+}

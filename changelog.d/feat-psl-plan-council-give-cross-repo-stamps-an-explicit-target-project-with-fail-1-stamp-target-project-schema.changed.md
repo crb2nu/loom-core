@@ -1,0 +1,1 @@
+- **Require an explicit target project on cross-repo stamps** (`pkg/mills/store/stamps.go`, `pkg/mills/crossrepo/stamp.go`): add target-bound stamp persistence and reject empty or whitespace-only destinations before any write.

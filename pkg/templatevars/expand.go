@@ -7,6 +7,7 @@
 package templatevars
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"strings"
@@ -38,8 +39,8 @@ func looksLikeSecretKey(name string) bool {
 // Expander resolves template variable patterns in strings.
 type Expander struct {
 	registry   *registry.Registry
+	secretsMu  sync.Mutex
 	secretsMgr *secrets.Manager
-	lazyInit   sync.Once
 	lazy       bool // if true, defer secrets.DefaultManager() to first use
 }
 
@@ -78,7 +79,13 @@ func New(opts ...Option) *Expander {
 }
 
 // resolveEnv resolves an environment variable with registry alias fallbacks.
-func (e *Expander) resolveEnv(name string) string {
+func (e *Expander) resolveEnvContext(ctx context.Context, name string) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ""
+	}
 	if e.registry != nil {
 		val := e.registry.GetEnvWithFallback(name)
 		if val != "" {
@@ -87,7 +94,7 @@ func (e *Expander) resolveEnv(name string) string {
 		// If this looks like a secret and the process env is missing it,
 		// fall back to the secrets manager (env backend -> keychain -> file).
 		if looksLikeSecretKey(name) {
-			return e.resolveSecret(name)
+			return e.resolveSecretContext(ctx, name)
 		}
 		return ""
 	}
@@ -96,18 +103,24 @@ func (e *Expander) resolveEnv(name string) string {
 		return val
 	}
 	if looksLikeSecretKey(name) {
-		return e.resolveSecret(name)
+		return e.resolveSecretContext(ctx, name)
 	}
 	return ""
 }
 
 // resolveSecret resolves a secret using the secrets manager.
-func (e *Expander) resolveSecret(key string) string {
-	mgr := e.getSecretsManager()
+func (e *Expander) resolveSecretContext(ctx context.Context, key string) string {
+	mgr := e.getSecretsManagerContext(ctx)
 	if mgr == nil {
 		return ""
 	}
-	val := mgr.GetValue(key)
+	val, err := mgr.GetValueContext(ctx, key)
+	if err != nil {
+		if ctx == nil || ctx.Err() == nil {
+			slog.Debug("failed to resolve secret", "key", key, "error", err)
+		}
+		return ""
+	}
 	if val == "" {
 		slog.Debug("secret not found", "key", key)
 	} else {
@@ -117,41 +130,52 @@ func (e *Expander) resolveSecret(key string) string {
 }
 
 // getSecretsManager returns the secrets manager, lazily initializing if configured.
-func (e *Expander) getSecretsManager() *secrets.Manager {
+func (e *Expander) getSecretsManagerContext(ctx context.Context) *secrets.Manager {
+	e.secretsMu.Lock()
+	defer e.secretsMu.Unlock()
 	if e.secretsMgr != nil {
 		return e.secretsMgr
 	}
 	if !e.lazy {
 		return nil
 	}
-	e.lazyInit.Do(func() {
-		mgr, err := secrets.DefaultManager()
-		if err != nil {
-			slog.Debug("failed to initialize secrets manager", "error", err)
-			return
-		}
-		e.secretsMgr = mgr
-	})
+	mgr, err := secrets.DefaultManagerContext(ctx)
+	if err != nil {
+		slog.Debug("failed to initialize secrets manager", "error", err)
+		return nil
+	}
+	// Cache only a successful initialization. In particular, a canceled first
+	// caller must not permanently poison this Expander for later refreshes.
+	e.secretsMgr = mgr
 	return e.secretsMgr
 }
 
 // Expand resolves ${env:VAR}, ${env:VAR:-default}, ${keychain:VAR}, and
 // ${secret:VAR} patterns in s. It does NOT touch ${repo} or ${HOME}.
 func (e *Expander) Expand(s string) string {
+	return e.ExpandContext(context.Background(), s)
+}
+
+// ExpandContext resolves template patterns while allowing subprocess-backed
+// secret stores to be canceled.
+func (e *Expander) ExpandContext(ctx context.Context, s string) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Expand ${env:VAR} and ${env:VAR:-default} patterns
-	s = e.expandEnv(s)
+	s = e.expandEnvContext(ctx, s)
 
 	// Expand ${keychain:VAR} patterns
-	s = e.expandKeychain(s)
+	s = e.expandKeychainContext(ctx, s)
 
 	// Expand ${secret:VAR} patterns
-	s = e.expandSecret(s)
+	s = e.expandSecretContext(ctx, s)
 
 	return s
 }
 
-func (e *Expander) expandEnv(s string) string {
-	for {
+func (e *Expander) expandEnvContext(ctx context.Context, s string) string {
+	for ctx.Err() == nil {
 		start := strings.Index(s, "${env:")
 		if start == -1 {
 			break
@@ -171,7 +195,7 @@ func (e *Expander) expandEnv(s string) string {
 			varName = varExpr
 		}
 
-		value := e.resolveEnv(varName)
+		value := e.resolveEnvContext(ctx, varName)
 		if value == "" {
 			value = defaultVal
 		}
@@ -180,8 +204,8 @@ func (e *Expander) expandEnv(s string) string {
 	return s
 }
 
-func (e *Expander) expandKeychain(s string) string {
-	for {
+func (e *Expander) expandKeychainContext(ctx context.Context, s string) string {
+	for ctx.Err() == nil {
 		start := strings.Index(s, "${keychain:")
 		if start == -1 {
 			break
@@ -194,17 +218,17 @@ func (e *Expander) expandKeychain(s string) string {
 		varName := s[start+len("${keychain:") : end]
 
 		// Try secrets manager first, fall back to env
-		value := e.resolveSecret(varName)
+		value := e.resolveSecretContext(ctx, varName)
 		if value == "" {
-			value = e.resolveEnv(varName)
+			value = e.resolveEnvContext(ctx, varName)
 		}
 		s = s[:start] + value + s[end+1:]
 	}
 	return s
 }
 
-func (e *Expander) expandSecret(s string) string {
-	for {
+func (e *Expander) expandSecretContext(ctx context.Context, s string) string {
+	for ctx.Err() == nil {
 		start := strings.Index(s, "${secret:")
 		if start == -1 {
 			break
@@ -216,7 +240,7 @@ func (e *Expander) expandSecret(s string) string {
 		end += start
 		varName := s[start+len("${secret:") : end]
 
-		value := e.resolveSecret(varName)
+		value := e.resolveSecretContext(ctx, varName)
 		s = s[:start] + value + s[end+1:]
 	}
 	return s

@@ -8,20 +8,27 @@
 package coordinator
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/crb2nu/loom/pkg/aimodels"
 )
 
 // Config holds all coordinator configuration.
 type Config struct {
 	// FlexInfer connection.
-	FlexInferURL string // Base URL (e.g., "http://flexinfer-proxy:8080"). Empty = disabled.
+	// FlexInferURL is the proxy base URL (pkg/flexinfer.DefaultProxyURL
+	// in-cluster). Empty = disabled, and that is deliberate: ConfigFromEnv
+	// reads FLEXINFER_URL with no fallback so Enabled() reports false
+	// off-cluster rather than dialing an unreachable service every poll.
+	FlexInferURL string
 	FlexInferKey string // Optional API key for FlexInfer.
 
 	// Model selection.
-	DefaultModel  string // Default model for all tasks (e.g., "qwen3-8b").
+	DefaultModel  string // Default model for all tasks (e.g., "gemma4-26b-a4b-gptq").
 	FallbackModel string // Fallback if default is unavailable.
 	PlannerModel  string // Override for planning (may need larger model).
 
@@ -42,8 +49,10 @@ type Config struct {
 	ExtractorBatchSize  int     // Entries per extraction batch.
 
 	// Per-cycle safety caps — limit work per poll to avoid storming the backend.
-	MaxSweepSessions int // Max sessions to summarize per poll cycle.
-	MaxCompressItems int // Max items to compress per poll cycle.
+	MaxSweepSessions               int // Max sessions to summarize per poll cycle.
+	MaxCompressItems               int // Max items to compress per poll cycle.
+	CompactionPromptTokenThreshold int // Run compaction early when an active session exceeds this prompt estimate.
+	CompactionInspectSessions      int // Max active sessions to inspect for prompt pressure per cycle.
 
 	// Circuit breaker.
 	CircuitBreakerThreshold int           // Consecutive failures to open.
@@ -56,10 +65,13 @@ type Config struct {
 	PlannerTimeout   time.Duration // Planner gets longer timeout (API only).
 }
 
-// DefaultConfig returns a Config with sensible defaults.
+// DefaultConfig returns a Config with sensible defaults. The default
+// model resolves through pkg/aimodels (RoleCoordinatorDefault) so the
+// coordinator and weaver share a single source of truth for what model
+// is canonical on this cluster.
 func DefaultConfig() Config {
 	return Config{
-		DefaultModel:  "qwen3-8b",
+		DefaultModel:  aimodels.DefaultResolver().ResolveOrDefault(aimodels.RoleCoordinatorDefault, "gemma4-26b-a4b-gptq"),
 		FallbackModel: "",
 		PlannerModel:  "",
 
@@ -76,8 +88,10 @@ func DefaultConfig() Config {
 		TriagerBatchSize:    10,
 		ExtractorBatchSize:  5,
 
-		MaxSweepSessions: 2,
-		MaxCompressItems: 3,
+		MaxSweepSessions:               2,
+		MaxCompressItems:               3,
+		CompactionPromptTokenThreshold: 12000,
+		CompactionInspectSessions:      3,
 
 		CircuitBreakerThreshold: 3,
 		CircuitBreakerReset:     30 * time.Second,
@@ -134,6 +148,52 @@ func ConfigFromEnv() Config {
 // Enabled reports whether the coordinator should be started.
 func (c Config) Enabled() bool {
 	return c.FlexInferURL != ""
+}
+
+// Validate checks the config for obviously invalid values that would
+// cause panics or broken behavior at runtime. Returns nil if valid.
+func (c Config) Validate() error {
+	var errs []string
+	if c.MaxConcurrentLLM < 1 {
+		errs = append(errs, "MaxConcurrentLLM must be >= 1")
+	}
+	if c.CircuitBreakerThreshold < 1 {
+		errs = append(errs, "CircuitBreakerThreshold must be >= 1")
+	}
+	if c.CompressorRatio <= 0 || c.CompressorRatio > 1.0 {
+		errs = append(errs, "CompressorRatio must be in (0.0, 1.0]")
+	}
+	if c.SubsystemTimeout <= 0 {
+		errs = append(errs, "SubsystemTimeout must be > 0")
+	}
+	if c.PollInterval > 0 && c.SubsystemTimeout > c.PollInterval {
+		errs = append(errs, "SubsystemTimeout must be <= PollInterval")
+	}
+	if c.SummarizerMaxTokens < 1 {
+		errs = append(errs, "SummarizerMaxTokens must be >= 1")
+	}
+	if c.TriagerBatchSize < 1 {
+		errs = append(errs, "TriagerBatchSize must be >= 1")
+	}
+	if c.ExtractorBatchSize < 1 {
+		errs = append(errs, "ExtractorBatchSize must be >= 1")
+	}
+	if c.MaxSweepSessions < 1 {
+		errs = append(errs, "MaxSweepSessions must be >= 1")
+	}
+	if c.MaxCompressItems < 1 {
+		errs = append(errs, "MaxCompressItems must be >= 1")
+	}
+	if c.CompactionPromptTokenThreshold < 1 {
+		errs = append(errs, "CompactionPromptTokenThreshold must be >= 1")
+	}
+	if c.CompactionInspectSessions < 1 {
+		errs = append(errs, "CompactionInspectSessions must be >= 1")
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("coordinator config: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // envBool reads a boolean environment variable, returning def if unset.

@@ -1,4 +1,6 @@
-<script>
+<script lang="ts">
+  import type { BadgeVariant } from '../../utils/tokens.ts';
+  import type { HandoffRecord } from '../../clients/presenceActions.ts';
   import { formatTime } from '../../utils/format.ts';
   import Badge from '../../widgets/Badge.svelte';
   import DataTable from '../shared/DataTable.svelte';
@@ -6,11 +8,16 @@
 
   let {
     handoffs = [],
-    templates = [],
     handoffLoading = false,
     handoffError = '',
     onOpenHandoffModal = () => {},
     onAcceptHandoff = () => {},
+  }: {
+    handoffs?: HandoffRecord[];
+    handoffLoading?: boolean;
+    handoffError?: string;
+    onOpenHandoffModal?: () => void;
+    onAcceptHandoff?: (id: string, targetAgentID: string) => void;
   } = $props();
 
   const handoffColumns = [
@@ -18,12 +25,12 @@
     { key: 'to_agent', label: 'To', width: '100px' },
     { key: 'summary', label: 'Summary' },
     { key: 'status', label: 'Status', width: '90px' },
-    { key: 'created_at', label: 'Created', width: '90px' },
+    { key: 'created_at', label: 'Created', width: '90px', hideBelow: 720 },
     { key: 'actions', label: 'Actions', width: '80px' },
   ];
 
-  function handoffStatusVariant(status) {
-    const map = {
+  function handoffStatusVariant(status: string): BadgeVariant {
+    const map: Record<string, BadgeVariant> = {
       pending: 'warning',
       accepted: 'success',
       expired: 'error',
@@ -55,16 +62,19 @@
     <DataTable
       columns={handoffColumns}
       rows={handoffs}
+      stableLayout={true}
     >
-      {#snippet row({ row: handoff })}
+      {#snippet row({ row: handoff, hiddenColumns })}
         <td class="text-mono">{handoff.from_agent || '---'}</td>
-        <td class="text-mono">{handoff.to_agent || 'any'}</td>
+        <td class="text-mono">{handoff.target_agent_id || handoff.to_agent || '---'}</td>
         <td class="truncate" title={handoff.summary}>{handoff.summary}</td>
         <td><Badge text={handoff.status} variant={handoffStatusVariant(handoff.status)} /></td>
+        {#if !hiddenColumns.has('created_at')}
         <td class="text-mono text-muted">{formatTime(handoff.created_at)}</td>
+        {/if}
         <td>
           {#if handoff.status === 'pending'}
-            <button class="btn btn-xs btn-success" onclick={() => onAcceptHandoff(handoff.id)}>
+            <button class="btn btn-xs btn-success" onclick={() => onAcceptHandoff(handoff.id, handoff.target_agent_id || handoff.to_agent || '')}>
               Accept
             </button>
           {:else}
@@ -75,27 +85,12 @@
     </DataTable>
   {/if}
 
-  {#if templates.length > 0}
-    <div class="templates-section">
-      <div class="section-header">
-        <span class="section-title">Session Templates</span>
-      </div>
-      <div class="template-list">
-        {#each templates as tpl (tpl.id)}
-          <div class="template-chip">
-            <span class="template-name text-mono">{tpl.name}</span>
-            <span class="text-muted text-xs">{tpl.description}</span>
-          </div>
-        {/each}
-      </div>
-    </div>
-  {/if}
 </div>
 
 <style>
   .count-badge {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--text-xs);
     background: var(--bg-tertiary);
     color: var(--fg-secondary);
     padding: 1px 6px;
@@ -104,61 +99,6 @@
 
   .card-actions {
     margin-left: auto;
-  }
-
-  .btn-xs {
-    padding: 2px 8px;
-    font-size: 11px;
-  }
-
-  .btn-success {
-    background: rgba(34, 178, 85, 0.15);
-    color: var(--success);
-    border: 1px solid rgba(34, 178, 85, 0.3);
-  }
-
-  .btn-success:hover {
-    background: rgba(34, 178, 85, 0.25);
-  }
-
-  .templates-section {
-    border-top: 1px solid var(--border);
-    padding: 12px 0 0;
-    margin-top: 12px;
-  }
-
-  .section-header {
-    margin-bottom: 8px;
-  }
-
-  .section-title {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--fg-muted);
-  }
-
-  .template-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .template-chip {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: 6px 10px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-  }
-
-  .template-name {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--fg-primary);
   }
 
   .loading-bar {

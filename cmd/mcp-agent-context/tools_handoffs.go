@@ -17,7 +17,7 @@ func registerHandoffTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 
 	server.AddTool(mcp.Tool{
 		Name:        "agent_handoff_create",
-		Description: "Create a handoff package for another agent. Packages session context with instructions.",
+		Description: "Create a handoff package for another agent. Packages session context with instructions. Optionally attach a plan_id/slice_id so the receiver resumes a known plan scope by id (cross-vendor) instead of rebuilding from entry_ids.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -46,6 +46,14 @@ func registerHandoffTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 				"token_budget": map[string]any{
 					"type":        "integer",
 					"description": "Maximum tokens in handoff (default: 8000).",
+				},
+				"plan_id": map[string]any{
+					"type":        "string",
+					"description": "Optional plan to hand off; receiver resumes via agent_plan_get{plan_id}.",
+				},
+				"slice_id": map[string]any{
+					"type":        "string",
+					"description": "Optional slice scope within the plan; receiver resumes via agent_plan_slice_get{slice_id}.",
 				},
 			},
 			Required: []string{"session_id", "target_agent_id"},

@@ -342,6 +342,75 @@ RUN apt-get update && apt-get install -y git curl
 	}
 }
 
+// Regression: flexdeck's Dockerfile chains `apk add ... && adduser -D -u 1000 flexdeck`
+// on a continuation line. The parser must not ingest tokens from commands after the
+// shell separator as package names (apk then fails with "1000 (no such package)").
+func TestFingerprint_SystemDeps_FlexdeckDockerfile(t *testing.T) {
+	dir := t.TempDir()
+
+	fixture, err := os.ReadFile(filepath.Join("testdata", "flexdeck.Dockerfile"))
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), fixture, 0644); err != nil {
+		t.Fatalf("failed to write Dockerfile: %v", err)
+	}
+
+	fp, err := Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("Fingerprint() returned error: %v", err)
+	}
+
+	depSet := make(map[string]bool)
+	for _, d := range fp.SystemDeps {
+		depSet[d] = true
+	}
+
+	for _, want := range []string{"git", "ca-certificates", "tzdata"} {
+		if !depSet[want] {
+			t.Errorf("expected %q in SystemDeps, got %v", want, fp.SystemDeps)
+		}
+	}
+	for _, bad := range []string{"adduser", "-D", "-u", "1000", "flexdeck", "&&"} {
+		if depSet[bad] {
+			t.Errorf("SystemDeps must not contain %q (leaked from a chained command), got %v", bad, fp.SystemDeps)
+		}
+	}
+}
+
+func TestFingerprint_SystemDeps_ChainedCommands(t *testing.T) {
+	dir := t.TempDir()
+
+	dockerfile := `FROM debian:12
+RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache make; adduser -D app
+`
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0644); err != nil {
+		t.Fatalf("failed to write Dockerfile: %v", err)
+	}
+
+	fp, err := Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("Fingerprint() returned error: %v", err)
+	}
+
+	depSet := make(map[string]bool)
+	for _, d := range fp.SystemDeps {
+		depSet[d] = true
+	}
+
+	for _, want := range []string{"git", "curl", "make"} {
+		if !depSet[want] {
+			t.Errorf("expected %q in SystemDeps, got %v", want, fp.SystemDeps)
+		}
+	}
+	for _, bad := range []string{"rm", "-rf", "/var/lib/apt/lists/*", "adduser", "app"} {
+		if depSet[bad] {
+			t.Errorf("SystemDeps must not contain %q (leaked from a chained command), got %v", bad, fp.SystemDeps)
+		}
+	}
+}
+
 func TestFingerprint_ManifestOverrides(t *testing.T) {
 	dir := t.TempDir()
 

@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -35,6 +34,7 @@ type Extractor struct {
 	client *FlexInferClient
 	agent  *bridge.AgentBridge
 	config Config
+	model  string // Resolved model from selectModel().
 	logger *slog.Logger
 }
 
@@ -56,17 +56,20 @@ func (e *Extractor) ExtractFromEntries(ctx context.Context, entries []bridge.Con
 
 	userMsg := formatEntries(entries)
 
-	raw, err := e.client.CompleteSimple(ctx, e.config.DefaultModel, promptEntityExtraction, userMsg, 500)
+	model := e.model
+	if model == "" {
+		model = e.config.DefaultModel
+	}
+	raw, err := e.client.CompleteSimple(ctx, model, promptEntityExtraction, userMsg, 500)
 	if err != nil {
 		return nil, nil, fmt.Errorf("entity extraction: %w", err)
 	}
 
-	raw = stripCodeFence(raw)
 	var result struct {
 		Entities  []ExtractedEntity   `json:"entities"`
 		Relations []ExtractedRelation `json:"relations"`
 	}
-	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+	if err := decodeStructuredJSON(raw, &result); err != nil {
 		return nil, nil, fmt.Errorf("parse extraction result: %w", err)
 	}
 

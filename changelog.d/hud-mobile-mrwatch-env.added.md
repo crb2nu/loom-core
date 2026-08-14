@@ -1,0 +1,1 @@
+- mobile-hud (loom-hub): configure the mrwatch poller (GITLAB_API_URL, GITLAB_TOKEN via loom-secrets, LOOM_MRWATCH_PROJECTS=services/loom-core) so the cluster HUD serves MR state and the iOS attention lanes receive merge/conflict data; notifier is default-on, shepherd stays off.

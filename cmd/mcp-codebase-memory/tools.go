@@ -4,19 +4,35 @@ import (
 	"context"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/crb2nu/loom/pkg/codebase"
-	"github.com/crb2nu/loom/pkg/mcpotel"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
-func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Tracer) {
-	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
-		return mcpotel.TracedToolHandler(tracer, name, h)
-	}
+func registerTools(srv *mcpscaffold.Server, svc *codebase.Service) {
+	srv.AddTracedTool(mcp.Tool{
+		Name:        "codebase_embedding_backfill",
+		Description: "Repair one bounded page of marked or legacy fallback embeddings; pass cursor from the prior response to resume.",
+		InputSchema: mcp.InputSchema{Type: "object", Properties: map[string]any{
+			"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": 256},
+			"cursor": map[string]any{"description": "Opaque Qdrant scroll cursor from the previous response."},
+		}},
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		v := validate.NewArgs(args)
+		limit := v.Int("limit", 100)
+		cursor := v.Any("cursor")
+		if err := v.Validate(); err != nil {
+			return mcp.ErrorResult(err), nil
+		}
+		result, err := svc.BackfillFallbackVectors(ctx, limit, cursor)
+		if err != nil {
+			return mcp.ErrorResult(err), nil
+		}
+		return mcp.JSONResult(result)
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_stats",
 		Description: "Get basic stats about an indexed repo (counts by language/chunk_type).",
 		InputSchema: mcp.InputSchema{
@@ -38,7 +54,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 				},
 			},
 		},
-	}, wrap("codebase_stats", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "")      // optional
 		_ = v.StringSlice("languages")   // optional
@@ -47,9 +63,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleStats(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_delete_repo",
 		Description: "Delete all indexed vectors for a repo_id (destructive). Requires confirm=true.",
 		InputSchema: mcp.InputSchema{
@@ -64,7 +80,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"repo_id", "confirm"},
 		},
-	}, wrap("codebase_delete_repo", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.Required("repo_id")
 		_ = v.RequiredBool("confirm")
@@ -76,9 +92,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleDeleteRepo(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_index_start",
 		Description: "Start indexing a repository (async job).",
 		InputSchema: mcp.InputSchema{
@@ -116,7 +132,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 				},
 			},
 		},
-	}, wrap("codebase_index_start", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("root", ".")         // optional with default
 		_ = v.String("repo_id", "")       // optional
@@ -129,11 +145,11 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleIndexStart(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_watch_start",
-		Description: "Start watching a repository for changes and incrementally update the index (async job).",
+		Description: "Start watching a repository for changes and incrementally update the index (async job). Idempotent per (repo_id, root): a running watch on the same root is reused (response has reused:true) instead of creating a duplicate. Watches expire after CODEBASE_WATCH_TTL (default 72h) without start/poll activity; poll to keep one alive, or stop it when done.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -169,7 +185,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 				},
 			},
 		},
-	}, wrap("codebase_watch_start", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("root", ".")         // optional with default
 		_ = v.String("repo_id", "")       // optional
@@ -182,11 +198,11 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleWatchStart(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_watch_poll",
-		Description: "Poll a watch job started with codebase_watch_start.",
+		Description: "Poll a watch job started with codebase_watch_start. Polling counts as activity and keeps the watch from TTL expiry; orphaned persisted watches are adopted and resumed automatically.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -194,16 +210,16 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"watch_id"},
 		},
-	}, wrap("codebase_watch_poll", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.Required("watch_id")
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleWatchPoll(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_watch_stop",
 		Description: "Stop a watch job.",
 		InputSchema: mcp.InputSchema{
@@ -213,16 +229,25 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"watch_id"},
 		},
-	}, wrap("codebase_watch_stop", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.Required("watch_id")
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleWatchStop(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
+		Name:        "codebase_watch_list",
+		Description: "List watch jobs: running/stopped/failed/expired watches in this server process (with stats and last-activity times) plus persisted watches owned by other processes. Use to find or clean up existing watches before starting new ones.",
+		InputSchema: mcp.InputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	}, svc.HandleWatchList)
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_index_poll",
 		Description: "Poll an indexing job started with codebase_index_start.",
 		InputSchema: mcp.InputSchema{
@@ -232,16 +257,16 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"job_id"},
 		},
-	}, wrap("codebase_index_poll", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.Required("job_id")
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleIndexPoll(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_index_cancel",
 		Description: "Cancel an indexing job.",
 		InputSchema: mcp.InputSchema{
@@ -251,16 +276,16 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"job_id"},
 		},
-	}, wrap("codebase_index_cancel", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.Required("job_id")
 		if err := v.Validate(); err != nil {
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleIndexCancel(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_search",
 		Description: "Semantic search across an indexed codebase.",
 		InputSchema: mcp.InputSchema{
@@ -295,7 +320,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"query"},
 		},
-	}, wrap("codebase_search", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("query")
@@ -309,9 +334,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleSearch(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_text_search",
 		Description: "Lexical fallback search (no embeddings): scans stored chunk payloads for query tokens.",
 		InputSchema: mcp.InputSchema{
@@ -358,7 +383,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"query"},
 		},
-	}, wrap("codebase_text_search", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("query")
@@ -373,9 +398,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleTextSearch(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_get_definition",
 		Description: "Jump to a symbol definition (best-effort; matches indexed chunk name).",
 		InputSchema: mcp.InputSchema{
@@ -403,7 +428,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"symbol"},
 		},
-	}, wrap("codebase_get_definition", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("symbol")
@@ -415,9 +440,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleGetDefinition(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_get_references",
 		Description: "Find references to a symbol (best-effort: definitions by name + callers by call graph).",
 		InputSchema: mcp.InputSchema{
@@ -457,7 +482,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"symbol"},
 		},
-	}, wrap("codebase_get_references", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("symbol")
@@ -472,9 +497,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleGetReferences(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_get_context",
 		Description: "Get context for a file/line (chunk + nearby chunks + callers/callees heuristics).",
 		InputSchema: mcp.InputSchema{
@@ -508,7 +533,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"file_path", "line_number"},
 		},
-	}, wrap("codebase_get_context", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("file_path")
@@ -521,9 +546,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleGetContext(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_find_callers",
 		Description: "Find callers of a function/symbol (best-effort; uses calls[] scanning).",
 		InputSchema: mcp.InputSchema{
@@ -542,7 +567,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"symbol"},
 		},
-	}, wrap("codebase_find_callers", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("symbol")
@@ -552,9 +577,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleFindCallers(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_find_callees",
 		Description: "Find callees of a function/symbol (best-effort; uses calls[]).",
 		InputSchema: mcp.InputSchema{
@@ -573,7 +598,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"symbol"},
 		},
-	}, wrap("codebase_find_callees", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("symbol")
@@ -583,9 +608,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleFindCallees(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_call_graph",
 		Description: "Build a best-effort call graph around a symbol using stored calls[] + caller queries (BFS).",
 		InputSchema: mcp.InputSchema{
@@ -635,7 +660,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			},
 			Required: []string{"symbol"},
 		},
-	}, wrap("codebase_call_graph", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "") // optional
 		_ = v.Required("symbol")
@@ -651,9 +676,9 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleCallGraph(ctx, args)
-	}))
+	})
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "codebase_module_graph",
 		Description: "Build a best-effort module dependency graph from indexed module chunks (imports edges).",
 		InputSchema: mcp.InputSchema{
@@ -686,7 +711,7 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 				},
 			},
 		},
-	}, wrap("codebase_module_graph", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	}, func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		v := validate.NewArgs(args)
 		_ = v.String("repo_id", "")          // optional
 		_ = v.StringSlice("languages")       // optional
@@ -698,5 +723,5 @@ func registerTools(server *mcp.Server, svc *codebase.Service, tracer trace.Trace
 			return mcp.ErrorResult(err), nil
 		}
 		return svc.HandleModuleGraph(ctx, args)
-	}))
+	})
 }

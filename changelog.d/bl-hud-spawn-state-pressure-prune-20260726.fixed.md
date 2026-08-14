@@ -1,0 +1,1 @@
+- Prevent spawn dispatch stalls by pressure-pruning terminal ConfigMap state in `internal/spawn/store.go` and classifying spawn-state budget exhaustion as retryable infrastructure in `pkg/mills/pipeline/spawn_class.go`.

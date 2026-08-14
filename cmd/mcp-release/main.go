@@ -12,8 +12,10 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -28,9 +30,29 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp,
+		shutdownTracer,
+		err := mcpotel.
+		InitTracer(ctx, "mcp-release",
+			logger,
+		)
+	if err !=
+		nil {
+		logger.
+			Warn("OTel tracer init failed",
+
+				"error", err)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.
+		Tracer(tp, "mcp-release")
+
 	logger.Info("starting server", "name", "mcp-release", "version", version)
 
 	server := mcp.NewServer("mcp-release", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Multi-channel release orchestration. Tools: release_validate, release_changelog, release_status")
 
 	server.AddTool(mcp.Tool{
@@ -46,7 +68,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project_dir"},
 		},
-	}, handleValidate)
+	}, mcpotel.TracedToolHandler(tracer, "release_validate", handleValidate))
 
 	server.AddTool(mcp.Tool{
 		Name:        "release_changelog",
@@ -69,7 +91,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project_dir", "from_tag"},
 		},
-	}, handleChangelog)
+	}, mcpotel.TracedToolHandler(tracer, "release_changelog", handleChangelog))
 
 	server.AddTool(mcp.Tool{
 		Name:        "release_status",
@@ -92,7 +114,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"project_dir"},
 		},
-	}, handleStatus)
+	}, mcpotel.TracedToolHandler(tracer, "release_status", handleStatus))
 
 	return server.Run(ctx)
 }

@@ -1,0 +1,107 @@
+{
+  "active_agents": 2,
+  "active_sessions": 3,
+  "coordination": {
+    "active_blockers": [],
+    "attention_agents": [],
+    "attention_lanes": [
+      {
+        "deep_link": "loom://session/sess_abc123",
+        "freshness": {
+          "source": "coordination_snapshot"
+        },
+        "id": "claude-code-1",
+        "label": "Agent lane",
+        "recommended_action": "Open session",
+        "route": "people",
+        "scope": "services/loom-core",
+        "severity": "warning",
+        "summary": "blocked on review",
+        "target_id": "sess_abc123",
+        "target_kind": "session",
+        "type": "agent"
+      },
+      {
+        "deep_link": "loom://tasks?status=blocked",
+        "filter": {
+          "namespace": "services/loom-core/mobile",
+          "status": "blocked"
+        },
+        "freshness": {
+          "source": "coordination_snapshot"
+        },
+        "id": "services/loom-core/mobile",
+        "label": "Work lane",
+        "recommended_action": "Review work queue",
+        "route": "work",
+        "scope": "3 tasks",
+        "severity": "critical",
+        "summary": "blocked tasks",
+        "target_id": "",
+        "target_kind": "task_filter",
+        "type": "namespace"
+      },
+      {
+        "deep_link": "loom://tasks?status=in_progress",
+        "filter": {
+          "status": "in_progress"
+        },
+        "freshness": {
+          "source": "coordination_snapshot"
+        },
+        "id": "merge-ready",
+        "label": "Merge ready",
+        "recommended_action": "Review merge-ready work",
+        "route": "dispatch",
+        "scope": "2 branches",
+        "severity": "info",
+        "summary": "2 branches ready to merge",
+        "target_id": "",
+        "target_kind": "task_filter",
+        "type": "merge"
+      },
+      {
+        "deep_link": "loom://work",
+        "freshness": {
+          "source": "coordination_snapshot"
+        },
+        "id": "file-conflicts",
+        "label": "File conflicts",
+        "recommended_action": "Resolve coordination conflicts",
+        "route": "dispatch",
+        "scope": "1 file",
+        "severity": "critical",
+        "summary": "1 file claimed by multiple agents",
+        "target_id": "file-conflicts",
+        "target_kind": "connection",
+        "type": "conflict"
+      }
+    ],
+    "risky_namespaces": [],
+    "summary": {
+      "active_namespaces": 2,
+      "agents_needing_attention": 0,
+      "conflict_files": 0,
+      "cross_agent_blockers": 0,
+      "idle_claim_holders": 0,
+      "merge_ready_branches": 0,
+      "namespaces_at_risk": 0,
+      "orphan_tasks": 0,
+      "shared_branches": 1
+    },
+    "top_relations": []
+  },
+  "daemon_running": true,
+  "health": {
+    "degraded_servers": 1,
+    "down_servers": 1,
+    "healthy_servers": 10,
+    "idle_servers": 0,
+    "total_servers": 12
+  },
+  "idle_agents": 1,
+  "offline_agents": 0,
+  "recent_timeline": [],
+  "server_count": 12,
+  "updated_at": "2025-01-15T10:30:00Z"
+}

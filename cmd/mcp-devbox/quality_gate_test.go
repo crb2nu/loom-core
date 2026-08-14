@@ -1,0 +1,600 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/crb2nu/loom/internal/devbox/backend"
+	"github.com/crb2nu/loom/internal/devbox/state"
+)
+
+// qgFakeBackend is a fake backend that returns configurable exit codes per command.
+type qgFakeBackend struct {
+	fakeBackend
+	commandResults map[string]*backend.ExecResult
+	calls          []backend.ExecOpts
+}
+
+func (b *qgFakeBackend) Exec(_ context.Context, opts backend.ExecOpts) (*backend.ExecResult, error) {
+	b.calls = append(b.calls, opts)
+	if r, ok := b.commandResults[opts.Command]; ok {
+		return r, nil
+	}
+	return &backend.ExecResult{ExitCode: 0, StdoutTail: "ok"}, nil
+}
+
+func TestQualityGate_ExtraTestsRunAfterChecksWithSandboxEnv(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &qgFakeBackend{fakeBackend: fakeBackend{statuses: map[string]*fakeStatus{}}, commandResults: map[string]*backend.ExecResult{}}
+	mgr := newQGTestManager(t, fb, "go")
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project":             "test-project",
+		"checks":              []any{"fmt"},
+		"extra_test_commands": []any{"go test ./pkg/a", "go test ./pkg/b"},
+		"env":                 map[string]any{"GIT_TOKEN": "secret-token", "CUSTOM": "value"},
+	})
+	if err != nil {
+		t.Fatalf("quality gate: %v", err)
+	}
+	var qr qualityGateResult
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &qr); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if got := []string{qr.Checks[0].Name, qr.Checks[1].Name, qr.Checks[2].Name}; !equalStrings(got, []string{"fmt", "test:0", "test:1"}) {
+		t.Fatalf("check order = %v", got)
+	}
+	if len(fb.calls) != 3 {
+		t.Fatalf("exec calls = %d", len(fb.calls))
+	}
+	for _, call := range fb.calls[1:] {
+		if call.TimeoutSec < 15*60 {
+			t.Errorf("extra test timeout = %ds, want at least 900s", call.TimeoutSec)
+		}
+		for key, want := range map[string]string{
+			"GOTOOLCHAIN": "auto", "GOWORK": "off", "GOPRIVATE": "gitlab.flexinfer.ai/*",
+			"CGO_ENABLED": "0", "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_1": "safe.directory",
+			"GIT_CONFIG_VALUE_1": "*", "CUSTOM": "value",
+		} {
+			if call.Env[key] != want {
+				t.Errorf("env[%s] = %q, want %q", key, call.Env[key], want)
+			}
+		}
+		if !strings.Contains(call.Env["GIT_CONFIG_KEY_0"], "secret-token") {
+			t.Errorf("git auth config missing token")
+		}
+	}
+}
+
+func TestQualityGate_ExtraTestsWithoutTokenDoNotAddGoEnvAndFailFast(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &qgFakeBackend{
+		fakeBackend: fakeBackend{statuses: map[string]*fakeStatus{}},
+		commandResults: map[string]*backend.ExecResult{
+			"go test ./bad": {ExitCode: 1, StderrTail: "compile failed"},
+		},
+	}
+	mgr := newQGTestManager(t, fb, "go")
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project": "test-project", "checks": []any{"fmt"},
+		"extra_test_commands": []any{"go test ./bad", "go test ./never"},
+		"env":                 map[string]any{"CUSTOM": "value"},
+	})
+	if err != nil {
+		t.Fatalf("quality gate: %v", err)
+	}
+	var qr qualityGateResult
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &qr); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if len(qr.Checks) != 2 || qr.Checks[1].Name != "test:0" || !strings.Contains(qr.Checks[1].OutputTail, "compile failed") {
+		t.Fatalf("checks = %#v", qr.Checks)
+	}
+	if len(fb.calls) != 2 || fb.calls[1].Command != "go test ./bad" {
+		t.Fatalf("calls = %#v", fb.calls)
+	}
+	if _, ok := fb.calls[1].Env["GOWORK"]; ok {
+		t.Fatalf("Go sandbox env added without GIT_TOKEN: %#v", fb.calls[1].Env)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func newQGTestManager(t *testing.T, b backend.Backend, lang string) *manager {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "workspace", "services", "test-project")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("create project dir: %v", err)
+	}
+
+	// Create language marker file
+	switch lang {
+	case "go":
+		os.WriteFile(filepath.Join(projectDir, "go.mod"), []byte("module test\n\ngo 1.22\n"), 0o644)
+	case "python":
+		os.WriteFile(filepath.Join(projectDir, "pyproject.toml"), []byte("[project]\nname=\"test\"\n"), 0o644)
+	case "node":
+		os.WriteFile(filepath.Join(projectDir, "package.json"), []byte(`{"name":"test"}`), 0o644)
+	case "rust":
+		os.WriteFile(filepath.Join(projectDir, "Cargo.toml"), []byte("[package]\nname=\"test\"\n"), 0o644)
+	default:
+		os.WriteFile(filepath.Join(projectDir, "Makefile"), []byte("fmt:\nlint:\ntest:\n"), 0o644)
+	}
+
+	store, err := state.NewStore(filepath.Join(tmpDir, "cache"))
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+
+	return &manager{
+		cfg: managerConfig{
+			workspaceRoot: filepath.Join(tmpDir, "workspace"),
+			cacheDir:      filepath.Join(tmpDir, "cache"),
+			backendType:   "docker",
+			imagePrefix:   "test/devbox",
+			maxTailLines:  20,
+			idleTimeout:   5 * time.Minute,
+			defaultCPU:    1.0,
+			defaultMemMB:  512,
+		},
+		backend: b,
+		store:   store,
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+func TestQualityGate_GoAllPass(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &qgFakeBackend{
+		fakeBackend:    fakeBackend{statuses: map[string]*fakeStatus{}},
+		commandResults: map[string]*backend.ExecResult{},
+	}
+	mgr := newQGTestManager(t, fb, "go")
+
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project": "test-project",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// Parse the JSON result
+	var qr qualityGateResult
+	if len(result.Content) > 0 {
+		if err := json.Unmarshal([]byte(result.Content[0].Text), &qr); err != nil {
+			t.Fatalf("unmarshal result: %v", err)
+		}
+	}
+
+	if qr.Language != "go" {
+		t.Errorf("language = %q, want %q", qr.Language, "go")
+	}
+	if !qr.Passed {
+		t.Error("expected quality gate to pass")
+	}
+	if len(qr.Checks) != 3 {
+		t.Errorf("expected 3 checks, got %d", len(qr.Checks))
+	}
+}
+
+func TestQualityGate_FailFast(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &qgFakeBackend{
+		fakeBackend: fakeBackend{statuses: map[string]*fakeStatus{}},
+		commandResults: map[string]*backend.ExecResult{
+			"go vet ./...": {ExitCode: 1, StdoutTail: "vet: found issues"},
+		},
+	}
+	mgr := newQGTestManager(t, fb, "go")
+
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project":   "test-project",
+		"fail_fast": true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	var qr qualityGateResult
+	if len(result.Content) > 0 {
+		json.Unmarshal([]byte(result.Content[0].Text), &qr)
+	}
+
+	if qr.Passed {
+		t.Error("expected quality gate to fail")
+	}
+	// fail_fast should stop after lint (fmt passes, lint fails)
+	if len(qr.Checks) != 2 {
+		t.Errorf("expected 2 checks (fail_fast after lint), got %d", len(qr.Checks))
+	}
+}
+
+func TestQualityGate_CustomChecks(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &qgFakeBackend{
+		fakeBackend:    fakeBackend{statuses: map[string]*fakeStatus{}},
+		commandResults: map[string]*backend.ExecResult{},
+	}
+	mgr := newQGTestManager(t, fb, "go")
+
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project": "test-project",
+		"checks":  []any{"test"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var qr qualityGateResult
+	if len(result.Content) > 0 {
+		json.Unmarshal([]byte(result.Content[0].Text), &qr)
+	}
+
+	if len(qr.Checks) != 1 {
+		t.Errorf("expected 1 check, got %d", len(qr.Checks))
+	}
+	if len(qr.Checks) > 0 && qr.Checks[0].Name != "test" {
+		t.Errorf("check name = %q, want %q", qr.Checks[0].Name, "test")
+	}
+}
+
+// TestQualityGate_NoExecutedChecksErrors verifies the gate refuses to
+// mint a verdict when zero checks executed (empty or unresolvable
+// checks selector). Before the guard it returned passed=true with an
+// empty checks array — a definite verdict from zero evidence.
+func TestQualityGate_NoExecutedChecksErrors(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	for name, checksArg := range map[string]any{
+		"unknown check name": []any{"bogus"},
+		"empty checks list":  []any{},
+	} {
+		fb := &qgFakeBackend{
+			fakeBackend:    fakeBackend{statuses: map[string]*fakeStatus{}},
+			commandResults: map[string]*backend.ExecResult{},
+		}
+		mgr := newQGTestManager(t, fb, "go")
+
+		result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+			"project": "test-project",
+			"checks":  checksArg,
+		})
+		if err != nil {
+			t.Fatalf("%s: unexpected transport error: %v", name, err)
+		}
+		if result == nil || !result.IsError {
+			t.Fatalf("%s: expected IsError result, got %+v", name, result)
+		}
+		if len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "executed no checks") {
+			t.Errorf("%s: error should name the zero-checks condition: %+v", name, result.Content)
+		}
+	}
+}
+
+func TestQualityGate_GitCloneProbesSandboxLanguage(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &qgFakeBackend{
+		fakeBackend: fakeBackend{statuses: map[string]*fakeStatus{}},
+		commandResults: map[string]*backend.ExecResult{
+			sandboxLanguageProbeCommand: {ExitCode: 0, StdoutTail: "go"},
+		},
+	}
+	mgr := newQGTestManager(t, fb, "unknown")
+	mgr.cfg.syncMode = "git-clone"
+
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project": "test-project",
+		"checks":  []string{"fmt"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var qr qualityGateResult
+	if len(result.Content) > 0 {
+		if err := json.Unmarshal([]byte(result.Content[0].Text), &qr); err != nil {
+			t.Fatalf("unmarshal result: %v", err)
+		}
+	}
+
+	if qr.Language != "go" {
+		t.Fatalf("language = %q, want go", qr.Language)
+	}
+	if len(qr.Checks) != 1 || qr.Checks[0].Name != "fmt" {
+		t.Fatalf("checks = %#v", qr.Checks)
+	}
+}
+
+// TestDetectSandboxLanguage_FallsBackToWorkspaceRoot asserts the
+// probe iterates past the per-project workdir and inspects /workspace
+// when the first probe comes back unknown. The historical canary
+// failures fingerprint as unknown at the project path (git-clone
+// dropped source under a different prefix than expected) and the
+// fallback path is what keeps `make fmt` from running blind.
+func TestDetectSandboxLanguage_FallsBackToWorkspaceRoot(t *testing.T) {
+	calls := []backend.ExecOpts{}
+	fb := &fakeProbeBackend{
+		results: map[string]*backend.ExecResult{
+			"/workspace": {ExitCode: 0, StdoutTail: "go\n"},
+		},
+		calls: &calls,
+	}
+	tmp := t.TempDir()
+	mgr := &manager{
+		cfg:    managerConfig{workspaceRoot: tmp},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	mgr.backend = fb
+
+	got := mgr.detectSandboxLanguage(context.Background(), "ctr", filepath.Join(tmp, "services", "loom-core"))
+	if got != "go" {
+		t.Fatalf("language = %q, want go", got)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 probe attempts (workdir + workspace root), got %d", len(calls))
+	}
+	if calls[0].WorkDir == calls[1].WorkDir {
+		t.Fatalf("expected distinct probe paths, got both = %q", calls[0].WorkDir)
+	}
+}
+
+// fakeProbeBackend records every Exec call and returns workdir-keyed
+// results so detectSandboxLanguage path iteration is observable.
+type fakeProbeBackend struct {
+	fakeBackend
+	results map[string]*backend.ExecResult
+	calls   *[]backend.ExecOpts
+}
+
+func (b *fakeProbeBackend) Exec(_ context.Context, opts backend.ExecOpts) (*backend.ExecResult, error) {
+	*b.calls = append(*b.calls, opts)
+	if r, ok := b.results[opts.WorkDir]; ok {
+		return r, nil
+	}
+	return &backend.ExecResult{ExitCode: 0, StdoutTail: "unknown\n"}, nil
+}
+
+// TestQualityGate_StderrSurfacedWhenStdoutEmpty mirrors the canary
+// failure mode where `make fmt` returns exit=1 with empty stdout
+// but a useful stderr line. The artifact's OutputTail must reflect
+// stderr so escalations show the actual error.
+// emptyErrorBackend returns a non-nil error whose Error() is empty
+// for every Exec call — the empty-err.Error() failure mode observed in
+// production canary attempts when go-toolchain exec wrappers swallow
+// their message. Verifies the gate now synthesizes a fallback so the
+// check artifact never reaches the operator with a blank Output.
+type emptyErrorBackend struct{ fakeBackend }
+
+type emptyErr struct{}
+
+func (emptyErr) Error() string { return "" }
+
+func (b *emptyErrorBackend) Exec(_ context.Context, _ backend.ExecOpts) (*backend.ExecResult, error) {
+	return nil, emptyErr{}
+}
+
+func TestQualityGate_EmptyErrorStillProducesOutput(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &emptyErrorBackend{fakeBackend{statuses: map[string]*fakeStatus{}}}
+	mgr := newQGTestManager(t, fb, "go")
+
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project": "test-project",
+		"checks":  []string{"fmt"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var qr qualityGateResult
+	if len(result.Content) > 0 {
+		if err := json.Unmarshal([]byte(result.Content[0].Text), &qr); err != nil {
+			t.Fatalf("unmarshal: %v (raw=%q)", err, result.Content[0].Text)
+		}
+	}
+	if len(qr.Checks) != 1 {
+		t.Fatalf("expected 1 check, got %d", len(qr.Checks))
+	}
+	got := qr.Checks[0]
+	if got.Passed {
+		t.Fatalf("expected fmt check to fail when exec returns error")
+	}
+	if got.OutputTail == "" {
+		t.Fatalf("OutputTail must never be empty when exec errored; got blank")
+	}
+	if !strings.Contains(got.OutputTail, "fmt") && !strings.Contains(got.OutputTail, "exec failed") {
+		t.Fatalf("OutputTail = %q, expected a fallback that names the check or exec", got.OutputTail)
+	}
+}
+
+func TestQualityGate_StderrSurfacedWhenStdoutEmpty(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	const stderrMsg = "make: *** No rule to make target 'fmt'. Stop."
+	fb := &qgFakeBackend{
+		fakeBackend: fakeBackend{statuses: map[string]*fakeStatus{}},
+		commandResults: map[string]*backend.ExecResult{
+			"make fmt": {ExitCode: 1, StdoutTail: "", StderrTail: stderrMsg},
+		},
+	}
+	mgr := newQGTestManager(t, fb, "unknown")
+	// Without a language marker on the host (lang="unknown"), the
+	// only way ensureRunning's dockerfile generation succeeds is via
+	// the git-clone genericGitCloneDockerfile fallback.
+	mgr.cfg.syncMode = "git-clone"
+
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project": "test-project",
+		"checks":  []string{"fmt"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var qr qualityGateResult
+	if len(result.Content) > 0 {
+		if err := json.Unmarshal([]byte(result.Content[0].Text), &qr); err != nil {
+			t.Fatalf("unmarshal result: %v (raw=%q)", err, result.Content[0].Text)
+		}
+	}
+	if len(qr.Checks) != 1 {
+		t.Fatalf("expected 1 check, got %d", len(qr.Checks))
+	}
+	got := qr.Checks[0]
+	if got.Passed {
+		t.Fatalf("expected fmt check to fail")
+	}
+	if got.StderrTail != stderrMsg {
+		t.Fatalf("StderrTail = %q, want %q", got.StderrTail, stderrMsg)
+	}
+	if got.OutputTail != stderrMsg {
+		t.Fatalf("OutputTail = %q, want stderr fallback %q", got.OutputTail, stderrMsg)
+	}
+}
+
+func TestQualityGate_DiffCheckAndStringChecks(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+	fb := &qgFakeBackend{
+		fakeBackend: fakeBackend{statuses: map[string]*fakeStatus{}},
+		commandResults: map[string]*backend.ExecResult{
+			"git diff --exit-code": {ExitCode: 1, StdoutTail: "generated files drifted"},
+		},
+	}
+	mgr := newQGTestManager(t, fb, "go")
+
+	result, err := mgr.handleQualityGate(context.Background(), map[string]any{
+		"project": "test-project",
+		"checks":  []string{"diff"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var qr qualityGateResult
+	if len(result.Content) > 0 {
+		if err := json.Unmarshal([]byte(result.Content[0].Text), &qr); err != nil {
+			t.Fatalf("unmarshal result: %v", err)
+		}
+	}
+
+	if qr.Passed {
+		t.Fatal("expected diff check to fail")
+	}
+	if len(qr.Checks) != 1 {
+		t.Fatalf("expected 1 check, got %d", len(qr.Checks))
+	}
+	if qr.Checks[0].Name != "diff" {
+		t.Fatalf("check name = %q, want diff", qr.Checks[0].Name)
+	}
+	if qr.Checks[0].OutputTail != "generated files drifted" {
+		t.Fatalf("output tail = %q, want diff failure output", qr.Checks[0].OutputTail)
+	}
+}
+
+func TestTruncateOutput(t *testing.T) {
+	t.Parallel()
+
+	short := "hello"
+	if got := truncateOutput(short, 100); got != short {
+		t.Errorf("short string should not be truncated: got %q", got)
+	}
+
+	long := "line1\nline2\nline3\nline4\nline5"
+	truncated := truncateOutput(long, 15)
+	if len(truncated) > 20 { // 15 + "..." prefix
+		t.Errorf("truncated output too long: %d bytes", len(truncated))
+	}
+}
+
+// TestAwaitSandboxBuild covers the quality gate's behavior of polling past the
+// async builder's "build in progress" signal instead of failing instantly
+// (the root cause of the Mills canary tests stage recording `0 checks`).
+func TestAwaitSandboxBuild(t *testing.T) {
+	building := &buildInProgressError{tag: "t", project: "p"}
+
+	t.Run("returns once build completes", func(t *testing.T) {
+		calls := 0
+		ensure := func() (string, error) {
+			calls++
+			if calls < 3 {
+				return "", building
+			}
+			return "container-123", nil
+		}
+		id, err := awaitSandboxBuild(context.Background(), time.Second, time.Millisecond, ensure)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id != "container-123" {
+			t.Fatalf("id = %q, want container-123", id)
+		}
+		if calls != 3 {
+			t.Fatalf("ensure called %d times, want 3", calls)
+		}
+	})
+
+	t.Run("passes through non-building errors immediately", func(t *testing.T) {
+		calls := 0
+		boom := errors.New("boom")
+		ensure := func() (string, error) {
+			calls++
+			return "", boom
+		}
+		_, err := awaitSandboxBuild(context.Background(), time.Second, time.Millisecond, ensure)
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want boom", err)
+		}
+		if calls != 1 {
+			t.Fatalf("ensure called %d times, want 1 (no retry on non-building error)", calls)
+		}
+	})
+
+	t.Run("times out while still building", func(t *testing.T) {
+		ensure := func() (string, error) { return "", building }
+		_, err := awaitSandboxBuild(context.Background(), 20*time.Millisecond, time.Millisecond, ensure)
+		if err == nil || !strings.Contains(err.Error(), "still building") {
+			t.Fatalf("err = %v, want 'still building' timeout", err)
+		}
+		if _, ok := asBuildInProgress(err); !ok {
+			t.Fatalf("timeout error should wrap buildInProgressError, got %v", err)
+		}
+	})
+
+	t.Run("honors context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		ensure := func() (string, error) {
+			calls++
+			if calls == 1 {
+				cancel()
+			}
+			return "", building
+		}
+		_, err := awaitSandboxBuild(ctx, time.Minute, 5*time.Millisecond, ensure)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
+}

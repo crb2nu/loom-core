@@ -18,12 +18,15 @@ import (
 
 // MsgPresenceData is sent by the app when new presence data arrives.
 type MsgPresenceData struct {
-	Agents       []PresenceAgentData
-	Claims       []ClaimData
-	Worktrees    []WorktreeData
-	ActiveAgents int
-	IdleAgents   int
-	TotalClaims  int
+	Agents            []PresenceAgentData
+	AgentCoordination []PresenceAgentCoordination
+	Claims            []ClaimData
+	Worktrees         []WorktreeData
+	ActiveAgents      int
+	IdleAgents        int
+	TotalClaims       int
+	SharedBranches    int
+	IdleClaimHolders  int
 }
 
 // PresenceAgentData holds agent presence data for the presence panel.
@@ -55,6 +58,19 @@ type WorktreeData struct {
 	CreatedAt string
 }
 
+// PresenceAgentCoordination carries attention metadata for an agent row.
+type PresenceAgentCoordination struct {
+	AgentID          string
+	TaskCount        int
+	BlockedTasks     int
+	ClaimCount       int
+	ConflictFiles    int
+	BlockingOthers   int
+	BlockedByOthers  int
+	AttentionReasons []string
+	NeedsAttention   bool
+}
+
 // ---------------------------------------------------------------------------
 // Sub-tab
 // ---------------------------------------------------------------------------
@@ -75,13 +91,16 @@ var presenceTabNames = []string{"Agents", "Claims", "Worktrees"}
 
 // PresencePanel renders agent presence, file claims, and worktree assignments.
 type PresencePanel struct {
-	width, height int
-	agents        []PresenceAgentData
-	claims        []ClaimData
-	worktrees     []WorktreeData
-	activeAgents  int
-	idleAgents    int
-	totalClaims   int
+	width, height     int
+	agents            []PresenceAgentData
+	claims            []ClaimData
+	worktrees         []WorktreeData
+	agentCoordination map[string]PresenceAgentCoordination
+	activeAgents      int
+	idleAgents        int
+	totalClaims       int
+	sharedBranches    int
+	idleClaimHolders  int
 
 	// Interactive state
 	activeTab   presenceTab
@@ -104,11 +123,17 @@ func (p PresencePanel) Update(msg tea.Msg) (PresencePanel, tea.Cmd) {
 		p.height = msg.Height
 	case MsgPresenceData:
 		p.agents = msg.Agents
+		p.agentCoordination = make(map[string]PresenceAgentCoordination, len(msg.AgentCoordination))
+		for _, coord := range msg.AgentCoordination {
+			p.agentCoordination[coord.AgentID] = coord
+		}
 		p.claims = msg.Claims
 		p.worktrees = msg.Worktrees
 		p.activeAgents = msg.ActiveAgents
 		p.idleAgents = msg.IdleAgents
 		p.totalClaims = msg.TotalClaims
+		p.sharedBranches = msg.SharedBranches
+		p.idleClaimHolders = msg.IdleClaimHolders
 		// Clamp cursor after data update.
 		p.clampCursor()
 	case tea.KeyMsg:
@@ -206,6 +231,8 @@ func (p PresencePanel) renderSummary() string {
 		theme.Styles.StatusMuted.Render(fmt.Sprintf("%d offline", offlineCount)),
 		theme.Styles.Label.Render("Claims: ") + theme.Styles.Value.Render(fmt.Sprintf("%d", p.totalClaims)),
 		conflictsText,
+		theme.Styles.Label.Render("Shared Branches: ") + theme.Styles.Value.Render(fmt.Sprintf("%d", p.sharedBranches)),
+		theme.Styles.Label.Render("Idle Holders: ") + theme.Styles.Value.Render(fmt.Sprintf("%d", p.idleClaimHolders)),
 		theme.Styles.Label.Render("Worktrees: ") + theme.Styles.Value.Render(fmt.Sprintf("%d", len(p.worktrees))),
 	}
 	return strings.Join(parts, "  ")
@@ -314,6 +341,29 @@ func (p PresencePanel) renderAgentsTable() string {
 			descStyle := lipgloss.NewStyle().Foreground(theme.ColorFgMuted).PaddingLeft(5)
 			b.WriteString(descStyle.Render(truncate(a.CurrentTask, p.width-8)))
 			b.WriteString("\n")
+		}
+		if isSelected {
+			if coord, ok := p.agentCoordination[a.AgentID]; ok && coord.NeedsAttention {
+				descStyle := lipgloss.NewStyle().Foreground(theme.ColorFgMuted).PaddingLeft(5)
+				parts := []string{
+					fmt.Sprintf("tasks:%d", coord.TaskCount),
+					fmt.Sprintf("blocked:%d", coord.BlockedTasks),
+					fmt.Sprintf("claims:%d", coord.ClaimCount),
+					fmt.Sprintf("conflicts:%d", coord.ConflictFiles),
+				}
+				if coord.BlockingOthers > 0 {
+					parts = append(parts, fmt.Sprintf("blocking:%d", coord.BlockingOthers))
+				}
+				if coord.BlockedByOthers > 0 {
+					parts = append(parts, fmt.Sprintf("waiting:%d", coord.BlockedByOthers))
+				}
+				b.WriteString(descStyle.Render(truncate(strings.Join(parts, "  "), p.width-8)))
+				b.WriteString("\n")
+				if len(coord.AttentionReasons) > 0 {
+					b.WriteString(descStyle.Render(truncate("attention: "+strings.Join(coord.AttentionReasons, ", "), p.width-8)))
+					b.WriteString("\n")
+				}
+			}
 		}
 	}
 

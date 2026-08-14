@@ -1,8 +1,21 @@
-<script>
-  /** @type {{ data: number[], width?: number, height?: number, color?: string, showTrend?: boolean }} */
-  let { data = [], width = 120, height = 24, color = 'var(--info)', showTrend = false } = $props();
+<script lang="ts">
+  let {
+    data = [],
+    width = 120,
+    height = 24,
+    color = 'var(--info)',
+    showTrend = false,
+  }: {
+    data?: number[];
+    width?: number;
+    height?: number;
+    color?: string;
+    showTrend?: boolean;
+  } = $props();
 
-  let gradientId = $derived(`spark-grad-${Math.random().toString(36).slice(2, 8)}`);
+  // Stable unique IDs — generated once per component instance (not on every reactive update).
+  const instanceId = Math.random().toString(36).slice(2, 8);
+  const gradientId = `spark-grad-${instanceId}`;
 
   // Compute SVG polyline points and path for smooth cubic interpolation.
   let computed = $derived.by(() => {
@@ -70,15 +83,15 @@
     return '→';
   });
 
-  let glowFilterId = $derived(`spark-glow-${Math.random().toString(36).slice(2, 8)}`);
+  const glowFilterId = `spark-glow-${instanceId}`;
 
   // Tooltip state.
-  let hoveredIdx = $state(null);
+  let hoveredIdx = $state<number | null>(null);
   let hoveredPt = $derived(hoveredIdx !== null && computed ? computed.pts[hoveredIdx] : null);
 
-  function handleMouseMove(e) {
+  function handleMouseMove(e: MouseEvent) {
     if (!computed) return;
-    const svg = e.currentTarget;
+    const svg = e.currentTarget as SVGSVGElement;
     const rect = svg.getBoundingClientRect();
     const mouseX = (e.clientX - rect.left) * (width / rect.width);
     // Find nearest point.
@@ -98,7 +111,7 @@
     hoveredIdx = null;
   }
 
-  function formatValue(v) {
+  function formatValue(v: number) {
     if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
     if (Number.isInteger(v)) return v.toString();
     return v.toFixed(1);

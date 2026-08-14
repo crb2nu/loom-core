@@ -1,0 +1,234 @@
+// proxy_heartbeat.go — HUD heartbeat, agent identity resolution, and namespace hashing.
+package main
+
+import (
+	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/crb2nu/loom/internal/hud"
+)
+
+// proxyHeartbeat fires an async heartbeat to the HUD for proxy-level agent identification.
+// This provides universal heartbeat coverage for any agent using loom proxy.
+func proxyHeartbeat(agentType string) {
+	resolvedAgentID, resolvedAgentType := resolveProxyIdentity(agentType)
+	proxyNamespaceOnce.Do(func() {
+		proxyNamespace = inferGitNamespace()
+	})
+	bodyMap := map[string]any{
+		"agent_id":       resolvedAgentID,
+		"status":         "active",
+		"agent_type":     resolvedAgentType,
+		"ensure_session": true,
+	}
+	if strings.TrimSpace(proxyNamespace) != "" {
+		bodyMap["namespace"] = proxyNamespace
+	}
+	body, err := json.Marshal(bodyMap)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Try port file first, fall back to default.
+	port := "3333"
+	if data, err := os.ReadFile(hud.PortFilePath()); err == nil {
+		if p := strings.TrimSpace(string(data)); p != "" {
+			port = p
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://127.0.0.1:"+port+"/api/agent/heartbeat",
+		strings.NewReader(string(body)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+func resolveProxyIdentity(agentHint string) (agentID, agentType string) {
+	agentType = strings.TrimSpace(agentHint)
+	if agentType == "" {
+		agentType = "proxy"
+	}
+
+	proxyIdentityOnce.Do(func() {
+		if override := strings.TrimSpace(os.Getenv("LOOM_PROXY_AGENT_ID")); override != "" {
+			proxyAgentID = override
+			return
+		}
+
+		typePart := sanitizeIDPart(agentType)
+		if typePart == "" {
+			typePart = "proxy"
+		}
+
+		if stableID, ok := stableWorkspaceProxyAgentID(typePart); ok {
+			proxyAgentID = stableID
+			return
+		}
+
+		host, err := os.Hostname()
+		if err != nil {
+			host = "host"
+		}
+		hostPart := sanitizeIDPart(host)
+		if hostPart == "" {
+			hostPart = "host"
+		}
+
+		pidPart := strconv.Itoa(os.Getpid())
+		nsHash := namespaceDigest(inferGitNamespace())
+		if nsHash != "" {
+			proxyAgentID = fmt.Sprintf("%s-%s-%s-%s", typePart, hostPart, pidPart, nsHash)
+			return
+		}
+		proxyAgentID = fmt.Sprintf("%s-%s-%s", typePart, hostPart, pidPart)
+	})
+
+	return proxyAgentID, agentType
+}
+
+func stableWorkspaceProxyAgentID(agentType string) (string, bool) {
+	// Derive the same workspace-scoped key the CLI session hooks register:
+	// <type>-<cksum(workspace root)> (see hookAgentIDBootstrap in
+	// pkg/generator/configs_hooks.go — its WS_HASH is `cksum` of the same git
+	// toplevel). The hooks append a per-Claude-session suffix the proxy cannot
+	// know (no session_id is exposed to MCP servers), so this is the base the
+	// HUD base-matches to attribute proxy tool-call activity to the agent's
+	// session(s) in this workspace. Previously gated to codex only — which is
+	// why every other platform's calls carried a non-matching process-scoped id
+	// and showed "0 calls". A stable workspace key also stops the per-restart
+	// host-pid roster proliferation.
+	if strings.TrimSpace(agentType) == "" {
+		return "", false
+	}
+
+	root := inferGitTopLevel()
+	if root == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", false
+		}
+		root = wd
+	}
+	return workspaceProxyAgentIDFor(agentType, root), true
+}
+
+// workspaceProxyAgentIDFor formats the workspace-scoped proxy id `<type>-<cksum>`
+// for a given agent type and git root.
+//
+// Codex is workspace-anchored: its session id is `codex-<WS_HASH>` with no
+// SESSION_SCOPE, so conversationId keeps the WS_HASH (see WORKSPACE_ANCHORED_BASES
+// in agents.ts) and the notify hook now hashes the CANONICAL main-repo root (see
+// worktreeCanonRootShell). We canonicalize here too so the proxy's
+// `codex-<WS_HASH>` base reconciles to the session across worktrees instead of
+// forking a per-worktree id. Conversation-scoped vendors (claude/gemini) still
+// hash the raw worktree root — their shell bootstrap is unchanged and their proxy
+// base must keep matching it.
+func workspaceProxyAgentIDFor(agentType, root string) string {
+	if strings.TrimSpace(agentType) == "codex" {
+		root = stripWorktreeFromRepoRoot(root)
+	}
+	return fmt.Sprintf("%s-%d", agentType, posixCKSumString(root))
+}
+
+func inferGitTopLevel() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", wd, "rev-parse", "--show-toplevel")
+	cmd.Env = withoutAmbientGitEnv(os.Environ())
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func withoutAmbientGitEnv(env []string) []string {
+	filtered := env[:0]
+	for _, kv := range env {
+		key, _, _ := strings.Cut(kv, "=")
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX":
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+	return filtered
+}
+
+func posixCKSumString(input string) uint32 {
+	var crc uint32
+	update := func(b byte) {
+		crc ^= uint32(b) << 24
+		for i := 0; i < 8; i++ {
+			if crc&0x80000000 != 0 {
+				crc = (crc << 1) ^ 0x04C11DB7
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+
+	for i := 0; i < len(input); i++ {
+		update(input[i])
+	}
+	for n := len(input); n > 0; n >>= 8 {
+		update(byte(n & 0xff))
+	}
+	return ^crc
+}
+
+func sanitizeIDPart(input string) string {
+	if input == "" {
+		return ""
+	}
+	normalized := strings.ToLower(strings.TrimSpace(input))
+	var b strings.Builder
+	b.Grow(len(normalized))
+	prevDash := false
+	for _, r := range normalized {
+		isAlphaNum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isAlphaNum {
+			b.WriteRune(r)
+			prevDash = false
+			continue
+		}
+		if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func namespaceDigest(namespace string) string {
+	if strings.TrimSpace(namespace) == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(namespace))
+	return hex.EncodeToString(sum[:])[:8]
+}

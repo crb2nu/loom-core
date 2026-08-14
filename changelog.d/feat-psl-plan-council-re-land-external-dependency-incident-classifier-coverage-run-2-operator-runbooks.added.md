@@ -1,0 +1,1 @@
+- Add pattern-linked detection, remediation, and verification procedures for every Mills external-dependency classifier ID in `docs/operator-runbook-external-dependency-incidents.md`, enforced by `pkg/mills/pipeline/failure_classifier_test.go`.

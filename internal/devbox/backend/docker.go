@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,6 +37,13 @@ func (d *DockerBackend) Health(ctx context.Context) error {
 }
 
 func (d *DockerBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, error) {
+	if opts.PreferExisting {
+		inspect := exec.CommandContext(ctx, d.dockerPath, "image", "inspect", opts.Tag)
+		if err := inspect.Run(); err == nil {
+			return &BuildResult{ImageTag: opts.Tag, Cached: true}, nil
+		}
+	}
+
 	// Write Dockerfile to a temp file in the context directory
 	tmpDir, err := os.MkdirTemp("", "devbox-build-*")
 	if err != nil {
@@ -64,6 +72,20 @@ func (d *DockerBackend) Start(ctx context.Context, opts StartOpts) (*StartResult
 	_ = d.Stop(ctx, opts.Name)
 
 	args := []string{"run", "-d", "--name", opts.Name}
+
+	// Apply container labels (symmetry with K8s backend pod labels).
+	managedBy := "mcp-devbox"
+	if opts.ManagedByOverride != "" {
+		managedBy = opts.ManagedByOverride
+	}
+	args = append(args, "--label", "app.kubernetes.io/managed-by="+managedBy)
+	args = append(args, "--label", "devbox/project="+opts.Name)
+	if opts.AgentID != "" {
+		args = append(args, "--label", "devbox/agent-id="+opts.AgentID)
+	}
+	for k, v := range opts.ExtraLabels {
+		args = append(args, "--label", k+"="+v)
+	}
 
 	for _, m := range opts.Mounts {
 		flag := fmt.Sprintf("%s:%s", m.Host, m.Container)
@@ -143,6 +165,14 @@ func (d *DockerBackend) Exec(ctx context.Context, opts ExecOpts) (*ExecResult, e
 			if exitCode == 137 {
 				oomKilled = true
 			}
+			// `docker exec` reports a runc start-of-process failure on
+			// stderr with exit 126, not 137 — the OOM killer took runc
+			// init while the container's PID 1 lived on. Nothing in that
+			// message mentions memory, so spell out the likely cause.
+			if !oomKilled && hasRuncInitFailureMarker(stderrBuf.String()) {
+				stderrBuf.WriteString(execMemoryHint(d.containerMemoryLimit(ctx, opts.ContainerID), false))
+				stderrBuf.WriteByte('\n')
+			}
 		} else {
 			return nil, fmt.Errorf("exec failed: %w", err)
 		}
@@ -166,6 +196,22 @@ func (d *DockerBackend) Exec(ctx context.Context, opts ExecOpts) (*ExecResult, e
 		Truncated:   stdoutTrunc || stderrTrunc,
 		OOMKilled:   oomKilled,
 	}, nil
+}
+
+// containerMemoryLimit returns the container's memory limit formatted for an
+// operator ("4Gi"), or "" when docker reports no limit or cannot be reached.
+// Only called on the exec failure path, so the extra docker call is rare.
+func (d *DockerBackend) containerMemoryLimit(ctx context.Context, id string) string {
+	out, err := exec.CommandContext(ctx, d.dockerPath, "inspect", "-f", "{{.HostConfig.Memory}}", id).Output()
+	if err != nil {
+		return ""
+	}
+	bytesLimit, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil || bytesLimit <= 0 {
+		// Docker reports 0 for "unlimited".
+		return ""
+	}
+	return fmt.Sprintf("%dMi", bytesLimit/(1024*1024))
 }
 
 func (d *DockerBackend) Stop(ctx context.Context, id string) error {
@@ -220,6 +266,10 @@ func (d *DockerBackend) ReadFile(ctx context.Context, id, path string) ([]byte, 
 		return nil, fmt.Errorf("read file %q: %w (%s)", path, err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
+}
+
+func (d *DockerBackend) CleanupBuilds(_ context.Context, _ time.Duration) (int, error) {
+	return 0, nil // Docker builds don't leave pods behind
 }
 
 func (d *DockerBackend) WriteFile(ctx context.Context, id, path string, content []byte, mode string) error {

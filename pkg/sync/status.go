@@ -4,9 +4,11 @@ package sync
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/skills"
@@ -45,12 +47,19 @@ type DriftItem struct {
 	Status   DriftStatus
 }
 
+// PolicyHashFilename is the filename written to home config dirs during sync.
+// It records the SHA256 hash of the registry's policy-relevant data so that
+// loom doctor and loom sync status can detect when the registry changed without
+// a re-sync.
+const PolicyHashFilename = ".loom-policy-hash"
+
 // SyncStatus represents the sync state of a profile.
 type SyncStatus struct {
 	Profile      string
 	RepoExists   bool
 	HomeExists   bool
 	InSync       bool
+	PolicyStatus string // "in-sync", "stale", "not-configured"
 	DriftDetails []DriftItem
 	LastSyncTime time.Time
 	RepoPath     string
@@ -83,13 +92,19 @@ func (m *Manager) GetSyncStatus(profileName string) (*SyncStatus, error) {
 	}
 
 	// If either doesn't exist, not in sync
-	if !status.RepoExists || !status.HomeExists {
+	requiresRepo := !profile.GeneratedDirectToHome
+	if profile.SkillsManifest != "" && !profile.SkillsDirectToHome {
+		requiresRepo = true
+	}
+	if (requiresRepo && !status.RepoExists) || !status.HomeExists {
 		status.InSync = false
 		return status, nil
 	}
 
 	// Compare files
-	if profile.SyncGeneratedOnly {
+	if profile.GeneratedDirectToHome {
+		status.DriftDetails = compareHomeGeneratedFiles(homePath, profile)
+	} else if profile.SyncGeneratedOnly {
 		status.DriftDetails = compareGeneratedFile(repoPath, homePath, profile)
 	} else {
 		status.DriftDetails = m.compareDirectories(repoPath, homePath, profile)
@@ -101,12 +116,26 @@ func (m *Manager) GetSyncStatus(profileName string) (*SyncStatus, error) {
 		}
 	}
 
+	// Check for stale workspace-level configs that shadow home configs
+	if profile.GeneratedDirectToHome && m.WorkspaceRoot != "" && m.WorkspaceRoot != m.RepoRoot {
+		for _, relPath := range homeGeneratedFiles(profile) {
+			wsConfigPath := filepath.Join(m.WorkspaceRoot, profile.RepoDir, relPath)
+			if Exists(wsConfigPath) {
+				status.DriftDetails = append(status.DriftDetails, DriftItem{
+					File:   "workspace:" + relPath,
+					Status: DriftOutOfSync,
+				})
+				status.InSync = false
+			}
+		}
+	}
+
 	// Check skill files for drift via manifest
 	if profile.SkillsManifest != "" {
 		var skillDrift []DriftItem
 		if profile.SkillsDirectToHome {
 			// Skills live only in home; verify they exist there.
-			skillDrift = compareHomeSkillFiles(homePath)
+			skillDrift = compareHomeSkillFiles(skillsHomeManifestDir(profile, homePath))
 		} else {
 			skillDrift = compareSkillFiles(repoPath, homePath, profile)
 		}
@@ -118,7 +147,44 @@ func (m *Manager) GetSyncStatus(profileName string) (*SyncStatus, error) {
 		}
 	}
 
+	// Check policy hash for staleness.
+	regPath := discoverRegistryPath(m.RepoRoot)
+	status.PolicyStatus = m.checkPolicyStatus(homePath, regPath)
+
 	return status, nil
+}
+
+// DriftSummary returns aggregate drift counts across all profiles. Useful for
+// HUD status display and quick health checks.
+func (m *Manager) DriftSummary() (inSync int, outOfSync int, missing int, err error) {
+	for _, name := range m.List() {
+		status, e := m.GetSyncStatus(name)
+		if e != nil {
+			err = e
+			return
+		}
+		if status == nil {
+			continue
+		}
+		if status.InSync {
+			inSync++
+		} else {
+			// Classify why it's out of sync.
+			hasMissing := false
+			for _, item := range status.DriftDetails {
+				if item.Status == DriftMissing {
+					hasMissing = true
+					break
+				}
+			}
+			if hasMissing || !status.RepoExists || !status.HomeExists {
+				missing++
+			} else {
+				outOfSync++
+			}
+		}
+	}
+	return
 }
 
 // GetAllSyncStatus returns sync status for all profiles.
@@ -310,6 +376,52 @@ func compareHomeSkillFiles(homePath string) []DriftItem {
 	return items
 }
 
+// homeGeneratedFiles returns the generated files that should exist in home for
+// a direct-to-home profile. The primary generated file is always required, and
+// extra generated files are treated as required home artifacts as well.
+func homeGeneratedFiles(profile *Profile) []string {
+	if profile == nil || profile.GeneratedFile == "" {
+		return nil
+	}
+
+	primary := primaryHomeGeneratedFile(profile)
+	files := []string{primary}
+	seen := map[string]struct{}{
+		primary: {},
+	}
+	for _, rel := range profile.ExtraGeneratedFiles {
+		if rel == "" {
+			continue
+		}
+		homeRel := mapRepoGeneratedToHome(profile, rel)
+		if _, ok := seen[homeRel]; ok {
+			continue
+		}
+		seen[homeRel] = struct{}{}
+		files = append(files, homeRel)
+	}
+	return files
+}
+
+func compareHomeGeneratedFiles(homePath string, profile *Profile) []DriftItem {
+	files := homeGeneratedFiles(profile)
+	if len(files) == 0 {
+		return []DriftItem{{File: "", Status: DriftOutOfSync}}
+	}
+
+	var items []DriftItem
+	for _, rel := range files {
+		path := filepath.Join(homePath, rel)
+		if Exists(path) {
+			homeHash, _ := hashFile(path)
+			items = append(items, DriftItem{File: rel, HomeHash: homeHash, Status: DriftInSync})
+		} else {
+			items = append(items, DriftItem{File: rel, Status: DriftMissing})
+		}
+	}
+	return items
+}
+
 func compareGeneratedFile(repoPath, homePath string, profile *Profile) []DriftItem {
 	if profile.GeneratedFile == "" {
 		return []DriftItem{{
@@ -325,7 +437,8 @@ func compareGeneratedFile(repoPath, homePath string, profile *Profile) []DriftIt
 	var items []DriftItem
 	for _, rel := range files {
 		repoFile := filepath.Join(repoPath, rel)
-		homeFile := filepath.Join(homePath, rel)
+		homeRel := mapRepoGeneratedToHome(profile, rel)
+		homeFile := filepath.Join(homePath, homeRel)
 
 		repoExists := Exists(repoFile)
 		homeExists := Exists(homeFile)
@@ -347,7 +460,23 @@ func compareGeneratedFile(repoPath, homePath string, profile *Profile) []DriftIt
 			repoHash, _ := hashFile(repoFile)
 			homeHash, _ := hashFile(homeFile)
 			if repoHash != homeHash {
-				items = append(items, DriftItem{File: rel, RepoHash: repoHash, HomeHash: homeHash, Status: DriftOutOfSync})
+				// For settings.json, home-managed keys (hooks, permissions, etc.) are
+				// stripped from repo via SyncAllProjects but preserved in home. Compare
+				// non-home-managed keys only to avoid false drift.
+				if profile.Name == "zed" && zedGeneratedInSync(repoFile, homeFile) {
+					// The zed fragment is merged into the user's settings.json,
+					// so the files are never byte-identical; compare the
+					// context_servers subset instead.
+					items = append(items, DriftItem{File: rel, RepoHash: repoHash, HomeHash: homeHash, Status: DriftInSync})
+				} else if rel == "settings.json" && settingsInSyncIgnoringHomeManaged(repoFile, homeFile, profile) {
+					items = append(items, DriftItem{File: rel, RepoHash: repoHash, HomeHash: homeHash, Status: DriftInSync})
+				} else if strings.HasSuffix(rel, ".toml") && tomlInSyncIgnoringKeys(repoFile, homeFile, []string{"notify"}) {
+					// For TOML configs, the [notify] section may exist in home
+					// (added by lifecycle hooks) but not in repo. Treat as in-sync.
+					items = append(items, DriftItem{File: rel, RepoHash: repoHash, HomeHash: homeHash, Status: DriftInSync})
+				} else {
+					items = append(items, DriftItem{File: rel, RepoHash: repoHash, HomeHash: homeHash, Status: DriftOutOfSync})
+				}
 			} else {
 				items = append(items, DriftItem{File: rel, RepoHash: repoHash, HomeHash: homeHash, Status: DriftInSync})
 			}
@@ -358,4 +487,154 @@ func compareGeneratedFile(repoPath, homePath string, profile *Profile) []DriftIt
 		return []DriftItem{{File: profile.GeneratedFile, Status: DriftMissing}}
 	}
 	return items
+}
+
+// configInSyncIgnoringKeys compares two JSON config files, treating them as
+// in-sync if they differ only in the specified keys. This accounts for
+// intentional design where certain keys are stripped from the repo copy but
+// preserved in home via merge operations.
+func configInSyncIgnoringKeys(repoFile, homeFile string, ignoreKeys []string) bool {
+	repoData, err := os.ReadFile(repoFile)
+	if err != nil {
+		return false
+	}
+	homeData, err := os.ReadFile(homeFile)
+	if err != nil {
+		return false
+	}
+
+	var repoMap, homeMap map[string]json.RawMessage
+	if json.Unmarshal(repoData, &repoMap) != nil || json.Unmarshal(homeData, &homeMap) != nil {
+		return false
+	}
+
+	for _, key := range ignoreKeys {
+		delete(repoMap, key)
+		delete(homeMap, key)
+	}
+
+	repoNorm, _ := json.Marshal(repoMap)
+	homeNorm, _ := json.Marshal(homeMap)
+	return string(repoNorm) == string(homeNorm)
+}
+
+// settingsInSyncIgnoringHomeManaged compares two settings.json files, treating
+// them as in-sync if they differ only in the profile's HomeManagedSettingsKeys.
+// SyncAllProjects strips these keys from the repo copy (they live at user level
+// only), so a naive byte-compare reports false drift against the home copy that
+// retains them.
+func settingsInSyncIgnoringHomeManaged(repoFile, homeFile string, profile *Profile) bool {
+	keys := []string{"hooks"}
+	if profile != nil && len(profile.HomeManagedSettingsKeys) > 0 {
+		keys = profile.HomeManagedSettingsKeys
+	}
+	return configInSyncIgnoringKeys(repoFile, homeFile, keys)
+}
+
+// tomlInSyncIgnoringKeys compares two TOML config files, treating them as
+// in-sync if they differ only in the specified top-level sections. Uses a
+// simple line-based approach to strip [key] sections rather than importing
+// a TOML library, since the config files are simple.
+func tomlInSyncIgnoringKeys(repoFile, homeFile string, ignoreKeys []string) bool {
+	repoData, err := os.ReadFile(repoFile)
+	if err != nil {
+		return false
+	}
+	homeData, err := os.ReadFile(homeFile)
+	if err != nil {
+		return false
+	}
+
+	repoFiltered := filterTOMLSections(string(repoData), ignoreKeys)
+	homeFiltered := filterTOMLSections(string(homeData), ignoreKeys)
+	return repoFiltered == homeFiltered
+}
+
+// filterTOMLSections removes top-level sections matching the given keys from
+// TOML content. A section starts with [key] and extends until the next
+// top-level section header or end of file.
+func filterTOMLSections(content string, ignoreKeys []string) string {
+	ignore := make(map[string]bool, len(ignoreKeys))
+	for _, k := range ignoreKeys {
+		ignore[k] = true
+	}
+
+	lines := strings.Split(content, "\n")
+	var result []string
+	skipping := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Detect top-level section headers like [notify] or [notify.hooks]
+		if strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "[[") {
+			section := strings.TrimPrefix(trimmed, "[")
+			section = strings.TrimSuffix(section, "]")
+			section = strings.TrimSpace(section)
+			// Extract the top-level key (before any dot)
+			topKey := section
+			if idx := strings.Index(section, "."); idx >= 0 {
+				topKey = section[:idx]
+			}
+			skipping = ignore[topKey]
+		}
+		if !skipping {
+			result = append(result, line)
+		}
+	}
+
+	return strings.Join(result, "\n")
+}
+
+// ComputePolicyHash returns a SHA256 hex hash of the registry file. This hash
+// is written to home config dirs during sync and compared later for staleness
+// detection. Any registry change (servers, permissions, sandbox policy) triggers
+// a "stale" signal that is cleared by the next sync.
+func ComputePolicyHash(registryPath string) (string, error) {
+	data, err := os.ReadFile(registryPath)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:]), nil
+}
+
+// ReadPolicyHash reads the previously-synced policy hash from a home config dir.
+func ReadPolicyHash(homePath string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(homePath, PolicyHashFilename))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// WritePolicyHash writes the policy hash to a home config dir.
+func WritePolicyHash(homePath, hash string) error {
+	if err := os.MkdirAll(homePath, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(homePath, PolicyHashFilename), []byte(hash+"\n"), 0o644)
+}
+
+// checkPolicyStatus computes the policy sync status for a profile by comparing
+// the current registry hash against the hash recorded during last sync.
+func (m *Manager) checkPolicyStatus(homePath, registryPath string) string {
+	if registryPath == "" {
+		return "not-configured"
+	}
+
+	currentHash, err := ComputePolicyHash(registryPath)
+	if err != nil {
+		return "not-configured"
+	}
+
+	savedHash, err := ReadPolicyHash(homePath)
+	if err != nil {
+		// Hash file does not exist -- never synced with policy tracking.
+		return "not-configured"
+	}
+
+	if currentHash == savedHash {
+		return "in-sync"
+	}
+	return "stale"
 }

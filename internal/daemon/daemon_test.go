@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/pkg/profiles"
 )
 
 // =============================================================================
@@ -372,6 +374,44 @@ func TestManifestManager_SaveLoad(t *testing.T) {
 	}
 	if tools[0].Name != "tool1" {
 		t.Errorf("tool name = %q, want tool1", tools[0].Name)
+	}
+}
+
+func TestLoadManifestToolCacheFiltersActiveProfile(t *testing.T) {
+	manifestPath := filepath.Join(t.TempDir(), "manifest.yaml")
+	manifest := &ManifestManager{
+		path: manifestPath,
+		manifest: &ToolManifest{
+			Version: 1,
+			Servers: make(map[string]ServerManifest),
+		},
+	}
+	manifest.ReplaceServerTools(map[string][]mcp.Tool{
+		"mcp-git": {{Name: "mcp-git__status"}},
+		"mcp-k8s": {{Name: "mcp-k8s__delete_cluster"}},
+	})
+	if err := manifest.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	d := newCallPipelineTestDaemon()
+	d.fileCfg.Context.ActiveProfile = "dev"
+	d.profiles = profiles.NewManager()
+	d.toolCache = &ToolCache{ttl: time.Minute}
+	d.manifest = &ManifestManager{
+		path: manifestPath,
+		manifest: &ToolManifest{
+			Version: 1,
+			Servers: make(map[string]ServerManifest),
+		},
+	}
+	d.loadManifestToolCache()
+
+	d.toolCache.mu.RLock()
+	tools := append([]mcp.Tool(nil), d.toolCache.tools...)
+	d.toolCache.mu.RUnlock()
+	if len(tools) != 1 || tools[0].Name != "mcp-git__status" {
+		t.Fatalf("startup cache for dev profile = %v, want [mcp-git__status]", cacheRevisionTestToolNames(tools))
 	}
 }
 
@@ -821,6 +861,44 @@ func TestLoadConfigFile_Default(t *testing.T) {
 	}
 	if cfg.Hub.Profile != "codex" {
 		t.Errorf("Hub.Profile = %q, want codex", cfg.Hub.Profile)
+	}
+}
+
+func TestLoadConfigFile_AuditEnvOverridesDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("LOOM_AUDIT_ENABLED", "true")
+	t.Setenv("LOOM_AUDIT_LOG_PATH", filepath.Join(tmpDir, "audit.jsonl"))
+
+	cfg, err := LoadConfigFile()
+	if err != nil {
+		t.Fatalf("LoadConfigFile failed: %v", err)
+	}
+
+	if !cfg.Audit.Enabled {
+		t.Fatal("Audit.Enabled = false, want true from LOOM_AUDIT_ENABLED")
+	}
+	if cfg.Audit.LogPath != filepath.Join(tmpDir, "audit.jsonl") {
+		t.Errorf("Audit.LogPath = %q, want env override", cfg.Audit.LogPath)
+	}
+}
+
+func TestLoadConfigFile_InvalidAuditEnvWarning(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LOOM_AUDIT_ENABLED", "not-bool")
+
+	cfg, warnings, err := LoadConfigFileWithWarnings()
+	if err != nil {
+		t.Fatalf("LoadConfigFileWithWarnings failed: %v", err)
+	}
+	if cfg.Audit.Enabled {
+		t.Fatal("Audit.Enabled = true, want default false for invalid env")
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected invalid LOOM_AUDIT_ENABLED warning")
+	}
+	if !strings.Contains(warnings[0], "LOOM_AUDIT_ENABLED") {
+		t.Fatalf("warning = %q, want LOOM_AUDIT_ENABLED", warnings[0])
 	}
 }
 

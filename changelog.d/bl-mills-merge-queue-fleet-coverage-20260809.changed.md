@@ -1,0 +1,1 @@
+- Route fleet non-pipeline merge intents through the authenticated, durable Mills serial merge queue and document the remaining green-MR adoption exception.

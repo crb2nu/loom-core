@@ -13,11 +13,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -39,9 +41,28 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx,
+		"mcp-pagerduty",
+
+		logger,
+	)
+	if err !=
+		nil {
+		logger.Warn("OTel tracer init failed",
+
+			"error",
+			err,
+		)
+	}
+	defer func() {
+		_ = shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-pagerduty")
+
 	logger.Info("starting server", "name", "mcp-pagerduty", "version", version)
 
 	server := mcp.NewServer("mcp-pagerduty", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("PagerDuty incident management tools. Configure with PAGERDUTY_API_KEY.")
 
 	// Incidents
@@ -78,7 +99,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListIncidents)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_incidents", handleListIncidents))
 
 	server.AddTool(mcp.Tool{
 		Name:        "pd_get_incident",
@@ -93,7 +114,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleGetIncident)
+	}, mcpotel.TracedToolHandler(tracer, "pd_get_incident", handleGetIncident))
 
 	server.AddTool(mcp.Tool{
 		Name:        "pd_list_incident_alerts",
@@ -108,7 +129,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleListIncidentAlerts)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_incident_alerts", handleListIncidentAlerts))
 
 	server.AddTool(mcp.Tool{
 		Name:        "pd_list_incident_notes",
@@ -123,7 +144,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleListIncidentNotes)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_incident_notes", handleListIncidentNotes))
 
 	server.AddTool(mcp.Tool{
 		Name:        "pd_list_incident_log_entries",
@@ -138,7 +159,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleListIncidentLogEntries)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_incident_log_entries", handleListIncidentLogEntries))
 
 	// Services
 	server.AddTool(mcp.Tool{
@@ -157,7 +178,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListServices)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_services", handleListServices))
 
 	server.AddTool(mcp.Tool{
 		Name:        "pd_get_service",
@@ -172,9 +193,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleGetService)
+	}, mcpotel.TracedToolHandler(
 
-	// On-Calls
+		// On-Calls
+		tracer, "pd_get_service", handleGetService))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pd_list_oncalls",
 		Description: "List current on-call entries",
@@ -193,9 +216,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListOnCalls)
+	}, mcpotel.TracedToolHandler(
 
-	// Schedules
+		// Schedules
+		tracer, "pd_list_oncalls", handleListOnCalls))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pd_list_schedules",
 		Description: "List all schedules",
@@ -208,7 +233,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListSchedules)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_schedules", handleListSchedules))
 
 	server.AddTool(mcp.Tool{
 		Name:        "pd_get_schedule",
@@ -231,9 +256,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleGetSchedule)
+	}, mcpotel.TracedToolHandler(
 
-	// Escalation Policies
+		// Escalation Policies
+		tracer, "pd_get_schedule", handleGetSchedule))
+
 	server.AddTool(mcp.Tool{
 		Name:        "pd_list_escalation_policies",
 		Description: "List all escalation policies",
@@ -246,7 +273,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListEscalationPolicies)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_escalation_policies", handleListEscalationPolicies))
 
 	// Users
 	server.AddTool(mcp.Tool{
@@ -265,7 +292,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleListUsers)
+	}, mcpotel.TracedToolHandler(tracer, "pd_list_users", handleListUsers))
 
 	server.AddTool(mcp.Tool{
 		Name:        "pd_get_user",
@@ -280,7 +307,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"id"},
 		},
-	}, handleGetUser)
+	}, mcpotel.TracedToolHandler(tracer, "pd_get_user", handleGetUser))
 
 	return server.Run(ctx)
 }

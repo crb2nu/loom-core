@@ -3,10 +3,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -17,8 +14,7 @@ import (
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
-	"github.com/crb2nu/loom/pkg/mcperror"
-	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -51,14 +47,17 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
-	logger.Info("starting server", "name", "mcp-terraform", "version", version, "host", tfcHost)
-
-	server := mcp.NewServer("mcp-terraform", version)
-	server.SetInstructions("Terraform Cloud/Enterprise state and plan management tools. Configure with TFC_TOKEN and TFC_ORGANIZATION. Optionally set TFC_HOST for Enterprise.")
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-terraform", version,
+		mcpscaffold.WithInstructions("Terraform Cloud/Enterprise state and plan management tools. Configure with TFC_TOKEN and TFC_ORGANIZATION. Optionally set TFC_HOST for Enterprise."),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cleanup(ctx) }()
+	srv.Logger.Info("tfc endpoint configured", "host", tfcHost)
 
 	// Workspaces
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_list_workspaces",
 		Description: "List workspaces in the organization",
 		InputSchema: mcp.InputSchema{
@@ -80,7 +79,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListWorkspaces)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_get_workspace",
 		Description: "Get details of a specific workspace",
 		InputSchema: mcp.InputSchema{
@@ -96,7 +95,8 @@ func run(ctx context.Context) error {
 	}, handleGetWorkspace)
 
 	// State
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_current_state",
 		Description: "Get current state version for a workspace",
 		InputSchema: mcp.InputSchema{
@@ -111,7 +111,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleCurrentState)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_state_resources",
 		Description: "List resources in the current state",
 		InputSchema: mcp.InputSchema{
@@ -130,7 +130,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleStateResources)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_state_outputs",
 		Description: "Get outputs from the current state",
 		InputSchema: mcp.InputSchema{
@@ -146,7 +146,8 @@ func run(ctx context.Context) error {
 	}, handleStateOutputs)
 
 	// Runs
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_list_runs",
 		Description: "List runs for a workspace",
 		InputSchema: mcp.InputSchema{
@@ -169,7 +170,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListRuns)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_get_run",
 		Description: "Get details of a specific run",
 		InputSchema: mcp.InputSchema{
@@ -184,7 +185,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleGetRun)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_run_plan",
 		Description: "Get the plan output for a run",
 		InputSchema: mcp.InputSchema{
@@ -200,7 +201,8 @@ func run(ctx context.Context) error {
 	}, handleRunPlan)
 
 	// Variables
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_list_variables",
 		Description: "List variables for a workspace",
 		InputSchema: mcp.InputSchema{
@@ -216,7 +218,8 @@ func run(ctx context.Context) error {
 	}, handleListVariables)
 
 	// Variable Sets
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_list_varsets",
 		Description: "List variable sets in the organization",
 		InputSchema: mcp.InputSchema{
@@ -225,7 +228,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListVarsets)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_get_varset",
 		Description: "Get details of a variable set",
 		InputSchema: mcp.InputSchema{
@@ -241,7 +244,8 @@ func run(ctx context.Context) error {
 	}, handleGetVarset)
 
 	// Organizations
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_get_organization",
 		Description: "Get organization details",
 		InputSchema: mcp.InputSchema{
@@ -251,7 +255,8 @@ func run(ctx context.Context) error {
 	}, handleGetOrganization)
 
 	// Policies
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_list_policies",
 		Description: "List Sentinel policies in the organization",
 		InputSchema: mcp.InputSchema{
@@ -266,7 +271,8 @@ func run(ctx context.Context) error {
 	}, handleListPolicies)
 
 	// Registry Modules
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "tf_list_modules",
 		Description: "List private registry modules",
 		InputSchema: mcp.InputSchema{
@@ -280,52 +286,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListModules)
 
-	return server.Run(ctx)
-}
-
-// tfcRequest makes an authenticated request to Terraform Cloud API
-func tfcRequest(ctx context.Context, method, path string) (map[string]any, error) {
-	apiURL := strings.TrimSuffix(tfcHost, "/") + "/api/v2" + path
-
-	req, err := http.NewRequestWithContext(ctx, method, apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+tfcToken)
-	req.Header.Set("Content-Type", "application/vnd.api+json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		var errResp map[string]any
-		if json.Unmarshal(body, &errResp) == nil {
-			if errors, ok := errResp["errors"].([]any); ok && len(errors) > 0 {
-				if errObj, ok := errors[0].(map[string]any); ok {
-					return nil, mcperror.APIError("Terraform Cloud", resp.StatusCode, fmt.Sprintf("%v", errObj["detail"]))
-				}
-			}
-		}
-		return nil, mcperror.APIError("Terraform Cloud", resp.StatusCode, string(body))
-	}
-
-	var result map[string]any
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("parse response: %w", err)
-		}
-	}
-
-	return result, nil
+	return srv.Run(ctx)
 }
 
 func handleListWorkspaces(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {

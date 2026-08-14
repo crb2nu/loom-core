@@ -1,0 +1,38 @@
+/*
+ * Mills component aliases.
+ *
+ * Keep the primitive scales in theme.css. These aliases describe how Mills
+ * panels consume them, giving the legacy panels and their shared shell one
+ * stable vocabulary without duplicating raw sizes, radii, or colours.
+ */
+:root {
+  --mills-text-caption: var(--text-2xs);
+  --mills-text-label: var(--text-xs);
+  --mills-text-body: var(--text-sm);
+  --mills-text-title: var(--text-lg);
+  --mills-text-heading: clamp(var(--text-lg), 1.7vw, var(--text-xl));
+  --mills-text-display: var(--text-2xl);
+  --mills-text-alert: var(--text-3xl);
+
+  --mills-radius-control: var(--radius-xs);
+  --mills-radius-surface: var(--radius-lg);
+  --mills-radius-state: var(--radius-xl);
+  --mills-radius-pill: var(--radius-full);
+  --mills-radius-round: var(--radius-full);
+
+  --mills-color-text: var(--fg-primary);
+  --mills-color-text-secondary: var(--fg-secondary);
+  --mills-color-text-muted: var(--fg-muted);
+  --mills-color-border: var(--border);
+  --mills-color-border-subtle: var(--border-subtle);
+  --mills-color-border-focus: var(--border-focus);
+  --mills-color-surface: var(--bg-secondary);
+  --mills-color-surface-raised: var(--bg-tertiary);
+  --mills-color-glow: var(--accent-dim);
+  --mills-color-success-glow: var(--success-dim);
+  --mills-color-error-glow: var(--error-dim);
+  --mills-color-accent: var(--mills);
+  --mills-color-success: var(--success);
+  --mills-color-warning: var(--warning);
+  --mills-color-error: var(--error);
+}

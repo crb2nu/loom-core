@@ -3,6 +3,7 @@ package embed
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -24,8 +25,9 @@ func TestFlexInferClient_EmbedQuery(t *testing.T) {
 		}
 
 		var req struct {
-			Model string   `json:"model"`
-			Input []string `json:"input"`
+			Model          string   `json:"model"`
+			Input          []string `json:"input"`
+			EncodingFormat string   `json:"encoding_format"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -33,6 +35,9 @@ func TestFlexInferClient_EmbedQuery(t *testing.T) {
 		}
 		if req.Model != "BAAI/bge-large-en-v1.5" {
 			t.Errorf("unexpected model: %s", req.Model)
+		}
+		if req.EncodingFormat != "float" {
+			t.Errorf("expected encoding_format=float, got %q", req.EncodingFormat)
 		}
 
 		resp := map[string]any{
@@ -62,12 +67,16 @@ func TestFlexInferClient_EmbedQuery(t *testing.T) {
 func TestFlexInferClient_EmbedDocuments(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Model string   `json:"model"`
-			Input []string `json:"input"`
+			Model          string   `json:"model"`
+			Input          []string `json:"input"`
+			EncodingFormat string   `json:"encoding_format"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
+		}
+		if req.EncodingFormat != "float" {
+			t.Errorf("expected encoding_format=float, got %q", req.EncodingFormat)
 		}
 
 		data := make([]map[string]any, len(req.Input))
@@ -176,6 +185,19 @@ func TestFlexInferClient_ErrorHandling(t *testing.T) {
 	_, err := client.EmbedQuery(context.Background(), "test")
 	if err == nil {
 		t.Error("expected error for 503 response")
+	}
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("expected HTTPStatusError, got %T: %v", err, err)
+	}
+	if statusErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d", statusErr.StatusCode)
+	}
+	if statusErr.Provider != "flexinfer" {
+		t.Fatalf("expected provider flexinfer, got %q", statusErr.Provider)
+	}
+	if got := err.Error(); got != "flexinfer API HTTP 503: model not loaded\n" {
+		t.Fatalf("unexpected error string %q", got)
 	}
 }
 

@@ -22,7 +22,6 @@ This document tracks the migration of non-Go MCP servers to native Go implementa
 | prometheus | `mcp-prometheus` | Done |
 | loki | `mcp-loki` | Done |
 | grafana | `mcp-grafana` | Done |
-| morph_embeddings | `mcp-morph-embeddings` | Done |
 | qdrant | `mcp-qdrant` | Done |
 | gitlab | `mcp-gitlab` | Done |
 | memory | `mcp-memory` | Done |

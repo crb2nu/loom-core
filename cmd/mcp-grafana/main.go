@@ -12,11 +12,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/portforward"
 	"github.com/crb2nu/loom/pkg/strutil"
 	"github.com/crb2nu/loom/pkg/validate"
@@ -48,10 +50,21 @@ func run(ctx context.Context) error {
 	defer cleanup()
 
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-grafana", logger)
+	if err != nil {
+		logger.Warn("OTel tracer init failed", "error", err)
+	}
+	defer func() { _ = shutdownTracer(ctx) }()
+	tracer := mcpotel.Tracer(tp, "mcp-grafana")
+
 	logger.Info("starting server", "name", "mcp-grafana", "version", version, "url", grafanaURL)
 
 	server := mcp.NewServer("mcp-grafana", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Grafana dashboard search and retrieval")
+	wrap := func(name string, h mcp.ToolHandler) mcp.ToolHandler {
+		return mcpotel.TracedToolHandler(tracer, name, h)
+	}
 
 	// Tools
 	server.AddTool(mcp.Tool{
@@ -64,7 +77,7 @@ func run(ctx context.Context) error {
 				"limit": map[string]any{"type": "integer", "description": "max results"},
 			},
 		},
-	}, handleSearch)
+	}, wrap("grafana_search", handleSearch))
 
 	server.AddTool(mcp.Tool{
 		Name:        "grafana_get_dashboard",
@@ -76,7 +89,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"uid"},
 		},
-	}, handleGetDashboard)
+	}, wrap("grafana_get_dashboard", handleGetDashboard))
 
 	// Datasource tools
 	server.AddTool(mcp.Tool{
@@ -86,7 +99,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleListDatasources)
+	}, wrap("grafana_list_datasources", handleListDatasources))
 
 	server.AddTool(mcp.Tool{
 		Name:        "grafana_get_datasource",
@@ -98,7 +111,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"uid"},
 		},
-	}, handleGetDatasource)
+	}, wrap("grafana_get_datasource", handleGetDatasource))
 
 	// Alert tools
 	server.AddTool(mcp.Tool{
@@ -111,7 +124,7 @@ func run(ctx context.Context) error {
 				"limit": map[string]any{"type": "integer", "description": "Maximum number of alerts"},
 			},
 		},
-	}, handleListAlerts)
+	}, wrap("grafana_list_alerts", handleListAlerts))
 
 	server.AddTool(mcp.Tool{
 		Name:        "grafana_list_alert_instances",
@@ -120,7 +133,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleListAlertInstances)
+	}, wrap("grafana_list_alert_instances", handleListAlertInstances))
 
 	// Annotation tools
 	server.AddTool(mcp.Tool{
@@ -135,7 +148,7 @@ func run(ctx context.Context) error {
 				"limit":         map[string]any{"type": "integer", "description": "Maximum annotations"},
 			},
 		},
-	}, handleListAnnotations)
+	}, wrap("grafana_list_annotations", handleListAnnotations))
 
 	server.AddTool(mcp.Tool{
 		Name:        "grafana_create_annotation",
@@ -152,7 +165,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"text"},
 		},
-	}, handleCreateAnnotation)
+	}, wrap("grafana_create_annotation", handleCreateAnnotation))
 
 	// Folder tools
 	server.AddTool(mcp.Tool{
@@ -162,7 +175,7 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleListFolders)
+	}, wrap("grafana_list_folders", handleListFolders))
 
 	return server.Run(ctx)
 }

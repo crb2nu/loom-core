@@ -1,0 +1,1 @@
+- Bumped the Go toolchain to 1.26.6 across CI, all builder Dockerfiles, and the spawn go version: 1.26.6 ships stdlib security fixes (GO-2026-6218 net/url, -6091 html/template, -6090 crypto/tls, -6089 net/http, -6088 encoding/xml, -5972 asn1) that were redding every main pipeline's govulncheck gate and blocking deploys.

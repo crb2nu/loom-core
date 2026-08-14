@@ -1,0 +1,299 @@
+import SwiftUI
+import LoomCompanionKit
+
+struct OpsWorkflowDetailView: View {
+    let workflow: MobileWorkflow
+    let loadDetail: (String) async throws -> MobileWorkflowDetailResponse
+    /// Approve/reject the workflow's pending step. Optional so previews and
+    /// any read-only embedding can omit the controls entirely.
+    var approve: ((String, String) async throws -> Void)?
+    var reject: ((String, String, String?) async throws -> Void)?
+
+    @State private var detail: MobileWorkflowDetail?
+    @State private var events: [MobileWorkflowEvent] = []
+    @State private var isLoading = false
+    @State private var error: String?
+
+    // Decision state: one in-flight mutation at a time, with an explicit
+    // confirmation step (approve) or a reason prompt (reject).
+    @State private var isDeciding = false
+    @State private var decisionMessage: String?
+    @State private var confirmingApprove = false
+    @State private var confirmingReject = false
+    @State private var rejectReason = ""
+
+    /// The step an approve/reject applies to: the first one waiting on a
+    /// human. Nil means there is nothing to decide right now.
+    private var pendingStep: MobileWorkflowStep? {
+        (detail?.steps ?? []).first { $0.status == .waitingApproval }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Label("Legacy workflow approvals are deprecated.", systemImage: "exclamationmark.triangle.fill")
+                    .font(LoomTypography.caption)
+                    .foregroundStyle(LoomColors.statusDegraded)
+            }
+
+            decisionSection
+
+            Section("Overview") {
+                LabeledContent("Name", value: workflow.name ?? workflow.id)
+                LabeledContent("Status") {
+                    StatusBadge(workflow.status.rawValue, color: statusColor(workflow.status))
+                }
+                if let step = detail?.currentStep ?? workflow.currentStep {
+                    LabeledContent("Current Step", value: step)
+                }
+                LabeledContent("Progress") {
+                    ProgressView(value: detail?.progress ?? workflow.progress)
+                        .frame(width: 100)
+                }
+                LabeledContent("Started", value: workflow.startedAt)
+                if let completed = workflow.completedAt {
+                    LabeledContent("Completed", value: completed)
+                }
+                if let err = workflow.error {
+                    LabeledContent("Error") {
+                        Text(err)
+                            .foregroundStyle(LoomColors.statusCritical)
+                    }
+                }
+            }
+
+            if let detail, let steps = detail.steps, !steps.isEmpty {
+                Section("Steps") {
+                    ForEach(steps) { step in
+                        HStack(spacing: LoomSpacing.sm) {
+                            Image(systemName: stepIcon(step.status))
+                                .foregroundStyle(statusColor(step.status))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(step.name)
+                                    .font(LoomTypography.bodyMedium)
+                                    .foregroundStyle(LoomColors.textPrimary)
+                                if let type = step.type {
+                                    Text(type)
+                                        .font(LoomTypography.caption)
+                                        .foregroundStyle(LoomColors.textSecondary)
+                                }
+                            }
+                            Spacer()
+                            Text(step.status.rawValue)
+                                .font(LoomTypography.caption)
+                                .foregroundStyle(LoomColors.textTertiary)
+                        }
+                    }
+                }
+            }
+
+            if !events.isEmpty {
+                Section("Events") {
+                    ForEach(events) { event in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(event.eventType)
+                                    .font(LoomTypography.bodyMedium)
+                                    .foregroundStyle(LoomColors.textPrimary)
+                                Spacer()
+                                Text(event.timestamp)
+                                    .font(LoomTypography.caption)
+                                    .foregroundStyle(LoomColors.textTertiary)
+                            }
+                            if let stepName = event.stepName {
+                                Text(stepName)
+                                    .font(LoomTypography.caption)
+                                    .foregroundStyle(LoomColors.textSecondary)
+                            }
+                            if let details = event.details {
+                                Text(details)
+                                    .font(LoomTypography.caption)
+                                    .foregroundStyle(LoomColors.textSecondary)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let error {
+                Section {
+                    Text(error)
+                        .foregroundStyle(LoomColors.statusCritical)
+                        .font(LoomTypography.caption)
+                }
+            }
+        }
+        .navigationTitle("Workflow")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    LoomCopyLinkButton(link: .workflow(id: workflow.id, approve: false))
+                    LoomShareLink(link: .workflow(id: workflow.id, approve: false))
+                    Divider()
+                    LoomCopyLinkButton(
+                        link: .workflow(id: workflow.id, approve: true),
+                        label: "Copy approve link"
+                    )
+                } label: {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+            }
+        }
+        .task {
+            await loadWorkflowDetail()
+        }
+        .refreshable {
+            await loadWorkflowDetail()
+        }
+        .confirmationDialog(
+            "Approve this step?",
+            isPresented: $confirmingApprove,
+            titleVisibility: .visible
+        ) {
+            Button("Approve") { Task { await performApprove() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(pendingStep.map { "Approving \"\($0.name)\" lets the workflow continue." }
+                 ?? "This workflow has no step awaiting approval.")
+        }
+        .alert("Reject this step?", isPresented: $confirmingReject) {
+            TextField("Reason (optional)", text: $rejectReason)
+            Button("Reject", role: .destructive) { Task { await performReject() } }
+            Button("Cancel", role: .cancel) { rejectReason = "" }
+        } message: {
+            Text(pendingStep.map { "Rejecting \"\($0.name)\" stops the workflow here." }
+                 ?? "This workflow has no step awaiting approval.")
+        }
+    }
+
+    // MARK: - Decision controls
+
+    @ViewBuilder
+    private var decisionSection: some View {
+        if approve != nil || reject != nil {
+            Section("Decision") {
+                if let step = pendingStep {
+                    Text("Waiting on you: \(step.name)")
+                        .font(LoomTypography.caption)
+                        .foregroundStyle(LoomColors.statusDegraded)
+
+                    HStack(spacing: LoomSpacing.sm) {
+                        if approve != nil {
+                            Button {
+                                HapticManager.selection()
+                                confirmingApprove = true
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if isDeciding { ProgressView().controlSize(.mini) }
+                                    Label("Approve", systemImage: "checkmark.circle")
+                                }
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(LoomColors.statusHealthy)
+                            .disabled(isDeciding)
+                        }
+                        if reject != nil {
+                            Button {
+                                HapticManager.selection()
+                                rejectReason = ""
+                                confirmingReject = true
+                            } label: {
+                                Label("Reject", systemImage: "xmark.circle")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(LoomColors.statusCritical)
+                            .disabled(isDeciding)
+                        }
+                    }
+                } else if isLoading && detail == nil {
+                    Text("Loading steps…")
+                        .font(LoomTypography.caption)
+                        .foregroundStyle(LoomColors.textSecondary)
+                } else {
+                    Text("No step is waiting for approval.")
+                        .font(LoomTypography.caption)
+                        .foregroundStyle(LoomColors.textSecondary)
+                }
+
+                if let decisionMessage {
+                    Text(decisionMessage)
+                        .font(LoomTypography.caption)
+                        .foregroundStyle(LoomColors.textSecondary)
+                }
+            }
+        }
+    }
+
+    private func performApprove() async {
+        guard let approve, let step = pendingStep else { return }
+        isDeciding = true
+        decisionMessage = nil
+        error = nil
+        defer { isDeciding = false }
+        do {
+            try await approve(workflow.id, step.id)
+            HapticManager.success()
+            decisionMessage = "Approved \"\(step.name)\"."
+            await loadWorkflowDetail()
+        } catch {
+            HapticManager.error()
+            self.error = "Approve failed: \((error as? LoomAPIError)?.description ?? error.localizedDescription)"
+        }
+    }
+
+    private func performReject() async {
+        guard let reject, let step = pendingStep else { return }
+        let reason = rejectReason.trimmingCharacters(in: .whitespacesAndNewlines)
+        rejectReason = ""
+        isDeciding = true
+        decisionMessage = nil
+        error = nil
+        defer { isDeciding = false }
+        do {
+            try await reject(workflow.id, step.id, reason.isEmpty ? nil : reason)
+            HapticManager.success()
+            decisionMessage = "Rejected \"\(step.name)\"."
+            await loadWorkflowDetail()
+        } catch {
+            HapticManager.error()
+            self.error = "Reject failed: \((error as? LoomAPIError)?.description ?? error.localizedDescription)"
+        }
+    }
+
+    private func loadWorkflowDetail() async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let response = try await loadDetail(workflow.id)
+            detail = response.workflow
+            events = response.events
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func statusColor(_ status: MobileWorkflowStatus) -> Color {
+        switch status {
+        case .running: return LoomColors.statusActive
+        case .completed: return LoomColors.statusHealthy
+        case .failed: return LoomColors.statusCritical
+        case .waitingApproval: return LoomColors.statusDegraded
+        case .cancelled, .unknown: return LoomColors.statusIdle
+        }
+    }
+
+    private func stepIcon(_ status: MobileWorkflowStatus) -> String {
+        switch status {
+        case .running: return "play.circle.fill"
+        case .completed: return "checkmark.circle.fill"
+        case .failed: return "xmark.circle.fill"
+        case .waitingApproval: return "pause.circle.fill"
+        case .cancelled: return "minus.circle.fill"
+        case .unknown: return "circle"
+        }
+    }
+}

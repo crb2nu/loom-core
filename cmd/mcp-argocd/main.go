@@ -17,7 +17,7 @@ import (
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
-	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -47,14 +47,17 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
-	logger.Info("starting server", "name", "mcp-argocd", "version", version, "url", argocdURL)
-
-	server := mcp.NewServer("mcp-argocd", version)
-	server.SetInstructions("ArgoCD GitOps application management tools. Configure with ARGOCD_SERVER and ARGOCD_AUTH_TOKEN. Set ARGOCD_INSECURE=true to skip TLS verification.")
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-argocd", version,
+		mcpscaffold.WithInstructions("ArgoCD GitOps application management tools. Configure with ARGOCD_SERVER and ARGOCD_AUTH_TOKEN. Set ARGOCD_INSECURE=true to skip TLS verification."),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cleanup(ctx) }()
+	srv.Logger.Info("argocd endpoint configured", "url", argocdURL)
 
 	// Applications
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_list_apps",
 		Description: "List all ArgoCD applications",
 		InputSchema: mcp.InputSchema{
@@ -72,7 +75,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListApps)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_get_app",
 		Description: "Get details of a specific application",
 		InputSchema: mcp.InputSchema{
@@ -87,7 +90,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleGetApp)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_app_resources",
 		Description: "List resources managed by an application",
 		InputSchema: mcp.InputSchema{
@@ -102,7 +105,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleAppResources)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_app_manifests",
 		Description: "Get rendered manifests for an application",
 		InputSchema: mcp.InputSchema{
@@ -121,7 +124,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleAppManifests)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_app_diff",
 		Description: "Get diff between live and desired state",
 		InputSchema: mcp.InputSchema{
@@ -136,7 +139,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleAppDiff)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_sync_app",
 		Description: "Sync an application to its target state",
 		InputSchema: mcp.InputSchema{
@@ -163,7 +166,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleSyncApp)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_refresh_app",
 		Description: "Refresh application state from Git",
 		InputSchema: mcp.InputSchema{
@@ -182,7 +185,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleRefreshApp)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_app_history",
 		Description: "Get sync history for an application",
 		InputSchema: mcp.InputSchema{
@@ -198,7 +201,8 @@ func run(ctx context.Context) error {
 	}, handleAppHistory)
 
 	// Projects
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_list_projects",
 		Description: "List all ArgoCD projects",
 		InputSchema: mcp.InputSchema{
@@ -207,7 +211,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListProjects)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_get_project",
 		Description: "Get details of a specific project",
 		InputSchema: mcp.InputSchema{
@@ -223,7 +227,8 @@ func run(ctx context.Context) error {
 	}, handleGetProject)
 
 	// Repositories
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_list_repos",
 		Description: "List configured Git repositories",
 		InputSchema: mcp.InputSchema{
@@ -232,7 +237,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListRepos)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_get_repo",
 		Description: "Get details of a specific repository",
 		InputSchema: mcp.InputSchema{
@@ -248,7 +253,8 @@ func run(ctx context.Context) error {
 	}, handleGetRepo)
 
 	// Clusters
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_list_clusters",
 		Description: "List configured Kubernetes clusters",
 		InputSchema: mcp.InputSchema{
@@ -257,7 +263,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleListClusters)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_get_cluster",
 		Description: "Get details of a specific cluster",
 		InputSchema: mcp.InputSchema{
@@ -273,7 +279,8 @@ func run(ctx context.Context) error {
 	}, handleGetCluster)
 
 	// Settings
-	server.AddTool(mcp.Tool{
+
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_settings",
 		Description: "Get ArgoCD server settings",
 		InputSchema: mcp.InputSchema{
@@ -282,7 +289,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleSettings)
 
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "argocd_version",
 		Description: "Get ArgoCD server version",
 		InputSchema: mcp.InputSchema{
@@ -291,7 +298,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleVersion)
 
-	return server.Run(ctx)
+	return srv.Run(ctx)
 }
 
 // argocdRequest makes an authenticated request to ArgoCD API

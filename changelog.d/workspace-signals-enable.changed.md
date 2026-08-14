@@ -1,0 +1,1 @@
+- Changed `pkg/mills/council/brief.go` and workspace-signal tests so every council brief carries a bounded workspace-signals section, including explicit fail-open notes when Loki and GitLab CI signals are partially unavailable, wholly unavailable, or empty.

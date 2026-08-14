@@ -1,0 +1,1 @@
+- Classify OpenRouter HTTP 402 credit exhaustion as `external_dependency.openrouter.credits_exhausted` with operator runbook — a balance dip 402'd three unrelated research stages on 2026-08-06 as `code` (`pkg/mills/pipeline/failure_classifier.go`, `docs/runbooks/openrouter-credits-exhausted.md`).

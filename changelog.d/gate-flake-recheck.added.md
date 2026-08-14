@@ -1,0 +1,1 @@
+- Add structured gate-flake telemetry and a bounded, concurrency-safe free re-check policy for identical `docs_guardrail` and `scope` inputs in `pkg/mills/gates/telemetry.go` and `pkg/mills/pipeline/gate_recheck.go`.

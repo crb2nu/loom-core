@@ -1,0 +1,1 @@
+- Test-harden `pkg/mills/council/ci_incident_classifier.go` with real ClickHouse, Langfuse/Redis, GitLab CI, and repository-regression fixtures, including deterministic external-incident precedence.

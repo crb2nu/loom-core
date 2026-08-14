@@ -1,0 +1,1 @@
+- Classify observed ClickHouse merge-task, Longhorn no-available-disk, LiteLLM missing-API-key, and GitLab agent unauthenticated failures as terminal external dependency incidents in `pkg/mills/pipeline/failure_classifier.go`, with focused signature and near-miss coverage in `pkg/mills/pipeline/failure_classifier_test.go`.

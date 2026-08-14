@@ -1,0 +1,1 @@
+- Gate daemon request tracing on successful OTel exporter configuration in `internal/daemon/daemon.go`, with a safe no-op tracer helper in `pkg/mcpotel/otel.go`.

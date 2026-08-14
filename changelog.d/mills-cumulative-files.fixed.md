@@ -1,0 +1,1 @@
+- Fix Mills post-implement gates to use freshly fetched cumulative branch paths and line totals independently of patch rendering, reconcile every HUD-compatible spawn checkout with the operator root, and preserve telemetry when refresh or metadata capture fails.

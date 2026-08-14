@@ -1,0 +1,1 @@
+- Harden `spec_conformance`, `pr_self_review`, and `scope` verdict handling in `pkg/mills/gates/gates.go` and add bounded parse telemetry in `pkg/telemetry/telemetry.go`.

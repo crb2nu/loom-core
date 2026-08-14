@@ -1,0 +1,352 @@
+# Platform profiles for Loom MCP config generation.
+# Each platform defines its config format, file paths, hook support,
+# capabilities, and serialization features. Adding a new platform
+# requires only a new entry here — no Go code changes.
+#
+# Schema versioning: bumped to v2 on 2026-05-07 to gate forthcoming
+# template-driven fields (hooks.template, policy_refs → templates/policies/,
+# extras → templates/extras/). v1 readers cannot reliably consume v2 YAML
+# once those fields are populated. See .loom/107 (EPIC 3 product spec).
+
+version: 2
+
+platforms:
+  claude:
+    display_name: "Claude Code"
+    config_format: "json"
+    config_file: "mcp.json"
+    config_root: "mcpServers"
+    hooks:
+      enabled: true
+      file: "settings.json"
+      events: ["sessionStart", "sessionEnd", "preToolUse", "postToolUse", "subagentStart"]
+      policy_refs: ["gitops_flux"]
+      enforcement: "native"
+      agent_id: "claude-code"
+      agent_type: "claude-code"
+      description: "Claude Code session"
+      # Claude `Stop` is per-turn ("Claude finishes responding"); `SessionEnd`
+      # fires once per session (matchers: clear/resume/logout/prompt_input_exit/
+      # bypass_permissions_disabled/other). Mapping session-end to `Stop`
+      # caused `loom agent session-end --summarize` to run every turn —
+      # corrected on 2026-05-12 to fire on the real session-end event.
+      # See pkg/generator/VENDOR_SPECS.md "Hook lifecycle surface" + the
+      # SessionEnd row in the canonical → vendor mapping table.
+      session_end_event: "SessionEnd"
+      heartbeat_event: "PostToolUse"
+      heartbeat_matcher: "Bash|Task"
+      extras: ["postToolUse_formatters", "postToolUse_taskSync", "telemetry_eventEmit"]
+    loom_proxy:
+      agent_hint: "claude-code"
+      tool_profile: "llm-core"
+      max_tools: 167
+    capabilities:
+      mcp_servers: true
+      permissions: true
+      sandbox: false
+      web_search: true
+      custom_models: true
+      plugin_system: false
+    features:
+      command_format: "separate"
+      env_key: "env"
+      timeout_unit: "seconds"
+      timeout_field: "timeout"
+      supports_timeout: true
+      supports_description: true
+
+  claude_desktop:
+    display_name: "Claude Desktop"
+    config_format: "json"
+    config_file: "claude_desktop_config.json"
+    config_root: "mcpServers"
+    hooks:
+      enabled: false
+      policy_refs: ["gitops_flux"]
+      enforcement: "proxy"
+    loom_proxy:
+      agent_hint: "claude-desktop"
+      tool_profile: "llm-core"
+      max_tools: 167
+      env:
+        LOOM_PROXY_IDLE_EXIT_SECONDS: "0"
+    capabilities:
+      mcp_servers: true
+      permissions: false
+      sandbox: false
+      web_search: false
+      custom_models: false
+      plugin_system: false
+    features:
+      command_format: "separate"
+      env_key: "env"
+      timeout_unit: "seconds"
+      supports_timeout: false
+      supports_description: true
+
+  gemini:
+    display_name: "Gemini CLI"
+    config_format: "toml"
+    config_file: "config.toml"
+    hooks:
+      enabled: true
+      file: "settings.json"
+      events: ["sessionStart", "sessionEnd", "postToolUse"]
+      policy_refs: ["gitops_flux"]
+      enforcement: "native"
+      agent_id: "gemini-cli"
+      agent_type: "gemini-cli"
+      description: "Gemini CLI session"
+      session_end_event: "SessionEnd"
+      heartbeat_event: "AfterTool"
+      heartbeat_matcher: "run_shell_command"
+      extras: ["telemetry_eventEmit"]
+    capabilities:
+      mcp_servers: true
+      permissions: false
+      sandbox: false
+      web_search: true
+      custom_models: true
+      plugin_system: false
+    features:
+      command_format: "separate"
+      env_key: "env"
+      timeout_unit: "seconds"
+      supports_timeout: true
+      supports_description: true
+
+  codex:
+    display_name: "Codex CLI"
+    config_format: "toml"
+    config_file: "config.toml"
+    # Codex shipped a Claude-style [hooks] block in v0.129.0 (2026-05-07). We
+    # emit `notify = [...]` in config.toml AND a Claude-shape hooks.json
+    # alongside it, so both `notify` (turn-end keepalive) and the richer
+    # SessionStart/Stop/PostToolUse events fire. `notify` stays as a fallback
+    # because the [hooks] block does not always fire SessionStart/Stop for
+    # repo-local config (openai/codex#17532).
+    hooks:
+      enabled: true
+      file: "hooks.json"
+      template: "hooks.tmpl"
+      # Note: Codex's `Stop` event is per-turn (fires after every model
+      # response), NOT session-end. There is NO `SessionEnd` event in Codex
+      # docs (https://developers.openai.com/codex/hooks). True session
+      # termination is detected via notify + the keepalive-wrap background
+      # process (deregister-on-exit). Therefore:
+      #   - `stop` is intentionally absent from this events list
+      #   - session_end_event is empty so buildPlatformHooks doesn't emit a
+      #     [hooks.Stop] block that would spam `loom agent session-end
+      #     --summarize` every turn.
+      # PostToolUse is intentionally omitted: codex's heartbeat_matcher
+      # has no useful narrowing equivalent (Claude uses "Bash|Task", Gemini
+      # uses "run_shell_command" — codex tool names aren't stable enough
+      # to filter on), so a PostToolUse heartbeat would fire on every tool
+      # call and synchronously fork `loom agent heartbeat` each time.
+      # Each fork pays for a shell bootstrap (git rev-parse + jq + cksum
+      # + file I/O) plus loom binary cold-start (~50-200ms) and codex's
+      # TUI bounces visibly per tool call. notify + keepalive-wrap already
+      # provide session keepalive in the background, so the per-tool-call
+      # heartbeat is redundant overhead.
+      events: ["sessionStart", "notify"]
+      # Enforcement stays "proxy": Codex's PreToolUse doesn't expose a Bash
+      # matcher (image-gen and other tools also don't fire PreToolUse —
+      # openai/codex#20616), so kubectl/policy guardrails still run via the
+      # loom proxy.
+      policy_refs: ["gitops_flux"]
+      enforcement: "proxy"
+      agent_id: "codex"
+      agent_type: "codex"
+      description: "Codex CLI session"
+      session_end_event: ""
+      # heartbeat_event "" suppresses the per-tool-call heartbeat hook;
+      # buildPlatformHooks gates the block on a non-empty event name.
+      heartbeat_event: ""
+      heartbeat_matcher: ""
+      # postToolUse_taskSyncPlan: bridge Codex's native `update_plan` tool into
+      # agent-context tasks (parity with Claude's TodoWrite). Matched to
+      # `update_plan` only, so it fires on plan updates — NOT every tool call —
+      # avoiding the per-tool-call fork that ruled out a PostToolUse heartbeat
+      # here. Listed AFTER telemetry_eventEmit so the unmatched telemetry walker
+      # doesn't also inject into the freshly-bootstrapped PostToolUse slot.
+      extras: ["telemetry_eventEmit", "postToolUse_taskSyncPlan"]
+    loom_proxy:
+      agent_hint: "codex"
+      tool_profile: "llm-core"
+      max_tools: 167
+    capabilities:
+      mcp_servers: true
+      permissions: true
+      sandbox: true
+      web_search: true
+      custom_models: true
+      plugin_system: false
+    features:
+      command_format: "separate"
+      env_key: "env"
+      timeout_unit: "seconds"
+      timeout_field: "tool_timeout_sec"
+      supports_timeout: true
+      supports_description: false
+      requires_preamble: true
+
+  opencode:
+    display_name: "OpenCode"
+    config_format: "json"
+    config_file: "opencode.json"
+    config_root: "mcp"
+    hooks:
+      enabled: true
+      file: "plugins/loom-hooks.ts"
+      type: "typescript"
+      events: ["sessionCreated", "sessionDeleted", "sessionIdle", "toolExecuteAfter"]
+      policy_refs: ["gitops_flux"]
+      enforcement: "plugin"
+    capabilities:
+      mcp_servers: true
+      permissions: false
+      sandbox: false
+      web_search: false
+      custom_models: true
+      plugin_system: true
+    features:
+      command_format: "array"
+      env_key: "environment"
+      timeout_unit: "milliseconds"
+      supports_timeout: true
+      supports_description: false
+
+  vscode:
+    display_name: "VS Code"
+    config_format: "json"
+    config_file: "mcp.json"
+    # VS Code's mcp.json schema uses top-level "servers" (NOT "mcpServers",
+    # which VS Code ignores). Verified 2026-07-14 against
+    # https://code.visualstudio.com/docs/copilot/customization/mcp-servers
+    config_root: "servers"
+    hooks:
+      enabled: false
+      policy_refs: ["gitops_flux"]
+      enforcement: "proxy"
+    capabilities:
+      mcp_servers: true
+      permissions: false
+      sandbox: false
+      web_search: false
+      custom_models: false
+      plugin_system: false
+    features:
+      command_format: "separate"
+      env_key: "env"
+      timeout_unit: "seconds"
+      timeout_field: "timeout"
+      supports_timeout: true
+      supports_description: true
+
+  antigravity:
+    display_name: "Antigravity 2.0"
+    config_format: "json"
+    config_file: "mcp_config.json"
+    config_root: "mcpServers"
+    hooks:
+      enabled: true
+      file: "hooks.json"
+      events: ["preInvocation", "preToolUse", "postToolUse", "stop"]
+      policy_refs: ["gitops_flux"]
+      enforcement: "native"
+      agent_id: "antigravity"
+      agent_type: "antigravity"
+      description: "Antigravity session"
+      session_end_event: "Stop"
+      heartbeat_event: "PostToolUse"
+      heartbeat_matcher: "run_command|manage_task|invoke_subagent"
+      extras: ["telemetry_eventEmit"]
+    loom_proxy:
+      agent_hint: "antigravity"
+      tool_profile: "antigravity-core"
+      max_tools: 100
+    capabilities:
+      mcp_servers: true
+      permissions: true
+      sandbox: false
+      web_search: false
+      custom_models: false
+      plugin_system: false
+    features:
+      command_format: "separate"
+      env_key: "env"
+      timeout_unit: "seconds"
+      timeout_field: "timeout"
+      supports_timeout: true
+      supports_description: true
+
+  kilocode:
+    # Kilo 1.0 (extension kilocode.kilo-code v7.x) is rebuilt on the OpenCode
+    # engine. It reads kilo.json(c) — global ~/.config/kilo/kilo.json, project
+    # <root>/kilo.json or .kilo/kilo.json — with a top-level `mcp` map
+    # (type local/remote, array command, `environment`, ms timeouts) and a
+    # `permission` map keyed by {server}_{tool} globs. The legacy TOML
+    # ~/.kilocode/config.toml was never read by any Kilo surface.
+    # Docs: https://kilo.ai/docs/automate/mcp/using-in-kilo-code
+    # Runtime evidence: v7.4.5 bundle — globalConfigDir()=$XDG_CONFIG_HOME/kilo,
+    # MODERN=["kilo.jsonc","kilo.json"], SCHEMA="https://app.kilo.ai/config.json".
+    display_name: "Kilo Code"
+    config_format: "json"
+    config_file: "kilo.json"
+    config_root: "mcp"
+    schema_url: "https://app.kilo.ai/config.json"
+    hooks:
+      enabled: false
+      policy_refs: ["gitops_flux"]
+      enforcement: "proxy"
+    loom_proxy:
+      agent_hint: "kilocode"
+      tool_profile: "llm-core"
+      max_tools: 167
+    capabilities:
+      mcp_servers: true
+      permissions: true
+      sandbox: false
+      web_search: false
+      custom_models: false
+      plugin_system: false
+    features:
+      command_format: "array"
+      env_key: "environment"
+      timeout_unit: "milliseconds"
+      supports_timeout: true
+      supports_description: false
+
+  zed:
+    display_name: "Zed"
+    # Zed core reads MCP servers from the "context_servers" key in
+    # settings.json — it never reads an mcp.json file. The generator emits a
+    # context_servers.json fragment that `loom sync zed` merges into
+    # ~/.config/zed/settings.json (foreign entries and comments preserved).
+    # Stdio shape is flat {"command", "args", "env", "timeout"} — see
+    # https://github.com/zed-industries/zed/blob/main/docs/src/ai/mcp.md and
+    # ContextServerCommand in crates/settings_content/src/project.rs
+    # (path is serde-renamed to "command"; timeout is seconds).
+    config_format: "json"
+    config_file: "context_servers.json"
+    config_root: "context_servers"
+    hooks:
+      enabled: false
+      policy_refs: ["gitops_flux"]
+      enforcement: "proxy"
+    loom_proxy:
+      agent_hint: "zed"
+    capabilities:
+      mcp_servers: true
+      permissions: false
+      sandbox: false
+      web_search: false
+      custom_models: false
+      plugin_system: false
+    features:
+      command_format: "separate"
+      env_key: "env"
+      timeout_unit: "seconds"
+      timeout_field: "timeout"
+      supports_timeout: true
+      supports_description: true

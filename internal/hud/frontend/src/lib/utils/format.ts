@@ -32,14 +32,35 @@ export function formatDateTime(ts: string | number | Date | null | undefined): s
   return d.toLocaleDateString('en-CA') + ' ' + d.toLocaleTimeString('en-US', { hour12: false });
 }
 
-/** Relative time string: "3s ago", "5m ago", "2h ago", "1d ago". */
+/** Coarse magnitude of a positive millisecond span: "45s", "5m", "2h", "3d". */
+function spanLabel(ms: number): string {
+  const secs = Math.floor(ms / 1_000);
+  if (secs < 60) return secs + 's';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return mins + 'm';
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + 'h';
+  return Math.floor(hours / 24) + 'd';
+}
+
+/**
+ * Relative time string: "3s ago", "5m ago", "2h ago", "1d ago".
+ *
+ * Future timestamps read forward ("in 10m"). A deadline that hasn't lapsed —
+ * an overseer suppression lease, a retry-after — used to collapse to
+ * 'just now', so a live lease rendered as if it had already expired. Only
+ * the sub-second window keeps that wording, where it is still true.
+ */
 export function relativeTime(ts: string | number | Date | null | undefined): string {
   if (!ts) return '---';
   const then = ts instanceof Date ? ts.getTime() : new Date(ts).getTime();
   if (isNaN(then)) return '---';
   const diff = Date.now() - then;
   const secs = Math.floor(diff / 1_000);
-  if (secs < 0) return 'just now';
+  if (secs < 0) {
+    const ahead = -diff;
+    return ahead < 1_000 ? 'just now' : 'in ' + spanLabel(ahead);
+  }
   if (secs < 60) return secs + 's ago';
   const mins = Math.floor(secs / 60);
   if (mins < 60) return mins + 'm ago';
@@ -120,7 +141,12 @@ export function statusVariant(status: string | null | undefined): BadgeVariant {
   return STATUS_VARIANTS[lower] ?? 'info';
 }
 
-/** Map a status string to a CSS color variable. */
+/**
+ * Map a status string to a CSS color variable — the canonical status→color
+ * function. Panels that hand-rolled their own disagreed with this one and with
+ * each other (`running` read green in the spawn list, cyan in the DAG), so
+ * every status swatch in the HUD routes here and through STATUS_VARIANTS.
+ */
 export function statusColor(status: string | null | undefined): string {
   const variant = statusVariant(status);
   const map: Record<BadgeVariant, string> = {
@@ -155,6 +181,20 @@ export function agentLabel(agentType: string | null | undefined): string {
   if (lower.includes('gemini')) return 'Gemini';
   if (lower.includes('copilot')) return 'Copilot';
   return agentType;
+}
+
+/** Infer agent type from a declared type or agent ID prefix. */
+export function inferAgentType(agentId: string | null | undefined, declaredType?: string | null): string {
+  const raw = (declaredType ?? '').trim();
+  if (raw && raw.toLowerCase() !== 'unknown') return raw;
+  if (!agentId) return 'unknown';
+  const lower = agentId.toLowerCase();
+  if (lower.startsWith('claude')) return 'claude';
+  if (lower.startsWith('codex')) return 'codex';
+  if (lower.startsWith('gemini')) return 'gemini';
+  if (lower.startsWith('copilot')) return 'copilot';
+  if (lower.startsWith('kilocode')) return 'kilocode';
+  return agentId.split('-')[0] || 'unknown';
 }
 
 // ---- Event / entry icons ----

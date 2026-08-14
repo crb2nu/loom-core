@@ -1,0 +1,1 @@
+- Harden `pkg/mills/gates/scope.go` directory matching across path separators and make `pkg/mills/gates/nonempty_diff.go` distinguish unavailable capture telemetry from a true no-op.

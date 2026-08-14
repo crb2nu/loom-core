@@ -1,0 +1,567 @@
+<script lang="ts">
+  import type { FleetRow } from '../../utils/fleetRows.ts';
+  import type { Session } from '../../stores/fleet.svelte.ts';
+  import type { SpawnState } from '../../stores/spawn.svelte.ts';
+  import type { UnifiedAgent } from '../../utils/agents.ts';
+
+  /**
+   * FleetTable — agent fleet table with grouping toggle. Pure presentational
+   * shell on top of shared/DataTable; consumes pre-built FleetRow[] from
+   * lib/utils/fleetRows.ts and the fleet store sort/group state.
+   */
+  let {
+    rows,
+    loading,
+    ungroupedStartIndex,
+    ungroupedCount,
+    spawnByAgentId,
+    expiringClaims,
+    onRowClick,
+    onSessionClick,
+    onTraceClick,
+    onSpawnClick,
+  }: {
+    rows: FleetRow[];
+    loading: boolean;
+    ungroupedStartIndex: number;
+    ungroupedCount: number;
+    spawnByAgentId: Map<string, SpawnState>;
+    expiringClaims: Map<string, string[]>;
+    onRowClick: (row: FleetRow) => void;
+    onSessionClick: (sessionId: string) => void;
+    onTraceClick: (agentId: string) => void;
+    onSpawnClick: (e: Event, spawnId: string) => void;
+  } = $props();
+
+  import { fleetStore } from '../../stores/fleet.svelte.ts';
+  import { chaptersStore } from '../../stores/chapters.svelte.ts';
+  import { parseNamespace } from '../../utils/namespace.ts';
+  import { formatTime, relativeTime, sanitizeText, inferAgentType } from '../../utils/format.ts';
+  import { VIRTUAL_SCROLL_THRESHOLD } from '../../utils/tokens.ts';
+  import StatusDot from '../../widgets/StatusDot.svelte';
+  import DataTable from '../shared/DataTable.svelte';
+  import EmptyState from '../shared/EmptyState.svelte';
+
+  // Agent column intentionally has no explicit width: with table-layout: fixed
+  // (from DataTable's stable-layout) the unsized column absorbs leftover space.
+  // hideBelow drops low-priority columns as the table narrows, so the agent
+  // column never collapses below a readable width.
+  const columns = [
+    { key: 'agent', label: 'Agent', sortable: true },
+    { key: 'status', label: 'Status', sortable: true, width: '70px' },
+    { key: 'evidence', label: 'Evidence', sortable: true, width: '92px', hideBelow: 740 },
+    { key: 'namespace', label: 'Namespace', sortable: true, width: '150px', hideBelow: 620 },
+    { key: 'activity', label: 'Activity', sortable: false, width: '200px', hideBelow: 940 },
+    { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '96px' },
+    { key: 'actions', label: 'Actions', sortable: false, width: '164px' },
+  ];
+
+  function unifiedAgentStatus(agent: UnifiedAgent): 'healthy' | 'degraded' | 'down' {
+    if (agent.status === 'active') return 'healthy';
+    if (agent.status === 'idle') return 'degraded';
+    return 'down';
+  }
+
+  function sessionLabel(session: Session | null): string {
+    if (!session) return 'unknown';
+    return sanitizeText(session.agent || session.agent_id || session.id.slice(0, 8));
+  }
+</script>
+
+<div class="card fleet-table-card">
+  <div class="card-header">
+    <span class="card-title">Live Agents</span>
+    <div class="card-header-tools">
+      <button
+        class="header-toggle"
+        class:header-toggle-active={fleetStore.groupByRootSession}
+        onclick={() => fleetStore.toggleGrouping()}
+        title={fleetStore.groupByRootSession ? 'Grouped by conversation — repos/worktrees of one chat nest under it' : 'Show a flat agent list'}
+      >
+        {fleetStore.groupByRootSession ? 'Grouped by conversation' : 'Flat list'}
+      </button>
+      <span class="count-badge">{rows.length}</span>
+    </div>
+  </div>
+  {#if rows.length === 0 && fleetStore.lastUpdated}
+    <EmptyState icon={'◈'} heading="No active agents" compact />
+  {:else}
+    <DataTable
+      {columns}
+      {rows}
+      sortKey={fleetStore.sortKey}
+      sortDir={fleetStore.sortDir}
+      rowLabel="agent"
+      stableLayout={true}
+      {loading}
+      skeletonRows={4}
+      maxRows={VIRTUAL_SCROLL_THRESHOLD}
+      onSort={(key, dir) => fleetStore.setSort(key, dir)}
+      onRowClick={(row) => onRowClick(row)}
+    >
+      {#snippet row({ row, index, hiddenColumns })}
+        {@const agent = row.agent}
+        {@const linkedSpawn = spawnByAgentId.get(agent.agent_id)}
+        {@const showUngroupedDivider = fleetStore.groupByRootSession && row.ungrouped && index === ungroupedStartIndex && ungroupedStartIndex > 0}
+        <td class="text-mono agent-cell" class:subagent-row={row.depth > 0} class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.agent_id ?? '---')}>
+          {#if showUngroupedDivider}
+            <span class="ungrouped-label" aria-hidden="true">No active session match{ungroupedCount > 1 ? ` · ${ungroupedCount}` : ''}</span>
+          {/if}
+          {#if fleetStore.groupByRootSession && row.depth > 0}
+            <span class="subagent-indent" aria-hidden="true">└─</span>
+          {/if}
+          <span class="agent-id-row">
+            <span class="agent-id">{sanitizeText(agent.agent_id ?? '---')}</span>
+            {#if linkedSpawn}
+              <button
+                class="spawn-link-icon"
+                title="Spawned agent — click to view spawn detail"
+                onclick={(e) => onSpawnClick(e, linkedSpawn.spawn_id)}
+              >{'⬢'}</button>
+            {/if}
+            {#if expiringClaims.has(agent.agent_id)}
+              <span class="expiring-icon" title={`Expiring: ${expiringClaims.get(agent.agent_id)?.join(', ')}`}>{'⏰'}</span>
+            {/if}
+          </span>
+          <div class="agent-meta-row">
+            <span>{inferAgentType(agent.agent_id, agent.agent_type)}</span>
+            <span>{agent.source}</span>
+          </div>
+          {#if row.session}
+            {@const repos = row.conversationMemberCount ?? 0}
+            {@const showRootRef = !!row.rootSession && row.rootSession.id !== row.session.id}
+            {@const showRootSession = row.rootSession?.id === row.session.id && row.totalChildCount > 0}
+            {@const hasHierarchy = row.conversationSibling || !!row.parentSession || showRootSession || repos > 1 || showRootRef || row.totalChildCount > 0}
+            {#if hasHierarchy}
+            <div class="agent-hierarchy-row">
+              {#if row.conversationSibling}
+                <span class="hierarchy-pill hierarchy-pill-child">same conversation</span>
+              {:else if row.parentSession}
+                <span class="hierarchy-pill hierarchy-pill-child">child of {sessionLabel(row.parentSession)}</span>
+              {:else if showRootSession}
+                <span class="hierarchy-pill hierarchy-pill-root">root session</span>
+              {/if}
+              {#if repos > 1}
+                <span class="hierarchy-pill hierarchy-pill-root" title={`This conversation worked across ${repos} repos/worktrees.`}>{repos} repos</span>
+              {/if}
+              {#if showRootRef}
+                <span class="hierarchy-pill">root {sessionLabel(row.rootSession)}</span>
+              {/if}
+              {#if row.totalChildCount > 0}
+                <span class="hierarchy-pill">{row.liveChildCount}/{row.totalChildCount} child{row.totalChildCount === 1 ? '' : 'ren'}</span>
+              {/if}
+            </div>
+            {/if}
+          {/if}
+          {#if row.depth === 0 && !row.conversationSibling}
+            {@const latestChapter = chaptersStore.latestForAgent(agent.agent_id)}
+            {#if latestChapter}
+              {@const chapterCount = chaptersStore.countForAgent(agent.agent_id)}
+              <div class="agent-chapter-row" title={sanitizeText(latestChapter.summary || latestChapter.title)}>
+                <span class="chapter-pill">
+                  <span class="chapter-glyph" aria-hidden="true">▸</span>
+                  <span class="chapter-title">{sanitizeText(latestChapter.title)}</span>
+                  {#if chapterCount > 1}<span class="chapter-count">·&nbsp;{chapterCount}</span>{/if}
+                </span>
+              </div>
+            {/if}
+          {/if}
+        </td>
+        <td class="dt-col-status" class:ungrouped-divider={showUngroupedDivider}>
+          <StatusDot status={unifiedAgentStatus(agent)} />
+        </td>
+        {#if !hiddenColumns.has('evidence')}
+        <td class="evidence-cell dt-col-evidence" class:ungrouped-divider={showUngroupedDivider}>
+          <div class="evidence-stack">
+            {#if agent.has_presence}
+              <span class="evidence-pill evidence-pill-active">presence</span>
+            {/if}
+            {#if agent.has_session}
+              <span class="evidence-pill evidence-pill-active">session</span>
+            {/if}
+            {#if agent.has_spawn}
+              <span class="evidence-pill evidence-pill-active">spawn</span>
+            {/if}
+            {#if agent.is_orphan}
+              <span
+                class="evidence-pill evidence-pill-orphan"
+                title={`Heartbeating without an active session for ${Math.round(agent.orphan_age_seconds / 60)}m. Auto-reaped at 10m.`}
+              >orphan</span>
+            {/if}
+            {#if !agent.has_presence && !agent.has_session && !agent.has_spawn && !agent.is_orphan}
+              <span class="evidence-empty" title="No presence, session, or spawn evidence">—</span>
+            {/if}
+          </div>
+        </td>
+        {/if}
+        {#if !hiddenColumns.has('namespace')}
+        {@const ns = parseNamespace(agent.namespace ?? agent.project)}
+        <td class="text-mono namespace-cell dt-col-namespace" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.namespace ?? agent.project ?? '---')}>
+          {#if ns.synthetic}
+            <span class="ns-unknown" title="No repository resolved for this session (synthetic/fallback namespace).">—</span>
+          {:else}
+            <div class="ns-repo">{sanitizeText(ns.repo)}</div>
+            {#if ns.branch}
+              <div class="ns-branch" class:ns-branch-default={ns.branch === 'main' || ns.branch === 'master'}>{sanitizeText(ns.branch)}</div>
+            {/if}
+          {/if}
+        </td>
+        {/if}
+        {#if !hiddenColumns.has('activity')}
+        <td class="text-muted text-xs description-cell dt-col-activity" class:ungrouped-divider={showUngroupedDivider} title={sanitizeText(agent.current_task || agent.description || '')}>
+          {sanitizeText(agent.current_task || agent.description || '---')}
+        </td>
+        {/if}
+        <td class="text-mono text-muted dt-col-heartbeat" class:ungrouped-divider={showUngroupedDivider} title={formatTime(agent.last_heartbeat || agent.session_started_at)}>
+          {relativeTime(agent.last_heartbeat || agent.session_started_at)}
+        </td>
+        <td class="actions-cell dt-col-actions" class:ungrouped-divider={showUngroupedDivider}>
+          <div class="actions-row">
+          {#if agent.session_id}
+            <button class="btn btn-xs btn-ghost" onclick={(e) => { e.stopPropagation(); if (agent.session_id) onSessionClick(agent.session_id); }}>
+              Session
+            </button>
+          {/if}
+          <button
+            class="btn btn-xs btn-ghost"
+            onclick={(e) => {
+              e.stopPropagation();
+              // Subagent rows (Claude Code Task-tool children, etc.) share an
+              // MCP connection with their parent, so the audit stream tags
+              // their tool calls with the ROOT agent's id, not the subagent's.
+              // Resolve to root_agent_id whenever the row is a child so the
+              // Traces filter actually returns results. Falls back to the
+              // row's own agent_id for root sessions.
+              const isChild = !!(row.rootSession && row.session && row.rootSession.id !== row.session.id);
+              const traceAgent = isChild ? (row.rootSession?.agent_id ?? agent.agent_id) : agent.agent_id;
+              onTraceClick(traceAgent);
+            }}
+          >
+            Traces
+          </button>
+          </div>
+        </td>
+      {/snippet}
+    </DataTable>
+  {/if}
+</div>
+
+<style>
+  .fleet-table-card {
+    min-width: 0;
+    min-height: 200px;
+    /* U10: Allow the agent list to scroll so the "Showing X of Y" footer
+       and overflowing rows stay reachable when the card is cropped. */
+    max-height: 60vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .count-badge {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    background: var(--bg-tertiary);
+    color: var(--fg-secondary);
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .card-header-tools {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .header-toggle {
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--fg-muted);
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    transition: color var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+  }
+
+  .header-toggle:hover,
+  .header-toggle-active {
+    color: var(--fg-primary);
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
+  }
+
+  .agent-cell,
+  .namespace-cell {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Namespace split into a primary repo line + a dimmed branch line. */
+  .ns-repo {
+    color: var(--fg-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ns-branch {
+    margin-top: 1px;
+    font-size: 10px;
+    color: var(--fg-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* main/master are the common case — keep them present but extra-subtle. */
+  .ns-branch-default {
+    opacity: 0.6;
+  }
+
+  .ns-unknown {
+    color: var(--fg-dim);
+  }
+
+  /* Per-card vertical-align override removed: DataTable engine now defaults
+     to `vertical-align: top`, so every consumer with mixed-height rows is
+     correct out-of-the-box. The agent-cell rule below is still required to
+     override stable-layout's `white-space: nowrap` and let the multi-line
+     agent id stack wrap. */
+
+  /* Agent cell intentionally wraps so its stacked children (id, meta-row,
+     hierarchy-pills) read naturally — overriding the stable-layout default
+     that forces nowrap on every td. No word-break here: the id span below
+     ellipsizes on one line; break-word would shred long agent ids into
+     per-character vertical strings whenever the column gets tight. */
+  :global(.fleet-table-card .data-table.stable-layout tbody td.agent-cell) {
+    position: relative;
+    white-space: normal;
+    vertical-align: top;
+    padding-top: var(--space-2);
+    padding-bottom: var(--space-2);
+  }
+
+  .agent-id-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .agent-id {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .namespace-cell {
+    white-space: nowrap;
+  }
+
+  .agent-meta-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+    font-size: 10px;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .agent-meta-row span {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .agent-hierarchy-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+  }
+
+  .hierarchy-pill {
+    border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border));
+    border-radius: 999px;
+    padding: 1px 6px;
+    font-size: 9px;
+    font-family: var(--font-mono);
+    color: var(--fg-dim);
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+    white-space: nowrap;
+  }
+
+  .hierarchy-pill-root {
+    color: var(--fg-secondary);
+  }
+
+  .hierarchy-pill-child {
+    border-color: color-mix(in srgb, var(--info) 24%, var(--border));
+    background: color-mix(in srgb, var(--info) 8%, transparent);
+  }
+
+  /* Latest session chapter (Claude Code mark_chapter) for this conversation. */
+  .agent-chapter-row {
+    display: flex;
+    margin-top: 6px;
+    min-width: 0;
+  }
+
+  .chapter-pill {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 5px;
+    max-width: 100%;
+    min-width: 0;
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 10px;
+    line-height: 1.3;
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+
+  .chapter-glyph {
+    flex: none;
+    color: var(--accent);
+    font-size: 9px;
+  }
+
+  .chapter-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg-secondary);
+  }
+
+  .chapter-count {
+    flex: none;
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+  }
+
+  .subagent-row {
+    padding-left: 18px;
+  }
+
+  .subagent-indent {
+    position: absolute;
+    left: 0;
+    top: 2px;
+    color: var(--fg-dim);
+    font-size: 11px;
+  }
+
+  /* Visual separator above the first ungrouped agent row, applied to every
+     cell of that row so the divider spans the full table width. The label
+     sits below the dashed border (inside the agent cell), giving the row
+     a clear two-band header instead of a floating chip that overlapped
+     the previous row. */
+  .ungrouped-divider {
+    border-top: 1px dashed color-mix(in srgb, var(--warning) 40%, var(--border)) !important;
+    padding-top: var(--space-3);
+  }
+
+  .ungrouped-label {
+    display: block;
+    width: fit-content;
+    margin-bottom: 6px;
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+  }
+
+  /* Keep the td a real table cell (display: flex on a td drops it out of
+     table layout and lets content float mid-row); flex lives on an inner
+     wrapper instead. */
+  .evidence-stack {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  .evidence-pill {
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 6px;
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .evidence-pill.evidence-pill-active {
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    color: var(--fg-secondary);
+  }
+
+  .evidence-pill.evidence-pill-orphan {
+    border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    color: var(--warning);
+  }
+
+  .evidence-empty {
+    font-size: 11px;
+    color: var(--fg-dim);
+  }
+
+  .actions-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .spawn-link-icon {
+    display: inline-flex;
+    align-items: center;
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-size: 10px;
+    margin-left: 4px;
+    padding: 0 2px;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity var(--transition-fast);
+  }
+
+  .spawn-link-icon:hover {
+    opacity: 1;
+  }
+
+  .expiring-icon {
+    color: var(--warning);
+    font-size: 12px;
+    margin-left: 4px;
+    cursor: help;
+    animation: glowPulse 2s ease-in-out infinite;
+  }
+
+  .description-cell {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 180px;
+  }
+</style>

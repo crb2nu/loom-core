@@ -1,65 +1,88 @@
 # golangci-lint configuration (v2)
 # https://golangci-lint.run/usage/configuration/
+#
+# Migrated from the v1 schema (issue #240). The file previously declared
+# version "2" but used v1 keys (`linters-settings`, `issues.exclude-rules`,
+# `issues.exclude-dirs-use-default`), which golangci-lint v2 does not recognize:
+# `golangci-lint config verify` rejects them and `run` silently ignores them.
+# The effective linter set had therefore drifted from the intended config.
+#
+# `golangci-lint config verify` now runs as a CI gate (see .gitlab-ci.yml) so
+# schema drift is caught at push time rather than silently ignored.
+#
+# NOTE: govet's `shadow` check is intentionally NOT enabled. Idiomatic
+# `if err := ...` shadowing is high-noise (50+ hits in pkg/mills + internal/hud
+# alone), so loom-core aligns with the canonical fleet config (shadow off).
+# Re-enabling shadow requires a dedicated cleanup pass first.
 
 version: "2"
 
-linters-settings:
-  govet:
-    enable:
-      - shadow
-  gocyclo:
-    min-complexity: 15
-  dupl:
-    threshold: 100
-  goconst:
-    min-len: 2
-    min-occurrences: 2
-  misspell:
-    locale: US
-  lll:
-    line-length: 140
-  goimports:
-    local-prefixes: github.com/crb2nu/loom
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - experimental
-      - opinionated
-      - performance
-      - style
-    disabled-checks:
-      - dupImport
-      - ifElseChain
-      - octalLiteral
-      - whyNoLint
-      - wrapperFunc
+run:
+  tests: true
+  modules-download-mode: readonly
 
 linters:
   enable:
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
-    # Memory safety linters (added for leak prevention)
-    - bodyclose     # Detect unclosed HTTP response bodies
-    - noctx         # Detect HTTP requests without context
+    - bodyclose # Detect unclosed HTTP response bodies
+    - noctx # Detect HTTP requests without context
   disable:
     - errcheck
+  settings:
+    gocyclo:
+      min-complexity: 15
+    dupl:
+      threshold: 100
+    goconst:
+      min-len: 2
+      min-occurrences: 2
+    misspell:
+      locale: US
+    lll:
+      line-length: 140
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - dupImport
+        - ifElseChain
+        - octalLiteral
+        - whyNoLint
+        - wrapperFunc
+  exclusions:
+    generated: lax
+    # Preserves the v1 default-exclude behavior that the broken config lost.
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - errcheck
+          - dupl
+          - gosec
+      - path: cmd/
+        linters:
+          - gochecknoinits
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 
-issues:
-  exclude-dirs-use-default: true
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - gocyclo
-        - errcheck
-        - dupl
-        - gosec
-    - path: cmd/
-      linters:
-        - gochecknoinits
-
-run:
-  timeout: 5m
-  tests: true
-  modules-download-mode: readonly
+formatters:
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/crb2nu/loom
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

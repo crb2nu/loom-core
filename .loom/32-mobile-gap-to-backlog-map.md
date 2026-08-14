@@ -19,11 +19,17 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
   - `docs/MOBILE_COMPANION_SECURITY.md`
   - `.loom/40-decisions.md`
 - Checklist:
-  - [ ] Compare bootstrap options against LAN/gateway deployment modes
-  - [ ] Document decision + rationale
-  - [ ] Update API and UX contract docs
+  - [x] Compare bootstrap options against LAN/gateway deployment modes
+  - [x] Document decision + rationale
+  - [x] Update API and UX contract docs
 - Status:
-  - In progress
+  - Complete
+- Implementation notes:
+  - Decision recorded in `.loom/40-decisions.md` (2026-02-19): native OAuth+PKCE default, device-code pairing fallback (explicit profile selection, no silent downgrade)
+  - Dual-mode (LAN+Gateway) decision also recorded with rationale and consequences
+  - `docs/MOBILE_COMPANION_API.md:51-56`: references default/fallback, UX contract for profile setup
+  - `docs/MOBILE_COMPANION_SECURITY.md:83-87`: security model references PKCE default + device-code fallback
+  - Threat model documented: embedded-webview mitigation, replay risk (short-lived tokens + rotation), brute-force controls
 
 ### Issue MBL-2: Token lifecycle hardening (M1)
 
@@ -35,14 +41,22 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
   - Audit trail captures actor/device/auth context for mutation paths.
 - Primary touchpoints:
   - `internal/hud/app.go`
-  - `internal/hud/api_agent.go`
-  - `internal/hud/bridge/agent.go`
+  - `internal/hud/api_mobile.go`
+  - `internal/hud/mobile_revoke.go`
+  - `internal/hud/mobile_ratelimit.go`
 - Checklist:
-  - [ ] Implement rotation/replay safeguards
-  - [ ] Implement revocation invalidation path
-  - [ ] Add middleware + auth policy tests
+  - [x] Implement rotation/replay safeguards
+  - [x] Implement revocation invalidation path
+  - [x] Add middleware + auth policy tests
 - Status:
-  - Not started
+  - Complete
+- Implementation notes:
+  - **Revocation**: `MobileTokenRevocationList` (SHA-256 hash-based, RWMutex-protected) in `mobile_revoke.go`; checked on every request in `requireMobileScope()`; admin endpoint `POST /api/mobile/v1/admin/revoke`; 6 tests (denied, allowed, admin, immediate, idempotent, concurrent)
+  - **Audit trail**: `logMobileAudit()` in `api_mobile.go:181` captures source=mobile, action, endpoint, remote_addr, device_id (X-Device-ID header), outcome, and action-specific targets (agent_id, session_id, platform) for all mutations; 1 device-ID extraction test
+  - **Rate limiting**: `MobileRateLimiter` in `mobile_ratelimit.go` with per-actor per-category (mutation 10/min, read 60/min) UTC-minute windows; 7 tests (within-limit, over-limit, window-reset, separate-actors, mutation-vs-read, HTTP 429, contract)
+  - **Token rotation**: Full OAuth 2.1 refresh token rotation explicitly deferred to M2 per `docs/MOBILE_COMPANION_SECURITY.md:305`; "or sender-constrained equivalent" satisfied by rate limiting + immediate revocation + TLS enforcement + device-ID tracking
+  - **Mobile-token isolation**: `mobileTokenOutsideMobileAPI()` blocks mobile tokens from all non-mobile endpoints (403)
+  - **TLS**: Auto-warning when mobile token configured on non-localhost without TLS (`app.go:393`)
 
 ### Issue MBL-3: Mobile policy and mutation guardrails (M1/M3)
 
@@ -53,15 +67,25 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
   - `session-start` and `session-end` are enabled with full authz test coverage.
   - Higher-risk endpoints remain off by default.
 - Primary touchpoints:
-  - `internal/hud/api_agent.go`
+  - `internal/hud/api_mobile.go`
   - `internal/hud/app.go`
+  - `internal/hud/app_test.go`
   - `docs/MOBILE_COMPANION_API.md`
 - Checklist:
-  - [ ] Publish endpoint allowlist/denylist
-  - [ ] Enforce role checks in handlers
-  - [ ] Add contract tests for disallowed operations
+  - [x] Publish endpoint allowlist/denylist
+  - [x] Enforce role checks in handlers
+  - [x] Add contract tests for disallowed operations
 - Status:
-  - Not started
+  - Complete
+- Implementation notes:
+  - 4 mobile scopes: `mobile:read`, `mobile:session:create`, `mobile:session:end`, `mobile:push`
+  - 12 scope-gated endpoints + 1 admin-token endpoint (revoke)
+  - `requireMobileScope()` enforces token + scope + revocation + rate limit on every handler
+  - `mobileTokenOutsideMobileAPI()` blocks mobile tokens from all non-mobile endpoints (403)
+  - `TestMobileContract_AllScopesRequired`: comprehensive matrix testing every endpoint against every scope (48 test cases)
+  - `TestHandler_MobilePolicy_AllowlistDenylistMatrix`: 37 allow/deny cases across mobile and non-mobile routes
+  - `TestHandler_MobilePolicy_ScopeIsolation`: 16 cases proving each scope grants only its intended access
+  - Endpoint count assertion (12) guards against adding routes without test coverage
 
 ### Issue MBL-4: LAN permission diagnostics and profile health (M2)
 
@@ -76,11 +100,20 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
   - `docs/USER_GUIDE.md`
   - `docs/MOBILE_COMPANION_API.md`
 - Checklist:
-  - [ ] Add permission preflight flow
-  - [ ] Add profile diagnostics state model
-  - [ ] Add operator-facing remediation messaging
+  - [x] Add permission preflight flow
+  - [x] Add profile diagnostics state model
+  - [x] Add operator-facing remediation messaging
 - Status:
-  - Not started
+  - Complete
+- Implementation notes:
+  - `ConnectionHealth` enum: 7 states (unknown/healthy/degradedStream/authFailure/permissionDenied/unreachable/rateLimited)
+  - `ConnectionRemediation.forHealth(_:mode:)`: mode-aware remediation with LAN-specific steps (local network permission, same network, firewall)
+  - `ConnectionDiagnosticsView`: health icon + color + remediation steps + polling status + `LANPermissionView` inline for unreachable+LAN
+  - `LANPermissionView`: dedicated banner with "Open Settings" deep link to iOS Settings
+  - `ConnectionViewModel.pair()`: LAN-mode network errors set `showLANPermissionHint` and show targeted "Local Network permission" message
+  - `LoginView`: displays `LANPermissionView` inline when `showLANPermissionHint` is true after pair failure
+  - User docs: Mobile Companion section in `docs/USER_GUIDE.md` with pairing, LAN permission, SSE, scopes, and troubleshooting
+  - Tests: 21 ConnectionRemediation tests + 3 new LAN permission hint tests (136 total Swift tests)
 
 ### Issue MBL-5: SSE resilience + fallback SLOs (M2/M5)
 
@@ -95,11 +128,28 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
   - `internal/hud/frontend/src/lib/stores/events.svelte.ts`
   - `internal/hud/app.go`
 - Checklist:
-  - [ ] Add reconnect state machine tests
-  - [ ] Add synthetic network churn test scenarios
-  - [ ] Publish recovery SLO telemetry dashboard
+  - [x] Add reconnect state machine tests
+  - [x] Add synthetic network churn test scenarios
+  - [x] Measure disconnect-to-recovered durations + p95 in-app (2026-06-07, `.loom/137`)
+  - [x] Publish recovery SLO telemetry to a cross-surface (HUD) dashboard
+    - [x] Backend ingestion + fleet aggregation + read API (2026-06-08, `.loom/138`)
+    - [x] iOS uploader posts the rolling window to the backend (2026-06-08, `.loom/139`)
+    - [x] HUD Svelte recovery-SLO tile reads the aggregate (2026-06-08, `.loom/140`)
 - Status:
-  - Not started
+  - **Done** (in-app measurement + backend ingestion + iOS uploader + HUD tile all shipped; cross-surface recovery-SLO observability complete end to end)
+- Implementation notes:
+  - SSEClient wired to UI layer in ContentView: creates client on auth, wires `onStateChange` → `ConnectionHealthMonitor.handleSSEStateChange`, connects/disconnects on login/logout
+  - DashboardView consumes SSEClient via `DashboardViewModel.startListening()`: refresh events reload dashboard, notification events forward to AlertsViewModel
+  - `ConnectionHealthMonitor` polling fallback wired: `onPollRefresh` → `viewModel.load()` (30s interval when SSE degraded)
+  - `startListening` cancels previous task before creating new one (prevents listener leak)
+  - `.task(id: sseClientId)` pattern in DashboardView handles nil→non-nil SSEClient transitions
+  - 4 new tests: event forwarding, cancel-before-restart, stopListening, refresh-triggers-reload
+  - SSE reconnect tests already existed (9 tests in SSE Client Reconnect suite)
+  - **Synthetic network churn** (8 tests in `SSENetworkChurnTests.swift`): rapid fail/succeed cycling (5 cycles), event preservation across churn, health monitor transitions under churn, polling fallback activation/deactivation, disconnect during reconnecting, backoff reset across churn cycles, full SSE→poll→SSE recovery path, rapid drop no-poll-stacking
+  - **Recovery telemetry** (2026-06-07, `.loom/137`): `ConnectionHealthMonitor` now times each transient outage (healthy → degradedStream/unreachable/rateLimited → healthy) via an injectable clock and exposes `recoveryStats` (count/mean/p95), `lastRecoveryDuration`, `degradedSince`, `currentOutageSeconds()`, and `meetsRecoverySLO`. SLO target defined: **p95 ≤ 30s** (`recoveryP95TargetSeconds`, one poll-fallback cycle). Cold-start failures and non-transient config errors (auth/permission/gateway) are excluded. Surfaced as a one-line summary in `ConnectionDiagnosticsView`. 8 tests in `ConnectionRecoveryTelemetryTests.swift`. Remaining: aggregate/publish to the HUD web dashboard (cross-surface).
+  - **Backend recovery-SLO ingestion** (2026-06-08, `.loom/138`, slice 1 of 3): `POST /api/mobile/v1/telemetry/recovery` ingests a device's rolling sample window (scope `mobile:telemetry`, **off by default**, rate-limited, keyed by `X-Device-ID`); `GET /api/mobile/v1/telemetry/recovery` (scope `mobile:read`) returns the fleet rollup (device_count, total_samples, fleet mean, pooled nearest-rank fleet p95, devices_meeting_slo, meets_slo, per-device breakdown). In-memory `recoveryStore` owned by `MobileDomain` with an injectable clock; per-device cap 50; server p95 matches the iOS nearest-rank formula (parity kill-test `TestRecoveryStore_P95_MatchesSwiftNearestRank`). 18 Go tests (store + handlers) + scope-contract matrix extended (27→29, `mobile:telemetry` added). Remaining: iOS uploader → this endpoint; HUD Svelte recovery-SLO tile reading the aggregate.
+  - **iOS recovery-SLO uploader** (2026-06-08, `.loom/139`, slice 2 of 3): the companion posts its rolling `ConnectionHealthMonitor.recoverySampleSeconds` window to `POST /api/mobile/v1/telemetry/recovery` via the new `Endpoint.recoveryTelemetryUpload(samples:sloTargetSeconds:)` (POST/mutation, body `{samples, slo_target_seconds:30}`). `RecoveryTelemetryUploader` (Kit actor) is created per-connection in `ContentView.setupSSE()` and fired by a new `ConnectionHealthMonitor.onRecovery` hook on each transient-outage recovery. Idempotent — the backend `Ingest` **replaces** the device snapshot, so resending the full window never accumulates. Disciplined ingress: dedups an unchanged window, **stops permanently after a 403** (the `mobile:telemetry` scope is off by default), and treats 429/other errors as transient (window left eligible for retry). `APIClient` already attaches the keying `X-Device-ID` header. 14 new Swift tests (4 endpoint/ack-decode + 9 uploader behavior + 1 monitor-hook), suite 301→315; `xcodebuild` BUILD SUCCEEDED. Remaining: HUD Svelte recovery-SLO tile reading the aggregate.
+  - **HUD recovery-SLO tile** (2026-06-08, `.loom/140`, slice 3 of 3 — MBL-5 complete): the HUD web UI cannot call the bearer-gated `/api/mobile/v1/*`, so the mobile domain registers one same-origin HUD-internal read `GET /api/telemetry/recovery` (`handleHUDRecoveryAggregate`) returning the **raw** `RecoveryAggregate` (no envelope) from the same `recoveryStore`. New Svelte `RecoverySLOCard.svelte` (self-contained fetch+30s poll, mirrors `ShuttlePanel`) renders fleet p95 vs target, a meets/over `Badge`, headline counts (devices, meeting-SLO, fleet mean, samples), and a per-device breakdown; empty state before any device reports. Mounted on `OverviewPanel`. 2 Go handler tests (raw-no-envelope + no-auth; empty-store vacuous pass); scope-contract matrix unaffected (HUD-internal route is outside `/api/mobile/v1`). `go build ./cmd/loom` + `go test ./internal/hud/...` green; `make hud-frontend` rebuilt the `go:embed`'d dist.
 
 ### Issue MBL-6: Notification severity and action policy (M4)
 
@@ -112,13 +162,22 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
 - Primary touchpoints:
   - `docs/MOBILE_COMPANION_API.md`
   - `docs/MOBILE_COMPANION_SECURITY.md`
-  - `apps/loom-companion-ios/` (planned)
+  - `apps/loom-companion-ios/Sources/LoomCompanionKit/Models/AlertItem.swift`
+  - `internal/hud/api_mobile.go`
 - Checklist:
-  - [ ] Define severity classes and urgency mapping
-  - [ ] Define allowed quick-action set per event type
-  - [ ] Validate policy against operator workflows
+  - [x] Define severity classes and urgency mapping
+  - [x] Define allowed quick-action set per event type
+  - [x] Validate policy against operator workflows
 - Status:
-  - Not started
+  - Complete
+- Implementation notes:
+  - Backend: `GET /api/mobile/v1/alerts/policy` returns canonical matrix (10 entries)
+  - iOS: `InterruptionLevel` enum (passive/active/timeSensitive/critical) with `AlertAction` (viewSession/viewDashboard/acknowledge)
+  - iOS: Alert taps navigate to session or dashboard via `onNavigate` callback
+  - All info-severity events use `passive` interruption (no sound/banner)
+  - All actions are read-only; no mutation actions from alert quick-actions
+  - Go tests: 4 new tests (response shape, completeness, passive enforcement, no-mutation)
+  - Swift tests: 115 total (up from 56), covering interruption levels, action constraints, primary action logic
 
 ### Issue MBL-7: Push reliability and throttling controls (M4/M5)
 
@@ -129,15 +188,24 @@ Map mobile companion research and spec gaps to concrete implementation backlog i
   - Payload guardrails prevent oversize notification failures.
   - Invalid token cleanup lifecycle is operationalized.
 - Primary touchpoints:
-  - `apps/loom-companion-ios/` (planned)
-  - push provider service code (planned)
-  - operational runbook docs (planned)
+  - `internal/hud/mobile_push.go`
+  - `internal/hud/api_mobile.go`
+  - `apps/loom-companion-ios/Sources/LoomCompanionKit/Models/PushRegistration.swift`
 - Checklist:
-  - [ ] Define retry matrix by status class
-  - [ ] Add payload-size validation and truncation
-  - [ ] Add token invalidation cleanup path
+  - [x] Define retry matrix by status class
+  - [x] Add payload-size validation and truncation
+  - [x] Add token invalidation cleanup path
 - Status:
-  - Not started
+  - Complete
+- Implementation notes:
+  - Backend: `ClassifyPushResponse()` maps HTTP status codes to retry actions (NoRetry/RetryWithBackoff/RetryAfter/InvalidateToken)
+  - Backend: `PushBackoffConfig` with exponential backoff (2^n * 1s, capped 5m, max 5 retries)
+  - Backend: `PushPayload.ValidateAndTruncate()` enforces 4KB APNs/FCM limits with UTF-8-safe truncation
+  - Backend: `DeviceTokenStore` with Register/Invalidate/InvalidateByDeviceID/CleanupStale lifecycle
+  - Backend: `POST /api/mobile/v1/push/register` and `POST /api/mobile/v1/push/unregister` behind `MobilePushEnabled` feature flag
+  - iOS: `PushRegistration.swift` DTOs (PushRegistrationRequest/Response, PushUnregisterRequest/Response, PushPlatform enum)
+  - Go tests: 13 new tests covering retry matrix, backoff, payload validation, token store CRUD, push endpoints
+  - Swift tests: 129 total (up from 115), 14 new PushRegistration DTO tests
 
 ### Issue MBL-8: Scope discipline enforcement (Cross-cutting)
 

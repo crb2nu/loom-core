@@ -1,6 +1,17 @@
-<script>
-  /** @type {{ value: number, max: number, label?: string, color?: string, showPercentage?: boolean }} */
-  let { value = 0, max = 100, label = '', color = 'var(--info)', showPercentage = true } = $props();
+<script lang="ts">
+  let {
+    value = 0,
+    max = 100,
+    label = '',
+    color = 'var(--info)',
+    showPercentage = true,
+  }: {
+    value?: number;
+    max?: number;
+    label?: string;
+    color?: string;
+    showPercentage?: boolean;
+  } = $props();
 
   let pct = $derived(max > 0 ? Math.min((value / max) * 100, 100) : 0);
 
@@ -25,6 +36,7 @@
       class="gauge-fill"
       style:width="{pct}%"
       style:background={resolvedColor}
+      style:--gauge-color={resolvedColor}
     ></div>
   </div>
 </div>
@@ -66,6 +78,6 @@
     height: 100%;
     border-radius: 3px;
     transition: width 0.3s ease, background 0.3s ease;
-    box-shadow: 0 0 6px rgba(1, 135, 153, 0.15);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--gauge-color, var(--info)) 25%, transparent);
   }
 </style>

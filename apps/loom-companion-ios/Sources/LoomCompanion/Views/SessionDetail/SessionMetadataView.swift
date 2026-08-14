@@ -1,0 +1,72 @@
+import SwiftUI
+import LoomCompanionKit
+
+struct SessionMetadataView: View {
+    let session: SessionInfo
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Session Info")
+                    .font(.headline)
+                Spacer()
+                StatusBadge(sessionStatus: session.status)
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                GridRow {
+                    Text("ID").foregroundStyle(LoomColors.fgSecondary)
+                    Text(session.id).font(.caption).monospaced()
+                }
+                GridRow {
+                    Text("Agent").foregroundStyle(LoomColors.fgSecondary)
+                    Text(session.agentId)
+                }
+                GridRow {
+                    Text("Namespace").foregroundStyle(LoomColors.fgSecondary)
+                    Text(session.namespace)
+                }
+                if !session.description.isEmpty {
+                    GridRow {
+                        Text("Description").foregroundStyle(LoomColors.fgSecondary)
+                        Text(session.description)
+                    }
+                }
+                if let parent = session.parentSessionId, !parent.isEmpty {
+                    GridRow {
+                        Text("Parent").foregroundStyle(LoomColors.fgSecondary)
+                        Text(parent).font(.caption).monospaced()
+                    }
+                }
+                if let root = session.rootSessionId, !root.isEmpty {
+                    GridRow {
+                        Text("Root").foregroundStyle(LoomColors.fgSecondary)
+                        Text(root).font(.caption).monospaced()
+                    }
+                }
+                GridRow {
+                    Text("Started").foregroundStyle(LoomColors.fgSecondary)
+                    Text(LoomFormat.absolute(fromISO: session.startedAt))
+                }
+                if let endedAt = session.endedAt {
+                    GridRow {
+                        Text("Ended").foregroundStyle(LoomColors.fgSecondary)
+                        Text(LoomFormat.absolute(fromISO: endedAt))
+                    }
+                }
+                GridRow {
+                    Text("Entries").foregroundStyle(LoomColors.fgSecondary)
+                    Text(LoomFormat.compact(session.entryCount))
+                }
+                GridRow {
+                    Text("Tokens").foregroundStyle(LoomColors.fgSecondary)
+                    Text(LoomFormat.compact(session.totalTokens))
+                }
+            }
+            .font(.subheadline)
+        }
+        .padding()
+        .background(LoomColors.bgSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}

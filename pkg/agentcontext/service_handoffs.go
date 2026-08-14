@@ -11,7 +11,9 @@ import (
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
-func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+type HandoffSvc struct{ *Service }
+
+func (s *HandoffSvc) HandleHandoffCreate(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	sessionID := v.Required("session_id")
 	targetAgentID := v.Required("target_agent_id")
@@ -19,6 +21,8 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 	instructions := v.String("instructions", "")
 	entryIDs := v.StringSlice("entry_ids")
 	tokenBudget := v.Int("token_budget", s.cfg.HandoffMaxTokens)
+	planID := v.String("plan_id", "")
+	sliceID := v.String("slice_id", "")
 
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
@@ -40,6 +44,8 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 		HandoffType:   handoffType,
 		Status:        HandoffStatusPending,
 		Instructions:  instructions,
+		PlanID:        planID,
+		SliceID:       sliceID,
 		CreatedAt:     now,
 	}
 
@@ -56,7 +62,7 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 	switch handoffType {
 	case HandoffTypeFull:
 		// Get all entries for the session
-		entries, _ := s.contextQdrant.Scroll(ctx, FilterMust(Match("session_id", sessionID)), 500)
+		entries, _ := s.qdrant.Get(CollContext).Scroll(ctx, FilterMust(Match("session_id", sessionID)), 500)
 		for _, e := range entries {
 			if totalTokens+e.TokenCount > tokenBudget {
 				break
@@ -69,7 +75,7 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 	case HandoffTypeSelective:
 		// Use provided entry IDs
 		for _, id := range entryIDs {
-			p, err := s.contextQdrant.GetPoint(ctx, id, false)
+			p, err := s.qdrant.Get(CollContext).GetPoint(ctx, id, false)
 			if err != nil {
 				continue
 			}
@@ -87,7 +93,7 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 
 	case HandoffTypeSummaryOnly:
 		// Get session summaries and decisions only
-		entries, _ := s.contextQdrant.Scroll(ctx, FilterMust(
+		entries, _ := s.qdrant.Get(CollContext).Scroll(ctx, FilterMust(
 			Match("session_id", sessionID),
 			FilterShould(
 				Match("entry_type", string(EntryTypeSummary)),
@@ -109,7 +115,7 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 
 	// Store handoff (use dummy vector since not searching by content)
 	dummyVector := make([]float64, sessionsVectorSize)
-	if err := s.handoffsQdrant.EnsureCollection(ctx, sessionsVectorSize); err != nil {
+	if err := s.qdrant.Get(CollHandoffs).EnsureCollection(ctx, sessionsVectorSize); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("ensure collection: %w", err)), nil
 	}
 
@@ -119,7 +125,7 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 		Payload: handoffToPayload(handoff),
 	}
 
-	if err := s.handoffsQdrant.Upsert(ctx, []Point{point}, true); err != nil {
+	if err := s.qdrant.Get(CollHandoffs).Upsert(ctx, []Point{point}, true); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("create handoff: %w", err)), nil
 	}
 
@@ -129,10 +135,12 @@ func (s *Service) HandleHandoffCreate(ctx context.Context, args map[string]any) 
 		"token_count": handoff.TokenCount,
 		"entry_count": len(handoff.EntryIDs),
 		"summary":     handoff.Summary,
+		"plan_id":     handoff.PlanID,
+		"slice_id":    handoff.SliceID,
 	})
 }
 
-func (s *Service) HandleHandoffAccept(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *HandoffSvc) HandleHandoffAccept(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	handoffID := v.Required("handoff_id")
 	sessionID := v.Required("session_id")
@@ -148,7 +156,7 @@ func (s *Service) HandleHandoffAccept(ctx context.Context, args map[string]any) 
 	}
 
 	// Get handoff
-	p, err := s.handoffsQdrant.GetPoint(ctx, handoffID, false)
+	p, err := s.qdrant.Get(CollHandoffs).GetPoint(ctx, handoffID, false)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("handoff %s not found", handoffID)), nil
 	}
@@ -166,7 +174,7 @@ func (s *Service) HandleHandoffAccept(ctx context.Context, args map[string]any) 
 	// Check expiration
 	if handoff.ExpiresAt != nil && time.Now().After(*handoff.ExpiresAt) {
 		handoff.Status = HandoffStatusExpired
-		s.handoffsQdrant.SetPayload(ctx, []string{handoffID}, map[string]any{"status": string(HandoffStatusExpired)}, true)
+		s.qdrant.Get(CollHandoffs).SetPayload(ctx, []string{handoffID}, map[string]any{"status": string(HandoffStatusExpired)}, true)
 		return mcp.ErrorResult(fmt.Errorf("handoff has expired")), nil
 	}
 
@@ -183,12 +191,21 @@ func (s *Service) HandleHandoffAccept(ctx context.Context, args map[string]any) 
 		"summary":      handoff.Summary,
 		"token_count":  handoff.TokenCount,
 	}
+	// Plan-aware: surface the plan/slice so the receiver resumes by id
+	// (agent_plan_get / agent_plan_slice_get) rather than rebuilding context.
+	if handoff.PlanID != "" {
+		result["plan_id"] = handoff.PlanID
+		result["resume_hint"] = "call agent_plan_get{plan_id} to resume the plan"
+	}
+	if handoff.SliceID != "" {
+		result["slice_id"] = handoff.SliceID
+	}
 
 	// Import entries if requested
 	if importEntries && len(handoff.EntryIDs) > 0 {
 		var importedEntries []ContextEntry
 		for _, id := range handoff.EntryIDs {
-			ep, err := s.contextQdrant.GetPoint(ctx, id, true)
+			ep, err := s.qdrant.Get(CollContext).GetPoint(ctx, id, true)
 			if err != nil {
 				continue
 			}
@@ -206,7 +223,7 @@ func (s *Service) HandleHandoffAccept(ctx context.Context, args map[string]any) 
 	now := time.Now()
 	handoff.Status = HandoffStatusAccepted
 	handoff.AcceptedAt = &now
-	s.handoffsQdrant.SetPayload(ctx, []string{handoffID}, map[string]any{
+	s.qdrant.Get(CollHandoffs).SetPayload(ctx, []string{handoffID}, map[string]any{
 		"status":      string(HandoffStatusAccepted),
 		"accepted_at": now.Format(time.RFC3339Nano),
 	}, true)
@@ -215,7 +232,7 @@ func (s *Service) HandleHandoffAccept(ctx context.Context, args map[string]any) 
 }
 
 // HandleHandoffInbox lists pending handoffs for an agent
-func (s *Service) HandleHandoffInbox(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *HandoffSvc) HandleHandoffInbox(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	agentID := v.Required("agent_id")
 	includeViewed := v.Bool("include_viewed", false)
@@ -230,7 +247,7 @@ func (s *Service) HandleHandoffInbox(ctx context.Context, args map[string]any) (
 		conds = append(conds, Match("status", string(HandoffStatusPending)))
 	}
 
-	points, err := s.handoffsQdrant.ScrollPoints(ctx, FilterMust(conds...), 50, false)
+	points, err := s.qdrant.Get(CollHandoffs).ScrollPoints(ctx, FilterMust(conds...), 50, false)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("query inbox: %w", err)), nil
 	}
@@ -266,6 +283,12 @@ func (s *Service) HandleHandoffInbox(ctx context.Context, args map[string]any) (
 			"entry_count":  len(h.EntryIDs),
 			"created_at":   h.CreatedAt.Format(time.RFC3339),
 		}
+		if h.PlanID != "" {
+			entry["plan_id"] = h.PlanID
+		}
+		if h.SliceID != "" {
+			entry["slice_id"] = h.SliceID
+		}
 		if h.ExpiresAt != nil {
 			entry["expires_at"] = h.ExpiresAt.Format(time.RFC3339)
 		}
@@ -274,7 +297,7 @@ func (s *Service) HandleHandoffInbox(ctx context.Context, args map[string]any) (
 		// Mark as viewed if pending
 		if h.Status == HandoffStatusPending {
 			viewedAt := now.Format(time.RFC3339Nano)
-			if err := s.handoffsQdrant.SetPayload(ctx, []string{h.ID}, map[string]any{
+			if err := s.qdrant.Get(CollHandoffs).SetPayload(ctx, []string{h.ID}, map[string]any{
 				"status":    string(HandoffStatusViewed),
 				"viewed_at": viewedAt,
 			}, true); err != nil {
@@ -292,7 +315,7 @@ func (s *Service) HandleHandoffInbox(ctx context.Context, args map[string]any) (
 }
 
 // HandleHandoffReject rejects a handoff with a reason
-func (s *Service) HandleHandoffReject(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+func (s *HandoffSvc) HandleHandoffReject(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
 	handoffID := v.Required("handoff_id")
 	reason := v.String("reason", "")
@@ -302,7 +325,7 @@ func (s *Service) HandleHandoffReject(ctx context.Context, args map[string]any) 
 	}
 
 	// Get the handoff
-	p, err := s.handoffsQdrant.GetPoint(ctx, handoffID, false)
+	p, err := s.qdrant.Get(CollHandoffs).GetPoint(ctx, handoffID, false)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("handoff %s not found", handoffID)), nil
 	}
@@ -318,7 +341,7 @@ func (s *Service) HandleHandoffReject(ctx context.Context, args map[string]any) 
 	}
 
 	now := time.Now()
-	if err := s.handoffsQdrant.SetPayload(ctx, []string{handoffID}, map[string]any{
+	if err := s.qdrant.Get(CollHandoffs).SetPayload(ctx, []string{handoffID}, map[string]any{
 		"status":          string(HandoffStatusRejected),
 		"rejected_at":     now.Format(time.RFC3339Nano),
 		"rejected_reason": reason,
@@ -346,6 +369,8 @@ func handoffToPayload(h Handoff) map[string]any {
 		"summary":         h.Summary,
 		"entry_ids":       h.EntryIDs,
 		"token_count":     h.TokenCount,
+		"plan_id":         h.PlanID,
+		"slice_id":        h.SliceID,
 		"created_at":      h.CreatedAt.Format(time.RFC3339Nano),
 	}
 	if h.AcceptedAt != nil {
@@ -382,6 +407,8 @@ func payloadToHandoff(payload map[string]any) (*Handoff, error) {
 		Summary:       toString(payload["summary"]),
 		EntryIDs:      toStringSlice(payload["entry_ids"]),
 		TokenCount:    toInt(payload["token_count"]),
+		PlanID:        toString(payload["plan_id"]),
+		SliceID:       toString(payload["slice_id"]),
 	}
 
 	if ts := toString(payload["created_at"]); ts != "" {
@@ -412,4 +439,112 @@ func payloadToHandoff(payload map[string]any) (*Handoff, error) {
 	h.RejectedReason = toString(payload["rejected_reason"])
 
 	return h, nil
+}
+
+// MaybeAutoHandoff creates a DRAFT handoff entry tagged source="auto"
+// when the TriggerGate (F5) has fired for a spawn's telemetry. It never
+// auto-accepts — humans still approve via the HUD Handoffs panel.
+//
+// Slice C1 contract: the call is surgical, nil-safe, and a no-op if any
+// prerequisite is missing (empty IDs, nil service, missing session). It
+// increments `loom_handoff_trigger_fired_total{reason}` on success and
+// `loom_handoff_trigger_suppressed_total{reason}` on any guard miss.
+//
+// `details` is an optional free-form map persisted into the handoff's
+// Instructions field so reviewers see the telemetry snapshot that
+// tripped the trigger.
+func (s *Service) MaybeAutoHandoff(
+	ctx context.Context,
+	sessionID, sourceAgent, targetAgent, reason string,
+	details map[string]any,
+) error {
+	if s == nil {
+		return nil
+	}
+	if s.metrics == nil {
+		// Service is in a partially-initialised test state; fail open.
+		return nil
+	}
+	if sessionID == "" || targetAgent == "" || reason == "" {
+		s.metrics.IncHandoffTriggerSuppressed(reason)
+		return nil
+	}
+
+	// Best-effort: verify the session exists. A missing session is
+	// treated as a no-op rather than an error so the budget watcher
+	// cannot wedge a spawn on a stale session record.
+	session, err := s.getSession(ctx, sessionID)
+	if err != nil || session == nil {
+		s.metrics.IncHandoffTriggerSuppressed(reason)
+		if s.logger != nil {
+			s.logger.Warn("auto-handoff skipped: session lookup failed",
+				"session_id", sessionID, "reason", reason, "error", err)
+		}
+		return nil
+	}
+
+	// If the caller didn't provide an explicit source agent, fall back
+	// to the session's owning agent.
+	if sourceAgent == "" {
+		sourceAgent = session.AgentID
+	}
+
+	instructions := fmt.Sprintf("Auto-handoff draft (reason=%s). Review telemetry and approve or reject.", reason)
+	if len(details) > 0 {
+		var b strings.Builder
+		b.WriteString(instructions)
+		b.WriteString("\n\nTelemetry:\n")
+		for k, v := range details {
+			fmt.Fprintf(&b, "  - %s: %v\n", k, v)
+		}
+		instructions = b.String()
+	}
+
+	now := time.Now()
+	// Mirror the ID shape used by HandleHandoffCreate: (sourceAgent,
+	// targetAgent, sessionID, now). GenerateID hashes the tuple.
+	handoff := Handoff{
+		ID:            GenerateID(sourceAgent, targetAgent, sessionID, now),
+		SourceAgentID: sourceAgent,
+		SourceSession: sessionID,
+		TargetAgentID: targetAgent,
+		HandoffType:   HandoffTypeSummaryOnly,
+		Status:        HandoffStatusPending,
+		Instructions:  instructions,
+		Summary:       fmt.Sprintf("Auto-handoff: %s threshold breached twice consecutively", reason),
+		CreatedAt:     now,
+	}
+	if s.cfg.HandoffExpirationHours > 0 {
+		expires := now.Add(time.Duration(s.cfg.HandoffExpirationHours) * time.Hour)
+		handoff.ExpiresAt = &expires
+	}
+
+	payload := handoffToPayload(handoff)
+	// Tag source="auto" so the HUD can distinguish auto-drafts from
+	// human-created handoffs (per plan §4.C1). Also record the breach
+	// reason for downstream filtering.
+	payload["source"] = "auto"
+	payload["auto_reason"] = reason
+
+	dummyVector := make([]float64, sessionsVectorSize)
+	if err := s.qdrant.Get(CollHandoffs).EnsureCollection(ctx, sessionsVectorSize); err != nil {
+		s.metrics.IncHandoffTriggerSuppressed(reason)
+		return fmt.Errorf("ensure handoffs collection: %w", err)
+	}
+	point := Point{ID: handoff.ID, Vector: dummyVector, Payload: payload}
+	if err := s.qdrant.Get(CollHandoffs).Upsert(ctx, []Point{point}, true); err != nil {
+		s.metrics.IncHandoffTriggerSuppressed(reason)
+		return fmt.Errorf("upsert auto handoff: %w", err)
+	}
+
+	s.metrics.IncHandoffTriggerFired(reason)
+	if s.logger != nil {
+		s.logger.Info("auto-handoff draft created",
+			"handoff_id", handoff.ID,
+			"session_id", sessionID,
+			"source_agent", sourceAgent,
+			"target_agent", targetAgent,
+			"reason", reason)
+	}
+	return nil
 }

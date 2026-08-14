@@ -36,10 +36,16 @@ type AuditEntry struct {
 	Server           string    `json:"server"`
 	Tool             string    `json:"tool"`
 	DurationMs       int64     `json:"duration_ms"`
+	RouteMs          int64     `json:"route_ms,omitempty"`
+	BuildMs          int64     `json:"build_ms,omitempty"`
+	ExecuteMs        int64     `json:"execute_ms,omitempty"`
+	SendMs           int64     `json:"send_ms,omitempty"`
+	RecvMs           int64     `json:"recv_ms,omitempty"`
 	Status           string    `json:"status"` // "success", "error", "denied"
 	Error            string    `json:"error,omitempty"`
 	Target           string    `json:"target,omitempty"` // "local" or "hub"
 	Cached           bool      `json:"cached,omitempty"`
+	PipelineStage    string    `json:"pipeline_stage,omitempty"`
 	PolicyRuleID     string    `json:"policy_rule_id,omitempty"`
 	PolicyReasonCode string    `json:"policy_reason_code,omitempty"`
 }
@@ -50,6 +56,7 @@ type AuditLogger struct {
 	file   *os.File
 	enc    *json.Encoder
 	logger *slog.Logger
+	path   string
 }
 
 // NewAuditLogger creates an audit logger. Returns nil if auditing is disabled.
@@ -82,6 +89,7 @@ func NewAuditLogger(cfg AuditConfig, logger *slog.Logger) (*AuditLogger, error) 
 		file:   f,
 		enc:    json.NewEncoder(f),
 		logger: logger,
+		path:   logPath,
 	}, nil
 }
 

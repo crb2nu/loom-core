@@ -1,0 +1,1 @@
+- Add regression coverage for GitLab Agent authentication, ClickHouse Code 432 merge failures, Longhorn replica scheduling, and LiteLLM missing authentication in `pkg/mills/council/ci_incident_classifier.go` and `pkg/mills/council/ci_incident_classifier_test.go`, while keeping ambiguous signals unclassified.

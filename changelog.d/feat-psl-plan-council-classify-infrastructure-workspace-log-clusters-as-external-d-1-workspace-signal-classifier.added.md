@@ -1,0 +1,1 @@
+- Classify known infrastructure workspace-log clusters as persisted `external_dependency_incident` signals during council brief compilation via `pkg/mills/council/workspace_signal_classifier.go`, with the durable class contract in `pkg/mills/store/incident_class.go`.

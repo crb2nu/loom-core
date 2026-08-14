@@ -1,5 +1,7 @@
-<script>
+<script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import type { SSEEvent } from '../stores/events.svelte.ts';
+  import type { EnrichedSession } from '../stores/fleet.svelte.ts';
   import { overlayStore } from '../stores/overlay.svelte.ts';
   import { fleetStore } from '../stores/fleet.svelte.ts';
   import { healthStore } from '../stores/health.svelte.ts';
@@ -11,8 +13,10 @@
   import { eventStore } from '../stores/events.svelte.ts';
   import StatusDot from '../widgets/StatusDot.svelte';
 
+  const fleetPollingOwner = Symbol('OverlayShell');
+
   // Make html/body transparent so native NSVisualEffectView vibrancy shows through.
-  function transparentBody(_node) {
+  function transparentBody(_node: HTMLElement) {
     document.documentElement.style.background = 'transparent';
     document.body.style.background = 'transparent';
     return {
@@ -23,11 +27,11 @@
     };
   }
 
-  let activityUnsubs = [];
+  let activityUnsubs: Array<() => void> = [];
 
   onMount(() => {
     eventStore.connect();
-    fleetStore.startPolling();
+    fleetStore.startPolling(60000, fleetPollingOwner);
     healthStore.startPolling();
     taskStore.startPolling();
     workflowStore.startPolling();
@@ -36,9 +40,9 @@
     sandboxStore.startPolling();
 
     // Wire granular agent SSE events to overlay activity tracking.
-    function pushAgentEvent(e) {
-      const data = e.data || {};
-      const agentId = data.agent_id || 'unknown';
+    function pushAgentEvent(e: SSEEvent) {
+      const data = e.data;
+      const agentId = (data.agent_id as string) || 'unknown';
       overlayStore.pushEvent(e.type, agentId);
     }
     activityUnsubs = [
@@ -53,7 +57,7 @@
     for (const unsub of activityUnsubs) unsub();
     activityUnsubs = [];
     eventStore.disconnect();
-    fleetStore.stopPolling();
+    fleetStore.stopPolling(fleetPollingOwner);
     healthStore.stopPolling();
     taskStore.stopPolling();
     workflowStore.stopPolling();
@@ -89,7 +93,7 @@
   // Last 5 activity events for the compact activity log.
   let activityLog = $derived(overlayStore.recentEvents.slice(-5).reverse());
 
-  function activityShortTime(ts) {
+  function activityShortTime(ts: string | number | Date) {
     try {
       return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     } catch {
@@ -98,16 +102,16 @@
   }
 
   /** Strip "agent." prefix for compact display. */
-  function activityLabel(type) {
+  function activityLabel(type: string) {
     return type.replace('agent.', '');
   }
 
-  function formatTime(d) {
+  function formatTime(d: Date | null) {
     if (!d) return '--:--';
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  function shortTime(ts) {
+  function shortTime(ts: string | number | null | undefined) {
     if (!ts) return '--:--';
     try {
       return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -116,7 +120,7 @@
     }
   }
 
-  function statusDotStatus(status) {
+  function statusDotStatus(status: string) {
     switch (status) {
       case 'healthy': return 'healthy';
       case 'degraded': return 'degraded';
@@ -126,7 +130,7 @@
     }
   }
 
-  function priorityClass(p) {
+  function priorityClass(p: string) {
     switch (p) {
       case 'critical': return 'badge-critical';
       case 'high': return 'badge-high';
@@ -136,7 +140,7 @@
     }
   }
 
-  function taskStatusDotStatus(status) {
+  function taskStatusDotStatus(status: string) {
     switch (status) {
       case 'in_progress': return 'healthy';
       case 'blocked':     return 'degraded';
@@ -147,7 +151,7 @@
     }
   }
 
-  function sessionAgentDotStatus(session) {
+  function sessionAgentDotStatus(session: EnrichedSession) {
     switch (session.agentStatus) {
       case 'active':  return 'healthy';
       case 'idle':    return 'idle';
@@ -163,8 +167,8 @@
     if (isOpen && !prevFleetOpen) {
       // Section just opened — collapse idle groups
       const groups = fleetStore.namespaceGroups;
-      const collapseNs = new Set();
-      const collapseSess = new Set();
+      const collapseNs = new Set<string>();
+      const collapseSess = new Set<string>();
       for (const g of groups) {
         if (!g.hasActiveWork) {
           collapseNs.add(g.project);
@@ -185,7 +189,7 @@
     prevFleetOpen = isOpen;
   });
 
-  function workflowStatusDotStatus(status) {
+  function workflowStatusDotStatus(status: string) {
     switch (status) {
       case 'running':          return 'healthy';
       case 'waiting_approval': return 'degraded';
@@ -209,7 +213,7 @@
     { id: 'activity',  label: 'ACTIVITY',  icon: '\u26A1' },
   ];
 
-  function sectionSummary(id) {
+  function sectionSummary(id: string) {
     switch (id) {
       case 'fleet': {
         const groups = fleetStore.namespaceGroups;
@@ -225,14 +229,14 @@
       }
       case 'tasks': {
         if (totalTasks === 0) return 'none';
-        const parts = [];
+        const parts: string[] = [];
         if (inProgressTasks > 0) parts.push(`${inProgressTasks} active`);
         if (pendingTasks > 0) parts.push(`${pendingTasks} pend`);
         if (blockedTasks > 0) parts.push(`${blockedTasks} blocked`);
         return parts.length > 0 ? parts.join(' \u00B7 ') : `${totalTasks} total`;
       }
       case 'workflows': {
-        const parts = [];
+        const parts: string[] = [];
         if (activeWorkflows > 0) parts.push(`${activeWorkflows} active`);
         if (definitionCount > 0) parts.push(`${definitionCount} defs`);
         return parts.length > 0 ? parts.join(' \u00B7 ') : 'none';
@@ -279,6 +283,7 @@
       <button
         class="section-header"
         class:expanded={overlayStore.expandedSection === section.id}
+        aria-expanded={overlayStore.expandedSection === section.id}
         onclick={() => overlayStore.toggleSection(section.id)}
       >
         <span class="section-arrow">{overlayStore.expandedSection === section.id ? '\u25BE' : '\u25B8'}</span>
@@ -297,6 +302,7 @@
                 <button
                   class="ns-header"
                   class:ns-active={group.hasActiveWork}
+                  aria-expanded={overlayStore.isNamespaceExpanded(group.project)}
                   onclick={() => overlayStore.toggleNamespace(group.project)}
                 >
                   <span class="ns-chevron">{overlayStore.isNamespaceExpanded(group.project) ? '\u25BE' : '\u25B8'}</span>
@@ -310,6 +316,7 @@
                   {#each group.sessions.slice(0, 4) as session (session.id)}
                     <button
                       class="session-row"
+                      aria-expanded={overlayStore.isSessionExpanded(session.id)}
                       onclick={() => overlayStore.toggleSession(session.id)}
                     >
                       <span class="row-dot-wrap" class:pulsing={overlayStore.activeAgentIds.has(session.agent_id)}><StatusDot status={sessionAgentDotStatus(session)} /></span>
@@ -573,7 +580,7 @@
     padding: 6px 12px;
     border-bottom: 1px solid var(--border);
     cursor: pointer;
-    transition: background var(--transition-fast, 0.1s), color var(--transition-fast, 0.1s);
+    transition: background var(--transition-fast), color var(--transition-fast);
     -webkit-app-region: no-drag;
     font-size: 10px;
     text-align: left;
@@ -742,7 +749,7 @@
     background: none;
     color: var(--fg-secondary);
     border-left: 2px solid transparent;
-    transition: background var(--transition-fast, 0.1s);
+    transition: background var(--transition-fast);
   }
 
   .ns-header:hover {
@@ -798,7 +805,7 @@
     border: none;
     background: none;
     color: var(--fg-primary);
-    transition: background var(--transition-fast, 0.1s);
+    transition: background var(--transition-fast);
   }
 
   .session-row:hover {

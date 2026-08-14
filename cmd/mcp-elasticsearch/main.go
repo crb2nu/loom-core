@@ -14,11 +14,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/strutil"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -47,9 +49,25 @@ func main() {
 
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-elasticsearch",
+		logger)
+	if err != nil {
+		logger.
+			Warn("OTel tracer init failed",
+
+				"error",
+				err)
+	}
+	defer func() {
+		_ =
+			shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.Tracer(tp, "mcp-elasticsearch")
+
 	logger.Info("starting server", "name", "mcp-elasticsearch", "version", version, "url", esURL)
 
 	server := mcp.NewServer("mcp-elasticsearch", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Elasticsearch search and cluster management tools. Configure with ELASTICSEARCH_URL, ELASTICSEARCH_USERNAME/PASSWORD or ELASTICSEARCH_API_KEY.")
 
 	// Search
@@ -94,9 +112,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleSearch)
+	}, mcpotel.TracedToolHandler(
 
-	// Simple query string search
+		// Simple query string search
+		tracer, "es_search", handleSearch))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_query",
 		Description: "Simple query string search (Lucene syntax)",
@@ -126,9 +146,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"q"},
 		},
-	}, handleSimpleQuery)
+	}, mcpotel.TracedToolHandler(
 
-	// Get document
+		// Get document
+		tracer, "es_query", handleSimpleQuery))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_get",
 		Description: "Get a document by ID",
@@ -151,9 +173,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"index", "id"},
 		},
-	}, handleGet)
+	}, mcpotel.TracedToolHandler(
 
-	// Count documents
+		// Count documents
+		tracer, "es_get", handleGet))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_count",
 		Description: "Count documents matching a query",
@@ -170,9 +194,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleCount)
+	}, mcpotel.TracedToolHandler(
 
-	// List indices
+		// List indices
+		tracer, "es_count", handleCount))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_indices",
 		Description: "List indices with stats",
@@ -194,9 +220,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleIndices)
+	}, mcpotel.TracedToolHandler(
 
-	// Get mapping
+		// Get mapping
+		tracer, "es_indices", handleIndices))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_mapping",
 		Description: "Get index mapping (field types and structure)",
@@ -210,9 +238,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"index"},
 		},
-	}, handleMapping)
+	}, mcpotel.TracedToolHandler(
 
-	// Get aliases
+		// Get aliases
+		tracer, "es_mapping", handleMapping))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_aliases",
 		Description: "List index aliases",
@@ -229,9 +259,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleAliases)
+	}, mcpotel.TracedToolHandler(
 
-	// Cluster health
+		// Cluster health
+		tracer, "es_aliases", handleAliases))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_health",
 		Description: "Get cluster health status",
@@ -249,9 +281,11 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleHealth)
+	}, mcpotel.TracedToolHandler(
 
-	// Cluster info
+		// Cluster info
+		tracer, "es_health", handleHealth))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_info",
 		Description: "Get Elasticsearch cluster info and version",
@@ -259,9 +293,11 @@ func run(ctx context.Context) error {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleInfo)
+	}, mcpotel.TracedToolHandler(
 
-	// Index stats
+		// Index stats
+		tracer, "es_info", handleInfo))
+
 	server.AddTool(mcp.Tool{
 		Name:        "es_stats",
 		Description: "Get index statistics",
@@ -278,7 +314,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, handleStats)
+	}, mcpotel.TracedToolHandler(tracer, "es_stats", handleStats))
 
 	return server.Run(ctx)
 }

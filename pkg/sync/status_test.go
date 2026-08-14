@@ -436,6 +436,188 @@ func TestGetSyncStatus_ResolvesRelativeHomeDir(t *testing.T) {
 	}
 }
 
+func TestGetSyncStatus_UsesHomeGeneratedFileOverride(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	repoProfileDir := filepath.Join(repoDir, "test-profile")
+	homeProfileDir := filepath.Join(homeDir, ".test-home")
+	os.MkdirAll(repoProfileDir, 0755)
+	os.MkdirAll(homeProfileDir, 0755)
+	os.WriteFile(filepath.Join(repoProfileDir, "mcp.json"), []byte("content"), 0644)
+	os.WriteFile(filepath.Join(homeProfileDir, "mcp_config.json"), []byte("content"), 0644)
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:              "test",
+		RepoDir:           "test-profile",
+		HomeDir:           ".test-home",
+		GeneratedFile:     "mcp.json",
+		HomeGeneratedFile: "mcp_config.json",
+		SyncGeneratedOnly: true,
+	}
+
+	status, err := m.GetSyncStatus("test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !status.InSync {
+		t.Fatalf("expected InSync = true, got false (drift=%v)", status.DriftDetails)
+	}
+	if len(status.DriftDetails) != 1 || status.DriftDetails[0].Status != DriftInSync {
+		t.Fatalf("expected single in-sync item, got %v", status.DriftDetails)
+	}
+}
+
+func TestGetSyncStatus_HomeOnlyGeneratedProfile(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	homeProfileDir := filepath.Join(homeDir, ".codex")
+	if err := os.MkdirAll(homeProfileDir, 0o755); err != nil {
+		t.Fatalf("mkdir home profile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeProfileDir, "config.toml"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("write home config: %v", err)
+	}
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:                  "test",
+		RepoDir:               "unused-repo-dir",
+		HomeDir:               ".codex",
+		GeneratedFile:         "config.toml",
+		GeneratedDirectToHome: true,
+		SyncGeneratedOnly:     true,
+	}
+
+	status, err := m.GetSyncStatus("test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !status.HomeExists {
+		t.Fatal("expected HomeExists = true")
+	}
+	if status.RepoExists {
+		t.Fatal("expected RepoExists = false for missing repo mirror")
+	}
+	if !status.InSync {
+		t.Fatalf("expected InSync = true, got false (drift=%v)", status.DriftDetails)
+	}
+	if len(status.DriftDetails) != 1 || status.DriftDetails[0].File != "config.toml" || status.DriftDetails[0].Status != DriftInSync {
+		t.Fatalf("expected single in-sync home item, got %v", status.DriftDetails)
+	}
+}
+
+func TestGetSyncStatus_HomeOnlyGeneratedProfile_ExtraArtifactMissing(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	homeProfileDir := filepath.Join(homeDir, ".claude")
+	if err := os.MkdirAll(homeProfileDir, 0o755); err != nil {
+		t.Fatalf("mkdir home profile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeProfileDir, "mcp.json"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("write home mcp.json: %v", err)
+	}
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.Profiles["test"] = &Profile{
+		Name:                  "test",
+		RepoDir:               "unused-repo-dir",
+		HomeDir:               ".claude",
+		GeneratedFile:         "mcp.json",
+		ExtraGeneratedFiles:   []string{"settings.json"},
+		GeneratedDirectToHome: true,
+		SyncGeneratedOnly:     true,
+	}
+
+	status, err := m.GetSyncStatus("test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status.InSync {
+		t.Fatalf("expected InSync = false when extra artifact is missing, got true (drift=%v)", status.DriftDetails)
+	}
+	if len(status.DriftDetails) != 2 {
+		t.Fatalf("expected 2 drift items, got %d: %v", len(status.DriftDetails), status.DriftDetails)
+	}
+	foundPrimary := false
+	foundMissingExtra := false
+	for _, item := range status.DriftDetails {
+		switch item.File {
+		case "mcp.json":
+			foundPrimary = item.Status == DriftInSync
+		case "settings.json":
+			foundMissingExtra = item.Status == DriftMissing
+		}
+	}
+	if !foundPrimary {
+		t.Fatal("expected primary mcp.json to remain in sync")
+	}
+	if !foundMissingExtra {
+		t.Fatal("expected missing settings.json extra artifact to be reported")
+	}
+}
+
+func TestGetSyncStatus_HomeOnlyGeneratedProfile_ExtraArtifactShadowedInWorkspace(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+	workspaceDir := t.TempDir()
+
+	homeProfileDir := filepath.Join(homeDir, ".claude")
+	workspaceProfileDir := filepath.Join(workspaceDir, ".claude")
+	if err := os.MkdirAll(homeProfileDir, 0o755); err != nil {
+		t.Fatalf("mkdir home profile: %v", err)
+	}
+	if err := os.MkdirAll(workspaceProfileDir, 0o755); err != nil {
+		t.Fatalf("mkdir workspace profile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeProfileDir, "mcp.json"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("write home mcp.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeProfileDir, "settings.json"), []byte(`{"hooks":{}}`), 0o644); err != nil {
+		t.Fatalf("write home settings.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceProfileDir, "settings.json"), []byte(`{"hooks":{"stale":true}}`), 0o644); err != nil {
+		t.Fatalf("write workspace settings.json: %v", err)
+	}
+
+	m, _ := NewManager(repoDir)
+	m.HomeDir = homeDir
+	m.WorkspaceRoot = workspaceDir
+	m.Profiles["test"] = &Profile{
+		Name:                  "test",
+		RepoDir:               ".claude",
+		HomeDir:               ".claude",
+		GeneratedFile:         "mcp.json",
+		ExtraGeneratedFiles:   []string{"settings.json"},
+		GeneratedDirectToHome: true,
+		SyncGeneratedOnly:     true,
+	}
+
+	status, err := m.GetSyncStatus("test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status.InSync {
+		t.Fatalf("expected InSync = false when workspace copy shadows home extra, got true (drift=%v)", status.DriftDetails)
+	}
+
+	foundWorkspaceShadow := false
+	for _, item := range status.DriftDetails {
+		if item.File == "workspace:settings.json" && item.Status == DriftOutOfSync {
+			foundWorkspaceShadow = true
+		}
+	}
+	if !foundWorkspaceShadow {
+		t.Fatalf("expected workspace:settings.json drift item, got %v", status.DriftDetails)
+	}
+}
+
 func TestGetSyncStatus_OutOfSync(t *testing.T) {
 	repoDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -502,5 +684,188 @@ func TestGetAllSyncStatus_ReturnsAllProfiles(t *testing.T) {
 	// Should have statuses for all profiles
 	if len(statuses) != len(m.Profiles) {
 		t.Errorf("expected %d statuses, got %d", len(m.Profiles), len(statuses))
+	}
+}
+
+// =============================================================================
+// Policy Hash Tests
+// =============================================================================
+
+func TestComputePolicyHash_ConsistentHash(t *testing.T) {
+	tmpDir := t.TempDir()
+	regFile := filepath.Join(tmpDir, "registry.yaml")
+
+	content := []byte("version: 1\nservers: []\nplatform_permissions:\n  agents:\n    settings:\n      dirty_worktree_mode: continue\n")
+	if err := os.WriteFile(regFile, content, 0644); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	hash1, err := ComputePolicyHash(regFile)
+	if err != nil {
+		t.Fatalf("ComputePolicyHash failed: %v", err)
+	}
+
+	hash2, err := ComputePolicyHash(regFile)
+	if err != nil {
+		t.Fatalf("ComputePolicyHash second call failed: %v", err)
+	}
+
+	if hash1 != hash2 {
+		t.Errorf("hash not consistent: %q != %q", hash1, hash2)
+	}
+
+	// SHA256 hex is 64 characters
+	if len(hash1) != 64 {
+		t.Errorf("hash length = %d, want 64", len(hash1))
+	}
+}
+
+func TestComputePolicyHash_DifferentContent(t *testing.T) {
+	tmpDir := t.TempDir()
+	reg1 := filepath.Join(tmpDir, "reg1.yaml")
+	reg2 := filepath.Join(tmpDir, "reg2.yaml")
+
+	os.WriteFile(reg1, []byte("version: 1\nservers: []"), 0644)
+	os.WriteFile(reg2, []byte("version: 2\nservers: []"), 0644)
+
+	hash1, _ := ComputePolicyHash(reg1)
+	hash2, _ := ComputePolicyHash(reg2)
+
+	if hash1 == hash2 {
+		t.Error("different content should produce different hashes")
+	}
+}
+
+func TestComputePolicyHash_NonExistent(t *testing.T) {
+	_, err := ComputePolicyHash("/nonexistent/registry.yaml")
+	if err == nil {
+		t.Error("expected error for non-existent file")
+	}
+}
+
+func TestReadWritePolicyHash(t *testing.T) {
+	tmpDir := t.TempDir()
+	expectedHash := "abc123def456"
+
+	if err := WritePolicyHash(tmpDir, expectedHash); err != nil {
+		t.Fatalf("WritePolicyHash failed: %v", err)
+	}
+
+	got, err := ReadPolicyHash(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadPolicyHash failed: %v", err)
+	}
+
+	if got != expectedHash {
+		t.Errorf("ReadPolicyHash = %q, want %q", got, expectedHash)
+	}
+}
+
+func TestReadPolicyHash_NotExists(t *testing.T) {
+	tmpDir := t.TempDir()
+	_, err := ReadPolicyHash(tmpDir)
+	if err == nil {
+		t.Error("expected error when policy hash file does not exist")
+	}
+}
+
+func TestCheckPolicyStatus_InSync(t *testing.T) {
+	tmpDir := t.TempDir()
+	regFile := filepath.Join(tmpDir, "mcp", "context", "registry.yaml")
+	homeDir := filepath.Join(tmpDir, "home", ".claude")
+
+	// Create registry
+	os.MkdirAll(filepath.Dir(regFile), 0755)
+	os.MkdirAll(homeDir, 0755)
+	os.WriteFile(regFile, []byte("version: 1\nservers: []"), 0644)
+
+	// Compute and write hash
+	hash, _ := ComputePolicyHash(regFile)
+	WritePolicyHash(homeDir, hash)
+
+	m, _ := NewManager(tmpDir)
+	status := m.checkPolicyStatus(homeDir, regFile)
+
+	if status != "in-sync" {
+		t.Errorf("checkPolicyStatus = %q, want in-sync", status)
+	}
+}
+
+func TestCheckPolicyStatus_Stale(t *testing.T) {
+	tmpDir := t.TempDir()
+	regFile := filepath.Join(tmpDir, "mcp", "context", "registry.yaml")
+	homeDir := filepath.Join(tmpDir, "home", ".claude")
+
+	// Create registry with original content
+	os.MkdirAll(filepath.Dir(regFile), 0755)
+	os.MkdirAll(homeDir, 0755)
+	os.WriteFile(regFile, []byte("version: 1\nservers: []"), 0644)
+
+	// Write hash for old content
+	hash, _ := ComputePolicyHash(regFile)
+	WritePolicyHash(homeDir, hash)
+
+	// Modify registry
+	os.WriteFile(regFile, []byte("version: 2\nservers: []\nplatform_permissions:\n  agents:\n    settings:\n      new_field: true"), 0644)
+
+	m, _ := NewManager(tmpDir)
+	status := m.checkPolicyStatus(homeDir, regFile)
+
+	if status != "stale" {
+		t.Errorf("checkPolicyStatus = %q, want stale", status)
+	}
+}
+
+func TestCheckPolicyStatus_NotConfigured_NoRegistry(t *testing.T) {
+	tmpDir := t.TempDir()
+	m, _ := NewManager(tmpDir)
+	status := m.checkPolicyStatus(tmpDir, "")
+
+	if status != "not-configured" {
+		t.Errorf("checkPolicyStatus = %q, want not-configured", status)
+	}
+}
+
+func TestCheckPolicyStatus_NotConfigured_NoHashFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	regFile := filepath.Join(tmpDir, "registry.yaml")
+	homeDir := filepath.Join(tmpDir, "home")
+
+	os.WriteFile(regFile, []byte("version: 1"), 0644)
+	os.MkdirAll(homeDir, 0755)
+
+	m, _ := NewManager(tmpDir)
+	status := m.checkPolicyStatus(homeDir, regFile)
+
+	if status != "not-configured" {
+		t.Errorf("checkPolicyStatus = %q, want not-configured", status)
+	}
+}
+
+func TestGetSyncStatus_IncludesPolicyStatus(t *testing.T) {
+	repoDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	// Create matching files for a sync'd profile
+	profileDir := filepath.Join(repoDir, "test-profile")
+	os.MkdirAll(profileDir, 0755)
+	os.WriteFile(filepath.Join(profileDir, "config.toml"), []byte("content"), 0644)
+	os.WriteFile(filepath.Join(homeDir, "config.toml"), []byte("content"), 0644)
+
+	m, _ := NewManager(repoDir)
+	m.Profiles["test"] = &Profile{
+		Name:    "test",
+		RepoDir: "test-profile",
+		HomeDir: homeDir,
+	}
+
+	status, err := m.GetSyncStatus("test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Without a registry, policy status should be "not-configured"
+	if status.PolicyStatus != "not-configured" {
+		t.Errorf("PolicyStatus = %q, want not-configured", status.PolicyStatus)
 	}
 }

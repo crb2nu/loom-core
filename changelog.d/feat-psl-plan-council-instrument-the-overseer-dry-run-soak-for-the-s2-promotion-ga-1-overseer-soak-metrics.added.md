@@ -1,0 +1,1 @@
+- Add machine-readable, fail-closed S2 overseer soak metrics and exact seven-day promotion thresholds (`pkg/mills/overseer/overseer.go`, `docs/MILLS.md`).

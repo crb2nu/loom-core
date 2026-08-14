@@ -1,0 +1,1 @@
+- Added structured local configuration preflight validation for LiteLLM API keys and PostgreSQL roles (`pkg/validate/preflight.go`, `pkg/validate/preflight_test.go`).

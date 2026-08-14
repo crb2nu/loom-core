@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/crb2nu/loom/pkg/generator"
 )
 
 // Profile defines the configuration for a specific tool profile.
@@ -16,21 +18,38 @@ type Profile struct {
 	SecretFiles     []string
 	GeneratorTarget string // Target name for the generator (e.g. "codex")
 	GeneratedFile   string // Filename generated (e.g. "config.toml")
+	// HomeGeneratedFile overrides the primary generated filename when syncing
+	// to home. This is useful when a platform expects a different filename than
+	// the generated artifact kept in-repo.
+	HomeGeneratedFile string
 	// ExtraGeneratedFiles lists additional files produced by the generator
 	// (e.g. "settings.json" for lifecycle hooks). These are synced alongside
 	// GeneratedFile but are optional — missing extras are silently skipped.
 	ExtraGeneratedFiles []string
+	// HomeExtraGeneratedFiles overrides the home relative path for extra
+	// generated files. Keys are repo-relative extra paths, values are paths
+	// relative to HomeDir.
+	HomeExtraGeneratedFiles map[string]string
+	// GeneratedDirectToHome writes generated config files directly into the home
+	// profile directory and treats the repo mirror as stale cache to be cleaned.
+	GeneratedDirectToHome bool
 	// SyncGeneratedOnly limits sync/backup/status to GeneratedFile only.
 	// This is important for profiles whose HomeDir points at large application
 	// directories (e.g. VS Code/Claude Desktop) where we only manage mcp.json.
 	SyncGeneratedOnly bool
 	SkillsTarget      string // Target name for skills generator (mirrors GeneratorTarget)
 	SkillsManifest    string // Filename of skills manifest (e.g., ".loom-skills-manifest.json")
+	// SkillsHomePath sets the final home skills base path used for ${SKILL_PATH}
+	// resolution in generated skill instructions.
+	SkillsHomePath string
 	// SkillsDirectToHome generates skills directly into the home directory instead
 	// of the repo directory. This avoids duplication when the CLI discovers skills
 	// from both repo and home (e.g. Gemini CLI reading ~/.gemini/skills/ and
 	// <repo>/.gemini/skills/ simultaneously).
 	SkillsDirectToHome bool
+	// HomeManagedSettingsKeys lists settings.json keys that should only live at
+	// the user/home level and should be stripped from workspace project copies.
+	HomeManagedSettingsKeys []string
 
 	// DefaultLoomMode generates a single loom proxy entry instead of individual servers.
 	// Useful for platforms that can't resolve template patterns at runtime (e.g. Claude Code).
@@ -42,10 +61,11 @@ type Profile struct {
 
 // Manager handles synchronization operations.
 type Manager struct {
-	RepoRoot   string
-	HomeDir    string
-	Profiles   map[string]*Profile
-	SkipSkills bool // When true, skip skills generation during Regenerate
+	RepoRoot      string
+	HomeDir       string
+	WorkspaceRoot string // Inferred workspace root (may equal RepoRoot)
+	Profiles      map[string]*Profile
+	SkipSkills    bool // When true, skip skills generation during Regenerate
 }
 
 // NewManager creates a new sync manager.
@@ -56,9 +76,10 @@ func NewManager(repoRoot string) (*Manager, error) {
 	}
 
 	m := &Manager{
-		RepoRoot: repoRoot,
-		HomeDir:  home,
-		Profiles: make(map[string]*Profile),
+		RepoRoot:      repoRoot,
+		HomeDir:       home,
+		WorkspaceRoot: generator.InferWorkspaceRoot(repoRoot),
+		Profiles:      make(map[string]*Profile),
 	}
 
 	// Register default profiles
@@ -69,31 +90,48 @@ func NewManager(repoRoot string) (*Manager, error) {
 
 func (m *Manager) registerProfiles() {
 	m.Profiles["codex"] = &Profile{
-		Name:                  "codex",
-		RepoDir:               ".codex",
-		HomeDir:               ".codex",
-		Excludes:              []string{"auth.json", "sessions", "backups"},
-		SecretFiles:           []string{"auth.json"},
-		GeneratorTarget:       "codex",
-		GeneratedFile:         "config.toml",
+		Name:            "codex",
+		RepoDir:         ".codex",
+		HomeDir:         ".codex",
+		Excludes:        []string{"auth.json", "sessions", "backups"},
+		SecretFiles:     []string{"auth.json"},
+		GeneratorTarget: "codex",
+		GeneratedFile:   "config.toml",
+		// hooks.json: Codex v0.129.0 [hooks] block (Claude-shape JSON, opt-in via features.hooks=true).
+		// sol.config.toml: standalone planner profile (Codex 0.134.0+ reads
+		// ~/.codex/<name>.config.toml, selected with `codex --profile sol`;
+		// emitted by generator.generateCodexProfileConfigs from
+		// platform_permissions.codex.settings.profiles). Add one entry per
+		// declared profile — ExtraGeneratedFiles is a static list and missing
+		// extras are silently skipped, so this stays safe if a profile is removed.
+		ExtraGeneratedFiles:   []string{"hooks.json", "sol.config.toml"},
+		GeneratedDirectToHome: true,
 		SyncGeneratedOnly:     true,
 		SkillsTarget:          "codex",
 		SkillsManifest:        ".loom-skills-manifest.json",
+		SkillsDirectToHome:    true,
+		SkillsHomePath:        "$HOME/.codex/skills",
 		DefaultLoomMode:       true,
 		DefaultResolveSecrets: true,
 	}
 
+	// Kilo 1.0 (OpenCode engine) reads MCP config from ~/.config/kilo/kilo.json.
+	// The legacy ~/.kilocode/ dir keeps rules/workflows (skills), which the
+	// extension still migrates/reads, so SkillsHomePath stays on ~/.kilocode.
 	m.Profiles["kilocode"] = &Profile{
 		Name:                  "kilocode",
 		RepoDir:               ".kilocode",
-		HomeDir:               ".kilocode",
+		HomeDir:               filepath.Join(".config", "kilo"),
 		Excludes:              []string{"auth.json", "sessions", "backups"},
 		SecretFiles:           []string{"auth.json"},
 		GeneratorTarget:       "kilocode",
-		GeneratedFile:         "config.toml",
+		GeneratedFile:         "kilo.json",
+		GeneratedDirectToHome: true,
 		SyncGeneratedOnly:     true,
 		SkillsTarget:          "kilocode",
 		SkillsManifest:        ".loom-skills-manifest.json",
+		SkillsDirectToHome:    true,
+		SkillsHomePath:        "$HOME/.kilocode/skills",
 		DefaultLoomMode:       true,
 		DefaultResolveSecrets: true,
 	}
@@ -110,7 +148,13 @@ func (m *Manager) registerProfiles() {
 		SyncGeneratedOnly:   true,
 		SkillsTarget:        "claude",
 		SkillsManifest:      ".loom-skills-manifest.json",
-		DefaultLoomMode:     true,
+		SkillsDirectToHome:  true,
+		SkillsHomePath:      "$HOME/.claude/skills",
+		HomeManagedSettingsKeys: []string{
+			"hooks",
+			"permissions",
+		},
+		DefaultLoomMode: true,
 	}
 
 	m.Profiles["claude_desktop"] = &Profile{
@@ -137,23 +181,46 @@ func (m *Manager) registerProfiles() {
 		SyncGeneratedOnly:   true,
 		SkillsTarget:        "gemini",
 		SkillsManifest:      ".loom-skills-manifest.json",
+		SkillsHomePath:      "$HOME/.gemini/skills",
 		SkillsDirectToHome:  true,
-		DefaultLoomMode:     true,
+		HomeManagedSettingsKeys: []string{
+			"hooks",
+			"experimental",
+			"general",
+			"tools",
+			"security",
+		},
+		DefaultLoomMode: true,
 	}
 
 	m.Profiles["antigravity"] = &Profile{
 		Name:    "antigravity",
-		RepoDir: ".antigravity",
-		HomeDir: ".antigravity",
+		RepoDir: ".agents",
+		HomeDir: ".gemini",
 		Excludes: []string{
 			"auth.json", "sessions", "backups", "extensions",
 			"antigravity", "argv.json", "logs", "CachedData",
 		},
-		SecretFiles:       []string{"auth.json"},
-		GeneratorTarget:   "antigravity", // Uses mcp.json format (VSCode fork)
-		GeneratedFile:     "mcp.json",
-		SyncGeneratedOnly: true,
-		DefaultLoomMode:   true,
+		SecretFiles:     []string{"auth.json"},
+		GeneratorTarget: "antigravity",
+		GeneratedFile:   "mcp_config.json",
+		// Antigravity 2.0 reads the shared central config at
+		// ~/.gemini/config/mcp_config.json (the pre-2.0 IDE-only path
+		// ~/.gemini/antigravity/mcp_config.json survives locally as a
+		// symlink to it). Keep this aligned with hooks.json below.
+		HomeGeneratedFile: "config/mcp_config.json",
+		ExtraGeneratedFiles: []string{
+			"hooks.json",
+		},
+		HomeExtraGeneratedFiles: map[string]string{
+			"hooks.json": "config/hooks.json",
+		},
+		SyncGeneratedOnly:  true,
+		SkillsTarget:       "antigravity",
+		SkillsManifest:     ".loom-skills-manifest.json",
+		SkillsHomePath:     "$HOME/.gemini/antigravity/skills",
+		SkillsDirectToHome: true,
+		DefaultLoomMode:    true,
 	}
 
 	m.Profiles["vscode"] = &Profile{
@@ -180,13 +247,26 @@ func (m *Manager) registerProfiles() {
 	}
 
 	m.Profiles["zed"] = &Profile{
-		Name:              "zed",
-		RepoDir:           ".zed",
-		HomeDir:           "Library/Application Support/Zed",
-		GeneratorTarget:   "zed",
-		GeneratedFile:     "mcp.json",
-		SyncGeneratedOnly: true,
-		DefaultLoomMode:   true,
+		Name:    "zed",
+		RepoDir: ".zed",
+		// Zed reads settings (including context_servers) from
+		// ~/.config/zed/settings.json on macOS and Linux. The previous
+		// mcp.json emission into ~/Library/Application Support/Zed was inert:
+		// Zed core never reads that file, and the loom-zed extension gets its
+		// config through the Zed extension API, not mcp.json.
+		HomeDir:         ".config/zed",
+		GeneratorTarget: "zed",
+		// Repo-side staging fragment; merged (not copied) into the home
+		// settings.json by syncZedGenerated to preserve user settings,
+		// comments, and foreign context servers.
+		GeneratedFile:      "context_servers.json",
+		HomeGeneratedFile:  "settings.json",
+		SyncGeneratedOnly:  true,
+		SkillsTarget:       "zed",
+		SkillsManifest:     ".loom-skills-manifest.json",
+		SkillsDirectToHome: true,
+		SkillsHomePath:     "$HOME/.config/zed/skills",
+		DefaultLoomMode:    true,
 	}
 
 	m.Profiles["opencode"] = &Profile{
@@ -197,6 +277,10 @@ func (m *Manager) registerProfiles() {
 		GeneratedFile:       "opencode.json",
 		ExtraGeneratedFiles: []string{filepath.Join("plugins", "loom-hooks.ts")},
 		SyncGeneratedOnly:   true,
+		SkillsTarget:        "opencode",
+		SkillsManifest:      ".loom-skills-manifest.json",
+		SkillsDirectToHome:  true,
+		SkillsHomePath:      "$HOME/.config/opencode/skills",
 		DefaultLoomMode:     true,
 	}
 }

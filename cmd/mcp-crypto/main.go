@@ -16,7 +16,7 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
 	"github.com/crb2nu/loom/pkg/lifecycle"
-	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpscaffold"
 	"github.com/crb2nu/loom/pkg/validate"
 )
 
@@ -30,14 +30,16 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	logger := mcplog.NewDefault()
-	logger.Info("starting server", "name", "mcp-crypto", "version", version)
-
-	server := mcp.NewServer("mcp-crypto", version)
-	server.SetInstructions("Cryptographic and encoding utilities. Tools: random_string, uuid_v4, hash_string, base64_encode, base64_decode")
+	srv, cleanup, err := mcpscaffold.NewServer(ctx, "mcp-crypto", version,
+		mcpscaffold.WithInstructions("Cryptographic and encoding utilities. Tools: random_string, uuid_v4, hash_string, base64_encode, base64_decode"),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cleanup(ctx) }()
 
 	// random_string
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "random_string",
 		Description: "Generate a cryptographically secure random string",
 		InputSchema: mcp.InputSchema{
@@ -56,7 +58,7 @@ func run(ctx context.Context) error {
 	}, handleRandomString)
 
 	// uuid_v4
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "uuid_v4",
 		Description: "Generate a UUID v4",
 		InputSchema: mcp.InputSchema{
@@ -66,7 +68,7 @@ func run(ctx context.Context) error {
 	}, handleUUID)
 
 	// hash_string
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "hash_string",
 		Description: "Hash a string using MD5 or SHA256",
 		InputSchema: mcp.InputSchema{
@@ -87,7 +89,7 @@ func run(ctx context.Context) error {
 	}, handleHashString)
 
 	// base64_encode
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "base64_encode",
 		Description: "Encode text to Base64",
 		InputSchema: mcp.InputSchema{
@@ -103,7 +105,7 @@ func run(ctx context.Context) error {
 	}, handleBase64Encode)
 
 	// base64_decode
-	server.AddTool(mcp.Tool{
+	srv.AddTracedTool(mcp.Tool{
 		Name:        "base64_decode",
 		Description: "Decode Base64 text",
 		InputSchema: mcp.InputSchema{
@@ -118,7 +120,7 @@ func run(ctx context.Context) error {
 		},
 	}, handleBase64Decode)
 
-	return server.Run(ctx)
+	return srv.Run(ctx)
 }
 
 func handleRandomString(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {

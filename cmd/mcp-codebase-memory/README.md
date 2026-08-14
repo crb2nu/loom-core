@@ -14,6 +14,7 @@ Supports Go, TypeScript, JavaScript, Python, and Rust indexing.
 - `codebase_watch_poll`
 - `codebase_index_cancel`
 - `codebase_watch_stop`
+- `codebase_watch_list`
 - `codebase_search`
 - `codebase_text_search`
 - `codebase_get_definition`
@@ -50,6 +51,11 @@ Indexing:
 - `CODEBASE_MAX_FILE_BYTES` (default: `2097152`)
 - `CODEBASE_GIT_METADATA` (default: `false`) (if true, attempts `git blame` to attach author/commit metadata)
 
+Watch lifecycle:
+
+- `CODEBASE_WATCH_STATE_DIR` (default: `~/.loom/codebase/watches`) (durable watch descriptors; empty disables persistence)
+- `CODEBASE_WATCH_TTL` (Go duration, default: `72h`; `0` disables) (watches with no start/poll activity beyond the TTL are expired at resume time and by a periodic sweep)
+
 HTTP:
 
 - `HTTP_TIMEOUT` (seconds, default: `30`)
@@ -70,5 +76,10 @@ HTTP:
 - Use `embeddings=false` on `codebase_index_start` / `codebase_watch_start` to index without an embeddings API key (semantic search will not be useful).
 - Set `full_refresh=false` for incremental indexing (skips unchanged files using the module chunk file hash).
 - `codebase_search` supports `rerank=hybrid` and `lexical_weight` for lightweight hybrid reranking.
+- Watch lifecycle:
+  - `codebase_watch_start` is idempotent per `(repo_id, root)`: a live watch on the same root is reused (`reused:true`) instead of creating a duplicate that would re-embed every file change again.
+  - Watches persist across process restarts. Only one process runs a given watch at a time (cross-process `flock` claim on the shared state dir); `codebase_watch_poll` adopts a persisted watch whose owner died.
+  - Polling counts as activity; watches idle beyond `CODEBASE_WATCH_TTL` expire, and watches whose root directory was deleted (e.g. removed worktrees) are dropped instead of resumed.
+  - `codebase_watch_list` shows local watches (all statuses, with stats) plus persisted watches owned by other processes.
 - `codebase_delete_repo` requires `confirm=true` (and supports `dry_run=true`).
 - See `cmd/mcp-codebase-memory/ROADMAP.md` for planned phases.

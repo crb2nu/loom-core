@@ -1,0 +1,1 @@
+- Add a fail-closed Mills project intake policy and explicit allowlist admission in `pkg/policy/mills_intake.go` and `pkg/mills/intake/allowlist.go`.

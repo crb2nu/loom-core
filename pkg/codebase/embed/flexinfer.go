@@ -2,6 +2,7 @@ package embed
 
 import (
 	"context"
+	"errors"
 
 	"github.com/crb2nu/loom/pkg/httpclient"
 )
@@ -17,7 +18,7 @@ type FlexInferClient struct {
 var _ Embedder = (*FlexInferClient)(nil)
 
 // NewFlexInferClient creates a FlexInfer embedder client.
-// baseURL is typically "http://flexinfer-proxy:8080/v1" or similar.
+// baseURL is typically "http://flexinfer-proxy/v1" or similar.
 // apiKey is optional (TEI backends often don't require auth).
 // model defaults to "BAAI/bge-large-en-v1.5" if empty.
 func NewFlexInferClient(httpc *httpclient.Client, baseURL, apiKey, model string) *FlexInferClient {
@@ -29,9 +30,9 @@ func NewFlexInferClient(httpc *httpclient.Client, baseURL, apiKey, model string)
 	if apiKey == "" {
 		apiKey = "not-required"
 	}
-	return &FlexInferClient{
-		inner: NewMorphClient(httpc, baseURL, apiKey, model),
-	}
+	inner := NewMorphClient(httpc, baseURL, apiKey, model)
+	inner.provider = "flexinfer"
+	return &FlexInferClient{inner: inner}
 }
 
 // Name returns "flexinfer" to distinguish from the morph provider.
@@ -46,10 +47,30 @@ func (c *FlexInferClient) Model() string {
 
 // EmbedQuery embeds a single query string via the FlexInfer TEI backend.
 func (c *FlexInferClient) EmbedQuery(ctx context.Context, query string) ([]float64, error) {
-	return c.inner.EmbedQuery(ctx, query)
+	vec, err := c.inner.EmbedQuery(ctx, query)
+	if err != nil {
+		return nil, c.normalizeError(err)
+	}
+	return vec, nil
 }
 
 // EmbedDocuments embeds multiple documents via the FlexInfer TEI backend.
 func (c *FlexInferClient) EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error) {
-	return c.inner.EmbedDocuments(ctx, texts)
+	vecs, err := c.inner.EmbedDocuments(ctx, texts)
+	if err != nil {
+		return nil, c.normalizeError(err)
+	}
+	return vecs, nil
+}
+
+func (c *FlexInferClient) normalizeError(err error) error {
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return &HTTPStatusError{
+			Provider:   c.Name(),
+			StatusCode: statusErr.StatusCode,
+			Body:       statusErr.Body,
+		}
+	}
+	return err
 }

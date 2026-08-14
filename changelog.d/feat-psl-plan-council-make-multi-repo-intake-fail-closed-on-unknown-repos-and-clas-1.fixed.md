@@ -1,0 +1,1 @@
+- Fail multi-repository intake closed in `pkg/mills/intake/intake.go` for unknown repositories and classifier errors, with structured rejection events from `pkg/mills/audit/audit.go`; an empty or unavailable allowlist rejects every named repository.

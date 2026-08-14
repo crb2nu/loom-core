@@ -1,0 +1,73 @@
+[
+  {
+    "type": "agent",
+    "id": "claude-code-1",
+    "label": "Agent lane",
+    "route": "people",
+    "scope": "services/loom-core",
+    "summary": "blocked on review",
+    "severity": "warning",
+    "target_kind": "session",
+    "target_id": "sess_abc123",
+    "deep_link": "loom://session/sess_abc123",
+    "recommended_action": "Open session",
+    "freshness": {
+      "source": "coordination_snapshot"
+    }
+  },
+  {
+    "type": "namespace",
+    "id": "services/loom-core/mobile",
+    "label": "Work lane",
+    "route": "work",
+    "scope": "3 tasks",
+    "summary": "blocked tasks",
+    "severity": "critical",
+    "target_kind": "task_filter",
+    "target_id": "",
+    "deep_link": "loom://tasks?status=blocked",
+    "filter": {
+      "namespace": "services/loom-core/mobile",
+      "status": "blocked"
+    },
+    "recommended_action": "Review work queue",
+    "freshness": {
+      "source": "coordination_snapshot"
+    }
+  },
+  {
+    "type": "merge",
+    "id": "merge-ready",
+    "label": "Merge ready",
+    "route": "dispatch",
+    "scope": "2 branches",
+    "summary": "2 branches ready to merge",
+    "severity": "info",
+    "target_kind": "task_filter",
+    "target_id": "",
+    "deep_link": "loom://tasks?status=in_progress",
+    "filter": {
+      "status": "in_progress"
+    },
+    "recommended_action": "Review merge-ready work",
+    "freshness": {
+      "source": "coordination_snapshot"
+    }
+  },
+  {
+    "type": "conflict",
+    "id": "file-conflicts",
+    "label": "File conflicts",
+    "route": "dispatch",
+    "scope": "1 file",
+    "summary": "1 file claimed by multiple agents",
+    "severity": "critical",
+    "target_kind": "connection",
+    "target_id": "file-conflicts",
+    "deep_link": "loom://work",
+    "recommended_action": "Resolve coordination conflicts",
+    "freshness": {
+      "source": "coordination_snapshot"
+    }
+  }
+]

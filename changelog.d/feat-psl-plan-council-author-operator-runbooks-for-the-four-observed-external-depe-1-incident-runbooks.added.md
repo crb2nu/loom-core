@@ -1,0 +1,1 @@
+- Add dedicated GitLab-agent authentication, ClickHouse merge-failure, Longhorn disk-exhaustion, and LiteLLM missing-auth operator runbooks under `docs/runbooks/`, linked from the classifier table in `pkg/mills/pipeline/classifier.go`.

@@ -1,0 +1,1 @@
+- Enabled the mrwatch shepherd on the cluster HUD as the serial merge queue's standing feeder: green-but-unarmed MRs are submitted as SHA-pinned queue candidates (no more direct MWPS arming), with the LOOM_MILLS_ADMIN_TOKEN bearer the shepherd's enqueue path actually reads wired from loom-secrets.

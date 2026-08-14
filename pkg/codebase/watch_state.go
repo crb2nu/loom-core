@@ -6,9 +6,15 @@ func (s *Service) setWatchFailed(watchID, msg string) {
 	s.watchMu.Lock()
 	defer s.watchMu.Unlock()
 	if job := s.watchJobs[watchID]; job != nil {
+		releaseClaim(job.claim)
+		job.claim = nil
+		if job.status != "running" {
+			return
+		}
 		job.status = "failed"
 		job.err = msg
 		job.stats.StoppedAt = time.Now()
+		job.stats.Stages.Total = stageSample(job.stats.StoppedAt.Sub(job.stats.StartedAt), job.stats.FilesIndexed+job.stats.FilesSkipped+job.stats.FilesDeleted)
 	}
 }
 
@@ -16,11 +22,15 @@ func (s *Service) setWatchStopped(watchID string) {
 	s.watchMu.Lock()
 	defer s.watchMu.Unlock()
 	if job := s.watchJobs[watchID]; job != nil {
-		if job.status == "failed" {
+		releaseClaim(job.claim)
+		job.claim = nil
+		// failed/expired are terminal statuses; keep them.
+		if job.status != "running" {
 			return
 		}
 		job.status = "stopped"
 		job.stats.StoppedAt = time.Now()
+		job.stats.Stages.Total = stageSample(job.stats.StoppedAt.Sub(job.stats.StartedAt), job.stats.FilesIndexed+job.stats.FilesSkipped+job.stats.FilesDeleted)
 	}
 }
 

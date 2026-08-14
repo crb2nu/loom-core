@@ -1,13 +1,18 @@
-.PHONY: all build clean test install servers lint fmt vet check setup hooks dev help \
-		loom loomd \
-		install-core install-all bootstrap-local dev-upgrade dev-reload \
-		ci ci-lint ci-guardrails ci-lint-soft ci-lint-strict ci-build ci-test ci-test-unit ci-test-integration ci-test-race ci-benchmark ci-security ci-baseline \
+.PHONY: all build clean test test-hooks install servers lint fmt vet check setup hooks git-setup dev help \
+		loom loomd loom-mills-operator \
+		install-core install-all bootstrap-local dev-sync dev-sync-repo dev-upgrade dev-reload \
+	ci ci-lint ci-guardrails ci-lint-soft ci-lint-strict ci-build ci-test ci-test-unit ci-test-integration ci-test-enterprise-smoke ci-test-race ci-reliability ci-benchmark ci-security ci-baseline ci-contracts ci-openapi \
+	codebase-bench-baseline codebase-bench-full codebase-bench-incremental codebase-bench-watch \
 		security security-gosec security-vuln \
-		docker-build docker-build-loom-core docker-build-custom-server \
-		docker-push docker-push-loom-core docker-push-custom-server \
-		deploy deploy-status \
-		browserkit-check browserkit-setup \
-		hud hud-dev hud-build hud-install hud-reload hud-frontend hud-dist-check hud-clean
+		changelog changelog-html changelog-json changelog-check changelog-fold \
+		docker-build docker-build-loom-core docker-build-custom-server docker-build-loom-mills-operator \
+		docker-push docker-push-loom-core docker-push-custom-server docker-push-loom-mills-operator \
+		deploy deploy-check deploy-status \
+	browserkit-check browserkit-setup \
+	hud hud-dev hud-build hud-install hud-install-service hud-reload hud-frontend hud-dist-check hud-clean \
+		mobile-iphone-preflight mobile-gateway-sync-token mobile-gateway-preflight mobile-gateway-configure-url mobile-ios-project-sync mobile-hud mobile-app-open mobile-app-run-sim mobile-app-run-device mobile-dev mobile-gateway-dev \
+		mobile-signing-check mobile-signing-prepare mobile-signing-cleanup mobile-app-archive-export \
+	accel accel-build accel-verify
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
@@ -18,11 +23,23 @@ GOIMPORTS := $(GOPATH)/bin/goimports
 GOSEC := $(GOPATH)/bin/gosec
 GOVULNCHECK := $(GOPATH)/bin/govulncheck
 BASELINE_DIR ?= .loom/baselines
+CODEBASE_BENCH_DIR ?= .loom/codebase-bench
+LOOM_BUILD_P ?= 1
+CGO_ENABLED ?= 0
+MOBILE_IOS_PROJECT ?= apps/loom-companion-ios/LoomCompanion.xcodeproj
+MOBILE_IOS_SCHEME ?= LoomCompanion
+MOBILE_IOS_APP_NAME ?= LoomCompanion
+MOBILE_IOS_BUNDLE_ID ?= ai.flexinfer.loom.companion
+MOBILE_IOS_SIMULATOR ?= iPhone 17
+MOBILE_IOS_CONFIGURATION ?= Debug
+MOBILE_IOS_DERIVED_DATA ?= /tmp/loom-mobile-deriveddata
+MOBILE_IOS_PROJECT_YAML ?= apps/loom-companion-ios/project.yml
 
 # Docker settings
 REGISTRY ?= registry.harbor.lan
 LOOM_CORE_IMAGE := $(REGISTRY)/mcp/loom-core
 CUSTOM_SERVER_IMAGE := $(REGISTRY)/mcp/custom-server
+LOOM_MILLS_OPERATOR_IMAGE := $(REGISTRY)/mcp/loom-mills-operator
 IMAGE_TAG ?= $(shell git rev-parse --short=8 HEAD 2>/dev/null || echo "dev")
 
 # Workspace root (for local Docker builds that need libs/)
@@ -31,9 +48,10 @@ WORKSPACE_ROOT ?= $(shell realpath ../.. 2>/dev/null || echo "$(HOME)/workspace"
 # GitOps settings
 GITOPS_DIR ?= $(shell realpath ../../platform/gitops 2>/dev/null || echo "$(HOME)/workspace/platform/gitops")
 LOOM_HUB_DIR := $(GITOPS_DIR)/k3s/loom-hub
+FLUX_KUST := $(GITOPS_DIR)/clusters/k3s/flux-system/kustomization-loom-hub-servers.yaml
 
 # MCP server binaries
-MCP_SERVERS := mcp-time mcp-git mcp-github mcp-gitlab mcp-memory mcp-sequentialthinking mcp-prometheus mcp-k8s mcp-tavily mcp-server-mgmt mcp-cloudflare mcp-loki mcp-asus-router mcp-git-worktree mcp-grafana mcp-k8s-ops mcp-minio mcp-morph-embeddings mcp-qdrant mcp-quality mcp-ops mcp-zep mcp-morph-fast-apply mcp-youtube mcp-godot mcp-alertmanager mcp-flux mcp-postgres mcp-helm mcp-docker mcp-codebase-memory mcp-agent-context mcp-redis mcp-neo4j mcp-confluence mcp-browserkit mcp-devbox mcp-itchio mcp-release mcp-substack mcp-linkedin mcp-jobsearch mcp-flexinfer
+MCP_SERVERS := mcp-time mcp-git mcp-github mcp-gitlab mcp-memory mcp-sequentialthinking mcp-prometheus mcp-k8s mcp-tavily mcp-server-mgmt mcp-cloudflare mcp-loki mcp-asus-router mcp-git-worktree mcp-grafana mcp-k8s-ops mcp-minio mcp-qdrant mcp-quality mcp-brand-kit mcp-ops mcp-zep mcp-morph-fast-apply mcp-youtube mcp-godot mcp-alertmanager mcp-flux mcp-postgres mcp-helm mcp-docker mcp-codebase-memory mcp-agent-context mcp-redis mcp-neo4j mcp-confluence mcp-jira mcp-browserkit mcp-devbox mcp-itchio mcp-release mcp-substack mcp-linkedin mcp-google-workspace mcp-jobsearch mcp-mentatlab mcp-flexinfer mcp-weaver mcp-office mcp-icc-capture mcp-icc mcp-loom-widget mcp-agent-loop mcp-pm
 .PHONY: $(MCP_SERVERS)
 
 # Default target
@@ -46,10 +64,13 @@ help:
 	@echo "Development:"
 	@echo "  make setup      - Install dev dependencies and git hooks"
 	@echo "  make hooks      - Install git pre-commit hooks"
+	@echo "  make git-setup  - Repair worktree-aware git config and install shared hooks"
 	@echo "  make dev        - Build and run daemon in debug mode"
-	@echo "  make dev-upgrade - Build, install, sync, restart daemon (safe: skips if active connections)"
-	@echo "  make dev-reload  - Build, install, sync, force-restart daemon (all proxies auto-reconnect)"
-	@echo "  make bootstrap-local - Build + install core binaries + sync configs + check setup"
+	@echo "  make dev-sync   - Regen configs and sync all profiles + skills using the repo-built loom"
+	@echo "  make dev-sync-repo - Regen configs + skills in-repo only (skip home sync/install)"
+	@echo "  make dev-upgrade - Build, install, sync configs+skills, restart daemon (safe when idle; direct embedded-HUD fallback when launchd is not active)"
+	@echo "  make dev-reload  - Build, install, sync configs+skills, force-restart daemon (embedded HUD included)"
+	@echo "  make bootstrap-local - Build + install core binaries + sync configs+skills + check setup"
 	@echo "  make check      - Run all checks (fmt, vet, lint, test)"
 	@echo ""
 	@echo "Building:"
@@ -72,15 +93,21 @@ help:
 	@echo "CI (local):"
 	@echo "  make ci              - Run full CI pipeline locally"
 	@echo "  make ci-lint         - Run CI lint stage (fmt, vet, lint - warnings only)"
-	@echo "  make ci-guardrails   - Run docs drift + loom CLI help smoke checks"
+	@echo "  make ci-guardrails   - Run docs, CLI, and diagnostic smoke checks"
 	@echo "  make ci-lint-strict  - Run lint stage (fails on any issue)"
 	@echo "  make ci-build        - Run CI build stage"
 	@echo "  make ci-test         - Run CI test stage (unit + integration)"
 	@echo "  make ci-test-unit    - Run unit tests with coverage threshold"
 	@echo "  make ci-test-integration - Run integration tests"
+	@echo "  make ci-test-enterprise-smoke - Run enterprise smoke suite (gateway + RBAC + devbox)"
+	@echo "  make ci-reliability  - Run the hermetic fleet reliability branch gate"
 	@echo "  make ci-benchmark    - Run benchmarks"
 	@echo "  make ci-security     - Run CI security stage (gosec + govulncheck)"
 	@echo "  make ci-baseline     - Capture benchmark + health baseline artifacts"
+	@echo "  make codebase-bench-baseline    - Run full + incremental + watch codebase benchmarks"
+	@echo "  make codebase-bench-full        - Run full-refresh codebase benchmark"
+	@echo "  make codebase-bench-incremental - Run unchanged-rerun codebase benchmark"
+	@echo "  make codebase-bench-watch       - Run watch-latency benchmark on fixture repo"
 	@echo ""
 	@echo "Docker:"
 	@echo "  make docker-build              - Build all Docker images"
@@ -92,21 +119,52 @@ help:
 	@echo ""
 	@echo "Deploy:"
 	@echo "  make deploy         - Build, push, and deploy to k8s"
+	@echo "  make deploy-check   - Run deploy validation gates"
 	@echo "  make deploy-status  - Show deployment status"
 	@echo ""
 	@echo "HUD (Agent Command Center):"
-	@echo "  make hud           - Build frontend + Go binary, then launch HUD"
-	@echo "  make hud-reload    - Full cycle: build frontend, install, restart HUD"
-	@echo "  make hud-dev       - Launch HUD in dev mode (Vite hot-reload + Go API)"
+	@echo "  make hud           - Build frontend + loomd, then launch with embedded HUD"
+	@echo "  make hud-reload    - Full cycle: build, install, restart loomd with HUD"
+	@echo "  make hud-dev       - Launch HUD in dev mode (Vite hot-reload + loomd API)"
 	@echo "  make hud-build     - Build frontend (pnpm build) + Go binary"
-	@echo "  make hud-install   - Build + install to ~/.local/bin"
+	@echo "  make hud-install   - Build + install loom+loomd to ~/.local/bin"
+	@echo "  make hud-install-service - Install HUD as launchd service (auto-start, Redis)"
 	@echo "  make hud-frontend  - Build only the Svelte frontend"
 	@echo "  make hud-clean     - Remove frontend node_modules and dist"
+	@echo ""
+	@echo "Mobile Companion (iPhone):"
+	@echo "  make mobile-iphone-preflight - Verify Xcode + iOS device test prerequisites"
+	@echo "  make mobile-gateway-sync-token - Sync local mobile token/scopes from loom-hub/loom-secrets"
+	@echo "  make mobile-gateway-preflight - Verify MCP + mobile API surfaces on gateway host"
+	@echo "  make mobile-gateway-configure-url - Echo loom://configure URL for Companion gateway bootstrap"
+	@echo "  make mobile-ios-project-sync - Regenerate Xcode project from project.yml"
+	@echo "  make mobile-hud              - Launch HUD with mobile auth on 0.0.0.0:3333"
+	@echo "  make mobile-app-open         - Open iOS app project in Xcode"
+	@echo "  make mobile-app-run-sim      - Build/install/launch app in iOS Simulator"
+	@echo "  make mobile-app-run-device   - Build/install/launch app on connected iPhone"
+	@echo "  make mobile-dev              - Generate token, restart HUD, open app, print URL+token"
+	@echo "  make mobile-gateway-dev      - Rotate token, patch loom-hub secret, restart mobile-hud, verify gateway"
+	@echo "  make mobile-signing-check    - Check iOS signing variables and current Xcode signing state"
+	@echo "  make mobile-signing-prepare  - Import Apple cert/profile into a temporary keychain (streamslate-style)"
+	@echo "  make mobile-signing-cleanup  - Remove temporary signing keychain and restore search list"
+	@echo "  make mobile-app-archive-export - Archive + app-store export (requires signing env prepared)"
+	@echo ""
+	@echo "Changelog:"
+	@echo "  make changelog-check - Validate changelog.d/ fragments (CI lint; no changes)"
+	@echo "  make changelog-fold  - Fold changelog.d/ fragments into CHANGELOG.md (release time)"
+	@echo "  make changelog       - Generate CHANGELOG.generated.md from git history (Keep-a-Changelog)"
+	@echo "  make changelog-html  - Generate changelog as HTML with Aurora theme"
+	@echo "  make changelog-json  - Generate changelog as JSON for programmatic use"
 	@echo ""
 	@echo "Schemas:"
 	@echo "  make schemas-list    - List vendored upstream platform schemas"
 	@echo "  make schemas-check   - Check for upstream schema drift"
 	@echo "  make schemas-update  - Fetch and update vendored schemas from upstream"
+	@echo ""
+	@echo "Acceleration (fi-accel native library):"
+	@echo "  make accel         - Rebuild fi-accel native lib + verify CGO link"
+	@echo "  make accel-build   - Rebuild fi-accel-ffi from Rust source"
+	@echo "  make accel-verify  - Verify CGO_ENABLED=1 build succeeds"
 	@echo ""
 	@echo "Other:"
 	@echo "  make install    - Install binaries to ~/.local/bin"
@@ -116,10 +174,13 @@ help:
 	@echo "  make browserkit-check  - Verify Python deps + Playwright Chromium"
 	@echo "  make browserkit-setup  - Install Python deps + Playwright Chromium (downloads)"
 
-build: loomd loom servers
+build: loomd loom servers mcp-hub-wrapper loom-mills-operator
 
 loomd:
 	go build $(LDFLAGS) -o bin/loomd ./cmd/loomd
+
+loom-mills-operator:
+	go build $(LDFLAGS) -o bin/loom-mills-operator ./cmd/loom-mills-operator
 
 loom:
 	@# cmd/loom embeds internal/hud/frontend/dist via //go:embed.
@@ -132,12 +193,18 @@ loom:
 			go clean -cache; \
 		fi; \
 	fi
-	go build $(LDFLAGS) -o bin/loom ./cmd/loom
+	CGO_ENABLED=$(CGO_ENABLED) go build -p $(LOOM_BUILD_P) $(LDFLAGS) -o bin/loom ./cmd/loom
 
 servers: $(MCP_SERVERS)
 
 mcp-time:
 	go build $(LDFLAGS) -o bin/mcp-time ./cmd/mcp-time
+
+mcp-agent-loop:
+	go build $(LDFLAGS) -o bin/mcp-agent-loop ./cmd/mcp-agent-loop
+
+mcp-pm:
+	go build $(LDFLAGS) -o bin/mcp-pm ./cmd/mcp-pm
 
 mcp-k8s:
 	go build $(LDFLAGS) -o bin/mcp-k8s ./cmd/mcp-k8s
@@ -187,14 +254,14 @@ mcp-k8s-ops:
 mcp-minio:
 	go build $(LDFLAGS) -o bin/mcp-minio ./cmd/mcp-minio
 
-mcp-morph-embeddings:
-	go build $(LDFLAGS) -o bin/mcp-morph-embeddings ./cmd/mcp-morph-embeddings
-
 mcp-qdrant:
 	go build $(LDFLAGS) -o bin/mcp-qdrant ./cmd/mcp-qdrant
 
 mcp-quality:
 	go build $(LDFLAGS) -o bin/mcp-quality ./cmd/mcp-quality
+
+mcp-brand-kit:
+	go build $(LDFLAGS) -o bin/mcp-brand-kit ./cmd/mcp-brand-kit
 
 mcp-ops:
 	go build $(LDFLAGS) -o bin/mcp-ops ./cmd/mcp-ops
@@ -232,6 +299,19 @@ mcp-codebase-memory:
 mcp-agent-context:
 	go build $(LDFLAGS) -o bin/mcp-agent-context ./cmd/mcp-agent-context
 
+mcp-loom-widget:
+	go build $(LDFLAGS) -o bin/mcp-loom-widget ./cmd/mcp-loom-widget
+
+# Build the React widget bundle (web/loom-fleet-widget) and copy the
+# single-file output into the path embedded by cmd/mcp-loom-widget.
+# Re-run `make mcp-loom-widget` afterwards to bake the new bundle into
+# the Go binary.
+.PHONY: widget
+widget:
+	cd web/loom-fleet-widget && pnpm install --frozen-lockfile && pnpm build
+	\cp web/loom-fleet-widget/dist/index.html cmd/mcp-loom-widget/widget.html
+	@echo "widget: built $$(wc -c < cmd/mcp-loom-widget/widget.html) bytes into cmd/mcp-loom-widget/widget.html"
+
 mcp-redis:
 	go build $(LDFLAGS) -o bin/mcp-redis ./cmd/mcp-redis
 
@@ -241,14 +321,39 @@ mcp-neo4j:
 mcp-confluence:
 	go build $(LDFLAGS) -o bin/mcp-confluence ./cmd/mcp-confluence
 
+mcp-jira:
+	go build $(LDFLAGS) -o bin/mcp-jira ./cmd/mcp-jira
+
 mcp-browserkit:
 	go build $(LDFLAGS) -o bin/mcp-browserkit ./cmd/mcp-browserkit
 
 mcp-devbox:
 	go build $(LDFLAGS) -o bin/mcp-devbox ./cmd/mcp-devbox
 
+base-images:
+	./scripts/build-base-images.sh --push
+
+# sync-spawn-driver copies the loom-spawn-driver bundle from its source-of-truth
+# location under tools/spawn-driver/dist/ into internal/hud/ where go:embed can
+# pick it up. Run after editing the driver bundle (Slice 7c+ will replace the
+# stub with an esbuild-generated bundle from TypeScript sources).
+sync-spawn-driver:
+	@cp tools/spawn-driver/dist/spawn-driver.js internal/hud/spawn_driver_bundle.js
+	@echo "Synced spawn-driver bundle to internal/hud/spawn_driver_bundle.js"
+
+install-devbox-sync:
+	@mkdir -p $(HOME)/.config/loom/logs
+	cp launchd/com.loom.devbox-sync.plist $(HOME)/Library/LaunchAgents/com.loom.devbox-sync.plist
+	launchctl unload $(HOME)/Library/LaunchAgents/com.loom.devbox-sync.plist 2>/dev/null || true
+	launchctl load $(HOME)/Library/LaunchAgents/com.loom.devbox-sync.plist
+	@echo "Devbox sync agent installed and started."
+	@echo "  Logs: $(HOME)/.config/loom/logs/devbox-sync.log"
+
 mcp-itchio:
 	go build $(LDFLAGS) -o bin/mcp-itchio ./cmd/mcp-itchio
+
+mcp-office:
+	go build $(LDFLAGS) -o bin/mcp-office ./cmd/mcp-office
 
 mcp-release:
 	go build $(LDFLAGS) -o bin/mcp-release ./cmd/mcp-release
@@ -259,15 +364,52 @@ mcp-substack:
 mcp-linkedin:
 	go build $(LDFLAGS) -o bin/mcp-linkedin ./cmd/mcp-linkedin
 
+mcp-google-workspace:
+	go build $(LDFLAGS) -o bin/mcp-google-workspace ./cmd/mcp-google-workspace
+
 mcp-jobsearch:
 	go build $(LDFLAGS) -o bin/mcp-jobsearch ./cmd/mcp-jobsearch
+
+mcp-mentatlab:
+	go build $(LDFLAGS) -o bin/mcp-mentatlab ./cmd/mcp-mentatlab
 
 mcp-flexinfer:
 	go build $(LDFLAGS) -o bin/mcp-flexinfer ./cmd/mcp-flexinfer
 
+mcp-weaver:
+	go build $(LDFLAGS) -o bin/mcp-weaver ./cmd/mcp-weaver
+
+mcp-icc-capture:
+	go build $(LDFLAGS) -o bin/mcp-icc-capture ./cmd/mcp-icc-capture
+
+mcp-icc:
+	go build $(LDFLAGS) -o bin/mcp-icc ./cmd/mcp-icc
+
+mcp-hub-wrapper:
+	go build $(LDFLAGS) -o bin/mcp-hub-wrapper ./cmd/mcp-hub-wrapper
+
 clean: hud-clean
 	rm -rf bin/
 	rm -f coverage.out coverage.html
+
+## Acceleration / fi-accel native library ————————————————————————————
+FIACCEL_DIR ?= $(WORKSPACE_ROOT)/libs/fi-accel
+
+accel: accel-build accel-verify ## Rebuild fi-accel native lib + verify CGO build
+
+accel-build:
+	@echo "Building fi-accel-ffi (release) ..."
+	cd $(FIACCEL_DIR) && cargo build --release -p fi-accel-ffi
+	yes | cp $(FIACCEL_DIR)/target/release/libfi_accel_ffi.a $(FIACCEL_DIR)/go/lib/darwin_arm64/libfi_accel_ffi.a
+	@echo "Verifying eventlog symbols ..."
+	@nm $(FIACCEL_DIR)/go/lib/darwin_arm64/libfi_accel_ffi.a 2>/dev/null | grep -q '_fi_project_eventlog' \
+		|| { echo "ERROR: _fi_project_eventlog not found in rebuilt library"; exit 1; }
+	@echo "fi-accel-ffi rebuilt successfully."
+
+accel-verify:
+	@echo "Verifying CGO build ..."
+	CGO_ENABLED=1 go build ./cmd/loom ./cmd/loomd ./cmd/mcp-agent-context
+	@echo "CGO build verified."
 
 # Testing targets
 test:
@@ -295,14 +437,24 @@ test-race:
 test-short:
 	go test -short ./...
 
+# Regression tests for the pre-commit/pre-push stash wrapper.
+# Concurrency: two linked worktrees run the wrapper concurrently to prove it
+# never leaks shared refs/stash entries or cross-contaminates sibling worktrees.
+# Rename safety: a staged rename with unstaged edits restores byte-exact with
+# no merge conflicts and the guarded commit succeeds.
+test-hooks:
+	bash scripts/hooks/with-stashed-worktree_test.sh
+	bash scripts/hooks/with-stashed-worktree_rename_test.sh
+
 # Installation
 install: install-all
 
 # Install only loom + loomd (fast iteration; least disruptive to agent/server processes).
-install-core: loom loomd
+install-core: loom loomd mcp-hub-wrapper
 	@chmod +x scripts/install_atomic.sh
 	@scripts/install_atomic.sh bin/loomd $(INSTALL_DIR)/loomd
 	@scripts/install_atomic.sh bin/loom  $(INSTALL_DIR)/loom
+	@scripts/install_atomic.sh bin/mcp-hub-wrapper $(INSTALL_DIR)/mcp-hub-wrapper
 
 # Install loom, loomd, and all MCP server binaries.
 install-all: build
@@ -310,6 +462,7 @@ install-all: build
 	@mkdir -p $(INSTALL_DIR)
 	@scripts/install_atomic.sh bin/loomd $(INSTALL_DIR)/loomd
 	@scripts/install_atomic.sh bin/loom  $(INSTALL_DIR)/loom
+	@scripts/install_atomic.sh bin/mcp-hub-wrapper $(INSTALL_DIR)/mcp-hub-wrapper
 	@for f in bin/mcp-*; do \
 		if [ -f "$$f" ]; then scripts/install_atomic.sh "$$f" "$(INSTALL_DIR)/$$(basename $$f)"; fi; \
 	done
@@ -318,28 +471,46 @@ install-all: build
 	@echo "  Run: make browserkit-check"
 	@echo "  Or:  make browserkit-setup"
 
+# Regenerate configs and sync all profiles + skills from the repo-built loom binary.
+# This avoids PATH drift when the installed loom binary is stale.
+dev-sync: loom
+	@./bin/loom sync all --regen --loom-mode --loom-binary "$(PWD)/bin/loom"
+	@./bin/loom sync skills all
+
+# Regenerate configs and skills in-repo only. Useful in sandboxes or when home sync/install
+# would fail, while still keeping repo-local generated artifacts fresh.
+dev-sync-repo: loom
+	@./bin/loom sync all --regen --repo-only --loom-mode --loom-binary "$(PWD)/bin/loom"
+	@./bin/loom sync skills all --repo-only
+
 # One-command local dev upgrade:
 # - rebuild loom/loomd
 # - atomic install to ~/.local/bin
-# - regen+sync configs in loom mode
+# - regen+sync configs + skills in loom mode
 # - restart daemon only when idle
+# - use a direct embedded-HUD restart path when launchd is installed but not active
+# - leave loom proxy clients running so they reconnect across daemon restarts
 dev-upgrade:
 	@chmod +x scripts/dev/upgrade_local.sh
 	@scripts/dev/upgrade_local.sh
 
 # Force rebuild + restart: always restarts daemon regardless of active connections.
-# Proxy connections (Claude, Codex, Zed, etc.) auto-reconnect on the next tool call.
+# Leaves existing loom proxy clients running; they reconnect on the next tool call.
+# Set REAP_PROXY_CLIENTS=always only when intentionally resetting client-held proxy processes.
+# If launchd is not actively managing the daemon, restart directly with --hud-port so
+# the embedded HUD/mobile API comes back in the same process.
 dev-reload:
 	@chmod +x scripts/dev/upgrade_local.sh
 	@RESTART_DAEMON=always scripts/dev/upgrade_local.sh
 
 # First-run/local onboarding:
 # - build + atomic install loom/loomd
-# - regenerate and sync loom-mode configs
+# - regenerate and sync loom-mode configs + skills
 # - run environment checks
-bootstrap-local: install-core
-	@./bin/loom sync all --regen --loom-mode
-	@./bin/loom check
+bootstrap-local: git-setup install-core
+	@"$(INSTALL_DIR)/loom" sync all --regen --loom-mode --loom-binary "$(INSTALL_DIR)/loom"
+	@"$(INSTALL_DIR)/loom" sync skills all
+	@"$(INSTALL_DIR)/loom" check
 	@echo ""
 	@echo "Bootstrap complete."
 	@echo "Next:"
@@ -357,6 +528,7 @@ vet:
 	go vet ./...
 
 lint:
+	$(GOLANGCI_LINT) config verify
 	$(GOLANGCI_LINT) run --timeout 5m ./...
 
 lint-fix:
@@ -372,7 +544,7 @@ check-quick: fmt-check vet
 	go build ./...
 
 # Setup development environment
-setup: tools hooks
+setup: tools git-setup
 	@echo "\nDevelopment environment ready!"
 	@echo "Run 'make help' to see available commands"
 
@@ -386,25 +558,32 @@ tools:
 	go install github.com/boumenot/gocover-cobertura@v1.4.0
 	@echo "Tools installed to $(GOPATH)/bin"
 
-# Install git hooks
-hooks:
-	@echo "Installing git hooks..."
+# Repair worktree-aware git config and install hooks into the shared git dir.
+git-setup:
+	@chmod +x scripts/dev/with-clean-git-env.sh
+	@chmod +x scripts/dev/repair_git_setup.sh
+	@chmod +x scripts/hooks/run-pre-commit-hook.sh
+	@chmod +x scripts/hooks/with-stashed-worktree.sh
+	@chmod +x scripts/hooks/pre-commit
+	@chmod +x scripts/hooks/pre-commit-native.sh
+	@chmod +x scripts/hooks/pre-push
+	@chmod +x scripts/hooks/pre-push-native.sh
+	@./scripts/dev/repair_git_setup.sh
 	@if command -v pre-commit >/dev/null 2>&1; then \
-		pre-commit install; \
-		echo "pre-commit hooks installed"; \
+		echo "git-setup: pre-commit detected"; \
 	else \
-		cp scripts/hooks/pre-commit .git/hooks/pre-commit; \
-		chmod +x .git/hooks/pre-commit; \
-		echo "Native pre-commit hook installed"; \
-		echo "Tip: Install pre-commit for more features: pip install pre-commit"; \
+		echo "git-setup: pre-commit not installed; native hook fallback will be used"; \
 	fi
+
+hooks: git-setup
+	@echo "Hooks installed via git-setup"
 
 # Pre-commit (run manually)
 pre-commit:
-	@if command -v pre-commit >/dev/null 2>&1; then \
-		pre-commit run --all-files; \
+	@if [ -f .pre-commit-config.yaml ] && command -v pre-commit >/dev/null 2>&1; then \
+		bash scripts/dev/with-clean-git-env.sh pre-commit run --all-files; \
 	else \
-		./scripts/hooks/pre-commit; \
+		./scripts/hooks/pre-commit-native.sh; \
 	fi
 
 # =============================================================================
@@ -476,7 +655,7 @@ mod-update:
 COVERAGE_THRESHOLD ?= 28
 
 # Full CI pipeline
-ci: ci-lint ci-build ci-test ci-security
+ci: ci-lint ci-build ci-test ci-contracts ci-security
 	@echo ""
 	@echo "✓ CI pipeline passed!"
 
@@ -488,8 +667,10 @@ ci-lint: fmt-check vet ci-guardrails ci-lint-soft
 ci-guardrails:
 	@echo "Running docs/CLI guardrails..."
 	@bash scripts/ci/check_docs_guardrails.sh
+	@bash scripts/ci/check_docs_guardrails_test.sh
 	@bash scripts/ci/check_flexinfer_site_integration.sh
 	@bash scripts/ci/check_error_handling.sh
+	@bash mcp/skills/mills-ops/scripts/mills_status_snapshot_test.sh
 	@go run ./cmd/loom --help >/dev/null
 	@go run ./cmd/loom proxy --help >/dev/null
 	@echo "✓ Guardrails passed"
@@ -502,6 +683,7 @@ ci-lint-soft:
 # Lint strict - fails on any lint issue
 ci-lint-strict: fmt-check vet
 	@echo "Running golangci-lint (strict)..."
+	$(GOLANGCI_LINT) config verify
 	$(GOLANGCI_LINT) run --timeout 5m ./...
 	@echo "✓ Lint stage passed (strict)"
 
@@ -546,15 +728,22 @@ ci-test-unit:
 	@echo ""
 	@echo "Coverage Summary:"
 	@go tool cover -func=coverage.out | tail -20
-	@TOTAL=$$(go tool cover -func=coverage.out | grep total | awk '{print $$3}' | sed 's/%//'); \
+	@# Anchored on the `total:` first field. A bare `grep total` also matches
+	@# functions whose names contain "total" (internal/hud.totalPendingLocked,
+	@# pkg/mills/runner.total), which made TOTAL multi-line and silently
+	@# disabled this gate. Same fix as scripts/ci/run_unit_tests.sh.
+	@TOTAL=$$(go tool cover -func=coverage.out | awk '$$1 == "total:" { pct = $$3 } END { print pct }' | tr -d '%'); \
 	echo ""; \
 	echo "Total Coverage: $${TOTAL}%"; \
-	TOTAL_INT=$$(echo "$$TOTAL" | cut -d. -f1); \
-	if [ "$$TOTAL_INT" -lt "$(COVERAGE_THRESHOLD)" ]; then \
+	if ! printf '%s' "$$TOTAL" | grep -Eq '^[0-9]+(\.[0-9]+)?$$'; then \
+		echo "ERROR: could not parse total coverage (got '$${TOTAL}')"; \
+		exit 1; \
+	fi; \
+	if awk -v total="$$TOTAL" -v threshold="$(COVERAGE_THRESHOLD)" 'BEGIN { exit !(total < threshold) }'; then \
 		echo "ERROR: Coverage $${TOTAL}% is below threshold $(COVERAGE_THRESHOLD)%"; \
 		exit 1; \
 	fi; \
-	echo "✓ Coverage threshold met (>= $(COVERAGE_THRESHOLD)%)"
+	echo "✓ Coverage threshold met ($${TOTAL}% >= $(COVERAGE_THRESHOLD)%)"
 
 # Integration tests (mirrors GitLab CI test:integration)
 ci-test-integration: ci-build
@@ -567,11 +756,39 @@ ci-test-integration: ci-build
 	echo ""; \
 	go test -v -race ./internal/integration/...
 
+# Contract tests — verify golden files are up-to-date (run in CI and before releases)
+# Fails if any golden file would change, surfacing drift for sibling consumers (loom, loom-zed).
+ci-contracts:
+	@echo "Running contract tests (golden file verification)..."
+	@go test -v -count=1 -run 'Contract$$' ./internal/contracts/...
+	@echo ""
+	@echo "Golden files verified:"
+	@ls internal/contracts/testdata/*.golden | wc -l | xargs -I{} echo "  {} golden files checked"
+	@echo "✓ Contract tests passed — no drift detected"
+
+# OpenAPI spec conformance — verifies docs/api/openapi.yaml stays in sync
+# with the Go contracts in internal/visibility/contracts (UNIFY-2c, EPIC 2 / #66).
+# Fixture-vs-spec only; does not exercise live HUD handlers.
+ci-openapi:
+	@echo "Running OpenAPI conformance tests..."
+	@go test -v -count=1 -run 'OpenAPI' ./internal/contracts/...
+	@echo "✓ OpenAPI conformance passed"
+
+# Enterprise smoke suite (mirrors GitLab CI test:enterprise-smoke)
+ci-test-enterprise-smoke:
+	@echo "Running enterprise smoke suite..."
+	@bash scripts/ci/enterprise_smoke_suite.sh
+
 # Race detection tests (mirrors GitLab CI test:race)
 ci-test-race:
 	@echo "Running race detection tests..."
 	go test -race -short ./...
 	@echo "✓ Race tests passed"
+
+# Hermetic branch reliability gate. Produces versioned evidence under
+# .loom/local/evidence/fleet-reliability/ by default.
+ci-reliability:
+	bash scripts/ci/fleet_reliability_gate.sh
 
 # Benchmarks (mirrors GitLab CI test:benchmark)
 ci-benchmark: ci-build
@@ -603,6 +820,38 @@ ci-baseline: ci-build
 	fi
 	@echo "Baseline artifacts saved in $(BASELINE_DIR)/"
 
+codebase-bench-baseline:
+	@echo "Running codebase benchmark baseline..."
+	@mkdir -p $(CODEBASE_BENCH_DIR)
+	go run ./cmd/codebase-bench \
+		-scenario all \
+		-root "$$(pwd)" \
+		-output-dir "$(CODEBASE_BENCH_DIR)"
+
+codebase-bench-full:
+	@echo "Running full-refresh codebase benchmark..."
+	@mkdir -p $(CODEBASE_BENCH_DIR)
+	go run ./cmd/codebase-bench \
+		-scenario full \
+		-root "$$(pwd)" \
+		-output-dir "$(CODEBASE_BENCH_DIR)"
+
+codebase-bench-incremental:
+	@echo "Running incremental codebase benchmark..."
+	@mkdir -p $(CODEBASE_BENCH_DIR)
+	go run ./cmd/codebase-bench \
+		-scenario incremental \
+		-root "$$(pwd)" \
+		-output-dir "$(CODEBASE_BENCH_DIR)"
+
+codebase-bench-watch:
+	@echo "Running watch-latency codebase benchmark..."
+	@mkdir -p $(CODEBASE_BENCH_DIR)
+	go run ./cmd/codebase-bench \
+		-scenario watch \
+		-root "$$(pwd)" \
+		-output-dir "$(CODEBASE_BENCH_DIR)"
+
 # =============================================================================
 # HUD TARGETS - Agent Command Center (Go HTTP + Svelte 5)
 # =============================================================================
@@ -611,6 +860,8 @@ HUD_FRONTEND := internal/hud/frontend
 
 # Build the Svelte frontend (requires pnpm)
 # Always cleans dist/ first so stale assets never leak into the embed.
+# The built dist/ is gitignored (not committed) — only dist/.gitkeep is tracked,
+# so it is restored after the build to keep //go:embed all:frontend/dist valid.
 hud-frontend:
 	@echo "Building HUD frontend..."
 	@if ! command -v pnpm >/dev/null 2>&1; then \
@@ -623,6 +874,7 @@ hud-frontend:
 	fi
 	rm -rf $(HUD_FRONTEND)/dist
 	cd $(HUD_FRONTEND) && pnpm build
+	@git checkout -q -- $(HUD_FRONTEND)/dist/.gitkeep 2>/dev/null || touch $(HUD_FRONTEND)/dist/.gitkeep
 	@echo "✓ Frontend built to $(HUD_FRONTEND)/dist/"
 
 # Build frontend + Go binary with HUD embedded.
@@ -631,46 +883,51 @@ hud-frontend:
 hud-build: hud-frontend loom
 	@echo "✓ HUD build complete (bin/loom)"
 
-# Build + install to ~/.local/bin in one step.
-hud-install: hud-build
+# Build + install loom and loomd to ~/.local/bin in one step.
+# HUD is embedded in loomd; loom is the proxy/CLI.
+hud-install: hud-build loomd
 	@chmod +x scripts/install_atomic.sh
 	@scripts/install_atomic.sh bin/loom $(INSTALL_DIR)/loom
-	@echo "✓ Installed to $(INSTALL_DIR)/loom"
-	@echo "  Restart HUD: loom hud --port 3333 --overlay"
+	@scripts/install_atomic.sh bin/loomd $(INSTALL_DIR)/loomd
+	@echo "✓ Installed loom + loomd to $(INSTALL_DIR)/"
+	@echo "  Restart HUD: loomd --hud-port 3333"
 
-# Full cycle: build frontend, rebuild+install loom binary, restart running HUD.
+# Install HUD as a launchd service (auto-start on login, Redis cache).
+hud-install-service: build
+	@./bin/loom hud install
+
+# Full cycle: build frontend, rebuild+install binaries, restart running loomd.
 # This is the one-command target for HUD development iteration.
 hud-reload: hud-install
-	@echo "Restarting HUD process..."
+	@echo "Restarting loomd (embedded HUD)..."
 	@HUD_PID=$$(lsof -ti :3333 2>/dev/null | head -1); \
 	if [ -n "$$HUD_PID" ]; then \
-		HUD_ARGS=$$(ps -p $$HUD_PID -o args= 2>/dev/null || true); \
 		kill $$HUD_PID 2>/dev/null || true; \
 		sleep 1; \
 		if kill -0 $$HUD_PID 2>/dev/null; then kill -9 $$HUD_PID 2>/dev/null || true; fi; \
-		echo "Killed old HUD (PID $$HUD_PID)"; \
+		echo "Killed old process (PID $$HUD_PID)"; \
 	else \
-		HUD_ARGS=""; \
-		echo "No HUD process found on port 3333"; \
+		echo "No process found on port 3333"; \
 	fi; \
-	echo "Starting HUD..."; \
-	nohup $(INSTALL_DIR)/loom hud --port 3333 > /tmp/loom-hud.log 2>&1 & \
+	echo "Starting loomd with embedded HUD..."; \
+	nohup $(INSTALL_DIR)/loomd --hud-port 3333 > /tmp/loomd-hud.log 2>&1 & \
 	NEW_PID=$$!; \
-	sleep 2; \
+	sleep 3; \
 	if kill -0 $$NEW_PID 2>/dev/null; then \
-		echo "✓ HUD restarted (PID $$NEW_PID) — http://127.0.0.1:3333"; \
+		HUD_URL=$$(bash scripts/dev/detect_hud_url.sh 3333); \
+		echo "✓ loomd restarted (PID $$NEW_PID) — $$HUD_URL"; \
 	else \
-		echo "ERROR: HUD failed to start. Check /tmp/loom-hud.log"; \
+		echo "ERROR: loomd failed to start. Check /tmp/loomd-hud.log"; \
 		exit 1; \
 	fi
 
-# Launch HUD (builds first if needed)
-hud: hud-build
-	@echo "Launching HUD..."
-	./bin/loom hud
+# Launch loomd with embedded HUD (builds first if needed)
+hud: hud-build loomd
+	@echo "Launching loomd with embedded HUD..."
+	./bin/loomd --hud-port 3333
 
 # Dev mode: start Vite dev server + Go API concurrently
-hud-dev: loom
+hud-dev: loom loomd
 	@echo "Starting HUD in development mode..."
 	@echo "  Frontend: http://localhost:5173 (Vite)"
 	@echo "  API:      http://localhost:9800 (Go)"
@@ -680,19 +937,20 @@ hud-dev: loom
 		cd $(HUD_FRONTEND) && pnpm install; \
 	fi
 	@trap 'kill 0' EXIT; \
-	./bin/loom hud --dev --port 9800 & \
+	./bin/loomd --hud-port 9800 & \
 	cd $(HUD_FRONTEND) && pnpm dev & \
 	wait
 
-# Verify committed dist/ matches a fresh build.
-# Use locally before committing or in CI (requires pnpm/node).
+# Verify the HUD frontend builds and produces an embeddable bundle.
+# The bundle is gitignored (built in CI/Docker, not committed), so this checks
+# that vite succeeds and emits a non-empty index.html — the same invariant the
+# CI build:frontend job and the Docker frontend stage assert.
 hud-dist-check: hud-frontend
-	@echo "Checking HUD dist freshness..."
-	@if git diff --quiet $(HUD_FRONTEND)/dist/ 2>/dev/null; then \
-		echo "✓ HUD dist is up-to-date"; \
+	@echo "Checking HUD bundle built..."
+	@if [ -s $(HUD_FRONTEND)/dist/index.html ]; then \
+		echo "✓ HUD bundle built ($(HUD_FRONTEND)/dist/index.html present)"; \
 	else \
-		echo "ERROR: HUD dist is stale. Run 'make hud-frontend' and commit the result."; \
-		git diff --stat $(HUD_FRONTEND)/dist/; \
+		echo "ERROR: HUD bundle missing — 'make hud-frontend' did not produce dist/index.html."; \
 		exit 1; \
 	fi
 
@@ -702,12 +960,249 @@ hud-clean:
 	rm -rf $(HUD_FRONTEND)/node_modules $(HUD_FRONTEND)/dist
 	@echo "✓ HUD cleaned"
 
+# Verify local prerequisites for running the iOS app on a physical iPhone.
+mobile-iphone-preflight:
+	@./scripts/mobile/iphone_preflight.sh
+
+mobile-gateway-sync-token:
+	@./scripts/mobile/gateway_sync_token.sh
+
+mobile-gateway-preflight: mobile-gateway-sync-token
+	@./scripts/mobile/gateway_preflight.sh
+
+# Echo the `loom://configure?...` URL used by mobile-app-run-{sim,device}
+# to bootstrap Gateway-mode creds on freshly installed builds. Reads from
+# env vars, ~/.config/loom/hud.env, or the loom-hub/loom-secrets secret.
+# Prints nothing (exit 0) if creds aren't resolvable — callers skip config.
+mobile-gateway-configure-url:
+	@./scripts/mobile/build_configure_url.sh; echo
+
+# Keep the generated Xcode project aligned with project.yml and source layout.
+mobile-ios-project-sync:
+	@if ! command -v xcodegen >/dev/null 2>&1; then \
+		echo "ERROR: xcodegen is required to generate $(MOBILE_IOS_PROJECT)"; \
+		echo "Install with: brew install xcodegen"; \
+		exit 1; \
+	fi
+	@cd apps/loom-companion-ios && xcodegen generate --use-cache >/tmp/loom-mobile-xcodegen.log 2>&1 || { \
+		echo "ERROR: failed to generate iOS project from $(MOBILE_IOS_PROJECT_YAML)"; \
+		tail -n 40 /tmp/loom-mobile-xcodegen.log; \
+		exit 1; \
+	}
+
+# Open the iOS app project in Xcode.
+mobile-app-open: mobile-ios-project-sync
+	@open "$(MOBILE_IOS_PROJECT)"
+
+# Build, install, and launch Loom Companion in iOS Simulator.
+# Optional overrides:
+#   MOBILE_IOS_SIMULATOR="iPhone 17 Pro"
+#   MOBILE_IOS_CONFIGURATION=Debug
+mobile-app-run-sim: mobile-ios-project-sync
+	@echo "Booting simulator: $(MOBILE_IOS_SIMULATOR)"
+	@open -a Simulator >/dev/null 2>&1 || true
+	@xcrun simctl boot "$(MOBILE_IOS_SIMULATOR)" >/dev/null 2>&1 || true
+	@xcrun simctl bootstatus "$(MOBILE_IOS_SIMULATOR)" -b >/dev/null 2>&1 || true
+	@echo "Building $(MOBILE_IOS_SCHEME) for simulator..."
+	@xcodebuild -project "$(MOBILE_IOS_PROJECT)" \
+		-scheme "$(MOBILE_IOS_SCHEME)" \
+		-destination "platform=iOS Simulator,name=$(MOBILE_IOS_SIMULATOR)" \
+		-configuration "$(MOBILE_IOS_CONFIGURATION)" \
+		-derivedDataPath "$(MOBILE_IOS_DERIVED_DATA)" \
+		build >/tmp/loom-mobile-app-build.log && tail -n 10 /tmp/loom-mobile-app-build.log
+	@APP_PATH="$(MOBILE_IOS_DERIVED_DATA)/Build/Products/$(MOBILE_IOS_CONFIGURATION)-iphonesimulator/$(MOBILE_IOS_APP_NAME).app"; \
+	if [ ! -d "$$APP_PATH" ]; then \
+		echo "ERROR: app bundle not found at $$APP_PATH"; \
+		exit 1; \
+	fi; \
+	SIM_UDID="$$(xcrun simctl list devices booted | rg -o -m1 '[0-9A-F-]{36}')"; \
+	if [ -z "$$SIM_UDID" ]; then \
+		echo "No booted simulator detected; retrying boot for $(MOBILE_IOS_SIMULATOR)..."; \
+		xcrun simctl boot "$(MOBILE_IOS_SIMULATOR)" >/dev/null 2>&1 || true; \
+		xcrun simctl bootstatus "$(MOBILE_IOS_SIMULATOR)" -b >/dev/null 2>&1 || true; \
+		SIM_UDID="$$(xcrun simctl list devices booted | rg -o -m1 '[0-9A-F-]{36}')"; \
+	fi; \
+	if [ -z "$$SIM_UDID" ]; then \
+		echo "ERROR: no booted iOS Simulator found."; \
+		echo "Open Simulator.app and ensure '$(MOBILE_IOS_SIMULATOR)' is booted, then rerun."; \
+		exit 1; \
+	fi; \
+	echo "Installing $$APP_PATH on $$SIM_UDID"; \
+	xcrun simctl install "$$SIM_UDID" "$$APP_PATH"; \
+	CONFIGURE_URL="$$(./scripts/mobile/build_configure_url.sh 2>/dev/null || true)"; \
+	if [ -n "$$CONFIGURE_URL" ]; then \
+		echo "Launching $(MOBILE_IOS_BUNDLE_ID) on $$SIM_UDID (with gateway bootstrap)"; \
+		xcrun simctl launch "$$SIM_UDID" "$(MOBILE_IOS_BUNDLE_ID)" "$$CONFIGURE_URL"; \
+	else \
+		echo "Launching $(MOBILE_IOS_BUNDLE_ID) on $$SIM_UDID"; \
+		echo "  (no gateway credentials found — skipping auto-configure)"; \
+		xcrun simctl launch "$$SIM_UDID" "$(MOBILE_IOS_BUNDLE_ID)"; \
+	fi
+
+# Build and install Loom Companion on a connected iPhone.
+# Requires: device in dev mode, trusted, and automatic signing configured in Xcode.
+# Optional overrides:
+#   MOBILE_IOS_CONFIGURATION=Release
+#   APPLE_TEAM_ID=XXXXXXXXXX
+mobile-app-run-device: mobile-ios-project-sync
+	@./scripts/mobile/run_on_device.sh \
+		"$(MOBILE_IOS_PROJECT)" \
+		"$(MOBILE_IOS_SCHEME)" \
+		"$(MOBILE_IOS_CONFIGURATION)" \
+		"$(MOBILE_IOS_DERIVED_DATA)" \
+		"$(MOBILE_IOS_APP_NAME)" \
+		"$(MOBILE_IOS_BUNDLE_ID)"
+
+# One-command local mobile dev bootstrap:
+# - ensures bin/loom exists
+# - generates a fresh mobile operator token
+# - restarts HUD with that token
+# - opens the iOS app project in Xcode
+# - prints copy/paste URL + token values
+mobile-dev:
+	@./scripts/mobile/dev_bootstrap.sh
+
+# One-command gateway bootstrap:
+# - validates gateway surfaces via mobile-gateway-preflight
+# - generates a fresh mobile operator token
+# - patches loom-hub/loom-secrets (token/scopes and CF token normalization when configured)
+# - rollout-restarts deployment/mobile-hud
+# - verifies remote /api/mobile/v1/ping and prints copy/paste-ready values
+mobile-gateway-dev:
+	@./scripts/mobile/gateway_preflight.sh
+	@./scripts/mobile/gateway_bootstrap.sh
+
+# Validate signing-related environment and show current Xcode signing state.
+mobile-signing-check: mobile-ios-project-sync
+	@echo "== Loom Companion Signing Check =="
+	@echo "Project: $(MOBILE_IOS_PROJECT)"
+	@echo ""
+	@for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID APPLE_PROVISIONING_PROFILE APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_BASE64; do \
+		val=$$(eval "printf '%s' \"\$${$$key:-}\""); \
+		if [ -n "$$val" ]; then \
+			echo "PASS: $$key is set"; \
+		else \
+			echo "WARN: $$key is not set"; \
+		fi; \
+	done
+	@echo ""
+	@echo "Resolved Xcode signing fields (Release, generic iOS):"
+	@xcodebuild -project "$(MOBILE_IOS_PROJECT)" \
+		-scheme "$(MOBILE_IOS_SCHEME)" \
+		-configuration Release \
+		-destination 'generic/platform=iOS' \
+		-showBuildSettings 2>/dev/null | \
+		rg 'PRODUCT_BUNDLE_IDENTIFIER|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER' || true
+
+# Import Apple certificate/profile into temporary keychain and emit build.env.
+mobile-signing-prepare:
+	@chmod +x scripts/mobile/import-certificate.sh
+	@./scripts/mobile/import-certificate.sh
+
+# Cleanup temporary keychain created by mobile-signing-prepare.
+mobile-signing-cleanup:
+	@chmod +x scripts/mobile/cleanup-signing.sh
+	@./scripts/mobile/cleanup-signing.sh
+
+# Archive and export an app-store IPA using manual signing inputs.
+mobile-app-archive-export:
+	@chmod +x scripts/mobile/archive_export.sh
+	@./scripts/mobile/archive_export.sh
+
+# Launch HUD for LAN iPhone testing (requires mobile auth token).
+mobile-hud:
+	@if [ ! -x "./bin/loom" ]; then \
+		echo "bin/loom not found; building with LOOM_BUILD_P=$(LOOM_BUILD_P) CGO_ENABLED=$(CGO_ENABLED)"; \
+		if ! $(MAKE) loom LOOM_BUILD_P=$(LOOM_BUILD_P) CGO_ENABLED=$(CGO_ENABLED); then \
+			echo "ERROR: failed to build bin/loom (likely memory pressure)."; \
+			echo "Try closing Simulator/Xcode and rerun: LOOM_BUILD_P=1 CGO_ENABLED=0 make loom"; \
+			exit 1; \
+		fi; \
+	fi
+	@if [ "$${MOBILE_HUD_REBUILD:-0}" = "1" ]; then \
+		echo "MOBILE_HUD_REBUILD=1; rebuilding loom with LOOM_BUILD_P=$(LOOM_BUILD_P) CGO_ENABLED=$(CGO_ENABLED)"; \
+		if ! $(MAKE) loom LOOM_BUILD_P=$(LOOM_BUILD_P) CGO_ENABLED=$(CGO_ENABLED); then \
+			if [ -x "./bin/loom" ]; then \
+				echo "WARN: rebuild failed (likely memory pressure); using existing ./bin/loom"; \
+			else \
+				echo "ERROR: rebuild failed and no existing ./bin/loom is available."; \
+				exit 1; \
+			fi; \
+		fi; \
+	fi
+	@if [ -z "$$HUD_MOBILE_OPERATOR_TOKEN" ]; then \
+		echo "ERROR: HUD_MOBILE_OPERATOR_TOKEN is required."; \
+		echo "Set one with: export HUD_MOBILE_OPERATOR_TOKEN=\"$$(openssl rand -hex 32)\""; \
+		exit 1; \
+	fi
+	@SCOPES=$${HUD_MOBILE_OPERATOR_SCOPES:-mobile:read,mobile:session:create,mobile:session:end,mobile:push}; \
+	echo "Launching HUD for mobile testing on http://0.0.0.0:3333"; \
+	echo "Scopes: $$SCOPES"; \
+	./bin/loom hud --bind 0.0.0.0 --port 3333 \
+		--mobile-operator-token "$$HUD_MOBILE_OPERATOR_TOKEN" \
+		--mobile-operator-scopes "$$SCOPES"
+
+# =============================================================================
+# CHANGELOG TARGETS
+# =============================================================================
+#
+# Per-MR fragments (changelog.d/) assembled at release, replacing direct
+# CHANGELOG.md edits that collided across concurrent MRs. See changelog.d/README.md
+# and docs/DOCS_MAINTENANCE.md. The assembler lives in scripts/changelog/.
+
+# Validate changelog.d/ fragments (known category, non-empty body, unique slugs).
+# Cheap; runs in the guardrails:docs-cli CI lint job. Makes no changes.
+changelog-check:
+	@GOWORK=off CGO_ENABLED=0 go run ./scripts/changelog --check
+
+# Fold changelog.d/ fragments into CHANGELOG.md's [Unreleased] section and delete
+# them. Run at RELEASE time, not per-merge. Pass VERSION= (and optional DATE=) to
+# also cut a versioned section, e.g. `make changelog-fold VERSION=v0.10.0`.
+changelog-fold:
+	@GOWORK=off CGO_ENABLED=0 go run ./scripts/changelog --fold \
+		$(if $(VERSION),--version $(VERSION)) $(if $(DATE),--date $(DATE))
+
+# CHANGELOG.generated.md - Autogenerated from conventional commits via py-changelog-ai
+# =============================================================================
+
+CHANGELOG_AI := changelog-ai
+CHANGELOG_AI_LIB := $(WORKSPACE_ROOT)/libs/py-changelog-ai
+
+# Generate CHANGELOG.generated.md (Keep-a-Changelog format) from full git history.
+# The hand-curated CHANGELOG.md remains the source of truth for releases;
+# this target produces a machine-generated companion for cross-reference.
+changelog:
+	@if ! command -v $(CHANGELOG_AI) >/dev/null 2>&1; then \
+		echo "Installing changelog-ai from $(CHANGELOG_AI_LIB)..."; \
+		pip install -e "$(CHANGELOG_AI_LIB)" >/dev/null 2>&1; \
+	fi
+	$(CHANGELOG_AI) generate --full -o CHANGELOG.generated.md --config .changelog-ai.yaml --summary
+	@echo "✓ Generated CHANGELOG.generated.md"
+
+# Generate HTML changelog with Aurora theme.
+changelog-html:
+	@if ! command -v $(CHANGELOG_AI) >/dev/null 2>&1; then \
+		echo "Installing changelog-ai from $(CHANGELOG_AI_LIB)..."; \
+		pip install -e "$(CHANGELOG_AI_LIB)" >/dev/null 2>&1; \
+	fi
+	$(CHANGELOG_AI) generate --full -o CHANGELOG.html -f html --theme aurora --config .changelog-ai.yaml
+	@echo "✓ Generated CHANGELOG.html"
+
+# Generate JSON changelog for programmatic consumption.
+changelog-json:
+	@if ! command -v $(CHANGELOG_AI) >/dev/null 2>&1; then \
+		echo "Installing changelog-ai from $(CHANGELOG_AI_LIB)..."; \
+		pip install -e "$(CHANGELOG_AI_LIB)" >/dev/null 2>&1; \
+	fi
+	$(CHANGELOG_AI) generate --full -o CHANGELOG.json -f json --config .changelog-ai.yaml
+	@echo "✓ Generated CHANGELOG.json"
+
 # =============================================================================
 # DOCKER TARGETS
 # =============================================================================
 
 # Build all Docker images (uses local Dockerfiles with workspace context)
-docker-build: docker-build-loom-core docker-build-custom-server
+docker-build: docker-build-loom-core docker-build-custom-server docker-build-loom-mills-operator
 	@echo "✓ All Docker images built"
 
 # Build loom-core image (local build using workspace root context)
@@ -726,15 +1221,29 @@ docker-build-loom-core:
 docker-build-custom-server:
 	@echo "Building custom-server image..."
 	@echo "Image: $(CUSTOM_SERVER_IMAGE):$(IMAGE_TAG)"
-	@echo "Context: $(WORKSPACE_ROOT)"
-	cd $(WORKSPACE_ROOT) && docker build \
+	@echo "Context: $(CURDIR)"
+	@echo "Named libs context: $(WORKSPACE_ROOT)/libs"
+	cd $(CURDIR) && docker build \
+		--build-context libs=$(WORKSPACE_ROOT)/libs \
 		-t $(CUSTOM_SERVER_IMAGE):$(IMAGE_TAG) \
 		-t $(CUSTOM_SERVER_IMAGE):latest \
-		-f services/loom-core/Dockerfile.custom-server.local .
+		-f Dockerfile.custom-server.local .
 	@echo "✓ custom-server image built"
 
+# Build loom-mills-operator image (cluster operator for the council + pipeline)
+docker-build-loom-mills-operator:
+	@echo "Building loom-mills-operator image..."
+	@echo "Image: $(LOOM_MILLS_OPERATOR_IMAGE):$(IMAGE_TAG)"
+	@echo "Context: $(CURDIR)"
+	cd $(CURDIR) && docker build \
+		--build-arg VERSION=$(VERSION) \
+		-t $(LOOM_MILLS_OPERATOR_IMAGE):$(IMAGE_TAG) \
+		-t $(LOOM_MILLS_OPERATOR_IMAGE):latest \
+		-f Dockerfile.loom-mills-operator .
+	@echo "✓ loom-mills-operator image built"
+
 # Push all images
-docker-push: docker-push-loom-core docker-push-custom-server
+docker-push: docker-push-loom-core docker-push-custom-server docker-push-loom-mills-operator
 	@echo "✓ All images pushed to $(REGISTRY)"
 
 # Push loom-core image
@@ -751,78 +1260,72 @@ docker-push-custom-server: docker-build-custom-server
 	docker push $(CUSTOM_SERVER_IMAGE):latest
 	@echo "✓ custom-server pushed"
 
+# Push loom-mills-operator image
+docker-push-loom-mills-operator: docker-build-loom-mills-operator
+	@echo "Pushing loom-mills-operator image..."
+	docker push $(LOOM_MILLS_OPERATOR_IMAGE):$(IMAGE_TAG)
+	docker push $(LOOM_MILLS_OPERATOR_IMAGE):latest
+	@echo "✓ loom-mills-operator pushed"
+
 # =============================================================================
 # DEPLOY TARGETS
 # =============================================================================
 
-# Full deploy: build, push, update gitops, reconcile
-deploy: docker-push deploy-update-images deploy-reconcile
+# Full deploy: validate, build, push, update gitops, reconcile
+deploy: deploy-check docker-push deploy-update-images deploy-commit deploy-reconcile
 	@echo ""
 	@echo "✓ Deployment complete!"
 	@echo "  Image tag: $(IMAGE_TAG)"
 	@echo "  Registry:  $(REGISTRY)"
 
-# Update image tags in gitops repo (only loom-hub/servers deployments)
+# Validate the deploy mutation prerequisites before changing GitOps state.
+deploy-check: loom
+	@echo "Running deploy validation gates..."
+	@./bin/loom validate configs
+	@./bin/loom validate schemas
+	@./bin/loom validate rbac --source repo
+	@echo "✓ Deploy validation gates passed"
+
+# Update image tags in Flux Kustomization CRD (single file in gitops)
 deploy-update-images:
-	@echo "Updating image tags in gitops repo..."
-	@if [ ! -d "$(LOOM_HUB_DIR)/servers" ]; then \
-		echo "ERROR: GitOps directory not found: $(LOOM_HUB_DIR)/servers"; \
+	@echo "Updating image tags in Flux Kustomization..."
+	@if [ ! -f "$(FLUX_KUST)" ]; then \
+		echo "ERROR: Flux Kustomization not found: $(FLUX_KUST)"; \
 		echo "Set GITOPS_DIR to override"; \
 		exit 1; \
 	fi
-	@echo "Updating kustomization.yaml newTag to $(IMAGE_TAG)"
-	@sed -i '' 's|newTag: [a-zA-Z0-9._-]*|newTag: $(IMAGE_TAG)|' "$(LOOM_HUB_DIR)/servers/kustomization.yaml"
-	@echo "Updating deployments to use $(CUSTOM_SERVER_IMAGE):$(IMAGE_TAG)"
-	@for f in $(LOOM_HUB_DIR)/servers/*/deployment.yaml; do \
-		if [ -f "$$f" ]; then \
-			sed -i '' 's|$(REGISTRY)/mcp/custom-server:[a-zA-Z0-9._-]*|$(CUSTOM_SERVER_IMAGE):$(IMAGE_TAG)|g' "$$f"; \
-		fi; \
-	done
-	@echo "✓ Image tags updated"
+	@python3 scripts/deploy/flux_deploy.py update-images --file "$(FLUX_KUST)" --tag "$(IMAGE_TAG)"
+	@echo "✓ Image tags updated to $(IMAGE_TAG)"
 	@echo ""
 	@echo "Changed files:"
-	@cd $(GITOPS_DIR) && git diff --name-only k3s/loom-hub/
+	@cd $(GITOPS_DIR) && git diff --name-only clusters/
 
-# Reconcile Flux
+# Reconcile Flux (both git sources + kustomizations)
 deploy-reconcile:
 	@echo "Reconciling Flux..."
 	@if command -v flux >/dev/null 2>&1; then \
-		flux reconcile kustomization loom-hub -n flux-system --with-source; \
+		flux reconcile source git loom-core -n flux-system && \
+		flux reconcile source git gitops-gitlab -n flux-system && \
+		flux reconcile kustomization apps -n flux-system && \
+		flux reconcile kustomization loom-hub-servers -n flux-system; \
 	else \
 		echo "Warning: flux CLI not found, skipping reconcile"; \
-		echo "Run manually: flux reconcile kustomization loom-hub -n flux-system --with-source"; \
+		echo "Run manually:"; \
+		echo "  flux reconcile source git loom-core -n flux-system"; \
+		echo "  flux reconcile source git gitops-gitlab -n flux-system"; \
+		echo "  flux reconcile kustomization apps -n flux-system"; \
+		echo "  flux reconcile kustomization loom-hub-servers -n flux-system"; \
 	fi
 
 # Commit gitops changes
 deploy-commit:
 	@echo "Committing gitops changes..."
 	@cd $(GITOPS_DIR) && \
-		git add k3s/loom-hub && \
-		git commit -m "chore(loom-hub): update custom-server to $(IMAGE_TAG)" && \
+		git add clusters/k3s/flux-system/kustomization-loom-hub-servers.yaml && \
+		git commit -m "chore(loom-hub): update images to $(IMAGE_TAG)" && \
 		git push
 	@echo "✓ GitOps changes committed and pushed"
 
 # Show deployment status
 deploy-status:
-	@echo "=== Deployment Status ==="
-	@echo ""
-	@echo "Local:"
-	@echo "  Version:   $(VERSION)"
-	@echo "  Image tag: $(IMAGE_TAG)"
-	@echo "  Registry:  $(REGISTRY)"
-	@echo ""
-	@echo "GitOps ($(LOOM_HUB_DIR)):"
-	@if [ -d "$(LOOM_HUB_DIR)" ]; then \
-		echo "  Current image tags:"; \
-		grep -r "$(REGISTRY)/mcp/custom-server:" $(LOOM_HUB_DIR)/servers/*/deployment.yaml 2>/dev/null | \
-			sed 's|.*/servers/||' | sed 's|/deployment.yaml:.*image: | -> |' | sort -u | head -10; \
-	else \
-		echo "  Directory not found"; \
-	fi
-	@echo ""
-	@echo "Kubernetes:"
-	@if command -v kubectl >/dev/null 2>&1; then \
-		kubectl get pods -n loom-hub -o wide 2>/dev/null | head -15 || echo "  Unable to connect to cluster"; \
-	else \
-		echo "  kubectl not found"; \
-	fi
+	@python3 scripts/deploy/flux_deploy.py status --file "$(FLUX_KUST)" --tag "$(IMAGE_TAG)" --registry "$(REGISTRY)" --namespace loom-hub --flux-namespace flux-system

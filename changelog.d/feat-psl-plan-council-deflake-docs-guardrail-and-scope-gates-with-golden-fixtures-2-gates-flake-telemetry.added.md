@@ -1,0 +1,1 @@
+- Emit bounded per-evaluation docs-guardrail and scope gate telemetry through `pkg/mills/gates/telemetry.go`, `pkg/eventpub/eventpub.go`, and `pkg/telemetry/telemetry.go`.

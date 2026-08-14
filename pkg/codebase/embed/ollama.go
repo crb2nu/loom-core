@@ -60,12 +60,14 @@ func (c *OllamaClient) EmbedQuery(ctx context.Context, query string) ([]float64,
 
 // EmbedDocuments embeds multiple documents.
 // Note: Ollama's /api/embed endpoint processes one at a time, so we batch sequentially.
-func (c *OllamaClient) EmbedDocuments(ctx context.Context, texts []string) ([][]float64, error) {
+func (c *OllamaClient) EmbedDocuments(ctx context.Context, texts []string) (results [][]float64, err error) {
+	observation := observeRequest(ctx, c.Name())
+	defer func() { observation.finish(err) }()
 	if len(texts) == 0 {
 		return [][]float64{}, nil
 	}
 
-	results := make([][]float64, 0, len(texts))
+	results = make([][]float64, 0, len(texts))
 	for _, text := range texts {
 		vec, err := c.embedSingle(ctx, text)
 		if err != nil {

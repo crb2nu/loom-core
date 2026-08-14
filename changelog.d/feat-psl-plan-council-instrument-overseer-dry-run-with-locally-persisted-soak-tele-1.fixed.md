@@ -1,0 +1,1 @@
+- Persist overseer dry-run soak decisions in UTC day buckets and fail closed when the seven-day telemetry window is incomplete or inconsistent (`pkg/mills/store/store.go`, `pkg/mills/overseer/overseer.go`, and `docs/MILLS.md`).

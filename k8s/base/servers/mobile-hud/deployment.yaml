@@ -1,0 +1,440 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: mobile-hud
+    component: mobile-hud
+  name: mobile-hud
+spec:
+  replicas: 1
+  # Recreate (not RollingUpdate): the workspace volume below is a
+  # ReadWriteOnce Longhorn volume, so the old pod must release it before
+  # the new one attaches — a surge pod would deadlock on the RWO mount.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mobile-hud
+  template:
+    metadata:
+      labels:
+        app: mobile-hud
+        component: mobile-hud
+    spec:
+      serviceAccountName: loom-hub
+      # loomd exits promptly on SIGTERM; the default 30s grace period just
+      # extends the Recreate outage window (old pod must fully terminate
+      # before the new one schedules). 10s covers in-flight request drain.
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - k3s-w-7
+      containers:
+        - name: loomd
+          # Concrete SHA tag is set via the platform/gitops Kustomization
+          # `images:` override (kustomization-loom-hub-servers.yaml). The
+          # `:latest` placeholder here only matches the override key.
+          image: registry.harbor.lan/mcp/loom-core:latest
+          # Always pull on rollout so a SHA bump in the gitops Kustomization
+          # picks up the new image even when the previous SHA was already
+          # cached on the node. Without this, IfNotPresent kept pods on
+          # whatever was first pulled, and SHA bumps silently no-op'd.
+          imagePullPolicy: Always
+          command:
+            - /usr/local/bin/loomd
+          args:
+            - --registry
+            - /etc/loom/registry.yaml
+            - --warm
+            - agent_context
+            - --target
+            - codex
+            - --hub-url
+            - ws://loom-gateway.loom-hub.svc.cluster.local/ws
+            - --hub-fallback=true
+            - --metrics-addr
+            - 127.0.0.1:9876
+            - --hud-port
+            - "3333"
+          env:
+            # mrwatch: MR-awareness poller for the HUD panels AND the mobile
+            # attention lanes (merge/conflict). The notifier is enabled by
+            # default once the poller exists (LOOM_MRWATCH_NOTIFY=off is the
+            # opt-OUT); without these three vars the poller never constructs
+            # and the phone's merge lanes are permanently empty. Token reuses
+            # the same loom-secrets key the mcp-gitlab server mounts. The
+            # shepherd (mutating auto-merge actor) stays default-off.
+            - name: GITLAB_API_URL
+              value: https://gitlab.flexinfer.ai/api/v4
+            - name: GITLAB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: GITLAB_PERSONAL_ACCESS_TOKEN
+            - name: LOOM_MRWATCH_PROJECTS
+              value: services/loom-core
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://langfuse-web.ai.svc.cluster.local:3000/api/public/otel"
+            - name: LOOM_AUDIT_ENABLED
+              value: "true"
+            - name: LOOM_AUDIT_LOG_PATH
+              value: /home/mcp/.config/loom/audit.jsonl
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: QDRANT_API_KEY
+            - name: MORPH_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: MORPH_API_KEY
+            - name: MORPH_BASE_URL
+              value: https://api.morphllm.com/v1
+            - name: MORPH_EMBED_MODEL
+              value: morph-embedding-v3
+            # HUD configuration (previously in separate hud container)
+            - name: HUD_BIND_ADDRESS
+              value: 0.0.0.0
+            - name: HUD_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: HUD_ADMIN_TOKEN
+            # Cloudflare Access SSO → HUD admin. A verified Access identity
+            # (Gmail login) for an allowlisted email is treated as admin, so the
+            # operator doesn't paste a token. The manual HUD_ADMIN_TOKEN above
+            # stays as the LAN/CLI fallback. Non-secret values (team domain +
+            # allowlist) are inline; the AUD is an optional secret so it can be
+            # added via SOPS to scope tokens to this app without a manifest edit.
+            - name: HUD_CF_ACCESS_TEAM_DOMAIN
+              value: flexinfer.cloudflareaccess.com
+            - name: HUD_ADMIN_EMAILS
+              value: cody.r.blevins@gmail.com
+            - name: HUD_CF_ACCESS_AUD
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: HUD_CF_ACCESS_AUD
+                  optional: true
+            # LAN trusted-network admin: on-LAN, split-horizon DNS points
+            # hud.flexinfer.ai at the internal nginx ingress, bypassing
+            # Cloudflare — so there's no Access JWT. Grant admin (no token) to
+            # requests whose real client IP is in the home LAN. Must be the LAN
+            # subnet only, never the pod/service CIDRs (10.x) — those are how
+            # in-cluster callers reach the HUD and they carry their own tokens.
+            - name: HUD_ADMIN_TRUSTED_CIDRS
+              value: 192.168.50.0/24
+            - name: HUD_MOBILE_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: HUD_MOBILE_OPERATOR_TOKEN
+            - name: HUD_MOBILE_OPERATOR_SCOPES
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: HUD_MOBILE_OPERATOR_SCOPES
+            - name: CACHE_BACKEND
+              value: memory
+            - name: SPAWN_ENABLED
+              value: "true"
+            # Stable logical owner for shared loom-spawn-state recovery. The
+            # Deployment is replicas=1 + Recreate, so only one live process may
+            # use this ID. A future multi-replica HUD must add leader election
+            # or a fencing epoch before sharing the same recovery domain.
+            - name: SPAWN_CONTROLLER_ID
+              value: loom-hub/mobile-hud
+            # Sole authority for migrating pre-owner ConfigMap rows and
+            # unlabeled orphan pods. Desktop loomd instances use distinct local
+            # IDs and must leave this disabled.
+            - name: SPAWN_RECOVERY_AUTHORITY
+              value: "true"
+            - name: SPAWN_REGISTRY
+              value: registry.harbor.lan/mcp
+            - name: SPAWN_NAMESPACE
+              value: devbox
+            - name: SPAWN_SYNC_MODE
+              value: git-clone
+            - name: SPAWN_GIT_BASE_URL
+              value: http://192.168.50.218/services
+            - name: SPAWN_GIT_SECRET
+              value: gitlab-creds
+            - name: SPAWN_PROJECTS
+              value: "loom-core,flexdeck,flexinfer,homelab-homepage,storyboard-generator,jobsearch-app"
+            - name: SPAWN_DEFAULT_CPU
+              value: "0.5"
+            - name: SPAWN_DEFAULT_MEMORY_MB
+              # 2 GiB OOMKilled claude-code within ~7s of `claude -p ...`
+              # against the loom-core source tree (PIPE-MILLS-CANARY-
+              # 20260514-142702 implement spawn-e06aa121df9e: exit 137,
+              # turn_count=0, total_cost_usd=0). Bump to 4 GiB so the
+              # agent has runway for a full multi-turn implement pass
+              # plus background JSONL parsing.
+              value: "4096"
+            # Max concurrent active spawn pods. Unset = the code default of 3
+            # (internal/hud/spawn.go DefaultSpawnConfig). On a working loop the
+            # daily council, daily canary, plan-slice emitter, and manual runs
+            # routinely overlap, so a cap of 3 serialized real work and — before
+            # the spawn-pool-saturation classifier fix (loom-core !857) — made
+            # over-limit requests escalate instantly with class=code, $0 cost.
+            # !857 makes saturation back off + retry; the ceiling is raised so
+            # the steady state no longer serializes.
+            #
+            # Raised 6 → 10 to give Mills headroom as demand expands across more
+            # repos (multi-repo intake). Each spawn is 0.5 CPU + 4 GiB
+            # (SPAWN_DEFAULT_*), so 10 = 5 CPU + 40 GiB against ~1.25 TiB cluster
+            # allocatable memory (16 nodes) — well under 4% of capacity. Capacity
+            # is not the constraint here; demand is. Image builds stay throttled
+            # to 1 via SPAWN_MAX_CONCURRENT_BUILDS below, so a higher run cap does
+            # not trigger a buildah thundering herd. Safe to raise further if
+            # demand grows.
+            - name: SPAWN_MAX_CONCURRENT
+              value: "10"
+            - name: SPAWN_MAX_CONCURRENT_BUILDS
+              value: "1"
+            - name: SPAWN_BUILD_CPU_REQUEST
+              value: 250m
+            - name: SPAWN_BUILD_CPU_LIMIT
+              value: 500m
+            - name: SPAWN_BUILD_EPHEMERAL_STORAGE_REQUEST
+              value: 2Gi
+            - name: SPAWN_BUILD_EPHEMERAL_STORAGE_LIMIT
+              value: 40Gi
+            - name: SPAWN_BUILD_AVOID_NODES
+              value: k3s-w-7,k3s-w-11
+            # Shared Go build/module cache for spawn pods. Cold-cache `go test`
+            # compiles were eating 20+ min of 25-min spawn deadlines
+            # (2026-07-26: 17/73 failed stage-attempts were deadline kills).
+            # Names the RWX claim in SPAWN_NAMESPACE (devbox); the orchestrator
+            # mounts it at /gocache and points GOCACHE/GOMODCACHE inside. Unset
+            # to disable (legacy per-spawn cold caches).
+            #
+            # The CLAIM ITSELF lives in platform/gitops k3s/devbox/, NOT in this
+            # tree: the loom-hub-servers Flux Kustomization pins
+            # targetNamespace: loom-hub, which overrides the `namespace:` of
+            # every resource here. A PVC declared here lands in loom-hub, where
+            # spawn pods in devbox cannot mount it (gitops!496). Anything the
+            # SPAWN pods must reach belongs in the devbox kustomization.
+            - name: SPAWN_GO_CACHE_PVC
+              value: spawn-go-cache
+            # Plan Store MCP wiring for spawned agent pods (loom-core MR !786).
+            # The spawn orchestrator (internal/hud/spawn.go) runs IN THIS
+            # process, so resolveSpawnLoomImage / resolvePlanStoreWSURL read
+            # THESE env vars (not the Mills operator's — the operator only POSTs
+            # a spawn request over HTTP). The generated spawn-runtime Dockerfile
+            # does `COPY --from=$SPAWN_LOOM_IMAGE /usr/local/bin/loom ...` to
+            # bundle the loom binary, and the codex/claude agent gets an injected
+            # [mcp_servers.loom] launching `loom proxy --ws-backend <url>` so it
+            # can call agent_plan_* against the agent-context Plan Store.
+            #
+            # SPAWN_LOOM_IMAGE: code default is loom-core:latest, kept here. This
+            # is a build-time `COPY --from` source, NOT a running workload — the
+            # spawn POD runs an immutable content-hashed spawn-runtime image, so
+            # `:latest` is acceptable (it never reaches a live pod tag). It also
+            # tracks the newest loom-core, i.e. the same image this daemon's
+            # loomd resolves to via its gitops `images:` newTag, giving the best
+            # day-to-day version-alignment. A static pin was evaluated and
+            # rejected (platform/gitops 2026-06-25): Flux Kustomization has no
+            # `replacements:` field and $imagepolicy markers are invisible inside
+            # `patch:` block scalars, so any pin is static and drifts OLDER than
+            # the daemon on every loom-core build — worse than :latest.
+            - name: SPAWN_LOOM_IMAGE
+              value: registry.harbor.lan/mcp/loom-core:latest
+            # SPAWN_CODEX_VERSION: pin the codex CLI baked into the spawn
+            # runtime image. 0.143.0 (the previous code default) still trips
+            # OpenAI's gpt-5.6 version gate (400 "requires a newer version of
+            # Codex"), which wedged every stage_models codex spawn from
+            # 2026-07-18. Set here so the FLUX APPLY takes effect immediately
+            # on the currently deployed image — the env changes the runtime
+            # Dockerfile hash, so the next spawn rebuilds at 0.144.6 without
+            # waiting for a loom-core image rollout. Matches the in-code
+            # default (internal/hud/spawn.go codexVersion) as of this commit;
+            # keep the two in sync or drop this env once the code default
+            # image is everywhere.
+            - name: SPAWN_CODEX_VERSION
+              value: "0.144.6"
+            # SPAWN_PLAN_STORE_WS_URL: agent-context Plan Store, plain MCP over
+            # WebSocket at /ws (the mcp-agent-context Deployment sets
+            # MCP_TRANSPORT=websocket on :8080). This equals the in-code default
+            # (resolvePlanStoreWSURL); set explicitly for self-documentation.
+            # Set to "disabled" to turn plan-store MCP wiring off entirely.
+            - name: SPAWN_PLAN_STORE_WS_URL
+              value: ws://mcp-agent-context.loom-hub.svc.cluster.local:8080/ws
+            # harvester-vm spawn substrate (Mills roadmap Slice A1). Registers
+            # the harvester-vm backend so Mills can route implement+tests of
+            # mills-canary-harvester-vm items to KubeVirt VMs. Empty kubeconfig
+            # would leave the substrate unregistered (k8s-only). The kubeconfig
+            # is mounted from the loom-hub harvester-kubeconfig Secret below,
+            # which holds a token for the namespaced `mills-spawn`
+            # ServiceAccount (harvester default ns) — NOT hypervisor admin.
+            # The SA's Role grants only the VM/VMI/PVC/Secret verbs
+            # HarvesterVMBackend needs; see platform/gitops/harvester/flux/
+            # apps/mills-spawn-rbac.yaml.
+            # SSH user is intentionally unset → backend defaults to "agent"
+            # (Slice 2d.5c home-parity). Storage class is the stock Ubuntu
+            # image for now; the curated mills-devbox-base image (B1) will
+            # swap it for a faster pre-baked class.
+            - name: SPAWN_HARVESTER_KUBECONFIG
+              value: /etc/harvester/kubeconfig
+            - name: SPAWN_HARVESTER_NAMESPACE
+              value: default
+            - name: SPAWN_HARVESTER_STORAGE_CLASS
+              value: longhorn-image-mc9ph
+            - name: SPAWN_HARVESTER_NAD
+              value: default/lan10g
+            # Embedded weaver (LLM-orchestrated multi-tool queries)
+            - name: WEAVER_ENABLED
+              value: "true"
+            - name: FLEXINFER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: FLEXINFER_URL
+            # FLEXINFER_URL above is misnamed for historical reasons:
+            # on the canonical cluster it points at the LiteLLM gateway
+            # (litellm.ai.svc.cluster.local) used by the coordinator
+            # and spawn paths. The aimodels domain's flexinfer-models
+            # endpoint needs the FlexInfer proxy directly to surface
+            # model availability badges in the AuditPanel / CouncilPanel
+            # ensemble block, so wire the proxy URL as a separate var.
+            # No secret needed — the in-cluster service URL is public.
+            - name: FLEXINFER_PROXY_URL
+              value: http://flexinfer-proxy.flexinfer-system.svc.cluster.local
+            - name: WEAVER_ROUTER_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: WEAVER_ROUTER_MODEL
+                  optional: true
+            - name: WEAVER_SUBAGENT_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: WEAVER_SUBAGENT_MODEL
+                  optional: true
+            # Mills operator proxy. Setting LOOM_MILLS_OPERATOR_URL flips
+            # the HUD's mills proxy from "503 — operator not configured"
+            # to live read-through against the loom-mills-operator
+            # service in the loom-mills namespace. Reads (Council
+            # panel, Pipelines panel, Backlog, Audit, Cross-repo,
+            # Squads, Debate transcripts) work immediately. Mutations
+            # (POST /council/run, /subrun, etc.) additionally require
+            # LOOM_MILLS_OPERATOR_TOKEN; until that's wired through
+            # SOPS into loom-secrets, mutating endpoints respond 401
+            # (graceful — the panels stay read-only).
+            - name: LOOM_MILLS_OPERATOR_URL
+              value: http://loom-mills-operator.loom-mills.svc.cluster.local:8090
+            - name: LOOM_MILLS_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: LOOM_MILLS_OPERATOR_TOKEN
+                  optional: true
+            # mrwatch shepherd: ENABLED 2026-08-09 as the serial merge queue's
+            # standing feeder. Post-!1548 the arm action no longer arms GitLab
+            # MWPS — it submits a SHA-pinned external candidate to the merge
+            # queue (fail-closed on disabled/full/unreachable), so the burst
+            # risk that kept this default-off is gone. Budget: 2 actions per
+            # MR per UTC day; kill switch = delete this env (or set "off").
+            - name: LOOM_MRWATCH_SHEPHERD
+              value: "on"
+            # The shepherd's enqueue bearer. NOTE the env NAME differs from
+            # the proxy's: shepherd.go reads LOOM_MILLS_ADMIN_TOKEN
+            # (EnvMillsOperatorToken), not LOOM_MILLS_OPERATOR_TOKEN — both
+            # draw the same operator admin credential from loom-secrets.
+            # Without this the enqueue POSTs unauthenticated and the
+            # operator's requireAdmin gate 401s every shepherd action.
+            - name: LOOM_MILLS_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loom-secrets
+                  key: LOOM_MILLS_OPERATOR_TOKEN
+                  optional: true
+            # HUD_PIPELINE_PROJECTS is intentionally unset: the embedded HUD
+            # auto-discovers projects via the `gitlab__list_projects` MCP tool
+            # at startup (internal/hud/embed.go). Set this env var explicitly
+            # only to pin a smaller subset of projects for pipeline monitoring.
+          ports:
+            - containerPort: 9876
+              name: metrics
+            - containerPort: 3333
+              name: http
+          # Tight readiness cadence: with strategy Recreate every roll is a
+          # full outage window, so the probe should mark the pod ready the
+          # moment /api/health answers rather than adding up to 18s of
+          # initialDelay+period slack on top of image pull + boot.
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3333
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3333
+            initialDelaySeconds: 12
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: registry
+              mountPath: /etc/loom
+              readOnly: true
+            # harvester-vm spawn substrate kubeconfig (Slice A1). Mounted as a
+            # file at SPAWN_HARVESTER_KUBECONFIG=/etc/harvester/kubeconfig.
+            - name: harvester-kubeconfig
+              mountPath: /etc/harvester
+              readOnly: true
+            # Read-only mount of the agent workspace so the spawn
+            # orchestrator's project resolver (internal/hud/spawn.go →
+            # resolveProjectPath, wsRoot=$HOME/workspace=/home/mcp/workspace)
+            # can find services/loom-core etc. on disk to fingerprint +
+            # generate the Dockerfile before kicking off a git-clone spawn
+            # pod. Backed by the healthy Longhorn PVC `loom-hub-workspace`
+            # (storageClass loom-ws-1r). Replaces the prior NFS export on
+            # `storage-vm-linux-nas-pilot`, which was halted during the
+            # 2026-06-21 storage-fault incident (two dying SAS disks).
+            # Orchestrator never writes here.
+            - name: workspace
+              mountPath: /home/mcp/workspace
+              readOnly: true
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      volumes:
+        - name: registry
+          configMap:
+            name: mobile-hud-registry
+        - name: harvester-kubeconfig
+          secret:
+            secretName: harvester-kubeconfig
+            items:
+              - key: kubeconfig
+                path: kubeconfig
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: loom-hub-workspace
+            readOnly: true

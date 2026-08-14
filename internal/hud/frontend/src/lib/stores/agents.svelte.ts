@@ -1,6 +1,7 @@
 // Agents store — agent list for task assignment and dispatch.
 // SSE-first: applies agent data from hud.fleet snapshots; falls back to /api/agents poll.
 import { eventStore } from './events.svelte.ts';
+import { createPoller } from '../utils/poller.ts';
 
 export interface Agent {
   agent_id: string;
@@ -18,7 +19,10 @@ class AgentStore {
   error = $state<string | null>(null);
   lastUpdated = $state<Date | null>(null);
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  // 30s fallback poll — fires only when SSE is disconnected.
+  private poller = createPoller(() => {
+    if (!eventStore.connected) this.fetch();
+  }, 30000);
   private eventUnsubs: Array<() => void> = [];
 
   get activeAgents(): Agent[] {
@@ -61,7 +65,7 @@ class AgentStore {
   startPolling(intervalMs = 30000): void {
     this.stopPolling();
     this.fetch();
-    this.pollTimer = setInterval(() => { if (!eventStore.connected) this.fetch(); }, intervalMs);
+    this.poller.start(intervalMs);
 
     // SSE-first: extract agents from fleet snapshots.
     this.eventUnsubs.push(
@@ -70,10 +74,7 @@ class AgentStore {
   }
 
   stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.poller.stop();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }

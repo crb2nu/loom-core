@@ -170,6 +170,69 @@ func TestGetFileEmbeddingCache(t *testing.T) {
 	}
 }
 
+func TestGetFilePreflight(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/collections/test/points/scroll" {
+			w.Header().Set("content-type", "application/json")
+			_, _ = w.Write([]byte(`{"result":{"points":[` +
+				`{"payload":{"chunk_type":"module","content_hash":"module-hash","embed_model":"model","file_path":"file"},"vector":[0.1,0.2]},` +
+				`{"payload":{"chunk_type":"function","content_hash":"h1","embed_model":"model"},"vector":[1,2,3]},` +
+				`{"payload":{"chunk_type":"class","content_hash":"h2","embed_model":"other"},"vector":[4,5,6]},` +
+				`{"payload":{"chunk_type":"function","content_hash":"h1","embed_model":"model"},"vector":[7,8,9]}` +
+				`],"next_page_offset":null}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(httpclient.NewDefault(), srv.URL, "", "test", "Cosine")
+	got, err := c.GetFilePreflight(context.Background(), "repo", "file", "model", 10)
+	if err != nil {
+		t.Fatalf("GetFilePreflight err=%v", err)
+	}
+	if !got.ModuleFound || got.ModuleContentHash != "module-hash" {
+		t.Fatalf("module preflight=%+v want module-hash", got)
+	}
+	if len(got.EmbeddingCache) != 2 {
+		t.Fatalf("embedding cache size=%d want 2", len(got.EmbeddingCache))
+	}
+	if vec := got.EmbeddingCache["module-hash"]; len(vec) != 2 || vec[0] != 0.1 {
+		t.Fatalf("embedding cache[module-hash]=%v want [0.1 0.2]", vec)
+	}
+	if vec := got.EmbeddingCache["h1"]; len(vec) != 3 || vec[0] != 1 {
+		t.Fatalf("embedding cache[h1]=%v want [1 2 3]", vec)
+	}
+}
+
+func TestGetFilePreflight_CollectionNotFound(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/collections/test/points/scroll" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"status":{"error":"collection not found"}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(httpclient.NewDefault(), srv.URL, "", "test", "Cosine")
+	got, err := c.GetFilePreflight(context.Background(), "repo", "file", "model", 10)
+	if err != nil {
+		t.Fatalf("GetFilePreflight err=%v", err)
+	}
+	if got.ModuleFound || got.ModuleContentHash != "" {
+		t.Fatalf("unexpected module preflight=%+v", got)
+	}
+	if len(got.EmbeddingCache) != 0 {
+		t.Fatalf("embedding cache size=%d want 0", len(got.EmbeddingCache))
+	}
+}
+
 func TestToPointID_IsDeterministicUUID(t *testing.T) {
 	t.Parallel()
 
@@ -237,6 +300,65 @@ func TestDoJSON_404WithoutCollectionMessageIsNotCollectionNotFound(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "qdrant HTTP 404") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUpsert_PassesWaitFlagInQueryString(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		wait     bool
+		wantWait string
+	}{
+		{name: "wait_false", wait: false, wantWait: "false"},
+		{name: "wait_true", wait: true, wantWait: "true"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var seenWait string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && r.URL.Path == "/collections/test/points" {
+					seenWait = r.URL.Query().Get("wait")
+					_, _ = w.Write([]byte(`{"status":"ok"}`))
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(srv.Close)
+
+			c := NewClient(httpclient.NewDefault(), srv.URL, "", "test", "Cosine")
+			points := []Point{{ID: "a", Vector: []float64{1, 2, 3}, Payload: map[string]any{"id": "a"}}}
+			if err := c.Upsert(context.Background(), points, tc.wait); err != nil {
+				t.Fatalf("Upsert err=%v", err)
+			}
+			if seenWait != tc.wantWait {
+				t.Fatalf("wait query=%q want %q", seenWait, tc.wantWait)
+			}
+		})
+	}
+}
+
+func TestUpsert_EmptyPointsIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(httpclient.NewDefault(), srv.URL, "", "test", "Cosine")
+	if err := c.Upsert(context.Background(), nil, true); err != nil {
+		t.Fatalf("Upsert(nil) err=%v", err)
+	}
+	if hits != 0 {
+		t.Fatalf("expected no HTTP calls for empty points, got %d", hits)
 	}
 }
 

@@ -1,0 +1,1 @@
+- Fixed `pkg/pm/config.go` embedding defaults to use the FlexInfer proxy's implicit port 80 and the `embeddings-1536` serving alias; serving availability remains dependent on the FlexInfer embedding lane.

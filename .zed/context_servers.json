@@ -1,0 +1,16 @@
+{
+  "_loom_policy": {
+    "gitops_flux": "enforced at loom proxy layer (no native hook support)"
+  },
+  "context_servers": {
+    "loom": {
+      "args": [
+        "proxy",
+        "--agent-hint",
+        "zed"
+      ],
+      "command": "/Users/cblevins/.local/bin/loom",
+      "timeout": 600
+    }
+  }
+}

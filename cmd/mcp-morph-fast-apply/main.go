@@ -16,10 +16,13 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/lifecycle"
+	"github.com/crb2nu/loom/pkg/llmusage"
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/pathsec"
 	"github.com/crb2nu/loom/pkg/validate"
 )
@@ -43,11 +46,37 @@ func main() {
 	}
 }
 
+// usageObserver reports per-completion token accounting from the Morph API.
+//
+// Package-level because handleEditFile is registered as a bare function
+// reference and has no logger in scope; run sets this once at startup, before
+// any tool can be dispatched. No Sink: this binary exports no Prometheus
+// registry, and read-only instrumentation is not a good enough reason to give
+// it one.
+var usageObserver llmusage.Observer
+
 func run(ctx context.Context) error {
 	logger := mcplog.NewDefault()
+	usageObserver = llmusage.Observer{Logger: logger, Component: "morph-fast-apply"}
+	tp, shutdownTracer, err := mcpotel.InitTracer(ctx, "mcp-morph-fast-apply",
+		logger)
+	if err != nil {
+		logger.Warn("OTel tracer init failed",
+			"error",
+
+			err)
+	}
+	defer func() {
+		_ =
+			shutdownTracer(ctx)
+	}()
+	tracer := mcpotel.
+		Tracer(tp, "mcp-morph-fast-apply")
+
 	logger.Info("starting server", "name", "mcp-morph-fast-apply", "version", version)
 
 	server := mcp.NewServer("mcp-morph-fast-apply", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Morph Fast Apply server for intelligent code editing. Use edit_file to apply code changes.")
 
 	// edit_file - Apply code edits to a file
@@ -72,9 +101,11 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"path", "instruction", "update"},
 		},
-	}, handleEditFile)
+	}, mcpotel.TracedToolHandler(
 
-	// Also register as morph_edit_file for compatibility
+		// Also register as morph_edit_file for compatibility
+		tracer, "edit_file", handleEditFile))
+
 	server.AddTool(mcp.Tool{
 		Name:        "morph_edit_file",
 		Description: "Apply code edits to a file using Morph's fast apply model (alias)",
@@ -96,7 +127,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"path", "instruction", "update"},
 		},
-	}, handleEditFile)
+	}, mcpotel.TracedToolHandler(tracer, "morph_edit_file", handleEditFile))
 
 	return server.Run(ctx)
 }
@@ -255,12 +286,24 @@ func handleEditFile(ctx context.Context, args map[string]any) (*mcp.CallToolResu
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
 			TotalTokens      int `json:"total_tokens"`
+			// The cached share of the prompt, in whichever dialect this
+			// gateway speaks. Morph's apply model re-sends the whole target
+			// file on every edit, so its prefix is about as reusable as
+			// prompts get — worth measuring before assuming otherwise.
+			PromptTokensDetails llmusage.Details `json:"prompt_tokens_details"`
+			InputTokensDetails  llmusage.Details `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("failed to parse response: %w", err)), nil
 	}
+
+	usageObserver.Observe(ctx, model, llmusage.Usage{
+		PromptTokens:       result.Usage.PromptTokens,
+		CachedPromptTokens: llmusage.CachedTokens(result.Usage.PromptTokensDetails, result.Usage.InputTokensDetails),
+		CompletionTokens:   result.Usage.CompletionTokens,
+	})
 
 	if len(result.Choices) == 0 {
 		return mcp.ErrorResult(fmt.Errorf("no response from Morph API")), nil

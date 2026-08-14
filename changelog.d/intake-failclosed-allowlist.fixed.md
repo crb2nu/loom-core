@@ -1,0 +1,1 @@
+- Reject unlisted cross-repository Mills intake targets before admission or dispatch, with fail-closed policy matching in `pkg/policy/policy.go`, enforcement in `pkg/mills/intake/intake.go`, and rejection accounting in `pkg/telemetry/telemetry.go`.

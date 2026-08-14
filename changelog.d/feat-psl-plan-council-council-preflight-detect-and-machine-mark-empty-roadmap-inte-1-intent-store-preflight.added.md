@@ -1,0 +1,1 @@
+- Add a Council preflight in `pkg/mills/council/council.go` that marks empty canonical roadmap-intent stores in planning briefs and records the event through the concurrency-safe counter in `pkg/telemetry/telemetry.go`.

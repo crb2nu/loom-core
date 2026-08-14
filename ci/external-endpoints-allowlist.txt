@@ -1,0 +1,11 @@
+# Deliberate direct-internet endpoints in CI YAML.
+#
+# Format: <repo-relative-path> <endpoint-key> # reason
+# The reason is mandatory — scripts/ci/check_ci_external_endpoints.sh rejects
+# entries without one. Endpoint keys are the rule names printed by that script.
+#
+# Before adding a line, check docs/ci-external-endpoints.md: most of these
+# already have an in-cluster cache in the `ci` namespace.
+
+.gitlab-ci.yml proxy.golang.org # GOPROXY fallback *after* athens; `|` only reaches it when athens errors
+.gitlab-ci.yml registry.gitlab.com # release-cli has no Harbor mirror; tag-only job, not on the merge path

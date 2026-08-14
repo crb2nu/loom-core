@@ -1,10 +1,14 @@
-<script>
+<script lang="ts">
+  import type { BadgeVariant } from '../utils/tokens.ts';
+  import type { KnowledgeEntry } from '../stores/knowledge.svelte.ts';
   import { knowledgeStore } from '../stores/knowledge.svelte.ts';
   import { formatNumber, relativeTime } from '../utils/format.ts';
   import Badge from '../widgets/Badge.svelte';
   import DataTable from './shared/DataTable.svelte';
   import FilterBar from './shared/FilterBar.svelte';
   import EmptyState from './shared/EmptyState.svelte';
+  import PanelHeader from './shared/PanelHeader.svelte';
+  import ErrorBanner from './shared/ErrorBanner.svelte';
 
   $effect(() => {
     knowledgeStore.startPolling(30000);
@@ -16,17 +20,55 @@
   let agents = $derived(knowledgeStore.agents);
 
   let searchInput = $state('');
-  let expandedIds = $state(new Set());
+  let expandedIds = $state<Set<string>>(new Set());
+
+  let topCategories = $derived.by(() =>
+    categories
+      .map((category) => ({
+        name: category,
+        count: entries.filter((entry) => entry.entry_type === category).length,
+      }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+      .slice(0, 6)
+  );
+
+  let topAgents = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const entry of entries) {
+      if (!entry.agent_id) continue;
+      counts.set(entry.agent_id, (counts.get(entry.agent_id) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+      .slice(0, 6);
+  });
+
+  let topNamespaces = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const entry of entries) {
+      if (!entry.namespace) continue;
+      counts.set(entry.namespace, (counts.get(entry.namespace) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+      .slice(0, 5);
+  });
+
+  let averageTokens = $derived.by(() =>
+    entries.length > 0 ? Math.round(knowledgeStore.totalTokens / entries.length) : 0
+  );
 
   // Sort state
   let sortKey = $state('timestamp');
-  let sortDir = $state('desc');
+  let sortDir = $state<'asc' | 'desc'>('desc');
 
   let sortedEntries = $derived.by(() => {
     const sorted = [...entries];
     sorted.sort((a, b) => {
-      let va = a[sortKey] ?? '';
-      let vb = b[sortKey] ?? '';
+      let va: string | number = (a as unknown as Record<string, string | number>)[sortKey] ?? '';
+      let vb: string | number = (b as unknown as Record<string, string | number>)[sortKey] ?? '';
       if (sortKey === 'token_count') {
         va = a.token_count ?? 0;
         vb = b.token_count ?? 0;
@@ -42,8 +84,8 @@
     { key: 'entry_type', label: 'Type', sortable: true, width: '90px' },
     { key: 'title', label: 'Title', sortable: true },
     { key: 'agent_id', label: 'Agent', sortable: true, width: '110px' },
-    { key: 'file_path', label: 'File', sortable: true, width: '120px' },
-    { key: 'token_count', label: 'Tokens', sortable: true, width: '70px', align: 'right' },
+    { key: 'file_path', label: 'File', sortable: true, width: '120px', hideBelow: 820 },
+    { key: 'token_count', label: 'Tokens', sortable: true, width: '70px', align: 'right' as const, hideBelow: 700 },
     { key: 'timestamp', label: 'Time', sortable: true, width: '80px' },
   ];
 
@@ -62,12 +104,12 @@
     },
   ]);
 
-  function handleSearch(val) {
+  function handleSearch(val: string) {
     searchInput = val;
     knowledgeStore.search(val);
   }
 
-  function handleFilter(key, value) {
+  function handleFilter(key: string, value: string) {
     if (key === 'category') {
       knowledgeStore.filterCategory = value || 'all';
       knowledgeStore.fetch();
@@ -77,12 +119,12 @@
     }
   }
 
-  function handleSort(key, dir) {
+  function handleSort(key: string, dir: 'asc' | 'desc') {
     sortKey = key;
     sortDir = dir;
   }
 
-  function toggleExpand(row) {
+  function toggleExpand(row: KnowledgeEntry) {
     const next = new Set(expandedIds);
     if (next.has(row.id)) {
       next.delete(row.id);
@@ -92,8 +134,8 @@
     expandedIds = next;
   }
 
-  function entryTypeColor(type) {
-    const map = {
+  function entryTypeColor(type: string) {
+    const map: Record<string, string> = {
       decision: 'var(--accent)',
       finding: 'var(--info)',
       error: 'var(--error)',
@@ -107,20 +149,24 @@
     return map[type] ?? 'var(--fg-muted)';
   }
 
-  function entryTypeVariant(type) {
-    const map = {
+  // 'summary'/default previously returned 'neutral', which is not a valid
+  // BadgeVariant and rendered as the info fallback; 'muted' is the neutral tone.
+  function entryTypeVariant(type: string): BadgeVariant {
+    const map: Record<string, BadgeVariant> = {
       decision: 'accent',
       finding: 'info',
       error: 'error',
       question: 'warning',
       task: 'success',
-      summary: 'neutral',
+      summary: 'muted',
     };
-    return map[type] ?? 'neutral';
+    return map[type] ?? 'muted';
   }
 </script>
 
 <div class="panel knowledge-panel">
+  <PanelHeader title="Knowledge" icon={'⦾'} count={knowledgeStore.entries.length} />
+
   <!-- Stats row -->
   <div class="stats-strip">
     <div class="stat-card">
@@ -157,65 +203,141 @@
     {/snippet}
   </FilterBar>
 
-  <!-- Entry table -->
-  <div class="entry-list">
-    {#if sortedEntries.length === 0 && !knowledgeStore.loading}
-      <EmptyState
-        icon={knowledgeStore.error ? '\u26A0' : '\u{1F4D6}'}
-        heading={knowledgeStore.error ? `Error: ${knowledgeStore.error}` : 'No knowledge entries found'}
-        description={knowledgeStore.error ? '' : 'Agents need active sessions with context.'}
-      />
-    {:else}
-      <DataTable
-        {columns}
-        rows={sortedEntries}
-        {sortKey}
-        {sortDir}
-        {expandedIds}
-        idKey="id"
-        loading={knowledgeStore.loading}
-        onSort={handleSort}
-        onToggleExpand={toggleExpand}
-      >
-        {#snippet row({ row: entry, expanded })}
-          <td style="border-left: 3px solid {entryTypeColor(entry.entry_type)}">
-            <Badge text={entry.entry_type} variant={entryTypeVariant(entry.entry_type)} />
-          </td>
-          <td class="entry-title">
-            <span class="expand-icon">{expanded ? '\u25BC' : '\u25B6'}</span>
-            {entry.title ?? '---'}
-          </td>
-          <td class="text-mono text-xs">{entry.agent_id || '---'}</td>
-          <td class="text-mono text-xs text-muted" title={entry.file_path}>
-            {#if entry.file_path}
-              {entry.file_path.split('/').pop()}
-            {:else}
-              ---
-            {/if}
-          </td>
-          <td class="text-mono text-xs" style="text-align: right">{formatNumber(entry.token_count ?? 0)}</td>
-          <td class="text-mono text-xs text-muted">{relativeTime(entry.timestamp)}</td>
-        {/snippet}
-        {#snippet expandedRow({ row: entry })}
-          <div class="expand-content">
-            <div class="expand-meta">
-              <span class="meta-item">Agent: <strong>{entry.agent_id}</strong></span>
-              <span class="meta-item">Session: <strong>{entry.session_id?.slice(0, 8) ?? '---'}</strong></span>
-              {#if entry.namespace}
-                <span class="meta-item">Namespace: <strong>{entry.namespace}</strong></span>
-              {/if}
+  {#if knowledgeStore.error}
+    <!-- Fetch errors on /api/knowledge were previously surfaced only
+         inside an EmptyState (when the table was empty), so a refresh
+         failure on a populated table left stale rows on screen with no
+         signal the data had gone stale. Banner mirrors the CatalogPanel
+         pattern and auto-clears on the next successful fetch (the store
+         resets error to null at fetch start). -->
+    <ErrorBanner prefix="Knowledge refresh failed" message={knowledgeStore.error} />
+  {/if}
+
+  <div class="knowledge-layout">
+    <!-- Entry table -->
+    <div class="entry-list">
+      {#if sortedEntries.length === 0 && !knowledgeStore.loading}
+        <EmptyState
+          icon={knowledgeStore.error ? '\u26A0' : '\u{1F4D6}'}
+          heading={knowledgeStore.error ? `Error: ${knowledgeStore.error}` : 'No knowledge entries found'}
+          description={knowledgeStore.error ? '' : 'Agents need active sessions with context.'}
+        />
+      {:else}
+        <DataTable
+          {columns}
+          rows={sortedEntries}
+          {sortKey}
+          {sortDir}
+          {expandedIds}
+          idKey="id"
+          stableLayout={true}
+          loading={knowledgeStore.loading}
+          onSort={handleSort}
+          onToggleExpand={toggleExpand}
+        >
+          {#snippet row({ row: entry, expanded, hiddenColumns })}
+            <td style="border-left: 3px solid {entryTypeColor(entry.entry_type)}">
+              <Badge text={entry.entry_type} variant={entryTypeVariant(entry.entry_type)} />
+            </td>
+            <td class="entry-title">
+              <span class="expand-icon">{expanded ? '\u25BC' : '\u25B6'}</span>
+              {entry.title ?? '---'}
+            </td>
+            <td class="text-mono text-xs">{entry.agent_id || '---'}</td>
+            {#if !hiddenColumns.has('file_path')}
+            <td class="text-mono text-xs text-muted" title={entry.file_path}>
               {#if entry.file_path}
-                <span class="meta-item">File: <strong>{entry.file_path}</strong></span>
+                {entry.file_path.split('/').pop()}
+              {:else}
+                ---
               {/if}
-              {#if entry.tags?.length}
-                <span class="meta-item">Tags: {entry.tags.join(', ')}</span>
-              {/if}
+            </td>
+            {/if}
+            {#if !hiddenColumns.has('token_count')}
+            <td class="text-mono text-xs" style="text-align: right">{formatNumber(entry.token_count ?? 0)}</td>
+            {/if}
+            <td class="text-mono text-xs text-muted">{relativeTime(entry.timestamp)}</td>
+          {/snippet}
+          {#snippet expandedRow({ row: entry })}
+            <div class="expand-content">
+              <div class="expand-meta">
+                <span class="meta-item">Agent: <strong>{entry.agent_id}</strong></span>
+                <span class="meta-item">Session: <strong>{entry.session_id?.slice(0, 8) ?? '---'}</strong></span>
+                {#if entry.namespace}
+                  <span class="meta-item">Namespace: <strong>{entry.namespace}</strong></span>
+                {/if}
+                {#if entry.file_path}
+                  <span class="meta-item">File: <strong>{entry.file_path}</strong></span>
+                {/if}
+                {#if entry.tags?.length}
+                  <span class="meta-item">Tags: {entry.tags.join(', ')}</span>
+                {/if}
+              </div>
+              <pre class="content-pre">{entry.content ?? '(no content)'}</pre>
             </div>
-            <pre class="content-pre">{entry.content ?? '(no content)'}</pre>
+          {/snippet}
+        </DataTable>
+      {/if}
+    </div>
+
+    <aside class="knowledge-rail">
+      <section class="rail-card">
+        <div class="rail-card-header">
+          <span class="rail-card-title">Entry Mix</span>
+          <span class="rail-card-meta text-mono">{averageTokens} avg tok</span>
+        </div>
+        {#if topCategories.length > 0}
+          <div class="rail-list">
+            {#each topCategories as category}
+              <div class="rail-list-row">
+                <Badge text={category.name} variant={entryTypeVariant(category.name)} />
+                <span class="rail-count text-mono">{formatNumber(category.count)}</span>
+              </div>
+            {/each}
           </div>
-        {/snippet}
-      </DataTable>
-    {/if}
+        {:else}
+          <div class="rail-empty">No categorized entries yet</div>
+        {/if}
+      </section>
+
+      <section class="rail-card">
+        <div class="rail-card-header">
+          <span class="rail-card-title">Top Agents</span>
+          <span class="rail-card-meta text-mono">{agents.length} active</span>
+        </div>
+        {#if topAgents.length > 0}
+          <div class="rail-list">
+            {#each topAgents as agent}
+              <div class="rail-list-row">
+                <span class="rail-label text-mono" title={agent.name}>{agent.name}</span>
+                <span class="rail-count text-mono">{agent.count}</span>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="rail-empty">No agents in current result set</div>
+        {/if}
+      </section>
+
+      <section class="rail-card">
+        <div class="rail-card-header">
+          <span class="rail-card-title">Busy Namespaces</span>
+          <span class="rail-card-meta text-mono">{knowledgeStore.tokenBudget} budget</span>
+        </div>
+        {#if topNamespaces.length > 0}
+          <div class="rail-stack">
+            {#each topNamespaces as namespace}
+              <div class="namespace-row">
+                <span class="namespace-name text-mono" title={namespace.name}>{namespace.name}</span>
+                <span class="namespace-count text-mono">{namespace.count}</span>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="rail-empty">Namespaces appear once agents write scoped context</div>
+        {/if}
+      </section>
+    </aside>
   </div>
 </div>
 
@@ -224,36 +346,54 @@
     display: flex;
     flex-direction: column;
     overflow-y: auto;
-    gap: 12px;
+    gap: var(--space-3);
   }
 
   .stats-strip {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: var(--space-3);
   }
 
   .stat-card {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
-    padding: 12px 16px;
-    text-align: center;
+    border-radius: var(--radius-md);
+    padding: var(--space-3) var(--space-3);
+    text-align: left;
+    position: relative;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
   }
 
   .stat-value {
-    font-size: 20px;
+    font-size: 18px;
     font-weight: 700;
     color: var(--fg-primary);
     line-height: 1.1;
   }
 
   .stat-label {
-    font-size: 9px;
+    font-size: var(--text-2xs);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--fg-muted);
-    margin-top: 4px;
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-dim);
+    margin-top: var(--space-1);
+  }
+
+  .knowledge-layout {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 280px;
+    gap: var(--space-3);
   }
 
   .entry-list {
@@ -263,8 +403,91 @@
     min-height: 200px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--border-radius);
+    border-radius: var(--radius-md);
     overflow: hidden;
+  }
+
+  .knowledge-rail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    min-height: 0;
+  }
+
+  .rail-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    position: relative;
+  }
+
+  .rail-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
+  }
+
+  .rail-card-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .rail-card-title {
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-muted);
+  }
+
+  .rail-card-meta {
+    font-size: var(--text-xs);
+    color: var(--fg-secondary);
+  }
+
+  .rail-list,
+  .rail-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .rail-list-row,
+  .namespace-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .rail-label,
+  .namespace-name {
+    color: var(--fg-primary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .rail-count,
+  .namespace-count {
+    color: var(--fg-secondary);
+    flex-shrink: 0;
+  }
+
+  .rail-empty {
+    font-size: var(--text-sm);
+    color: var(--fg-dim);
+    line-height: var(--leading-normal);
   }
 
   .entry-title {
@@ -277,23 +500,23 @@
   .expand-icon {
     font-size: 8px;
     color: var(--fg-muted);
-    margin-right: 6px;
+    margin-right: var(--space-2);
   }
 
   .expand-content {
     background: var(--bg-primary);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-subtle);
     border-radius: var(--radius-sm);
-    padding: 10px 14px;
-    margin-left: 16px;
+    padding: var(--space-3) var(--space-3);
+    margin-left: var(--space-4);
   }
 
   .expand-meta {
     display: flex;
     flex-wrap: wrap;
-    gap: 12px;
-    margin-bottom: 8px;
-    font-size: 11px;
+    gap: var(--space-3);
+    margin-bottom: var(--space-2);
+    font-size: var(--text-sm);
     color: var(--fg-secondary);
   }
 
@@ -303,11 +526,17 @@
 
   .content-pre {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--text-sm);
     color: var(--fg-secondary);
     white-space: pre-wrap;
     word-break: break-word;
-    line-height: 1.5;
+    line-height: var(--leading-normal);
     margin: 0;
+  }
+
+  @media (max-width: 1100px) {
+    .knowledge-layout {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

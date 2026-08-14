@@ -1,0 +1,1 @@
+- Add a flag-gated, concurrency-safe unread council digest notification trigger and platform-neutral notification seam in `pkg/mills/council/unread_trigger.go` and `internal/hud/notify/notify.go`.

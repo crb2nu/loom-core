@@ -1,10 +1,16 @@
-<script>
+<script lang="ts">
+  import type { BadgeVariant } from '../utils/tokens.ts';
+  import type { WorkflowSummary, WorkflowDefinition } from '../stores/workflows.svelte.ts';
   import { workflowStore } from '../stores/workflows.svelte.ts';
+  import { toastStore } from '../stores/toasts.svelte.ts';
   import { formatTime, formatDateTime, relativeTime, statusVariant } from '../utils/format.ts';
   import Badge from '../widgets/Badge.svelte';
   import DagView from '../widgets/DagView.svelte';
+  import ConfirmDialog from './shared/ConfirmDialog.svelte';
   import EmptyState from './shared/EmptyState.svelte';
   import FilterBar from './shared/FilterBar.svelte';
+  import PanelHeader from './shared/PanelHeader.svelte';
+  import ErrorBanner from './shared/ErrorBanner.svelte';
 
   $effect(() => {
     workflowStore.startPolling(5000);
@@ -37,22 +43,22 @@
   let selected = $derived(workflowStore.selectedWorkflow ?? null);
 
   /** Track whether we're viewing an instance or a definition. */
-  let viewMode = $state(/** @type {'instance' | 'definition' | null} */ (null));
-  let selectedDef = $state(/** @type {import('../stores/workflows.svelte.ts').WorkflowDefinition | null} */ (null));
+  let viewMode = $state<'instance' | 'definition' | null>(null);
+  let selectedDef = $state<WorkflowDefinition | null>(null);
 
-  function selectWorkflow(wf) {
+  function selectWorkflow(wf: WorkflowSummary) {
     viewMode = 'instance';
     selectedDef = null;
     workflowStore.fetchDetail(wf.id);
   }
 
-  function selectDefinition(def) {
+  function selectDefinition(def: WorkflowDefinition) {
     viewMode = 'definition';
     selectedDef = def;
   }
 
 
-  function stepProgress(wf) {
+  function stepProgress(wf: WorkflowSummary) {
     if (!wf.steps?.length) return '0/0';
     const done = wf.steps.filter(s =>
       s.status === 'completed' || s.status === 'approved'
@@ -60,7 +66,7 @@
     return `${done}/${wf.steps.length}`;
   }
 
-  function stepProgressPct(wf) {
+  function stepProgressPct(wf: WorkflowSummary) {
     // Use explicit progress field if available.
     if (typeof wf.progress === 'number') return wf.progress * 100;
     if (!wf.steps?.length) return 0;
@@ -70,7 +76,27 @@
     return (done / wf.steps.length) * 100;
   }
 
-  function dagSteps(wf) {
+  /**
+   * Label for a list row's progress slot. The SSE summary
+   * (workflows.svelte.ts applySnapshot) carries `progress` + `current_step`
+   * but NOT the `steps[]` array, so stepProgress() would render a misleading
+   * "0/0 steps" for every running workflow. Prefer a real step count when
+   * present (REST detail rows), then the progress %, then the current step —
+   * never imply zero total steps.
+   */
+  function listProgressLabel(wf: WorkflowSummary) {
+    if (wf.steps?.length) {
+      const done = wf.steps.filter(s =>
+        s.status === 'completed' || s.status === 'approved'
+      ).length;
+      return `${done}/${wf.steps.length} steps`;
+    }
+    if (typeof wf.progress === 'number') return `${Math.round(wf.progress * 100)}% complete`;
+    if (wf.current_step) return `@ ${wf.current_step}`;
+    return '';
+  }
+
+  function dagSteps(wf: WorkflowSummary) {
     if (!wf.steps) return [];
     return wf.steps.map(s => ({
       id: s.id ?? s.name,
@@ -81,8 +107,8 @@
   }
 
 
-  function eventVariant(eventType) {
-    const map = {
+  function eventVariant(eventType: string): BadgeVariant {
+    const map: Record<string, BadgeVariant> = {
       started: 'info',
       completed: 'success',
       failed: 'error',
@@ -106,22 +132,97 @@
     return selected.steps.find(s => s.status === 'waiting_approval');
   });
 
-  function approveStep() {
+  // Approve / Reject / Cancel are applied to a RUNNING autonomous workflow, so
+  // each one is stray-click gated through the shared ConfirmDialog and reports
+  // its outcome as a toast. The target ids are captured at click time: the
+  // panel re-polls detail every 5s, so `selected` / `waitingStep` can move
+  // between the click and the confirm.
+  type PendingDecision =
+    | { kind: 'approve' | 'reject'; label: string; workflowId: string; stepId: string }
+    | { kind: 'cancel'; label: string; workflowId: string };
+
+  let pending = $state<PendingDecision | null>(null);
+  let busy = $state(false);
+
+  const DIALOG_TITLES = {
+    approve: 'Approve this step?',
+    reject: 'Reject this step?',
+    cancel: 'Cancel this workflow?',
+  } as const;
+
+  const SUCCESS_COPY = {
+    approve: 'Step approved',
+    reject: 'Step rejected',
+    cancel: 'Workflow cancelled',
+  } as const;
+
+  const ACTION_VERBS = {
+    approve: 'Approve',
+    reject: 'Reject',
+    cancel: 'Cancel workflow',
+  } as const;
+
+  function requestDecision(kind: 'approve' | 'reject') {
     const step = waitingStep;
-    if (step && selected) {
-      workflowStore.approveStep(selected.id, step.id ?? step.name);
+    if (!step || !selected) return;
+    pending = {
+      kind,
+      label: `Step "${step.name ?? step.id}" of ${selected.name ?? selected.id}`,
+      workflowId: selected.id,
+      stepId: step.id ?? step.name,
+    };
+  }
+
+  function requestCancel() {
+    if (!selected) return;
+    pending = {
+      kind: 'cancel',
+      label: `Workflow ${selected.name ?? selected.id}`,
+      workflowId: selected.id,
+    };
+  }
+
+  async function runPending(): Promise<void> {
+    const req = pending;
+    if (!req) return;
+    busy = true;
+    try {
+      if (req.kind === 'approve') await workflowStore.approveStep(req.workflowId, req.stepId);
+      else if (req.kind === 'reject') await workflowStore.rejectStep(req.workflowId, req.stepId);
+      else await workflowStore.cancelWorkflow(req.workflowId);
+      const failure = workflowStore.actionError;
+      if (failure) toastStore.error(`${ACTION_VERBS[req.kind]} failed: ${failure}`);
+      else toastStore.success(SUCCESS_COPY[req.kind]);
+    } finally {
+      busy = false;
+      pending = null;
     }
   }
 
-  function rejectStep() {
-    const step = waitingStep;
-    if (step && selected) {
-      workflowStore.rejectStep(selected.id, step.id ?? step.name);
-    }
+  function clearFilters() {
+    searchQuery = '';
+    filterStatus = '';
   }
+
+  // Cancelling an already-terminal workflow is a no-op server-side; keep
+  // the button visible for layout stability but disable it, matching how
+  // Approve/Reject are gated on hasWaitingStep.
+  const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+  let selectedIsTerminal = $derived(TERMINAL_STATUSES.has(selected?.status ?? ''));
 </script>
 
 <div class="panel workflows-panel">
+  <PanelHeader title="Workflows" icon={'⚙'} count={workflows.length}>
+    {#snippet stats()}
+      <span class="text-muted text-xs">{definitions.length} definition{definitions.length === 1 ? '' : 's'}</span>
+    {/snippet}
+  </PanelHeader>
+
+  {#if workflowStore.error}
+    <ErrorBanner prefix="Workflow refresh failed" message={workflowStore.error} />
+  {/if}
+
+  <div class="wf-body">
   <!-- Left sidebar: workflow list -->
   <div class="wf-sidebar">
     <div class="sidebar-filter">
@@ -141,20 +242,18 @@
         resultCount={filteredWorkflows.length + filteredDefinitions.length}
         onSearch={(q) => { searchQuery = q; }}
         onFilter={(key, val) => { if (key === 'status') filterStatus = val; }}
+        onClear={clearFilters}
       />
     </div>
     {#if workflowStore.loading}
       <div class="loading-bar"><div class="loading-bar-inner"></div></div>
     {/if}
-    {#if workflowStore.error}
-      <div class="wf-error-banner text-xs text-muted" style="padding: 4px 12px; color: var(--error);">
-        {workflowStore.error}
-      </div>
-    {/if}
     <div class="wf-list">
-      <!-- Running instances -->
+      <!-- Workflow instances — the list mixes every lifecycle state
+           (running, waiting, cancelled, failed), so the heading must not
+           claim "Running"; each row's status badge carries the state. -->
       {#if filteredWorkflows.length > 0}
-        <div class="wf-section-label">Running</div>
+        <div class="wf-section-label">Instances</div>
         {#each filteredWorkflows as wf (wf.id)}
           <button
             class="wf-item"
@@ -166,7 +265,7 @@
               <Badge text={wf.status ?? 'pending'} variant={statusVariant(wf.status)} />
             </div>
             <div class="wf-item-bottom">
-              <span class="wf-progress text-mono text-xs">{stepProgress(wf)} steps</span>
+              <span class="wf-progress text-mono text-xs">{listProgressLabel(wf)}</span>
               <span class="wf-time text-mono text-xs text-muted">{relativeTime(wf.started_at)}</span>
             </div>
             <div class="wf-progress-track">
@@ -250,7 +349,7 @@
             {#each selected.events as event, i (event.id ?? `${event.timestamp}-${i}`)}
               <div class="event-row">
                 <span class="event-time text-mono">{formatTime(event.timestamp)}</span>
-                <Badge text={event.event_type ?? 'event'} variant={eventVariant(event.event_type)} />
+                <Badge text={event.event_type ?? 'event'} variant={eventVariant(event.event_type ?? '')} />
                 {#if event.step_name}
                   <span class="event-step text-mono">{event.step_name}</span>
                 {/if}
@@ -269,20 +368,27 @@
       <div class="action-bar">
         <button
           class="btn btn-success"
-          disabled={!hasWaitingStep}
-          onclick={approveStep}
+          disabled={!hasWaitingStep || busy}
+          onclick={() => requestDecision('approve')}
         >
           Approve
         </button>
         <button
           class="btn btn-danger"
-          disabled={!hasWaitingStep}
-          onclick={rejectStep}
+          disabled={!hasWaitingStep || busy}
+          onclick={() => requestDecision('reject')}
         >
           Reject
         </button>
         <div class="toolbar-spacer"></div>
-        <button class="btn btn-ghost" onclick={() => { if (selected) workflowStore.cancelWorkflow(selected.id); }}>Cancel Workflow</button>
+        <button
+          class="btn btn-ghost"
+          disabled={selectedIsTerminal || busy}
+          title={selectedIsTerminal ? `Workflow already ${selected?.status}` : 'Cancel this workflow'}
+          onclick={requestCancel}
+        >
+          Cancel Workflow
+        </button>
       </div>
 
     {:else if viewMode === 'definition' && selectedDef}
@@ -349,13 +455,34 @@
       <EmptyState icon={'\u2699'} heading="Select a workflow" description="Choose a workflow from the list to view its DAG and events" />
     {/if}
   </div>
+  </div>
 </div>
+
+<ConfirmDialog
+  open={pending !== null}
+  title={pending ? DIALOG_TITLES[pending.kind] : ''}
+  message={pending
+    ? `${pending.label} — this decision is applied to the running autonomous workflow immediately.`
+    : ''}
+  confirmLabel={pending ? ACTION_VERBS[pending.kind] : 'Confirm'}
+  variant={pending?.kind === 'approve' ? 'default' : 'danger'}
+  onConfirm={runPending}
+  onCancel={() => (pending = null)}
+/>
 
 <style>
   .workflows-panel {
     display: flex;
+    flex-direction: column;
     overflow: hidden;
     gap: 0;
+  }
+
+  .wf-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
   }
 
   /* Sidebar */
@@ -382,40 +509,47 @@
     flex-direction: column;
     gap: 4px;
     width: 100%;
-    padding: 8px 12px;
+    padding: var(--space-2) var(--space-3);
     text-align: left;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--border-subtle);
     cursor: pointer;
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
 
   .wf-item:hover {
     background: var(--bg-tertiary);
   }
 
+  .wf-item:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
   .wf-selected {
-    background: rgba(1, 135, 153, 0.08) !important;
+    background: var(--info-dim) !important;
     border-left: 3px solid var(--info);
     padding-left: 11px;
+    box-shadow: 0 0 6px var(--glow-accent);
   }
 
   .wf-item-top {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
+    gap: var(--space-2);
   }
 
   .wf-name {
     font-weight: 500;
     color: var(--fg-primary);
-    font-size: 12px;
+    font-size: var(--text-sm);
   }
 
   .wf-item-bottom {
     display: flex;
     justify-content: space-between;
-    gap: 8px;
+    gap: var(--space-2);
   }
 
   .wf-progress {
@@ -436,8 +570,20 @@
   }
 
   .detail-top {
-    padding: 14px 16px;
+    position: relative;
+    padding: var(--space-3) var(--space-4);
     border-bottom: 1px solid var(--border);
+  }
+
+  .detail-top::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 10%;
+    right: 10%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(var(--info-rgb), 0.06) 50%, transparent);
+    pointer-events: none;
   }
 
   .detail-title-row {
@@ -448,7 +594,7 @@
   }
 
   .detail-title {
-    font-size: 16px;
+    font-size: var(--text-lg);
     font-weight: 600;
     color: var(--fg-primary);
     margin: 0;
@@ -456,7 +602,7 @@
 
   .detail-meta {
     display: flex;
-    gap: 16px;
+    gap: var(--space-4);
     flex-wrap: wrap;
   }
 
@@ -464,7 +610,7 @@
     flex: 1;
     min-height: 120px;
     overflow: auto;
-    padding: 12px 16px;
+    padding: var(--space-3) var(--space-4);
     border-bottom: 1px solid var(--border);
   }
 
@@ -478,8 +624,13 @@
   }
 
   .events-header {
-    padding: 8px 16px;
+    padding: var(--space-2) var(--space-4);
     border-bottom: 1px solid var(--border);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-muted);
   }
 
   .events-scroll {
@@ -490,10 +641,15 @@
   .event-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 5px 16px;
-    font-size: 12px;
-    border-bottom: 1px solid rgba(3, 89, 100, 0.3);
+    gap: var(--space-2);
+    padding: 5px var(--space-4);
+    font-size: var(--text-xs);
+    border-bottom: 1px solid var(--border-subtle);
+    transition: background var(--transition-fast);
+  }
+
+  .event-row:hover {
+    background: var(--bg-elevated);
   }
 
   .event-row:last-child {
@@ -501,32 +657,46 @@
   }
 
   .event-time {
-    color: var(--fg-muted);
-    font-size: 11px;
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+    font-family: var(--font-mono);
     flex-shrink: 0;
     width: 65px;
+    letter-spacing: var(--tracking-normal);
   }
 
   .event-step {
     color: var(--fg-secondary);
-    font-size: 11px;
+    font-size: var(--text-xs);
+    font-family: var(--font-mono);
     flex-shrink: 0;
   }
 
   .event-details {
     flex: 1;
     min-width: 0;
-    font-size: 11px;
+    font-size: var(--text-xs);
+    color: var(--fg-secondary);
   }
 
   /* Action bar */
   .action-bar {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
     background: var(--bg-secondary);
     border-top: 1px solid var(--border);
+    position: relative;
+  }
+
+  .action-bar::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
   }
 
   .action-bar .btn:disabled {
@@ -536,12 +706,12 @@
 
   /* Section labels */
   .wf-section-label {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--fg-muted);
-    padding: 8px 14px 4px;
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-dim);
+    padding: var(--space-2) var(--space-3) var(--space-1);
     background: var(--bg-secondary);
   }
 
@@ -553,21 +723,21 @@
   .def-detail-body {
     flex: 1;
     overflow-y: auto;
-    padding: 16px;
+    padding: var(--space-4);
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: var(--space-5);
   }
 
   .def-description {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: var(--space-2);
   }
 
   .def-description-text {
     color: var(--fg-secondary);
-    font-size: 13px;
+    font-size: var(--text-sm);
     line-height: 1.5;
     margin: 0;
   }
@@ -575,31 +745,47 @@
   .def-info-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-    gap: 10px;
+    gap: var(--space-2);
   }
 
   .def-info-card {
     display: flex;
     flex-direction: column;
     gap: 3px;
-    padding: 10px 12px;
+    padding: var(--space-2) var(--space-3);
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
+    position: relative;
+    transition: border-color var(--transition-fast);
+  }
+
+  .def-info-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--surface-highlight);
+    pointer-events: none;
+  }
+
+  .def-info-card:hover {
+    border-color: color-mix(in srgb, var(--info) 30%, var(--border));
   }
 
   .def-info-label {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.3px;
-    color: var(--fg-muted);
+    letter-spacing: var(--tracking-wide);
+    color: var(--fg-dim);
   }
 
   .def-info-value {
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--fg-primary);
     word-break: break-all;
+    font-family: var(--font-mono);
   }
 
   .def-usage {
@@ -610,14 +796,15 @@
 
   .def-usage-code {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--fg-secondary);
     background: var(--bg-tertiary);
-    padding: 10px 12px;
+    padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-md);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-subtle);
     white-space: pre-wrap;
     word-break: break-all;
+    letter-spacing: var(--tracking-normal);
   }
 
   .wf-progress-track {
@@ -632,7 +819,8 @@
     height: 100%;
     background: var(--success);
     border-radius: 2px;
-    transition: width 0.3s ease;
+    transition: width var(--transition-normal);
+    box-shadow: 0 0 4px var(--glow-success);
   }
 
   /* Loading bar */

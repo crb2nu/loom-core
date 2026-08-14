@@ -1,0 +1,1 @@
+- Join HUD merge-queue candidates to MR-watch state by source branch, showing the existing merge request and preventing conflicted or stalled MRs from appearing ready.

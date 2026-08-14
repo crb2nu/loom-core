@@ -1,0 +1,1 @@
+- Make `spec_conformance`, `scope`, `pr_self_review`, and `nonempty_diff` emit deterministic reason codes and pin their replay verdicts in `pkg/mills/gates/`.

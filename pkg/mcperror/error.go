@@ -3,6 +3,7 @@ package mcperror
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -223,16 +224,23 @@ func APIError(service string, statusCode int, body string) *Error {
 
 // IsNotFound returns true if the error is a not found error (HTTP 404).
 func IsNotFound(err error) bool {
-	if mcpErr, ok := err.(*Error); ok {
-		return mcpErr.Code == CodeNotFound
-	}
-	return false
+	return codeMatches(err, CodeNotFound)
 }
 
 // IsServerError returns true if the error is a server error (HTTP 5xx).
 func IsServerError(err error) bool {
-	if mcpErr, ok := err.(*Error); ok {
-		return mcpErr.Code == CodeServerError
+	return codeMatches(err, CodeServerError)
+}
+
+// codeMatches reports whether err (or any error it wraps) is an *Error with
+// the given code. errors.As unwraps fmt.Errorf("...: %w") chains, and the
+// explicit nil check guards the typed-nil trap: Wrap/OperationFailed/WrapAPI
+// return a nil *Error for a nil input, which becomes a non-nil error
+// interface holding a nil pointer — dereferencing its Code would panic.
+func codeMatches(err error, code string) bool {
+	var mcpErr *Error
+	if errors.As(err, &mcpErr) && mcpErr != nil {
+		return mcpErr.Code == code
 	}
 	return false
 }

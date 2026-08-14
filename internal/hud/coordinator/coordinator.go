@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +57,9 @@ type Coordinator struct {
 	// Concurrency control.
 	sem chan struct{} // Semaphore limiting concurrent LLM calls.
 
+	// Metrics — optional, nil when metrics are not initialized.
+	metrics *Metrics
+
 	// State.
 	mu              sync.RWMutex
 	healthy         bool
@@ -80,7 +84,7 @@ func NewCoordinator(cfg Config, agent *bridge.AgentBridge, sse SSEBroadcaster, l
 	logger = logger.With("component", "coordinator")
 
 	breaker := NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerReset)
-	client := NewFlexInferClient(cfg.FlexInferURL, cfg.FlexInferKey, breaker, logger)
+	client := NewFlexInferClient(cfg.FlexInferURL, cfg.FlexInferKey, cfg.DefaultTimeout, breaker, logger)
 
 	c := &Coordinator{
 		config: cfg,
@@ -92,24 +96,62 @@ func NewCoordinator(cfg Config, agent *bridge.AgentBridge, sse SSEBroadcaster, l
 		stopCh: make(chan struct{}),
 	}
 
+	// Resolve the default model once so all subsystems use a consistent,
+	// fallback-aware model string. selectModel checks available models
+	// against the preferred and fallback configuration.
+	resolvedModel := c.selectModel(cfg.DefaultModel)
+
 	// Initialize subsystems based on feature toggles.
 	if cfg.EnableSummarizer {
-		c.summarizer = NewSummarizer(client, agent, cfg, logger)
+		s := NewSummarizer(client, agent, cfg, logger)
+		s.model = resolvedModel
+		c.summarizer = s
 	}
 	if cfg.EnableCompressor {
-		c.compressor = NewCompressor(client, agent, cfg, logger)
+		comp := NewCompressor(client, agent, cfg, logger)
+		comp.model = resolvedModel
+		c.compressor = comp
 	}
 	if cfg.EnableTriager {
-		c.triager = NewTriager(client, agent, cfg, logger)
+		t := NewTriager(client, agent, cfg, logger)
+		t.model = resolvedModel
+		c.triager = t
 	}
 	if cfg.EnableExtractor {
-		c.extractor = NewExtractor(client, agent, cfg, logger)
+		e := NewExtractor(client, agent, cfg, logger)
+		e.model = resolvedModel
+		c.extractor = e
 	}
 	if cfg.EnablePlanner {
 		c.planner = NewPlanner(client, agent, cfg, logger)
 	}
 
 	return c
+}
+
+// Client returns the coordinator's FlexInfer (LiteLLM gateway) client so
+// other HUD subsystems (e.g. the autofix engine) can share the same
+// connection, circuit breaker, and usage accounting instead of dialing a
+// second client from the same config.
+func (c *Coordinator) Client() *FlexInferClient {
+	if c == nil {
+		return nil
+	}
+	return c.client
+}
+
+// SetMetrics attaches Prometheus metrics to the coordinator and its subsystems.
+func (c *Coordinator) SetMetrics(m *Metrics) {
+	c.metrics = m
+	if c.summarizer != nil {
+		c.summarizer.metrics = m
+	}
+	// Route per-completion token accounting into the same registry. Metrics
+	// arrive after the client is constructed, hence a setter rather than a
+	// constructor argument.
+	if c.client != nil {
+		c.client.SetUsageSink(m)
+	}
 }
 
 // Start performs an initial health check and begins the background poll loop.
@@ -148,7 +190,7 @@ func (c *Coordinator) Start() error {
 
 	c.broadcastEvent("coordinator.health", map[string]any{
 		"flexinfer_healthy": true,
-		"circuit_state":     c.client.breaker.State().String(),
+		"circuit_state":     c.client.Breaker().State().String(),
 		"model":             c.config.DefaultModel,
 	})
 
@@ -181,8 +223,8 @@ func (c *Coordinator) Status() CoordinatorStatus {
 		Enabled:      true,
 		Healthy:      c.healthy,
 		Model:        c.config.DefaultModel,
-		CircuitState: c.client.breaker.State().String(),
-		Failures:     c.client.breaker.Failures(),
+		CircuitState: c.client.Breaker().State().String(),
+		Failures:     c.client.Breaker().Failures(),
 		Subsystems: SubsystemMap{
 			Summarizer: c.config.EnableSummarizer,
 			Compressor: c.config.EnableCompressor,
@@ -215,16 +257,13 @@ func (c *Coordinator) OnSessionEnd(sessionID, agentID string) {
 			"session_id": sessionID,
 		})
 
-		result, err := c.summarizer.SummarizeSession(ctx, sessionID)
+		result, err := c.summarizeSessionWithTelemetry(ctx, sessionID, agentID)
 		if err != nil {
 			c.logger.Warn("summarize session failed", "session_id", sessionID, "error", err)
 			return
 		}
 
-		c.broadcastEvent("coordinator.summarize.complete", map[string]any{
-			"session_id":      sessionID,
-			"summary_preview": truncate(result.Summary, 200),
-		})
+		c.broadcastEvent("coordinator.summarize.complete", summaryEventPayload(result))
 	}()
 }
 
@@ -238,14 +277,14 @@ func (c *Coordinator) SummarizeSession(ctx context.Context, sessionID string) (*
 	if c.summarizer == nil {
 		return nil, fmt.Errorf("summarizer is disabled")
 	}
-	if !c.client.breaker.IsAvailable() {
+	if !c.client.Breaker().IsAvailable() {
 		return nil, ErrUnavailable
 	}
 	if !c.acquireSem() {
 		return nil, ErrUnavailable
 	}
 	defer c.releaseSem()
-	return c.summarizer.SummarizeSession(ctx, sessionID)
+	return c.summarizeSessionWithTelemetry(ctx, sessionID, "")
 }
 
 // RunCompression performs on-demand memory compression (for API calls).
@@ -254,7 +293,7 @@ func (c *Coordinator) RunCompression(ctx context.Context) (*CompactionResult, er
 	if c.compressor == nil {
 		return nil, fmt.Errorf("compressor is disabled")
 	}
-	if !c.client.breaker.IsAvailable() {
+	if !c.client.Breaker().IsAvailable() {
 		return nil, ErrUnavailable
 	}
 	if !c.acquireSem() {
@@ -270,7 +309,7 @@ func (c *Coordinator) PlanWorkflow(ctx context.Context, goal, namespace string) 
 	if c.planner == nil {
 		return nil, fmt.Errorf("planner is disabled")
 	}
-	if !c.client.breaker.IsAvailable() {
+	if !c.client.Breaker().IsAvailable() {
 		return nil, ErrUnavailable
 	}
 	if !c.acquireSem() {
@@ -335,14 +374,16 @@ func (c *Coordinator) adjustInterval(pollOK bool) time.Duration {
 
 // poll executes one sweep cycle. Returns true if the cycle was healthy.
 func (c *Coordinator) poll() bool {
+	pollStart := time.Now()
+
 	c.mu.Lock()
-	c.lastPoll = time.Now()
+	c.lastPoll = pollStart
 	c.mu.Unlock()
 
 	// ── Health check ───────────────────────────────────────────────
 	// Skip when circuit is open — the breaker's half-open probe handles recovery.
 	prevHealthy := c.isHealthy()
-	if c.client.breaker.IsAvailable() {
+	if c.client.Breaker().IsAvailable() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := c.client.HealthCheck(ctx)
 		cancel()
@@ -354,9 +395,11 @@ func (c *Coordinator) poll() bool {
 			if prevHealthy {
 				c.broadcastEvent("coordinator.health", map[string]any{
 					"flexinfer_healthy": false,
-					"circuit_state":     c.client.breaker.State().String(),
+					"circuit_state":     c.client.Breaker().State().String(),
 				})
 			}
+			c.recordHealthMetrics(false)
+			c.recordPollMetrics(pollStart)
 			return false
 		}
 		c.mu.Lock()
@@ -365,7 +408,7 @@ func (c *Coordinator) poll() bool {
 		if !prevHealthy {
 			c.broadcastEvent("coordinator.health", map[string]any{
 				"flexinfer_healthy": true,
-				"circuit_state":     c.client.breaker.State().String(),
+				"circuit_state":     c.client.Breaker().State().String(),
 				"model":             c.config.DefaultModel,
 			})
 		}
@@ -375,34 +418,38 @@ func (c *Coordinator) poll() bool {
 		c.healthy = false
 		c.mu.Unlock()
 		c.logger.Debug("coordinator poll skipped: circuit open")
+		c.recordHealthMetrics(false)
+		c.recordPollMetrics(pollStart)
 		return false
 	}
 
 	// ── Subsystems — each gets its own short context ───────────────
 	// Check circuit before each step to bail fast on cascading failures.
 
-	if c.summarizer != nil && c.client.breaker.IsAvailable() {
+	if c.summarizer != nil && c.client.Breaker().IsAvailable() {
 		if c.acquireSem() {
 			ctx, cancel := context.WithTimeout(context.Background(), c.config.SubsystemTimeout)
 			count, err := c.summarizer.SweepEndedSessions(ctx, c.config.MaxSweepSessions)
 			cancel()
 			c.releaseSem()
+			c.recordSubsystem("summarizer", err)
 			if err != nil {
-				c.logger.Debug("sweep ended sessions error", "error", err)
+				c.logger.Warn("sweep ended sessions error", "error", err)
 			} else if count > 0 {
 				c.logger.Info("swept ended sessions", "summarized", count)
 			}
 		}
 	}
 
-	if c.triager != nil && c.client.breaker.IsAvailable() {
+	if c.triager != nil && c.client.Breaker().IsAvailable() {
 		if c.acquireSem() {
 			ctx, cancel := context.WithTimeout(context.Background(), c.config.SubsystemTimeout)
 			result, err := c.triager.TriageRecent(ctx)
 			cancel()
 			c.releaseSem()
+			c.recordSubsystem("triager", err)
 			if err != nil {
-				c.logger.Debug("triage recent error", "error", err)
+				c.logger.Warn("triage recent error", "error", err)
 			} else if result != nil && result.Count > 0 {
 				c.broadcastEvent("coordinator.triage.complete", map[string]any{
 					"count":    result.Count,
@@ -413,14 +460,15 @@ func (c *Coordinator) poll() bool {
 		}
 	}
 
-	if c.extractor != nil && c.client.breaker.IsAvailable() {
+	if c.extractor != nil && c.client.Breaker().IsAvailable() {
 		if c.acquireSem() {
 			ctx, cancel := context.WithTimeout(context.Background(), c.config.SubsystemTimeout)
 			result, err := c.extractor.ExtractRecent(ctx)
 			cancel()
 			c.releaseSem()
+			c.recordSubsystem("extractor", err)
 			if err != nil {
-				c.logger.Debug("extract recent error", "error", err)
+				c.logger.Warn("extract recent error", "error", err)
 			} else if result != nil && (result.EntitiesAdded > 0 || result.RelationsAdded > 0) {
 				c.broadcastEvent("coordinator.extract.complete", map[string]any{
 					"entities_added":  result.EntitiesAdded,
@@ -430,25 +478,57 @@ func (c *Coordinator) poll() bool {
 		}
 	}
 
-	if c.compressor != nil && c.client.breaker.IsAvailable() {
+	if c.compressor != nil && c.client.Breaker().IsAvailable() {
 		if c.acquireSem() {
 			ctx, cancel := context.WithTimeout(context.Background(), c.config.SubsystemTimeout)
 			result, err := c.compressor.RunCompactionCycle(ctx)
 			cancel()
 			c.releaseSem()
+			c.recordSubsystem("compressor", err)
 			if err != nil {
-				c.logger.Debug("compaction cycle error", "error", err)
-			} else if result != nil && result.CompressedCount > 0 {
-				c.broadcastEvent("coordinator.compress.complete", map[string]any{
-					"tier":             result.Tier,
-					"compressed_count": result.CompressedCount,
-					"tokens_saved":     result.TokensSaved,
-				})
+				c.logger.Warn("compaction cycle error", "error", err)
+			} else if hasCompactionWork(result) {
+				c.recordCompactionMetrics(result)
+				c.broadcastEvent("coordinator.compress.complete", compactionEventPayload(result))
 			}
 		}
 	}
 
+	c.recordHealthMetrics(true)
+	c.recordPollMetrics(pollStart)
 	return true
+}
+
+// recordSubsystem records a subsystem run in metrics if available.
+func (c *Coordinator) recordSubsystem(name string, err error) {
+	if c.metrics != nil {
+		c.metrics.RecordSubsystemRun(name, err)
+	}
+}
+
+// recordHealthMetrics updates health and circuit metrics if available.
+func (c *Coordinator) recordHealthMetrics(healthy bool) {
+	if c.metrics == nil {
+		return
+	}
+	c.mu.RLock()
+	failures := c.consecutiveFail
+	c.mu.RUnlock()
+	c.metrics.UpdateHealth(healthy, failures)
+	c.metrics.UpdateCircuit(c.client.Breaker().State())
+}
+
+// recordPollMetrics records the poll cycle duration if metrics are available.
+func (c *Coordinator) recordPollMetrics(start time.Time) {
+	if c.metrics != nil {
+		c.metrics.RecordPollCycle(time.Since(start))
+	}
+}
+
+func (c *Coordinator) recordCompactionMetrics(result *CompactionResult) {
+	if c.metrics != nil {
+		c.metrics.RecordCompactionResult(result)
+	}
 }
 
 // selectModel checks if the preferred model is available; falls back if not.
@@ -496,6 +576,106 @@ func (c *Coordinator) broadcastEvent(eventType string, payload any) {
 		Timestamp: time.Now(),
 		Data:      data,
 	})
+}
+
+func (c *Coordinator) summarizeSessionWithTelemetry(ctx context.Context, sessionID, agentID string) (*SessionSummaryResult, error) {
+	if c == nil || c.summarizer == nil {
+		return nil, fmt.Errorf("summarizer is disabled")
+	}
+
+	resolvedAgentID := strings.TrimSpace(agentID)
+	if resolvedAgentID == "" {
+		resolvedAgentID = c.resolveSessionAgentID(sessionID)
+	}
+	before := c.inspectSessionPrompt(resolvedAgentID, sessionID)
+
+	result, err := c.summarizer.SummarizeSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	enrichSummaryPromptDelta(result, resolvedAgentID, before, c.inspectSessionPrompt(resolvedAgentID, sessionID))
+	return result, nil
+}
+
+func (c *Coordinator) resolveSessionAgentID(sessionID string) string {
+	if c == nil || c.agent == nil || strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	sessions, err := c.agent.Sessions()
+	if err != nil {
+		return ""
+	}
+	for _, session := range sessions {
+		if session.ID == sessionID {
+			return strings.TrimSpace(session.AgentID)
+		}
+	}
+	return ""
+}
+
+func (c *Coordinator) inspectSessionPrompt(agentID, sessionID string) *bridge.ContextInspectResult {
+	if c == nil || c.agent == nil || strings.TrimSpace(agentID) == "" || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	inspect, err := c.agent.ContextInspect(agentID, sessionID, false, 200)
+	if err != nil {
+		return nil
+	}
+	return inspect
+}
+
+func enrichSummaryPromptDelta(result *SessionSummaryResult, agentID string, before, after *bridge.ContextInspectResult) {
+	if result == nil {
+		return
+	}
+	result.AgentID = strings.TrimSpace(agentID)
+	if before != nil {
+		result.PromptTokensBefore = before.EstimatedTokens
+	}
+	if after != nil {
+		result.PromptTokensAfter = after.EstimatedTokens
+	}
+	if result.PromptTokensBefore > 0 && result.PromptTokensAfter > 0 {
+		result.PromptTokensDelta = result.PromptTokensBefore - result.PromptTokensAfter
+	}
+}
+
+func summaryEventPayload(result *SessionSummaryResult) map[string]any {
+	if result == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"session_id":           result.SessionID,
+		"agent_id":             result.AgentID,
+		"summary_preview":      truncate(result.Summary, 200),
+		"prompt_tokens_before": result.PromptTokensBefore,
+		"prompt_tokens_after":  result.PromptTokensAfter,
+		"prompt_tokens_delta":  result.PromptTokensDelta,
+	}
+}
+
+func hasCompactionWork(result *CompactionResult) bool {
+	return result != nil && (result.CompressedCount > 0 || result.MergedCount > 0)
+}
+
+func compactionEventPayload(result *CompactionResult) map[string]any {
+	if result == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"tier":                      result.Tier,
+		"trigger":                   result.Trigger,
+		"compressed_count":          result.CompressedCount,
+		"merged_count":              result.MergedCount,
+		"tokens_saved":              result.TokensSaved,
+		"pressure_session_id":       result.PressureSessionID,
+		"pressure_agent_id":         result.PressureAgentID,
+		"pressure_namespace":        result.PressureNamespace,
+		"prompt_tokens_before":      result.PromptTokensBefore,
+		"prompt_tokens_after":       result.PromptTokensAfter,
+		"prompt_tokens_delta":       result.PromptTokensDelta,
+		"pressure_estimated_tokens": result.PressureEstimatedTokens,
+	}
 }
 
 // acquireSem tries to acquire the LLM semaphore without blocking.

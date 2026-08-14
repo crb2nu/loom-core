@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: k8s-harvester-infra
+    component: mcp-server
+    mcp.server/name: k8s_harvester_infra
+    mcp.server/type: custom
+  name: k8s-harvester-infra
+spec:
+  # Parked at 0 until a read-scoped Harvester credential exists.
+  #
+  # This server targets the Harvester (RKE2) cluster at 192.168.50.190:6443,
+  # which is a *different* cluster from the one the hub runs in, so unlike the
+  # flux/helm/longhorn-k3s servers it cannot be fixed with an in-cluster
+  # kubeconfig. Two hazards kept it from being wired up:
+  #
+  #   1. mcp-k8s-ops shells out to kubectl, which silently falls back to the
+  #      pod ServiceAccount when MCP_K8S_KUBECONFIG is missing. Granting this
+  #      Deployment an SA would make it answer *Harvester* questions with
+  #      *k3s* data -- a wrong-cluster answer, which is worse than an error.
+  #   2. The only Harvester credential in this namespace is the
+  #      `harvester-kubeconfig` Secret, deliberately scoped to the `mills-spawn`
+  #      SA (KubeVirt VM/PVC/Secret verbs in Harvester's `default` ns) to
+  #      replace a hypervisor-admin kubeconfig -- see
+  #      platform/gitops/harvester/flux/apps/mills-spawn-rbac.yaml. It grants
+  #      none of the pod/node reads this server needs, and binding it to a
+  #      server that exposes generic k8s_apply/k8s_exec would turn a narrow
+  #      VM-lifecycle credential into a general write path against the
+  #      hypervisor.
+  #
+  # Use the local stdio target in mcp/context/registry.yaml (which reads the
+  # operator's .kube/harvester-admin.yaml) until a read-only Harvester SA +
+  # kubeconfig Secret is provisioned; then set replicas back to 1 and mount it
+  # the way mobile-hud mounts harvester-kubeconfig.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: k8s-harvester-infra
+  template:
+    metadata:
+      annotations:
+        mcp.server/categories: kubernetes,operations
+        mcp.server/description: Kubernetes operations for the Harvester (RKE2) management cluster (Go native)
+      labels:
+        app: k8s-harvester-infra
+        component: mcp-server
+        mcp.server/name: k8s_harvester_infra
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - env:
+            # Mount point reserved for the future read-scoped Harvester
+            # kubeconfig Secret (mobile-hud mounts its own at the same path).
+            # Nothing is mounted here yet -- see the replicas comment above.
+            - name: KUBECONFIG
+              value: /etc/harvester/kubeconfig
+            - name: MCP_K8S_KUBECONFIG
+              value: /etc/harvester/kubeconfig
+            - name: MCP_TRANSPORT
+              value: websocket
+            - name: MCP_WS_PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: info
+            - name: MCP_SERVER_NAME
+              value: k8s_harvester_infra
+            - name: MCP_SERVER_COMMAND
+              value: /app/services/loom-core/bin/mcp-k8s-ops
+          image: registry.harbor.lan/mcp/custom-server:latest
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          name: k8s-harvester-infra
+          ports:
+            - containerPort: 8080
+              name: websocket
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000

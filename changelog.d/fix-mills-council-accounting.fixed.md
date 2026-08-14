@@ -1,0 +1,1 @@
+- Make Council admission and cost accounting fail closed with atomic budget reservations, crash-expiring leases, terminal persistence on every exit, and complete evaluator, fallback, debate, and unpriced-provider spend handling.

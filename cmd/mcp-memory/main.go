@@ -12,6 +12,7 @@ import (
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/lifecycle"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
@@ -67,7 +68,15 @@ func run(ctx context.Context) error {
 	// Get persist path from env or default
 	persistPath := os.Getenv("MEMORY_PERSIST_PATH")
 	if persistPath == "" {
-		home, _ := os.UserHomeDir()
+		home, err := os.UserHomeDir()
+		if err != nil || strings.TrimSpace(home) == "" {
+			// No home (e.g. a containerized spawn with $HOME unset): a
+			// filepath.Join("", ...) would yield a cwd-relative path, so the
+			// graph would silently persist to and reload from wherever the
+			// process happens to start. Anchor to a stable absolute dir.
+			home = os.TempDir()
+			logger.Warn("home directory unavailable; persisting memory graph under temp dir", "dir", home)
+		}
 		persistPath = filepath.Join(home, ".config", "loom", "memory_graph.json")
 	}
 
@@ -90,6 +99,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting server", "name", "mcp-memory", "version", version, "path", persistPath)
 
 	server := mcp.NewServer("mcp-memory", version)
+	loomconcurrency.Apply(server)
 	server.SetInstructions("Knowledge graph memory for persistent context. Store entities, relations, and observations.")
 
 	// create_entities
@@ -290,16 +300,30 @@ func (m *memoryServer) load() error {
 		return err
 	}
 
-	return json.Unmarshal(data, m.graph)
+	if err := json.Unmarshal(data, m.graph); err != nil {
+		return err
+	}
+	// A persisted (or externally-edited) file with `"entities": null` /
+	// `"relations": null` unmarshals to nil maps; the first mutation would
+	// then panic with "assignment to entry in nil map". Re-initialize.
+	if m.graph.Entities == nil {
+		m.graph.Entities = make(map[string]*Entity)
+	}
+	if m.graph.Relations == nil {
+		m.graph.Relations = make([]*Relation, 0)
+	}
+	return nil
 }
 
-func (m *memoryServer) save() error {
+// saveLocked persists the graph. The caller MUST already hold m.mu (write
+// lock for mutations, at least a read lock otherwise): every mutating handler
+// calls this while holding m.mu.Lock(), so acquiring any lock here would
+// self-deadlock (sync.RWMutex is not reentrant). The write is atomic
+// (tempfile + rename) so a crash mid-write can never truncate the graph.
+func (m *memoryServer) saveLocked() error {
 	if !m.autoSave {
 		return nil
 	}
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 
 	// Ensure directory exists
 	dir := filepath.Dir(m.filePath)
@@ -312,7 +336,24 @@ func (m *memoryServer) save() error {
 		return err
 	}
 
-	return os.WriteFile(m.filePath, data, 0644)
+	tmp, err := os.CreateTemp(dir, ".memory_graph-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, m.filePath)
 }
 
 func (m *memoryServer) handleCreateEntities(_ context.Context, args map[string]any) (*mcp.CallToolResult, error) {
@@ -365,7 +406,7 @@ func (m *memoryServer) handleCreateEntities(_ context.Context, args map[string]a
 		created = append(created, name)
 	}
 
-	if err := m.save(); err != nil {
+	if err := m.saveLocked(); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("save graph: %w", err)), nil
 	}
 
@@ -420,7 +461,7 @@ func (m *memoryServer) handleCreateRelations(_ context.Context, args map[string]
 		}
 	}
 
-	if err := m.save(); err != nil {
+	if err := m.saveLocked(); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("save graph: %w", err)), nil
 	}
 
@@ -464,7 +505,7 @@ func (m *memoryServer) handleAddObservations(_ context.Context, args map[string]
 		added++
 	}
 
-	if err := m.save(); err != nil {
+	if err := m.saveLocked(); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("save graph: %w", err)), nil
 	}
 
@@ -502,7 +543,7 @@ func (m *memoryServer) handleDeleteEntities(_ context.Context, args map[string]a
 		}
 	}
 
-	if err := m.save(); err != nil {
+	if err := m.saveLocked(); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("save graph: %w", err)), nil
 	}
 
@@ -545,7 +586,7 @@ func (m *memoryServer) handleDeleteRelations(_ context.Context, args map[string]
 		m.graph.Relations = newRelations
 	}
 
-	if err := m.save(); err != nil {
+	if err := m.saveLocked(); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("save graph: %w", err)), nil
 	}
 
@@ -596,7 +637,7 @@ func (m *memoryServer) handleDeleteObservations(_ context.Context, args map[stri
 		entity.Observations = newObs
 	}
 
-	if err := m.save(); err != nil {
+	if err := m.saveLocked(); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("save graph: %w", err)), nil
 	}
 

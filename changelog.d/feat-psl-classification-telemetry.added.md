@@ -1,0 +1,1 @@
+- Add bounded per-class incident classification telemetry in `pkg/telemetry/metrics.go` and emit it from `pkg/mills/pipeline/classifier.go`.

@@ -80,3 +80,115 @@ func TestTracer_Convenience_SDK(t *testing.T) {
 	tracer := Tracer(tp, "test")
 	assert.NotNil(t, tracer)
 }
+
+func TestInitTracerWithOptions_NoEndpoint(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+
+	tp, shutdown, err := InitTracerWithOptions(context.Background(), "test", slog.Default(), Options{})
+	require.NoError(t, err)
+	_, isNoop := tp.(noop.TracerProvider)
+	assert.True(t, isNoop, "expected noop when no endpoint configured")
+	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestInitTracerWithOptions_FileEndpoint(t *testing.T) {
+	// No env var, but Options has endpoint
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+
+	tp, shutdown, err := InitTracerWithOptions(context.Background(), "test", slog.Default(), Options{
+		Endpoint: "http://localhost:4318",
+	})
+	if err != nil {
+		require.NotNil(t, tp)
+		assert.NoError(t, shutdown(context.Background()))
+		return
+	}
+	_, isSDK := tp.(*sdktrace.TracerProvider)
+	assert.True(t, isSDK, "expected SDK provider when file config endpoint is set")
+	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestInitTracerWithOptions_EnvOverridesFile(t *testing.T) {
+	// Env var takes precedence over Options.Endpoint
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+
+	tp, shutdown, err := InitTracerWithOptions(context.Background(), "test", slog.Default(), Options{
+		Endpoint: "http://should-be-ignored:9999",
+	})
+	if err != nil {
+		require.NotNil(t, tp)
+		assert.NoError(t, shutdown(context.Background()))
+		return
+	}
+	_, isSDK := tp.(*sdktrace.TracerProvider)
+	assert.True(t, isSDK, "expected SDK provider when env endpoint is set")
+	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestInitTracerWithOptions_SampleRate(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+
+	tp, shutdown, err := InitTracerWithOptions(context.Background(), "test", slog.Default(), Options{
+		SampleRate: 0.5,
+	})
+	if err != nil {
+		require.NotNil(t, tp)
+		assert.NoError(t, shutdown(context.Background()))
+		return
+	}
+	_, isSDK := tp.(*sdktrace.TracerProvider)
+	assert.True(t, isSDK, "expected SDK provider with sampling")
+	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestInitTracerWithOptions_GRPCProtocol(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+	tp, shutdown, err := InitTracerWithOptions(context.Background(), "test", slog.Default(), Options{
+		Protocol: "grpc",
+	})
+	if err != nil {
+		require.NotNil(t, tp)
+		assert.NoError(t, shutdown(context.Background()))
+		return
+	}
+	_, isSDK := tp.(*sdktrace.TracerProvider)
+	assert.True(t, isSDK, "expected SDK provider with gRPC protocol")
+	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestInitTracerWithOptions_GRPCWithFileEndpoint(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+
+	tp, shutdown, err := InitTracerWithOptions(context.Background(), "test", slog.Default(), Options{
+		Protocol: "grpc",
+		Endpoint: "localhost:4317",
+	})
+	if err != nil {
+		require.NotNil(t, tp)
+		assert.NoError(t, shutdown(context.Background()))
+		return
+	}
+	_, isSDK := tp.(*sdktrace.TracerProvider)
+	assert.True(t, isSDK, "expected SDK provider with gRPC file config endpoint")
+	assert.NoError(t, shutdown(context.Background()))
+}
+
+func TestInitTracerWithOptions_GRPCWithHeaders(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+
+	tp, shutdown, err := InitTracerWithOptions(context.Background(), "test", slog.Default(), Options{
+		Protocol: "grpc",
+		Endpoint: "localhost:4317",
+		Headers:  map[string]string{"Authorization": "Bearer test-token"},
+	})
+	if err != nil {
+		require.NotNil(t, tp)
+		assert.NoError(t, shutdown(context.Background()))
+		return
+	}
+	_, isSDK := tp.(*sdktrace.TracerProvider)
+	assert.True(t, isSDK, "expected SDK provider with gRPC headers")
+	assert.NoError(t, shutdown(context.Background()))
+}

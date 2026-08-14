@@ -1,0 +1,1 @@
+- **Added incident-hardening operator guidance** (`docs/incident-hardening.md`): defines storage warning and critical thresholds, local configuration preflight boundaries, and GitLab/GitLab-agent external-dependency incident handling.

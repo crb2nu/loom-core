@@ -1,0 +1,1 @@
+- Decouple GitLab escalation reconciliation from `Reconciler.Tick` into a dedicated budgeted sweeper, with durable exponential recheck backoff and pass metrics (`pkg/mills`, `cmd/loom-mills-operator`).

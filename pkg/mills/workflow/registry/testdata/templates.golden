@@ -1,0 +1,5 @@
+# Shipped workflow-template content hashes. NEVER edit a shipped version —
+# add a new version instead; in-flight runs frozen to an edited version
+# terminalize on the content-hash guard. Regenerate (new versions only):
+# UPDATE_TEMPLATE_HASHES=1 go test ./pkg/mills/workflow/registry -run TestTemplateContentHashesPinned
+implement-gate@v1 78c7bbc396895c6621c3034da6b7963ee8b2ac93dcd10968f85466a45451214a

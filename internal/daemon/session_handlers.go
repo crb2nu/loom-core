@@ -5,15 +5,18 @@ import (
 	"encoding/json"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // --- loom/session/open ---
 
 type sessionOpenParams struct {
-	AgentHint      string `json:"agent_hint,omitempty"`
-	HostPID        string `json:"host_pid,omitempty"`
-	Version        string `json:"version,omitempty"`
-	PriorSessionID string `json:"prior_session_id,omitempty"`
+	AgentHint       string `json:"agent_hint,omitempty"`
+	HostPID         string `json:"host_pid,omitempty"`
+	Version         string `json:"version,omitempty"`
+	PriorSessionID  string `json:"prior_session_id,omitempty"`
+	PresenceAgentID string `json:"presence_agent_id,omitempty"`
 }
 
 type sessionOpenResult struct {
@@ -22,8 +25,12 @@ type sessionOpenResult struct {
 	LeaseSecs   int    `json:"lease_seconds"`
 }
 
-func (d *Daemon) handleSessionOpen(_ context.Context, msg *mcp.Message) (*mcp.Message, error) {
+func (d *Daemon) handleSessionOpen(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	_, span := d.daemonTracer().Start(ctx, "daemon.session.open")
+	defer span.End()
+
 	if d.sessions == nil {
+		span.SetStatus(codes.Error, "session manager not initialized")
 		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, "session manager not initialized"), nil
 	}
 
@@ -33,16 +40,24 @@ func (d *Daemon) handleSessionOpen(_ context.Context, msg *mcp.Message) (*mcp.Me
 	}
 
 	sess := d.sessions.Open(SessionClientInfo{
-		AgentHint: params.AgentHint,
-		HostPID:   params.HostPID,
-		Version:   params.Version,
+		AgentHint:       params.AgentHint,
+		HostPID:         params.HostPID,
+		Version:         params.Version,
+		PresenceAgentID: params.PresenceAgentID,
 	}, params.PriorSessionID)
+
+	span.SetAttributes(
+		attribute.String("session.id", sess.ID),
+		attribute.String("session.agent_hint", params.AgentHint),
+		attribute.String("session.presence_agent_id", params.PresenceAgentID),
+	)
 
 	d.logger.Info("proxy session opened",
 		"session_id", sess.ID,
 		"prior_id", sess.PriorID,
 		"epoch", sess.DaemonEpoch,
 		"agent_hint", params.AgentHint,
+		"presence_agent_id", params.PresenceAgentID,
 	)
 
 	return mcp.NewResponse(msg.ID, sessionOpenResult{
@@ -66,8 +81,12 @@ type sessionHeartbeatResult struct {
 	State       string `json:"state"`
 }
 
-func (d *Daemon) handleSessionHeartbeat(_ context.Context, msg *mcp.Message) (*mcp.Message, error) {
+func (d *Daemon) handleSessionHeartbeat(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	_, span := d.daemonTracer().Start(ctx, "daemon.session.heartbeat")
+	defer span.End()
+
 	if d.sessions == nil {
+		span.SetStatus(codes.Error, "session manager not initialized")
 		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, "session manager not initialized"), nil
 	}
 
@@ -77,13 +96,20 @@ func (d *Daemon) handleSessionHeartbeat(_ context.Context, msg *mcp.Message) (*m
 	}
 
 	if params.SessionID == "" {
+		span.SetStatus(codes.Error, "missing session_id")
 		return mcp.NewErrorResponse(msg.ID, mcp.InvalidParams, "missing session_id"), nil
 	}
 
+	span.SetAttributes(attribute.String("session.id", params.SessionID))
+
 	sess, err := d.sessions.Heartbeat(params.SessionID, params.DaemonEpoch)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return mcp.NewErrorResponse(msg.ID, mcp.InvalidRequest, err.Error()), nil
 	}
+
+	span.SetAttributes(attribute.String("session.state", string(sess.State)))
 
 	return mcp.NewResponse(msg.ID, sessionHeartbeatResult{
 		SessionID:   sess.ID,
@@ -103,10 +129,15 @@ type sessionStatusResult struct {
 }
 
 func (d *Daemon) handleSessionStatus(_ context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	drainState := "none"
+	if d.draining.Load() {
+		drainState = "draining"
+	}
+
 	if d.sessions == nil {
 		return mcp.NewResponse(msg.ID, sessionStatusResult{
 			DaemonEpoch: d.daemonEpoch,
-			DrainState:  "none",
+			DrainState:  drainState,
 		})
 	}
 
@@ -114,7 +145,7 @@ func (d *Daemon) handleSessionStatus(_ context.Context, msg *mcp.Message) (*mcp.
 		DaemonEpoch:    d.daemonEpoch,
 		ActiveSessions: d.sessions.ActiveCount(),
 		TotalSessions:  d.sessions.Count(),
-		DrainState:     "none",
+		DrainState:     drainState,
 	})
 }
 
@@ -128,8 +159,12 @@ type sessionCloseResult struct {
 	Closed bool `json:"closed"`
 }
 
-func (d *Daemon) handleSessionClose(_ context.Context, msg *mcp.Message) (*mcp.Message, error) {
+func (d *Daemon) handleSessionClose(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	_, span := d.daemonTracer().Start(ctx, "daemon.session.close")
+	defer span.End()
+
 	if d.sessions == nil {
+		span.SetStatus(codes.Error, "session manager not initialized")
 		return mcp.NewErrorResponse(msg.ID, mcp.InternalError, "session manager not initialized"), nil
 	}
 
@@ -139,10 +174,15 @@ func (d *Daemon) handleSessionClose(_ context.Context, msg *mcp.Message) (*mcp.M
 	}
 
 	if params.SessionID == "" {
+		span.SetStatus(codes.Error, "missing session_id")
 		return mcp.NewErrorResponse(msg.ID, mcp.InvalidParams, "missing session_id"), nil
 	}
 
+	span.SetAttributes(attribute.String("session.id", params.SessionID))
+
 	closed := d.sessions.Close(params.SessionID)
+	span.SetAttributes(attribute.Bool("session.closed", closed))
+
 	if closed {
 		d.logger.Info("proxy session closed", "session_id", params.SessionID)
 	}

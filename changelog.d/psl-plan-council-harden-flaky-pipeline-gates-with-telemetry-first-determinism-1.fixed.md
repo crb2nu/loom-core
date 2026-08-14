@@ -1,0 +1,1 @@
+- Persist structured Mills gate verdict telemetry with gate, verdict, reason, pipeline run ID, and evaluation duration across `pkg/mills/gates/gates.go`, `pkg/mills/store/gate_verdicts.go`, and `pkg/telemetry/telemetry.go`.

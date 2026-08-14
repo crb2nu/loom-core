@@ -1,32 +1,34 @@
-<script>
+<script lang="ts">
+  import type { UnifiedAgent } from '../utils/agents.ts';
+  import { agentColor, relativeTime } from '../utils/format.ts';
+  import { router } from '../stores/router.svelte.ts';
   import StatusDot from './StatusDot.svelte';
   import SparkLine from './SparkLine.svelte';
 
-  /** @type {{ agent: import('../stores/presence.svelte.ts').AgentPresence, heartbeatData?: number[], sharedFileAgents?: string[], ondispatch?: (agentId: string) => void, onnudge?: (agentId: string) => void }} */
-  let { agent, heartbeatData = [], sharedFileAgents = [], ondispatch, onnudge } = $props();
+  let {
+    agent,
+    heartbeatData = [],
+    sharedFileAgents = [],
+    ondispatch,
+    onnudge,
+  }: {
+    agent: UnifiedAgent;
+    heartbeatData?: number[];
+    sharedFileAgents?: string[];
+    ondispatch?: (agentId: string) => void;
+    onnudge?: (agentId: string) => void;
+  } = $props();
 
-  const AGENT_COLORS = {
-    claude: '#E95D74',
-    codex: '#22B255',
-    gemini: '#018799',
-    copilot: '#E7B312',
-  };
-
-  function agentColor(agentType) {
-    if (!agentType) return '#5EBDC9';
-    const lower = agentType.toLowerCase();
-    for (const [key, color] of Object.entries(AGENT_COLORS)) {
-      if (lower.includes(key)) return color;
-    }
-    return '#5EBDC9';
-  }
-
-  function presenceStatus(status) {
-    const map = { active: 'healthy', idle: 'degraded', offline: 'down' };
+  function presenceStatus(status: UnifiedAgent['status']): 'healthy' | 'degraded' | 'down' {
+    const map: Record<UnifiedAgent['status'], 'healthy' | 'degraded' | 'down'> = {
+      active: 'healthy',
+      idle: 'degraded',
+      offline: 'down',
+    };
     return map[status] ?? 'down';
   }
 
-  function agentIcon(agentType) {
+  function agentIcon(agentType: string) {
     if (!agentType) return '\u25C9';
     const lower = agentType.toLowerCase();
     if (lower.includes('claude')) return '\u25CF';
@@ -35,21 +37,26 @@
     return '\u25C6';
   }
 
-  // Relative time.
+  // Relative time. The local reimplementation this replaced collapsed the
+  // first 10s to 'just now' and capped at hours, so a 3-day-old heartbeat read
+  // "72h ago"; `rel` only adds the tick dependency that re-renders the labels.
   let _tick = $state(0);
   $effect(() => {
     const t = setInterval(() => { _tick++ }, 5000);
     return () => clearInterval(t);
   });
 
-  function relativeTime(ts) {
+  const rel = (ts: string | number | null | undefined) => {
     void _tick;
-    if (!ts) return '---';
-    const diff = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
-    if (diff < 10) return 'just now';
-    if (diff < 60) return `${diff}s ago`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    return `${Math.floor(diff / 3600)}h ago`;
+    return relativeTime(ts);
+  };
+
+  function compactDuration(seconds: number | null | undefined) {
+    const value = Number(seconds ?? 0);
+    if (!Number.isFinite(value) || value <= 0) return '';
+    if (value < 60) return `${Math.floor(value)}s`;
+    if (value < 3600) return `${Math.floor(value / 60)}m`;
+    return `${Math.floor(value / 3600)}h`;
   }
 
   let color = $derived(agentColor(agent.agent_type));
@@ -69,7 +76,27 @@
   </div>
   <div class="card-subheader">
     <span class="agent-type">{agent.agent_type || 'unknown'}{#if agent.active_files?.length} · {agent.active_files.length} files{/if}</span>
-    <span class="heartbeat-time">{relativeTime(agent.last_heartbeat)}</span>
+    <span class="heartbeat-time">
+      {agent.has_presence ? rel(agent.last_heartbeat) : 'session trace'}
+      {#if agent.has_presence && agent.registered_at} · reg {rel(agent.registered_at)}{/if}
+    </span>
+  </div>
+
+  <div class="evidence-row">
+    <span class="evidence-chip" class:evidence-active={agent.has_presence}>presence</span>
+    <span class="evidence-chip" class:evidence-active={agent.has_session}>session</span>
+    {#if agent.has_spawn}
+      <span class="evidence-chip evidence-active">spawn</span>
+    {/if}
+    <span class="telemetry-chip" class:telemetry-stale={agent.telemetry_status === 'stale'}>{agent.telemetry_status || agent.source}</span>
+  </div>
+  <div class="telemetry-row">
+    {#if agent.has_presence}
+      <span>heartbeat {compactDuration(agent.heartbeat_age_seconds) || rel(agent.last_heartbeat)}</span>
+    {/if}
+    {#if agent.has_session}
+      <span>session {compactDuration(agent.session_age_seconds) || rel(agent.session_started_at)}</span>
+    {/if}
   </div>
 
   <!-- Sparkline: heartbeat frequency -->
@@ -82,6 +109,12 @@
 
   <!-- Details -->
   <div class="card-details">
+    {#if agent.description}
+      <div class="detail-row">
+        <span class="detail-icon">{'\u2139'}</span>
+        <span class="detail-text truncate" title={agent.description}>{agent.description}</span>
+      </div>
+    {/if}
     {#if agent.current_task}
       <div class="detail-row">
         <span class="detail-icon">{'\u2611'}</span>
@@ -95,6 +128,12 @@
         {#if agent.pr_url}
           <a href={agent.pr_url} target="_blank" rel="noopener" class="pr-badge">PR</a>
         {/if}
+      </div>
+    {/if}
+    {#if agent.namespace}
+      <div class="detail-row">
+        <span class="detail-icon">{'\u25A6'}</span>
+        <span class="detail-text text-mono truncate" title={agent.namespace}>{agent.namespace}</span>
       </div>
     {/if}
     {#if sharedFileAgents.length > 0}
@@ -111,15 +150,29 @@
         </span>
       </div>
     {/if}
+    {#if agent.active_files?.length > 0}
+      <div class="file-list">
+        {#each agent.active_files.slice(0, 3) as filePath}
+          <span class="file-item text-mono" title={filePath}>{filePath.split('/').slice(-2).join('/')}</span>
+        {/each}
+        {#if agent.active_files.length > 3}
+          <span class="file-more text-muted">+{agent.active_files.length - 3} more</span>
+        {/if}
+      </div>
+    {/if}
   </div>
 
   <!-- Actions -->
-  {#if agent.status === 'active' && (ondispatch || onnudge)}
+  {#if agent.session_id || agent.agent_id || (agent.status === 'active' && (ondispatch || onnudge))}
     <div class="card-actions">
-      {#if onnudge}
+      {#if agent.session_id}
+        <button class="btn btn-xs btn-ghost" onclick={() => router.navigate('agents', 'fleet', agent.session_id)}>Session</button>
+      {/if}
+      <button class="btn btn-xs btn-ghost" onclick={() => router.navigate('activity', 'traces', agent.agent_id)}>Traces</button>
+      {#if onnudge && agent.status === 'active'}
         <button class="btn btn-xs btn-nudge" onclick={() => onnudge(agent.agent_id)}>Nudge</button>
       {/if}
-      {#if ondispatch}
+      {#if ondispatch && agent.status === 'active'}
         <button class="btn btn-xs btn-dispatch" onclick={() => ondispatch(agent.agent_id)}>Dispatch</button>
       {/if}
     </div>
@@ -145,11 +198,51 @@
   .header-right { display: flex; align-items: center; gap: 4px; }
   .agent-icon { font-size: 14px; }
   .agent-id { font-size: 13px; font-weight: 600; font-family: var(--font-mono); color: var(--fg-primary); }
-  .status-label { font-size: 10px; font-family: var(--font-mono); color: var(--fg-muted); text-transform: uppercase; }
+  .status-label { font-size: 10px; font-weight: 600; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.06em; }
 
   .card-subheader { display: flex; align-items: center; justify-content: space-between; }
   .agent-type { font-size: 11px; color: var(--fg-secondary); }
   .heartbeat-time { font-size: 10px; font-family: var(--font-mono); color: var(--fg-muted); }
+  .evidence-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .evidence-chip {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    padding: 1px 7px;
+    font-size: var(--text-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-muted);
+  }
+  .evidence-active {
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+    color: var(--fg-secondary);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+  .telemetry-chip {
+    margin-left: auto;
+    font-size: var(--text-2xs);
+    font-weight: 600;
+    color: var(--fg-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border: 1px solid color-mix(in srgb, var(--agent-color) 28%, var(--border));
+    background: color-mix(in srgb, var(--agent-color) 8%, transparent);
+    border-radius: var(--radius-full);
+    padding: 1px 7px;
+  }
+  .telemetry-stale {
+    border-color: color-mix(in srgb, var(--warning) 36%, var(--border));
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    color: var(--warning);
+  }
+  .telemetry-row {
+    display: flex;
+    gap: 10px;
+    font-size: 10px;
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+  }
 
   .sparkline-row { display: flex; align-items: center; gap: 8px; }
   .sparkline-label { font-size: 10px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.3px; width: 48px; flex-shrink: 0; }
@@ -159,17 +252,23 @@
   .detail-icon { font-size: 11px; color: var(--fg-muted); width: 14px; text-align: center; flex-shrink: 0; }
   .detail-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .pr-badge { font-size: 9px; padding: 1px 4px; border-radius: var(--radius-sm); background: rgba(129, 240, 254, 0.1); color: var(--accent); text-decoration: none; border: 1px solid rgba(129, 240, 254, 0.2); flex-shrink: 0; }
-  .pr-badge:hover { background: rgba(129, 240, 254, 0.2); }
+  .pr-badge { font-size: var(--text-2xs); padding: 1px 4px; border-radius: var(--radius-sm); background: var(--info-dim); color: var(--info); text-decoration: none; border: 1px solid color-mix(in srgb, var(--info) 24%, var(--border)); flex-shrink: 0; }
+  .pr-badge:hover { background: color-mix(in srgb, var(--info-dim) 70%, var(--info)); }
 
   .overlap-dots { display: flex; align-items: center; gap: 2px; margin-left: auto; }
   .overlap-dot { width: 8px; height: 8px; border-radius: 50%; }
-  .overlap-more { font-size: 9px; color: var(--fg-muted); font-family: var(--font-mono); }
+  .overlap-more { font-size: var(--text-2xs); color: var(--fg-muted); font-family: var(--font-mono); }
 
-  .card-actions { display: flex; justify-content: flex-end; padding-top: 4px; border-top: 1px solid var(--border); }
+  .card-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; padding-top: 4px; border-top: 1px solid var(--border); }
   .btn-xs { padding: 2px 8px; font-size: 11px; }
-  .btn-nudge { background: rgba(231, 179, 18, 0.1); color: var(--warning); border: 1px solid rgba(231, 179, 18, 0.25); border-radius: var(--radius-sm); cursor: pointer; }
-  .btn-nudge:hover { background: rgba(231, 179, 18, 0.2); }
-  .btn-dispatch { background: rgba(129, 240, 254, 0.1); color: var(--accent); border: 1px solid rgba(129, 240, 254, 0.25); border-radius: var(--radius-sm); cursor: pointer; }
-  .btn-dispatch:hover { background: rgba(129, 240, 254, 0.2); }
+  .btn-ghost { background: transparent; color: var(--fg-secondary); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--fg-primary); }
+  .btn-nudge { background: var(--warning-dim); color: var(--warning); border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border)); border-radius: var(--radius-sm); cursor: pointer; }
+  .btn-nudge:hover { background: color-mix(in srgb, var(--warning-dim) 70%, var(--warning)); }
+  .btn-dispatch { background: var(--accent-dim); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border)); border-radius: var(--radius-sm); cursor: pointer; }
+  .btn-dispatch:hover { background: color-mix(in srgb, var(--accent-dim) 70%, var(--accent)); }
+
+  .file-list { display: flex; flex-direction: column; gap: 1px; padding-top: 4px; border-top: 1px solid var(--border); margin-top: 4px; }
+  .file-item { font-size: 10px; color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-more { font-size: 10px; font-family: var(--font-mono); }
 </style>

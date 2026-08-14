@@ -1,0 +1,1 @@
+- Promote the curated OpenRouter HTTP 402 credit-exhaustion signature and verify its paid-retry budget remains untouched while waiting for dependency recovery (`pkg/mills/pipeline/failure_signatures.go`, `pkg/mills/pipeline/retry_policy.go`).

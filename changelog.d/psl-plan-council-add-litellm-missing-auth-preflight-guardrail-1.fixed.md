@@ -1,0 +1,1 @@
+- Add a local LiteLLM missing-auth preflight guardrail in `pkg/flexinfer/client.go`, with focused tests and operator recovery guidance.

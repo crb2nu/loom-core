@@ -1,0 +1,1 @@
+- Enforce fail-closed Mills storage-health and local-config admission gates in `pkg/mills/gates/gate_runner.go` and `pkg/mills/pipeline/pipeline.go`.

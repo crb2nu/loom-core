@@ -1,38 +1,34 @@
-<script>
-  /**
-   * @typedef {{ id: string, name: string, status: string, depends_on: string[] }} Step
-   * @type {{ steps: Step[] }}
-   */
-  let { steps = [] } = $props();
+<script lang="ts">
+  import { statusColor } from '../utils/format.ts';
+
+  interface Step {
+    id: string;
+    name: string;
+    status: string;
+    depends_on: string[];
+  }
+
+  let { steps = [] }: { steps?: Step[] } = $props();
 
   // Unique ID per instance to avoid SVG marker collisions when multiple DagViews exist.
   const markerId = `arrowhead-${Math.random().toString(36).slice(2, 8)}`;
 
-  const NODE_W = 120;
+  const NODE_W = 148;
   const NODE_H = 36;
   const LAYER_GAP = 60;
   const ROW_GAP = 16;
   const PADDING = 20;
-
-  const statusColors = {
-    completed: 'var(--status-completed)',
-    running: 'var(--status-running)',
-    pending: 'var(--status-pending)',
-    failed: 'var(--status-failed)',
-    waiting_approval: 'var(--status-waiting)',
-    cancelled: 'var(--fg-muted)',
-  };
 
   // Topological layering
   let layout = $derived.by(() => {
     if (!steps || steps.length === 0) return { nodes: [], edges: [], width: 0, height: 0 };
 
     const stepMap = new Map(steps.map((s) => [s.id, s]));
-    const layers = [];
-    const assigned = new Set();
+    const layers: string[][] = [];
+    const assigned = new Set<string>();
 
     // BFS layering
-    const inDegree = new Map();
+    const inDegree = new Map<string, number>();
     for (const s of steps) {
       if (!inDegree.has(s.id)) inDegree.set(s.id, 0);
       for (const dep of s.depends_on || []) {
@@ -44,7 +40,7 @@
     while (queue.length > 0) {
       layers.push([...queue]);
       queue.forEach((id) => assigned.add(id));
-      const next = [];
+      const next: string[] = [];
       for (const s of steps) {
         if (assigned.has(s.id)) continue;
         const deps = s.depends_on || [];
@@ -64,7 +60,7 @@
     }
 
     // Position nodes
-    const nodePositions = new Map();
+    const nodePositions = new Map<string, { x: number; y: number }>();
     let maxRowCount = 0;
 
     for (let li = 0; li < layers.length; li++) {
@@ -83,12 +79,12 @@
         ...s,
         x: pos.x,
         y: pos.y,
-        color: statusColors[s.status] || 'var(--fg-muted)',
+        color: statusColor(s.status),
       };
     });
 
     // Build edges
-    const edges = [];
+    const edges: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
     for (const s of steps) {
       for (const dep of s.depends_on || []) {
         const from = nodePositions.get(dep);
@@ -146,6 +142,8 @@
       <!-- Nodes -->
       {#each layout.nodes as node}
         <g transform="translate({node.x}, {node.y})">
+          <!-- Full step name on hover; the visible label is width-truncated. -->
+          <title>{node.name}</title>
           <rect
             width={NODE_W}
             height={NODE_H}
@@ -164,7 +162,7 @@
             font-size="11"
             font-family="var(--font-sans)"
           >
-            {node.name.length > 14 ? node.name.slice(0, 13) + '\u2026' : node.name}
+            {node.name.length > 22 ? node.name.slice(0, 21) + '\u2026' : node.name}
           </text>
           <!-- Status indicator bar at bottom -->
           <rect
@@ -194,6 +192,6 @@
 
   .dag-svg {
     display: block;
-    min-width: 100%;
+    margin: 0 auto;
   }
 </style>

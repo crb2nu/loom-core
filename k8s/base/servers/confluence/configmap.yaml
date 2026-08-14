@@ -1,0 +1,24 @@
+apiVersion: v1
+data:
+  server.yaml: |
+    always_allow:
+        - confluence_search
+        - confluence_get_page
+        - confluence_get_page_by_title
+        - confluence_list_spaces
+        - confluence_get_space
+        - confluence_list_pages
+        - confluence_get_children
+        - confluence_get_ancestors
+    categories:
+        - docs
+        - collaboration
+    description: Atlassian Confluence wiki (read-only)
+    name: confluence
+    timeout: 60
+kind: ConfigMap
+metadata:
+  labels:
+    app: confluence
+    component: mcp-server
+  name: confluence-config

@@ -1,0 +1,1 @@
+- Bound `wait_for_dependency_recovery` with durable external-incident dwell metadata, first-writer-wins timeout/fast-kill reconciliation, duration telemetry, tests, and the operator runbook.

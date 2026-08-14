@@ -1,0 +1,1 @@
+- Add deterministic GitLab CI, model-provider, and storage incident classification in `pkg/mills/pipeline/incident_classifier.go` with durable `IncidentRecord` persistence in `pkg/mills/store/incidents.go`.

@@ -1,0 +1,745 @@
+// Package contracts provides golden-file contract tests for API response shapes,
+// SSE event payloads, and CLI output formats. When a field is added, renamed,
+// or removed the golden file diff surfaces the change in code review, preventing
+// silent divergence with sibling repos (loom VS Code extension, loom-zed).
+package contracts
+
+import (
+	"encoding/json"
+	"flag"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/crb2nu/loom/internal/hud/bridge"
+	"github.com/crb2nu/loom/internal/visibility/contracts/presence"
+)
+
+var updateGolden = flag.Bool("update-golden", false, "update golden files with actual output")
+
+// testdataDir returns the absolute path to the testdata directory.
+func testdataDir(t *testing.T) string {
+	t.Helper()
+	// testdata is relative to this test file.
+	dir, err := filepath.Abs("testdata")
+	require.NoError(t, err)
+	return dir
+}
+
+// assertGolden compares got against the golden file at testdata/<name>.golden.
+// If -update-golden is set, it writes got to the golden file instead.
+func assertGolden(t *testing.T, name string, got []byte) {
+	t.Helper()
+
+	goldenPath := filepath.Join(testdataDir(t), name+".golden")
+
+	if *updateGolden {
+		err := os.MkdirAll(filepath.Dir(goldenPath), 0o755)
+		require.NoError(t, err)
+		err = os.WriteFile(goldenPath, got, 0o644)
+		require.NoError(t, err)
+		t.Logf("updated golden file: %s", goldenPath)
+		return
+	}
+
+	expected, err := os.ReadFile(goldenPath)
+	require.NoError(t, err, "golden file missing; run with -update-golden to create: %s", goldenPath)
+
+	assert.JSONEq(t, string(expected), string(got),
+		"golden file mismatch for %s.\nRun with -update-golden to accept changes.", name)
+}
+
+// marshalIndent is a helper that marshals v with indentation for human-readable diffs.
+// Appends a trailing newline to match end-of-file-fixer expectations.
+func marshalIndent(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	require.NoError(t, err)
+	return append(data, '\n')
+}
+
+// ---------------------------------------------------------------------------
+// Mobile Envelope Contract
+// ---------------------------------------------------------------------------
+
+// mobileEnvelope mirrors the hud.mobileEnvelope struct (unexported in hud package).
+// We replicate it here to validate the contract shape independently.
+type mobileEnvelope struct {
+	OK    bool    `json:"ok"`
+	Data  any     `json:"data,omitempty"`
+	Error any     `json:"error,omitempty"`
+	Meta  mobMeta `json:"meta"`
+}
+
+type mobMeta struct {
+	RequestID string `json:"request_id"`
+	Timestamp string `json:"timestamp"`
+}
+
+type mobError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func TestMobileEnvelopeContract(t *testing.T) {
+	t.Run("success_envelope", func(t *testing.T) {
+		env := mobileEnvelope{
+			OK:   true,
+			Data: map[string]any{"pong": true},
+			Meta: mobMeta{
+				RequestID: "req_0000000000000000",
+				Timestamp: "2025-01-15T10:30:00Z",
+			},
+		}
+		assertGolden(t, "mobile_envelope", marshalIndent(t, env))
+	})
+
+	t.Run("error_envelope", func(t *testing.T) {
+		env := mobileEnvelope{
+			OK: false,
+			Error: mobError{
+				Code:    "upstream_error",
+				Message: "failed to list sessions",
+			},
+			Meta: mobMeta{
+				RequestID: "req_0000000000000000",
+				Timestamp: "2025-01-15T10:30:00Z",
+			},
+		}
+		assertGolden(t, "mobile_envelope_error", marshalIndent(t, env))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Mobile Dashboard Contract
+// ---------------------------------------------------------------------------
+
+func TestMobileDashboardContract(t *testing.T) {
+	dashboard := map[string]any{
+		"daemon_running":  true,
+		"server_count":    12,
+		"active_sessions": 3,
+		"active_agents":   2,
+		"idle_agents":     1,
+		"offline_agents":  0,
+		"updated_at":      "2025-01-15T10:30:00Z",
+		"health": map[string]any{
+			"total_servers":    12,
+			"healthy_servers":  10,
+			"degraded_servers": 1,
+			"down_servers":     1,
+			"idle_servers":     0,
+		},
+		"coordination": map[string]any{
+			"summary": map[string]any{
+				"active_namespaces":        2,
+				"namespaces_at_risk":       0,
+				"agents_needing_attention": 0,
+				"shared_branches":          1,
+				"conflict_files":           0,
+				"cross_agent_blockers":     0,
+				"orphan_tasks":             0,
+				"idle_claim_holders":       0,
+				"merge_ready_branches":     0,
+			},
+			"attention_agents": []any{},
+			"risky_namespaces": []any{},
+			"active_blockers":  []any{},
+			"top_relations":    []any{},
+			"attention_lanes": []any{
+				map[string]any{
+					"type":               "agent",
+					"id":                 "claude-code-1",
+					"label":              "Agent lane",
+					"route":              "people",
+					"scope":              "services/loom-core",
+					"summary":            "blocked on review",
+					"severity":           "warning",
+					"target_kind":        "session",
+					"target_id":          "sess_abc123",
+					"deep_link":          "loom://session/sess_abc123",
+					"recommended_action": "Open session",
+					"freshness":          map[string]any{"source": "coordination_snapshot"},
+				},
+				map[string]any{
+					"type":               "namespace",
+					"id":                 "services/loom-core/mobile",
+					"label":              "Work lane",
+					"route":              "work",
+					"scope":              "3 tasks",
+					"summary":            "blocked tasks",
+					"severity":           "critical",
+					"target_kind":        "task_filter",
+					"target_id":          "",
+					"deep_link":          "loom://tasks?status=blocked",
+					"filter":             map[string]any{"status": "blocked", "namespace": "services/loom-core/mobile"},
+					"recommended_action": "Review work queue",
+					"freshness":          map[string]any{"source": "coordination_snapshot"},
+				},
+				map[string]any{
+					"type":               "merge",
+					"id":                 "merge-ready",
+					"label":              "Merge ready",
+					"route":              "dispatch",
+					"scope":              "2 branches",
+					"summary":            "2 branches ready to merge",
+					"severity":           "info",
+					"target_kind":        "task_filter",
+					"target_id":          "",
+					"deep_link":          "loom://tasks?status=in_progress",
+					"filter":             map[string]any{"status": "in_progress"},
+					"recommended_action": "Review merge-ready work",
+					"freshness":          map[string]any{"source": "coordination_snapshot"},
+				},
+				map[string]any{
+					"type":               "conflict",
+					"id":                 "file-conflicts",
+					"label":              "File conflicts",
+					"route":              "dispatch",
+					"scope":              "1 file",
+					"summary":            "1 file claimed by multiple agents",
+					"severity":           "critical",
+					"target_kind":        "connection",
+					"target_id":          "file-conflicts",
+					"deep_link":          "loom://work",
+					"recommended_action": "Resolve coordination conflicts",
+					"freshness":          map[string]any{"source": "coordination_snapshot"},
+				},
+			},
+		},
+		"recent_timeline": []any{},
+	}
+	assertGolden(t, "mobile_dashboard", marshalIndent(t, dashboard))
+}
+
+// ---------------------------------------------------------------------------
+// Mobile Attention Lanes Contract
+// ---------------------------------------------------------------------------
+
+// attentionLane mirrors the attention-lane map emitted by
+// internal/hud/domain/mobile.buildMobileAttentionLanes. Freezing it as a typed
+// struct catches field renames that a plain map[string]any would hide.
+type attentionLane struct {
+	Type              string         `json:"type"`
+	ID                string         `json:"id"`
+	Label             string         `json:"label"`
+	Route             string         `json:"route"`
+	Scope             string         `json:"scope"`
+	Summary           string         `json:"summary"`
+	Severity          string         `json:"severity"`
+	TargetKind        string         `json:"target_kind"`
+	TargetID          string         `json:"target_id"`
+	DeepLink          string         `json:"deep_link"`
+	Filter            map[string]any `json:"filter,omitempty"`
+	RecommendedAction string         `json:"recommended_action"`
+	Freshness         map[string]any `json:"freshness"`
+}
+
+func TestMobileAttentionLanesContract(t *testing.T) {
+	lanes := []attentionLane{
+		{Type: "agent", ID: "claude-code-1", Label: "Agent lane", Route: "people", Scope: "services/loom-core", Summary: "blocked on review", Severity: "warning", TargetKind: "session", TargetID: "sess_abc123", DeepLink: "loom://session/sess_abc123", RecommendedAction: "Open session", Freshness: map[string]any{"source": "coordination_snapshot"}},
+		{Type: "namespace", ID: "services/loom-core/mobile", Label: "Work lane", Route: "work", Scope: "3 tasks", Summary: "blocked tasks", Severity: "critical", TargetKind: "task_filter", TargetID: "", DeepLink: "loom://tasks?status=blocked", Filter: map[string]any{"status": "blocked", "namespace": "services/loom-core/mobile"}, RecommendedAction: "Review work queue", Freshness: map[string]any{"source": "coordination_snapshot"}},
+		{Type: "merge", ID: "merge-ready", Label: "Merge ready", Route: "dispatch", Scope: "2 branches", Summary: "2 branches ready to merge", Severity: "info", TargetKind: "task_filter", TargetID: "", DeepLink: "loom://tasks?status=in_progress", Filter: map[string]any{"status": "in_progress"}, RecommendedAction: "Review merge-ready work", Freshness: map[string]any{"source": "coordination_snapshot"}},
+		{Type: "conflict", ID: "file-conflicts", Label: "File conflicts", Route: "dispatch", Scope: "1 file", Summary: "1 file claimed by multiple agents", Severity: "critical", TargetKind: "connection", TargetID: "file-conflicts", DeepLink: "loom://work", RecommendedAction: "Resolve coordination conflicts", Freshness: map[string]any{"source": "coordination_snapshot"}},
+	}
+	assertGolden(t, "mobile_attention_lanes", marshalIndent(t, lanes))
+}
+
+// ---------------------------------------------------------------------------
+// Mobile Agents Contract
+// ---------------------------------------------------------------------------
+
+// unifiedAgent mirrors the hud.unifiedAgent struct.
+type unifiedAgent struct {
+	AgentID          string   `json:"agent_id"`
+	AgentType        string   `json:"agent_type"`
+	Status           string   `json:"status"`
+	Source           string   `json:"source"`
+	Description      string   `json:"description"`
+	CurrentTask      string   `json:"current_task"`
+	Branch           string   `json:"branch"`
+	LastHeartbeat    string   `json:"last_heartbeat"`
+	SessionID        string   `json:"session_id,omitempty"`
+	ParentSessionID  string   `json:"parent_session_id,omitempty"`
+	RootSessionID    string   `json:"root_session_id,omitempty"`
+	Namespace        string   `json:"namespace,omitempty"`
+	SessionStatus    string   `json:"session_status,omitempty"`
+	SessionStarted   string   `json:"session_started_at,omitempty"`
+	EntryCount       int      `json:"entry_count"`
+	TotalTokens      int      `json:"total_tokens"`
+	SpawnID          string   `json:"spawn_id,omitempty"`
+	SpawnStatus      string   `json:"spawn_status,omitempty"`
+	Project          string   `json:"project,omitempty"`
+	ActiveFileCount  int      `json:"active_file_count"`
+	NeedsAttention   bool     `json:"needs_attention"`
+	AttentionReasons []string `json:"attention_reasons,omitempty"`
+	TaskCount        int      `json:"task_count"`
+	BlockedTasks     int      `json:"blocked_tasks"`
+	ClaimCount       int      `json:"claim_count"`
+}
+
+// unifiedAgentsSummary mirrors the hud.unifiedAgentsSummary struct.
+type unifiedAgentsSummary struct {
+	TotalAgents   int `json:"total_agents"`
+	ActiveAgents  int `json:"active_agents"`
+	IdleAgents    int `json:"idle_agents"`
+	OfflineAgents int `json:"offline_agents"`
+	SpawnedAgents int `json:"spawned_agents"`
+	WithSessions  int `json:"with_sessions"`
+}
+
+func TestMobileAgentsContract(t *testing.T) {
+	agents := []unifiedAgent{
+		{
+			AgentID:         "claude-code-1",
+			AgentType:       "claude-code",
+			Status:          "active",
+			Source:          "presence",
+			Description:     "Implementing feature X",
+			CurrentTask:     "Write unit tests",
+			Branch:          "feat/feature-x",
+			LastHeartbeat:   "2025-01-15T10:29:55Z",
+			SessionID:       "sess_abc123",
+			RootSessionID:   "sess_abc123",
+			Namespace:       "project/feature-x",
+			SessionStatus:   "active",
+			SessionStarted:  "2025-01-15T10:00:00Z",
+			EntryCount:      42,
+			TotalTokens:     8500,
+			ActiveFileCount: 3,
+			NeedsAttention:  false,
+			TaskCount:       5,
+			BlockedTasks:    1,
+			ClaimCount:      2,
+		},
+		{
+			AgentID:         "claude-code-sub-1",
+			AgentType:       "claude-code",
+			Status:          "active",
+			Source:          "presence",
+			Description:     "Subagent exploring payment module",
+			Branch:          "feat/feature-x",
+			LastHeartbeat:   "2025-01-15T10:29:50Z",
+			SessionID:       "sess_sub_xyz",
+			ParentSessionID: "sess_abc123",
+			RootSessionID:   "sess_abc123",
+			Namespace:       "project/feature-x",
+			SessionStatus:   "active",
+			SessionStarted:  "2025-01-15T10:20:00Z",
+			EntryCount:      8,
+			TotalTokens:     1200,
+			NeedsAttention:  false,
+		},
+		{
+			AgentID:        "gemini-1",
+			AgentType:      "gemini",
+			Status:         "idle",
+			Source:         "presence",
+			Description:    "Code review agent",
+			LastHeartbeat:  "2025-01-15T10:25:00Z",
+			NeedsAttention: false,
+		},
+	}
+	summary := unifiedAgentsSummary{
+		TotalAgents:  3,
+		ActiveAgents: 2,
+		IdleAgents:   1,
+		WithSessions: 2,
+	}
+	resp := map[string]any{
+		"agents":  agents,
+		"summary": summary,
+	}
+	assertGolden(t, "mobile_agents", marshalIndent(t, resp))
+}
+
+// ---------------------------------------------------------------------------
+// Mobile Sessions Contract
+// ---------------------------------------------------------------------------
+
+func TestMobileSessionsContract(t *testing.T) {
+	sessions := []bridge.SessionInfo{
+		{
+			ID:            "sess_abc123",
+			AgentID:       "claude-code-1",
+			Namespace:     "project/feature-x",
+			StartedAt:     "2025-01-15T10:00:00Z",
+			Status:        "active",
+			Description:   "Working on feature X",
+			EntryCount:    42,
+			TotalTokens:   8500,
+			RootSessionID: "sess_abc123",
+		},
+		{
+			ID:              "sess_sub_xyz",
+			AgentID:         "claude-code-sub-1",
+			Namespace:       "project/feature-x",
+			StartedAt:       "2025-01-15T10:20:00Z",
+			Status:          "active",
+			Description:     "Subagent exploring payment module",
+			EntryCount:      8,
+			TotalTokens:     1200,
+			ParentSessionID: "sess_abc123",
+			RootSessionID:   "sess_abc123",
+		},
+		{
+			ID:          "sess_def456",
+			AgentID:     "gemini-1",
+			Namespace:   "project/review",
+			StartedAt:   "2025-01-15T09:00:00Z",
+			EndedAt:     "2025-01-15T09:45:00Z",
+			Status:      "ended",
+			Description: "Code review session",
+			EntryCount:  15,
+			TotalTokens: 3200,
+		},
+	}
+	resp := map[string]any{
+		"sessions": sessions,
+	}
+	assertGolden(t, "mobile_sessions", marshalIndent(t, resp))
+}
+
+func TestMobileSessionTreeContract(t *testing.T) {
+	resp := map[string]any{
+		"roots": []any{
+			map[string]any{
+				"session": map[string]any{
+					"id":              "sess_abc123",
+					"agent_id":        "claude-code-1",
+					"namespace":       "project/feature-x",
+					"started_at":      "2025-01-15T10:00:00Z",
+					"status":          "active",
+					"description":     "Working on feature X",
+					"entry_count":     42,
+					"total_tokens":    8500,
+					"root_session_id": "sess_abc123",
+				},
+				"depth":              0,
+				"child_count":        1,
+				"active_child_count": 1,
+				"children": []any{
+					map[string]any{
+						"session": map[string]any{
+							"id":                "sess_sub_xyz",
+							"agent_id":          "claude-code-sub-1",
+							"namespace":         "project/feature-x",
+							"started_at":        "2025-01-15T10:20:00Z",
+							"status":            "active",
+							"description":       "Subagent exploring payment module",
+							"entry_count":       8,
+							"total_tokens":      1200,
+							"parent_session_id": "sess_abc123",
+							"root_session_id":   "sess_abc123",
+						},
+						"depth":              1,
+						"child_count":        0,
+						"active_child_count": 0,
+						"children":           []any{},
+					},
+				},
+			},
+		},
+		"orphans": []any{},
+		"summary": map[string]any{
+			"root_count":      1,
+			"active_sessions": 2,
+			"orphan_sessions": 0,
+			"updated_at":      "2025-01-15T10:30:00Z",
+		},
+	}
+	assertGolden(t, "mobile_session_tree", marshalIndent(t, resp))
+}
+
+// ---------------------------------------------------------------------------
+// Mobile Tasks Contract
+// ---------------------------------------------------------------------------
+
+// mobileTaskDTO mirrors hud.mobileTaskDTO.
+type mobileTaskDTO struct {
+	ID        string   `json:"id"`
+	SessionID string   `json:"session_id"`
+	AgentID   string   `json:"agent_id"`
+	Namespace string   `json:"namespace"`
+	Title     string   `json:"title"`
+	Context   string   `json:"context"`
+	Priority  string   `json:"priority"`
+	Status    string   `json:"status"`
+	Tags      []string `json:"tags"`
+	BlockedBy []string `json:"blocked_by"`
+	CreatedAt string   `json:"created_at"`
+	UpdatedAt string   `json:"updated_at"`
+}
+
+// mobileTaskCounts mirrors hud.mobileTaskCounts.
+type mobileTaskCounts struct {
+	Pending    int `json:"pending"`
+	InProgress int `json:"in_progress"`
+	Blocked    int `json:"blocked"`
+	Completed  int `json:"completed"`
+}
+
+func TestMobileTasksContract(t *testing.T) {
+	tasks := []mobileTaskDTO{
+		{
+			ID:        "task_001",
+			SessionID: "sess_abc123",
+			AgentID:   "claude-code-1",
+			Namespace: "project/feature-x",
+			Title:     "Implement golden test framework",
+			Context:   "Add contract tests for API response shapes",
+			Priority:  "high",
+			Status:    "in_progress",
+			Tags:      []string{"testing", "contracts"},
+			BlockedBy: []string{},
+			CreatedAt: "2025-01-15T10:05:00Z",
+			UpdatedAt: "2025-01-15T10:20:00Z",
+		},
+		{
+			ID:        "task_002",
+			SessionID: "sess_abc123",
+			AgentID:   "claude-code-1",
+			Namespace: "project/feature-x",
+			Title:     "Add SSE event golden files",
+			Context:   "Capture SSE event payload shapes",
+			Priority:  "medium",
+			Status:    "pending",
+			Tags:      []string{"testing"},
+			BlockedBy: []string{"task_001"},
+			CreatedAt: "2025-01-15T10:06:00Z",
+			UpdatedAt: "2025-01-15T10:06:00Z",
+		},
+	}
+	counts := mobileTaskCounts{
+		Pending:    1,
+		InProgress: 1,
+	}
+	resp := map[string]any{
+		"tasks":  tasks,
+		"counts": counts,
+		"coordination": map[string]any{
+			"summary": map[string]any{
+				"active_namespaces":        1,
+				"namespaces_at_risk":       0,
+				"agents_needing_attention": 0,
+				"shared_branches":          0,
+				"conflict_files":           0,
+				"cross_agent_blockers":     0,
+				"orphan_tasks":             0,
+				"idle_claim_holders":       0,
+				"merge_ready_branches":     0,
+			},
+			"blockers":         []any{},
+			"risky_namespaces": []any{},
+		},
+	}
+	assertGolden(t, "mobile_tasks", marshalIndent(t, resp))
+}
+
+// ---------------------------------------------------------------------------
+// SSE Events Contract
+// ---------------------------------------------------------------------------
+
+func TestSSEEventsContract(t *testing.T) {
+	fixedTime := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+
+	events := map[string]bridge.SSEEvent{
+		"fleet": {
+			ID:        "evt_fleet_001",
+			Type:      "hud.fleet",
+			Timestamp: fixedTime,
+			Data:      json.RawMessage(`{"daemon_running":true,"server_count":12,"active_sessions":3,"active_agents":2,"idle_agents":1,"offline_agents":0}`),
+		},
+		"health": {
+			ID:        "evt_health_001",
+			Type:      "hud.health",
+			Timestamp: fixedTime,
+			Data:      json.RawMessage(`{"total_servers":12,"healthy_servers":10,"degraded_servers":1,"down_servers":1,"idle_servers":0}`),
+		},
+		"session_start": {
+			ID:        "evt_sess_001",
+			Type:      "hud.session.start",
+			Timestamp: fixedTime,
+			Data:      json.RawMessage(`{"session_id":"sess_abc123","agent_id":"claude-code-1","namespace":"project/feature-x","description":"Working on feature X"}`),
+		},
+		"session_end": {
+			ID:        "evt_sess_002",
+			Type:      "hud.session.end",
+			Timestamp: fixedTime,
+			Data:      json.RawMessage(`{"session_id":"sess_abc123","agent_id":"claude-code-1","namespace":"project/feature-x","summary":"Completed feature X implementation"}`),
+		},
+		"heartbeat": {
+			ID:        "evt_hb_001",
+			Type:      "hud.heartbeat",
+			Timestamp: fixedTime,
+			Data:      json.RawMessage(`{"agent_id":"claude-code-1","status":"active","current_task":"Writing tests","branch":"feat/feature-x"}`),
+		},
+	}
+
+	assertGolden(t, "sse_events", marshalIndent(t, events))
+}
+
+// ---------------------------------------------------------------------------
+// Bridge DTO Shape Contracts
+// ---------------------------------------------------------------------------
+
+func TestSessionInfoContract(t *testing.T) {
+	s := bridge.SessionInfo{
+		ID:          "sess_abc123",
+		AgentID:     "claude-code-1",
+		Namespace:   "project/feature-x",
+		StartedAt:   "2025-01-15T10:00:00Z",
+		EndedAt:     "2025-01-15T11:00:00Z",
+		Status:      "ended",
+		Description: "Working on feature X",
+		PipelineRef: &bridge.PipelineRef{
+			ID:      67890,
+			Project: "services/loom-core",
+			Ref:     "feat/feature-x",
+		},
+		EntryCount:  42,
+		TotalTokens: 8500,
+	}
+	assertGolden(t, "dto_session_info", marshalIndent(t, s))
+}
+
+func TestTaskInfoContract(t *testing.T) {
+	task := bridge.TaskInfo{
+		ID:        "task_001",
+		SessionID: "sess_abc123",
+		AgentID:   "claude-code-1",
+		Namespace: "project/feature-x",
+		Title:     "Implement golden test framework",
+		Context:   "Add contract tests for API response shapes",
+		Priority:  "high",
+		Status:    "in_progress",
+		Tags:      []string{"testing", "contracts"},
+		BlockedBy: []string{"task_000"},
+		PipelineRef: &bridge.PipelineRef{
+			ID:      12345,
+			Project: "services/loom-core",
+			Ref:     "feat/golden-tests",
+			WebURL:  "https://gitlab.example.com/services/loom-core/-/pipelines/12345",
+		},
+		WorkflowID: "wf_build_and_test_001",
+		CreatedAt:  "2025-01-15T10:05:00Z",
+		UpdatedAt:  "2025-01-15T10:20:00Z",
+	}
+	assertGolden(t, "dto_task_info", marshalIndent(t, task))
+}
+
+func TestPresenceInfoContract(t *testing.T) {
+	p := presence.PresenceInfo{
+		AgentID:       "claude-code-1",
+		SessionID:     "sess_abc123",
+		Status:        "active",
+		AgentType:     "claude-code",
+		Description:   "Working on feature X",
+		CurrentTask:   "Writing unit tests",
+		ActiveFiles:   []string{"internal/contracts/golden_test.go"},
+		Branch:        "feat/feature-x",
+		WorktreeID:    "wt_001",
+		LastHeartbeat: "2025-01-15T10:29:55Z",
+		RegisteredAt:  "2025-01-15T10:00:00Z",
+	}
+	assertGolden(t, "dto_presence_info", marshalIndent(t, p))
+}
+
+func TestEntityInfoContract(t *testing.T) {
+	e := bridge.EntityInfo{
+		ID:          "ent_001",
+		Name:        "UserService",
+		Type:        "service",
+		EntityType:  "service",
+		Description: "Handles user authentication and profile management",
+		Namespace:   "project/auth",
+		Properties:  map[string]any{"language": "go", "lines": 450},
+	}
+	assertGolden(t, "dto_entity_info", marshalIndent(t, e))
+}
+
+func TestEntityDetailContract(t *testing.T) {
+	d := bridge.EntityDetail{
+		ID:         "ent_001",
+		Name:       "UserService",
+		Type:       "service",
+		EntityType: "service",
+		Namespace:  "project/auth",
+		Properties: map[string]any{"language": "go"},
+		InboundRelations: []bridge.RelationInfo{
+			{
+				ID:           "rel_001",
+				Source:       "ent_002",
+				SourceName:   "APIGateway",
+				Target:       "ent_001",
+				TargetName:   "UserService",
+				Type:         "depends_on",
+				RelationType: "depends_on",
+			},
+		},
+		OutboundRelations: []bridge.RelationInfo{
+			{
+				ID:           "rel_002",
+				Source:       "ent_001",
+				SourceName:   "UserService",
+				Target:       "ent_003",
+				TargetName:   "PostgresDB",
+				Type:         "uses",
+				RelationType: "uses",
+			},
+		},
+	}
+	assertGolden(t, "dto_entity_detail", marshalIndent(t, d))
+}
+
+func TestRelationInfoContract(t *testing.T) {
+	r := bridge.RelationInfo{
+		ID:           "rel_001",
+		Source:       "ent_001",
+		SourceName:   "UserService",
+		Target:       "ent_002",
+		TargetName:   "PostgresDB",
+		Type:         "uses",
+		RelationType: "uses",
+	}
+	assertGolden(t, "dto_relation_info", marshalIndent(t, r))
+}
+
+func TestContextInspectRequestContract(t *testing.T) {
+	r := bridge.ContextInspectRequest{
+		AgentID:   "claude-code-1",
+		SessionID: "sess_abc123",
+		Detail:    true,
+		Limit:     200,
+	}
+	assertGolden(t, "dto_context_inspect_request", marshalIndent(t, r))
+}
+
+func TestNudgeQueuePolicyContract(t *testing.T) {
+	p := bridge.NudgeQueuePolicy{
+		DebounceMs:   500,
+		Cap:          100,
+		DropPolicy:   "drop_old",
+		LanePriority: []string{"critical", "high", "normal", "low"},
+	}
+	assertGolden(t, "dto_nudge_queue_policy", marshalIndent(t, p))
+}
+
+func TestHeartbeatRequestContract(t *testing.T) {
+	h := bridge.HeartbeatRequest{
+		AgentID:     "claude-code-1",
+		SessionID:   "sess_abc123",
+		Status:      "active",
+		AgentType:   "claude-code",
+		Description: "Working on feature X",
+		Namespace:   "project/feature-x",
+		ActiveFiles: []string{"internal/contracts/golden_test.go"},
+		CurrentTask: "Writing tests",
+		Branch:      "feat/feature-x",
+	}
+	assertGolden(t, "dto_heartbeat_request", marshalIndent(t, h))
+}

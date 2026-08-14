@@ -1,0 +1,1 @@
+- Let `loom mills council run` and `dryrun` use their ten-minute request budget by default while preserving explicit `--timeout` overrides.

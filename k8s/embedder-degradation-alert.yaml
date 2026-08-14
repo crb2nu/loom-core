@@ -1,0 +1,29 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: loom-embedder-degradation
+  labels:
+    app.kubernetes.io/name: loom
+    app.kubernetes.io/component: agent-context
+spec:
+  groups:
+    - name: loom.embedder-degradation
+      rules:
+        - alert: LoomEmbedderHighFailureRate
+          annotations:
+            description: >-
+              More than 10% of agent-context document embedding attempts have
+              fallen back over the last 15 minutes. The alert is suppressed
+              when no embedding attempts occurred during the window.
+            summary: Loom embedder failure rate is above 10%
+          expr: |-
+            (
+              sum(rate(agent_context_embed_fallback_writes_total[15m]))
+              /
+              sum(rate(agent_context_embed_write_attempts_total[15m]))
+            ) > 0.10
+            and
+            sum(rate(agent_context_embed_write_attempts_total[15m])) > 0
+          for: 5m
+          labels:
+            severity: warning

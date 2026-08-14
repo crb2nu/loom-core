@@ -1,0 +1,616 @@
+package fleet
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/crb2nu/loom/internal/hud/bridge"
+	"github.com/crb2nu/loom/internal/hud/fleetview"
+)
+
+// handleAgentSessionStart creates a new agent session (idempotent).
+func (d *FleetDomain) handleAgentSessionStart(w http.ResponseWriter, r *http.Request) {
+	var body bridge.SessionStartParams
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+	var err error
+	body, err = body.ToParams()
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	result, err := d.deps.Agent().StartSession(body)
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to start session", err)
+		return
+	}
+
+	if !result.AlreadyExisted {
+		d.deps.BroadcastAgentEvent("agent.session.start", map[string]any{
+			"session_id": result.SessionID,
+			"agent_id":   body.AgentID,
+			"agent_type": body.AgentType,
+			"namespace":  body.Namespace,
+		})
+		d.deps.FleetIncrementKPI("sessions", 1)
+		go d.deps.MaybeAutoProvisionSandbox(body.Namespace)
+	}
+	// Always refresh fleet snapshot so ActiveSessions gauge stays current,
+	// even for idempotent session starts that return an existing session.
+	go d.deps.FleetRefresh()
+	d.deps.MaybeSampleContextTelemetry(body.AgentID, result.SessionID, body.AgentType, "session_start")
+
+	d.deps.WriteJSON(w, http.StatusOK, result)
+}
+
+// handleAgentSessionEnd ends an agent session.
+func (d *FleetDomain) handleAgentSessionEnd(w http.ResponseWriter, r *http.Request) {
+	var body bridge.SessionEndParams
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+	var err error
+	body, err = body.ToParams()
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	body, _ = d.deps.PlanSessionEndSummary(body)
+	ended, err := d.deps.Agent().EndSession(body)
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to end session", err)
+		return
+	}
+
+	if ended {
+		d.deps.BroadcastAgentEvent("agent.session.end", map[string]any{
+			"session_id": body.SessionID,
+			"agent_id":   body.AgentID,
+		})
+		go d.deps.FleetRefresh()
+		d.deps.OnSessionEnd(body.SessionID, body.AgentID)
+	} else {
+		d.deps.Logger().Debug("session end: no active session found, skipping",
+			"agent_id", body.AgentID, "session_id", body.SessionID)
+	}
+
+	d.deps.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleAgentDeregister removes an agent from the presence registry.
+//
+// This is the HTTP surface for AgentBridge.PresenceDeregister, posted by
+// `loom agent keepalive` when it receives SIGINT/SIGTERM. Deregistration is
+// best-effort by nature (the agent is already going away), so a bridge failure
+// is reported as 502 but the fleet snapshot is refreshed either way.
+func (d *FleetDomain) handleAgentDeregister(w http.ResponseWriter, r *http.Request) {
+	var body bridge.DeregisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+	body = body.Normalize()
+	if err := body.Validate(); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	if err := d.deps.Agent().PresenceDeregister(body.AgentID); err != nil {
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to deregister presence", err)
+		return
+	}
+
+	d.deps.BroadcastAgentEvent("agent.presence.deregister", map[string]any{
+		"agent_id": body.AgentID,
+	})
+	go d.deps.FleetRefresh()
+
+	d.deps.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleAgentHeartbeat updates an agent's presence heartbeat.
+func (d *FleetDomain) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var body bridge.HeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+	var err error
+	body, err = body.ToRequest()
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	// Ingest mirror-forwarded tool-call activity unconditionally, before any of
+	// the presence/coalesce branches that return early. This is independent of
+	// presence registration, and mirror heartbeats use ensure_session=true whose
+	// bootstrap path returns before the handler's tail — so placing it there
+	// would silently drop every distributed agent's calls.
+	d.ingestRecentToolCalls(body)
+
+	var ensureSessionErr error
+	if body.EnsureSession {
+		namespace := strings.TrimSpace(body.Namespace)
+		if err := d.ensureHeartbeatSession(body.AgentID, namespace, body.AgentType, body.Description); err != nil {
+			ensureSessionErr = err
+			d.deps.Logger().Warn("heartbeat ensure-session failed", "agent_id", body.AgentID, "error", err)
+		}
+	}
+
+	// Coalesce rapid heartbeats: skip the MCP round-trip if we saw an identical
+	// payload recently.
+	cacheKey := "hb:" + body.AgentID
+	fp := heartbeatFingerprint(body.Status, body.CurrentTask, body.Branch, body.ActiveFiles)
+	if prev, ok := d.deps.CacheGet(cacheKey); ok {
+		if prevFP, ok := prev.(string); ok && prevFP == fp {
+			d.broadcastHeartbeat(body)
+
+			resp := map[string]any{"ok": true}
+			if pending := d.deps.NudgeQueue().Count(body.AgentID); pending > 0 {
+				resp["nudge_queue"] = d.deps.NudgeQueue().StatusView(body.AgentID)
+			}
+			if nudges := d.deps.NudgeQueue().Drain(body.AgentID); len(nudges) > 0 {
+				resp["nudges"] = nudges
+			}
+			d.deps.WriteJSON(w, http.StatusOK, resp)
+			return
+		}
+	}
+
+	result, err := d.deps.Agent().PresenceHeartbeat(body.AgentID, body.HeartbeatParams())
+	if err != nil {
+		if isPresenceNotRegisteredErr(err) {
+			if body.EnsureSession {
+				if ensureSessionErr == nil {
+					namespace := strings.TrimSpace(body.Namespace)
+					ensureSessionErr = d.ensureHeartbeatSession(body.AgentID, namespace, body.AgentType, body.Description)
+				}
+				if ensureSessionErr != nil {
+					d.deps.WriteError(w, http.StatusBadGateway, "failed to bootstrap session for heartbeat", ensureSessionErr)
+					return
+				}
+
+				result, err = d.deps.Agent().PresenceHeartbeat(body.AgentID, body.HeartbeatParams())
+				if err == nil {
+					d.deps.CacheSet(cacheKey, fp, 10*time.Second)
+					d.broadcastHeartbeat(body)
+					go d.deps.FleetRefresh()
+
+					resp := map[string]any{"ok": true}
+					if result != nil && result.HasConflicts {
+						resp["has_conflicts"] = true
+						resp["conflicts"] = result.Conflicts
+					}
+					if pending := d.deps.NudgeQueue().Count(body.AgentID); pending > 0 {
+						resp["nudge_queue"] = d.deps.NudgeQueue().StatusView(body.AgentID)
+					}
+					d.deps.WriteJSON(w, http.StatusOK, resp)
+					return
+				}
+
+				if isPresenceNotRegisteredErr(err) {
+					d.deps.WriteError(w, http.StatusBadGateway, "failed to bootstrap session for heartbeat", err)
+					return
+				}
+			}
+
+			_ = d.deps.Agent().PresenceRegister(body.AgentID, body.SessionID, body.AgentType, body.Description, body.HeartbeatTTLSeconds)
+			result, err = d.deps.Agent().PresenceHeartbeat(body.AgentID, body.HeartbeatParams())
+			if err == nil {
+				d.deps.CacheSet(cacheKey, fp, 10*time.Second)
+				d.broadcastHeartbeat(body)
+				go d.deps.FleetRefresh()
+
+				resp := map[string]any{"ok": true}
+				if result != nil && result.HasConflicts {
+					resp["has_conflicts"] = true
+					resp["conflicts"] = result.Conflicts
+				}
+				if pending := d.deps.NudgeQueue().Count(body.AgentID); pending > 0 {
+					resp["nudge_queue"] = d.deps.NudgeQueue().StatusView(body.AgentID)
+				}
+				d.deps.WriteJSON(w, http.StatusOK, resp)
+				return
+			}
+		}
+
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to send heartbeat", err)
+		return
+	}
+
+	d.deps.CacheSet(cacheKey, fp, 10*time.Second)
+	d.broadcastHeartbeat(body)
+	d.deps.FleetIncrementKPI("sessions", 0) // ensure day reset
+	go d.deps.FleetRefresh()
+
+	resp := map[string]any{"ok": true}
+	if result != nil && result.HasConflicts {
+		resp["has_conflicts"] = true
+		resp["conflicts"] = result.Conflicts
+	}
+	if pending := d.deps.NudgeQueue().Count(body.AgentID); pending > 0 {
+		resp["nudge_queue"] = d.deps.NudgeQueue().StatusView(body.AgentID)
+	}
+
+	// Build directives block with actionable info for the agent.
+	directives := make(map[string]any)
+	if handoffs, err := d.deps.Agent().HandoffListForAgent(body.AgentID); err == nil && len(handoffs) > 0 {
+		directives["pending_handoffs"] = len(handoffs)
+		dispatched := make([]map[string]any, 0)
+		for _, h := range handoffs {
+			if strings.HasPrefix(h.Summary, "[Dispatched] ") {
+				dispatched = append(dispatched, map[string]any{
+					"id":    h.ID,
+					"title": strings.TrimPrefix(h.Summary, "[Dispatched] "),
+				})
+			}
+		}
+		if len(dispatched) > 0 {
+			directives["dispatched_tasks"] = dispatched
+		}
+	}
+	if len(directives) > 0 {
+		resp["directives"] = directives
+	}
+
+	// Sandbox policy nudge.
+	if body.CurrentTask != "" {
+		d.maybeSandboxNudge(body.AgentID, body.CurrentTask)
+	}
+
+	if nudges := d.deps.NudgeQueue().Drain(body.AgentID); len(nudges) > 0 {
+		resp["nudges"] = nudges
+	}
+	d.deps.MaybeSampleContextTelemetry(body.AgentID, body.SessionID, body.AgentType, "heartbeat")
+
+	d.deps.WriteJSON(w, http.StatusOK, resp)
+}
+
+// ingestRecentToolCalls re-broadcasts tool-call activity forwarded by a HUD
+// mirror so it lands in the central HUD's EventLog (via BroadcastAgentEvent ->
+// eventLog.Append) and surfaces in buildSessionTrace for distributed agents
+// whose tool calls never reach this daemon's EventBus directly. Each entry's
+// session_id/agent_id is defaulted from the heartbeat when the mirror omitted
+// it. Bounded per heartbeat to keep a noisy session from flooding the log.
+func (d *FleetDomain) ingestRecentToolCalls(body bridge.HeartbeatRequest) {
+	const maxPerHeartbeat = 50
+	n := 0
+	for _, tc := range body.RecentToolCalls {
+		if tc == nil {
+			continue
+		}
+		if n >= maxPerHeartbeat {
+			break
+		}
+		if _, ok := tc["session_id"].(string); !ok && body.SessionID != "" {
+			tc["session_id"] = body.SessionID
+		}
+		if _, ok := tc["agent_id"].(string); !ok && body.AgentID != "" {
+			tc["agent_id"] = body.AgentID
+		}
+		d.deps.BroadcastAgentEvent("tool.call", tc)
+		n++
+	}
+}
+
+// handleAgentSession returns the active session for an agent.
+func (d *FleetDomain) handleAgentSession(w http.ResponseWriter, r *http.Request) {
+	req := bridge.SessionRequest{AgentID: r.URL.Query().Get("agent_id")}
+	req = req.Normalize()
+	if err := req.Validate(); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	session, err := d.deps.Agent().GetActiveSession(req.AgentID)
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to get session", err)
+		return
+	}
+	if session == nil {
+		d.deps.WriteJSON(w, http.StatusOK, map[string]any{"session": nil})
+		return
+	}
+
+	d.deps.WriteJSON(w, http.StatusOK, map[string]any{"session": session})
+}
+
+// handleAgentSessionList lists sessions with optional filters.
+func (d *FleetDomain) handleAgentSessionList(w http.ResponseWriter, r *http.Request) {
+	var req bridge.SessionListRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+	params, err := req.Params()
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	result, err := d.deps.Agent().ListSessions(params)
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to list sessions", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(result)
+}
+
+// handleAgentSessionPrune prunes stale sessions.
+func (d *FleetDomain) handleAgentSessionPrune(w http.ResponseWriter, r *http.Request) {
+	var req bridge.SessionPruneRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, "invalid request body", err)
+		return
+	}
+	params, err := req.Params()
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	result, err := d.deps.Agent().PruneSessions(params)
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to prune sessions", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(result)
+}
+
+// handleAgentSessionDetail serves the rich session detail.
+func (d *FleetDomain) handleAgentSessionDetail(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	agentID := strings.TrimSpace(r.URL.Query().Get("agent_id"))
+	if sessionID == "" && agentID == "" {
+		d.deps.WriteError(w, http.StatusBadRequest, "session_id or agent_id query parameter required", nil)
+		return
+	}
+
+	sessions, err := d.deps.Agent().Sessions()
+	if err != nil {
+		d.deps.WriteError(w, http.StatusBadGateway, "failed to list sessions", err)
+		return
+	}
+
+	var found *bridge.SessionInfo
+	for i := range sessions {
+		s := &sessions[i]
+		if sessionID != "" && strings.TrimSpace(s.ID) == sessionID {
+			found = s
+			break
+		}
+		if agentID != "" && strings.TrimSpace(s.AgentID) == agentID && s.Status == "active" {
+			found = s
+			break
+		}
+	}
+	if found == nil {
+		d.deps.WriteError(w, http.StatusNotFound, "session not found", nil)
+		return
+	}
+
+	result := map[string]any{"session": found}
+
+	inspect, err := d.deps.Agent().ContextInspect(found.AgentID, found.ID, true, 200)
+	if err == nil && inspect != nil {
+		result["entry_breakdown"] = inspect.ByEntryType
+		result["top_entries"] = inspect.TopEntries
+		result["tasks"] = inspect.Tasks
+
+		var decisions, errors []bridge.ContextInspectTopEntry
+		for _, e := range inspect.TopEntries {
+			switch e.EntryType {
+			case "decision":
+				decisions = append(decisions, e)
+			case "error":
+				errors = append(errors, e)
+			}
+		}
+		result["decisions"] = decisions
+		result["errors"] = errors
+	}
+
+	d.deps.WriteJSON(w, http.StatusOK, result)
+}
+
+// --- Helpers ---
+
+func (d *FleetDomain) ensureHeartbeatSession(agentID, namespace, agentType, description string) error {
+	if strings.TrimSpace(agentID) == "" {
+		return nil
+	}
+
+	cacheKey := "hb-session:" + agentID + ":" + namespace
+	if _, ok := d.deps.CacheGet(cacheKey); ok {
+		return nil
+	}
+
+	active, err := d.deps.Agent().GetActiveSession(agentID)
+	if err != nil {
+		return err
+	}
+	if active == nil {
+		// Reconcile to the real conversation session before bootstrapping.
+		// The proxy/mirror background heartbeat carries a workspace-scoped base
+		// id ("<type>-<WS_HASH>"); the CLI hooks own a scoped session
+		// ("<type>-<WS_HASH>-<SCOPE>") that exact GetActiveSession can't see.
+		// Without this, ensure_session forks a phantom "agents/<id>" twin —
+		// a background wakeup of the wrong session. Attach to the existing
+		// scoped session instead; only truly hook-less agents fall through to
+		// the bootstrap below.
+		active = d.baseMatchActiveSession(agentID)
+	}
+	if active != nil {
+		// A heartbeat must never fork a SECOND active session for an agent that
+		// already has one. The agent_id already encodes the workspace (WS_HASH),
+		// so one agent_id == one conversation in one workspace == at most one
+		// live session. Previously this reused the session only when the incoming
+		// namespace matched; the federation mirror posts heartbeats with a
+		// synthetic `agents/<agent-id>` namespace (mirror.go buildHeartbeatBody)
+		// whenever it can't resolve the source namespace, so the mismatch forked
+		// a duplicate `agents/<id>` twin of every mirrored agent and polluted the
+		// Live Agents table. Reuse the live session regardless of namespace.
+		d.deps.CacheSet(cacheKey, true, 30*time.Second)
+		return nil
+	}
+
+	if namespace == "" {
+		namespace = "agents/" + agentID
+	}
+	if strings.TrimSpace(agentType) == "" {
+		agentType = agentID
+	}
+	if strings.TrimSpace(description) == "" {
+		description = "Heartbeat bootstrap session"
+	}
+
+	result, err := d.deps.Agent().StartSession(bridge.SessionStartParams{
+		Namespace:   namespace,
+		AgentID:     agentID,
+		AgentType:   agentType,
+		Description: description,
+		AutoRecall:  false,
+	})
+	if err != nil {
+		return err
+	}
+
+	d.deps.CacheSet(cacheKey, true, 30*time.Second)
+	if result != nil {
+		d.deps.BroadcastAgentEvent("agent.session.bootstrap", map[string]any{
+			"agent_id":   agentID,
+			"agent_type": agentType,
+			"session_id": result.SessionID,
+			"namespace":  namespace,
+		})
+	}
+
+	return nil
+}
+
+// baseMatchActiveSession finds an active session owned by the conversation that
+// the given workspace-base agentID belongs to. The proxy/mirror background
+// heartbeat uses a scopeless "<type>-<WS_HASH>" id while the CLI hooks own a
+// scoped "<type>-<WS_HASH>-<SCOPE>" session; exact GetActiveSession misses that.
+// Returns the first active base-extension match (nil if none), so ensure_session
+// reuses the real session instead of forking an "agents/<id>" twin.
+func (d *FleetDomain) baseMatchActiveSession(agentID string) *bridge.SessionInfo {
+	sessions, err := d.deps.Agent().ActiveSessions()
+	if err != nil {
+		return nil
+	}
+	for i := range sessions {
+		s := &sessions[i]
+		if !strings.EqualFold(strings.TrimSpace(s.Status), "active") {
+			continue
+		}
+		sid := strings.TrimSpace(s.AgentID)
+		if sid == agentID || !fleetview.IsBaseOf(agentID, sid) {
+			continue
+		}
+		return s
+	}
+	return nil
+}
+
+func heartbeatFingerprint(status, currentTask, branch string, activeFiles []string) string {
+	afs := append([]string(nil), activeFiles...)
+	sort.Strings(afs)
+
+	h := sha256.New()
+	h.Write([]byte(status))
+	h.Write([]byte{0})
+	h.Write([]byte(currentTask))
+	h.Write([]byte{0})
+	h.Write([]byte(branch))
+	h.Write([]byte{0})
+	for _, f := range afs {
+		h.Write([]byte(f))
+		h.Write([]byte{0})
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func isPresenceNotRegisteredErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not registered") &&
+		strings.Contains(msg, "agent_presence_register")
+}
+
+func (d *FleetDomain) broadcastHeartbeat(body bridge.HeartbeatRequest) {
+	d.deps.BroadcastAgentEvent("agent.heartbeat", map[string]any{
+		"agent_id":     body.AgentID,
+		"status":       body.Status,
+		"current_task": body.CurrentTask,
+		"active_files": body.ActiveFiles,
+		"branch":       body.Branch,
+		"timestamp":    time.Now().Format(time.RFC3339),
+	})
+}
+
+// maybeSandboxNudge checks the cached sandbox_policy for require_sandbox patterns.
+// If the agent's current task matches and no active sandbox exists, a nudge is queued.
+func (d *FleetDomain) maybeSandboxNudge(agentID, currentTask string) {
+	cached, ok := d.deps.CacheGet("sandbox_policy")
+	if !ok {
+		return
+	}
+	policy, ok := cached.(map[string]any)
+	if !ok {
+		return
+	}
+	if !matchesSandboxPolicy(currentTask, policy) {
+		return
+	}
+
+	if summary, ok := d.deps.CacheGet("sandbox_summary"); ok {
+		if m, ok := summary.(map[string]any); ok {
+			if running, _ := m["running"].(float64); running > 0 {
+				return
+			}
+		}
+	}
+
+	d.deps.NudgeQueue().QueueNudge(agentID, "context_inject", "control",
+		"Your current task matches sandbox policy (require_sandbox). Consider using devbox_exec instead of running commands directly on the host.",
+		"hud")
+}
+
+func matchesSandboxPolicy(task string, policy map[string]any) bool {
+	patterns, ok := policy["require_sandbox"]
+	if !ok {
+		return false
+	}
+	patternList, ok := patterns.([]any)
+	if !ok {
+		return false
+	}
+	taskLower := strings.ToLower(task)
+	for _, p := range patternList {
+		if s, ok := p.(string); ok && strings.Contains(taskLower, strings.ToLower(s)) {
+			return true
+		}
+	}
+	return false
+}

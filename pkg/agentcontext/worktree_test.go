@@ -7,7 +7,8 @@ import (
 
 func TestWorktreeCleanupSafeTypeAssertions(t *testing.T) {
 	// Verify that toString() on missing/nil map values doesn't panic
-	// This tests the fix for the unsafe type assertions in HandleWorktreeCleanup
+	// This guards the toString() helper that the worktree payload converters
+	// below rely on (originally the fix for unsafe assertions in worktree cleanup).
 
 	m := map[string]any{}
 
@@ -124,9 +125,9 @@ func TestOrphanWorktreesForAgent(t *testing.T) {
 		CreatedAt:    now,
 	}
 
-	svc.worktreeAssns["wt-1"] = wt1
-	svc.worktreeAssns["wt-2"] = wt2
-	svc.worktreeAssns["wt-3"] = wt3
+	svc.worktrees.assns["wt-1"] = wt1
+	svc.worktrees.assns["wt-2"] = wt2
+	svc.worktrees.assns["wt-3"] = wt3
 
 	svc.orphanWorktreesForAgent("agent-1")
 
@@ -152,7 +153,7 @@ func TestOrphanWorktreesForAgent_SetsOrphanedAt(t *testing.T) {
 		Status:    WorktreeStatusActive,
 		CreatedAt: time.Now(),
 	}
-	svc.worktreeAssns["wt-orphan-at"] = wt
+	svc.worktrees.assns["wt-orphan-at"] = wt
 
 	before := time.Now()
 	svc.orphanWorktreesForAgent("agent-1")

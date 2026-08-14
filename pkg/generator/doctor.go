@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pelletier/go-toml/v2"
+
 	"github.com/crb2nu/loom/pkg/registry"
 	"github.com/crb2nu/loom/pkg/validator"
 )
@@ -22,6 +24,7 @@ type PlatformHealth struct {
 	Hooks        string              `json:"hooks"`                 // "ok", "stale", "missing", "n/a"
 	Perms        string              `json:"perms"`                 // "ok", "drift", "missing", "n/a"
 	Schema       string              `json:"schema"`                // "ok", "errors", "n/a"
+	Policy       string              `json:"policy"`                // "ok", "stale", "not-configured", "n/a"
 	Status       string              `json:"status"`                // "healthy", "stale", "not_configured"
 	ConfigPath   string              `json:"config_path,omitempty"` // path checked
 	Details      []string            `json:"details,omitempty"`
@@ -67,6 +70,7 @@ func DoctorCheck(reg *registry.Registry, platform, configDir string) *PlatformHe
 		Hooks:      "n/a",
 		Perms:      "n/a",
 		Schema:     "n/a",
+		Policy:     "n/a",
 		Status:     "healthy",
 		ConfigPath: configDir,
 	}
@@ -86,9 +90,14 @@ func DoctorCheck(reg *registry.Registry, platform, configDir string) *PlatformHe
 		checkCodexHealth(health, configDir)
 	case "opencode":
 		checkOpenCodeHealth(health, configDir)
+	case "antigravity":
+		checkAntigravityHealth(health, reg, configDir)
 	default:
 		checkBasicHealth(health, platform, configDir)
 	}
+
+	// Check policy enforcement health.
+	checkPolicyHealth(health, platform, configDir)
 
 	// Attach vendor capability matrix and check for feature mismatches.
 	health.Capabilities = GetVendorCapabilities(platform)
@@ -120,7 +129,8 @@ func checkClaudeHealth(health *PlatformHealth, reg *registry.Registry, configDir
 	}
 
 	// Compare hooks block.
-	expectedHooks := claudeHooks(reg)
+	claudeProfile, _ := GetPlatformProfile("claude")
+	expectedHooks := claudeHooks(reg, claudeProfile, "")
 	onDiskHooks := onDisk["hooks"]
 	if onDiskHooks == nil {
 		health.Hooks = "missing"
@@ -159,12 +169,26 @@ func checkClaudeHealth(health *PlatformHealth, reg *registry.Registry, configDir
 	}
 }
 
-// checkGeminiHealth checks Gemini CLI settings.json for hooks freshness.
+// checkGeminiHealth checks Gemini CLI config.toml and settings.json for loom
+// proxy wiring, hooks freshness, and policy drift.
 func checkGeminiHealth(health *PlatformHealth, reg *registry.Registry, configDir string) {
+	configPath := filepath.Join(configDir, "config.toml")
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		health.Perms = "missing"
+		health.Details = append(health.Details, "config.toml not found")
+	} else if !hasGeminiLoomProxyConfig(configData) {
+		health.Perms = "drift"
+		health.Details = append(health.Details, "config.toml exists but has no loom MCP proxy configuration")
+	} else {
+		health.Perms = "ok"
+	}
+
 	settingsPath := filepath.Join(configDir, "settings.json")
 	data, err := os.ReadFile(settingsPath)
 	if err != nil {
 		health.Hooks = "missing"
+		health.Perms = "missing"
 		health.Details = append(health.Details, "settings.json not found")
 		return
 	}
@@ -178,7 +202,8 @@ func checkGeminiHealth(health *PlatformHealth, reg *registry.Registry, configDir
 	}
 
 	// Compare hooks block.
-	expectedConfig := geminiHooksConfigFromRegistry(reg)
+	geminiProfile, _ := GetPlatformProfile("gemini")
+	expectedConfig := geminiHooksConfigFromRegistry(reg, geminiProfile, "")
 	expectedHooks := expectedConfig["hooks"]
 	onDiskHooks := onDisk["hooks"]
 	if onDiskHooks == nil {
@@ -189,6 +214,43 @@ func checkGeminiHealth(health *PlatformHealth, reg *registry.Registry, configDir
 		health.Details = append(health.Details, "hooks block differs from expected (regenerate with: loom sync gemini --regen)")
 	} else {
 		health.Hooks = "ok"
+	}
+
+	expectedGeneral, expectedGeneralOK := expectedConfig["general"]
+	onDiskGeneral, onDiskGeneralOK := onDisk["general"]
+	expectedTools, expectedToolsOK := expectedConfig["tools"]
+	onDiskTools, onDiskToolsOK := onDisk["tools"]
+
+	switch {
+	case expectedGeneralOK && !onDiskGeneralOK:
+		health.Perms = "missing"
+		health.Details = append(health.Details, "general block missing from settings.json")
+	case !expectedGeneralOK && onDiskGeneralOK:
+		if health.Perms != "missing" {
+			health.Perms = "drift"
+		}
+		health.Details = append(health.Details, "general block differs from expected")
+	case expectedGeneralOK && onDiskGeneralOK && jsonFingerprint(onDiskGeneral) != jsonFingerprint(expectedGeneral):
+		if health.Perms != "missing" {
+			health.Perms = "drift"
+		}
+		health.Details = append(health.Details, "general block differs from expected")
+	}
+
+	switch {
+	case expectedToolsOK && !onDiskToolsOK:
+		health.Perms = "missing"
+		health.Details = append(health.Details, "tools block missing from settings.json")
+	case !expectedToolsOK && onDiskToolsOK:
+		if health.Perms != "missing" {
+			health.Perms = "drift"
+		}
+		health.Details = append(health.Details, "tools block differs from expected")
+	case expectedToolsOK && onDiskToolsOK && jsonFingerprint(onDiskTools) != jsonFingerprint(expectedTools):
+		if health.Perms != "missing" {
+			health.Perms = "drift"
+		}
+		health.Details = append(health.Details, "tools block differs from expected")
 	}
 
 	// Schema validation.
@@ -205,6 +267,12 @@ func checkGeminiHealth(health *PlatformHealth, reg *registry.Registry, configDir
 	}
 }
 
+func hasGeminiLoomProxyConfig(data []byte) bool {
+	content := string(data)
+	return strings.Contains(content, "[mcp_servers.loom]") &&
+		strings.Contains(content, `args = ["proxy"]`)
+}
+
 // checkCodexHealth checks Codex config.toml for the notify hook line.
 func checkCodexHealth(health *PlatformHealth, configDir string) {
 	configPath := filepath.Join(configDir, "config.toml")
@@ -216,12 +284,26 @@ func checkCodexHealth(health *PlatformHealth, configDir string) {
 	}
 
 	content := string(data)
-	// Codex hooks are a single "notify" line containing loom agent heartbeat.
-	if strings.Contains(content, "notify") && strings.Contains(content, "loom") && strings.Contains(content, "heartbeat") {
+	hasNotify, notifyHealthy, notifyRateLimited := codexNotifyHookState(data)
+	if notifyHealthy && notifyRateLimited {
 		health.Hooks = "ok"
+	} else if notifyHealthy {
+		health.Hooks = "stale"
+		health.Details = append(health.Details, "config.toml uses keepalive-wrap but is missing notify storm throttling (regenerate with: loom sync codex --regen)")
 	} else if strings.Contains(content, "[mcp_servers") {
-		health.Hooks = "missing"
-		health.Details = append(health.Details, "config.toml exists but has no loom notify hook")
+		if hasNotify {
+			health.Hooks = "stale"
+			if strings.Contains(content, "keepalive-wrap") {
+				health.Details = append(health.Details, "config.toml has keepalive-wrap configured but is not using the Loom-managed background hook")
+			} else if strings.Contains(content, "heartbeat") {
+				health.Details = append(health.Details, "config.toml still uses legacy heartbeat-only notify hook (regenerate with: loom sync codex --regen)")
+			} else {
+				health.Details = append(health.Details, "config.toml has notify configured but is not using the Loom-managed hook")
+			}
+		} else {
+			health.Hooks = "missing"
+			health.Details = append(health.Details, "config.toml exists but has no loom notify hook")
+		}
 	} else {
 		health.Hooks = "missing"
 		health.Details = append(health.Details, "config.toml exists but appears incomplete")
@@ -239,6 +321,76 @@ func checkCodexHealth(health *PlatformHealth, configDir string) {
 	} else {
 		health.Schema = "ok"
 	}
+}
+
+func codexNotifyHookState(data []byte) (hasNotify bool, healthy bool, rateLimited bool) {
+	var config map[string]any
+	if err := toml.Unmarshal(data, &config); err != nil {
+		return false, false, false
+	}
+
+	notify, ok := config["notify"]
+	if !ok {
+		return false, false, false
+	}
+
+	return true, containsCodexKeepaliveWrapCommand(notify), containsCodexNotifyThrottle(notify)
+}
+
+func containsCodexKeepaliveWrapCommand(value any) bool {
+	switch v := value.(type) {
+	case []any:
+		var parts []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		if len(parts) > 0 {
+			return codexKeepaliveWrapCommandLooksHealthy(strings.Join(parts, " "))
+		}
+	case []string:
+		if len(v) > 0 {
+			return codexKeepaliveWrapCommandLooksHealthy(strings.Join(v, " "))
+		}
+	case string:
+		return codexKeepaliveWrapCommandLooksHealthy(v)
+	}
+	return false
+}
+
+func codexKeepaliveWrapCommandLooksHealthy(command string) bool {
+	return strings.Contains(command, "loom") &&
+		strings.Contains(command, "keepalive-wrap") &&
+		strings.Contains(command, "agent")
+}
+
+func containsCodexNotifyThrottle(value any) bool {
+	switch v := value.(type) {
+	case []any:
+		var parts []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		if len(parts) > 0 {
+			return codexNotifyCommandRateLimited(strings.Join(parts, " "))
+		}
+	case []string:
+		if len(v) > 0 {
+			return codexNotifyCommandRateLimited(strings.Join(v, " "))
+		}
+	case string:
+		return codexNotifyCommandRateLimited(v)
+	}
+	return false
+}
+
+func codexNotifyCommandRateLimited(command string) bool {
+	return strings.Contains(command, "keepalive-wrap-codex-") &&
+		strings.Contains(command, "date +%s") &&
+		strings.Contains(command, " -lt 15 ")
 }
 
 // checkOpenCodeHealth checks OpenCode config and hooks plugin.
@@ -274,13 +426,51 @@ func checkOpenCodeHealth(health *PlatformHealth, configDir string) {
 	}
 }
 
+func checkAntigravityHealth(health *PlatformHealth, reg *registry.Registry, configDir string) {
+	if _, ok := firstExistingFile(configDir, "mcp_config.json", filepath.Join("antigravity", "mcp_config.json")); !ok {
+		health.Status = "not_configured"
+		health.Details = append(health.Details, "mcp_config.json not found")
+	}
+
+	hooksPath, ok := firstExistingFile(configDir, "hooks.json", filepath.Join("config", "hooks.json"))
+	if !ok {
+		health.Hooks = "missing"
+		health.Details = append(health.Details, "hooks.json not found")
+		return
+	}
+	data, err := os.ReadFile(hooksPath)
+	if err != nil {
+		health.Hooks = "missing"
+		health.Details = append(health.Details, "cannot read hooks.json")
+		return
+	}
+	var onDisk map[string]any
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		health.Hooks = "missing"
+		health.Schema = "errors"
+		health.Details = append(health.Details, "hooks.json is not valid JSON")
+		return
+	}
+
+	antigravityProfile, _ := GetPlatformProfile("antigravity")
+	expected := antigravityHooksConfig(reg, antigravityProfile, "")
+	if jsonFingerprint(onDisk) != jsonFingerprint(expected) {
+		health.Hooks = "stale"
+		health.Details = append(health.Details, "hooks.json differs from expected (regenerate with: loom sync antigravity --regen)")
+	} else {
+		health.Hooks = "ok"
+	}
+}
+
 // checkBasicHealth checks platforms that only have MCP config (no hooks).
 func checkBasicHealth(health *PlatformHealth, platform, configDir string) {
 	// These platforms have no native hook support.
 	var configFile string
 	switch platform {
 	case "kilocode":
-		configFile = "config.toml"
+		configFile = "kilo.json"
+	case "antigravity":
+		configFile = "mcp_config.json"
 	default:
 		configFile = "mcp.json"
 	}
@@ -292,6 +482,16 @@ func checkBasicHealth(health *PlatformHealth, platform, configDir string) {
 	}
 }
 
+func firstExistingFile(base string, rels ...string) (string, bool) {
+	for _, rel := range rels {
+		path := filepath.Join(base, rel)
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	return "", false
+}
+
 // resolveConfigDir returns the config directory for a platform.
 // Prefers workspace-local config (e.g. .claude/) over home dir.
 func resolveConfigDir(platform, workspaceRoot, homeDir string) string {
@@ -301,7 +501,7 @@ func resolveConfigDir(platform, workspaceRoot, homeDir string) string {
 	// Check workspace-local first.
 	if workspaceRoot != "" {
 		candidate := filepath.Join(workspaceRoot, dirName)
-		if dirExists(candidate) {
+		if platformConfigPresent(platform, candidate) {
 			return candidate
 		}
 	}
@@ -309,7 +509,7 @@ func resolveConfigDir(platform, workspaceRoot, homeDir string) string {
 	// Fall back to home directory.
 	if homeDir != "" {
 		candidate := filepath.Join(homeDir, homeDirName)
-		if dirExists(candidate) {
+		if platformConfigPresent(platform, candidate) {
 			return candidate
 		}
 	}
@@ -319,6 +519,46 @@ func resolveConfigDir(platform, workspaceRoot, homeDir string) string {
 		return filepath.Join(workspaceRoot, dirName)
 	}
 	return filepath.Join(homeDir, homeDirName)
+}
+
+func platformConfigPresent(platform, dir string) bool {
+	if !dirExists(dir) {
+		return false
+	}
+	for _, rel := range platformExpectedFiles(platform) {
+		if rel == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, rel)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func platformExpectedFiles(platform string) []string {
+	switch platform {
+	case "claude":
+		return []string{"settings.json", "mcp.json"}
+	case "gemini":
+		return []string{"config.toml", "settings.json"}
+	case "codex":
+		return []string{"config.toml"}
+	case "kilocode":
+		return []string{"kilo.json"}
+	case "opencode":
+		return []string{"opencode.json", filepath.Join("plugins", "loom-hooks.ts")}
+	case "vscode":
+		return []string{"mcp.json"}
+	case "zed":
+		// Zed reads MCP servers from context_servers in settings.json; the
+		// repo-side staging fragment is context_servers.json.
+		return []string{"settings.json", "context_servers.json"}
+	case "antigravity":
+		return []string{"mcp_config.json", "hooks.json", filepath.Join("antigravity", "mcp_config.json"), filepath.Join("config", "hooks.json")}
+	default:
+		return nil
+	}
 }
 
 // platformDirNames returns the workspace-relative and home-relative directory names.
@@ -331,23 +571,65 @@ func platformDirNames(platform string) (workspace, home string) {
 	case "codex":
 		return ".codex", ".codex"
 	case "kilocode":
-		return ".kilocode", ".kilocode"
+		// Kilo 1.0 reads MCP config from ~/.config/kilo/kilo.json; the repo-side
+		// .kilocode/ dir still holds generated rules/workflows.
+		return ".kilocode", filepath.Join(".config", "kilo")
 	case "antigravity":
-		return ".antigravity", ".antigravity"
+		return ".agents", ".gemini"
 	case "opencode":
 		return ".opencode", filepath.Join(".config", "opencode")
 	case "vscode":
 		return ".vscode-mcp", filepath.Join("Library", "Application Support", "Code", "User")
 	case "zed":
-		return ".zed", filepath.Join("Library", "Application Support", "Zed")
+		// Zed settings live at ~/.config/zed/settings.json on macOS and Linux
+		// (~/Library/Application Support/Zed holds databases/extensions only).
+		return ".zed", filepath.Join(".config", "zed")
 	default:
 		return "." + platform, "." + platform
 	}
 }
 
+// PolicyHashFilename is the name of the file written to home config dirs during
+// sync. Mirrors the constant in pkg/sync to avoid a circular import.
+const PolicyHashFilename = ".loom-policy-hash"
+
+// checkPolicyHealth sets the Policy field on a PlatformHealth based on whether
+// the platform has native hook support or relies on proxy-level enforcement.
+func checkPolicyHealth(health *PlatformHealth, platform, configDir string) {
+	profile, err := GetPlatformProfile(platform)
+	if err != nil {
+		// Unknown platform -- skip policy check.
+		health.Policy = "n/a"
+		return
+	}
+
+	if profile.Hooks.Enabled {
+		// Platform supports native hooks -- check whether a policy hash was
+		// recorded during sync and whether it is still current.
+		hashPath := filepath.Join(configDir, PolicyHashFilename)
+		if _, err := os.Stat(hashPath); err != nil {
+			health.Policy = "not-configured"
+			health.Details = append(health.Details, "policy hash not found (run: loom sync "+platform+" --regen)")
+		} else {
+			// Hash file exists -- we report "ok" here because the actual
+			// staleness comparison requires the registry path, which is done
+			// in loom sync status. Doctor just checks that the mechanism is
+			// in place.
+			health.Policy = "ok"
+		}
+	} else {
+		// Hookless platform -- policy enforcement happens at the proxy level.
+		health.Policy = "n/a"
+		health.Details = append(health.Details, "Policy enforcement: proxy-level (no native hooks)")
+	}
+}
+
 // deriveStatus computes the overall platform status from individual check results.
 func deriveStatus(h *PlatformHealth) string {
-	if h.Hooks == "stale" || h.Perms == "drift" {
+	if h.Hooks == "stale" || h.Perms == "drift" || h.Perms == "missing" {
+		return "stale"
+	}
+	if h.Policy == "stale" {
 		return "stale"
 	}
 	if h.Schema == "errors" {
@@ -356,7 +638,7 @@ func deriveStatus(h *PlatformHealth) string {
 	if h.Hooks == "missing" && h.Hooks != "n/a" {
 		// Missing hooks on a platform that should have them.
 		switch h.Platform {
-		case "claude", "gemini", "codex", "opencode":
+		case "claude", "gemini", "codex", "opencode", "antigravity":
 			return "stale"
 		}
 	}

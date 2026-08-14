@@ -1,0 +1,1 @@
+- Reject generic normalized test-command phrases before the signature miner persists candidates in `pkg/mills/reconciler_signature_mining.go`, with regression coverage in `pkg/mills/reconciler_signature_mining_test.go`.

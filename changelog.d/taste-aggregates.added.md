@@ -1,0 +1,1 @@
+- Add plan-level bolt taste aggregates, rolling 14-day grade coverage metrics, attribution-guarded squad taste weighting, and pattern-instance grade propagation.

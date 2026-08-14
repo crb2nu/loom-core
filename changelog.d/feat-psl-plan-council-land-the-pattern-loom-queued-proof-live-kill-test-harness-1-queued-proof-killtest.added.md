@@ -1,0 +1,1 @@
+- Add the Pattern Loom queued-proof live kill-test, seeding a plan-linked queued item and failing closed unless it produces a non-empty auto-merged MR, including external-dependency incidents (`cmd/mills-workflow-killtest`, `pkg/mills/workflow/workflow.go`, `docs/MILLS.md`).

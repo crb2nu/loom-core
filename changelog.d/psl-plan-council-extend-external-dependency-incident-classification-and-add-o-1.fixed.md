@@ -1,0 +1,1 @@
+- Classify GitLab Agent unauthenticated and LiteLLM missing-API-key signatures as external dependency incidents with precise source tags in `pkg/mills/council/ci_incident_classifier.go`.

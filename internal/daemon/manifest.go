@@ -35,6 +35,7 @@ type ManifestManager struct {
 	manifest *ToolManifest
 	path     string
 	dirty    bool
+	changeID uint64
 }
 
 // NewManifestManager creates a new manifest manager.
@@ -70,33 +71,65 @@ func (m *ManifestManager) Load() error {
 	}
 
 	m.manifest = &manifest
+	m.changeID++
 	return nil
 }
 
 // Save writes the manifest to disk.
 func (m *ManifestManager) Save() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Snapshot under lock, perform slow filesystem writes unlocked, then commit
+	// only if no in-memory manifest mutation superseded the snapshot.
+	for attempt := 0; attempt < 3; attempt++ {
+		m.mu.Lock()
+		if !m.dirty {
+			m.mu.Unlock()
+			return nil
+		}
+		data, err := yaml.Marshal(m.manifest)
+		changeID := m.changeID
+		path := m.path
+		m.mu.Unlock()
+		if err != nil {
+			return err
+		}
 
-	if !m.dirty {
-		return nil
-	}
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(dir, ".loom-manifest-*.tmp")
+		if err != nil {
+			return err
+		}
+		tmpPath := tmp.Name()
+		writeErr := func() error {
+			defer tmp.Close()
+			if _, err := tmp.Write(data); err != nil {
+				return err
+			}
+			return tmp.Sync()
+		}()
+		if writeErr != nil {
+			_ = os.Remove(tmpPath)
+			return writeErr
+		}
 
-	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(m.path), 0700); err != nil {
+		m.mu.Lock()
+		if m.changeID != changeID || !m.dirty {
+			m.mu.Unlock()
+			_ = os.Remove(tmpPath)
+			continue
+		}
+		err = os.Rename(tmpPath, path)
+		if err == nil {
+			m.dirty = false
+		}
+		m.mu.Unlock()
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
 		return err
 	}
-
-	data, err := yaml.Marshal(m.manifest)
-	if err != nil {
-		return err
-	}
-
-	if err := os.WriteFile(m.path, data, 0600); err != nil {
-		return err
-	}
-
-	m.dirty = false
 	return nil
 }
 
@@ -137,6 +170,28 @@ func (m *ManifestManager) UpdateServerTools(serverName string, tools []mcp.Tool)
 	}
 	m.manifest.UpdatedAt = time.Now()
 	m.dirty = true
+	m.changeID++
+}
+
+// ReplaceServerTools atomically replaces the complete discovered-server
+// manifest. Failed or removed servers are deliberately absent so restart cannot
+// resurrect tools that the current refresh did not confirm.
+func (m *ManifestManager) ReplaceServerTools(servers map[string][]mcp.Tool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	replacement := make(map[string]ServerManifest, len(servers))
+	for serverName, tools := range servers {
+		replacement[serverName] = ServerManifest{
+			Tools:     tools,
+			FetchedAt: now,
+			Hash:      hashTools(tools),
+		}
+	}
+	m.manifest.Servers = replacement
+	m.manifest.UpdatedAt = now
+	m.dirty = true
+	m.changeID++
 }
 
 // RemoveServer removes a server from the manifest.
@@ -147,6 +202,7 @@ func (m *ManifestManager) RemoveServer(serverName string) {
 	delete(m.manifest.Servers, serverName)
 	m.manifest.UpdatedAt = time.Now()
 	m.dirty = true
+	m.changeID++
 }
 
 // GetServerHash returns the hash for a server's tools (for change detection).

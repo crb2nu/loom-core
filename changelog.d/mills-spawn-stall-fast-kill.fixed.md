@@ -1,0 +1,1 @@
+- Fixed stalled Kubernetes spawn execs being left running until their command timeout by relaying the watchdog cancellation to `internal/devbox/backend/stream_exec.go`.

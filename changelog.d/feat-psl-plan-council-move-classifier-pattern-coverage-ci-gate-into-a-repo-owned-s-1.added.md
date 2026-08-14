@@ -1,0 +1,1 @@
+- Add `scripts/classifier_pattern_coverage.sh` and a script-readable registry contract in `pkg/mills/pipeline/classifier.go` to enforce test-fixture and runbook coverage for every classifier incident pattern.

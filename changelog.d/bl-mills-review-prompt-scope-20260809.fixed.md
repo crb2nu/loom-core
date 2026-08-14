@@ -1,0 +1,1 @@
+- Scope the Mills `pr_self_review` prompt in `cmd/loom-mills-operator` to review the recorded diff, specification, and verification outcomes without re-running builds or full test suites.

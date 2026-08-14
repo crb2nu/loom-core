@@ -1,0 +1,1 @@
+- Promote deterministic OpenRouter HTTP 402 credit-exhaustion matching to an active counted-retry external-dependency signature in `pkg/mills/adaptive/adaptive.go`.

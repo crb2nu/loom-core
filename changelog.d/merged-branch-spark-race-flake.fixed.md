@@ -1,0 +1,1 @@
+- Made the merged-branch spark reserved-deadline regression test deterministic under the race detector by replacing its wall-clock wait with a test-controlled IID context in `pkg/mills/reconciler.go` and `pkg/mills/reconciler_merged_branch_spark_test.go`.

@@ -1,0 +1,1 @@
+- Add deterministic gate outcome telemetry and a flake-detection harness for `docs_guardrail` and `scope` evaluations in `pkg/mills/gates` and `pkg/telemetry`.

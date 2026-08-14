@@ -1,0 +1,1 @@
+- Add dual-source failure classification verdict resolution, durable event-backed storage, and disagreement publication in `pkg/mills/pipeline`, `pkg/mills/store/store.go`, and `pkg/eventpub/eventpub.go`.

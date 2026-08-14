@@ -1,0 +1,1 @@
+- Add durable pause/resume controls for Mills pipeline runs, including HUD stop actions and spawned-worker termination.

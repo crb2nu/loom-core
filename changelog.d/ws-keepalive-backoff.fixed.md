@@ -1,0 +1,1 @@
+- Harden the HUD hub WebSocket bridge with reusable keepalive liveness gating, correlated control ping/pong envelopes, and capped jittered reconnect backoff (`pkg/transport/keepalive.go`, `internal/hubproto/liveness.go`, `internal/hud/bridge/client.go`).

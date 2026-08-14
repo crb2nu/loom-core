@@ -1,0 +1,1 @@
+- Fixed `internal/hud/spawn_claude_parser.go` and `internal/hud/spawn_claude_parser_test.go` to close Claude Code 2.x stream-json tool calls and avoid false incomplete-spawn failures.

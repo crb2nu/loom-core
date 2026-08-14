@@ -1,0 +1,1 @@
+- Consolidated Mills HUD cost, percentage, duration, timestamp, and run-ID formatting in `internal/hud/frontend/src/lib/components/mills/shared/format.ts` and migrated its panel call sites.

@@ -15,6 +15,7 @@ import (
 	"github.com/crb2nu/loom/internal/devbox/detect"
 	"github.com/crb2nu/loom/internal/devbox/dockerfile"
 	"github.com/crb2nu/loom/internal/devbox/state"
+	"github.com/crb2nu/loom/pkg/env"
 )
 
 type managerConfig struct {
@@ -29,30 +30,128 @@ type managerConfig struct {
 	defaultMemMB  int
 
 	// K8s-specific
-	kubeconfig         string
-	k8sNamespace       string
-	storageClass       string
-	k8sWorkspacePVC    string
-	k8sImagePullSecret string
-	builderImage       string
+	kubeconfig                   string
+	k8sNamespace                 string
+	storageClass                 string
+	k8sWorkspacePVC              string
+	k8sImagePullSecret           string
+	builderImage                 string
+	gitCloneImage                string
+	buildCPURequest              string
+	buildCPULimit                string
+	buildMemoryRequest           string
+	buildMemoryLimit             string
+	buildEphemeralStorageRequest string
+	buildEphemeralStorageLimit   string
+	buildAvoidNodes              string
+	maxConcurrentBuilds          int
+	gitCloneMemoryRequest        string
+	gitCloneMemoryLimit          string
+
+	// NFS cache flush before each exec (default true for K8s backend)
+	nfsFlush bool
+
+	// Git-clone mode: populate workspace via git clone instead of NFS PVC
+	gitBaseURL string // base git URL (e.g., "https://gitlab.blevins.dev/homelab")
+	gitSecret  string // K8s secret name with git token (key: "token")
+
+	// Tar-pipe sync: stream local files into pods via SPDY exec
+	syncMode     string   // "tar-pipe", "git-clone", "nfs"
+	syncExcludes []string // additional exclude patterns
+	maxSyncSize  int64    // max uncompressed tar bytes
+
+	// Warm pool: pre-provision pods for these projects on startup
+	warmProjects []string
+
+	// Harvester-VM-specific (used when backendType == "harvester-vm").
+	harvesterKubeconfig       string
+	harvesterBaseImage        string
+	harvesterNamespace        string
+	harvesterStorageClass     string
+	harvesterNetworkAttachDef string
+	harvesterDefaultVCPUs     int
+	harvesterDefaultMemMi     int
+	harvesterDefaultDiskGi    int
+	harvesterSSHUser          string
 }
 
 type manager struct {
-	cfg     managerConfig
-	backend backend.Backend
-	store   *state.Store
-	logger  *slog.Logger
-	metrics *metrics
-	events  *eventEmitter
+	cfg            managerConfig
+	backend        backend.Backend
+	backends       map[string]backend.Backend
+	defaultBackend string
+	store          *state.Store
+	logger         *slog.Logger
+	metrics        *metrics
+	events         *eventEmitter
 
 	// Async exec tracking
 	asyncExecs *asyncRegistry
+
+	// Async image-build tracking. Cold sandbox builds can take several
+	// minutes; the tracker lets ensureRunning return "build in progress"
+	// immediately instead of blocking the caller until the MCP/proxy
+	// call times out.
+	builds *buildTracker
+
+	// buildWg tracks async build goroutines. Shutdown does NOT wait on it:
+	// the underlying build runs detached cluster-side (the K8s backend
+	// re-derives its own background context), so gating daemon shutdown on a
+	// multi-minute build would stall restarts. The wg exists for test
+	// synchronization and future bounded draining.
+	buildWg sync.WaitGroup
 
 	// Per-project lifecycle lock prevents concurrent ensureRunning races (TOCTOU).
 	projectMu sync.Map // map[string]*sync.Mutex
 
 	// Active exec counter per project — reaper skips projects with active execs.
 	activeExecs sync.Map // map[string]*atomic.Int32
+
+	// Cumulative counters for HUD summary.
+	startedAt   time.Time
+	totalExecs  atomic.Int64
+	totalBuilds atomic.Int64
+
+	// asyncWg tracks running async goroutines for graceful shutdown.
+	asyncWg sync.WaitGroup
+}
+
+// stringMapArg normalizes a string map received either directly from an
+// in-process caller or through JSON decoding at the MCP boundary.
+func stringMapArg(value any) map[string]string {
+	result := make(map[string]string)
+	switch values := value.(type) {
+	case map[string]string:
+		for key, val := range values {
+			result[key] = val
+		}
+	case map[string]any:
+		for key, val := range values {
+			if text, ok := val.(string); ok {
+				result[key] = text
+			}
+		}
+	}
+	return result
+}
+
+// stringSliceArg normalizes a string slice received either directly from an
+// in-process caller or through JSON decoding at the MCP boundary.
+func stringSliceArg(value any) []string {
+	switch values := value.(type) {
+	case []string:
+		return append([]string(nil), values...)
+	case []any:
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				result = append(result, text)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
 }
 
 // backendHealthTimeout bounds startup probing so MCP init is never blocked by a hung runtime.
@@ -65,6 +164,39 @@ func checkBackendHealth(ctx context.Context, logger *slog.Logger, health func(co
 	if err := health(healthCtx); err != nil {
 		logger.Warn("backend health check failed", "error", err)
 	}
+}
+
+func canonicalBackendType(backendType string) string {
+	switch strings.TrimSpace(strings.ToLower(backendType)) {
+	case "", "docker":
+		return "docker"
+	case "k8s", "kubernetes":
+		return "k8s"
+	case "harvester-vm":
+		return "harvester-vm"
+	default:
+		return backendType
+	}
+}
+
+func isK8sBackendType(backendType string) bool {
+	return canonicalBackendType(backendType) == "k8s"
+}
+
+func (m *manager) backendFor(name string) backend.Backend {
+	if m == nil {
+		return nil
+	}
+	key := canonicalBackendType(name)
+	if strings.TrimSpace(name) == "" {
+		key = m.defaultBackend
+	}
+	if m.backends != nil {
+		if b := m.backends[key]; b != nil {
+			return b
+		}
+	}
+	return m.backend
 }
 
 // projectLock returns (or creates) a per-project mutex for lifecycle serialization.
@@ -94,22 +226,38 @@ func (m *manager) hasActiveExecs(name string) bool {
 	return false
 }
 
-// sanitizeContainerName ensures the name contains only Docker-safe characters.
+// sanitizeContainerName returns a DNS-1123-safe name fragment that is also safe
+// for Docker container names and image repository components.
 func sanitizeContainerName(name string) string {
 	var b strings.Builder
-	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+	lastDash := false
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 			b.WriteRune(r)
-		} else {
+			lastDash = false
+			continue
+		}
+		if !lastDash {
 			b.WriteRune('-')
+			lastDash = true
 		}
 	}
-	return b.String()
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "sandbox"
+	}
+	return out
 }
 
 // validateMountPath ensures a host path is under an allowed directory.
+// Resolves symlinks before validation so symlinked paths are correctly matched.
 func (m *manager) validateMountPath(hostPath string) error {
-	abs, err := filepath.Abs(hostPath)
+	resolved, err := filepath.EvalSymlinks(hostPath)
+	if err != nil {
+		// Path doesn't exist yet — fall back to Abs only.
+		resolved = hostPath
+	}
+	abs, err := filepath.Abs(resolved)
 	if err != nil {
 		return fmt.Errorf("invalid mount path %q: %w", hostPath, err)
 	}
@@ -128,40 +276,113 @@ func (m *manager) validateMountPath(hostPath string) error {
 }
 
 func newManager(ctx context.Context, logger *slog.Logger, cfg managerConfig) (*manager, error) {
-	var b backend.Backend
-	switch cfg.backendType {
-	case "docker":
-		db, err := backend.NewDockerBackend()
-		if err != nil {
-			return nil, err
-		}
-		b = db
-	case "k8s", "kubernetes":
-		kb, err := backend.NewK8sBackend(backend.K8sBackendConfig{
-			Kubeconfig:      cfg.kubeconfig,
-			Namespace:       cfg.k8sNamespace,
-			Registry:        cfg.registry,
-			WorkspacePVC:    cfg.k8sWorkspacePVC,
-			ImagePullSecret: cfg.k8sImagePullSecret,
-			WorkspaceRoot:   cfg.workspaceRoot,
-			BuilderImage:    cfg.builderImage,
-		})
-		if err != nil {
-			return nil, err
-		}
-		b = kb
-	default:
-		return nil, fmt.Errorf("unsupported backend: %s (use 'docker' or 'k8s')", cfg.backendType)
+	backends, defaultBackend, err := initBackends(cfg, logger)
+	if err != nil {
+		return nil, err
 	}
+	cfg.backendType = defaultBackend
+	b := backends[defaultBackend]
 
-	checkBackendHealth(ctx, logger, b.Health)
+	for name, be := range backends {
+		checkBackendHealth(ctx, logger.With("backend", name), be.Health)
+	}
 
 	store, err := state.NewStore(cfg.cacheDir)
 	if err != nil {
 		return nil, fmt.Errorf("init state store: %w", err)
 	}
 
-	return &manager{cfg: cfg, backend: b, store: store, logger: logger}, nil
+	return &manager{
+		cfg:            cfg,
+		backend:        b,
+		backends:       backends,
+		defaultBackend: defaultBackend,
+		store:          store,
+		logger:         logger,
+		builds:         newBuildTracker(),
+	}, nil
+}
+
+func initBackends(cfg managerConfig, logger *slog.Logger) (map[string]backend.Backend, string, error) {
+	defaultBackend := canonicalBackendType(cfg.backendType)
+	switch defaultBackend {
+	case "docker":
+		db, err := backend.NewDockerBackend()
+		if err != nil {
+			return nil, "", err
+		}
+		return map[string]backend.Backend{"docker": db}, "docker", nil
+	case "k8s":
+		kb, err := newK8sBackend(cfg)
+		if err != nil {
+			return nil, "", err
+		}
+		return map[string]backend.Backend{"k8s": kb}, "k8s", nil
+	case "harvester-vm":
+		backends := make(map[string]backend.Backend, 2)
+		var resolver backend.SecretResolver
+		if kb, err := newK8sBackend(cfg); err != nil {
+			if logger != nil {
+				logger.Warn("k8s backend unavailable for harvester-vm secret resolver", "error", err)
+			}
+		} else {
+			backends["k8s"] = kb
+			resolver = kb
+		}
+
+		hb, err := newHarvesterVMBackend(cfg, resolver)
+		if err != nil {
+			return nil, "", err
+		}
+		backends["harvester-vm"] = hb
+		return backends, "harvester-vm", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported backend: %s (use 'docker', 'k8s', or 'harvester-vm')", cfg.backendType)
+	}
+}
+
+func newK8sBackend(cfg managerConfig) (*backend.K8sBackend, error) {
+	return backend.NewK8sBackend(backend.K8sBackendConfig{
+		Kubeconfig:                   cfg.kubeconfig,
+		Namespace:                    cfg.k8sNamespace,
+		Registry:                     cfg.registry,
+		WorkspacePVC:                 cfg.k8sWorkspacePVC,
+		ImagePullSecret:              cfg.k8sImagePullSecret,
+		WorkspaceRoot:                cfg.workspaceRoot,
+		BuilderImage:                 cfg.builderImage,
+		GitCloneImage:                cfg.gitCloneImage,
+		NFSFlush:                     cfg.nfsFlush,
+		GitBaseURL:                   cfg.gitBaseURL,
+		GitSecret:                    cfg.gitSecret,
+		BuildCPURequest:              cfg.buildCPURequest,
+		BuildCPULimit:                cfg.buildCPULimit,
+		BuildMemoryRequest:           cfg.buildMemoryRequest,
+		BuildMemoryLimit:             cfg.buildMemoryLimit,
+		BuildEphemeralStorageRequest: cfg.buildEphemeralStorageRequest,
+		BuildEphemeralStorageLimit:   cfg.buildEphemeralStorageLimit,
+		BuildAvoidNodes:              cfg.buildAvoidNodes,
+		MaxConcurrentBuilds:          cfg.maxConcurrentBuilds,
+		GitCloneMemoryRequest:        cfg.gitCloneMemoryRequest,
+		GitCloneMemoryLimit:          cfg.gitCloneMemoryLimit,
+		SyncMode:                     cfg.syncMode,
+		SyncExcludes:                 cfg.syncExcludes,
+		MaxSyncSize:                  cfg.maxSyncSize,
+	})
+}
+
+func newHarvesterVMBackend(cfg managerConfig, resolver backend.SecretResolver) (*backend.HarvesterVMBackend, error) {
+	return backend.NewHarvesterVMBackend(backend.HarvesterVMBackendConfig{
+		KubeconfigPath:       cfg.harvesterKubeconfig,
+		Namespace:            cfg.harvesterNamespace,
+		BaseImageName:        cfg.harvesterBaseImage,
+		StorageClassName:     cfg.harvesterStorageClass,
+		NetworkAttachmentDef: cfg.harvesterNetworkAttachDef,
+		DefaultVCPUs:         cfg.harvesterDefaultVCPUs,
+		DefaultMemMi:         cfg.harvesterDefaultMemMi,
+		DefaultDiskGi:        cfg.harvesterDefaultDiskGi,
+		SSHUser:              cfg.harvesterSSHUser,
+		SecretResolver:       resolver,
+	})
 }
 
 // resolveProject finds the absolute path for a project name.
@@ -189,7 +410,48 @@ func (m *manager) resolveProject(project string) (string, string, error) {
 		}
 	}
 
+	// git-clone fallback: the sandbox's git-clone init container is the source
+	// of truth, so a repo that is not staged in the local workspace need not be
+	// a hard failure. The on-disk copy is used only to fingerprint the sandbox
+	// toolchain image, and Fingerprint + generateSandboxDockerfile already
+	// degrade a missing/empty dir to the generic git-clone image (Go + Node +
+	// Python). Resolving lexically lets the tests stage run against any
+	// services-group repo without pre-staging it (mirrors the spawn
+	// orchestrator, loom-core !941). For tar-pipe/nfs the local copy IS the
+	// source, so keep the hard failure there.
+	if m.cfg.syncMode == "git-clone" {
+		if dir, name, ok := m.lexicalProjectDir(project); ok {
+			if m.logger != nil {
+				m.logger.Warn("project not staged in local workspace; using git-clone fallback (generic sandbox image; the sandbox clones the repo)",
+					"project", project, "resolved_dir", dir, "workspace", m.cfg.workspaceRoot)
+			}
+			return dir, name, nil
+		}
+	}
+
 	return "", "", fmt.Errorf("project '%s' not found under %s", project, m.cfg.workspaceRoot)
+}
+
+// lexicalProjectDir derives an on-disk project path from a name WITHOUT
+// requiring it to exist, for the git-clone fallback in resolveProject. A bare
+// name resolves under the "services" bucket (matching the git-clone base URL
+// group, so `flexdeck` clones from services/flexdeck.git); a bucket-qualified
+// name ("services/foo", "libs/bar") is used verbatim. Absolute paths and paths
+// that escape the workspace root are rejected (ok=false).
+func (m *manager) lexicalProjectDir(project string) (dir, name string, ok bool) {
+	p := strings.TrimSpace(project)
+	if p == "" || filepath.IsAbs(p) {
+		return "", "", false
+	}
+	p = filepath.Clean(p)
+	if p == "." || strings.HasPrefix(p, "..") {
+		return "", "", false
+	}
+	if !strings.ContainsRune(p, filepath.Separator) {
+		p = filepath.Join("services", p)
+	}
+	full := filepath.Join(m.cfg.workspaceRoot, p)
+	return full, filepath.Base(full), true
 }
 
 // imageTag returns the Docker image tag for a project fingerprint.
@@ -197,13 +459,34 @@ func (m *manager) imageTag(projectName, hash string) string {
 	return fmt.Sprintf("%s/%s:%s", m.cfg.imagePrefix, sanitizeContainerName(projectName), hash[:7])
 }
 
-// containerName returns the Docker container name for a project.
-func (m *manager) containerName(projectName string) string {
-	return "devbox-" + sanitizeContainerName(projectName)
+// containerName returns the Docker container/pod name for a project.
+// When agentID is provided, the pod name includes a truncated agent suffix
+// for per-agent isolation: devbox-<project>-<agent>.
+func (m *manager) containerName(projectName, agentID string) string {
+	base := "devbox-" + sanitizeContainerName(projectName)
+	if agentID != "" {
+		id := sanitizeContainerName(agentID)
+		if len(id) > 12 {
+			id = id[:12]
+			id = strings.Trim(id, "-")
+		}
+		return base + "-" + id
+	}
+	return base
+}
+
+// storeKey returns the state store key for a project+agent combination.
+// When agentID is set, returns "project/agentID" for per-agent state isolation.
+func storeKey(projectName, agentID string) string {
+	if agentID != "" {
+		return projectName + "/" + agentID
+	}
+	return projectName
 }
 
 // ensureRunning ensures a sandbox is built and running for a project.
-// Returns the container ID.
+// Returns the container ID. When agentID is provided, each agent gets
+// its own isolated pod for the project.
 func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, agentID string) (string, error) {
 	// Fingerprint the project
 	fp, err := detect.Fingerprint(projectDir)
@@ -211,9 +494,10 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 		return "", fmt.Errorf("fingerprint: %w", err)
 	}
 
-	entry := m.store.Get(projectName)
+	key := storeKey(projectName, agentID)
+	entry := m.store.Get(key)
 	tag := m.imageTag(projectName, fp.Hash)
-	containerID := m.containerName(projectName)
+	containerID := m.containerName(projectName, agentID)
 
 	// Fast path: container exists with matching hash
 	if entry != nil && entry.FingerprintHash == fp.Hash && entry.Status == "running" {
@@ -228,30 +512,50 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 		if err := m.backend.Resume(ctx, containerID); err == nil {
 			entry.Status = "running"
 			entry.LastUsed = time.Now()
-			_ = m.store.Set(projectName, entry)
-			m.logger.Info("resumed paused sandbox", "project", projectName)
+			_ = m.store.Set(key, entry)
+			m.logger.Info("resumed paused sandbox", "project", projectName, "agent", agentID)
 			return containerID, nil
 		}
 		// Resume failed — fall through to rebuild
-		m.logger.Warn("resume failed, rebuilding", "project", projectName)
+		m.logger.Warn("resume failed, rebuilding", "project", projectName, "agent", agentID)
 	}
 
-	// Stale or missing: rebuild if hash changed
-	if entry == nil || entry.FingerprintHash != fp.Hash {
-		m.logger.Info("building sandbox image", "project", projectName, "hash", fp.Hash[:7])
+	// Stopped container with matching hash — try to restart without rebuild.
+	// For K8s backend, Start() reuses existing running pods or creates new ones.
+	if entry != nil && entry.FingerprintHash == fp.Hash && entry.Status == "stopped" {
+		m.logger.Info("restarting stopped sandbox (hash match)", "project", projectName, "agent", agentID)
+		// Skip build, go straight to Start below
+	} else if entry == nil || entry.FingerprintHash != fp.Hash {
+		// Stale or missing: image build required (cold start or fingerprint
+		// changed). Cold builds run `go mod download`, apk installs, and an
+		// image push that routinely take several minutes — far longer than
+		// the MCP/proxy call timeout. For the K8s backend (where the build
+		// pod is already detached from the request context) run the build in
+		// a background goroutine and return buildInProgressError so the
+		// caller gets an immediate, actionable "retry shortly" response
+		// instead of a hung call. Synchronous backends (docker, harvester-vm)
+		// keep the original inline build — their builds are fast or no-ops.
+		if m.asyncBuildEnabled() {
+			if id, err := m.ensureAsyncBuild(projectDir, projectName, tag, fp); err != nil || id == "" {
+				return "", err
+			}
+			// Build finished successfully on a prior call — fall through to Start.
+		} else {
+			m.logger.Info("building sandbox image", "project", projectName, "hash", fp.Hash[:7])
 
-		dockerfileContent, err := dockerfile.Generate(fp)
-		if err != nil {
-			return "", fmt.Errorf("generate dockerfile: %w", err)
-		}
+			dockerfileContent, err := m.generateSandboxDockerfile(fp)
+			if err != nil {
+				return "", fmt.Errorf("generate dockerfile: %w", err)
+			}
 
-		_, err = m.backend.Build(ctx, backend.BuildOpts{
-			Tag:        tag,
-			Dockerfile: dockerfileContent,
-			ContextDir: projectDir,
-		})
-		if err != nil {
-			return "", fmt.Errorf("build image: %w", err)
+			_, err = m.backend.Build(ctx, backend.BuildOpts{
+				Tag:        tag,
+				Dockerfile: dockerfileContent,
+				ContextDir: projectDir,
+			})
+			if err != nil {
+				return "", fmt.Errorf("build image: %w", err)
+			}
 		}
 	}
 
@@ -289,7 +593,7 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 	}
 
 	workDir := m.projectWorkDir(projectDir)
-	m.logger.Info("starting sandbox", "project", projectName, "image", tag, "workdir", workDir)
+	m.logger.Info("starting sandbox", "project", projectName, "agent", agentID, "image", tag, "workdir", workDir)
 	result, err := m.backend.Start(ctx, backend.StartOpts{
 		Name:     containerID,
 		ImageTag: tag,
@@ -305,9 +609,14 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 		return "", fmt.Errorf("start container: %w", err)
 	}
 
+	// Tar-pipe sync: stream local source into the pod after it starts.
+	if err := m.syncIfNeeded(ctx, containerID, projectDir); err != nil {
+		return "", fmt.Errorf("sync workspace: %w", err)
+	}
+
 	// Persist state
 	now := time.Now()
-	if err := m.store.Set(projectName, &state.Entry{
+	if err := m.store.Set(key, &state.Entry{
 		ProjectDir:      projectDir,
 		ContainerID:     result.ContainerID,
 		ImageTag:        tag,
@@ -320,7 +629,90 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 		m.logger.Warn("failed to persist state", "error", err)
 	}
 
-	return m.containerName(projectName), nil
+	return containerID, nil
+}
+
+// asyncBuildEnabled reports whether cold image builds should run in a detached
+// goroutine (returning "build in progress" to the caller) rather than blocking.
+// Only the K8s backend benefits: its builds are minutes-long and already
+// detach the build pod from the request context. Docker and harvester-vm keep
+// the synchronous path (fast local builds / no-op builds respectively).
+// Set LOOM_DEVBOX_ASYNC_BUILD=0 to force the legacy synchronous behavior.
+func (m *manager) asyncBuildEnabled() bool {
+	if !env.Bool("LOOM_DEVBOX_ASYNC_BUILD", true) {
+		return false
+	}
+	return m.cfg.backendType == "k8s" || m.cfg.backendType == "kubernetes"
+}
+
+// ensureAsyncBuild drives the asynchronous build state machine for tag.
+//
+//   - Build still running (or just kicked off): returns ("", buildInProgressError).
+//   - Build finished with an error: returns ("", wrapped error) and clears the
+//     entry so the next call retries the build.
+//   - Build finished successfully: clears the entry and returns ("ready", nil)
+//     so the caller falls through to Start.
+func (m *manager) ensureAsyncBuild(projectDir, projectName, tag string, fp *detect.EnvFingerprint) (string, error) {
+	if bi := m.builds.lookup(tag); bi != nil && bi.done {
+		m.builds.clear(tag)
+		if bi.err != nil {
+			return "", fmt.Errorf("sandbox image build failed: %w", bi.err)
+		}
+		m.logger.Info("sandbox image build complete", "project", projectName, "tag", tag)
+		return "ready", nil
+	}
+
+	dockerfileContent, err := m.generateSandboxDockerfile(fp)
+	if err != nil {
+		return "", fmt.Errorf("generate dockerfile: %w", err)
+	}
+
+	bi, started := m.builds.startOrJoin(tag, &m.buildWg, func() error {
+		_, berr := m.backend.Build(context.Background(), backend.BuildOpts{
+			Tag:            tag,
+			Dockerfile:     dockerfileContent,
+			ContextDir:     projectDir,
+			PreferExisting: true,
+		})
+		if berr != nil {
+			m.logger.Warn("sandbox image build failed", "project", projectName, "tag", tag, "error", berr)
+			return berr
+		}
+		m.totalBuilds.Add(1)
+		return nil
+	})
+	if started {
+		m.logger.Info("building sandbox image (async)", "project", projectName, "hash", fp.Hash[:7], "tag", tag)
+	}
+	return "", &buildInProgressError{tag: tag, project: projectName, elapsed: time.Since(bi.startedAt), started: started}
+}
+
+func (m *manager) generateSandboxDockerfile(fp *detect.EnvFingerprint) ([]byte, error) {
+	df, err := dockerfile.Generate(fp)
+	if err == nil {
+		return df, nil
+	}
+	if fp != nil && len(fp.Languages) == 0 && m.cfg.syncMode == "git-clone" {
+		if m.logger != nil {
+			m.logger.Warn("using generic git-clone sandbox image; local project source is unavailable for language detection",
+				"project", fp.ProjectName,
+				"dir", fp.ProjectDir,
+				"error", err,
+			)
+		}
+		return genericGitCloneDockerfile(), nil
+	}
+	return nil, err
+}
+
+func genericGitCloneDockerfile() []byte {
+	return []byte(`# Auto-generated by mcp-devbox for git-clone source hydration.
+FROM registry.harbor.lan/mcp/devbox-base/go:1.25
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN apk add --no-cache nodejs npm python3 py3-pip
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
+`)
 }
 
 // projectWorkDir returns the working directory inside the container for a project.
@@ -334,11 +726,35 @@ func (m *manager) projectWorkDir(projectDir string) string {
 	return filepath.Join("/workspace", rel)
 }
 
+// syncIfNeeded performs tar-pipe workspace sync if configured.
+// It discovers the project's sibling deps (Go replace directives) and streams
+// all source files into the pod via SPDY exec.
+func (m *manager) syncIfNeeded(ctx context.Context, containerID, projectDir string) error {
+	if m.cfg.syncMode != "tar-pipe" {
+		return nil
+	}
+
+	kb, ok := m.backend.(*backend.K8sBackend)
+	if !ok {
+		return nil // tar-pipe only works with K8s backend
+	}
+
+	dirs, err := backend.DiscoverDeps(projectDir, m.cfg.workspaceRoot)
+	if err != nil {
+		return fmt.Errorf("discover deps: %w", err)
+	}
+
+	m.logger.Info("syncing workspace", "project", filepath.Base(projectDir),
+		"dirs", len(dirs), "container", containerID)
+
+	return kb.SyncWorkspace(ctx, containerID, dirs, m.cfg.syncExcludes, m.cfg.maxSyncSize) //nolint:staticcheck // intentionally deprecated, migrating to sandbox.Controller
+}
+
 // buildMounts creates the standard bind mounts for a sandbox.
 // For K8s backend, returns empty slice — NFS PVC handles workspace mounting.
 func (m *manager) buildMounts(projectDir string) []backend.Mount {
 	// K8s backend uses NFS PVC for workspace; host mounts are not available on cluster nodes.
-	if m.cfg.backendType == "k8s" || m.cfg.backendType == "kubernetes" {
+	if isK8sBackendType(m.cfg.backendType) {
 		return nil
 	}
 
@@ -375,7 +791,7 @@ func (m *manager) buildMounts(projectDir string) []backend.Mount {
 	return mounts
 }
 
-// reapLoop periodically stops idle containers.
+// reapLoop periodically stops idle containers, prunes stale state, and cleans up build pods.
 func (m *manager) reapLoop(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -386,59 +802,210 @@ func (m *manager) reapLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.reapIdle(ctx)
+			m.reapCompletedBuilds(ctx)
+			m.store.PruneOlderThan(7 * 24 * time.Hour)
 		}
 	}
+}
+
+// reapCompletedBuilds cleans up completed build pods and orphaned ConfigMaps.
+func (m *manager) reapCompletedBuilds(ctx context.Context) {
+	cleaned, err := m.backend.CleanupBuilds(ctx, 1*time.Hour)
+	if err != nil {
+		m.logger.Warn("build cleanup failed", "error", err)
+		return
+	}
+	if cleaned > 0 {
+		m.logger.Info("cleaned up build resources", "count", cleaned)
+	}
+}
+
+// isK8sBackend returns true if the backend is Kubernetes-based.
+func (m *manager) isK8sBackend() bool {
+	return isK8sBackendType(m.cfg.backendType)
+}
+
+// isWarmProject returns true if the project is in the warm pool list.
+func (m *manager) isWarmProject(projectName string) bool {
+	for _, p := range m.cfg.warmProjects {
+		if p == projectName {
+			return true
+		}
+	}
+	return false
+}
+
+// warmPool pre-provisions pods for configured warm projects.
+// Runs on startup and re-warms every 30 minutes.
+func (m *manager) warmPool(ctx context.Context) {
+	m.warmOnce(ctx)
+
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.warmOnce(ctx)
+		}
+	}
+}
+
+func (m *manager) warmOnce(ctx context.Context) {
+	for _, project := range m.cfg.warmProjects {
+		projectDir, projectName, err := m.resolveProject(project)
+		if err != nil {
+			m.logger.Warn("warm pool: project not found", "project", project, "error", err)
+			continue
+		}
+
+		key := storeKey(projectName, "")
+		mu := m.projectLock(key)
+		mu.Lock()
+		_, err = m.ensureRunning(ctx, projectDir, projectName, "")
+		mu.Unlock()
+		if bip, ok := asBuildInProgress(err); ok {
+			// Expected on the warm path: the async build was kicked off (or is
+			// still running). A later tick promotes it to a ready sandbox.
+			m.logger.Info("warm pool: building project image", "project", projectName, "elapsed", bip.elapsed.Round(time.Second))
+		} else if err != nil {
+			m.logger.Warn("warm pool: failed to warm project", "project", projectName, "error", err)
+		} else {
+			m.logger.Info("warm pool: project ready", "project", projectName)
+		}
+	}
+}
+
+// parseStoreKey splits a compound store key ("project/agent") into its parts.
+func parseStoreKey(key string) (projectName, agentID string) {
+	if idx := strings.Index(key, "/"); idx >= 0 {
+		return key[:idx], key[idx+1:]
+	}
+	return key, ""
 }
 
 // reapIdle pauses containers that have been idle beyond the timeout.
 // Paused containers can be resumed instantly (~5ms) vs cold start (~2-5s).
 // Falls back to stop if pause is not supported by the backend.
+//
+// K8s-aware: sleeping K8s pods use ~0 CPU. On first idle timeout, just log
+// "keeping warm". Hard-reap (stop) only after 2× idle timeout.
 func (m *manager) reapIdle(ctx context.Context) {
 	idle := m.store.IdleEntries(m.cfg.idleTimeout)
-	for name, entry := range idle {
-		// Skip projects with active exec calls
-		if m.hasActiveExecs(name) {
+	for key, entry := range idle {
+		// Skip entries with active exec calls
+		if m.hasActiveExecs(key) {
 			continue
 		}
 
-		m.logger.Info("pausing idle sandbox", "project", name,
-			"idle_since", entry.LastUsed.Format(time.RFC3339))
+		projectName, agentID := parseStoreKey(key)
 
-		containerName := m.containerName(name)
+		// Skip warm-pool projects — the warm pool goroutine will just recreate them.
+		if agentID == "" && m.isWarmProject(projectName) {
+			continue
+		}
 
-		// Try pause first (instant resume); fall back to stop
-		if err := m.backend.Pause(ctx, containerName); err != nil {
-			// Pause not supported — fall back to stop
+		containerName := m.containerName(projectName, agentID)
+
+		// K8s-aware: keep pods warm on first idle, hard-reap at 2× timeout.
+		if m.isK8sBackend() {
+			idleDuration := time.Since(entry.LastUsed)
+			if idleDuration < 2*m.cfg.idleTimeout {
+				m.logger.Debug("keeping K8s pod warm", "key", key,
+					"idle_since", entry.LastUsed.Format(time.RFC3339))
+				continue
+			}
+			// Exceeded 2× timeout — hard-reap.
+			m.logger.Info("hard-reaping idle K8s pod", "key", key,
+				"idle_since", entry.LastUsed.Format(time.RFC3339))
 			if err := m.backend.Stop(ctx, containerName); err != nil {
-				m.logger.Warn("failed to stop idle sandbox", "project", name, "error", err)
+				m.logger.Warn("failed to stop idle sandbox", "key", key, "error", err)
 				continue
 			}
 			entry.Status = "stopped"
 		} else {
-			entry.Status = "paused"
+			m.logger.Info("pausing idle sandbox", "key", key,
+				"idle_since", entry.LastUsed.Format(time.RFC3339))
+
+			// Try pause first (instant resume); fall back to stop
+			if err := m.backend.Pause(ctx, containerName); err != nil {
+				// Pause not supported — fall back to stop
+				if err := m.backend.Stop(ctx, containerName); err != nil {
+					m.logger.Warn("failed to stop idle sandbox", "key", key, "error", err)
+					continue
+				}
+				entry.Status = "stopped"
+			} else {
+				entry.Status = "paused"
+			}
 		}
 
 		if m.metrics != nil {
-			m.metrics.idleReaps.WithLabelValues(name).Inc()
+			m.metrics.idleReaps.WithLabelValues(projectName).Inc()
 		}
-		if err := m.store.Set(name, entry); err != nil {
-			m.logger.Warn("failed to update state", "project", name, "error", err)
+		if err := m.store.Set(key, entry); err != nil {
+			m.logger.Warn("failed to update state", "key", key, "error", err)
+		}
+	}
+}
+
+// reconcileState checks actual pod/container status on startup and corrects
+// stale entries (e.g., pods evicted during daemon downtime, node reboots).
+func (m *manager) reconcileState(ctx context.Context) {
+	entries := m.store.List()
+	for key, entry := range entries {
+		if entry.Status != "running" && entry.Status != "paused" {
+			continue
+		}
+		projectName, agentID := parseStoreKey(key)
+		containerName := m.containerName(projectName, agentID)
+		status, err := m.backend.Status(ctx, containerName)
+		if err != nil {
+			m.logger.Warn("reconcile: failed to check status", "key", key, "error", err)
+			entry.Status = "stopped"
+			_ = m.store.Set(key, entry)
+			continue
+		}
+		if !status.Running {
+			m.logger.Info("reconcile: marking stale entry as stopped",
+				"key", key, "actual_status", status.Status)
+			entry.Status = "stopped"
+			_ = m.store.Set(key, entry)
 		}
 	}
 }
 
 // shutdownAll stops all managed containers gracefully.
+// It cancels running async execs and waits for goroutines to finish
+// before stopping containers.
 func (m *manager) shutdownAll(ctx context.Context) {
+	// Cancel all running async execs so goroutines exit promptly.
+	if m.asyncExecs != nil {
+		m.asyncExecs.mu.RLock()
+		for _, ae := range m.asyncExecs.execs {
+			if ae.Status == "running" && ae.cancel != nil {
+				ae.cancel()
+			}
+		}
+		m.asyncExecs.mu.RUnlock()
+	}
+
+	// Wait for all async goroutines to complete.
+	m.asyncWg.Wait()
+
 	entries := m.store.List()
-	for name, entry := range entries {
+	for key, entry := range entries {
 		if entry.Status == "running" {
-			containerName := m.containerName(name)
-			m.logger.Info("shutting down sandbox", "project", name)
+			projectName, agentID := parseStoreKey(key)
+			containerName := m.containerName(projectName, agentID)
+			m.logger.Info("shutting down sandbox", "key", key)
 			if err := m.backend.Stop(ctx, containerName); err != nil {
-				m.logger.Warn("failed to stop sandbox on shutdown", "project", name, "error", err)
+				m.logger.Warn("failed to stop sandbox on shutdown", "key", key, "error", err)
 			}
 			entry.Status = "stopped"
-			_ = m.store.Set(name, entry)
+			_ = m.store.Set(key, entry)
 		}
 	}
 }

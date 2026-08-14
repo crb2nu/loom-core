@@ -1,0 +1,173 @@
+// Catalog store - browsable registry with enable/disable toggles
+import { untrack } from 'svelte';
+import { arraysEqualByKey } from '../utils/diff.ts';
+import { createPoller } from '../utils/poller.ts';
+
+export interface CatalogServer {
+  name: string;
+  description: string;
+  categories: string[];
+  command: string;
+  enabled: boolean;
+  running: boolean;
+  tool_count: number;
+  env_hints: string[];
+  config_hints: string[];
+  // Populated by the HUD when the health monitor has a recent probe failure
+  // for this server. Empty/undefined when the server is healthy or no probe
+  // has run yet. Drives the "unhealthy" runtime pill tooltip.
+  error_message?: string;
+}
+
+export interface CatalogResponse {
+  servers: CatalogServer[];
+  count: number;
+  registry_path: string;
+}
+
+class CatalogStore {
+  servers = $state<CatalogServer[]>([]);
+  loading = $state(false);
+  error = $state<string | null>(null);
+  lastUpdated = $state<Date | null>(null);
+  registryPath = $state('');
+
+  searchQuery = $state('');
+  categoryFilter = $state('all');
+  statusFilter = $state<'all' | 'enabled' | 'disabled' | 'running'>('all');
+
+  private poller = createPoller(() => this.fetch(), 30000);
+
+  get categories(): string[] {
+    const set = new Set<string>();
+    for (const srv of this.servers) {
+      for (const cat of srv.categories ?? []) {
+        set.add(cat);
+      }
+    }
+    return [...set].sort();
+  }
+
+  get runningCount(): number {
+    return this.servers.filter((s) => s.running).length;
+  }
+
+  get filteredServers(): CatalogServer[] {
+    let result = [...this.servers];
+    if (this.statusFilter === 'enabled') result = result.filter((s) => s.enabled);
+    else if (this.statusFilter === 'disabled') result = result.filter((s) => !s.enabled);
+    else if (this.statusFilter === 'running') result = result.filter((s) => s.running);
+    if (this.categoryFilter !== 'all') {
+      result = result.filter((s) =>
+        s.categories?.some((c) => c.toLowerCase() === this.categoryFilter.toLowerCase())
+      );
+    }
+    if (this.searchQuery) {
+      const q = this.searchQuery.toLowerCase();
+      result = result.filter((s) =>
+        s.name.toLowerCase().includes(q) ||
+        s.description?.toLowerCase().includes(q) ||
+        s.command?.toLowerCase().includes(q) ||
+        s.categories?.some((c) => c.toLowerCase().includes(q)) ||
+        s.env_hints?.some((c) => c.toLowerCase().includes(q)) ||
+        s.config_hints?.some((c) => c.toLowerCase().includes(q))
+      );
+    }
+    return result;
+  }
+
+  get enabledCount(): number {
+    return this.servers.filter((s) => s.enabled).length;
+  }
+
+  get disabledCount(): number {
+    return this.servers.filter((s) => !s.enabled).length;
+  }
+
+  async fetch(): Promise<void> {
+    this.loading = true;
+    this.error = null;
+    try {
+      // Snapshot filters OUTSIDE the caller's tracking context — fetch()
+      // runs synchronously inside the panel's mount $effect (startPolling),
+      // and a tracked filter read makes every keystroke re-run that effect:
+      // a second fetch plus a poller restart per input event. Explicit
+      // refetch on filter change lives in search()/filterByCategory().
+      const { categoryFilter, searchQuery } = untrack(() => ({
+        categoryFilter: this.categoryFilter,
+        searchQuery: this.searchQuery,
+      }));
+      const params = new URLSearchParams();
+      if (categoryFilter !== 'all') {
+        params.set('category', categoryFilter);
+      }
+      if (searchQuery.trim()) {
+        params.set('query', searchQuery.trim());
+      }
+      const url = params.toString() ? `/api/catalog?${params}` : '/api/catalog';
+      const res = await globalThis.fetch(url);
+      if (!res.ok) throw new Error(`Catalog API: ${res.status}`);
+
+      const data: CatalogResponse = await res.json();
+      const incoming = data.servers ?? [];
+
+      const keyFn = (s: CatalogServer) => s.name;
+      const hashFn = (s: CatalogServer) =>
+        `${s.enabled}|${s.running}|${s.command}|${s.tool_count}|${s.description}|${(s.categories ?? []).join(',')}|${(s.env_hints ?? []).join(',')}|${(s.config_hints ?? []).join(',')}|${s.error_message ?? ''}`;
+      if (!arraysEqualByKey(this.servers, incoming, keyFn, hashFn)) {
+        this.servers = incoming;
+      }
+      this.registryPath = data.registry_path ?? '';
+      this.lastUpdated = new Date();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  async toggleServer(name: string, enable: boolean): Promise<void> {
+    const action = enable ? 'enable' : 'disable';
+    try {
+      const res = await globalThis.fetch(`/api/catalog/${encodeURIComponent(name)}/${action}`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error(`Toggle ${action}: ${res.status}`);
+      await this.fetch();
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  search(query: string): void {
+    this.searchQuery = query;
+    void this.fetch();
+  }
+
+  filterByCategory(category: string): void {
+    this.categoryFilter = category;
+    this.fetch();
+  }
+
+  filterByStatus(status: 'all' | 'enabled' | 'disabled' | 'running'): void {
+    this.statusFilter = status;
+  }
+
+  resetFilters(): void {
+    this.searchQuery = '';
+    this.categoryFilter = 'all';
+    this.statusFilter = 'all';
+    void this.fetch();
+  }
+
+  startPolling(intervalMs = 30000): void {
+    this.fetch();
+    this.poller.start(intervalMs);
+  }
+
+  stopPolling(): void {
+    this.poller.stop();
+  }
+}
+
+export const catalogStore = new CatalogStore();
