@@ -1,0 +1,1 @@
+- Add human-approved audit sweep execution with per-issue freshness revalidation, traceable closing comments, and explicit partial-progress reporting in `pkg/mills/audit/sweep.go`, with coverage in `pkg/mills/audit/audit_test.go` and operator semantics in `docs/MILLS.md`.

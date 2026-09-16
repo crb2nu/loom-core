@@ -102,10 +102,10 @@ export function selectFileConflicts({ router, coordination }: InboxStores): Card
       key: 'file_conflict',
       severity: 'alert',
       headline: `${n} file conflict${n === 1 ? '' : 's'} detected`,
-      detail: 'Overlapping claims block parallel work. Resolve in Dispatch.',
+      detail: 'Overlapping claims block parallel work. Resolve in Presence.',
       primary: {
-        label: 'Open Dispatch',
-        run: () => router.navigate('dispatch'),
+        label: 'Open Presence',
+        run: () => router.navigate('presence'),
       },
     },
   ];
@@ -122,13 +122,9 @@ export function selectBlockedTasks({ router, tasks, coordination }: InboxStores)
       severity: 'warn',
       headline: `${n} blocked task${n === 1 ? '' : 's'}`,
       detail: cross > 0
-        ? `${cross} cross-agent blocker${cross === 1 ? '' : 's'} - inspect in Dispatch.`
-        : 'Inspect the work queue in Dispatch.',
+        ? `${cross} cross-agent blocker${cross === 1 ? '' : 's'} - inspect in Tasks.`
+        : 'Inspect the work queue in Tasks.',
       primary: {
-        label: 'Open Dispatch',
-        run: () => router.navigate('dispatch'),
-      },
-      secondary: {
         label: 'View Tasks',
         run: () => router.navigate('tasks'),
       },

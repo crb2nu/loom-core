@@ -1,0 +1,1 @@
+- Cover Mills report event metadata in the existing actor/time index, reducing cold-read I/O without deleting audit history or changing report contents. Preserve timestamp/ID ordering and replace the index transactionally during startup.

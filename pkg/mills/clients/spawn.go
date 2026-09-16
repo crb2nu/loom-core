@@ -17,6 +17,7 @@ import (
 
 	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
+	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/crb2nu/loom/pkg/mills/worker"
 )
 
@@ -261,6 +262,29 @@ type hudSpawnState struct {
 	Status    string             `json:"status"`
 	Error     string             `json:"error,omitempty"`
 	Telemetry *hudSpawnTelemetry `json:"telemetry,omitempty"`
+	// AuthMode is the credential path the HUD configured for the pod
+	// (spawn.AuthMode: cluster_oauth, cluster_api_key,
+	// cluster_service_account). It decides who pays for the turn.
+	AuthMode string `json:"auth_mode,omitempty"`
+	// AuthAccount is the pooled credential key the pod ran under (e.g.
+	// "claude-oauth-token-2"); empty for single-credential vendors.
+	AuthAccount      string `json:"auth_account,omitempty"`
+	AuthOutcome      string `json:"auth_outcome,omitempty"`
+	AuthFallbackFrom string `json:"auth_fallback_from,omitempty"`
+}
+
+// billingForAuthMode maps the HUD's credential path for a spawn to who pays
+// for its tokens: the cluster OAuth tokens are the Claude Max / ChatGPT
+// subscriptions, an API key or a service account is metered. Unknown or
+// empty returns "" so the runner applies its backend fallback.
+func billingForAuthMode(mode string) store.BillingClass {
+	switch strings.TrimSpace(mode) {
+	case "cluster_oauth":
+		return store.BillingSubscription
+	case "cluster_api_key", "cluster_service_account":
+		return store.BillingAPI
+	}
+	return ""
 }
 
 // Run implements pipeline.SpawnClient.
@@ -349,9 +373,9 @@ func (c *HUDSpawnClient) ResumeWithContext(ctx context.Context, spawnID string, 
 	return c.pollSpawn(ctx, spawnID, rc, true)
 }
 
-// Stop terminates an accepted HUD spawn. A stopped or already-gone spawn is
-// intentionally treated as success by the HUD endpoint, making pause retries
-// safe after an operator rollout.
+// Stop confirms runtime cleanup and driver exit for an accepted HUD spawn.
+// Only the endpoint's synchronous 200 acknowledgement permits a replacement;
+// missing records and asynchronous acceptance do not prove the writer stopped.
 func (c *HUDSpawnClient) Stop(ctx context.Context, spawnID string) error {
 	if c == nil || c.http == nil {
 		return errors.New("hud spawn: client not configured")
@@ -370,9 +394,22 @@ func (c *HUDSpawnClient) Stop(ctx context.Context, spawnID string) error {
 		return fmt.Errorf("hud spawn: stop %s: %w", spawnID, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("hud spawn: stop %s status %d: %s", spawnID, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var ack struct {
+		Stopped bool `json:"stopped"`
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return fmt.Errorf("hud spawn: read stop acknowledgement %s: %w", spawnID, err)
+	}
+	if err := decodeHUDResponse(body, &ack); err != nil {
+		return fmt.Errorf("hud spawn: decode stop acknowledgement %s: %w", spawnID, err)
+	}
+	if !ack.Stopped {
+		return fmt.Errorf("hud spawn: stop %s not confirmed", spawnID)
 	}
 	return nil
 }
@@ -564,6 +601,17 @@ func mapTelemetryToResponse(state *hudSpawnState) pipeline.SpawnResponse {
 			"agent_id": state.AgentID,
 			"status":   state.Status,
 		},
+		Billing: billingForAuthMode(state.AuthMode),
+	}
+	for key, value := range map[string]string{
+		"auth_mode":          state.AuthMode,
+		"auth_account":       state.AuthAccount,
+		"auth_outcome":       state.AuthOutcome,
+		"auth_fallback_from": state.AuthFallbackFrom,
+	} {
+		if value != "" {
+			resp.Artifacts[key] = value
+		}
 	}
 	if state.Telemetry == nil {
 		resp.LogTail = state.Error
@@ -704,6 +752,12 @@ func (c *HUDSpawnClient) attachGitContext(ctx context.Context, resp *pipeline.Sp
 		})
 		return
 	}
+	_, reason, ok := c.verifiedCaptureMergeBase(ctx, workingDir, baseRef, headRef, baseBranch, branch)
+	if !ok {
+		c.recordGitCapture(resp, gitCaptureOutcome{Status: gitCaptureStatusIntegrityFailed, Reason: reason,
+			WorkingDir: workingDir, BaseRef: baseRef, HeadRef: headRef, Resumed: resumed})
+		return
+	}
 
 	diff := captureGitDiff(ctx, c.cfg.GitRunner, workingDir, baseRef, headRef, c.cfg.MaxDiffBytes)
 	commits := captureGitCommitMessages(ctx, c.cfg.GitRunner, workingDir, baseRef, headRef, c.cfg.MaxCommitMessagesBytes)
@@ -775,7 +829,44 @@ const (
 	gitCaptureStatusResumeNoContext = "skipped_resume_without_capture_context"
 	gitCaptureStatusNoRunner        = "skipped_no_git_runner"
 	gitCaptureStatusFetchFailed     = "fetch_failed"
+	gitCaptureStatusIntegrityFailed = "degraded_unverified_merge_base"
 )
+
+// verifiedCaptureMergeBase refuses a shallow graft as a merge-base. It makes
+// one bounded deepen attempt, then degrades without replacing spawn telemetry.
+func (c *HUDSpawnClient) verifiedCaptureMergeBase(ctx context.Context, workingDir, baseRef, headRef, baseBranch, branch string) (string, string, bool) {
+	verify := func() (string, string, bool) {
+		out, stderr, code, err := c.cfg.GitRunner.Run(ctx, workingDir, "git", "merge-base", baseRef, headRef)
+		mb := strings.TrimSpace(out)
+		if err != nil || code != 0 || mb == "" {
+			return "", fmt.Sprintf("merge-base unresolved (exit %d): %s", code, redactGitOutput(stderr)), false
+		}
+		shallow, stderr, code, err := c.cfg.GitRunner.Run(ctx, workingDir, "git", "rev-parse", "--is-shallow-repository")
+		if err != nil || code != 0 {
+			return "", fmt.Sprintf("cannot inspect shallow repository state (exit %d): %s", code, redactGitOutput(stderr)), false
+		}
+		if strings.TrimSpace(shallow) == "true" {
+			_, _, code, err = c.cfg.GitRunner.Run(ctx, workingDir, "git", "rev-parse", mb+"^")
+			if err != nil || code != 0 {
+				return "", "merge-base " + mb + " is an unverified shallow boundary", false
+			}
+		}
+		return mb, "", true
+	}
+	if mb, reason, ok := verify(); ok {
+		return mb, reason, true
+	}
+	_, stderr, code, err := c.cfg.GitRunner.Run(ctx, workingDir, "git", "fetch", "--deepen=2000", "--no-tags", "origin",
+		"+refs/heads/"+baseBranch+":refs/remotes/origin/"+baseBranch, "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
+	if err != nil || code != 0 {
+		return "", fmt.Sprintf("bounded deepen failed (exit %d): %s", code, redactGitOutput(stderr)), false
+	}
+	mb, reason, ok := verify()
+	if !ok {
+		return "", "bounded deepen could not verify history: " + reason, false
+	}
+	return mb, "", true
+}
 
 // gitCaptureOutcome is the structured record of one capture attempt.
 type gitCaptureOutcome struct {

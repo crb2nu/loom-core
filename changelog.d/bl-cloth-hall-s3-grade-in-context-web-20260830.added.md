@@ -1,0 +1,1 @@
+- Render server-composed shift-report and bolt-archive cards in the HUD, with in-card grading, a keyboard grade walkthrough, and byte-exact server Markdown export.

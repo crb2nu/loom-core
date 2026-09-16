@@ -1,0 +1,1 @@
+- Show per-action dry-run evidence and conservative promotion readiness in the Factory overseer strip, with expandable explanations and backlog subjects (`OverseerStrip.svelte`, `mills_overseers.svelte.ts`, and `shuttleBoardHelpers.ts`); cache the 168h report on a five-minute cadence.

@@ -14,10 +14,17 @@ type Metrics interface {
 	// IncMuxDropsFullChan counts messages dropped because the destination
 	// channel (per-id or notification) was full.
 	IncMuxDropsFullChan()
-	// IncMuxDropsNoPending counts responses dropped because no caller had
-	// a pending registration for the message's id (cancelled call, or
-	// unsolicited response from the server).
+	// IncMuxDropsNoPending counts responses dropped because no caller ever
+	// registered the message's id: a genuinely unsolicited response from the
+	// server. Responses that arrive after the caller gave up are counted by
+	// IncMuxLateResponses instead.
 	IncMuxDropsNoPending()
+	// IncMuxLateResponses counts responses that arrived after the Recv caller
+	// abandoned the call (its context expired or the transport was closing).
+	// The upstream server finished the work; the caller had already reported
+	// a timeout. A high rate means the per-call budget is set just below the
+	// server's real latency and every timed-out call is wasted work.
+	IncMuxLateResponses()
 	// IncMuxNotifications counts id-less messages routed to NotificationCh.
 	IncMuxNotifications()
 }
@@ -27,4 +34,5 @@ type nopMetrics struct{}
 func (nopMetrics) IncMuxDispatches()     {}
 func (nopMetrics) IncMuxDropsFullChan()  {}
 func (nopMetrics) IncMuxDropsNoPending() {}
+func (nopMetrics) IncMuxLateResponses()  {}
 func (nopMetrics) IncMuxNotifications()  {}

@@ -210,83 +210,9 @@ public final class DashboardViewModel {
     private func syncWidgets() {
         #if os(iOS)
         guard let dashboard else { return }
-
-        let counts = taskCounts ?? MobileTaskCounts(
-            pending: 0,
-            inProgress: 0,
-            blocked: 0,
-            completed: 0
-        )
-
-        SharedDataStore.save(
-            WidgetData(
-                fleet: FleetWidgetData(
-                    daemonRunning: dashboard.daemonRunning,
-                    serverCount: dashboard.serverCount,
-                    sessionCount: dashboard.activeSessions,
-                    activeAgents: dashboard.activeAgents,
-                    idleAgents: dashboard.idleAgents,
-                    offlineAgents: dashboard.offlineAgents,
-                    healthyServers: dashboard.health.healthyServers,
-                    degradedServers: dashboard.health.degradedServers,
-                    downServers: dashboard.health.downServers
-                ),
-                tasks: TaskWidgetData(
-                    pending: counts.pending,
-                    inProgress: counts.inProgress,
-                    blocked: counts.blocked,
-                    completed: counts.completed,
-                    recentTitles: recentTaskTitles(from: dashboard.recentTimeline)
-                ),
-                sessions: SessionWidgetData(
-                    activeCount: dashboard.activeSessions,
-                    topSessions: recentSessions(from: dashboard.recentTimeline)
-                ),
-                attentionLanes: dashboard.coordination.attentionLanes.prefix(4).map { lane in
-                    AttentionLaneWidgetEntry(
-                        type: lane.type,
-                        laneID: lane.id,
-                        label: lane.label,
-                        route: lane.route,
-                        scope: lane.scope,
-                        summary: lane.summary,
-                        severity: lane.severity
-                    )
-                }
-            )
-        )
-
+        SharedDataStore.save(WidgetSnapshotBuilder.snapshot(dashboard: dashboard, counts: taskCounts))
         WidgetCenter.shared.reloadAllTimelines()
         #endif
-    }
-
-    private func recentTaskTitles(from timeline: [TimelineEntry]) -> [String] {
-        timeline.compactMap { entry in
-            guard
-                entry.eventType.contains("task"),
-                let title = entry.data?["title"]?.stringValue,
-                !title.isEmpty
-            else {
-                return nil
-            }
-            return title
-        }
-    }
-
-    private func recentSessions(from timeline: [TimelineEntry]) -> [SessionWidgetEntry] {
-        timeline.compactMap { entry -> SessionWidgetEntry? in
-            guard entry.eventType.contains("session") else { return nil }
-
-            let agentId = entry.agentId ?? entry.data?["agent_id"]?.stringValue ?? "unknown"
-            return SessionWidgetEntry(
-                id: entry.id,
-                namespace: entry.data?["namespace"]?.stringValue ?? entry.eventType,
-                agentId: agentId,
-                agentType: entry.data?["agent_type"]?.stringValue ?? Self.inferAgentType(from: agentId),
-                startedAt: entry.timestamp,
-                lastHeartbeat: Date()
-            )
-        }
     }
 
     #if os(iOS)
@@ -310,7 +236,7 @@ public final class DashboardViewModel {
               let sessionId = payload.session_id,
               let agentId = payload.agent_id else { return }
 
-        let agentType = payload.agent_type ?? Self.inferAgentType(from: agentId)
+        let agentType = payload.agent_type ?? WidgetSnapshotBuilder.inferAgentType(from: agentId)
         let namespace = payload.namespace ?? agentId
 
         let lam = LiveActivityManager.shared
@@ -430,7 +356,7 @@ public final class DashboardViewModel {
 
         let completed = CompletedSessionWidgetData(
             agentId: payload.agent_id ?? "unknown",
-            agentType: payload.agent_type ?? Self.inferAgentType(from: payload.agent_id ?? ""),
+            agentType: payload.agent_type ?? WidgetSnapshotBuilder.inferAgentType(from: payload.agent_id ?? ""),
             namespace: payload.namespace ?? "",
             durationSeconds: payload.duration_seconds ?? 0,
             tokenCount: payload.total_tokens ?? 0,
@@ -586,13 +512,4 @@ public final class DashboardViewModel {
     #endif
 
     /// Infer agent type from agent ID string.
-    private static func inferAgentType(from agentId: String) -> String {
-        let id = agentId.lowercased()
-        if id.contains("claude") { return "claude-code" }
-        if id.contains("gemini") { return "gemini" }
-        if id.contains("codex") { return "codex" }
-        if id.contains("kilo") { return "kilocode" }
-        if id.contains("antigravity") { return "antigravity" }
-        return "unknown"
-    }
 }

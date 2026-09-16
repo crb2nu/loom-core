@@ -1,0 +1,1 @@
+- Preserve research-stage failure provenance in `pkg/mills/pipeline/dispatcher.go` and `runner.go`, including per-attempt error records, provider metadata, events, and classified escalation reasons.

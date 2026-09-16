@@ -1,0 +1,1 @@
+- Disable Go module indexing for shared-cache devbox sandboxes while preserving unrelated GODEBUG settings and the input environment (`cmd/mcp-devbox/manager.go`, `cmd/mcp-devbox/manager_test.go`); document poisoned-index diagnosis and manual eviction in `docs/MILLS_RUNBOOK.md`.

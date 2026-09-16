@@ -1,0 +1,1 @@
+- Fixed Mills scope fairness in `pkg/mills/reconciler.go` and `pkg/mills/scope_overlap.go` so ineligible starved items cannot reserve scopes, with auditable exclusions and narrower glob-versus-literal matching.

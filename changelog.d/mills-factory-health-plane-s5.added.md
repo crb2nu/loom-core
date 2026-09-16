@@ -1,0 +1,1 @@
+- Add idempotent govulncheck advisory remediation in `pkg/mills/health/remediation.go`, wire its Renovate-first/template-fallback tick into `cmd/loom-mills-operator`, and document the runtime capability decision in `docs/MILLS.md`.

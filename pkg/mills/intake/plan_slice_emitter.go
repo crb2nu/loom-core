@@ -19,7 +19,7 @@ import (
 // fake it without standing up the MCP hub.
 type PlanReader interface {
 	ListPlans(ctx context.Context, project, namespace, phase string) ([]clients.PlanSummary, error)
-	ListSlices(ctx context.Context, planID string) ([]clients.PlanSliceSummary, error)
+	ListSlicesIfChanged(ctx context.Context, plan clients.PlanSummary) ([]clients.PlanSliceSummary, error)
 	// GetSlice recovers a slice's full detail (incl. the `files` array the
 	// tabular LIST view omits) so the emitter can stamp a real scope.
 	GetSlice(ctx context.Context, sliceID string) (clients.PlanSliceSummary, error)
@@ -118,7 +118,7 @@ type PlanSliceEmitter struct {
 	store     BacklogStore
 	cfg       PlanSliceEmitterConfig
 	logger    *slog.Logger
-	protected func([]string) []string
+	protected func(project string, paths []string) []string
 	grounder  func(ctx context.Context, project string, files []string) (missing []string, revision string, ok bool)
 	// Enabled is the live global admission barrier. Nil preserves existing
 	// standalone/test behavior.
@@ -139,13 +139,17 @@ func NewPlanSliceEmitter(plans PlanReader, st BacklogStore, cfg PlanSliceEmitter
 // SetProtectedPathHitter installs the hook that pre-declares a slice's
 // protected-path touches on the emitted item. hit returns the subset of the
 // given repo-relative paths matching the active policy's protected_paths globs
-// (e.g. func(p) { return pm.Current().ProtectedPathsHit(p) }); the emitter
-// records them in item.Policy.ProtectedPathsTouched so the post-implement
-// path_policy gate treats the plan-declared protected touch as intended rather
-// than escalating it. UNDECLARED protected touches — a path the implement stage
-// hit that the slice never declared — are not pre-declared, so the gate still
-// fires on them. nil-safe: without a hitter the emitter behaves as before.
-func (e *PlanSliceEmitter) SetProtectedPathHitter(hit func([]string) []string) {
+// for the given target project — empty project means the home repo — (e.g.
+// func(project string, p []string) []string { return
+// pm.Current().ProtectedPathsHitFor(project, p) }); the emitter records them
+// in item.Policy.ProtectedPathsTouched so the post-implement path_policy gate
+// treats the plan-declared protected touch as intended rather than escalating
+// it. The project parameter keeps cross-repo demand items (S6) judged against
+// the TARGET repo's protected_paths_per_repo overlay, not just the home-repo
+// globs. UNDECLARED protected touches — a path the implement stage hit that
+// the slice never declared — are not pre-declared, so the gate still fires on
+// them. nil-safe: without a hitter the emitter behaves as before.
+func (e *PlanSliceEmitter) SetProtectedPathHitter(hit func(project string, paths []string) []string) {
 	if e != nil {
 		e.protected = hit
 	}
@@ -302,7 +306,7 @@ func (e *PlanSliceEmitter) emitForProject(ctx context.Context, project, targetPr
 
 	emitted := 0
 	for _, pl := range plans {
-		slices, serr := e.plans.ListSlices(ctx, pl.ID)
+		slices, serr := e.plans.ListSlicesIfChanged(ctx, pl)
 		if serr != nil {
 			e.logger.Warn("plan-slice emitter list slices failed", "plan_id", pl.ID, "err", serr)
 			continue
@@ -367,7 +371,7 @@ func (e *PlanSliceEmitter) emitForProject(ctx context.Context, project, targetPr
 			// pre-declaration (prior behavior).
 			var protectedTouched []string
 			if e.protected != nil && len(sl.Files) > 0 {
-				protectedTouched = e.protected(sl.Files)
+				protectedTouched = e.protected(targetProject, sl.Files)
 			}
 			// Ground the declared files against the target repo's tree so a
 			// fabricated slice (every declared file absent) is flagged BEFORE

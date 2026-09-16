@@ -3,8 +3,6 @@ package main
 import (
 	"net/http"
 	"time"
-
-	"github.com/crb2nu/loom/pkg/mills/guard"
 )
 
 // Promotion-report defaults: the overseer family over the last week, the
@@ -33,17 +31,5 @@ func (o *operator) handlePromotionReport(w http.ResponseWriter, r *http.Request)
 		}
 		window = d
 	}
-	if o.store == nil || o.store.Events == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "events store unavailable"})
-		return
-	}
-
-	now := time.Now().UTC()
-	report, err := guard.BuildPromotionReport(r.Context(), o.store.Events, actor, now.Add(-window), now)
-	if err != nil {
-		o.logger.Warn("promotion report failed", "actor", actor, "window", window.String(), "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, report)
+	o.writeReportRollup(w, r, "promotion", window, actor)
 }

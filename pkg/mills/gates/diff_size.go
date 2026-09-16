@@ -26,11 +26,12 @@ type DiffSize struct {
 func (g *DiffSize) Name() string { return "diff_size" }
 
 // Evaluate compares (LinesAdded + LinesRemoved) against the ceiling
-// derived from (gate override → per-item budget → package default).
+// derived from (gate override → per-item policy → package default).
 func (g *DiffSize) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 	limit := g.MaxLines
+	itemOverride := false
 	if limit <= 0 {
-		limit = effectiveDiffLimit(in)
+		limit, itemOverride = effectiveDiffLimit(in)
 	}
 	added, removed := in.LinesAdded, in.LinesRemoved
 	total := added + removed
@@ -43,15 +44,19 @@ func (g *DiffSize) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 	// counts from the patch. This only fires on the telemetry gap: a genuinely
 	// empty diff carries no DiffPatch, so it still reads as 0 and passes.
 	if total == 0 && len(in.DiffPatch) > 0 {
-		added, removed = countDiffLines(in.DiffPatch)
+		added, removed = CountDiffLines(in.DiffPatch)
 		total = added + removed
 	}
 	if total <= limit {
 		return pass(), nil
 	}
+	capDescription := fmt.Sprintf("%d", limit)
+	if itemOverride {
+		capDescription += " (item override)"
+	}
 	return fail(fmt.Sprintf(
-		"diff is %d lines (added %d, removed %d); cap is %d",
-		total, added, removed, limit,
+		"diff is %d lines (added %d, removed %d); cap is %s",
+		total, added, removed, capDescription,
 	)), nil
 }
 
@@ -59,7 +64,10 @@ func (g *DiffSize) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 // excluding the +++/--- file headers (mirrors gates.addedLines). Used as a
 // fallback for the diff-size gate when the spawn parser did not populate
 // line-count telemetry.
-func countDiffLines(patch []byte) (added, removed int) {
+// CountDiffLines counts added/removed content lines in a unified diff,
+// excluding the +++/--- file headers. It is exported so read models can use
+// the exact same fallback as the enforcement gate.
+func CountDiffLines(patch []byte) (added, removed int) {
 	for _, raw := range strings.Split(string(patch), "\n") {
 		switch {
 		case strings.HasPrefix(raw, "+++"), strings.HasPrefix(raw, "---"):
@@ -73,12 +81,12 @@ func countDiffLines(patch []byte) (added, removed int) {
 	return added, removed
 }
 
-// effectiveDiffLimit picks the tightest non-zero ceiling. Item-level
-// policy can be more restrictive than the global default; we never
-// loosen below the package default unless an explicit override fires.
-func effectiveDiffLimit(in StageInput) int {
-	// Item budget can name a ceiling indirectly via MaxPipelineMinutes,
-	// but the schema doesn't have a dedicated diff cap yet. Reserve the
-	// extension point for when the item or policy adds one.
-	return defaultMaxDiffLines
+// effectiveDiffLimit returns the positive item override when one is present,
+// otherwise the package default. The boolean marks an item override so failure
+// reasons make the loosened (or tightened) ceiling auditable.
+func effectiveDiffLimit(in StageInput) (limit int, itemOverride bool) {
+	if in.MaxDiffLines > 0 {
+		return in.MaxDiffLines, true
+	}
+	return defaultMaxDiffLines, false
 }

@@ -1,0 +1,1 @@
+- Propagate operator grades to outcome writebacks transactionally, backfill historical grades, and expose realized quality calibration in `pkg/mills` and the Mills operator API.

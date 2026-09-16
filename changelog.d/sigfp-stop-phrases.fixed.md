@@ -1,0 +1,2 @@
+- Reject generic-only mined signature candidates and recognize OpenRouter HTTP 402 credit exhaustion as an attributed external dependency incident (`pkg/mills/sigfp/sigfp.go`, `pkg/mills/sigfp/sigfp_test.go`).
+- Prevent the failure-signature miner from persisting generic `error`, `failed`, `exit status 1`, and `context deadline exceeded` candidates in `pkg/mills/reconciler_signature_mining.go`.

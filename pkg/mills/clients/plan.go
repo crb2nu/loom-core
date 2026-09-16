@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -35,6 +37,12 @@ type PlanClient struct {
 	// AgentID is recorded as the plan's creator (attribution only; the
 	// store never scopes reads by agent_id).
 	AgentID string
+
+	cacheMu         sync.Mutex
+	sliceCache      map[string]planSliceCacheEntry
+	slicePlan       map[string]string
+	cacheGeneration map[string]uint64
+	now             func() time.Time
 }
 
 // NewPlanClient returns a PlanClient bound to hub.
@@ -94,6 +102,7 @@ func (c *PlanClient) AuthorPlan(ctx context.Context, item *store.BacklogItem, pr
 	if !parsed.OK && parsed.PlanID == "" {
 		return "", fmt.Errorf("plan: service reported failure: %q", body)
 	}
+	c.invalidatePlan(parsed.PlanID)
 	return parsed.PlanID, nil
 }
 

@@ -1,0 +1,1 @@
+- Make `internal/reliability/mixed_load_test.go`, `internal/fleetgate/benchmark.go`, and `scripts/ci/fleet_reliability_gate.sh` distinguish reliability failures from shared-runner contention while preserving hard correctness and liveness checks.

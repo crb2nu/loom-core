@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -36,6 +37,13 @@ const (
 // failed before returning a response. It distinguishes provider outages from
 // returned-but-unparseable responses, which remain critical audit evidence.
 var ErrNoAuditReviewersAvailable = errors.New("audit: no reviewers available")
+
+// warmableReviewer is an optional extension implemented by reviewer backends
+// whose models may scale to zero. Keeping it separate from Reviewer preserves
+// compatibility with backends that do not need a wake-up request.
+type warmableReviewer interface {
+	Warm(ctx context.Context, model string) error
+}
 
 // Dispatcher runs the configured reviewer pool concurrently, aggregates
 // the results, and emits a persistable AuditFinding plus the per-member
@@ -122,6 +130,7 @@ func (d *Dispatcher) Run(ctx context.Context, req *Request) (*Result, error) {
 	}
 
 	bulk, bulkSkipped := d.runPool(ctx, prompt, req.Pool)
+	mills.AuditBulkReviewersAvailable.Set(float64(len(req.Pool) - bulkSkipped))
 	if bulkSkipped == len(req.Pool) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -183,6 +192,7 @@ func (d *Dispatcher) runPool(ctx context.Context, prompt string, pool []PoolMemb
 	if len(pool) == 0 {
 		return nil, 0
 	}
+	d.warmPool(ctx, pool)
 	out := make([]MemberOutput, len(pool))
 	var skipped int
 	var skippedMu sync.Mutex
@@ -197,6 +207,7 @@ func (d *Dispatcher) runPool(ctx context.Context, prompt string, pool []PoolMemb
 		reviewer, ok := d.Reviewers[m.Backend]
 		if !ok || reviewer == nil {
 			d.warn("audit: reviewer not registered", "backend", m.Backend, "model", m.Model)
+			mills.AuditReviewerFailuresTotal.WithLabelValues(m.Backend, m.Model).Inc()
 			markSkipped()
 			out[i] = MemberOutput{Member: m, ParseErr: fmt.Errorf("audit: backend %q not registered", m.Backend)}
 			continue
@@ -208,6 +219,7 @@ func (d *Dispatcher) runPool(ctx context.Context, prompt string, pool []PoolMemb
 			if err != nil {
 				d.warn("audit: reviewer call failed",
 					"backend", m.Backend, "model", m.Model, "error", err)
+				mills.AuditReviewerFailuresTotal.WithLabelValues(m.Backend, m.Model).Inc()
 				markSkipped()
 				out[i] = MemberOutput{Member: m, CostUSD: cost, ParseErr: err}
 				return
@@ -225,6 +237,35 @@ func (d *Dispatcher) runPool(ctx context.Context, prompt string, pool []PoolMemb
 	}
 	wg.Wait()
 	return out, skipped
+}
+
+// warmPool wakes each unique backend/model pair before the concurrent review
+// fan-out. Warm failures are advisory: the real review is still attempted and
+// remains the source of reviewer failure metrics and availability semantics.
+func (d *Dispatcher) warmPool(ctx context.Context, pool []PoolMember) {
+	seen := make(map[string]struct{}, len(pool))
+	for _, member := range pool {
+		if ctx.Err() != nil {
+			return
+		}
+		reviewer, ok := d.Reviewers[member.Backend]
+		if !ok || reviewer == nil {
+			continue
+		}
+		warmer, ok := reviewer.(warmableReviewer)
+		if !ok {
+			continue
+		}
+		key := member.Backend + "\x00" + member.Model
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if err := warmer.Warm(ctx, member.Model); err != nil {
+			d.warn("audit: reviewer warm-up failed",
+				"backend", member.Backend, "model", member.Model, "error", err)
+		}
+	}
 }
 
 // shouldEscalate reports whether the bulk median lands in the

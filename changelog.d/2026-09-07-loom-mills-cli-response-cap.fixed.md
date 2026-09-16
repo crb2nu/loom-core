@@ -1,0 +1,1 @@
+`loom mills backlog list` no longer fails with `unexpected end of JSON input` once the backlog ledger passes ~800 items. The CLI silently truncated operator responses at 1 MiB; the cap is now 64 MiB and an over-cap body reports the cap by name instead of a parser error.

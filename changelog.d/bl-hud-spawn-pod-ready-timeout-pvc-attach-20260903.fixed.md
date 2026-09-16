@@ -1,0 +1,2 @@
+- Split HUD spawn pod readiness into PVC attach, image-pull, and container-start budgets in `internal/devbox/backend`, preserving shared cache PVCs while reporting stable failure reasons and the last Kubernetes event; document the storage choice in `docs/HUD.md`.
+- Treat a running init container (the git clone) as its own readiness phase bounded only by `DEVBOX_K8S_START_TIMEOUT`, so a slow clone no longer trips the two-minute image or start budgets (`init_wait_exceeded` names the phase when the overall timeout does expire).

@@ -1,0 +1,1 @@
+- Merge-queue eviction re-admission hop (A2, policy merge_queue.requeue_evictions, default off): head_moved and ci_timeout evictions re-enter once as external candidates under the observed head — merging still requires a green pipeline for that head, and the hop's own candidates never re-hop.

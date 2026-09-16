@@ -1,0 +1,1 @@
+- Merge-queue settles supersede escalated run verdicts: landing an MR whose pipeline run had already escalated appends a first-writer run.verdict.mergequeue_settled correction (registered for bulk discounting), so the escalation funnel stops reporting landed work as escalated.

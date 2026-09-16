@@ -8,7 +8,7 @@ RUN apk add --no-cache \
     gcc musl-dev
 
 # Common Go tools pinned to keep base image rebuilds reproducible.
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8 && \
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0 && \
     go install golang.org/x/tools/cmd/goimports@v0.43.0
 
 WORKDIR /workspace

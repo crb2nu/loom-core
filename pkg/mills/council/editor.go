@@ -59,9 +59,17 @@ type Reviser interface {
 	Revise(ctx context.Context, prior *EditorOutput, critiques []ReviewerOutput, focusAreas []string) (*EditorOutput, error)
 }
 
-// EditorOutput is what one Editor.Edit call returns. The artifact writer
-// (artifacts.go) consumes this to materialise the council's commit.
+// EditorFallbackHop records the failed source and actual successful destination.
+type EditorFallbackHop struct {
+	Primary     string
+	Destination string
+	Kind        string
+}
+
+// EditorOutput is the synthesized artifacts, attribution, and per-call audit.
 type EditorOutput struct {
+	FallbackHops []EditorFallbackHop `json:"fallback_hops,omitempty"`
+
 	// Documents are the markdown bodies the writer will persist as
 	// .loom/<NN>-<kind>-...md. At least one (research, product_spec,
 	// implementation_plan) per run; the editor decides the set.

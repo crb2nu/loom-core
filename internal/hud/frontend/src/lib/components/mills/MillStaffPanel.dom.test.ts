@@ -327,6 +327,18 @@ describe('MillStaffPanel evidence tiles — empty and error states', () => {
     );
   });
 
+  it('reports a missing window snapshot without calling the operator unconfigured', () => {
+    apply(() => {
+      millsStaffStore.judge = {
+        ...slot<JudgeCalibrationReport>(null),
+        snapshotUnavailable: true,
+      };
+    });
+    expect(tileByLabel('Judge calibration').querySelector('.tile-empty')?.textContent?.trim()).toBe(
+      'No snapshot for this window yet.',
+    );
+  });
+
   it('surfaces a hard error in the card body', () => {
     apply(() => {
       millsStaffStore.configOutcomes = slot<ConfigOutcomeReport>(null, 'operator unreachable');

@@ -263,7 +263,7 @@
         : (parseInt(shuttleStore.systemLoadPct) || 0) > 60
           ? 'var(--warning)'
           : 'var(--info)',
-      route: 'dispatch',
+      route: 'shuttles',
     },
     {
       label: 'Running',
@@ -327,7 +327,7 @@
           ? `${conflict.path} is shared by ${conflict.agents.join(', ')}`
           : `${conflictCount} file conflict${conflictCount === 1 ? '' : 's'} detected`,
         tone: 'alert',
-        action: { label: 'Resolve conflicts', route: 'dispatch' },
+        action: { label: 'Resolve conflicts', route: 'presence' },
         consumesKind: 'file_conflict',
       };
     }
@@ -347,7 +347,7 @@
         headline: 'Blocked work needs attention',
         detail: `${blockedTasks} blocked task${blockedTasks === 1 ? '' : 's'} · ${coordinationSummary.cross_agent_blockers} cross-agent blocker${coordinationSummary.cross_agent_blockers === 1 ? '' : 's'}`,
         tone: 'alert',
-        action: { label: 'Unblock tasks', route: 'dispatch' },
+        action: { label: 'Unblock tasks', route: 'tasks' },
         consumesKind: 'blocked_task',
       };
     }
@@ -402,7 +402,7 @@
     }
     if (blockedTasks > 0 || coordinationSummary.cross_agent_blockers > 0) {
       lanes.push({
-        route: 'dispatch',
+        route: 'tasks',
         label: 'Blocked',
         action: 'Unblock',
         value: `${blockedTasks} task${blockedTasks === 1 ? '' : 's'}`,
@@ -443,7 +443,7 @@
     }
     if (shuttleStore.hasRecommendations) {
       lanes.push({
-        route: 'dispatch',
+        route: 'shuttles',
         label: 'Dispatch',
         action: 'Route',
         value: `${shuttleStore.recommendations.length} suggestion${shuttleStore.recommendations.length === 1 ? '' : 's'}`,

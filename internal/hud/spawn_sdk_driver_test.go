@@ -60,6 +60,7 @@ func TestBuildSDKDriverCommand_SingleShot(t *testing.T) {
 		"spawn-abc",
 		"/workspace/loom-core",
 		"", // controlFilePath
+		"claude-opus-5",
 		50, // maxTurns
 		1.5,
 	)
@@ -70,6 +71,7 @@ func TestBuildSDKDriverCommand_SingleShot(t *testing.T) {
 		"--agent-id 'agent-1'",
 		"--spawn-id 'spawn-abc'",
 		"--working-dir '/workspace/loom-core'",
+		"--model 'claude-opus-5'",
 		"--max-turns 50",
 		"--max-cost-usd 1.5000",
 	}
@@ -97,6 +99,7 @@ func TestBuildSDKDriverCommand_MultiTurn(t *testing.T) {
 		"spawn-xyz",
 		"/workspace/loom-core",
 		path,
+		"",
 		0,
 		0,
 	)
@@ -128,6 +131,7 @@ func TestBuildSDKDriverCommand_ShellQuoting(t *testing.T) {
 		"don't break it",
 		"agent-3",
 		"spawn-3",
+		"",
 		"",
 		"",
 		0,

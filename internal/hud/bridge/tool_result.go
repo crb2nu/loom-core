@@ -11,18 +11,28 @@ import (
 
 // UnmarshalToolResult decodes a daemon tools/call response into target.
 // It supports both raw JSON payloads and standard MCP CallToolResult envelopes
-// whose text payload may be JSON or TOON.
+// whose structured payload is preferred over a JSON or TOON text fallback.
 func UnmarshalToolResult(raw json.RawMessage, target any) error {
 	if raw == nil {
 		return nil
 	}
 
 	var envelope mcp.CallToolResult
-	if err := json.Unmarshal(raw, &envelope); err == nil && (len(envelope.Content) > 0 || envelope.IsError) {
+	if err := json.Unmarshal(raw, &envelope); err == nil && (envelope.StructuredContent != nil || len(envelope.Content) > 0 || envelope.IsError) {
 		if envelope.IsError {
 			return toolEnvelopeError(envelope)
 		}
 		if target == nil {
+			return nil
+		}
+		if envelope.StructuredContent != nil {
+			structured, err := json.Marshal(envelope.StructuredContent)
+			if err != nil {
+				return fmt.Errorf("marshal structured tool result: %w", err)
+			}
+			if err := json.Unmarshal(structured, target); err != nil {
+				return fmt.Errorf("unmarshal structured tool result: %w", err)
+			}
 			return nil
 		}
 		text, err := firstToolText(envelope)

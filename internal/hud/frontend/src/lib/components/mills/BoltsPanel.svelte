@@ -10,7 +10,12 @@
    * the week") and the shift-report launch reuse the existing modals so
    * the offline SVG export is never regressed.
    */
-  import { millsStore, type PipelineRun } from '../../stores/mills.svelte.ts';
+  import {
+    millsStore,
+    type BacklogItem,
+    type MergeQueueEntry,
+    type PipelineRun,
+  } from '../../stores/mills.svelte.ts';
   import PanelShell from '../shared/PanelShell.svelte';
   import DataTable from '../shared/DataTable.svelte';
   import MetricCard from '../shared/MetricCard.svelte';
@@ -19,11 +24,20 @@
   import BoltArchive from './BoltArchive.svelte';
   import ShiftReport from './ShiftReport.svelte';
   import { archiveDays, archiveTotals, tartanSVG } from '../../utils/tartanHelpers.ts';
-  import { seededPattern } from '../../utils/factoryHelpers.ts';
   import { createPoller } from '../../utils/poller.ts';
   import { relativeTime } from '../../utils/format.ts';
   import { fmtCost } from './shared/format.ts';
   import { mrURL } from '../../utils/gitlabLinks.ts';
+  import OriginChip from './shared/OriginChip.svelte';
+  import RepoChip from './shared/RepoChip.svelte';
+  import {
+    originOf,
+    repoLabel,
+    repoFacet,
+    originFacet,
+    whyLine,
+    type OriginKind,
+  } from './shared/provenance.ts';
 
   // Local load/error state for the archive fetch. millsStore.refreshArchiveRuns
   // deliberately swallows errors to keep the last-good archive across ticks, so
@@ -49,16 +63,48 @@
 
   // KPIs share the 15s mills cadence; the archive changes slowly so it gets a
   // dedicated 60s poller with an explicit initial fetch (no initial tick).
+  // The press rides the shared tick via mergeQueueActive (opt-in, like
+  // historyActive) with one mount-time fetch so the lane shows immediately.
   $effect(() => {
     millsStore.startPolling(15000);
+    millsStore.mergeQueueActive = true;
+    void millsStore.fetchMergeQueue();
     void loadArchive(true);
     const poller = createPoller(() => loadArchive(false), 60_000);
     poller.start();
     return () => {
       poller.stop();
+      millsStore.mergeQueueActive = false;
       millsStore.stopPolling();
     };
   });
+
+  // The press (serial merge queue): entries FIFO as the operator returns
+  // them; position is per-lane (project→target), matching the slot each
+  // entry is actually waiting on.
+  let pressEntries = $derived(millsStore.mergeQueue?.active ?? []);
+  let settledEntries = $derived(millsStore.mergeQueue?.recent_settled ?? []);
+  let pressEnabled = $derived(millsStore.mergeQueue?.summary?.enabled ?? null);
+  let pressPositions = $derived.by(() => {
+    const counts = new Map<string, number>();
+    const out = new Map<number, number>();
+    for (const e of pressEntries) {
+      const lane = `${e.project}→${e.target_branch}`;
+      const pos = (counts.get(lane) ?? 0) + 1;
+      counts.set(lane, pos);
+      out.set(e.id, pos);
+    }
+    return out;
+  });
+  const PRESS_STATE_LABELS: Record<string, string> = {
+    queued: 'queued',
+    rebasing: 'rebasing',
+    awaiting_pipeline: 're-proving',
+    merging: 'merging',
+  };
+  function pressStateLabel(e: MergeQueueEntry): string {
+    return PRESS_STATE_LABELS[e.state] ?? e.state;
+  }
 
   // Bolts are the archived runs wound onto the take-up roll (done/merged).
   let bolts = $derived(millsStore.boltRuns);
@@ -94,31 +140,66 @@
   let mergedRuns24h = $derived(millsStore.kpis?.metrics?.pipeline_merged_runs);
   let mergedTrend = $derived(millsStore.metricSeries('pipeline_merged_runs'));
 
-  // Plan / pattern-book attribution: join a run's BacklogID → backlog item's
-  // PlanID (stamped plans embed their pattern slug) or Title. Built once per
-  // backlog change; every array read normalized `?? []`.
-  let planByBacklog = $derived.by(() => {
-    const m = new Map<string, string>();
+  // Join a run's BacklogID → its backlog item once, and read repo / origin /
+  // why off the result. The item carries TargetProject, Labels and CreatedBy on
+  // every poll; before this the join existed only to feed mrURL(), so the repo
+  // was resolved and then discarded.
+  let itemByID = $derived.by(() => {
+    const m = new Map<string, BacklogItem>();
     for (const item of millsStore.backlog ?? []) {
-      if (!item?.ID) continue;
-      m.set(item.ID, item.PlanID || item.Title || '');
+      if (item?.ID) m.set(item.ID, item);
     }
     return m;
   });
-  function planLabel(run: PipelineRun): string {
-    return planByBacklog.get(run.BacklogID) || run.BacklogID || '—';
+  function itemFor(run: PipelineRun): BacklogItem | undefined {
+    return itemByID.get(run.BacklogID);
+  }
+
+  // The why-line: what this bolt actually was. Title first — the old plan/book
+  // column preferred PlanID, which suppressed the readable reason on exactly
+  // the plan-linked items that dominate the floor.
+  function whyFor(run: PipelineRun): string {
+    return whyLine(itemFor(run)) || run.BacklogID || '—';
+  }
+
+  // --- Facets -------------------------------------------------------------
+  //
+  // 159 items merged in the trailing 48h on the live floor, so "scroll and
+  // read" is not a viable answer to "what landed in flexdeck this week".
+  // Facets are computed off the UNFILTERED bolts so counts stay stable as the
+  // operator narrows — a facet whose options vanish as you use it is a trap.
+  let repoFilter = $state<string | null>(null);
+  let originFilter = $state<OriginKind | null>(null);
+
+  let boltItems = $derived(bolts.map((run) => itemFor(run) ?? {}) as BacklogItem[]);
+  let repoOptions = $derived(repoFacet(boltItems));
+  let originOptions = $derived(originFacet(boltItems));
+
+  let filteredBolts = $derived(
+    bolts.filter((run) => {
+      const item = itemFor(run);
+      if (repoFilter && repoLabel(item?.TargetProject) !== repoFilter) return false;
+      if (originFilter && originOf(item).kind !== originFilter) return false;
+      return true;
+    }),
+  );
+
+  let filterActive = $derived(repoFilter != null || originFilter != null);
+  function clearFilters(): void {
+    repoFilter = null;
+    originFilter = null;
   }
 
   // Merged-runs table sort. Default: most recently wound first.
   let sortKey = $state('merged');
   let sortDir = $state<'asc' | 'desc'>('desc');
   const columns = [
-    { key: 'run', label: 'run' },
-    { key: 'bolt', label: 'bolt' },
-    { key: 'plan', label: 'plan / book', hideBelow: 620 },
+    { key: 'run', label: 'bolt / why' },
+    { key: 'bolt', label: 'mr' },
+    { key: 'repo', label: 'repo', hideBelow: 560, width: '8rem' },
+    { key: 'origin', label: 'origin', hideBelow: 700, width: '7rem' },
     { key: 'cost', label: 'cost', sortable: true, align: 'right' as const, width: '5.5rem' },
     { key: 'merged', label: 'merged', sortable: true, width: '7rem' },
-    { key: 'swatch', label: 'swatch', hideBelow: 520, width: '5.5rem' },
   ];
 
   function endedMs(run: PipelineRun): number {
@@ -128,7 +209,7 @@
   }
 
   let sortedBolts = $derived.by(() => {
-    const rows = [...bolts];
+    const rows = [...filteredBolts];
     const dir = sortDir === 'asc' ? 1 : -1;
     rows.sort((a, b) => {
       let va: number;
@@ -167,17 +248,16 @@
     millsStore.openRunDetail(id);
   }
 
-  // Tiny per-run swatch — the SAME seededPattern the live loom weaves, so a
-  // bolt's swatch matches its cloth. Rendered as a fixed 20-cell strip.
-  const SWATCH_N = 20;
-  function swatchCells(id: string): boolean[] {
-    return seededPattern(id, SWATCH_N);
-  }
 
   let showArchive = $state(false);
   let showShift = $state(false);
 
-  let isEmpty = $derived(!loading && !error && bolts.length === 0);
+  // Entries waiting in the press keep the panel alive even on a quiet week:
+  // PanelShell's empty state replaces the whole body, and a loaded lane
+  // with zero merged bolts is exactly when the operator needs the press.
+  let isEmpty = $derived(
+    !loading && !error && bolts.length === 0 && pressEntries.length === 0 && settledEntries.length === 0,
+  );
 </script>
 
 <PanelShell
@@ -210,6 +290,80 @@
 
   <LineageRibbon mode="spine" segments={millsStore.millFloorSpine} current="bolts" />
 
+  <!-- The press: the serial merge lane proven cloth passes through on its
+       way to the take-up roll. One entry per pipeline run holding or
+       waiting on a lane's head slot (rebase → re-prove → merge). -->
+  <div class="press" aria-label="Serial merge queue">
+    <div class="press-head">
+      <span class="press-tag">press · serial merge lane</span>
+      {#if millsStore.mergeQueue}
+        {#if pressEnabled === false}
+          <span class="press-mode press-off">off — policy</span>
+        {:else}
+          <span class="press-mode">{pressEntries.length} in lane</span>
+        {/if}
+      {/if}
+    </div>
+    {#if millsStore.mergeQueueError}
+      <div class="press-note press-error">press feed failed — {millsStore.mergeQueueError}</div>
+    {:else if pressEnabled === false}
+      <div class="press-note">serial lane disabled by policy — proven MRs merge directly</div>
+    {:else if pressEntries.length === 0 && settledEntries.length === 0}
+      <div class="press-note">press idle — lane clear, nothing waiting to merge</div>
+    {:else if pressEntries.length > 0}
+      <ol class="press-lane">
+        {#each pressEntries as entry (entry.id)}
+          <li class="press-entry">
+            <span class="press-pos text-mono">#{pressPositions.get(entry.id)}</span>
+            <span class="press-state press-state-{entry.state}">{pressStateLabel(entry)}</span>
+            <a
+              class="bolt-chip"
+              href={mrURL(entry.project, entry.mr_iid)}
+              target="_blank"
+              rel="noreferrer noopener"
+              title={`Open merge request !${entry.mr_iid}`}
+            >!{entry.mr_iid}</a>
+            <span class="press-id text-mono" title={entry.backlog_id || entry.pipeline_run_id}>
+              {entry.backlog_id || entry.pipeline_run_id}
+            </span>
+            <span class="press-lane-label text-mono text-muted" title={`${entry.project} → ${entry.target_branch}`}>
+              {entry.project}→{entry.target_branch}
+            </span>
+            {#if entry.attempts > 1}
+              <span class="press-attempts">attempt {entry.attempts}</span>
+            {/if}
+            <span class="press-age text-muted">{relativeTime(entry.enqueued_at)}</span>
+          </li>
+        {/each}
+      </ol>
+    {/if}
+    {#if !millsStore.mergeQueueError && pressEnabled !== false && settledEntries.length > 0}
+      <div class="press-history-label">settled · last 24h</div>
+      <ol class="press-history">
+        {#each settledEntries as entry (entry.id)}
+          <li class:press-evicted={entry.state === 'evicted'} class="press-settled-entry">
+            <span class="press-state press-state-{entry.state}">{entry.state}</span>
+            {#if entry.state === 'evicted' && entry.eviction_reason}
+              <span class="press-reason">{entry.eviction_reason}</span>
+            {/if}
+            <a
+              class="bolt-chip"
+              href={mrURL(entry.project, entry.mr_iid)}
+              target="_blank"
+              rel="noreferrer noopener"
+              title={`Open merge request !${entry.mr_iid}`}
+            >!{entry.mr_iid}</a>
+            <span class="press-id text-mono" title={entry.backlog_id || entry.pipeline_run_id}>
+              {entry.backlog_id || entry.pipeline_run_id}
+            </span>
+            <span class="press-lane-label text-mono text-muted">{entry.project}→{entry.target_branch}</span>
+            <span class="press-age text-muted">{relativeTime(entry.settled_at ?? entry.updated_at)}</span>
+          </li>
+        {/each}
+      </ol>
+    {/if}
+  </div>
+
   <div class="bolts-totals" aria-label="Week totals">
     <MetricCard
       label="bolts this week"
@@ -238,6 +392,46 @@
     </div>
   {/if}
 
+  <!-- Facet bar: narrow ~160 merges/48h down to the repo or author the
+       operator is actually asking about. -->
+  {#if repoOptions.length > 1 || originOptions.length > 1}
+    <div class="facets" aria-label="Filter bolts">
+      {#if repoOptions.length > 1}
+        <div class="facet-row">
+          <span class="facet-tag">repo</span>
+          {#each repoOptions as opt (opt.value)}
+            <button
+              type="button"
+              class="facet"
+              class:on={repoFilter === opt.value}
+              aria-pressed={repoFilter === opt.value}
+              onclick={() => (repoFilter = repoFilter === opt.value ? null : opt.value)}
+            >{opt.label}<span class="facet-n">{opt.count}</span></button>
+          {/each}
+        </div>
+      {/if}
+      {#if originOptions.length > 1}
+        <div class="facet-row">
+          <span class="facet-tag">origin</span>
+          {#each originOptions as opt (opt.value)}
+            <button
+              type="button"
+              class="facet"
+              class:on={originFilter === opt.value}
+              aria-pressed={originFilter === opt.value}
+              onclick={() => (originFilter = originFilter === opt.value ? null : opt.value)}
+            >{opt.label}<span class="facet-n">{opt.count}</span></button>
+          {/each}
+        </div>
+      {/if}
+      {#if filterActive}
+        <button type="button" class="facet-clear" onclick={clearFilters}>
+          clear · showing {filteredBolts.length} of {bolts.length}
+        </button>
+      {/if}
+    </div>
+  {/if}
+
   <DataTable
     {columns}
     rows={sortedBolts}
@@ -250,7 +444,14 @@
     onRowClick={(run) => openRun(run.ID)}
   >
     {#snippet row({ row: run, hiddenColumns })}
-      <td class="text-mono bolts-run">{run.BacklogID || run.ID}</td>
+      <td class="bolts-run">
+        <!-- Column flex lives on an inner wrapper so the td stays a real
+             table-cell and keeps stable-layout's truncation rules. -->
+        <div class="bolts-run-stack">
+          <span class="bolts-why" title={whyFor(run)}>{whyFor(run)}</span>
+          <span class="bolts-id text-mono text-muted">{run.BacklogID || run.ID}</span>
+        </div>
+      </td>
       <td>
         {#if run.MRIID != null}
           <span class="mr-affordances">
@@ -274,20 +475,14 @@
           <span class="bolt-chip bolt-chip-none">—</span>
         {/if}
       </td>
-      {#if !hiddenColumns.has('plan')}
-        <td class="text-mono text-muted bolts-plan" title={planLabel(run)}>{planLabel(run)}</td>
+      {#if !hiddenColumns.has('repo')}
+        <td><RepoChip targetProject={itemFor(run)?.TargetProject} /></td>
+      {/if}
+      {#if !hiddenColumns.has('origin')}
+        <td><OriginChip item={itemFor(run)} /></td>
       {/if}
       <td class="text-mono bolts-cost">{fmtCost(run.CostUSD)}</td>
       <td class="text-mono text-muted">{relativeTime(run.EndedAt ?? run.StartedAt)}</td>
-      {#if !hiddenColumns.has('swatch')}
-        <td class="bolts-swatch-cell">
-          <svg class="bolts-swatch" viewBox="0 0 {SWATCH_N * 3} 10" width={SWATCH_N * 3} height="10" aria-hidden="true">
-            {#each swatchCells(run.ID) as on, i (i)}
-              <rect x={i * 3} y="1" width="2.4" height="8" fill="var(--success)" fill-opacity={on ? 0.85 : 0.28} />
-            {/each}
-          </svg>
-        </td>
-      {/if}
     {/snippet}
   </DataTable>
 </PanelShell>
@@ -303,6 +498,119 @@
 {/if}
 
 <style>
+  .press {
+    margin-top: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    overflow: hidden;
+  }
+  .press-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--bg-primary);
+  }
+  .press-tag {
+    font-size: var(--text-2xs);
+    letter-spacing: var(--tracking-wide);
+    text-transform: uppercase;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .press-mode {
+    font-size: var(--text-2xs);
+    font-family: var(--font-mono);
+    color: var(--fg-muted);
+    white-space: nowrap;
+  }
+  .press-off { color: var(--warning); }
+  .press-note {
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--text-xs);
+    font-family: var(--font-mono);
+    color: var(--fg-dim);
+  }
+  .press-error { color: var(--warning); }
+  .press-lane {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .press-entry {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-xs);
+    border-bottom: 1px solid var(--border-subtle);
+    flex-wrap: wrap;
+  }
+  .press-entry:last-child { border-bottom: 0; }
+  .press-pos { color: var(--fg-dim); }
+  .press-state {
+    font-size: var(--text-2xs);
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-full);
+    border: 1px solid var(--border-subtle);
+    color: var(--fg-muted);
+    white-space: nowrap;
+  }
+  .press-state-rebasing { color: var(--info); border-color: color-mix(in srgb, var(--info) 45%, transparent); }
+  .press-state-awaiting_pipeline { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .press-state-merging { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, transparent); }
+  .press-state-merged { color: var(--success); border-color: transparent; }
+  .press-state-evicted { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 55%, transparent); }
+  .press-id {
+    color: var(--fg-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 26ch;
+  }
+  .press-lane-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 24ch;
+  }
+  .press-attempts { color: var(--warning); font-size: var(--text-2xs); white-space: nowrap; }
+  .press-age { margin-left: auto; font-size: var(--text-2xs); white-space: nowrap; }
+  .press-history-label {
+    padding: var(--space-1) var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+    font: var(--text-2xs) var(--font-mono);
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+  }
+  .press-history { margin: 0; padding: 0; list-style: none; }
+  .press-settled-entry {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-xs);
+    color: var(--fg-muted);
+    border-top: 1px solid var(--border-subtle);
+    flex-wrap: wrap;
+  }
+  .press-settled-entry.press-evicted { background: color-mix(in srgb, var(--warning) 7%, transparent); }
+  .press-reason {
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    color: var(--warning);
+    font: var(--text-2xs) var(--font-mono);
+    white-space: nowrap;
+  }
+
   .bolts-totals {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
@@ -325,18 +633,87 @@
     border-radius: var(--radius-sm);
   }
 
+  /* Two lines: what it was, then the id. The title carries the "why it
+     mattered" the operator previously had to open each row to read. */
   .bolts-run {
+    min-width: 0;
+    max-width: 42ch;
+  }
+  .bolts-run-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .bolts-why {
     font-weight: 600;
     color: var(--fg-primary);
-    word-break: break-all;
-  }
-
-  .bolts-plan {
-    max-width: 20ch;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .bolts-id {
+    font-size: var(--text-2xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .facets {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin: 0 0 var(--space-3);
+    padding: var(--space-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+  }
+  .facet-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+  .facet-tag {
+    font-size: var(--text-2xs);
+    letter-spacing: var(--tracking-wide);
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    min-width: 4rem;
+  }
+  .facet {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 1px var(--space-2);
+    border-radius: var(--radius-full);
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    cursor: pointer;
+  }
+  .facet:hover { color: var(--fg-primary); border-color: var(--border); }
+  .facet.on {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+  }
+  .facet-n { color: var(--fg-dim); }
+  .facet.on .facet-n { color: inherit; }
+  .facet-clear {
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--fg-dim);
+    font-size: var(--text-2xs);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .facet-clear:hover { color: var(--fg-primary); }
 
   .bolts-cost { text-align: right; }
 
@@ -369,10 +746,4 @@
     cursor: pointer;
   }
   .mr-copy:hover { color: var(--success); }
-
-  .bolts-swatch-cell { width: 5.5rem; }
-  .bolts-swatch {
-    display: block;
-    border-radius: var(--radius-xs);
-  }
 </style>

@@ -1,0 +1,1 @@
+- Add a scripted Mills CI kill-test that drives the canonical MR-awareness scenario and rejects absent, contradictory, or stale evidence.

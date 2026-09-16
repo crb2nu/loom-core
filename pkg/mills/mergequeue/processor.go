@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
@@ -21,6 +22,22 @@ const (
 	detailPipelineWaitSince = "pipeline_wait_since"
 	detailPipelineCreated   = "pipeline_create_attempted"
 	detailPipelineURL       = "pipeline_url"
+	detailPipelineID        = "pipeline_id"
+	detailPipelineLane      = "pipeline_lane"
+	detailProof             = "proof"
+	detailProofSource       = "proof_source"
+	detailSpecRef           = "speculative_ref"
+	detailSpecSHA           = "speculative_sha"
+	detailSpecPipelineID    = "speculative_pipeline_id"
+	detailSpecPredecessorID = "speculative_predecessor_id"
+	// detailSpecFailedOnto records the base a speculative head could not be
+	// built on (cherry-pick conflict, API refusal) so the tick loop does not
+	// retry the identical attempt every 15s; a new base clears it.
+	detailSpecFailedOnto = "speculative_failed_onto"
+	// detailObservedSHA carries the full successor head on head_moved
+	// evictions so the stage can reconstruct a typed head-movement error
+	// (A1) instead of scraping short SHAs out of the detail text.
+	detailObservedSHA = "observed_sha"
 )
 
 const (
@@ -61,13 +78,31 @@ type Processor struct {
 	Interval time.Duration
 	// AwaitPipeline overrides the pipeline wait bound. Zero → default.
 	AwaitPipeline time.Duration
+	// AwaitPipelineFn, when set, is consulted on every await so a
+	// hot-reloaded policy (merge_queue.await_pipeline_minutes) takes effect
+	// without a restart. A zero result falls back to AwaitPipeline, then to
+	// the default.
+	AwaitPipelineFn func() time.Duration
+	// SpeculationDepth is hot-reloaded; zero disables successor preparation.
+	SpeculationDepth func() int
 	// Now is injectable for tests. Nil → time.Now.
 	Now func() time.Time
 
 	// busy tracks lanes with an in-flight drive goroutine so a slow step
 	// (ObserveHead settle, the merge PUT's bounded retries) never stacks a
 	// second driver on the same lane. Lanes drive independently.
-	busy sync.Map
+	busy              sync.Map
+	recoveryMu        sync.Mutex
+	recoveryPipelines map[string]recoveryPipeline
+	// External re-admits green evictions (shepherd A2): head_moved and
+	// ci_timeout evictions re-enqueue ONCE as external candidates under the
+	// observed head when RequeueEvictions reports the policy flag on. nil or
+	// a false flag disables the hop; a candidate the evictor itself produced
+	// (producer == evictionRequeueProducer) is never re-requeued.
+	External         *ExternalEnqueuer
+	RequeueEvictions func() bool
+	// MainRedExternal gates each lane before its head is advanced.
+	MainRedExternal *MainRedExternalController
 }
 
 // Run ticks until ctx is cancelled. Returns nil on clean shutdown so it
@@ -103,6 +138,11 @@ func (p *Processor) tick(ctx context.Context) {
 	if p.Enabled == nil || !p.Enabled() {
 		return
 	}
+	p.prepareSpeculation(ctx)
+	// Revisit recently-settled external candidates before admitting more work.
+	// A process may die after MarkMerged commits but before the owning backlog
+	// transition does; replaying terminal rows makes that gap self-healing.
+	p.settleRecentExternalAdoptions(ctx)
 	heads, err := p.Store.MergeQueue.Heads(ctx)
 	if err != nil {
 		p.logger().Warn("merge queue: heads read failed", "error", err)
@@ -124,10 +164,118 @@ func (p *Processor) tick(ctx context.Context) {
 	}
 }
 
+func (p *Processor) prepareSpeculation(ctx context.Context) {
+	if p.SpeculationDepth == nil || p.SpeculationDepth() <= 0 {
+		return
+	}
+	active, err := p.Store.MergeQueue.ListActive(ctx)
+	if err != nil {
+		return
+	}
+	depth := p.SpeculationDepth()
+	for i, head := range active {
+		if head.State != store.MergeQueueAwaitingPipeline || head.CurrentSHA == "" {
+			continue
+		}
+		if held, err := p.deferMainRedExternal(ctx, head); err != nil || held {
+			continue
+		}
+		onto := head.CurrentSHA
+		prepared := 0
+		// One MR may hold several active entries (its own run plus an external
+		// candidate a producer such as the mrwatch shepherd submitted for the
+		// same head). Stacking an MR on top of itself cherry-picks its own
+		// commits onto its own head and fails every tick (2026-09-12: 720
+		// failed attempts in 3h for !1918), so each MR appears once per chain.
+		chain := map[int64]bool{head.MRIID: true}
+		for j := i + 1; j < len(active) && prepared < depth; j++ {
+			next := active[j]
+			if next.Project != head.Project || next.TargetBranch != head.TargetBranch || chain[next.MRIID] {
+				continue
+			}
+			chain[next.MRIID] = true
+			prepared++
+			if sha, _ := next.Detail[detailSpecSHA].(string); sha != "" {
+				onto = sha
+				continue
+			}
+			if failed, _ := next.Detail[detailSpecFailedOnto].(string); failed == onto {
+				break
+			}
+			forge, ok := p.ForProject(next.Project).(SpeculativeForge)
+			if !ok {
+				break
+			}
+			ref := fmt.Sprintf("mills-mq/spec-%d-%s", next.MRIID, shortSHA(onto))
+			spec, err := forge.PrepareSpeculativeHead(ctx, next.MRIID, onto, ref)
+			if err != nil {
+				p.logger().Warn("merge queue: speculative head failed", "mr", next.MRIID, "onto", shortSHA(onto), "error", err)
+				SpeculationTotal.WithLabelValues("miss").Inc()
+				failedDetail := cloneDetail(next.Detail)
+				failedDetail[detailSpecFailedOnto] = onto
+				_, _ = p.Store.MergeQueue.Transition(ctx, store.MergeQueueTransition{ID: next.ID, From: next.State, To: next.State, Detail: failedDetail})
+				break
+			}
+			detail := cloneDetail(next.Detail)
+			detail[detailSpecRef], detail[detailSpecSHA] = spec.Ref, spec.SHA
+			detail[detailSpecPipelineID], detail[detailSpecPredecessorID] = spec.Pipeline.ID, head.ID
+			if spec.Adopted {
+				detail[detailPipelineLane] = "adopted"
+			} else {
+				detail[detailPipelineLane] = "queue"
+			}
+			if _, err := p.Store.MergeQueue.Transition(ctx, store.MergeQueueTransition{ID: next.ID, From: next.State, To: next.State, Detail: detail}); err != nil {
+				_ = forge.CancelQueuePipeline(ctx, spec.Pipeline.ID)
+				_ = forge.DeleteQueueRef(ctx, spec.Ref)
+				break
+			}
+			onto = spec.SHA
+		}
+	}
+}
+
+func (p *Processor) cleanupSpeculation(ctx context.Context, predecessor *store.MergeQueueEntry, cancel bool) {
+	active, err := p.Store.MergeQueue.ListActive(ctx)
+	if err != nil {
+		return
+	}
+	for _, e := range active {
+		if detailInt64(e.Detail, detailSpecPredecessorID) != predecessor.ID {
+			continue
+		}
+		forge, ok := p.ForProject(e.Project).(SpeculativeForge)
+		if !ok {
+			continue
+		}
+		if cancel {
+			if err := forge.CancelQueuePipeline(ctx, detailInt64(e.Detail, detailSpecPipelineID)); err != nil {
+				continue
+			}
+		}
+		if ref, _ := e.Detail[detailSpecRef].(string); ref != "" {
+			if err := forge.DeleteQueueRef(ctx, ref); err != nil {
+				continue
+			}
+		}
+		detail := cloneDetail(e.Detail)
+		delete(detail, detailSpecRef)
+		delete(detail, detailSpecPredecessorID)
+		if cancel {
+			delete(detail, detailSpecSHA)
+			delete(detail, detailSpecPipelineID)
+			SpeculationTotal.WithLabelValues("cancelled").Inc()
+		}
+		_, _ = p.Store.MergeQueue.Transition(ctx, store.MergeQueueTransition{ID: e.ID, From: e.State, To: e.State, Detail: detail})
+	}
+}
+
 // driveHead advances one lane's head candidate a single step. Transient errors
 // return non-nil and are retried on a later tick; deterministic dead-ends
 // evict with a distinct reason.
 func (p *Processor) driveHead(ctx context.Context, e *store.MergeQueueEntry) error {
+	if held, err := p.deferMainRedExternal(ctx, e); err != nil || held {
+		return err
+	}
 	forge := p.ForProject(e.Project)
 	if forge == nil {
 		return fmt.Errorf("no forge for project %q", e.Project)
@@ -162,9 +310,12 @@ func (p *Processor) driveQueued(ctx context.Context, forge Forge, e *store.Merge
 	}
 	if snap.SHA != e.CurrentSHA {
 		// The head moved underneath the queue (external push). Fail closed —
-		// the authorization chain is broken and the run must re-gate.
+		// the authorization chain is broken and the run must re-gate. The
+		// observed successor rides structurally so the stage can hand the
+		// runner a typed head-movement it can rewind on (A1).
 		return p.evict(ctx, e, store.MergeQueueEvictHeadMoved,
-			fmt.Sprintf("head moved externally while queued: authorized %s, observed %s", shortSHA(e.CurrentSHA), shortSHA(snap.SHA)), nil)
+			fmt.Sprintf("head moved externally while queued: authorized %s, observed %s", shortSHA(e.CurrentSHA), shortSHA(snap.SHA)),
+			map[string]any{detailObservedSHA: snap.SHA})
 	}
 
 	tip, err := forge.BranchTip(ctx, e.TargetBranch)
@@ -279,36 +430,99 @@ func (p *Processor) driveRebasing(ctx context.Context, forge Forge, e *store.Mer
 	}
 }
 
+// awaitPipelineMax resolves the pipeline wait bound: the hot-reloaded policy
+// value first, then the static override, then the compiled default.
+func (p *Processor) awaitPipelineMax() time.Duration {
+	if p.AwaitPipelineFn != nil {
+		if d := p.AwaitPipelineFn(); d > 0 {
+			return d
+		}
+	}
+	if p.AwaitPipeline > 0 {
+		return p.AwaitPipeline
+	}
+	return defaultAwaitPipeline
+}
+
 // driveAwaitingPipeline waits for a terminal branch pipeline on the rebased
-// head, creating one bounded recovery pipeline if none appears.
+// head, creating one bounded recovery pipeline if none appears. External
+// candidates are additionally proven by a successful merge-request pipeline
+// for the head: repos like flexinfer gate MRs on detached MR pipelines, and
+// their branch pipelines either never exist or park on blocking manual jobs.
 func (p *Processor) driveAwaitingPipeline(ctx context.Context, forge Forge, e *store.MergeQueueEntry) error {
 	waitSince := detailTime(e.Detail, detailPipelineWaitSince, p.now())
-	awaitMax := p.AwaitPipeline
-	if awaitMax <= 0 {
-		awaitMax = defaultAwaitPipeline
-	}
+	awaitMax := p.awaitPipelineMax()
 
 	ps, err := forge.BranchPipelineStatus(ctx, e.CurrentSHA, e.SourceBranch)
 	if err != nil {
 		return fmt.Errorf("pipeline status: %w", err)
 	}
+	// The MR pipeline is POSITIVE proof only: success merges, and a live one
+	// holds the wait open, but red never evicts — GitLab pins a spurious 0-job
+	// FAILED merge_request_event placeholder on MR heads even in repos whose
+	// workflow rules suppress MR pipelines (see GitLabClient.Merge), so a red
+	// MR pipeline cannot be distinguished from that phantom. A genuinely red
+	// external MR falls through to the ci_timeout bound instead.
+	var mrPS PipelineStatus
+	if isExternalCandidate(e) {
+		mrPS, err = forge.MRPipelineStatus(ctx, e.MRIID, e.CurrentSHA)
+		if err != nil {
+			return fmt.Errorf("mr pipeline status: %w", err)
+		}
+	}
+	if ps.Found && ps.Status == "success" {
+		proof, err := forge.PipelineProof(ctx, e.CurrentSHA)
+		if err != nil || !proof.Found || proof.SHA != e.CurrentSHA {
+			if err != nil {
+				return fmt.Errorf("exact pipeline proof: %w", err)
+			}
+			return fmt.Errorf("exact pipeline %d has no commit-tree proof", ps.ID)
+		}
+		p.observePipelineTiming(ctx, forge, e, proof.ID, pipelineLane(e, proof))
+		return p.promoteToMergingWithProof(ctx, e, proof)
+	}
+	if mrPS.Found && mrPS.Status == "success" {
+		proof, err := forge.PipelineProof(ctx, e.CurrentSHA)
+		if err != nil || !proof.Found || proof.SHA != e.CurrentSHA || proof.Status != "success" {
+			if err != nil {
+				return fmt.Errorf("exact mr pipeline proof: %w", err)
+			}
+			return fmt.Errorf("mr pipeline %d has no successful commit-tree proof", mrPS.ID)
+		}
+		p.observePipelineTiming(ctx, forge, e, proof.ID, "adopted")
+		return p.promoteToMergingWithProof(ctx, e, proof)
+	}
+	proof, err := forge.PipelineProof(ctx, e.CurrentSHA)
+	if err != nil {
+		return fmt.Errorf("pipeline proof: %w", err)
+	}
+	if proof.Found {
+		switch proof.Status {
+		case "success":
+			p.observePipelineTiming(ctx, forge, e, proof.ID, pipelineLane(e, proof))
+			return p.promoteToMergingWithProof(ctx, e, proof)
+		case "failed", "canceled":
+			p.observePipelineTiming(ctx, forge, e, proof.ID, pipelineLane(e, proof))
+			return p.evict(ctx, e, store.MergeQueueEvictCIRed,
+				fmt.Sprintf("pipeline %d proving tree %s: %s", proof.ID, shortSHA(proof.Tree), proof.Status),
+				map[string]any{"pipeline_url": proof.WebURL, "pipeline_status": proof.Status, detailProofSource: proof.Source})
+		default:
+			if pipelineProgressing(proof.Status) {
+				return nil
+			}
+		}
+	}
 	if ps.Found {
 		switch ps.Status {
-		case "success":
-			detail := cloneDetail(e.Detail)
-			detail[detailPipelineURL] = ps.WebURL
-			_, err := p.Store.MergeQueue.Transition(ctx, store.MergeQueueTransition{
-				ID: e.ID, From: store.MergeQueueAwaitingPipeline, To: store.MergeQueueMerging,
-				Detail: detail,
-			})
-			return ignoreConflict(err)
 		case "failed", "canceled":
+			p.observePipelineTiming(ctx, forge, e, ps.ID, pipelineLane(e, PipelineProof{PipelineStatus: ps}))
 			return p.evict(ctx, e, store.MergeQueueEvictCIRed,
 				fmt.Sprintf("pipeline %d on rebased head %s: %s", ps.ID, shortSHA(e.CurrentSHA), ps.Status),
 				map[string]any{"pipeline_url": ps.WebURL, "pipeline_status": ps.Status})
-		case "skipped":
-			// A skipped pipeline never turns terminal-green; fall through to
-			// the create/timeout path below as if none existed.
+		case "skipped", "manual":
+			// Neither ever turns terminal-green on its own (manual blocks on a
+			// human playing a job); fall through to the create/timeout path
+			// below as if none existed.
 		default:
 			// running / pending / created — keep waiting inside the bound.
 			if p.now().Sub(waitSince) > awaitMax {
@@ -319,22 +533,45 @@ func (p *Processor) driveAwaitingPipeline(ctx context.Context, forge Forge, e *s
 			return nil
 		}
 	}
+	if mrPS.Found && pipelineProgressing(mrPS.Status) {
+		// A live MR pipeline is the candidate's proof in flight: hold the wait
+		// open and DON'T mint a recovery branch pipeline underneath it (in
+		// MR-pipeline repos that recovery would just park manual or skipped).
+		if p.now().Sub(waitSince) > awaitMax {
+			return p.evict(ctx, e, store.MergeQueueEvictCITimeout,
+				fmt.Sprintf("merge request pipeline %d still %s after %s", mrPS.ID, mrPS.Status, awaitMax),
+				map[string]any{"pipeline_url": mrPS.WebURL})
+		}
+		return nil
+	}
 
 	if p.now().Sub(waitSince) > awaitMax {
 		return p.evict(ctx, e, store.MergeQueueEvictCITimeout,
 			fmt.Sprintf("no terminal pipeline for rebased head %s within %s", shortSHA(e.CurrentSHA), awaitMax), nil)
 	}
 	if !detailBool(e.Detail, detailPipelineCreated) && p.now().Sub(waitSince) > pipelineAppearGrace {
-		created, err := forge.CreateQueuePipeline(ctx, e.SourceBranch)
+		created, adopted, err := p.adoptOrCreateRecoveryPipeline(ctx, forge, e)
 		if err != nil {
-			return fmt.Errorf("create recovery pipeline: %w", err)
+			return err
 		}
 		if created.SHA != "" && created.SHA != e.CurrentSHA {
 			return p.evict(ctx, e, store.MergeQueueEvictHeadMoved,
-				fmt.Sprintf("recovery pipeline built %s, queue head is %s", shortSHA(created.SHA), shortSHA(e.CurrentSHA)), nil)
+				fmt.Sprintf("recovery pipeline built %s, queue head is %s", shortSHA(created.SHA), shortSHA(e.CurrentSHA)),
+				map[string]any{detailObservedSHA: created.SHA})
 		}
 		detail := cloneDetail(e.Detail)
 		detail[detailPipelineCreated] = true
+		detail[detailPipelineID] = created.ID
+		detail[detailPipelineURL] = created.WebURL
+		if adopted {
+			detail[detailPipelineLane] = "adopted"
+			p.logger().Info("merge queue: adopted recovery pipeline", "adopted_pipeline_id", created.ID, "ref", e.SourceBranch, "sha", e.CurrentSHA, "minted_by", "merge_queue.recovery")
+			mills.PipelineAdoptionsTotal.WithLabelValues("merge_queue.recovery").Inc()
+		} else {
+			detail[detailPipelineLane] = "queue"
+			p.logger().Info("merge queue: minted recovery pipeline", "pipeline_id", created.ID, "ref", e.SourceBranch, "sha", e.CurrentSHA, "minted_by", "merge_queue.recovery")
+			mills.PipelineMintsTotal.WithLabelValues("merge_queue.recovery").Inc()
+		}
 		_, terr := p.Store.MergeQueue.Transition(ctx, store.MergeQueueTransition{
 			ID: e.ID, From: store.MergeQueueAwaitingPipeline, To: store.MergeQueueAwaitingPipeline,
 			Detail: detail,
@@ -342,6 +579,115 @@ func (p *Processor) driveAwaitingPipeline(ctx context.Context, forge Forge, e *s
 		return ignoreConflict(terr)
 	}
 	return nil
+}
+
+func (p *Processor) adoptOrCreateRecoveryPipeline(ctx context.Context, forge Forge, e *store.MergeQueueEntry) (PipelineStatus, bool, error) {
+	key := e.Project + "\x00" + e.SourceBranch + "\x00" + e.CurrentSHA
+	p.recoveryMu.Lock()
+	defer p.recoveryMu.Unlock()
+	if p.recoveryPipelines == nil {
+		p.recoveryPipelines = make(map[string]recoveryPipeline)
+	}
+	if cached, ok := p.recoveryPipelines[key]; ok {
+		// The entry whose recovery minted the pipeline keeps its "queue"
+		// lane on every later tick (the cache outlives the entry pointer, so
+		// identity is the persisted entry id + MR, never the pointer); any
+		// other entry sharing the exact head adopts the same pipeline.
+		adopted := !cached.minted || cached.minter != recoveryMinterOf(e)
+		return cached.status, adopted, nil
+	}
+	ps, err := forge.FindActivePipeline(ctx, e.SourceBranch, e.CurrentSHA)
+	if err != nil {
+		return PipelineStatus{}, false, fmt.Errorf("find active recovery pipeline: %w", err)
+	}
+	if ps.Found {
+		p.recoveryPipelines[key] = recoveryPipeline{status: ps}
+		return ps, true, nil
+	}
+	ps, err = forge.CreateQueuePipeline(ctx, e.SourceBranch, e.MRIID)
+	if err != nil {
+		return PipelineStatus{}, false, fmt.Errorf("create recovery pipeline: %w", err)
+	}
+	p.recoveryPipelines[key] = recoveryPipeline{status: ps, minted: true, minter: recoveryMinterOf(e)}
+	return ps, false, nil
+}
+
+// recoveryPipeline is one exact-head recovery pipeline shared by every queue
+// entry on that head. minted records that the merge queue created it (as
+// opposed to adopting an active pipeline the forge already had) and minter
+// which entry did so, so that entry alone reports the "queue" lane.
+type recoveryPipeline struct {
+	status PipelineStatus
+	minted bool
+	minter recoveryMinter
+}
+
+// recoveryMinter identifies a queue entry by persisted values, so the same
+// entry re-read from the store on a later tick still matches.
+type recoveryMinter struct {
+	entryID int64
+	mrIID   int64
+}
+
+func recoveryMinterOf(e *store.MergeQueueEntry) recoveryMinter {
+	return recoveryMinter{entryID: e.ID, mrIID: e.MRIID}
+}
+
+func pipelineLane(e *store.MergeQueueEntry, proof PipelineProof) string {
+	if lane, _ := e.Detail[detailPipelineLane].(string); lane == "queue" {
+		return lane
+	}
+	return "adopted"
+}
+
+func (p *Processor) observePipelineTiming(ctx context.Context, forge Forge, e *store.MergeQueueEntry, pipelineID int64, lane string) {
+	if pipelineID <= 0 {
+		return
+	}
+	timing, err := forge.PipelineTiming(ctx, pipelineID)
+	if err != nil {
+		p.logger().Warn("merge queue: pipeline timing read failed", "pipeline_id", pipelineID, "mr", e.MRIID, "error", err)
+		return
+	}
+	if timing.Duration != nil {
+		mills.MergeQueuePipelineWallSeconds.WithLabelValues(lane).Observe(*timing.Duration)
+	}
+	if timing.QueuedDuration != nil {
+		mills.MergeQueuePipelineQueuedSeconds.WithLabelValues(lane).Observe(*timing.QueuedDuration)
+	}
+}
+
+// promoteToMergingWithProof advances an awaiting_pipeline head whose proof
+// turned terminal-green, recording which pipeline (and tree) proved it.
+func (p *Processor) promoteToMergingWithProof(ctx context.Context, e *store.MergeQueueEntry, proof PipelineProof) error {
+	detail := cloneDetail(e.Detail)
+	detail[detailPipelineURL] = proof.WebURL
+	detail[detailProofSource] = proof.Source
+	detail[detailProof] = map[string]any{"pipeline_id": proof.ID, "sha": proof.SHA, "tree": proof.Tree}
+	_, err := p.Store.MergeQueue.Transition(ctx, store.MergeQueueTransition{
+		ID: e.ID, From: store.MergeQueueAwaitingPipeline, To: store.MergeQueueMerging,
+		Detail: detail,
+	})
+	if err == nil {
+		ProofSourceTotal.WithLabelValues(proof.Source).Inc()
+		if proof.Source == "speculative" {
+			SpeculationTotal.WithLabelValues("hit").Inc()
+		}
+	}
+	return ignoreConflict(err)
+}
+
+// pipelineProgressing reports whether a pipeline status can still reach a
+// terminal verdict on its own (created / waiting_for_resource / preparing /
+// pending / running / scheduled). Terminal statuses and the dead-ends —
+// skipped, and manual (blocked on a human playing a job) — are not.
+func pipelineProgressing(status string) bool {
+	switch status {
+	case "success", "failed", "canceled", "skipped", "manual":
+		return false
+	default:
+		return true
+	}
 }
 
 // driveMerging performs the SHA-preconditioned merge through the client's
@@ -359,7 +705,8 @@ func (p *Processor) driveMerging(ctx context.Context, forge Forge, e *store.Merg
 		var headMoved *pipeline.MergeSourceSHAMismatchError
 		if errors.As(err, &headMoved) {
 			return p.evict(ctx, e, store.MergeQueueEvictHeadMoved,
-				fmt.Sprintf("head moved before merge: authorized %s, observed %s", shortSHA(headMoved.ReviewedSHA), shortSHA(headMoved.ObservedSHA)), nil)
+				fmt.Sprintf("head moved before merge: authorized %s, observed %s", shortSHA(headMoved.ReviewedSHA), shortSHA(headMoved.ObservedSHA)),
+				map[string]any{detailObservedSHA: headMoved.ObservedSHA})
 		}
 		return p.evict(ctx, e, store.MergeQueueEvictMergeFailed, err.Error(), nil)
 	}
@@ -376,10 +723,163 @@ func (p *Processor) settleMerged(ctx context.Context, e *store.MergeQueueEntry, 
 	MergedTotal.Inc()
 	if got != nil {
 		QueueWaitSeconds.Observe(p.now().Sub(got.EnqueuedAt).Seconds())
+		e.SettledAt = got.SettledAt
 	}
-	p.appendEvent(ctx, e, "mergequeue.merged", map[string]any{"merged_sha": mergedSHA})
+	p.cleanupSpeculation(ctx, e, false)
+	p.appendEvent(ctx, e, "mergequeue.merged", map[string]any{"merged_sha": mergedSHA, "proof": e.Detail[detailProof], "proof_source": e.Detail[detailProofSource]})
+	owners, err := p.correctEscalatedRunVerdicts(ctx, e, mergedSHA)
+	if err != nil {
+		return err
+	}
+	if isExternalCandidate(e) {
+		if err := p.settleExternalAdoption(ctx, e, owners, mergedSHA); err != nil {
+			return err
+		}
+	}
 	p.logger().Info("merge queue: merged", "run", e.PipelineRunID, "mr", e.MRIID, "project", e.Project, "sha", shortSHA(mergedSHA))
 	return nil
+}
+
+// RunVerdictKindMergeQueueSettled is the Trustworthy-Verdicts correction
+// source for MRs the queue lands AFTER their pipeline run escalated (a stage
+// wait that timed out, an eviction whose external re-enqueue merged, an
+// external candidate landing an escalated run's MR). It MUST stay equal to
+// mills.RunVerdictKindMergeQueueSettled — registered there in
+// RunVerdictCorrectionKinds so bulk discounting (storm rule, KPI writer,
+// guard reports) sees it; a sync test in pkg/mills pins the pair. Defined as
+// a literal here because pkg/mills imports this package.
+const RunVerdictKindMergeQueueSettled = "run.verdict.mergequeue_settled"
+
+// correctEscalatedRunVerdicts appends a first-writer verdict correction onto
+// every ESCALATED pipeline run that owns the just-merged MR in the entry's
+// project. The terminal run row is never mutated (verdict = supersede-chain
+// HEAD); consumers resolve the correction through the run.verdict.* contract.
+// Lookup and append failures leave the funnel conservative and defer backlog
+// closure; the settled-entry replay retries both on the next processor tick.
+func (p *Processor) correctEscalatedRunVerdicts(ctx context.Context, e *store.MergeQueueEntry, mergedSHA string) ([]*store.PipelineRun, error) {
+	if p.Store == nil || p.Store.Events == nil || p.Store.Pipeline == nil {
+		return nil, nil
+	}
+	runs, err := p.Store.Pipeline.ListByMRIID(ctx, e.MRIID)
+	if err != nil {
+		p.logger().Warn("merge queue: verdict correction lookup failed", "mr", e.MRIID, "error", err)
+		return nil, err
+	}
+	if isExternalCandidate(e) {
+		branchRuns, err := p.externalBranchOwners(ctx, e)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, branchRuns...)
+	}
+	seen := make(map[string]bool)
+	owners := make([]*store.PipelineRun, 0, len(runs))
+	for _, run := range runs {
+		if run == nil || run.State != store.PipelineEscalated || seen[run.ID] {
+			continue
+		}
+		// MR iids are per-project; a foreign run that merely shares the iid
+		// must not be corrected. AuthorizedProject resolves the run's durable
+		// stage provenance; unknown provenance skips fail-closed.
+		project, perr := p.Store.Pipeline.AuthorizedProject(ctx, run.ID)
+		if perr != nil || !store.SameRepo(project, e.Project) {
+			continue
+		}
+		seen[run.ID] = true
+		owners = append(owners, run)
+		appended, verr := p.Store.Events.AppendOnceBySubjectKind(ctx, &store.Event{
+			Actor:       eventActor,
+			Kind:        RunVerdictKindMergeQueueSettled,
+			SubjectKind: "pipeline_run",
+			SubjectID:   run.ID,
+			Payload: map[string]any{
+				"class":       "merged_after_escalation",
+				"prior_class": run.EscalationClass,
+				"outcome":     "merged",
+				"backlog_id":  run.BacklogID,
+				"mr_iid":      e.MRIID,
+				"project":     e.Project,
+				"merged_sha":  mergedSHA,
+			},
+		})
+		if verr != nil {
+			p.logger().Warn("merge queue: verdict correction append failed", "run", run.ID, "error", verr)
+			return owners, verr
+		}
+		if appended {
+			p.logger().Info("merge queue: superseded escalated run verdict", "run", run.ID, "mr", e.MRIID)
+		}
+	}
+	return owners, nil
+}
+
+// settleExternalAdoption closes each backlog item proven to own the external
+// candidate by MR or exact canonical branch, authorized against durable run
+// project provenance above.
+func (p *Processor) settleExternalAdoption(ctx context.Context, e *store.MergeQueueEntry, owners []*store.PipelineRun, mergedSHA string) error {
+	seen := make(map[string]struct{}, len(owners))
+	for _, run := range owners {
+		if run == nil || run.BacklogID == "" {
+			continue
+		}
+		if _, ok := seen[run.BacklogID]; ok {
+			continue
+		}
+		seen[run.BacklogID] = struct{}{}
+
+		item, err := p.Store.Backlog.Get(ctx, run.BacklogID)
+		if err != nil {
+			return fmt.Errorf("external mq adoption backlog %s: %w", run.BacklogID, err)
+		}
+		if item.State != store.BacklogEscalated {
+			continue
+		}
+		event := &store.Event{
+			Actor: eventActor, Kind: "backlog.settled",
+			SubjectKind: "backlog", SubjectID: item.ID,
+			Payload: map[string]any{
+				"reason": "external_mq_adoption", "backlog_id": item.ID,
+				"run_id": run.ID, "mr_iid": e.MRIID, "project": e.Project,
+				"merged_sha": mergedSHA,
+			},
+		}
+		_, inserted, err := p.Store.Backlog.TransitionStateWithEventOnce(
+			ctx, item.ID, item.ClaimVersion, item.State, store.BacklogMerged, event,
+		)
+		if err != nil {
+			return fmt.Errorf("external mq adoption settle %s: %w", item.ID, err)
+		}
+		if inserted {
+			p.logger().Info("merge queue: settled adopted backlog", "backlog", item.ID, "run", run.ID, "mr", e.MRIID)
+		}
+	}
+	return nil
+}
+
+// settleRecentExternalAdoptions is the restart-safe half of adoption: settled
+// queue rows remain durable after their active lane disappears, so each tick
+// can retry the idempotent backlog transition.
+func (p *Processor) settleRecentExternalAdoptions(ctx context.Context) {
+	entries, err := p.Store.MergeQueue.ListSettled(ctx, time.Time{}, 100)
+	if err != nil {
+		p.logger().Warn("merge queue: settled adoption sweep failed", "error", err)
+		return
+	}
+	for _, e := range entries {
+		if e != nil {
+			p.cleanupSpeculation(ctx, e, e.State == store.MergeQueueEvicted)
+		}
+		if e == nil || e.State != store.MergeQueueMerged || !isExternalCandidate(e) {
+			continue
+		}
+		owners, err := p.correctEscalatedRunVerdicts(ctx, e, e.MergedSHA)
+		if err == nil {
+			err = p.settleExternalAdoption(ctx, e, owners, e.MergedSHA)
+		}
+		if err != nil && ctx.Err() == nil {
+			p.logger().Warn("merge queue: external adoption replay failed", "mr", e.MRIID, "error", err)
+		}
+	}
 }
 
 // evict terminalizes the head with a distinct reason. The waiting merge stage
@@ -393,11 +893,65 @@ func (p *Processor) evict(ctx context.Context, e *store.MergeQueueEntry, reason,
 	if _, err := p.Store.MergeQueue.MarkEvicted(ctx, e.ID, reason, d); err != nil && !errors.Is(err, store.ErrMergeQueueConflict) {
 		return err
 	}
+	p.cleanupSpeculation(ctx, e, true)
 	EvictionsTotal.WithLabelValues(reason).Inc()
 	payload := map[string]any{"reason": reason, "detail": detail}
 	p.appendEvent(ctx, e, "mergequeue.evicted", payload)
 	p.logger().Warn("merge queue: evicted", "run", e.PipelineRunID, "mr", e.MRIID, "reason", reason, "detail", detail)
+	p.maybeRequeueEviction(ctx, e, reason, extra)
 	return nil
+}
+
+// evictionRequeueProducer marks candidates the eviction hop itself minted; an
+// eviction of such a candidate is final (one hop, ever).
+const evictionRequeueProducer = "mergequeue_evictor"
+
+// maybeRequeueEviction is the shepherd-A2 hop: a head_moved eviction carries
+// the observed successor and a ci_timeout eviction carries a head whose
+// pipeline never proved itself in the window — both re-enter ONCE as external
+// candidates, which merge only on a terminal successful pipeline for the head
+// (driveQueued routes external candidates through awaiting_pipeline). All
+// other reasons are genuine dead-ends and stay evicted.
+func (p *Processor) maybeRequeueEviction(ctx context.Context, e *store.MergeQueueEntry, reason string, extra map[string]any) {
+	if p.External == nil || p.RequeueEvictions == nil || !p.RequeueEvictions() {
+		return
+	}
+	if producer, _ := e.Detail["producer"].(string); producer == evictionRequeueProducer {
+		return // the hop's own candidate evicted again: final
+	}
+	sha := e.CurrentSHA
+	switch reason {
+	case store.MergeQueueEvictHeadMoved:
+		if observed, _ := extra[detailObservedSHA].(string); observed != "" {
+			sha = observed
+		}
+	case store.MergeQueueEvictCITimeout:
+		// same head, fresh awaiting_pipeline window
+	default:
+		return
+	}
+	if sha == "" {
+		return
+	}
+	res, err := p.External.Enqueue(ctx, ExternalCandidate{
+		Producer:       evictionRequeueProducer,
+		IdempotencyKey: fmt.Sprintf("%s:%d:%s", e.Project, e.MRIID, sha),
+		Project:        e.Project,
+		MRIID:          e.MRIID,
+		SourceBranch:   e.SourceBranch,
+		TargetBranch:   e.TargetBranch,
+		ObservedSHA:    sha,
+	})
+	if err != nil {
+		p.logger().Warn("merge queue: eviction requeue failed", "run", e.PipelineRunID, "mr", e.MRIID, "error", err)
+		return
+	}
+	EvictionRequeuesTotal.WithLabelValues(reason, res.Outcome).Inc()
+	p.appendEvent(ctx, e, "mergequeue.eviction_requeued", map[string]any{
+		"reason": reason, "sha": sha, "outcome": res.Outcome,
+	})
+	p.logger().Info("merge queue: eviction requeued as external candidate",
+		"run", e.PipelineRunID, "mr", e.MRIID, "reason", reason, "sha", shortSHA(sha), "outcome", res.Outcome)
 }
 
 // ----- ledger helpers (#374) -----

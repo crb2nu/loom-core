@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
@@ -51,11 +53,25 @@ func run(ctx context.Context) error {
 		logger.Warn("OTel tracer init failed", "error", err)
 	}
 	defer func() { _ = shutdownTracer(ctx) }()
-	tracer := mcpotel.Tracer(tp, "mcp-mentatlab")
 
-	srv, err := newMentatlabServerFromEnv()
+	server, err := newMentatlabMCPServer(logger, mcpotel.Tracer(tp, "mcp-mentatlab"))
 	if err != nil {
 		return err
+	}
+	return server.Run(ctx)
+}
+
+// newMentatlabMCPServer builds the MCP server without running it, so tests
+// can drive initialize, tools/list and tool calls in-process. A missing
+// MENTATLAB_BASE_URL is not fatal: the server starts degraded and every tool
+// call answers NotConfigured until it is set.
+func newMentatlabMCPServer(logger *slog.Logger, tracer trace.Tracer) (*mcp.Server, error) {
+	srv, err := newMentatlabServerFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if srv.baseURL == "" {
+		logger.Warn("MentatLab backend is not configured; tool calls return NotConfigured", "missing_env", "MENTATLAB_BASE_URL")
 	}
 
 	logger.Info("starting server", "name", "mcp-mentatlab", "version", version, "base_url", srv.baseURL)
@@ -69,14 +85,11 @@ func run(ctx context.Context) error {
 	registerFlowTools(server, srv, tracer)
 	registerDiagnosticTools(server, srv, tracer)
 
-	return server.Run(ctx)
+	return server, nil
 }
 
 func newMentatlabServerFromEnv() (*mentatlabServer, error) {
 	baseURL := strings.TrimSpace(env.StringWithFallbacks("MENTATLAB_BASE_URL", "ORCHESTRATOR_BASE_URL"))
-	if baseURL == "" {
-		return nil, mcperror.NotConfigured("MENTATLAB_BASE_URL", "set MENTATLAB_BASE_URL (or ORCHESTRATOR_BASE_URL) to the orchestrator API base URL")
-	}
 
 	timeoutSeconds := env.Int("MENTATLAB_TIMEOUT_SECONDS", 30)
 	if timeoutSeconds <= 0 {
@@ -105,6 +118,9 @@ func newMentatlabServerFromEnv() (*mentatlabServer, error) {
 }
 
 func (s *mentatlabServer) request(ctx context.Context, method, path string, query map[string]string, payload any, expectedStatuses ...int) (*mentatlabResponse, error) {
+	if s.baseURL == "" {
+		return nil, mcperror.NotConfigured("MENTATLAB_BASE_URL", "set MENTATLAB_BASE_URL (or ORCHESTRATOR_BASE_URL) to the orchestrator API base URL")
+	}
 	normalizedPath := strings.TrimSpace(path)
 	if normalizedPath == "" {
 		return nil, mcperror.InvalidParam("path", "must not be empty")

@@ -20,8 +20,9 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/launchctl"
 	"github.com/spf13/cobra"
+
+	"github.com/crb2nu/loom/pkg/launchctl"
 )
 
 const agentTokenSyncLabel = "com.loom.agent-token-sync"

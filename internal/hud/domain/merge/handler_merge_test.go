@@ -7,10 +7,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/crb2nu/loom/internal/hud/coordination"
-	"github.com/crb2nu/loom/internal/hud/mrwatch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/crb2nu/loom/internal/hud/coordination"
+	"github.com/crb2nu/loom/internal/hud/mrwatch"
 )
 
 type mockDeps struct {

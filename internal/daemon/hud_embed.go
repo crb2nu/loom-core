@@ -277,10 +277,10 @@ func buildEmbeddedHUDConfig(cfg EmbeddedHUDConfig, registryPath string) hud.Conf
 
 		// Inbound webhook intake (GitLab/GitHub CI failure routing).
 		// File config wins; envs are fallbacks for K8s secret injection.
-		// `WEBHOOK_INBOUND_ENABLED=true` flips the gate; secrets are HMAC
-		// verifiers, not bearer tokens, and are required when the
-		// originating system signs its requests (always on for GitLab,
-		// recommended for GitHub).
+		// `WEBHOOK_INBOUND_ENABLED=true` flips the gate and requires at
+		// least one secret — hud.NewApp fails (and daemon startup with
+		// it) when inbound is enabled with both secrets empty. A vendor
+		// endpoint whose secret is empty rejects all requests.
 		WebhookInboundEnabled: cfg.WebhookInboundEnabled || envBoolTrue(os.Getenv("WEBHOOK_INBOUND_ENABLED")),
 		WebhookGitLabSecret:   firstNonEmpty(cfg.WebhookGitLabSecret, os.Getenv("WEBHOOK_GITLAB_SECRET")),
 		WebhookGitHubSecret:   firstNonEmpty(cfg.WebhookGitHubSecret, os.Getenv("WEBHOOK_GITHUB_SECRET")),

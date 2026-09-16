@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -46,40 +45,7 @@ func (o *operator) handleRegressionsList(w http.ResponseWriter, r *http.Request)
 		}
 		window = d
 	}
-	if o.store == nil || o.store.Events == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "events store unavailable"})
-		return
-	}
-
-	since := time.Now().UTC().Add(-window)
-	// The sweep is the sole writer of this actor, so selecting on it uses the
-	// indexed window scan and the kind filter below is a cheap belt-and-braces
-	// guard against a future actor reuse.
-	events, err := o.store.Events.ListByActorSince(r.Context(), mills.RegressionAttributionActor, since, regressionsScanLimit)
-	if err != nil {
-		o.logger.Warn("regression list failed", "window", window.String(), "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	resp := regressionsResponse{
-		Window:      window.String(),
-		Since:       since,
-		Regressions: make([]regressionAttributionView, 0, len(events)),
-	}
-	for _, ev := range events {
-		if ev == nil || ev.Kind != mills.RegressionAttributedEventKind {
-			continue
-		}
-		resp.Regressions = append(resp.Regressions, regressionAttributionView{
-			RegressedMRIID: eventPayloadInt64(ev, "regressed_mr_iid"),
-			MergedSHA:      eventPayloadString(ev, "merged_sha"),
-			RevertSHA:      eventPayloadString(ev, "revert_sha"),
-			RevertTitle:    eventPayloadString(ev, "revert_title"),
-			AttributedAt:   ev.OccurredAt,
-		})
-	}
-	resp.Count = len(resp.Regressions)
-	writeJSON(w, http.StatusOK, resp)
+	o.writeReportRollup(w, r, "regressions", window, "")
 }
 
 func eventPayloadString(ev *store.Event, key string) string {

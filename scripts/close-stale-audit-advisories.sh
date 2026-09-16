@@ -9,8 +9,12 @@ List stale Mills audit-advisory digest issues. The default is a dry run; issue
 mutation requires --execute. In execute mode each issue receives the rollback
 label before it is closed.
 
+This is the canonical audit-advisory closer. Triage, execution, verification,
+and rollback procedure: docs/runbook-audit-advisory-bulk-close.md
+
 Options:
-  --project GROUP/PROJECT  GitLab project path (or CI_PROJECT_PATH)
+  --project GROUP/PROJECT  GitLab project path (or CI_PROJECT_PATH);
+                           --repo is accepted as an alias
   --author USERNAME        Exact digest author (default: producer contract)
   --stale-after DAYS       Select issues older than DAYS (default: 30)
   --execute                Apply the rollback label, then close each issue
@@ -24,7 +28,7 @@ stale_after=""
 execute=false
 while (($#)); do
   case "$1" in
-    --project) [[ $# -ge 2 ]] || { echo "error: --project needs a value" >&2; exit 2; }; project="$2"; shift 2 ;;
+    --project|--repo) [[ $# -ge 2 ]] || { echo "error: $1 needs a value" >&2; exit 2; }; project="$2"; shift 2 ;;
     --author) [[ $# -ge 2 ]] || { echo "error: --author needs a value" >&2; exit 2; }; author="$2"; shift 2 ;;
     --stale-after) [[ $# -ge 2 ]] || { echo "error: --stale-after needs a value" >&2; exit 2; }; stale_after="$2"; shift 2 ;;
     --execute) execute=true; shift ;;
@@ -63,8 +67,10 @@ author="${author:-$default_author}"
 stale_after="${stale_after:-$default_stale_after}"
 [[ "$stale_after" =~ ^[1-9][0-9]*$ ]] || { echo "error: --stale-after must be a positive integer" >&2; exit 2; }
 
-cutoff_epoch="$(date -u -d "$stale_after days ago" +%s)"
-cutoff="$(date -u -d "@$cutoff_epoch" +%FT%TZ)"
+# jq supplies the clock and the timestamp formatting so the script has no GNU
+# `date` dependency and runs on both macOS and Linux userlands.
+cutoff_epoch="$(jq -n --argjson days "$stale_after" 'now - ($days * 86400) | floor')"
+cutoff="$(jq -rn --argjson epoch "$cutoff_epoch" '$epoch | todate')"
 encoded_project="$(jq -rn --arg value "$project" '$value | @uri')"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -92,7 +98,8 @@ jq -c --arg author "$author" --arg label "$digest_label" --argjson cutoff "$cuto
   select((.iid | type) == "number" and .iid > 0) |
   select(.state == "opened" and .author.username == $author) |
   select(any(.labels[]?; . == $label)) |
-  select((.title | type) == "string" and startswith($tp) and endswith($ts)) |
+  select((.title | type) == "string") |
+  select(.title | startswith($tp) and endswith($ts)) |
   ($tp | length) as $pl | ($ts | length) as $sl |
   (.title[$pl:(.title | length)-$sl]) as $period |
   select($period | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) |

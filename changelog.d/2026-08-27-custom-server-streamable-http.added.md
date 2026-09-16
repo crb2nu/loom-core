@@ -1,0 +1,1 @@
+- Add the `MCP_HTTP_PATH` Streamable HTTP JSON endpoint (default `/mcp`) in `cmd/custom-server`, accepting MCP protocol versions `2024-11-05`, `2025-06-18`, and `2026-07-28` while preserving `/sse`, `/messages`, and `/ws`.

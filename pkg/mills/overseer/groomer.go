@@ -22,7 +22,11 @@ const (
 	actionCloseObsolete = "close_obsolete" // retire an LLM-judged-obsolete zombie
 	actionReprioritize  = "reprioritize"   // adjacent-bucket priority demotion
 	actionZombieFlag    = "zombie_flagged" // event-only staleness flag
-	groomerTickKind     = "overseer.groomer.tick"
+	// actionDedupScopeVeto is the event-only record of a merged-dedup retire
+	// blocked because the canonical's delivered files never touch the
+	// candidate's declared slice files (see groomEscalatedDuplicatesOfMerged).
+	actionDedupScopeVeto = "dedup_scope_veto"
+	groomerTickKind      = "overseer.groomer.tick"
 
 	groomerSubjectKind = "backlog_item"
 )
@@ -64,6 +68,11 @@ type Groomer struct {
 	Triage   *Triage
 	Recorder *ActionRecorder
 	Logger   *slog.Logger
+	// HomeProject resolves empty TargetProject values when the merged-dedup
+	// pass compares a candidate's declared file scope against a canonical's
+	// delivered files (store.MergedCanonicalCovers). Wired from the operator's
+	// GitLab project at the composition root, like Shepherd.HomeProject.
+	HomeProject string
 	// Now is used by tests; defaults to time.Now UTC.
 	Now func() time.Time
 }
@@ -127,12 +136,13 @@ func (g *Groomer) Tick(ctx context.Context) (TickResult, error) {
 	llm := &llmBudget{cap: gp.LLMCallCap(), down: !g.Triage.Available()}
 
 	retired := map[string]bool{}
+	siblingAudit := map[string]bool{}
 	if len(items) > 0 {
-		g.groomDuplicates(ctx, &res, items, gp, budget, llm, dryRun, retired)
+		g.groomDuplicates(ctx, &res, items, gp, budget, llm, dryRun, retired, siblingAudit)
 		g.groomZombies(ctx, &res, items, gp, budget, llm, dryRun, now, retired)
 		g.groomStalePriorities(ctx, &res, items, gp, budget, dryRun, now, retired)
 	}
-	g.groomEscalatedDuplicatesOfMerged(ctx, &res, gp, budget, llm, dryRun, retired)
+	g.groomEscalatedDuplicatesOfMerged(ctx, &res, gp, budget, llm, dryRun, retired, siblingAudit)
 	if res.Inspected == 0 {
 		// Nothing in either lane — stay silent rather than emitting an idle
 		// tick event every interval, matching the pre-existing behaviour when
@@ -165,7 +175,7 @@ func (g *Groomer) Tick(ctx context.Context) (TickResult, error) {
 func (g *Groomer) groomDuplicates(
 	ctx context.Context, res *TickResult, items []*store.BacklogItem,
 	gp mills.GroomerPolicy, budget *tickBudget, llm *llmBudget,
-	dryRun bool, retired map[string]bool,
+	dryRun bool, retired, siblingAudit map[string]bool,
 ) {
 	threshold := gp.DedupThreshold()
 	for i := 0; i < len(items); i++ {
@@ -174,11 +184,14 @@ func (g *Groomer) groomDuplicates(
 			if a == nil || b == nil || retired[a.ID] || retired[b.ID] {
 				continue
 			}
+			canonical, candidate := olderFirst(a, b)
+			if g.skipPlanSibling(ctx, res, canonical, candidate, dryRun, siblingAudit) {
+				continue
+			}
 			score := textsim.TitleJaccard(a.Title, b.Title)
 			if score < textsim.GrayBandFloor {
 				continue
 			}
-			canonical, candidate := olderFirst(a, b)
 			payload := map[string]any{
 				"canonical_id": canonical.ID, "canonical_title": canonical.Title,
 				"jaccard": score, "allowed": gp.Allow.DedupClose,
@@ -242,7 +255,7 @@ func (g *Groomer) groomDuplicates(
 func (g *Groomer) groomEscalatedDuplicatesOfMerged(
 	ctx context.Context, res *TickResult,
 	gp mills.GroomerPolicy, budget *tickBudget, llm *llmBudget,
-	dryRun bool, retired map[string]bool,
+	dryRun bool, retired, siblingAudit map[string]bool,
 ) {
 	escalated, err := g.Store.Backlog.ListByStateLimit(ctx, store.BacklogEscalated, groomerCandidateBatch)
 	if err != nil {
@@ -282,6 +295,9 @@ func (g *Groomer) groomEscalatedDuplicatesOfMerged(
 			if m == nil || m.ID == candidate.ID {
 				continue
 			}
+			if g.skipPlanSibling(ctx, res, m, candidate, dryRun, siblingAudit) {
+				continue
+			}
 			if score := textsim.TitleJaccard(candidate.Title, m.Title); score > best {
 				canonical, best = m, score
 			}
@@ -289,11 +305,46 @@ func (g *Groomer) groomEscalatedDuplicatesOfMerged(
 		if canonical == nil || best < textsim.GrayBandFloor {
 			continue
 		}
+		// Title similarity alone cannot tell "this work merged under the
+		// canonical" from "a sibling slice merged, this one never did" —
+		// slices of one plan family read near-identical (…-s-1 vs …-s-2;
+		// live witness: …spawn-state-pruning-with-hud-pressure-s-2 against
+		// bl-hud-spawn-state-pressure-prune-20260726, whose !1241 delivered
+		// only internal/spawn while the -2 HUD metrics never landed). When
+		// the candidate declares slice files, retiring additionally requires
+		// the canonical's delivered files (captured files_changed; declared
+		// slices as fallback) to actually touch them. The veto is recomputed
+		// every tick, so a later merge that genuinely covers the candidate
+		// still retires it; FlagOnce just keeps the audit to one event.
+		var delivered []string
+		if len(candidate.Slices) > 0 {
+			// Only worth fetching when the candidate declares files at all —
+			// a sliceless candidate is ScopeCoverageUnknown regardless.
+			delivered = g.mergedDeliveredFiles(ctx, canonical.ID)
+		}
+		coverage, scopeReason := store.MergedCanonicalCovers(candidate, canonical, delivered, g.HomeProject)
+		if coverage == store.ScopeCoverageDisjoint {
+			res.Skipped++
+			if _, ferr := g.Recorder.FlagOnce(ctx, actionDedupScopeVeto, groomerSubjectKind, candidate.ID, map[string]any{
+				"canonical_id": canonical.ID, "canonical_title": canonical.Title,
+				"jaccard": best, "reason": scopeReason,
+			}); ferr != nil {
+				res.Errored++
+				if g.Logger != nil {
+					g.Logger.Warn("groomer: scope-veto flag failed", "backlog", candidate.ID, "error", ferr)
+				}
+			}
+			continue
+		}
 		payload := map[string]any{
 			"canonical_id": canonical.ID, "canonical_title": canonical.Title,
 			"canonical_state": string(store.BacklogMerged),
 			"jaccard":         best, "allowed": gp.Allow.DedupClose,
-			"from_state": string(store.BacklogEscalated),
+			"from_state":     string(store.BacklogEscalated),
+			"scope_coverage": string(coverage),
+		}
+		if coverage == store.ScopeCoverageOverlap {
+			payload["scope_witness"] = scopeReason
 		}
 		if best >= threshold {
 			payload["basis"] = "deterministic_merged_canonical"
@@ -328,6 +379,118 @@ func (g *Groomer) groomEscalatedDuplicatesOfMerged(
 			res.Skipped++
 		}
 	}
+}
+
+// skipPlanSibling always excludes protected slices from deduplication. Audit
+// evidence retains the first relevant witness per candidate, like the scope
+// veto above; unrelated pairs and unchanged ticks must not inflate the ledger
+// or dry-run soak denominator. The veto itself is recomputed every time.
+func (g *Groomer) skipPlanSibling(ctx context.Context, res *TickResult, canonical, candidate *store.BacklogItem, dryRun bool, audited map[string]bool) bool {
+	reason := ""
+	if canonical.PlanID != "" && canonical.PlanID == candidate.PlanID {
+		reason = "same_plan_id"
+	} else {
+		sliceName := func(title string) string {
+			if i := strings.LastIndex(title, " — "); i >= 0 {
+				return strings.TrimSpace(title[i+len(" — "):])
+			}
+			return ""
+		}
+		a, b := sliceName(canonical.Title), sliceName(candidate.Title)
+		if a != "" && b != "" && a != b {
+			reason = "different_slice_names"
+		}
+	}
+	if reason == "" {
+		return false
+	}
+	res.Skipped++
+	if audited[candidate.ID] || textsim.TitleJaccard(canonical.Title, candidate.Title) < textsim.GrayBandFloor {
+		return true
+	}
+	// Bound even failed audit attempts to one per candidate per tick. The next
+	// tick retries failed flag writes; successful flags survive restart.
+	audited[candidate.ID] = true
+	inserted, err := g.Recorder.FlagOnce(ctx, "dedup_skipped.plan_sibling", groomerSubjectKind, candidate.ID,
+		map[string]any{
+			"canonical_id": canonical.ID, "canonical_title": canonical.Title,
+			"canonical_plan_id": canonical.PlanID, "candidate_plan_id": candidate.PlanID,
+			"candidate_title": candidate.Title, "reason": reason,
+			"dry_run": dryRun, "would_have_acted": false,
+		})
+	if err == nil && inserted && dryRun {
+		err = RecordDryRunDecision(ctx, g.Store, g.now(), false, false)
+	}
+	if err != nil {
+		res.Errored++
+		if g.Logger != nil {
+			g.Logger.Warn("groomer: plan-sibling skip recording failed", "backlog", candidate.ID, "error", err)
+		}
+	}
+	return true
+}
+
+// mergedDeliveredFiles unions the captured files_changed artifacts across a
+// backlog item's DONE pipeline runs — the authoritative record of what its
+// branch actually merged (capture = touched ∪ branch-diff). Escalated and
+// paused runs are excluded: their diffs never landed. Returns nil when the
+// pipeline DAO is absent or nothing was captured, which
+// store.MergedCanonicalCovers treats as "fall back to declared slices".
+func (g *Groomer) mergedDeliveredFiles(ctx context.Context, backlogID string) []string {
+	if g.Store == nil || g.Store.Pipeline == nil {
+		return nil
+	}
+	runs, err := g.Store.Pipeline.ListByBacklog(ctx, backlogID)
+	if err != nil {
+		if g.Logger != nil {
+			g.Logger.Warn("groomer: delivered-files run list failed", "backlog", backlogID, "error", err)
+		}
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, run := range runs {
+		if run == nil || run.State != store.PipelineDone {
+			continue
+		}
+		stages, err := g.Store.Pipeline.ListStages(ctx, run.ID)
+		if err != nil {
+			if g.Logger != nil {
+				g.Logger.Warn("groomer: delivered-files stage list failed", "run", run.ID, "error", err)
+			}
+			continue
+		}
+		for _, sr := range stages {
+			if sr == nil || sr.Outcome == nil || *sr.Outcome != store.StageOutcomeSuccess || sr.Artifacts == nil {
+				continue
+			}
+			for _, f := range artifactStrings(sr.Artifacts["files_changed"]) {
+				if _, dup := seen[f]; !dup {
+					seen[f] = struct{}{}
+					out = append(out, f)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// artifactStrings coerces a persisted JSON array artifact ([]any of string
+// after a DB round-trip, []string when written in-process) into strings.
+func artifactStrings(v any) []string {
+	switch vv := v.(type) {
+	case []string:
+		return vv
+	case []any:
+		out := make([]string, 0, len(vv))
+		for _, e := range vv {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // groomZombies flags queued items past the zombie age with zero pipeline

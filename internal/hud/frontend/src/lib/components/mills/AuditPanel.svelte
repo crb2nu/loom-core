@@ -231,6 +231,19 @@
   </header>
 
   <div class="audit-list">
+    <!-- Column names for the six-value rows below. The rows are buttons,
+         not table cells, so the header is presentational: each button
+         already reads its own values to assistive tech. -->
+    {#if entries.length > 0}
+      <div class="audit-head audit-cols" aria-hidden="true">
+        <span></span>
+        <span>subject</span>
+        <span>score</span>
+        <span>severity</span>
+        <span>cost</span>
+        <span>when</span>
+      </div>
+    {/if}
     {#each entries as entry (entry.ID)}
       {@const detail = details[entry.ID] ?? entry}
       <article
@@ -239,7 +252,7 @@
       >
         <button
           type="button"
-          class="audit-row-btn"
+          class="audit-row-btn audit-cols"
           onclick={() => toggle(entry.ID)}
           aria-expanded={expanded === entry.ID}
         >
@@ -458,7 +471,9 @@
   .audit-row.sev-info {
     border-left: 3px solid var(--success);
   }
-  .audit-row-btn {
+  /* One grid shared by the header strip and every row button, so the
+     column names can never drift from the values under them. */
+  .audit-cols {
     display: grid;
     /* Severity column widened from 4rem → 9rem so it can fit the
        severity pill AND the optional 'no-run' badge side-by-side
@@ -469,6 +484,16 @@
     grid-template-columns: 1.2rem minmax(0, 1.6fr) 4rem 9rem 5rem 1fr;
     align-items: center;
     gap: 0.6rem;
+  }
+  .audit-head {
+    padding: 0 0.75rem 0.15rem;
+    font-size: var(--text-2xs);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  .audit-row-btn {
     width: 100%;
     text-align: left;
     background: transparent;
@@ -688,6 +713,9 @@
      cost/time) overflows narrow viewports; fold to three explicit lines —
      subject·score, severity·cost, then the timestamp. */
   @media (max-width: 720px) {
+    /* Rows re-flow into a two-line card here, so the column strip no
+       longer describes them. */
+    .audit-head { display: none; }
     .audit-row-btn {
       grid-template-columns: 1.2rem minmax(0, 1fr) auto;
       row-gap: 0.25rem;

@@ -1,9 +1,10 @@
-// api_engrams.go exposes the engram tech-tree summary to the HUD.
+// api_engrams.go exposes the engram tech tree and its summary to the HUD.
 //
-// The summary endpoint is a thin aggregator over agent_engram_list — it
-// returns counts by proof_status and tier so the catalog view can render a
-// single-line "Engrams: N verified · M stale · K failing" badge without the
-// frontend having to walk the full library.
+// The summary endpoint is a rollup of the same full-catalog graph the graph
+// endpoint serves — the bridge shares one agent_engram_graph fetch between
+// them — and returns counts by proof_status and tier so the catalog view can
+// render a single-line "Engrams: N verified · M stale · K failing" badge
+// without the frontend having to walk the full library.
 package hud
 
 import (
@@ -55,6 +56,14 @@ func (a *App) handleEngramGraph(w http.ResponseWriter, r *http.Request) {
 //	  "by_tier":   {"tier:1": int, "tier:2": int, "tier:3": int},
 //	  "degraded":  <bool>
 //	}
+//
+// The counts are rolled up from the graph fetch that also serves
+// handleEngramGraph (bridge.AgentBridge.EngramGraph coalesces overlapping
+// callers and briefly memoizes the result), so the HUD's paired graph+summary
+// poll costs one upstream call and the tree and the strip describe the same
+// snapshot. The summary used to issue its own agent_engram_list call with the
+// same arguments as the catalog list — a second identical upstream request
+// per poll that carried nothing the graph did not.
 //
 // The agent bridge is required; if it is not configured (e.g. tests with a
 // minimal App), the endpoint returns an empty summary instead of erroring

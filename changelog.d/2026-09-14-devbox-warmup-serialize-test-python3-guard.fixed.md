@@ -1,0 +1,1 @@
+- devbox: `TestSharedGoCacheWarmupsSerialize` skips when python3 is absent, so the sandbox quality gate no longer fails `test:1` on bare main and every `./cmd/mcp-devbox` tests stage no longer escalates as infra.

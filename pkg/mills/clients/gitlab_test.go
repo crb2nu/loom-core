@@ -17,6 +17,7 @@ import (
 	"context"
 
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
+	"github.com/crb2nu/loom/pkg/mills/webhookbus"
 )
 
 // recordingTransport captures every request the client makes and serves
@@ -48,6 +49,7 @@ func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if req.Body != nil {
 		buf, _ := io.ReadAll(req.Body)
 		body = string(buf)
+		req.Body = io.NopCloser(bytes.NewReader(buf))
 	}
 	// Use RawPath when the URL contains percent-encoded segments
 	// (Go's URL.Path decodes %2F → /, which loses information GitLab
@@ -110,11 +112,73 @@ func newGitLabStub(t *testing.T, routes map[string]func(*http.Request) (int, any
 	return cli, rt
 }
 
+func TestGitLabLatestPipelineForRefSelectsNewestAndLoadsFailedJobs(t *testing.T) {
+	client, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/pipelines/91/jobs": func(*http.Request) (int, any) {
+			return http.StatusOK, []pipelineJob{{ID: 7, Name: "test:unit", Status: "failed", FailureReason: "script_failure"}}
+		},
+		"GET /api/v4/projects/services%2Floom-core/jobs/7/trace": func(*http.Request) (int, any) {
+			return http.StatusOK, "FAIL package at /tmp/build/a.go after 1.2s: connection refused"
+		},
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(req *http.Request) (int, any) {
+			if req.URL.Query().Get("ref") != "main" || req.URL.Query().Get("per_page") != "1" {
+				t.Fatalf("unexpected query: %s", req.URL.RawQuery)
+			}
+			return http.StatusOK, []shaPipeline{{ID: 91, Ref: "main", Status: "failed", WebURL: "https://gitlab.example/pipelines/91"}}
+		},
+	})
+	got, err := client.LatestPipelineForRef(context.Background(), "main")
+	if err != nil {
+		t.Fatalf("LatestPipelineForRef: %v", err)
+	}
+	if got.Status != "failed" || got.URL == "" || len(got.FailedJobs) != 1 || got.FailedJobs[0].Trace == "" {
+		t.Fatalf("result=%+v", got)
+	}
+}
+
 const (
 	testGitLabProject = "services/loom-core"
 	testSourceBranch  = "feat/test"
 	testTargetBranch  = "main"
 )
+
+func TestGitLabClient_BranchHeadSHA(t *testing.T) {
+	const sha = "2222222222222222222222222222222222222222"
+	client, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/libs%2Ftarget/repository/branches/feat%2Fbranch": func(_ *http.Request) (int, any) {
+			return http.StatusOK, map[string]any{"commit": map[string]any{"id": sha}}
+		},
+	})
+	got, err := client.BranchHeadSHA(context.Background(), "libs/target", "feat/branch")
+	if err != nil || got != sha {
+		t.Fatalf("BranchHeadSHA() = %q, %v", got, err)
+	}
+	if len(rt.requests) != 1 || rt.requests[0].Path != "/api/v4/projects/libs%2Ftarget/repository/branches/feat%2Fbranch" {
+		t.Fatalf("requests = %#v", rt.requests)
+	}
+}
+
+func TestGitLabClient_BranchHeadSHAErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		payload any
+		want    string
+	}{
+		{name: "api", status: http.StatusForbidden, payload: map[string]any{"message": "forbidden"}, want: "status 403"},
+		{name: "missing commit id", status: http.StatusOK, payload: map[string]any{"commit": map[string]any{}}, want: "missing commit.id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+				"GET /api/v4/projects/services%2Floom-core/repository/branches/feat%2Fbranch": func(_ *http.Request) (int, any) { return tc.status, tc.payload },
+			})
+			_, err := client.BranchHeadSHA(context.Background(), "", "feat/branch")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
 
 func testPollRequest(iid int64, sourceBranch string) pipeline.PollPipelineRequest {
 	return pipeline.PollPipelineRequest{
@@ -515,6 +579,69 @@ func TestPollPipeline_TerminatesOnSuccess(t *testing.T) {
 	}
 }
 
+func TestPollPipeline_WebhookHintInterruptsFallbackWait(t *testing.T) {
+	var pollCount int32
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/42": func(_ *http.Request) (int, any) {
+			return 200, mrResponse{IID: 42, SHA: "abc123", SourceBranch: "feat/pipeline-auth", TargetBranch: testTargetBranch}
+		},
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(_ *http.Request) (int, any) {
+			n := atomic.AddInt32(&pollCount, 1)
+			status := "running"
+			if n >= 2 {
+				status = "success"
+			}
+			return 200, []map[string]any{{"id": 1234, "sha": "abc123", "ref": "feat/pipeline-auth", "status": status, "source": "push"}}
+		},
+	})
+	cli.cfg.PollInterval = time.Hour
+	wake := make(chan webhookbus.Event, 1)
+	req := testPollRequest(42, "feat/pipeline-auth")
+	req.Wake = wake
+	req.FallbackInterval = time.Hour
+	done := make(chan error, 1)
+	go func() { _, err := cli.PollPipeline(context.Background(), req); done <- err }()
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadInt32(&pollCount) < 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	wake <- webhookbus.Event{Project: testGitLabProject, SHA: "abc123"}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("webhook hint did not trigger immediate authoritative re-check")
+	}
+}
+
+func TestPollPipeline_WebhookSubscriptionRetainsFallbackPoll(t *testing.T) {
+	var pollCount int32
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/42": func(_ *http.Request) (int, any) {
+			return 200, mrResponse{IID: 42, SHA: "abc123", SourceBranch: "feat/pipeline-auth", TargetBranch: testTargetBranch}
+		},
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(_ *http.Request) (int, any) {
+			n := atomic.AddInt32(&pollCount, 1)
+			status := "running"
+			if n >= 2 {
+				status = "success"
+			}
+			return 200, []map[string]any{{"id": 1, "sha": "abc123", "ref": "feat/pipeline-auth", "status": status, "source": "push"}}
+		},
+	})
+	req := testPollRequest(42, "feat/pipeline-auth")
+	req.Wake = make(chan webhookbus.Event)
+	req.FallbackInterval = 5 * time.Millisecond
+	if _, err := cli.PollPipeline(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&pollCount); got != 2 {
+		t.Fatalf("polls=%d want 2", got)
+	}
+}
+
 func TestPollPipeline_FailedTerminal(t *testing.T) {
 	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
 		"GET /api/v4/projects/services%2Floom-core/merge_requests/77": func(_ *http.Request) (int, any) {
@@ -604,29 +731,87 @@ func TestFailedJobReasons_PaginatesCompleteResult(t *testing.T) {
 	}
 }
 
-// TestPollPipeline_IgnoresMergeRequestEventPlaceholder is the core regression
-// guard for the autonomous-merge blocker: when ONLY the spurious
-// merge_request_event pipeline exists for the SHA, the poll must NOT report it
-// as a terminal `failed` — it keeps waiting for the branch pipeline (here it
-// never appears, so it times out rather than falsely failing).
-func TestPollPipeline_IgnoresMergeRequestEventPlaceholder(t *testing.T) {
+func TestPollPipeline_AdoptsMergeRequestEventPipeline(t *testing.T) {
 	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
 		"GET /api/v4/projects/services%2Floom-core/merge_requests/88": func(_ *http.Request) (int, any) {
-			return 200, mrResponse{IID: 88, SHA: "cafef00d", SourceBranch: "feat/placeholder", TargetBranch: testTargetBranch}
+			return 200, mrResponse{IID: 88, SHA: "cafef00d", SourceBranch: "feat/mr-only", TargetBranch: testTargetBranch}
 		},
-		"GET /api/v4/projects/services%2Floom-core/pipelines": func(_ *http.Request) (int, any) {
-			// source=push excludes the project-wide merge_request_event placeholder.
-			return 200, []map[string]any{}
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(r *http.Request) (int, any) {
+			if r.URL.Query().Get("source") == "push" {
+				return 200, []shaPipeline{}
+			}
+			return 200, []shaPipeline{{ID: 8801, SHA: "cafef00d", Ref: "refs/merge-requests/88/head", Source: "merge_request_event", Status: "success", WebURL: "https://gitlab.example/pipelines/8801"}}
 		},
 	})
-	cli.cfg.PollDeadline = 50 * time.Millisecond
-	cli.cfg.PollInterval = 10 * time.Millisecond
-	resp, err := cli.PollPipeline(context.Background(), testPollRequest(88, "feat/placeholder"))
-	if err == nil {
-		t.Error("expected timeout, not a terminal failed from the placeholder")
+	cli.cfg.BranchPipelineDeadline = time.Hour
+	resp, err := cli.PollPipeline(context.Background(), testPollRequest(88, "feat/mr-only"))
+	if err != nil {
+		t.Fatalf("poll MR pipeline: %v", err)
 	}
-	if resp.Status != "timeout" {
-		t.Errorf("status = %q, want timeout", resp.Status)
+	if resp.Status != "success" || !strings.Contains(resp.LogTail, "(merge_request_event)") {
+		t.Fatalf("response = %+v, want successful MR-event pipeline", resp)
+	}
+}
+
+func TestPollPipeline_ReattachesExactPipelineIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, ref, source, sha string
+		id                     int64
+		wantStale              bool
+	}{
+		{"branch", "feat/mr-only", "push", "cafef00d", 8801, false},
+		{"detached", "refs/merge-requests/88/head", "merge_request_event", "cafef00d", 8801, false},
+		{"another MR", "refs/merge-requests/89/head", "merge_request_event", "cafef00d", 8801, true},
+		{"wrong source", "refs/merge-requests/88/head", "push", "cafef00d", 8801, true},
+		{"moved head", "feat/mr-only", "push", "new-head", 8801, true},
+		{"wrong ID", "feat/mr-only", "push", "cafef00d", 8802, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli, transport := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+				"GET /api/v4/projects/services%2Floom-core/merge_requests/88": func(*http.Request) (int, any) {
+					return 200, mrResponse{IID: 88, SHA: "cafef00d", SourceBranch: "feat/mr-only", TargetBranch: testTargetBranch}
+				},
+				"GET /api/v4/projects/services%2Floom-core/pipelines/8801": func(*http.Request) (int, any) {
+					return 200, shaPipeline{ID: tc.id, SHA: tc.sha, Ref: tc.ref, Source: tc.source, Status: "success"}
+				},
+			})
+			req := testPollRequest(88, "feat/mr-only")
+			req.PipelineID = 8801
+			resp, err := cli.PollPipeline(context.Background(), req)
+			if tc.wantStale {
+				if !errors.Is(err, pipeline.ErrMergeAuthorizationStale) {
+					t.Fatalf("error = %v, want stale identity", err)
+				}
+			} else if err != nil || resp.PipelineID != 8801 || resp.Status != "success" || resp.PipelineObservedAt.IsZero() {
+				t.Fatalf("reattach = (%+v, %v), want exact pipeline success with observation time", resp, err)
+			}
+			for _, request := range transport.requests {
+				if strings.HasSuffix(request.Path, "/pipelines") {
+					t.Fatal("reattachment selected a pipeline from the branch list")
+				}
+			}
+		})
+	}
+}
+
+func TestPollPipeline_PrefersPushOverMergeRequestEvent(t *testing.T) {
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/89": func(_ *http.Request) (int, any) {
+			return 200, mrResponse{IID: 89, SHA: "cafef00d", SourceBranch: "feat/both", TargetBranch: testTargetBranch}
+		},
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(r *http.Request) (int, any) {
+			if r.URL.Query().Get("source") == "push" {
+				return 200, []shaPipeline{{ID: 8902, SHA: "cafef00d", Ref: "feat/both", Source: "push", Status: "success", WebURL: "https://gitlab.example/pipelines/8902"}}
+			}
+			return 200, []shaPipeline{{ID: 8901, SHA: "cafef00d", Ref: "refs/merge-requests/89/head", Source: "merge_request_event", Status: "failed"}}
+		},
+	})
+	resp, err := cli.PollPipeline(context.Background(), testPollRequest(89, "feat/both"))
+	if err != nil {
+		t.Fatalf("poll push pipeline: %v", err)
+	}
+	if resp.PipelineURL != "https://gitlab.example/pipelines/8902" || !strings.Contains(resp.LogTail, "(push)") {
+		t.Fatalf("response = %+v, want push pipeline", resp)
 	}
 }
 
@@ -812,7 +997,7 @@ func TestNewGitLabClientClampsHeadSHADeadline(t *testing.T) {
 // TestPollPipeline_BranchPipelineUnavailableAfterBoundedWait is the round-2 twin
 // of the head-SHA wedge: the MR HAS a head, but no push pipeline ever appears
 // for it (workflow rules that admit only merge_request_event, CI disabled, a
-// deleted pipeline). That used to log "branch pipeline pending" until the poll
+// deleted pipelines). That used to log "branch pipeline pending" until the poll
 // deadline and return the generic ErrPipelinePollTimeout, which ci_watch reads
 // as "still running" — so it burned both watch extensions and escalated a
 // pipeline that never existed. It must now fail on its own bounded deadline
@@ -828,16 +1013,10 @@ func TestPollPipeline_BranchPipelineUnavailableAfterBoundedWait(t *testing.T) {
 			}
 		},
 		"GET /api/v4/projects/services%2Floom-core/pipelines": func(r *http.Request) (int, any) {
-			// The bounded poll filters source=push and finds nothing. The single
-			// unfiltered diagnostic lookup on the failure path finds the
-			// merge_request_event pipeline that explains why.
 			if r.URL.Query().Get("source") == "push" {
 				pushLookups++
-				return 200, []map[string]any{}
 			}
-			return 200, []map[string]any{
-				{"id": 9, "sha": "cafef00dcafef00d", "ref": "feat/no-push-pipeline", "status": "success", "source": "merge_request_event"},
-			}
+			return 200, []map[string]any{}
 		},
 	})
 	cli.cfg.PollDeadline = 10 * time.Second
@@ -854,8 +1033,8 @@ func TestPollPipeline_BranchPipelineUnavailableAfterBoundedWait(t *testing.T) {
 	if errors.Is(err, pipeline.ErrPipelinePollTimeout) {
 		t.Fatal("a head with no push pipeline must not be laundered into the retryable poll-timeout class")
 	}
-	if !strings.Contains(err.Error(), "merge_request_event") {
-		t.Errorf("error should name the pipelines that DO exist for the sha, got %q", err)
+	if !strings.Contains(err.Error(), "pipelines for this sha: none") {
+		t.Errorf("error should report that no pipelines exist for the sha, got %q", err)
 	}
 	if !strings.Contains(err.Error(), "merge_requests/91") {
 		t.Errorf("error should name the MR url, got %q", err)
@@ -1765,6 +1944,110 @@ func TestMerge_RetriesNotMergeableYet405(t *testing.T) {
 	}
 }
 
+// TestMerge_Draft405IncidentSelfRemediates reproduces the !1583 shape: green
+// CI authorized the exact head, but the owned rescue MR was still a draft.
+func TestMerge_Draft405IncidentSelfRemediates(t *testing.T) {
+	draft := true
+	updates := 0
+	mergeCalls := 0
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/1583": func(_ *http.Request) (int, any) {
+			mr := openedMR(1583, "tested-head")
+			if draft {
+				mr.Title = "Draft: feat: migrate embedder"
+			} else {
+				mr.Title = "feat: migrate embedder"
+			}
+			mr.Draft = draft
+			mr.MergeStatus = "can_be_merged"
+			return 200, mr
+		},
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/1583": func(req *http.Request) (int, any) {
+			updates++
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read un-draft body: %v", err)
+			}
+			if !strings.Contains(string(body), `"title":"feat: migrate embedder"`) {
+				t.Fatalf("un-draft body = %s", body)
+			}
+			draft = false
+			return 200, map[string]any{}
+		},
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/1583/merge": func(_ *http.Request) (int, any) {
+			mergeCalls++
+			return 200, mergedMR(1583, "tested-head", "merged-head")
+		},
+	})
+	resp, err := cli.Merge(context.Background(), testMergeArgs(1583, "tested-head"))
+	if err != nil {
+		t.Fatalf("draft rescue merge: %v", err)
+	}
+	if updates != 1 || mergeCalls != 1 || resp.MergedSHA != "merged-head" {
+		t.Fatalf("updates=%d mergeCalls=%d response=%+v", updates, mergeCalls, resp)
+	}
+	if got := strings.Join(resp.Remediations, "\n"); !strings.Contains(got, "un-drafted owned MR !1583") {
+		t.Fatalf("remediation audit = %q", got)
+	}
+}
+
+func TestMerge_CheckingAnd409UseBoundedRetries(t *testing.T) {
+	gets := 0
+	puts := 0
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/91": func(_ *http.Request) (int, any) {
+			gets++
+			mr := openedMR(91, "tested-head")
+			if gets == 1 {
+				// The legacy summary can lag while the detailed status is checking.
+				mr.MergeStatus = "cannot_be_merged"
+				mr.DetailedMergeStatus = "checking"
+			} else {
+				mr.MergeStatus = "can_be_merged"
+			}
+			return 200, mr
+		},
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/91/merge": func(_ *http.Request) (int, any) {
+			puts++
+			if puts == 1 {
+				return http.StatusConflict, map[string]any{"message": "mergeability is being checked"}
+			}
+			return 200, mergedMR(91, "tested-head", "merged-head")
+		},
+	})
+	cli.cfg.PollInterval = time.Millisecond
+	resp, err := cli.Merge(context.Background(), testMergeArgs(91, "tested-head"))
+	if err != nil {
+		t.Fatalf("recover checking/409: %v", err)
+	}
+	audit := strings.Join(resp.Remediations, "\n")
+	if puts != 2 || !strings.Contains(audit, "merge_status=checking") || !strings.Contains(audit, "HTTP 409") {
+		t.Fatalf("puts=%d audit=%q", puts, audit)
+	}
+}
+
+func TestMerge_UnrecoverableConflictNamesStateWithoutPUT(t *testing.T) {
+	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/92": func(_ *http.Request) (int, any) {
+			mr := openedMR(92, "tested-head")
+			mr.HasConflicts = true
+			mr.MergeStatus = "cannot_be_merged"
+			mr.DetailedMergeStatus = "conflict"
+			return 200, mr
+		},
+	})
+	_, err := cli.Merge(context.Background(), testMergeArgs(92, "tested-head"))
+	if err == nil || !strings.Contains(err.Error(), "has_conflicts=true") ||
+		!strings.Contains(err.Error(), "merge_status=cannot_be_merged") || !strings.Contains(err.Error(), "detailed_merge_status=conflict") {
+		t.Fatalf("named conflict error = %v", err)
+	}
+	for _, req := range rt.requests {
+		if req.Method == http.MethodPut {
+			t.Fatalf("unrecoverable conflict issued PUT: %+v", req)
+		}
+	}
+}
+
 // GitLab can also return 422 "Branch cannot be merged" during the same short
 // mergeability-settling window. Live Mills runs !1037 and !1044 reached green
 // CI, hit this response once, and were incorrectly escalated.
@@ -1877,8 +2160,8 @@ func TestMerge_Alternating405And422UsesOneBoundedBudget(t *testing.T) {
 	}
 }
 
-// TestMerge_NonRetryableErrorReturnsImmediately verifies a non-405 error
-// (e.g. 409 conflict) is NOT swallowed by the merge-readiness poll.
+// TestMerge_NonRetryableErrorReturnsImmediately verifies that a 409 backed by
+// an explicitly conflicted MR is not swallowed by the merge-readiness poll.
 func TestMerge_NonRetryableErrorReturnsImmediately(t *testing.T) {
 	calls := 0
 	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
@@ -1887,14 +2170,18 @@ func TestMerge_NonRetryableErrorReturnsImmediately(t *testing.T) {
 			return 409, map[string]any{"message": "409 Conflict"}
 		},
 		"GET /api/v4/projects/services%2Floom-core/merge_requests/8": func(_ *http.Request) (int, any) {
-			return 200, openedMR(8, "tested-head")
+			mr := openedMR(8, "tested-head")
+			mr.HasConflicts = true
+			mr.MergeStatus = "cannot_be_merged"
+			mr.DetailedMergeStatus = "conflict"
+			return 200, mr
 		},
 	})
 	if _, err := cli.Merge(context.Background(), testMergeArgs(8, "tested-head")); err == nil {
 		t.Error("expected 409 conflict to return an error")
 	}
-	if calls != 1 {
-		t.Errorf("non-405 error should not retry; got %d attempts", calls)
+	if calls != 0 {
+		t.Errorf("conflicted MR should be rejected before merge PUT; got %d attempts", calls)
 	}
 }
 
@@ -2053,6 +2340,71 @@ func TestMerge_RecoversDetachedHeadWithSameSHASuperseder(t *testing.T) {
 	}
 	if createdRef != "feat/safe-recovery" {
 		t.Fatalf("superseding ref = %q, want feat/safe-recovery", createdRef)
+	}
+}
+
+func TestPrepareMergeNotReadyAdoptsExistingActivePipelineBeforeCreate(t *testing.T) {
+	postCalls := 0
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(req *http.Request) (int, any) {
+			if strings.HasSuffix(req.URL.Path, "/pipelines/9002") {
+				return 200, shaPipeline{ID: 9002, SHA: "feedface", Ref: "feat/adopt", Status: "success", Source: "api"}
+			}
+			if req.URL.Query().Get("source") == "api" {
+				return 200, []shaPipeline{{ID: 9002, SHA: "feedface", Ref: "feat/adopt", Status: "pending", Source: "api", WebURL: "https://gl/9002"}}
+			}
+			return 200, []shaPipeline{}
+		},
+		"POST /api/v4/projects/services%2Floom-core/pipeline": func(*http.Request) (int, any) {
+			postCalls++
+			return 500, map[string]any{"message": "must not create"}
+		},
+	})
+	mr := mrResponse{IID: 9, State: "opened", SHA: "feedface", SourceBranch: "feat/adopt", TargetBranch: testTargetBranch, HeadPipeline: mrHeadPipe{ID: 9001, Status: "failed", Source: "merge_request_event"}}
+	auth, err := cli.mergeAuthorization(testMergeArgs(9, "feedface", "feat/adopt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled, err := cli.prepareMergeNotReady(context.Background(), mr, auth, false, time.Now().Add(time.Second))
+	if err != nil || !handled {
+		t.Fatalf("adopt active pipeline = %v, %v; want handled", handled, err)
+	}
+	if postCalls != 0 {
+		t.Fatalf("pipeline create POSTs = %d, want 0", postCalls)
+	}
+}
+
+func TestMerge_GreenMergeRequestEventPipelineNeedsNoSuperseder(t *testing.T) {
+	mergeCalls := 0
+	createCalls := 0
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/merge_requests/10": func(_ *http.Request) (int, any) {
+			return 200, mrResponse{IID: 10, State: "opened", SHA: "feedface", SourceBranch: "feat/mr-only", TargetBranch: testTargetBranch, HeadPipeline: mrHeadPipe{ID: 1001, Status: "success", Source: "merge_request_event"}}
+		},
+		"PUT /api/v4/projects/services%2Floom-core/merge_requests/10/merge": func(_ *http.Request) (int, any) {
+			mergeCalls++
+			if mergeCalls == 1 {
+				return 405, map[string]any{"message": "405 Method Not Allowed"}
+			}
+			return 200, mergedMR(10, "feedface", "merged-feedface", "feat/mr-only")
+		},
+		"GET /api/v4/projects/services%2Floom-core/pipelines": func(r *http.Request) (int, any) {
+			if r.URL.Query().Get("ref") != "refs/merge-requests/10/head" || r.URL.Query().Get("source") != "merge_request_event" {
+				t.Fatalf("unexpected pipeline lookup: %s", r.URL.RawQuery)
+			}
+			return 200, []shaPipeline{{ID: 1001, SHA: "feedface", Ref: "refs/merge-requests/10/head", Status: "success", Source: "merge_request_event"}}
+		},
+		"POST /api/v4/projects/services%2Floom-core/pipeline": func(_ *http.Request) (int, any) {
+			createCalls++
+			return 500, map[string]any{"message": "must not create"}
+		},
+	})
+	resp, err := cli.Merge(context.Background(), testMergeArgs(10, "feedface", "feat/mr-only"))
+	if err != nil || resp.MergedSHA != "merged-feedface" {
+		t.Fatalf("merge = %+v, %v", resp, err)
+	}
+	if mergeCalls != 2 || createCalls != 0 {
+		t.Fatalf("merge/create calls = %d/%d, want 2/0", mergeCalls, createCalls)
 	}
 }
 
@@ -2987,6 +3339,42 @@ func TestListIssues_PropagatesServerError(t *testing.T) {
 	}
 }
 
+func TestListAllIssues_PaginatesAndDecodesAuthor(t *testing.T) {
+	cli, rt := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/issues": func(req *http.Request) (int, any) {
+			if got := req.URL.Query().Get("per_page"); got != "100" {
+				return 400, map[string]string{"message": "wrong per_page: " + got}
+			}
+			switch req.URL.Query().Get("page") {
+			case "1":
+				items := make([]IssueListItem, 100)
+				for i := range items {
+					items[i].IID = int64(i + 1)
+				}
+				return 200, items
+			case "2":
+				return 200, []map[string]any{{"iid": 101, "author": map[string]any{"username": "mills-bot"}}}
+			default:
+				return 400, map[string]string{"message": "unexpected page"}
+			}
+		},
+	})
+
+	got, err := cli.ListAllIssues(context.Background(), ListIssuesOpts{State: "opened"})
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(got) != 101 {
+		t.Fatalf("issue count = %d, want 101", len(got))
+	}
+	if got[100].IID != 101 || got[100].Author.Username != "mills-bot" {
+		t.Fatalf("unexpected final issue: %+v", got[100])
+	}
+	if len(rt.requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(rt.requests))
+	}
+}
+
 // ----- FindOpenEscalation / CommentIssue (DEBT-073 #167 escalation dedup) -----
 
 func TestFindOpenEscalation_MatchesMarker(t *testing.T) {
@@ -3170,6 +3558,37 @@ func TestCommentIssue_PostsNote(t *testing.T) {
 	}
 	if body.Body != "recurred again" {
 		t.Errorf("note body = %q", body.Body)
+	}
+}
+
+func TestFindPreviousOpenAuditDigest_ExcludesCurrent(t *testing.T) {
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/issues": func(_ *http.Request) (int, any) {
+			return 200, []IssueListItem{
+				{IID: 9, Description: pipeline.AuditDigestMarker("2026-09-08")},
+				{IID: 8, Description: pipeline.AuditDigestMarker("2026-09-07")},
+			}
+		},
+	})
+	iid, found, err := cli.FindPreviousOpenAuditDigest(context.Background(), "2026-09-08")
+	if err != nil || !found || iid != 8 {
+		t.Fatalf("iid=%d found=%v err=%v", iid, found, err)
+	}
+}
+
+func TestIssueHasComment_ExactMatch(t *testing.T) {
+	cli, _ := newGitLabStub(t, map[string]func(*http.Request) (int, any){
+		"GET /api/v4/projects/services%2Floom-core/issues/8/notes": func(_ *http.Request) (int, any) {
+			return 200, []map[string]string{{"body": "superseded by #9"}, {"body": "other"}}
+		},
+	})
+	found, err := cli.IssueHasComment(context.Background(), 8, "superseded by #9")
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	found, err = cli.IssueHasComment(context.Background(), 8, "superseded by #99")
+	if err != nil || found {
+		t.Fatalf("exact match found=%v err=%v", found, err)
 	}
 }
 

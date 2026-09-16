@@ -38,21 +38,36 @@ spec:
               value: agent_context_v1
             - name: AGENT_CONTEXT_SESSIONS_COLLECTION
               value: agent_sessions_v1
-            # Embeddings (Morph API)
-            - name: MORPH_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  key: MORPH_API_KEY
-                  name: loom-secrets
-            - name: MORPH_BASE_URL
-              value: https://api.morphllm.com/v1
-            - name: MORPH_EMBED_MODEL
-              value: morph-embedding-v3
+            # Embeddings: intentionally unset. The MORPH_* trio that used to sit
+            # here pointed at the retired Morph endpoint and sat ahead of the
+            # FlexInfer defaults in pkg/agentcontext/config.go's env chain, so
+            # every embed asked flexinfer-proxy for "morph-embedding-v3" (404)
+            # and fell back to keyword search (2026-09-05: ~5,000 failures in
+            # 6h). With nothing set the chain lands on
+            # pkg/flexinfer.DefaultEmbedBaseURL + DefaultEmbedModel
+            # (flexinfer-proxy, embeddings-1536, dim 1536).
             # Auto-summarization settings
             - name: AGENT_CONTEXT_AUTO_SUMMARIZE
               value: "true"
             - name: AGENT_CONTEXT_DEFAULT_TOKEN_BUDGET
               value: "4000"
+            # Recall reranker (2026-09-13, flexinfer utilization slice 2). Was
+            # "off" in every manifest while the bge-reranker-radeonvii lane sat
+            # Ready on the retrieval card; the proxy's /v1/rerank answered a
+            # 3-document probe in 0.96 s. Kind "bge" pins bge-reranker-v2-m3 by
+            # default, which is not a proxy alias — the lane's aliases are
+            # rerank / bge-reranker / rerank-radeonvii — so the model is set
+            # explicitly. Base URL must be the keyless flexinfer proxy: with
+            # nothing set the client falls back to FLEXINFER_URL (unset here)
+            # and then http://localhost:8080. Rollback = WEAVER_RERANKER=off.
+            - name: WEAVER_RERANKER
+              value: "bge"
+            - name: WEAVER_RERANKER_MODEL
+              value: "bge-reranker"
+            - name: WEAVER_RERANKER_BASE_URL
+              value: "http://flexinfer-proxy.flexinfer-system.svc.cluster.local"
+            - name: WEAVER_RERANKER_TIMEOUT
+              value: "8s"
             # Logging
             - name: LOG_LEVEL
               value: info
@@ -86,7 +101,9 @@ spec:
           resources:
             limits:
               cpu: 200m
-              memory: 256Mi
+              # Match the incident stopgap in GitOps until shared-child mode is
+              # proven safe for agent-context's per-client initialize state.
+              memory: 1Gi
             requests:
               cpu: 50m
               memory: 128Mi

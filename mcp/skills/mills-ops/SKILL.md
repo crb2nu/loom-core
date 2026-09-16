@@ -102,6 +102,37 @@ curl -sf \
 # /api/mills/eval/scores and filter SubjectKind/SubjectID with jq.
 ```
 
+**Drain the open `audit-digest` pile**
+
+The audit follow-up writer files one `Audit advisory digest — <date> (UTC)`
+issue per UTC day and, on every new filing, retires the newest still-open prior
+digest (a `superseded by #<new>` note, then close). Anything older than that —
+the backlog from before supersession shipped, or a stray left by a failed
+close — is only ever closed by the confirm-gated sweep below. Treat the sweep as
+an irreversible GitLab mutation: preview, review every selected IID, then apply
+with the identical arguments.
+
+```bash
+# 0) The sweep only selects digests filed by --author (default mills-bot);
+#    read the real bot username off the newest open digest first.
+glab api "projects/services%2Floom-core/issues?labels=audit-digest&state=opened&per_page=1" \
+  | jq -r '.[0].author.username'
+# 1) Dry run (the default; no mutations). Prints EVERY open audit-digest issue
+#    with its age; "selected" counts only digests created strictly before the
+#    cutoff (default 30 days ago; an explicit --cutoff must be >= 7 days old).
+GITLAB_TOKEN=... loom audit-advisory-sweep --dry-run --project services/loom-core \
+  --author <bot-username> --cutoff 2026-08-17T00:00:00Z | tee audit-sweep-dry-run.log
+# 2) Only after reviewing the selected IIDs: the SAME arguments with --apply.
+GITLAB_TOKEN=... loom audit-advisory-sweep --apply --project services/loom-core \
+  --author <bot-username> --cutoff 2026-08-17T00:00:00Z | tee audit-sweep-apply.log
+# 3) Verify: the dry run now selects 0; a repeated --apply is a no-op.
+```
+
+Selection completes before the first close, and a close failure stops the
+sweep with the closed prefix reported, so re-running the same `--apply` is
+safe. There is no automatic rollback; the full procedure and recovery notes
+are in `docs/runbook-audit-advisory-sweep.md`.
+
 **Force-escalate a stuck pipeline run**
 ```bash
 loom mills pipelines list

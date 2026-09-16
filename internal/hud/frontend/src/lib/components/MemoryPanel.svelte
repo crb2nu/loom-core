@@ -572,28 +572,31 @@
           <td class="text-mono text-muted">{relativeTime(item.last_accessed)}</td>
           {/if}
           <td class="actions-cell">
-            {#if activeTier !== 'long_term'}
+            <!-- Flex on an inner wrapper keeps the td a real table-cell. -->
+            <div class="actions-row">
+              {#if activeTier !== 'long_term'}
+                <button
+                  class="action-btn promote-btn"
+                  onclick={(e) => { e.stopPropagation(); void promoteItem(item.id); }}
+                  title="Promote"
+                  aria-label="Promote"
+                >&#8593;</button>
+              {/if}
+              {#if activeTier !== 'working'}
+                <button
+                  class="action-btn demote-btn"
+                  onclick={(e) => { e.stopPropagation(); void demoteItem(item.id); }}
+                  title="Demote"
+                  aria-label="Demote"
+                >&#8595;</button>
+              {/if}
               <button
-                class="action-btn promote-btn"
-                onclick={(e) => { e.stopPropagation(); void promoteItem(item.id); }}
-                title="Promote"
-                aria-label="Promote"
-              >&#8593;</button>
-            {/if}
-            {#if activeTier !== 'working'}
-              <button
-                class="action-btn demote-btn"
-                onclick={(e) => { e.stopPropagation(); void demoteItem(item.id); }}
-                title="Demote"
-                aria-label="Demote"
-              >&#8595;</button>
-            {/if}
-            <button
-              class="action-btn delete-btn"
-              onclick={(e) => { e.stopPropagation(); confirmDelete(item); }}
-              title="Delete"
-              aria-label="Delete"
-            >&#10005;</button>
+                class="action-btn delete-btn"
+                onclick={(e) => { e.stopPropagation(); confirmDelete(item); }}
+                title="Delete"
+                aria-label="Delete"
+              >&#10005;</button>
+            </div>
           </td>
         {/snippet}
         {#snippet expandedRow({ row: item })}
@@ -949,7 +952,8 @@
     letter-spacing: var(--tracking-wide);
   }
 
-  .actions-cell {
+  .actions-cell { white-space: nowrap; }
+  .actions-row {
     display: flex;
     gap: 4px;
   }

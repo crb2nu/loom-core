@@ -1,0 +1,1 @@
+- Add a unified, collapsible Mill Staff HUD group that keeps overseer, MR-watch, and merge-queue lifecycle feeds mounted and polling while collapsed, with accessible grouped panel behavior.

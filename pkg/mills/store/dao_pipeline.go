@@ -30,7 +30,7 @@ const pipelineColumns = `id, backlog_id, aggregate_version, row_version, templat
 			worktree_path, mr_iid, started_at, ended_at, cost_usd, parent_session_id,
 			parent_run_id, depth, escalation_class, escalation_failure_class,
 			escalation_external_dependency_id, escalation_external_dependency,
-			escalation_retryable, retry_exhausted`
+			escalation_retryable, retry_exhausted, failure_signature, vaccine_ref, subscription_cost_usd`
 
 type pipelineRunQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -166,7 +166,7 @@ func putPipelineRun(ctx context.Context, queryer pipelineRunQueryer, run *Pipeli
 	var storedEndedAt sql.NullString
 	err := queryer.QueryRowContext(ctx, `
 			INSERT INTO pipeline_runs (`+pipelineColumns+`)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET
 				backlog_id        = excluded.backlog_id,
 				template          = excluded.template,
@@ -176,11 +176,12 @@ func putPipelineRun(ctx context.Context, queryer pipelineRunQueryer, run *Pipeli
 				worktree_path     = excluded.worktree_path,
 				mr_iid            = excluded.mr_iid,
 				ended_at          = CASE
-					WHEN pipeline_runs.state IN ('done', 'escalated', 'paused')
+					WHEN pipeline_runs.state IN ('done', 'escalated', 'preflight_failed', 'paused')
 						THEN COALESCE(pipeline_runs.ended_at, excluded.ended_at)
 					ELSE excluded.ended_at
 				END,
 				cost_usd          = excluded.cost_usd,
+				subscription_cost_usd = excluded.subscription_cost_usd,
 				parent_session_id = excluded.parent_session_id,
 				parent_run_id     = excluded.parent_run_id,
 				depth             = excluded.depth,
@@ -190,11 +191,17 @@ func putPipelineRun(ctx context.Context, queryer pipelineRunQueryer, run *Pipeli
 				escalation_external_dependency = excluded.escalation_external_dependency,
 				escalation_retryable = excluded.escalation_retryable,
 				retry_exhausted     = excluded.retry_exhausted,
+				failure_signature   = CASE
+					WHEN excluded.failure_signature <> '' THEN excluded.failure_signature
+					ELSE pipeline_runs.failure_signature
+				END,
+				vaccine_ref        = COALESCE(pipeline_runs.vaccine_ref, excluded.vaccine_ref),
 				row_version       = pipeline_runs.row_version + 1
 			WHERE excluded.aggregate_version = pipeline_runs.aggregate_version
 				AND pipeline_runs.row_version = ?
-				AND (pipeline_runs.state NOT IN ('done', 'escalated', 'paused')
-					OR excluded.state = pipeline_runs.state)
+				AND (pipeline_runs.state NOT IN ('done', 'escalated', 'preflight_failed', 'paused')
+					OR excluded.state = pipeline_runs.state
+					OR (pipeline_runs.state = 'escalated' AND excluded.state = 'preflight_failed'))
 			RETURNING row_version, ended_at
 		`,
 		run.ID, run.BacklogID, run.AggregateVersion, int64(1), run.Template, string(run.State),
@@ -202,6 +209,7 @@ func putPipelineRun(ctx context.Context, queryer pipelineRunQueryer, run *Pipeli
 		timeRFC3339(run.StartedAt), endedAt, run.CostUSD, nullStr(run.ParentSessionID),
 		parentRun, run.Depth, nullStr(run.EscalationClass), nullStr(run.FailureClass),
 		nullStr(run.ExternalDependencyID), nullStr(run.ExternalDependency), retryable, retryExhausted,
+		run.FailureSignature, nullStr(run.VaccineRef), run.SubscriptionCostUSD,
 		run.Revision,
 	).Scan(&storedRevision, &storedEndedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -424,13 +432,14 @@ func (d *PipelineDAO) CreateSubrun(ctx context.Context, run *PipelineRun) error 
 	parentRun := sql.NullString{String: *run.ParentRunID, Valid: true}
 	_, err := d.db.ExecContext(ctx, `
 			INSERT INTO pipeline_runs (`+pipelineColumns+`)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		`,
 		run.ID, run.BacklogID, run.AggregateVersion, int64(1), run.Template, string(run.State),
 		nullStr(run.CurrentStage), run.Attempts, nullStr(run.WorktreePath), sql.NullInt64{},
 		timeRFC3339(run.StartedAt), sql.NullString{}, run.CostUSD, nullStr(run.ParentSessionID),
 		parentRun, run.Depth, nullStr(run.EscalationClass), nullStr(run.FailureClass),
 		nullStr(run.ExternalDependencyID), nullStr(run.ExternalDependency), sql.NullBool{}, sql.NullBool{},
+		run.FailureSignature, nullStr(run.VaccineRef), run.SubscriptionCostUSD,
 	)
 	if err != nil {
 		return fmt.Errorf("pipeline create-subrun %s: %w", run.ID, err)
@@ -549,7 +558,7 @@ func (d *PipelineDAO) ListByStateSince(ctx context.Context, state PipelineState,
 func (d *PipelineDAO) ListInFlight(ctx context.Context) ([]*PipelineRun, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT `+pipelineColumns+` FROM pipeline_runs
-		WHERE state NOT IN ('done', 'escalated', 'paused')
+		WHERE state NOT IN ('done', 'escalated', 'preflight_failed', 'paused')
 		  AND (
 			state <> 'queued'
 			OR (
@@ -590,12 +599,16 @@ func (d *PipelineDAO) ListInFlight(ctx context.Context) ([]*PipelineRun, error) 
 // The active-only pipeline-run list the HUD polls can never surface a
 // terminal merged run, so the frontend cannot derive this itself.
 func (d *PipelineDAO) LatestMergedAt(ctx context.Context) (*time.Time, error) {
+	// External merge-queue placeholder rows are `done` from enqueue time and
+	// are settled (ended_at stamped) on eviction too, so without the template
+	// predicate an EVICTED fleet candidate would advance "last merge".
 	row := d.db.QueryRowContext(ctx, `
 		SELECT ended_at FROM pipeline_runs
 		WHERE state = ? AND ended_at IS NOT NULL AND ended_at != ''
+		  AND template <> ?
 		ORDER BY ended_at DESC
 		LIMIT 1
-	`, string(PipelineDone))
+	`, string(PipelineDone), PipelineTemplateExternalMerge)
 	var endedAt sql.NullString
 	if err := row.Scan(&endedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -607,6 +620,21 @@ func (d *PipelineDAO) LatestMergedAt(ctx context.Context) (*time.Time, error) {
 }
 
 // SumCostSince totals pipeline spend since the given timestamp.
+// SumSubscriptionCostSince returns the subscription-billed slice of pipeline
+// spend for runs started at-or-after since (Claude Code / Codex turns under
+// the cluster OAuth accounts, list-price equivalent). The budget subtracts it
+// from SumCostSince to get the metered spend the daily USD cap governs.
+func (d *PipelineDAO) SumSubscriptionCostSince(ctx context.Context, since time.Time) (float64, error) {
+	row := d.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(subscription_cost_usd), 0) FROM pipeline_runs WHERE started_at >= ?`,
+		timeRFC3339(since))
+	var total float64
+	if err := row.Scan(&total); err != nil {
+		return 0, fmt.Errorf("pipeline sum-subscription-cost: %w", err)
+	}
+	return total, nil
+}
+
 func (d *PipelineDAO) SumCostSince(ctx context.Context, since time.Time) (float64, error) {
 	row := d.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(cost_usd), 0) FROM pipeline_runs WHERE started_at >= ?`,
@@ -953,6 +981,9 @@ type EscalationMetadata struct {
 	ExternalDependency   string
 	Retryable            *bool
 	RetryExhausted       *bool
+	// FailureSignature is the sigfp failure-shape fingerprint; empty leaves
+	// any prior stamp in place (partial updates never erase evidence).
+	FailureSignature string
 }
 
 // SetEscalationMetadata stamps the full terminal classification payload on an
@@ -964,7 +995,7 @@ func (d *PipelineDAO) SetEscalationMetadata(ctx context.Context, runID string, m
 	}
 	if md.EscalationClass == "" && md.FailureClass == "" &&
 		md.ExternalDependencyID == "" && md.ExternalDependency == "" &&
-		md.Retryable == nil && md.RetryExhausted == nil {
+		md.Retryable == nil && md.RetryExhausted == nil && md.FailureSignature == "" {
 		return nil
 	}
 	var retryable sql.NullBool
@@ -982,11 +1013,12 @@ func (d *PipelineDAO) SetEscalationMetadata(ctx context.Context, runID string, m
 		    escalation_external_dependency_id = COALESCE(NULLIF(?, ''), escalation_external_dependency_id),
 		    escalation_external_dependency = COALESCE(NULLIF(?, ''), escalation_external_dependency),
 		    escalation_retryable = COALESCE(?, escalation_retryable),
-		    retry_exhausted = COALESCE(?, retry_exhausted)
+		    retry_exhausted = COALESCE(?, retry_exhausted),
+		    failure_signature = COALESCE(NULLIF(?, ''), failure_signature)
 		WHERE id = ?
 	`,
 		md.EscalationClass, md.FailureClass, md.ExternalDependencyID,
-		md.ExternalDependency, retryable, retryExhausted, runID,
+		md.ExternalDependency, retryable, retryExhausted, md.FailureSignature, runID,
 	)
 	if err != nil {
 		return fmt.Errorf("pipeline set-escalation-metadata: %w", err)
@@ -1008,7 +1040,7 @@ func (d *PipelineDAO) SetEscalationMetadata(ctx context.Context, runID string, m
 func (d *PipelineDAO) ListActive(ctx context.Context) ([]*PipelineRun, error) {
 	rows, err := d.db.QueryContext(ctx,
 		`SELECT `+pipelineColumns+` FROM pipeline_runs
-		WHERE state NOT IN ('done', 'escalated', 'paused')
+		WHERE state NOT IN ('done', 'escalated', 'preflight_failed', 'paused')
 		ORDER BY CASE state
 			WHEN 'queued' THEN 0
 			WHEN 'planning' THEN 1
@@ -1040,7 +1072,7 @@ func (d *PipelineDAO) ListActive(ctx context.Context) ([]*PipelineRun, error) {
 func (d *PipelineDAO) CountActive(ctx context.Context) (int, error) {
 	row := d.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM pipeline_runs
-		WHERE state NOT IN ('done', 'escalated', 'paused')
+		WHERE state NOT IN ('done', 'escalated', 'preflight_failed', 'paused')
 	`)
 	var n int
 	if err := row.Scan(&n); err != nil {
@@ -1103,7 +1135,7 @@ func (d *PipelineDAO) ListByBacklog(ctx context.Context, backlogID string) ([]*P
 // CountActive/ListInFlight use the complement. Keep the two predicates in
 // sync — a state added here must be excluded from "active" everywhere.
 var pipelineTerminalStates = []PipelineState{
-	PipelineDone, PipelineEscalated, PipelinePaused,
+	PipelineDone, PipelineEscalated, PipelinePreflightFailed, PipelinePaused,
 }
 
 // ListRecentTerminal returns finished pipeline runs (done / escalated /
@@ -1150,6 +1182,48 @@ func (d *PipelineDAO) ListRecentTerminal(ctx context.Context, since time.Time, l
 			return nil, err
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListRecentTerminalBolts returns the bounded terminal-work projection used by
+// Bolt Cards. Unlike pipeline history, its window and ordering anchor on the
+// terminal timestamp, falling back to started_at for legacy rows.
+func (d *PipelineDAO) ListRecentTerminalBolts(ctx context.Context, since time.Time, limit int) ([]*PipelineRun, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	args := make([]any, 0, len(pipelineTerminalStates)+2)
+	placeholders := ""
+	for i, state := range pipelineTerminalStates {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args = append(args, string(state))
+	}
+	query := `SELECT ` + pipelineColumns + ` FROM pipeline_runs WHERE state IN (` + placeholders + `)`
+	if !since.IsZero() {
+		query += ` AND COALESCE(ended_at, started_at) >= ?`
+		args = append(args, timeRFC3339(since))
+	}
+	query += ` ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline list-recent-terminal-bolts: %w", err)
+	}
+	defer rows.Close()
+	var out []*PipelineRun
+	for rows.Next() {
+		run, err := scanPipelineRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, run)
 	}
 	return out, rows.Err()
 }
@@ -1222,6 +1296,32 @@ func (d *PipelineDAO) ListByMRIID(ctx context.Context, mrIID int64) ([]*Pipeline
 		mrIID)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline list-mriid: %w", err)
+	}
+	defer rows.Close()
+	var out []*PipelineRun
+	for rows.Next() {
+		r, err := scanPipelineRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListByBacklogID returns every pipeline run spawned for one backlog item,
+// newest-first, served off idx_pipeline_backlog. limit bounds the response
+// for items with long retry histories; out-of-range values fall back to the
+// default so a caller can never request an unbounded scan.
+func (d *PipelineDAO) ListByBacklogID(ctx context.Context, backlogID string, limit int) ([]*PipelineRun, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+pipelineColumns+` FROM pipeline_runs WHERE backlog_id = ? ORDER BY started_at DESC LIMIT ?`,
+		backlogID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline list-backlog: %w", err)
 	}
 	defer rows.Close()
 	var out []*PipelineRun
@@ -1432,9 +1532,10 @@ func scanPipelineRun(s scanner) (*PipelineRun, error) {
 		run PipelineRun
 		currentStage, worktreePath, parentSession, endedAt, state, parentRun,
 		escalationClass, failureClass, externalDependencyID, externalDependency sql.NullString
-		mrIID                     sql.NullInt64
-		retryable, retryExhausted sql.NullBool
-		startedAt                 string
+		failureSignature, vaccineRef sql.NullString
+		mrIID                        sql.NullInt64
+		retryable, retryExhausted    sql.NullBool
+		startedAt                    string
 	)
 	err := s.Scan(
 		&run.ID, &run.BacklogID, &run.AggregateVersion, &run.Revision, &run.Template, &state,
@@ -1442,6 +1543,7 @@ func scanPipelineRun(s scanner) (*PipelineRun, error) {
 		&startedAt, &endedAt, &run.CostUSD, &parentSession,
 		&parentRun, &run.Depth, &escalationClass, &failureClass,
 		&externalDependencyID, &externalDependency, &retryable, &retryExhausted,
+		&failureSignature, &vaccineRef, &run.SubscriptionCostUSD,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1469,11 +1571,17 @@ func scanPipelineRun(s scanner) (*PipelineRun, error) {
 	if failureClass.Valid {
 		run.FailureClass = failureClass.String
 	}
+	if failureSignature.Valid {
+		run.FailureSignature = failureSignature.String
+	}
 	if externalDependencyID.Valid {
 		run.ExternalDependencyID = externalDependencyID.String
 	}
 	if externalDependency.Valid {
 		run.ExternalDependency = externalDependency.String
+	}
+	if vaccineRef.Valid {
+		run.VaccineRef = vaccineRef.String
 	}
 	if retryable.Valid {
 		run.EscalationRetryable = &retryable.Bool
@@ -1493,7 +1601,7 @@ func scanPipelineRun(s scanner) (*PipelineRun, error) {
 // ----- Stage results -----
 
 const stageColumns = `id, pipeline_run_id, stage, attempt, started_at, ended_at,
-		outcome, spawn_id, cost_usd, model, backend, artifacts_json, log_tail`
+		outcome, spawn_id, cost_usd, model, backend, billing, artifacts_json, log_tail`
 
 var ErrStageSpawnConflict = errors.New("pipeline: stage attempt already has an accepted spawn")
 
@@ -1542,8 +1650,8 @@ func (d *PipelineDAO) PutStage(ctx context.Context, sr *StageResult) error {
 	}
 	res, err := d.db.ExecContext(ctx, `
 		INSERT INTO stage_results (pipeline_run_id, stage, attempt, started_at,
-			ended_at, outcome, spawn_id, cost_usd, model, backend, artifacts_json, log_tail)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+			ended_at, outcome, spawn_id, cost_usd, model, backend, billing, artifacts_json, log_tail)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(pipeline_run_id, stage, attempt) DO UPDATE SET
 			ended_at        = excluded.ended_at,
 			outcome         = excluded.outcome,
@@ -1554,11 +1662,12 @@ func (d *PipelineDAO) PutStage(ctx context.Context, sr *StageResult) error {
 			-- same COALESCE(NULLIF(...)) guard spawn_id uses above.
 			model           = COALESCE(NULLIF(excluded.model, ''), stage_results.model),
 			backend         = COALESCE(NULLIF(excluded.backend, ''), stage_results.backend),
+			billing         = COALESCE(NULLIF(excluded.billing, ''), stage_results.billing),
 			artifacts_json  = excluded.artifacts_json,
 			log_tail        = excluded.log_tail
 	`,
 		sr.PipelineRunID, sr.Stage, sr.Attempt, timeRFC3339(sr.StartedAt),
-		endedAt, outcome, nullStr(sr.SpawnID), sr.CostUSD, nullStr(sr.Model), nullStr(sr.Backend), artifacts, nullStr(sr.LogTail),
+		endedAt, outcome, nullStr(sr.SpawnID), sr.CostUSD, nullStr(sr.Model), nullStr(sr.Backend), nullStr(string(sr.Billing)), artifacts, nullStr(sr.LogTail),
 	)
 	if err != nil {
 		return fmt.Errorf("stage put %s/%s/%d: %w", sr.PipelineRunID, sr.Stage, sr.Attempt, err)
@@ -1571,8 +1680,10 @@ func (d *PipelineDAO) PutStage(ctx context.Context, sr *StageResult) error {
 
 // ListStages returns every stage attempt for a pipeline run, in execution order.
 func (d *PipelineDAO) ListStages(ctx context.Context, pipelineRunID string) ([]*StageResult, error) {
+	// id breaks started_at ties (rows written in the same instant) by insertion
+	// order, so the list is deterministic rather than heap-order dependent.
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT `+stageColumns+` FROM stage_results WHERE pipeline_run_id = ? ORDER BY started_at ASC`,
+		`SELECT `+stageColumns+` FROM stage_results WHERE pipeline_run_id = ? ORDER BY started_at ASC, id ASC`,
 		pipelineRunID)
 	if err != nil {
 		return nil, fmt.Errorf("stage list: %w", err)
@@ -1587,13 +1698,17 @@ func (d *PipelineDAO) ListStages(ctx context.Context, pipelineRunID string) ([]*
 			spawnID   sql.NullString
 			model     sql.NullString
 			backend   sql.NullString
+			billing   sql.NullString
 			logTail   sql.NullString
 			artifacts string
 			startedAt string
 		)
 		if err := rows.Scan(&sr.ID, &sr.PipelineRunID, &sr.Stage, &sr.Attempt,
-			&startedAt, &endedAt, &outcome, &spawnID, &sr.CostUSD, &model, &backend, &artifacts, &logTail); err != nil {
+			&startedAt, &endedAt, &outcome, &spawnID, &sr.CostUSD, &model, &backend, &billing, &artifacts, &logTail); err != nil {
 			return nil, fmt.Errorf("stage scan: %w", err)
+		}
+		if billing.Valid {
+			sr.Billing = BillingClass(billing.String)
 		}
 		if sr.StartedAt, err = parseTime(startedAt); err != nil {
 			return nil, fmt.Errorf("started_at: %w", err)
@@ -1837,7 +1952,7 @@ func (d *PipelineDAO) PutGate(ctx context.Context, g *GateOutcome) error {
 // ListGates returns every gate outcome for a pipeline run, oldest-first.
 func (d *PipelineDAO) ListGates(ctx context.Context, pipelineRunID string) ([]*GateOutcome, error) {
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT `+gateColumns+` FROM gate_outcomes WHERE pipeline_run_id = ? ORDER BY evaluated_at ASC`,
+		`SELECT `+gateColumns+` FROM gate_outcomes WHERE pipeline_run_id = ? ORDER BY evaluated_at ASC, id ASC`,
 		pipelineRunID)
 	if err != nil {
 		return nil, fmt.Errorf("gate list: %w", err)

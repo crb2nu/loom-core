@@ -75,6 +75,13 @@ func TestOverseerSoakMetricsCountsFourBoundedDecisionSeries(t *testing.T) {
 	if len(families) != 1 || families[0].GetName() != "loom_mills_overseer_dry_run_decisions_total" || len(families[0].Metric) != 4 {
 		t.Fatalf("metric families = %+v, want one family with four bounded series", families)
 	}
+	for _, metric := range families[0].Metric {
+		if len(metric.Label) != 2 ||
+			metric.Label[0].GetName() != "diverged" ||
+			metric.Label[1].GetName() != "would_have_acted" {
+			t.Fatalf("labels = %+v, want only %q and %q", metric.Label, "diverged", "would_have_acted")
+		}
+	}
 }
 
 func TestOverseerSoakMetricsReusesRegisteredCollector(t *testing.T) {

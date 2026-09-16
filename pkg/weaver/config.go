@@ -11,9 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/crb2nu/loom/pkg/aimodels"
 	"github.com/crb2nu/loom/pkg/env"
-	"gopkg.in/yaml.v3"
 )
 
 const (

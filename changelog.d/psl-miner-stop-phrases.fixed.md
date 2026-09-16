@@ -1,0 +1,1 @@
+- Harden the signature miner stop-phrase filter in `pkg/mills/reconciler_signature_mining.go`, with regression coverage in `pkg/mills/reconciler_signature_mining_test.go`.

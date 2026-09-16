@@ -64,6 +64,11 @@ export async function runClaudeDriver(args: DriverArgs): Promise<number> {
     options.pathToClaudeCodeExecutable = claudeCli;
   }
 
+  if (args.model) {
+    // The routed model (Mills stage_models / agent_routing). Without this
+    // the SDK path ran the CLI default no matter what policy pinned.
+    options.model = args.model;
+  }
   if (args.maxTurns > 0) {
     options.maxTurns = args.maxTurns;
   }

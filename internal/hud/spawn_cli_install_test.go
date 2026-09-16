@@ -34,12 +34,12 @@ func TestAgentCLIInstallShell_GuardedAndPinned(t *testing.T) {
 }
 
 func TestClaudeCodeVersion_CurrentRuntimeFloor(t *testing.T) {
-	if claudeCodeVersion != "2.1.220" {
-		t.Fatalf("claudeCodeVersion = %q, want 2.1.220", claudeCodeVersion)
+	if claudeCodeVersion != "2.1.270" {
+		t.Fatalf("claudeCodeVersion = %q, want 2.1.270", claudeCodeVersion)
 	}
 	for _, install := range []string{agentCLIInstallLines("claude-code"), agentCLIInstallShell("claude-code")} {
-		if !strings.Contains(install, "@anthropic-ai/claude-code@2.1.220") {
-			t.Errorf("Claude install did not pin 2.1.220: %s", install)
+		if !strings.Contains(install, "@anthropic-ai/claude-code@2.1.270") {
+			t.Errorf("Claude install did not pin 2.1.270: %s", install)
 		}
 	}
 }

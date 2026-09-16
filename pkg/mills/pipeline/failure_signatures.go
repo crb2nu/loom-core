@@ -8,7 +8,6 @@ import (
 const (
 	openRouterCreditsExhaustedSignatureID = "external_dependency.openrouter.credits_exhausted"
 	openRouterDependency                  = "openrouter"
-	openRouterCreditsExhaustedPhrase      = "requires more credits"
 )
 
 // PersistedFailureSignature is a stable, policy-facing classification for a
@@ -21,7 +20,10 @@ type PersistedFailureSignature struct {
 	Retryable      bool
 }
 
-var openRouterHTTP402Pattern = regexp.MustCompile(`(?:status(?:[ _-]?code)?|code|http(?:/\d(?:\.\d)?)?)\s*["']?\s*[:=]?\s*402\b|\b402\s+payment required\b`)
+var (
+	openRouterHTTP402Pattern = regexp.MustCompile(`(?:status(?:[ _-]?code)?|code|http(?:/\d(?:\.\d)?)?)\s*["']?\s*[:=]?\s*402\b|\b402\s+payment required\b`)
+	openRouterCreditsPattern = regexp.MustCompile(`\b(?:requires?\s+more|insufficient)\s+credits?\b`)
+)
 
 // ClassifyPersistedFailureSignature matches promoted failure signatures whose
 // identity and retry policy must remain stable across runs. OpenRouter credit
@@ -32,7 +34,7 @@ func ClassifyPersistedFailureSignature(evidence string) (PersistedFailureSignatu
 	normalized := strings.ToLower(evidence)
 	if !strings.Contains(normalized, openRouterDependency) ||
 		!openRouterHTTP402Pattern.MatchString(normalized) ||
-		!strings.Contains(normalized, openRouterCreditsExhaustedPhrase) {
+		!openRouterCreditsPattern.MatchString(normalized) {
 		return PersistedFailureSignature{}, false
 	}
 

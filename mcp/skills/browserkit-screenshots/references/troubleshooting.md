@@ -2,10 +2,11 @@
 
 ## "No module named browser_kit" / "No module named playwright"
 
-Install Python deps:
+Install Python deps with the pinned installer (a bare `pip install
+flexinfer-browser-kit` pulls an unpinned PyPI release of an internal library):
 
 ```bash
-pip install flexinfer-browser-kit playwright
+bash scripts/browserkit/install_deps.sh
 ```
 
 ## "Executable doesn't exist" / Chromium won't launch

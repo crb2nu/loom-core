@@ -240,7 +240,10 @@ func TestFilterProxyTools_ICCCoreProfile(t *testing.T) {
 }
 
 func TestResolveProxyToolFilter_InferLLMCoreFromAgentHint(t *testing.T) {
-	for _, agentHint := range []string{"codex", "claude", "claude-code"} {
+	// Every LLM vendor hint shapes to llm-core. claude-desktop, zed and
+	// gemini were missing from this set and received the daemon's whole
+	// surface (≈500 tools after the daemon ceiling) — 2026-09-09..12 log.
+	for _, agentHint := range []string{"codex", "claude", "claude-code", "Claude-Desktop", "gemini", "gemini-cli", "zed", "kilocode", "kilo", "cursor", "windsurf", "opencode"} {
 		profile, limit := resolveProxyToolFilter(agentHint, "", 0)
 		if profile != proxyToolProfileLLMCore {
 			t.Fatalf("agentHint %q resolved profile = %q, want %q", agentHint, profile, proxyToolProfileLLMCore)
@@ -248,6 +251,67 @@ func TestResolveProxyToolFilter_InferLLMCoreFromAgentHint(t *testing.T) {
 		if limit != proxyToolLimitLLM {
 			t.Fatalf("agentHint %q resolved limit = %d, want %d", agentHint, limit, proxyToolLimitLLM)
 		}
+	}
+	// An unknown or empty hint stays unshaped: the daemon ceiling applies and
+	// an explicit --tool-profile is the way to opt in.
+	for _, agentHint := range []string{"", "fallback", "something-new"} {
+		profile, limit := resolveProxyToolFilter(agentHint, "", 0)
+		if profile != "" || limit != 0 {
+			t.Fatalf("agentHint %q resolved (%q, %d), want unshaped", agentHint, profile, limit)
+		}
+	}
+}
+
+func TestResolveProxyToolFilter_FullProfilePassthrough(t *testing.T) {
+	// `--tool-profile full` wins over the hint and disables shaping; only an
+	// explicit --max-tools still applies.
+	profile, limit := resolveProxyToolFilter("codex", "FULL", 0)
+	if profile != "" || limit != 0 {
+		t.Fatalf("full profile resolved (%q, %d), want unshaped", profile, limit)
+	}
+	profile, limit = resolveProxyToolFilter("codex", proxyToolProfileFull, 25)
+	if profile != "" || limit != 25 {
+		t.Fatalf("full profile with max-tools resolved (%q, %d), want (\"\", 25)", profile, limit)
+	}
+	tools := corePatternTools()
+	if got := filterProxyTools(tools, "codex", proxyToolProfileFull, 0); len(got) != len(tools) {
+		t.Fatalf("full profile kept %d of %d tools", len(got), len(tools))
+	}
+}
+
+func TestSelectProfileTools_ReportsDisplacedRequiredTools(t *testing.T) {
+	tools := corePatternTools()
+	// A cap below the number of required tools that are present must report
+	// exactly the tail that did not fit, in priority order — the silent
+	// displacement the proxyToolLimitLLM history describes.
+	limit := 5
+	kept, displaced := selectProfileTools(tools, limit, coreRequiredPatterns, coreServerOrder, coreServerQuota)
+	if len(kept) != limit {
+		t.Fatalf("kept %d tools, want %d", len(kept), limit)
+	}
+	present := 0
+	for _, tool := range tools {
+		for _, pattern := range coreRequiredPatterns {
+			if tool.Name == pattern {
+				present++
+				break
+			}
+		}
+	}
+	if len(displaced) != present-limit {
+		t.Fatalf("displaced %d tools, want %d (present required %d - cap %d)", len(displaced), present-limit, present, limit)
+	}
+	if displaced[0] != coreRequiredPatterns[limit] {
+		t.Fatalf("first displaced = %q, want the first pattern past the cap %q", displaced[0], coreRequiredPatterns[limit])
+	}
+	// With room to spare nothing is displaced, and unmatched patterns (servers
+	// not enabled) never count.
+	if _, displaced := selectProfileTools(tools, len(tools)+10, coreRequiredPatterns, coreServerOrder, coreServerQuota); len(displaced) != 0 {
+		t.Fatalf("unexpected displacement with headroom: %v", displaced)
+	}
+	// The report surfaces through the filter entry point.
+	if _, displaced := filterProxyToolsReport(tools, "codex", "", limit); len(displaced) == 0 {
+		t.Fatal("filterProxyToolsReport must surface displaced required tools")
 	}
 }
 
@@ -275,5 +339,36 @@ func TestFilterProxyTools_MaxToolsOnly(t *testing.T) {
 	}
 	if filtered[0].Name != "git__git_status" || filtered[1].Name != "git__git_diff" {
 		t.Fatalf("unexpected filtered tools: %#v", filtered)
+	}
+}
+
+// TestFilterProxyTools_LLMCoreIncludesMills pins the factory-from-CC S0
+// contract: every mills_* tool survives the llm-core cap so a profile-limited
+// session can drive Mills without falling back to the operator REST API, and
+// the block sits past position 100 so antigravity-core is byte-identical.
+func TestFilterProxyTools_LLMCoreIncludesMills(t *testing.T) {
+	tools := corePatternTools()
+	for i := 0; i < 190; i++ {
+		tools = append(tools, mcp.Tool{Name: fmt.Sprintf("misc__tool_%03d", i)})
+	}
+	filtered := filterProxyTools(tools, "codex", "", 0)
+	got := make(map[string]struct{}, len(filtered))
+	for _, tool := range filtered {
+		got[tool.Name] = struct{}{}
+	}
+	for _, want := range []string{
+		"mills__mills_status", "mills__mills_backlog_list", "mills__mills_backlog_get",
+		"mills__mills_backlog_post", "mills__mills_backlog_update_state", "mills__mills_runs",
+		"mills__mills_kpis", "mills__mills_escalation_diagnose",
+	} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("llm-core must include %q", want)
+		}
+	}
+	antigravity := filterProxyTools(tools, "antigravity", "", 0)
+	for _, tool := range antigravity {
+		if strings.HasPrefix(tool.Name, "mills__") {
+			t.Fatalf("mills tool %q leaked into antigravity-core (would displace a core tool)", tool.Name)
+		}
 	}
 }

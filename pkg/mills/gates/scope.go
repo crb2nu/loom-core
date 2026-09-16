@@ -2,11 +2,14 @@ package gates
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/telemetry"
 )
 
 const (
@@ -87,7 +90,67 @@ func (g *Scope) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 		// capped prose summary.
 		reasons[i] = "[" + ScopeReasonOutside + "] file outside slice scope: " + violation
 	}
-	return Outcome{Reasons: reasons, JudgedBy: "go"}, nil
+	return Outcome{
+		Reasons: reasons, JudgedBy: "go",
+		scopeFailureClass: g.classifyFailure(in.Item),
+	}, nil
+}
+
+// classifyFailure attributes the plan defect that made a failed evaluation
+// possible. Missing directories take precedence over guessed basenames; when
+// the declared paths are grounded, the out-of-envelope change is a real
+// detour. This ordering guarantees one bounded class for the whole evaluation.
+func (g *Scope) classifyFailure(item *store.BacklogItem) telemetry.ScopeFailureClass {
+	paths := make([]string, 0)
+	for _, slice := range item.Slices {
+		paths = append(paths, slice.Files...)
+		for _, test := range slice.Tests {
+			if isPathLike(test) {
+				paths = append(paths, test)
+			}
+		}
+	}
+	missingBasename := false
+	for _, declared := range paths {
+		declared = filepath.Clean(declared)
+		if declared == "." || strings.ContainsAny(declared, "*?[") {
+			continue
+		}
+		if !pathExists(filepath.Dir(declared)) {
+			return telemetry.ScopeFailureMissingDirectory
+		}
+		if !pathExists(declared) {
+			missingBasename = true
+		}
+	}
+	if missingBasename {
+		return telemetry.ScopeFailureWrongBasename
+	}
+	return telemetry.ScopeFailureGenuineDetour
+}
+
+var pathExists = func(path string) bool {
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	// Unit tests execute with the package directory as cwd. Walk to the
+	// nearest module root so repository-relative scope paths retain their
+	// production meaning there as well.
+	dir, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			_, err = os.Stat(filepath.Join(dir, path))
+			return err == nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
 }
 
 func codedPass(code string) Outcome {
@@ -210,7 +273,9 @@ func buildAllowedSet(slices []store.Slice, includeTests bool) allowedSet {
 		}
 		if includeTests {
 			for _, t := range s.Tests {
-				set.add(t)
+				if isPathLike(t) {
+					set.add(t)
+				}
 			}
 		}
 	}
@@ -522,4 +587,11 @@ func looksLikeTestFile(path string) bool {
 		return true
 	}
 	return false
+}
+
+// isPathLike distinguishes test paths/globs from commands in Slice.Tests.
+// Files declarations deliberately bypass this filter. Whitespace rejects
+// command prefixes such as "go ", "cd ", "pnpm ", "npm ", and "make ".
+func isPathLike(s string) bool {
+	return s != "" && strings.IndexFunc(s, unicode.IsSpace) < 0 && !strings.ContainsAny(s, "&|;<>()`")
 }

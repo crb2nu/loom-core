@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/mills/gates"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
@@ -31,6 +32,10 @@ func (r *Runner) runPreflight(ctx context.Context, run *store.PipelineRun, item 
 		return false, nil
 	}
 	decision, err := r.HealthGates.DecideHealthGates(ctx)
+	if recoveringResume(ctx) && ((err != nil && hubUnavailable(err.Error())) || (!decision.Allowed && onlyHubUnavailable(decision.Reasons))) {
+		// The stage records and budgets this outage as an explicit attempt.
+		return false, nil
+	}
 	if err != nil {
 		decision = gates.HealthDecision{
 			Allowed:    false,
@@ -72,4 +77,69 @@ func (r *Runner) runPreflight(ctx context.Context, run *store.PipelineRun, item 
 		"fail_closed": decision.FailClosed, "reasons": decision.Reasons,
 	})
 	return true, r.escalateWithItem(ctx, run, item, blockClass, reason)
+}
+
+// Hub readiness is deliberately narrow: unrelated policy/configuration blocks
+// must not be converted into rollout retries.
+func hubUnavailable(s string) bool {
+	s = strings.ToLower(s)
+	hub := strings.Contains(s, "mcp_hub_session") || strings.Contains(s, "mcphub") || strings.Contains(s, "mcp hub") || strings.Contains(s, "mcp-hub") || strings.Contains(s, "hub session")
+	return hub && (strings.Contains(s, "unavailable") || strings.Contains(s, "connection refused") || strings.Contains(s, "connection reset") || strings.Contains(s, "transport closed") || strings.Contains(s, "broken pipe"))
+}
+
+func onlyHubUnavailable(reasons []string) bool {
+	if len(reasons) == 0 {
+		return false
+	}
+	for _, reason := range reasons {
+		if !hubUnavailable(reason) {
+			return false
+		}
+	}
+	return true
+}
+
+type resumeRecoveryKey struct{}
+
+func recoveringResume(ctx context.Context) bool {
+	v, _ := ctx.Value(resumeRecoveryKey{}).(bool)
+	return v
+}
+
+func (r *Runner) resumeHubReadiness(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, stage Stage) error {
+	if !recoveringResume(ctx) {
+		return nil
+	}
+	if r.HealthGates != nil {
+		decision, err := r.HealthGates.DecideHealthGates(ctx)
+		if err != nil && hubUnavailable(err.Error()) {
+			return err
+		}
+		if !decision.Allowed && onlyHubUnavailable(decision.Reasons) {
+			return fmt.Errorf("MCP hub unavailable after operator rollout: %s", strings.Join(decision.Reasons, "; "))
+		}
+		if err != nil || !decision.Allowed {
+			cls := ClassInfra
+			if err != nil || decision.FailClosed {
+				cls = ClassConfig
+			}
+			if e := r.escalateWithItemPolicy(ctx, run, item, cls, fmt.Sprintf("resume health policy blocked: %v %s", err, strings.Join(decision.Reasons, "; ")), false); e != nil {
+				return e
+			}
+			return errRunTerminated
+		}
+	}
+	if r.AutonomyGate != nil {
+		decision := council.NormalizeAutonomyDecision(r.AutonomyGate(ctx, run, item, stage))
+		if !decision.Allowed && decision.Code == "capability_red" && onlyHubUnavailable(decision.Blockers) {
+			return fmt.Errorf("MCP hub unavailable after operator rollout: %s", strings.Join(decision.Blockers, "; "))
+		}
+		if !decision.Allowed {
+			if e := r.escalateWithItemPolicy(ctx, run, item, ClassConfig, "resume autonomy policy blocked: "+strings.Join(decision.Blockers, "; "), false); e != nil {
+				return e
+			}
+			return errRunTerminated
+		}
+	}
+	return nil
 }

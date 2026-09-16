@@ -1,11 +1,114 @@
 package mills
 
 import (
+	"context"
+	"errors"
 	"sort"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
+
+var ErrRankingBudgetExceeded = errors.New("ranking budget exceeded")
+
+const (
+	DefaultRankerTimeout       = 250 * time.Millisecond
+	DefaultRankerMaxCandidates = 100
+	DefaultRankerMaxCost       = 100.0
+	// MinimumTasteCoverage is the grade coverage required before taste can
+	// influence dispatch ranking. Read models should expose this value rather
+	// than copying the threshold.
+	MinimumTasteCoverage = 0.6
+	minimumTasteCoverage = MinimumTasteCoverage
+	tasteRegretPenalty   = 500.0
+	outcomeMergeBonus    = 200.0
+)
+
+// RankingInput is the bounded, immutable feature set presented to a Ranker.
+// Taste is nil when a plan has no sufficiently-covered grade history.
+type RankingInput struct {
+	Item        *store.BacklogItem
+	Escalations int
+	Outcome     *store.OutcomeFeatures
+	Taste       *store.PlanTasteAggregate
+}
+
+type RankingBudget struct {
+	MaxCandidates int
+	MaxCost       float64
+}
+
+type RankingResult struct {
+	Items               []*store.BacklogItem
+	CandidatesEvaluated int
+	Cost                float64
+}
+
+// Ranker orders candidates within priority bands. Implementations must return
+// a new slice and preserve input order for equal scores.
+type Ranker interface {
+	Rank(context.Context, []RankingInput, RankingBudget) (RankingResult, error)
+}
+
+// DispatchRanker is the default deterministic outcome+taste heuristic.
+type DispatchRanker struct{}
+
+func (DispatchRanker) Rank(ctx context.Context, in []RankingInput, budget RankingBudget) (RankingResult, error) {
+	limit := len(in)
+	if budget.MaxCandidates > 0 && limit > budget.MaxCandidates {
+		limit = budget.MaxCandidates
+	}
+	if budget.MaxCost > 0 && float64(limit) > budget.MaxCost {
+		return RankingResult{}, ErrRankingBudgetExceeded
+	}
+	type scored struct {
+		item  *store.BacklogItem
+		score float64
+	}
+	rows := make([]scored, 0, limit)
+	now := time.Now()
+	for i := 0; i < limit; i++ {
+		if err := ctx.Err(); err != nil {
+			return RankingResult{}, err
+		}
+		row := in[i]
+		score := scoreItem(row.Item, row.Escalations, now)
+		if row.Outcome != nil {
+			score += clamp01(row.Outcome.MergeRate) * outcomeMergeBonus
+		}
+		if row.Taste != nil {
+			score -= clamp01(row.Taste.RegretRate) * clamp01(row.Taste.GradeCoverage) * tasteRegretPenalty
+		}
+		rows = append(rows, scored{item: row.Item, score: score})
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].item == nil || rows[j].item == nil {
+			return rows[i].score > rows[j].score
+		}
+		if rows[i].item.Priority != rows[j].item.Priority {
+			return priorityBase(rows[i].item.Priority) > priorityBase(rows[j].item.Priority)
+		}
+		return rows[i].score > rows[j].score
+	})
+	out := make([]*store.BacklogItem, 0, len(in))
+	for _, row := range rows {
+		out = append(out, row.item)
+	}
+	for i := limit; i < len(in); i++ {
+		out = append(out, in[i].Item)
+	}
+	return RankingResult{Items: out, CandidatesEvaluated: limit, Cost: float64(limit)}, nil
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
 
 // Dispatch ranker (W3.2 of .loom/126). Replaces the store's
 // FIFO-within-priority queue order with a deterministic estimate of expected
@@ -82,6 +185,16 @@ func scoreItem(item *store.BacklogItem, escalations int, now time.Time) float64 
 		s += bonus
 	}
 	return s
+}
+
+// OutcomeDispatchScore maps the deterministic base dispatch score to a
+// probability-like 0..1 value for calibration. The positive constant divisor
+// preserves ordering while keeping terminal writebacks in the domain consumed
+// by OutcomeWritebackDAO.Calibration. startedAt fixes the age component to the
+// point the run was dispatched.
+func OutcomeDispatchScore(item *store.BacklogItem, escalations int, startedAt time.Time) float64 {
+	const maximumBaseScore = 4*priorityGap + maxAgeBonus
+	return clamp01(scoreItem(item, escalations, startedAt) / maximumBaseScore)
 }
 
 // Rank returns a new slice ordered by descending dispatch score. Equal scores

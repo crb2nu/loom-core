@@ -13,8 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/launchctl"
 	"github.com/spf13/cobra"
+
+	"github.com/crb2nu/loom/pkg/launchctl"
 )
 
 const hudLaunchdLabel = "com.loom.hud"

@@ -146,6 +146,7 @@ type CompetitiveResult struct {
 // audit fields (Frame/Model/Backend/Brief) are recorded on the plan so a
 // reviewer can see which frame spun it and from what roving.
 type DraftPlanInput struct {
+	Notes     []string // editor notes and fallback audit persisted with the draft
 	Title     string
 	Project   string
 	Namespace string
@@ -441,6 +442,13 @@ func (s *Spinner) spinFrame(ctx context.Context, brief string, req Request, fram
 	model := firstNonEmpty(out.Model, frame.Model)
 	backend := firstNonEmpty(out.Backend, frame.Backend)
 	title := draftTitle(brief, out)
+	var notes []string
+	if note := strings.TrimSpace(out.Sidecar.Notes); note != "" {
+		notes = append(notes, note)
+	}
+	for _, hop := range out.FallbackHops {
+		notes = append(notes, fmt.Sprintf("frame=%s primary=%s fell back to %s: %s", frame.Name, hop.Primary, hop.Destination, hop.Kind))
+	}
 
 	// Bound the plan-store write on its own budget: it goes over the MCP hub to
 	// agent_context, which can stall independently of the model call. A stall
@@ -460,6 +468,7 @@ func (s *Spinner) spinFrame(ctx context.Context, brief string, req Request, fram
 		Model:       model,
 		Backend:     backend,
 		Brief:       brief,
+		Notes:       notes,
 		Competitors: competitors,
 		Slices:      slices,
 	})

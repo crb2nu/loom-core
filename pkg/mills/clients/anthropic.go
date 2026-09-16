@@ -107,11 +107,13 @@ type anthropicMessenger interface {
 
 // AnthropicClient wraps the SDK client for a single stateless text turn.
 type AnthropicClient struct {
-	api anthropic.Client
+	api     anthropic.Client
+	breaker *VendorBreaker
 }
 
 // AnthropicClientConfig configures NewAnthropicClient. Only APIKey is required.
 type AnthropicClientConfig struct {
+	Breaker *VendorBreaker // nil uses the process-wide breaker
 	APIKey  string
 	BaseURL string        // optional override; empty ⇒ SDK default
 	Timeout time.Duration // per-request wall-clock cap; 0 ⇒ SDK default (10m)
@@ -131,7 +133,7 @@ func NewAnthropicClient(cfg AnthropicClientConfig) (*AnthropicClient, error) {
 	if cfg.Timeout > 0 {
 		opts = append(opts, option.WithRequestTimeout(cfg.Timeout))
 	}
-	return &AnthropicClient{api: anthropic.NewClient(opts...)}, nil
+	return &AnthropicClient{api: anthropic.NewClient(opts...), breaker: vendorBreaker(cfg.Breaker)}, nil
 }
 
 // CreateMessage runs one stateless user turn and returns the concatenated text
@@ -157,6 +159,10 @@ func (c *AnthropicClient) CreateMessage(ctx context.Context, req anthropicMessag
 	}
 	if strings.TrimSpace(req.Model) == "" {
 		return anthropicMessageResult{}, errors.New("anthropic client: model required")
+	}
+	b := vendorBreaker(c.breaker)
+	if err := b.check("anthropic"); err != nil {
+		return anthropicMessageResult{}, err
 	}
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
@@ -191,15 +197,17 @@ func (c *AnthropicClient) CreateMessage(ctx context.Context, req anthropicMessag
 	}
 
 	stream := c.api.Messages.NewStreaming(ctx, params)
+	defer stream.Close()
 	msg := anthropic.Message{}
 	for stream.Next() {
 		if err := msg.Accumulate(stream.Current()); err != nil {
-			return anthropicMessageResult{}, fmt.Errorf("anthropic client: accumulate: %w", err)
+			return anthropicMessageResult{}, b.failure("anthropic", fmt.Errorf("anthropic client: accumulate: %w", err))
 		}
 	}
 	if err := stream.Err(); err != nil {
-		return anthropicMessageResult{}, fmt.Errorf("anthropic client: stream: %w", err)
+		return anthropicMessageResult{}, b.failure("anthropic", fmt.Errorf("anthropic client: stream: %w", err))
 	}
+	b.Reset("anthropic")
 	// Same observation point as the OpenAI-compatible clients (MR !1223): one
 	// structured "llm usage" debug line plus the mills_llm_* counters. The
 	// component label rides on ctx — the council editor and rubric judge each

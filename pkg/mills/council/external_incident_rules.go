@@ -62,8 +62,11 @@ Backlog proposals MUST be actionable in this repository. Do not propose
 actions unless the proposal's files are repo files that implement a local
 guardrail, classifier, retry, telemetry, documentation, config, or operator
 runbook update. File-backed proposals that do not fit those local follow-up
-classes must be omitted, even if they name repository files. If there is no
-in-repo follow-up, emit {"proposals": [],
+classes must be omitted, even if they name repository files. This rule applies
+only to proposals that address the external dependency itself: repo-scoped
+roadmap and defect work that does not depend on the outside system is still
+expected in the same run. If there is no in-repo follow-up at all, emit
+{"proposals": [],
 "omit_reason": "external dependency incident; no actionable in-repo follow-up"}.
 `
 }

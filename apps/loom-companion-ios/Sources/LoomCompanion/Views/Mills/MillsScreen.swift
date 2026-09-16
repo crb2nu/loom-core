@@ -19,6 +19,9 @@ public struct MillsScreen: View {
     @State private var pipelineRuns: [MillsPipelineRun] = []
     @State private var kpi: MillsKPISnapshot?
     @State private var spinRuns: [MillsSpinRun] = []
+    @State private var taste: MillsTasteAggregates?
+    @State private var mergeQueue: MillsMergeQueueSnapshot?
+    @State private var operatorStatus: MillsOperatorStatus?
     @State private var loading = true
     @State private var loadError: String?
     /// True when the last failed read was an auth/permission problem
@@ -95,10 +98,13 @@ public struct MillsScreen: View {
                 } else {
                     if let actionBanner { escalateBanner(actionBanner) }
                     heroCard
+                    if operatorStatus != nil { operatorSection }
                     shiftReportButton
+                    if taste != nil { tasteSection }
                     if !cards.isEmpty { kpiGrid }
                     if controlAPI != nil { spinningRoomSection }
                     pipelinesSection
+                    if showMergeQueue { mergeQueueSection }
                     if let snapshotAt = kpi?.snapshotAt {
                         Text("Snapshot \(LoomFormat.relative(from: snapshotAt))")
                             .font(LoomTypography.monoCaption)
@@ -147,7 +153,7 @@ public struct MillsScreen: View {
         }
         .sheet(isPresented: $showShiftReport) {
             if let api {
-                ShiftReportSheet(api: api)
+                ShiftReportSheet(api: api, controlAPI: controlAPI)
             }
         }
         .confirmationDialog(
@@ -307,6 +313,287 @@ public struct MillsScreen: View {
                 }
             }
         }
+    }
+
+    // MARK: - Operator (policy, autonomy, budget, council yield)
+
+    /// Whether the factory is *allowed* to run, and how much room it has.
+    /// The hero says what happened; this card says why it will or won't
+    /// keep happening: the kill switch, autonomy blockers, health-gate
+    /// admission, 24h budget headroom per tier, and whether the council is
+    /// still minting work. Every row degrades to absent on an older operator.
+    private var operatorSection: some View {
+        let status = operatorStatus ?? MillsOperatorStatus()
+        let verdict = status.verdict
+        return VStack(alignment: .leading, spacing: LoomSpacing.sm) {
+            HStack(spacing: LoomSpacing.xs) {
+                Text("OPERATOR")
+                    .font(LoomTypography.sectionTitle)
+                    .tracking(0.8)
+                    .foregroundStyle(LoomColors.fgSecondary)
+                if let sha = status.buildSHA, !sha.isEmpty {
+                    Text(sha)
+                        .font(LoomTypography.monoCaption)
+                        .foregroundStyle(LoomColors.fgMuted)
+                }
+                Spacer(minLength: 0)
+                LoomPill(
+                    verdict.label,
+                    icon: verdictIcon(verdict),
+                    color: verdictColor(verdict),
+                    style: verdict == .ready ? .outlined : .tinted)
+            }
+
+            operatorChips(status)
+
+            ForEach(verdictReasons(verdict).prefix(3), id: \.self) { reason in
+                Label(reason, systemImage: "exclamationmark.triangle.fill")
+                    .font(LoomTypography.monoCaption)
+                    .foregroundStyle(verdictColor(verdict))
+                    .lineLimit(2)
+            }
+
+            ForEach(status.budgetTiers, id: \.name) { entry in
+                budgetRow(name: entry.name, tier: entry.tier)
+            }
+
+            if let yield = status.councilYield {
+                HStack(alignment: .top, spacing: LoomSpacing.xs) {
+                    Image(systemName: yield.isDrySpell ? "moon.zzz.fill" : "person.3.fill")
+                        .font(LoomTypography.monoCaption)
+                        .foregroundStyle(yield.isDrySpell ? LoomColors.statusDegraded : LoomColors.fgMuted)
+                    Text("Council · " + yield.summary())
+                        .font(LoomTypography.monoCaption)
+                        .foregroundStyle(yield.isDrySpell ? LoomColors.fgPrimary : LoomColors.fgMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if status.lastMergeAt != nil || status.lastCouncilAt != nil {
+                HStack(spacing: LoomSpacing.sm) {
+                    if let merged = status.lastMergeAt {
+                        Text("last merge \(LoomFormat.relative(from: merged))")
+                    }
+                    if let council = status.lastCouncilAt {
+                        Text("last council \(LoomFormat.relative(from: council))")
+                    }
+                }
+                .font(LoomTypography.monoCaption)
+                .foregroundStyle(LoomColors.fgMuted)
+            }
+        }
+        .loomCard(priority: .compact, accent: status.needsAttention
+            ? .severity(verdict == .ready ? LoomColors.statusDegraded : verdictColor(verdict))
+            : .none)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Operator \(verdict.label). " + operatorAccessibilitySummary(status))
+    }
+
+    /// Health-gate + capability chips. A gate block in observe mode is a
+    /// warning chip here rather than the verdict (see `healthGatesEnforcing`).
+    @ViewBuilder
+    private func operatorChips(_ status: MillsOperatorStatus) -> some View {
+        HStack(spacing: LoomSpacing.xs) {
+            if let gates = status.healthGates {
+                let label = (gates.status ?? (gates.allowed ? "pass" : "block"))
+                    + (status.healthGatesMode.map { " · \($0)" } ?? "")
+                LoomPill(
+                    "gates \(label)",
+                    icon: gates.allowed ? "checkmark.shield" : "xmark.shield",
+                    color: gates.allowed ? LoomColors.fgMuted : LoomColors.statusDegraded,
+                    style: gates.allowed ? .outlined : .tinted)
+            }
+            if let rollup = status.capabilityRollup {
+                let degraded = status.degradedCapabilities
+                LoomPill(
+                    degraded.isEmpty ? rollup : "\(rollup) · \(degraded.map(\.id).joined(separator: ", "))",
+                    icon: "cpu",
+                    color: degraded.isEmpty ? LoomColors.fgMuted : LoomColors.statusDegraded,
+                    style: degraded.isEmpty ? .outlined : .tinted)
+            }
+            if !status.policyEnabled, let v = status.policyVersion {
+                LoomPill("policy v\(v) off", icon: "pause.circle", color: LoomColors.statusBlocked, style: .tinted)
+            }
+        }
+    }
+
+    /// One 24h budget tier: "pipeline  $2.64 / $75 · 11/60 runs" over a
+    /// spend bar that turns amber past 85% of the cap.
+    private func budgetRow(name: String, tier: MillsBudgetTier) -> some View {
+        let barColor = tier.isNearCap ? LoomColors.statusDegraded : LoomColors.info
+        var runs = "\(tier.runs)"
+        if tier.runsCap > 0 { runs += "/\(tier.runsCap)" }
+        // Caps are policy constants ($75, $50) — render them whole so the row
+        // reads "$2.90 / $75", not "$2.90 / $75.0".
+        let capText = tier.capUSD == tier.capUSD.rounded()
+            ? "$\(Int(tier.capUSD))"
+            : LoomFormat.usd(tier.capUSD)
+        let cap = tier.capUSD > 0 ? " / \(capText)" : ""
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: LoomSpacing.xs) {
+                Text(name)
+                    .font(LoomTypography.monoCaption)
+                    .foregroundStyle(LoomColors.fgSecondary)
+                Spacer(minLength: 0)
+                Text("\(LoomFormat.usd(tier.spentUSD))\(cap) · \(runs) runs")
+                    .font(LoomTypography.monoCaption)
+                    .foregroundStyle(tier.isNearCap ? LoomColors.statusDegraded : LoomColors.fgMuted)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(LoomColors.bgTertiary)
+                    Capsule()
+                        .fill(barColor)
+                        .frame(width: max(tier.spentFraction > 0 ? 4 : 0, geo.size.width * tier.spentFraction))
+                }
+            }
+            .frame(height: 4)
+        }
+    }
+
+    private func verdictReasons(_ verdict: MillsOperatorStatus.Verdict) -> [String] {
+        switch verdict {
+        case let .held(reasons), let .blocked(reasons): return reasons
+        case .paused: return ["Policy is disabled — the kill switch is on."]
+        case .ready, .unknown: return []
+        }
+    }
+
+    private func verdictIcon(_ verdict: MillsOperatorStatus.Verdict) -> String {
+        switch verdict {
+        case .ready: return "checkmark.circle.fill"
+        case .paused: return "pause.circle.fill"
+        case .held: return "hand.raised.fill"
+        case .blocked: return "xmark.octagon.fill"
+        case .unknown: return "questionmark.circle"
+        }
+    }
+
+    private func verdictColor(_ verdict: MillsOperatorStatus.Verdict) -> Color {
+        switch verdict {
+        case .ready: return LoomColors.statusHealthy
+        case .paused: return LoomColors.statusBlocked
+        case .held: return LoomColors.statusDegraded
+        case .blocked: return LoomColors.statusCritical
+        case .unknown: return LoomColors.fgMuted
+        }
+    }
+
+    private func operatorAccessibilitySummary(_ status: MillsOperatorStatus) -> String {
+        var parts: [String] = []
+        if let rollup = status.capabilityRollup { parts.append("capabilities \(rollup)") }
+        for entry in status.budgetTiers {
+            parts.append("\(entry.name) budget \(LoomFormat.usd(entry.tier.spentUSD)) of \(LoomFormat.usd(entry.tier.capUSD))")
+        }
+        if let yield = status.councilYield { parts.append(yield.summary()) }
+        return parts.joined(separator: ". ")
+    }
+
+    // MARK: - Taste (grade-coverage soak gate)
+
+    /// The rolling-14d grade-coverage ratio against the ≥60% S5/S6 autonomy
+    /// gate. This is the one number a human moves by grading bolts, so it
+    /// gets its own card with the distance-to-gate spelled out.
+    private var tasteSection: some View {
+        let agg = taste ?? MillsTasteAggregates()
+        let coverage = agg.overallCoverage14d
+        let gate = MillsTasteAggregates.coverageGate
+        let atGate = coverage >= gate
+        let barColor = atGate ? LoomColors.statusHealthy : LoomColors.accent
+        return VStack(alignment: .leading, spacing: LoomSpacing.xs) {
+            HStack(spacing: LoomSpacing.xs) {
+                Text("TASTE — SOAK GATE")
+                    .font(LoomTypography.sectionTitle)
+                    .tracking(0.8)
+                    .foregroundStyle(LoomColors.fgSecondary)
+                Spacer(minLength: 0)
+                Text("\(Int((coverage * 100).rounded()))%")
+                    .font(LoomTypography.monoMedium)
+                    .foregroundStyle(atGate ? LoomColors.statusHealthy : LoomColors.fgPrimary)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(LoomColors.bgTertiary)
+                    Capsule()
+                        .fill(barColor)
+                        .frame(width: max(4, geo.size.width * min(1, coverage)))
+                    Rectangle()
+                        .fill(LoomColors.fgMuted)
+                        .frame(width: 2)
+                        .offset(x: geo.size.width * gate)
+                }
+            }
+            .frame(height: 6)
+            Text(tasteSubtitle(agg, atGate: atGate))
+                .font(LoomTypography.monoCaption)
+                .foregroundStyle(LoomColors.fgMuted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .loomCard(priority: .compact)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Taste grade coverage \(Int((coverage * 100).rounded())) percent of the 60 percent gate")
+    }
+
+    private func tasteSubtitle(_ agg: MillsTasteAggregates, atGate: Bool) -> String {
+        let base = "\(agg.overallGraded14d) of \(agg.overallMerged14d) merged bolts graded · 14d"
+        if atGate {
+            return base + " · gate met — ranked dispatch may arm"
+        }
+        let needed = Int((MillsTasteAggregates.coverageGate * Double(agg.overallMerged14d)).rounded(.up)) - agg.overallGraded14d
+        guard needed > 0, agg.overallMerged14d > 0 else { return base }
+        return base + " · \(needed) more to reach the 60% gate — tap grades in the shift report"
+    }
+
+    // MARK: - Merge queue
+
+    private var showMergeQueue: Bool {
+        guard let summary = mergeQueue?.summary else { return false }
+        return summary.enabled || summary.depth > 0
+    }
+
+    /// Serial merge-queue lanes: per-lane rebase→re-prove→merge means depth
+    /// is the number of green candidates waiting on the beam, not a problem
+    /// by itself — it becomes one when it grows, which is why it's visible.
+    private var mergeQueueSection: some View {
+        let entries = mergeQueue?.active ?? []
+        let depth = mergeQueue?.summary?.depth ?? 0
+        return VStack(alignment: .leading, spacing: LoomSpacing.sm) {
+            HStack(spacing: LoomSpacing.xs) {
+                Text("MERGE QUEUE")
+                    .font(LoomTypography.sectionTitle)
+                    .tracking(0.8)
+                    .foregroundStyle(LoomColors.fgSecondary)
+                Spacer(minLength: 0)
+                LoomPill(
+                    depth == 0 ? "idle" : "depth \(depth)",
+                    icon: "arrow.triangle.merge",
+                    color: depth == 0 ? LoomColors.fgMuted : LoomColors.accent,
+                    style: depth == 0 ? .outlined : .tinted)
+            }
+            ForEach(entries.prefix(4)) { entry in
+                HStack(spacing: LoomSpacing.xs) {
+                    Text("!\(entry.mrIID)")
+                        .font(LoomTypography.monoMedium)
+                        .foregroundStyle(LoomColors.fgPrimary)
+                    Text(entry.backlogID.isEmpty ? entry.pipelineRunID : entry.backlogID)
+                        .font(LoomTypography.monoCaption)
+                        .foregroundStyle(LoomColors.fgSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    Text(entry.state)
+                        .font(LoomTypography.monoCaption)
+                        .foregroundStyle(LoomColors.fgMuted)
+                }
+            }
+            if entries.count > 4 {
+                Text("+\(entries.count - 4) more waiting")
+                    .font(LoomTypography.monoCaption)
+                    .foregroundStyle(LoomColors.fgMuted)
+            }
+        }
+        .loomCard(priority: .compact)
     }
 
     // MARK: - Hero (north-star)
@@ -718,6 +1005,9 @@ public struct MillsScreen: View {
         loading = true
         async let snapTask: MillsKPISnapshot? = try? await api.latestKPI(window: "1d")
         async let spinsTask: [MillsSpinRun]? = fetchSpins()
+        async let tasteTask: MillsTasteAggregates? = try? await api.tasteAggregates()
+        async let mergeQueueTask: MillsMergeQueueSnapshot? = try? await api.mergeQueue()
+        async let statusTask: MillsOperatorStatus? = try? await api.operatorStatus()
 
         var runs: [MillsPipelineRun]?
         var runsError: LoomAPIError?
@@ -746,6 +1036,11 @@ public struct MillsScreen: View {
         // hero/grid don't blink back to "—" on a single dropped poll.
         if let snap { kpi = snap }
         if let spins { spinRuns = spins }
+        // Same keep-last contract: a dropped taste/queue poll must not
+        // un-render the sections.
+        if let agg = await tasteTask { taste = agg }
+        if let queue = await mergeQueueTask { mergeQueue = queue }
+        if let status = await statusTask { operatorStatus = status }
         loading = false
     }
 
@@ -838,6 +1133,36 @@ private struct MillsScreenPreviewAPI: MillsAPIProtocol, Sendable {
     func backlog() async throws -> [MillsBacklogItem] { [] }
 
     func approvedPatterns() async throws -> [MillsPatternInfo] { [] }
+
+    func operatorStatus() async throws -> MillsOperatorStatus? {
+        let now = Date()
+        switch state {
+        case .busy:
+            return MillsOperatorStatus(
+                buildSHA: "c9fe3ed7", policyEnabled: true, policyVersion: 2, autonomyReady: true,
+                capabilities: (1...11).map { MillsCapability(id: "cap\($0)", status: "green", requiredForAutonomy: true) },
+                budget: [
+                    "pipeline": MillsBudgetTier(spentUSD: 2.64, capUSD: 75, runs: 11, runsCap: 60),
+                    "council": MillsBudgetTier(spentUSD: 2.77, capUSD: 50, runs: 4),
+                ],
+                queueDepth: 1, activePipelineRuns: 3,
+                lastCouncilAt: now.addingTimeInterval(-4 * 3600),
+                lastMergeAt: now.addingTimeInterval(-8 * 3600),
+                healthGates: MillsHealthGates(allowed: true, status: "pass"), healthGatesMode: "observe",
+                councilYield: MillsCouncilYield(runsSinceLastDelta: 5, costSinceLastDeltaUSD: 3.48, sampleSize: 5))
+        case .idle:
+            return MillsOperatorStatus(
+                buildSHA: "9a61db1d", policyEnabled: true, policyVersion: 2, autonomyReady: false,
+                autonomyBlockers: ["hud_spawn is red", "council_participants uses fake agents"],
+                capabilities: [
+                    MillsCapability(id: "hud_spawn", status: "red", mode: "stub", requiredForAutonomy: true),
+                    MillsCapability(id: "sqlite_store", status: "green", requiredForAutonomy: true),
+                ],
+                budget: ["pipeline": MillsBudgetTier(spentUSD: 66, capUSD: 75, runs: 48, runsCap: 60)],
+                healthGates: MillsHealthGates(allowed: true, status: "pass"), healthGatesMode: "enforce",
+                councilYield: MillsCouncilYield(sampleSize: 4))
+        }
+    }
 
     func latestKPI(window: String) async throws -> MillsKPISnapshot? {
         MillsKPISnapshot(

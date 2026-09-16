@@ -35,6 +35,9 @@ type CodexJSONLParser struct {
 	// duplicate CompleteToolCall would clobber an unrelated in-flight call.
 	openTools      map[string]string
 	completedTools map[string]struct{}
+	// unpricedModelWarned throttles the "model not in price snapshot" warning
+	// to once per spawn: every turn of that spawn would otherwise repeat it.
+	unpricedModelWarned bool
 }
 
 // NewCodexJSONLParser creates a parser that writes structured events to sink.
@@ -184,12 +187,23 @@ func (p *CodexJSONLParser) handleTurnCompleted(line []byte) {
 	// 0 for every Codex spawn. Estimate the cost in-process using the model
 	// metadata from thread.started when available, and fall back to the
 	// canonical Codex model when the SDK omits it.
-	estimatedCost := bridge.EstimateCodexCost(
+	//
+	// A model the price snapshot does not know is billed at the default
+	// model's rate (priced=false), never at $0: this figure feeds Mills stage
+	// records and budget caps, and a free-looking stage is the unsafe
+	// direction. Warn once so a stale snapshot is visible in the spawn log.
+	estimatedCost, priced := bridge.EstimateCodexCost(
 		p.model,
 		freshInputTokens,
 		ev.Usage.CachedInputTokens,
 		ev.Usage.OutputTokens,
 	)
+	if !priced && !p.unpricedModelWarned {
+		p.unpricedModelWarned = true
+		p.logger.Warn("codex model missing from price snapshot; estimating at default rate",
+			"model", p.model,
+			"default_model", bridge.DefaultCodexModel)
+	}
 	if estimatedCost > 0 {
 		p.sink.AddEstimatedCost(estimatedCost)
 	}

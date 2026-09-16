@@ -300,7 +300,13 @@
     const spent = fmtCost(b.spent_usd);
     const cap = b.cap_usd > 0 ? fmtCost(b.cap_usd) : '∞';
     const runs = b.runs_cap > 0 ? `${b.runs}/${b.runs_cap}` : `${b.runs}`;
-    return `${spent} / ${cap} · ${runs} runs`;
+    // spent_usd is metered (billed) spend; subscription harness time is
+    // reported beside it so the gauge no longer reads phantom dollars.
+    const sub = b.subscription_spent_usd ?? 0;
+    const subCap = b.subscription_cap_usd ?? 0;
+    const subPart =
+      sub > 0 || subCap > 0 ? ` · sub ${fmtCost(sub)}${subCap > 0 ? ` / ${fmtCost(subCap)}` : ''}` : '';
+    return `api ${spent} / ${cap}${subPart} · ${runs} runs`;
   }
 
   function depSummary(rows: MillsCapabilityRow[]): string {

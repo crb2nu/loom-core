@@ -2559,3 +2559,19 @@ func TestPruneZeroMaxAgeIsNoOp(t *testing.T) {
 		t.Fatal("Prune with zero maxAge must not evict anything")
 	}
 }
+
+func TestListAuthStateSnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	ctrl := NewK8sController(fake.NewSimpleClientset(), "devbox", nil, nil)
+	ctrl.spawns["auth"] = &State{SpawnID: "auth", AuthFallbackAt: &now, AuthFailures: []AuthFailure{{Account: "oauth-token", ResetAt: now.Add(time.Hour)}}}
+	listed := ctrl.List()
+	if len(listed) != 1 || listed[0].AuthFallbackAt == nil || !listed[0].AuthFallbackAt.Equal(now) {
+		t.Fatalf("missing fallback timestamp: %+v", listed)
+	}
+	listed[0].AuthFailures[0].Account = "changed"
+	*listed[0].AuthFallbackAt = time.Time{}
+	again := ctrl.List()[0]
+	if again.AuthFailures[0].Account != "oauth-token" || !again.AuthFallbackAt.Equal(now) {
+		t.Fatal("List leaked mutable auth state")
+	}
+}

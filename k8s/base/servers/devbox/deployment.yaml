@@ -9,6 +9,20 @@ metadata:
   name: devbox
 spec:
   replicas: 1
+  # The state volume below is RWO Longhorn (node-scoped attach). The gitops
+  # loom-hub-servers overlay patches every mcp-server Deployment to
+  # RollingUpdate maxSurge:1/maxUnavailable:0 (so a base `Recreate` here is
+  # overridden — observed live 2026-09-02), which means the surge pod MUST
+  # co-schedule beside the incumbent to share the node attachment; see the
+  # required self-affinity under `affinity:` (same pattern as mobile-hud's
+  # workspace volume). The outgoing manager's SIGTERM path stops its
+  # sandboxes and marks them "stopped" in the persisted store; the incoming
+  # one restarts them from the registry image without a rebuild.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: devbox
@@ -22,7 +36,21 @@ spec:
         component: mcp-server
         mcp.server/name: devbox
     spec:
+      terminationGracePeriodSeconds: 1860
       serviceAccountName: mcp-devbox
+      # Same-node self-affinity: REQUIRED by the RollingUpdate strategy — the
+      # RWO `devbox-state` volume only attaches to one node, so the surge pod
+      # must land beside the incumbent to share the mount. When no devbox pod
+      # exists (bootstrap, node loss) the self-match carve-out lets the
+      # scheduler place it anywhere. If a roll wedges Pending, check the
+      # incumbent node's free capacity first (surge briefly doubles requests).
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: devbox
+              topologyKey: kubernetes.io/hostname
       containers:
         - env:
             - name: DEVBOX_BACKEND
@@ -33,8 +61,14 @@ spec:
               value: /home/mcp/.cache/loom/devbox
             - name: DEVBOX_DEFAULT_CPU
               value: "2"
+            # 6Gi (was 4Gi, 2026-09-12): `go test ./pkg/mills ./pkg/mills/store`
+            # in the shared loom-core sandbox was killed at the 4Gi limit (exit
+            # 137 / "could not start the exec process (container memory limit
+            # 4Gi)") in ~12 tests attempts over 2026-08-29..09-12 and escalated
+            # as code failures. Limit only — requests stay at the backend's
+            # 128Mi floor, so scheduling is unchanged.
             - name: DEVBOX_DEFAULT_MEMORY_MB
-              value: "4096"
+              value: "6144"
             - name: DEVBOX_HUD_ADDR
               valueFrom:
                 secretKeyRef:
@@ -58,10 +92,29 @@ spec:
               value: devbox-workspace-nfs
             - name: DEVBOX_K8S_MAX_CONCURRENT_BUILDS
               value: "1"
+            # Shared Go build/module/lint cache for every K8s sandbox
+            # (2026-09-13): the caches lived on each pod's ephemeral disk, so
+            # every replaced pod recompiled the world and the 900s test check
+            # timed out. The claim is defined in gitops k3s/devbox/
+            # sandbox-go-cache-pvc.yaml (namespace devbox, Longhorn RWX); the
+            # devbox server verifies it exists at start and falls back to cold
+            # caches with a WARN when it does not.
+            - name: DEVBOX_K8S_GO_CACHE_PVC
+              value: devbox-sandbox-go-cache
+            # Gate budgets sized to a 2-CPU sandbox with a warm cache: the test
+            # commands get 20 minutes; fmt/lint keep the 5-minute default.
+            - name: DEVBOX_QUALITY_GATE_TEST_TIMEOUT_SEC
+              value: "1200"
+            # Build CPU 2 (was 500m, 2026-09-13): buildah image builds for the
+            # loom-core and fi-fhir sandboxes stalled for tens of minutes on
+            # half a core while the factory waited on them (the fi-fhir build
+            # sat behind the weekly base-image job that exceeded its 30-minute
+            # deadline the same morning). The devbox LimitRange allows 4 CPU
+            # per container and the namespace quota has 24 CPU of limits free.
             - name: DEVBOX_K8S_BUILD_CPU_REQUEST
-              value: 250m
-            - name: DEVBOX_K8S_BUILD_CPU_LIMIT
               value: 500m
+            - name: DEVBOX_K8S_BUILD_CPU_LIMIT
+              value: "2"
             - name: DEVBOX_K8S_BUILD_EPHEMERAL_STORAGE_REQUEST
               value: 2Gi
             - name: DEVBOX_K8S_BUILD_EPHEMERAL_STORAGE_LIMIT
@@ -69,7 +122,11 @@ spec:
             - name: DEVBOX_K8S_BUILD_AVOID_NODES
               value: k3s-w-7,k3s-w-11
             - name: DEVBOX_K8S_GIT_BASE_URL
-              value: http://192.168.50.218/services
+              # Group-neutral root; sandbox pods derive the group-qualified
+              # repo path (services/…, libs/…) from their /workspace layout,
+              # and joinRepoURL dedups the boundary segment so either base
+              # form stays correct during config/image rollout skew.
+              value: http://192.168.50.218
             - name: DEVBOX_K8S_GIT_SECRET
               value: gitlab-creds
             - name: DEVBOX_MAX_TAIL_LINES
@@ -88,6 +145,10 @@ spec:
               value: devbox
             - name: MCP_SERVER_COMMAND
               value: /app/services/loom-core/bin/mcp-devbox
+            # Preserve the in-process build tracker and token cache across
+            # operator WebSocket reconnects.
+            - name: MCP_SHARED_CHILD
+              value: "1"
           image: registry.harbor.lan/mcp/custom-server:latest
           imagePullPolicy: Always
           livenessProbe:
@@ -119,6 +180,16 @@ spec:
               drop:
                 - ALL
             readOnlyRootFilesystem: false
+          volumeMounts:
+            # DEVBOX_CACHE_DIR: state.json (which sandbox images are built /
+            # which sandboxes are running) must outlive the pod, or every
+            # rollout rebuilds every project image. See pvc.yaml.
+            - name: state
+              mountPath: /home/mcp/.cache/loom/devbox
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: devbox-state
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true

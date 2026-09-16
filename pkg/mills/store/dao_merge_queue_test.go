@@ -206,3 +206,105 @@ func TestMergeQueueHeads_RestartResume(t *testing.T) {
 		t.Fatalf("ledger_seq lost across reads: %#v", h.Detail)
 	}
 }
+
+// 031 re-admission: an evicted run that re-passes enqueue-time authorization
+// gets a FRESH candidate; a merged verdict stays authoritative; a mid-flight
+// resume still re-finds its active row; readers take the newest row.
+func TestMergeQueueEnqueue_ReadmitsAfterEviction(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	run := seedMergeQueueRun(t, st, "mq-readmit")
+
+	first, created, err := st.MergeQueue.Enqueue(ctx, queueEntry(run, 200), 10)
+	if err != nil || !created {
+		t.Fatalf("first enqueue: created=%v err=%v", created, err)
+	}
+	// Mid-flight resume re-finds the active row.
+	if again, created, err := st.MergeQueue.Enqueue(ctx, queueEntry(run, 200), 10); err != nil || created || again.ID != first.ID {
+		t.Fatalf("active resume: created=%v id=%d err=%v", created, again.ID, err)
+	}
+
+	if _, err := st.MergeQueue.MarkEvicted(ctx, first.ID, MergeQueueEvictHeadMoved, map[string]any{"detail": "head moved"}); err != nil {
+		t.Fatalf("evict: %v", err)
+	}
+	// Re-enqueue after eviction inserts a fresh candidate.
+	second, created, err := st.MergeQueue.Enqueue(ctx, queueEntry(run, 200), 10)
+	if err != nil || !created {
+		t.Fatalf("re-admission: created=%v err=%v", created, err)
+	}
+	if second.ID == first.ID || second.State != MergeQueueQueued {
+		t.Fatalf("re-admission row = %+v (first %d)", second, first.ID)
+	}
+	// Get returns the newest row.
+	got, err := st.MergeQueue.Get(ctx, run)
+	if err != nil || got.ID != second.ID {
+		t.Fatalf("Get newest: id=%d err=%v want %d", got.ID, err, second.ID)
+	}
+	// A merged verdict is final: enqueue re-finds it, never re-queues.
+	if _, err := st.MergeQueue.MarkMerged(ctx, second.ID, MergeQueueQueued, "sha-final"); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if third, created, err := st.MergeQueue.Enqueue(ctx, queueEntry(run, 200), 10); err != nil || created || third.ID != second.ID {
+		t.Fatalf("post-merge enqueue: created=%v id=%d err=%v", created, third.ID, err)
+	}
+}
+
+func TestMergeQueueListSettled_FilterBoundsAndOrdering(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+
+	var entries []*MergeQueueEntry
+	for i := 0; i < 105; i++ {
+		run := seedMergeQueueRun(t, st, fmt.Sprintf("settled-%03d", i))
+		e, _, err := st.MergeQueue.Enqueue(ctx, queueEntry(run, int64(600+i)), 0)
+		if err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+		entries = append(entries, e)
+		if i%2 == 0 {
+			_, err = st.MergeQueue.MarkMerged(ctx, e.ID, MergeQueueQueued, "merged-sha")
+		} else {
+			_, err = st.MergeQueue.MarkEvicted(ctx, e.ID, MergeQueueEvictCIRed, nil)
+		}
+		if err != nil {
+			t.Fatalf("settle %d: %v", i, err)
+		}
+		settled := base.Add(time.Duration(i) * time.Minute)
+		if _, err := st.db.ExecContext(ctx, `UPDATE merge_queue SET settled_at = ?, updated_at = ? WHERE id = ?`,
+			timeRFC3339(settled), timeRFC3339(settled), e.ID); err != nil {
+			t.Fatalf("set settled_at %d: %v", i, err)
+		}
+	}
+
+	// Leave one active row to prove terminal filtering.
+	activeRun := seedMergeQueueRun(t, st, "settled-active")
+	if _, _, err := st.MergeQueue.Enqueue(ctx, queueEntry(activeRun, 999), 0); err != nil {
+		t.Fatalf("enqueue active: %v", err)
+	}
+
+	got, err := st.MergeQueue.ListSettled(ctx, base.Add(100*time.Minute), 10)
+	if err != nil {
+		t.Fatalf("ListSettled: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("since filter returned %d entries, want 5", len(got))
+	}
+	for i, e := range got {
+		want := entries[104-i].PipelineRunID
+		if e.PipelineRunID != want || !e.State.IsTerminal() {
+			t.Fatalf("entry %d = %s/%s, want %s/terminal", i, e.PipelineRunID, e.State, want)
+		}
+	}
+
+	for _, limit := range []int{0, -1} {
+		got, err = st.MergeQueue.ListSettled(ctx, time.Time{}, limit)
+		if err != nil || len(got) != 20 {
+			t.Fatalf("limit %d: len=%d err=%v, want default 20", limit, len(got), err)
+		}
+	}
+	got, err = st.MergeQueue.ListSettled(ctx, time.Time{}, 1000)
+	if err != nil || len(got) != 100 {
+		t.Fatalf("over-cap limit: len=%d err=%v, want cap 100", len(got), err)
+	}
+}

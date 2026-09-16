@@ -665,6 +665,10 @@ func (c *K8sController) Delete(ctx context.Context, spawnID string) error {
 		c.mu.RUnlock()
 		return fmt.Errorf("spawn %s not found", spawnID)
 	}
+	if retainAuthState(state, time.Now()) {
+		c.mu.RUnlock()
+		return fmt.Errorf("spawn retains active auth fallback history")
+	}
 	if !IsTerminal(state.Status) {
 		c.mu.RUnlock()
 		return fmt.Errorf("spawn %s is still %s — stop it first", spawnID, state.Status)
@@ -705,6 +709,13 @@ func (c *K8sController) List() []*State {
 
 func cloneStateForRead(state *State) *State {
 	copy := *state
+	if state.AuthFailures != nil {
+		copy.AuthFailures = append([]AuthFailure{}, state.AuthFailures...)
+	}
+	if state.AuthFallbackAt != nil {
+		at := *state.AuthFallbackAt
+		copy.AuthFallbackAt = &at
+	}
 	if state.Request.Metadata != nil {
 		copy.Request.Metadata = make(map[string]string, len(state.Request.Metadata))
 		for key, value := range state.Request.Metadata {
@@ -719,7 +730,8 @@ func cloneStateForRead(state *State) *State {
 // the persistent store. It also asks capacity-aware stores to shed oldest
 // terminal history when their serialized state crosses the soft size limit.
 // Cleanup-pending rows are retained by age pruning as generation locks; the
-// pressure pass may remove any terminal row to restore dispatch capacity.
+// pressure pass may remove other terminal rows to restore dispatch capacity.
+// Both passes retain same-day UTC fallbacks and unexpired account exclusions.
 //
 // Returns the number of pruned entries. The HUD's `/api/spawns` list grows
 // unboundedly without this — Reconcile keeps every record forever, and the
@@ -729,12 +741,13 @@ func cloneStateForRead(state *State) *State {
 func (c *K8sController) Prune(ctx context.Context, maxAge time.Duration) int {
 	pruned := 0
 	if maxAge > 0 {
-		cutoff := time.Now().Add(-maxAge)
+		now := time.Now()
+		cutoff := now.Add(-maxAge)
 
 		c.mu.RLock()
 		var candidates []*State
 		for id, state := range c.spawns {
-			if state == nil || !IsTerminal(state.Status) || state.CleanupAt == nil {
+			if state == nil || !IsTerminal(state.Status) || state.CleanupAt == nil || retainAuthState(state, now) {
 				continue
 			}
 			// Prefer EndedAt for the cutoff comparison (set by failSpawn /
@@ -1070,6 +1083,9 @@ func (c *K8sController) Reconcile(ctx context.Context) error {
 				}
 			}
 			stopping = append(stopping, *state)
+			continue
+		}
+		if state.AuthRetryPending {
 			continue
 		}
 		if !exists {

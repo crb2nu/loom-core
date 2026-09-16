@@ -1,0 +1,1 @@
+- Reject invalid or conflicting pipeline concurrency policy fields with a typed load-time error before limiter mutation in `pkg/policy/policy.go`, `pkg/policy/validate.go`, and `pkg/mills/pipeline/pipeline.go`.

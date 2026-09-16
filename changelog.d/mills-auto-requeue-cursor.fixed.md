@@ -1,0 +1,1 @@
+- Prevent auto-requeue starvation with a durable ordering cursor, candidate-sized deadlines, and elapsed/deadline/cursor telemetry and sweep metrics (`pkg/mills/reconciler_auto_requeue.go`, `reconciler.go`, `escalation_sweeper.go`, `metrics.go`, and `pkg/mills/store/dao_backlog.go` with migration 041).

@@ -92,6 +92,36 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	mux.HandleFunc("GET /api/mills/workflow/runs/{id}", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/backlog", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/backlog/{id}", mw(d.handleProxyGet))
+	// Backlog item event ledger — the drawer's journey strip. The frontend
+	// has fetched this since the journey shipped, but the allowlist never
+	// carried it, so every drawer poll got the SPA fallback and the journey
+	// rendered "History unavailable" against a healthy operator. Go 1.22
+	// ServeMux does not extend {id} over the /events suffix; the route needs
+	// its own entry.
+	mux.HandleFunc("GET /api/mills/backlog/{id}/events", mw(d.handleProxyGet))
+	// Taste rollup: per-plan grades + the rolling-14d grade-coverage ratio
+	// the S5/S6 autonomy gate reads. Open read like backlog; the iOS
+	// companion's taste tile polls it. Without the explicit registration the
+	// SPA fallback serves HTML the clients then fail to JSON.parse.
+	mux.HandleFunc("GET /api/mills/taste/aggregates", mw(d.handleProxyGet))
+	// Taste calibration: ranked-dispatch score vs terminal outcome (and,
+	// post Cloth Hall S4, grade-weighted realized quality). Open read like
+	// aggregates.
+	mux.HandleFunc("GET /api/mills/taste/calibration", mw(d.handleProxyGet))
+	// Fleet-gate waivers: consumed by the Telemetry panel's waivers section
+	// since it shipped, but never allowlisted — the section has been reading
+	// the SPA fallback in production.
+	mux.HandleFunc("GET /api/mills/fleet-gate/waivers", mw(d.handleProxyGet))
+	// Bolt cards (Cloth Hall S1) + the server-composed shift ledger (Cloth
+	// Hall S2, endpoint lands with that slice). Registered ahead of the
+	// consuming frontend slices: neither Mills slice owns this file, so
+	// without these entries S3's card surfaces would 404 at the HUD against
+	// a fully-deployed operator. Proxying a route the operator doesn't
+	// serve yet is harmless — the operator answers 404 until S2 merges.
+	mux.HandleFunc("GET /api/mills/bolts", mw(d.handleProxyGet))
+	mux.HandleFunc("GET /api/mills/shift-report", mw(d.handleProxyGet))
+	mux.HandleFunc("GET /api/mills/finishing/docs-mirror", mw(d.handleProxyGet))
+	mux.HandleFunc("GET /api/mills/finishing/digest", mw(d.handleProxyGet))
 	// Serial merge queue: active entries + per-lane depth (open read, feeds
 	// the HUD merge-queue panel and lane-pressure checks). Without the
 	// explicit registration the SPA fallback serves HTML the frontend then
@@ -126,6 +156,9 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	// "spin up a repo" action so it can show what's already minted and
 	// whether the two-key policy gate is on. Open read like the spin runs.
 	mux.HandleFunc("GET /api/mills/projects/bootstrapped", mw(d.handleProxyGet))
+	// Mills intake (HUD Projects panel): the project registry with a
+	// per-repo readiness verdict. Open read like the registry above.
+	mux.HandleFunc("GET /api/mills/projects", mw(d.handleProxyGet))
 
 	// Squads (Phase 2 slice 2.5). Read endpoints proxy through without
 	// an admin gate so the HUD's Squads panel can poll them. The
@@ -140,11 +173,6 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	// own admin gate.
 	mux.HandleFunc("GET /api/mills/audit/findings", mw(d.handleProxyGet))
 	mux.HandleFunc("GET /api/mills/audit/findings/{id}", mw(d.handleProxyGet))
-
-	// Cross-repo (Phase 4 slice 4.4). Reads proxy through; abort is
-	// HUD-admin-gated before reaching the operator's own admin gate.
-	mux.HandleFunc("GET /api/mills/cross-repo/runs", mw(d.handleProxyGet))
-	mux.HandleFunc("GET /api/mills/cross-repo/runs/{id}", mw(d.handleProxyGet))
 
 	// Mutations — gated by the HUD's existing admin-token check before
 	// the operator's own admin gate. Two layers of auth keep stray
@@ -162,6 +190,11 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	// plan. Creates a repo AND re-scopes the plan, so it is double-gated
 	// through the HUD admin token before the operator's own admin gate.
 	mux.HandleFunc("POST /api/mills/projects/bootstrap", mw(d.handleProxyAdminPost))
+	// Mills intake: register an existing repo at runtime, and open the
+	// gitops MR that writes its Git-policy admission. Both mutate (the
+	// registry, or platform/gitops), so both double-gate like bootstrap.
+	mux.HandleFunc("POST /api/mills/projects/onboard", mw(d.handleProxyAdminPost))
+	mux.HandleFunc("POST /api/mills/projects/policy-mr", mw(d.handleProxyAdminPost))
 	// Global autonomy kill-switch (plan 42 Slice 1b). Opens a GitOps
 	// auto-PR flipping policy `enabled:`; double-gated through the HUD
 	// admin token before the operator's own admin gate.
@@ -176,7 +209,7 @@ func (d *Domain) RegisterRoutes(mux *http.ServeMux, mw func(http.HandlerFunc) ht
 	mux.HandleFunc("POST /api/mills/eval/run-cross", mw(d.handleProxyAdminPost))
 	mux.HandleFunc("POST /api/mills/squads/{name}/route-test", mw(d.handleProxyAdminPost))
 	mux.HandleFunc("POST /api/mills/audit/run", mw(d.handleProxyAdminPost))
-	mux.HandleFunc("POST /api/mills/cross-repo/runs/{id}/abort", mw(d.handleProxyAdminPost))
+	mux.HandleFunc("POST /api/mills/finishing/digest/run", mw(d.handleProxyAdminPost))
 	// Serial merge-queue enqueue for LOCAL agents (the "via loomd" path):
 	// mcp-gitlab's merge tool posts here with the HUD admin credential and
 	// the proxy injects the operator bearer, so the cluster-wide operator

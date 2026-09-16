@@ -1,0 +1,1 @@
+- Fix Mills queued admission in `pkg/mills/reconciler.go` and `pkg/mills/store/dao_backlog.go` to page past dependency-blocked FIFO heads while preserving ordered, bounded dispatch and concurrency limits.

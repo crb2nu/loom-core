@@ -1,0 +1,1 @@
+- Classify terminal `ci_watch` pipelines whose failed jobs all have runner-level GitLab failure reasons as transient infrastructure, sharing the same structured incident matching in `pkg/mills/pipeline` and documenting the operator rule in `docs/MILLS_RUNBOOK.md`.

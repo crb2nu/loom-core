@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/council"
+	"github.com/crb2nu/loom/pkg/mills/spin"
 	"github.com/crb2nu/loom/pkg/openairesponses"
 )
 
@@ -79,6 +80,9 @@ func TestFallbackCouncilEditor_PrimarySuccessNoFallback(t *testing.T) {
 	e := &FallbackCouncilEditor{Primary: primary, Fallback: fb}
 	if _, err := e.Edit(context.Background(), &council.Brief{Markdown: "x"}, nil); err != nil {
 		t.Fatalf("err: %v", err)
+	}
+	if len(primary.out.FallbackHops) != 0 {
+		t.Fatal("successful primary recorded a hop")
 	}
 	if fb.calls != 0 {
 		t.Fatalf("fallback calls=%d, want 0 (primary succeeded)", fb.calls)
@@ -195,9 +199,11 @@ func TestOpenAICouncilTokenPricing_GPT56GatewayAliases(t *testing.T) {
 		want  float64
 	}{
 		// oa/ is a LiteLLM gateway prefix, not part of the vendor model ID.
-		{"oa/gpt-5.6-sol", (600*5.0 + 400*0.50 + 100*30.0) / 1_000_000},
-		{"oa/gpt-5.6-terra", (600*2.50 + 400*0.25 + 100*15.0) / 1_000_000},
-		{"oa/gpt-5.6-luna", (600*1.0 + 400*0.10 + 100*6.0) / 1_000_000},
+		// Rates are the pkg/llmpricing snapshot (Standard tier, 2026-09-04):
+		// sol $4/$0.40/$20, terra $2/$0.20/$12, luna $0.20/$0.02/$1.20.
+		{"oa/gpt-5.6-sol", (600*4.0 + 400*0.40 + 100*20.0) / 1_000_000},
+		{"oa/gpt-5.6-terra", (600*2.0 + 400*0.20 + 100*12.0) / 1_000_000},
+		{"oa/gpt-5.6-luna", (600*0.20 + 400*0.02 + 100*1.20) / 1_000_000},
 	}
 	for _, tc := range tests {
 		t.Run(tc.model, func(t *testing.T) {
@@ -293,5 +299,107 @@ docs, and a Backlog Proposals block decomposing this into independent slices.`)}
 	}
 	if len(out.Documents) != 3 {
 		t.Fatalf("docs=%d, want 3", len(out.Documents))
+	}
+}
+
+func TestFallbackCouncilEditorHopEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"billing", &VendorError{Vendor: "anthropic", Kind: VendorBilling, Err: errors.New("hold")}},
+		{"auth", &VendorError{Vendor: "anthropic", Kind: VendorAuth, Err: errors.New("key")}},
+		{"breaker_open", &VendorError{Vendor: "anthropic", Kind: VendorBilling, Err: ErrVendorBreakerOpen}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := nonEmptyOutput()
+			out.Backend = "openai"
+			out.Model = "gpt-5.5"
+			out.CostUSD = 2
+			ed := &FallbackCouncilEditor{Primary: &fakeCouncilEditor{out: &council.EditorOutput{CostUSD: 1}, err: tc.err}, Fallback: &fakeCouncilEditor{out: out}, PrimaryLabel: "anthropic:opus"}
+			got, err := ed.Edit(context.Background(), &council.Brief{}, nil)
+			if err != nil || got.CostUSD != 3 || len(got.FallbackHops) != 1 {
+				t.Fatalf("out=%+v err=%v", got, err)
+			}
+			want := council.EditorFallbackHop{Primary: "anthropic:opus", Destination: "openai:gpt-5.5", Kind: tc.name}
+			if got.FallbackHops[0] != want {
+				t.Fatalf("hop=%+v", got.FallbackHops)
+			}
+			if len(out.FallbackHops) != 0 {
+				t.Fatal("mutated shared output")
+			}
+		})
+	}
+}
+
+func TestFallbackCouncilEditorNestedHopEvidence(t *testing.T) {
+	out := nonEmptyOutput()
+	out.Backend = "flexinfer"
+	out.Model = "local"
+	errVendor := &VendorError{Kind: VendorAuth, Err: errors.New("key")}
+	ed := &FallbackCouncilEditor{PrimaryLabel: "anthropic:opus", Primary: &fakeCouncilEditor{err: errVendor}, Fallback: &FallbackCouncilEditor{PrimaryLabel: "openai:gpt", Primary: &fakeCouncilEditor{err: errVendor}, Fallback: &fakeCouncilEditor{out: out}}}
+	got, err := ed.Edit(context.Background(), &council.Brief{}, nil)
+	if err != nil || len(got.FallbackHops) != 2 {
+		t.Fatalf("%+v %v", got, err)
+	}
+	for _, hop := range got.FallbackHops {
+		if hop.Destination != "flexinfer:local" {
+			t.Fatalf("%+v", hop)
+		}
+	}
+}
+
+// Exercise the real fallback wrapper through SpinAll and the persisted spec renderer.
+func TestSpinAllFrameFallbackIsolation(t *testing.T) {
+	failure := &VendorError{Vendor: "anthropic", Kind: VendorBilling, Err: errors.New("billing hold")}
+	out := &council.EditorOutput{Backend: "openai", Model: "gpt-5.5", CostUSD: 2, BacklogProposals: []council.BacklogProposal{{Title: "Retry", PlanSlices: []council.PlanSliceSpec{{Name: "retry", Goal: "retry failures"}}}}}
+	author := &fallbackDraftAuthor{}
+	s := &spin.Spinner{
+		Enabled: func() bool { return true },
+		Frame: func(name string) (spin.Frame, bool) {
+			return spin.Frame{Name: name, Backend: "anthropic", Model: "opus"}, true
+		},
+		NewEditor: func(frame spin.Frame) (council.Editor, error) {
+			fb := &fakeCouncilEditor{out: out}
+			if frame.Name != "jacquard" {
+				fb = &fakeCouncilEditor{err: failure}
+			}
+			return &FallbackCouncilEditor{PrimaryLabel: "anthropic:opus", Primary: &fakeCouncilEditor{err: failure}, Fallback: fb}, nil
+		},
+		Author: author,
+	}
+	got, err := s.SpinAll(context.Background(), spin.Request{Brief: "Add retries", Frames: []string{"jacquard", "down"}})
+	if err != nil || len(got.Results) != 1 || len(got.Failures) != 1 || got.Failures[0].Frame != "down" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if got.Results[0].Model != "gpt-5.5" || got.Results[0].CostUSD != 2 {
+		t.Fatalf("%+v", got.Results[0])
+	}
+	if !strings.Contains(author.spec, "frame=jacquard primary=anthropic:opus fell back to openai:gpt-5.5: billing") {
+		t.Fatal(author.spec)
+	}
+	failed, err := s.SpinAll(context.Background(), spin.Request{Brief: "Add retries", Frames: []string{"down", "down-too"}})
+	if !errors.Is(err, failure) || len(failed.Results) != 0 || len(failed.Failures) != 2 {
+		t.Fatalf("all down: %+v %v", failed, err)
+	}
+}
+
+type fallbackDraftAuthor struct{ spec string }
+
+func (a *fallbackDraftAuthor) AuthorDraftPlan(_ context.Context, in spin.DraftPlanInput) (string, error) {
+	a.spec = draftSpecDoc(in)
+	return "draft", nil
+}
+
+func TestFallbackCouncilEditorExhaustedDoesNotReuseFailedOutput(t *testing.T) {
+	prior := nonEmptyOutput()
+	prior.CostUSD = 1
+	ed := &FallbackCouncilEditor{Primary: &fakeCouncilEditor{out: prior, err: errors.New("failed")}, Fallback: &fakeCouncilEditor{}}
+	got, err := ed.Edit(context.Background(), &council.Brief{}, nil)
+	if err != nil || got == nil || !got.Empty || got.CostUSD != 1 {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if prior.Empty {
+		t.Fatal("mutated primary output")
 	}
 }

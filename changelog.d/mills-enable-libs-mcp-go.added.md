@@ -1,0 +1,1 @@
+- Enable Mills spawns for `libs/mcp-go` with project-metadata-driven workspace and Git clone paths in the mobile HUD deployment, HUD orchestrator, and both devbox backends (k8s init-container and harvester-vm provision script).

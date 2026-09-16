@@ -7,7 +7,13 @@
 // a dependency-free leaf so every staff lane can import it.
 package textsim
 
-import "strings"
+import (
+	"context"
+	"math"
+	"strings"
+
+	"github.com/crb2nu/loom/pkg/codebase/embed"
+)
 
 // GrayBandFloor is the lower Jaccard bound for gray-band dedup: pairs
 // scoring in [GrayBandFloor, threshold) are too dissimilar for a
@@ -16,6 +22,37 @@ import "strings"
 // verdict. Chosen from the live miss: the !970/!978 title pair scores
 // exactly 0.6 with the default stopword set.
 const GrayBandFloor = 0.55
+
+// Scorer compares two work titles. Implementations return normalized scores
+// in [0,1]. Embedding-backed implementations set Fallback when they could not
+// produce a valid semantic score and returned lexical Jaccard unchanged.
+type Scorer interface {
+	Score(ctx context.Context, a, b string) Similarity
+}
+
+// Similarity describes the lexical and optional semantic signals used for a
+// title comparison. When Fallback is true, Combined is exactly Lexical and
+// SemanticAvailable is false.
+type Similarity struct {
+	Lexical           float64
+	Semantic          float64
+	Combined          float64
+	SemanticAvailable bool
+	Fallback          bool
+}
+
+// JaccardScorer adapts decoration-blind work-title Jaccard to Scorer.
+// It is the dependency-free default for callers that do not opt into semantic
+// scoring.
+type JaccardScorer struct{}
+
+// Score returns lexical Jaccard as both the lexical and combined score.
+func (JaccardScorer) Score(_ context.Context, a, b string) Similarity {
+	score := WorkTitleJaccard(a, b)
+	return Similarity{Lexical: score, Combined: score}
+}
+
+var _ Scorer = JaccardScorer{}
 
 // TitleJaccard reports the Jaccard similarity of two backlog-item titles
 // using the same normalization (lowercase, alphanumeric tokens, stopword
@@ -87,6 +124,20 @@ func WorkTitleJaccard(a, b string) float64 {
 		return 0
 	}
 	return Jaccard(ta, NormalizeWorkTitleTokens(b))
+}
+
+// CombineWorkTitleSimilarity returns the stronger of lexical title similarity
+// and a valid embedding cosine. Cosine's [-1,1] range is normalized to [0,1]
+// so the result remains comparable to Jaccard scores.
+// Invalid vectors return lexical unchanged, which is the required fallback
+// for unavailable or malformed embedding results.
+func CombineWorkTitleSimilarity(lexical float64, a, b []float64) (combined, semantic float64, ok bool) {
+	cosine, ok := embed.CosineSimilarity(a, b)
+	if !ok {
+		return lexical, 0, false
+	}
+	semantic = (cosine + 1) / 2
+	return math.Max(lexical, semantic), semantic, true
 }
 
 // stripTitleLead removes ONE leading decoration — a bracketed tag or a

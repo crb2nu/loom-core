@@ -218,7 +218,37 @@ func TestSignatureMiningStopPhrases(t *testing.T) {
 		{name: "normalized generic command", phrase: "go test <path> <path>", want: true},
 		{name: "case insensitive", phrase: "GO TEST ./pkg/mills ./pkg/store", want: true},
 		{name: "punctuation insensitive", phrase: "Go test: ./pkg/mills, ./pkg/store", want: true},
+		{name: "generic make command", phrase: "MAKE TEST ./pkg/mills", want: true},
+		{name: "generic build command", phrase: "go build ./cmd/loom", want: true},
+		{name: "generic format command", phrase: "go fmt ./pkg/mills", want: true},
+		{name: "generic vet command", phrase: "go vet ./...", want: true},
+		{name: "generic lint command", phrase: "golangci-lint run ./...", want: true},
+		{name: "generic repository status", phrase: "git status --short", want: true},
+		{name: "generic infrastructure plan", phrase: "terraform plan ./deployments/dev", want: true},
+		{name: "rfc3339 timestamp", phrase: "2026-08-15T12:34:56.123Z", want: true},
+		{name: "timestamp with weekday", phrase: "Fri, 15 Aug 2026 12:34:56 UTC", want: true},
+		{name: "normalized timestamp shape", phrase: "fri <num> aug <num> <num> <num> <num> utc", want: true},
+		{name: "unix timestamp", phrase: "1786797296", want: true},
+		{name: "uuid", phrase: "550e8400-e29b-41d4-a716-446655440000", want: true},
+		{name: "uuid with braces", phrase: "{550E8400-E29B-41D4-A716-446655440000}", want: true},
+		{name: "compact uuid-like identifier", phrase: "550e8400e29b41d4a716446655440000", want: true},
+		{name: "single normalized placeholder", phrase: "<path>", want: true},
+		{name: "mixed normalized placeholders", phrase: " <UUID>, <path>; <dur> ", want: true},
+		{name: "generic failure words", phrase: "an error occurred command failed", want: true},
+		{name: "bare error", phrase: "error", want: true},
+		{name: "bare failed case insensitive", phrase: "FAILED", want: true},
+		{name: "exit status normalizes number", phrase: "Exit status 1.", want: true},
+		{name: "normalized exit status", phrase: "exit status <num>", want: true},
+		{name: "deadline punctuation insensitive", phrase: "Context deadline exceeded!", want: true},
 		{name: "distinctive failure", phrase: "fatal knitter sidecar refused sync token", want: false},
+		{name: "distinctive error", phrase: "error openrouter returned 402 insufficient credits", want: false},
+		{name: "distinctive failed", phrase: "failed to reconcile deployment", want: false},
+		{name: "distinctive exit status", phrase: "exit status 1 while building loom", want: false},
+		{name: "distinctive deadline", phrase: "context deadline exceeded waiting for gitlab", want: false},
+		{name: "distinctive build failure", phrase: "go build failed undefined symbol reconcileState", want: false},
+		{name: "failure mentioning test command", phrase: "go test failed because linker exhausted memory", want: false},
+		{name: "failure with timestamp", phrase: "2026-08-15T12:34:56Z database connection refused", want: false},
+		{name: "openrouter credit exhaustion", phrase: "OpenRouter HTTP 402 insufficient credits for this request", want: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,7 +260,7 @@ func TestSignatureMiningStopPhrases(t *testing.T) {
 }
 
 // TestSignatureMiningRejectsStopPhraseBeforePersistence proves a generic
-// recurring test command may still form a cluster, but never becomes a stored
+// recurring failure fragment may still form a cluster, but never becomes a stored
 // candidate. Filtering after clustering preserves the miner's grouping rules.
 func TestSignatureMiningRejectsStopPhraseBeforePersistence(t *testing.T) {
 	env := newRecEnv(t, nil)
@@ -238,7 +268,7 @@ func TestSignatureMiningRejectsStopPhraseBeforePersistence(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		seedEscalationEvidence(t, env, fmt.Sprintf("MILLS-GENERIC-%d", i),
 			env.now.Add(-time.Duration(i)*time.Hour),
-			fmt.Sprintf("go test ./pkg/component%d ./pkg/store%d", i, i), false)
+			"context deadline exceeded", false)
 	}
 
 	res, err := env.rec.SweepSignatureMining(context.Background())

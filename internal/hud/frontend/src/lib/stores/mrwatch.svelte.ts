@@ -18,7 +18,7 @@
 
 import { createPoller } from '../utils/poller.ts';
 import { errorMessage, fetchJSON } from '../utils/apiJson.ts';
-import { isLiveMRWatchState } from '../utils/mrwatchStates.ts';
+import { isLiveMRWatchState, mrNeedsAttention } from '../utils/mrwatchStates.ts';
 
 /** registry.MergeRequest. */
 export interface MRWatchMergeRequest {
@@ -96,9 +96,13 @@ class MRWatchStore {
     return this.mergeRequests.filter((mr) => isLiveMRWatchState(mr.state));
   }
 
-  /** Live MRs that need attention. Go considers only "ok" healthy here. */
+  /**
+   * Live MRs that need a human. In-flight states (ci_running,
+   * awaiting_pipeline) and drafts are not "unhealthy" — the Deck chip read
+   * "8 unhealthy" on 2026-09-02 while six of them were simply in CI.
+   */
   get unhealthyCount(): number {
-    return this.liveMergeRequests.filter((mr) => mr.state !== 'ok').length;
+    return this.liveMergeRequests.filter((mr) => mrNeedsAttention(mr.state, mr.pipeline_status)).length;
   }
 
   /** Counts as sorted [state, n] pairs, dropping zero buckets. */

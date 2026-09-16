@@ -1,69 +1,138 @@
-# Mill Staff S2 overseer soak gate
+# Mill Staff S2 overseer soak exit criteria
 
-Promotion from overseer dry-run is held until `EvaluateSoakGate` passes. The
-gate evaluates only: it does not perform, queue, or record promotion. It passes
-only when one `SoakGateTelemetry` snapshot satisfies every criterion:
+This document is the promotion contract for Mill Staff S2. Promotion remains
+blocked unless a checker accepts one complete evidence bundle. A checker must
+fail closed: a missing field, wrong type, invalid value, unreadable source,
+incomplete window, or incomparable baseline returns `promotable: false`.
 
-- the closed soak window is at least 168 hours;
-- the regression count is zero; and
-- reviewed decision disagreements are strictly below 5% of reviewed decisions.
+The predicate is deliberately about elapsed hours, not calendar days. A soak
+must last at least `168` hours, including across daylight-saving transitions.
 
-Exactly 5% disagreement fails. Missing, negative, or internally inconsistent
-evidence also fails closed. At least one reviewed decision is required so the
-rate has a meaningful denominator.
+## Evidence bundle
 
-The input fields are `window`, `regressions`, `reviewed_decisions`, and
-`disagreements`. Callers provide the window explicitly, making the 168-hour
-boundary independent of wall time. The threshold comparison uses exact integer
-arithmetic; the floating-point rate is output for observation only.
+The evaluator accepts one JSON object with a `soak` and a `baseline` snapshot.
+Every field below is required. Counts and rate components are JSON integers;
+they must be non-negative. `duration_hours` must be a JSON number, must be
+finite, and must be at least zero. `start` and `end` are RFC 3339 UTC
+timestamps (`Z` suffix); `end - start` must equal `duration_hours` exactly.
 
-The JSON verdict contains `pass`, the observed
-`decision_disagreement_rate`, stable `failure_reasons`, and
-`mills_overseer_s2_soak_gate_pass`. The metric is numeric: `1` means all
-criteria passed and `0` means promotion remains blocked.
-
-## Persisted dry-run decision counters
-
-Every successfully persisted overseer S2 dry-run decision increments
-`loom_mills_overseer_dry_run_decisions_total`. Decisions rejected by the
-persistence layer are not counted, so the counter describes the same evidence
-population used by the fail-closed persisted-soak evaluation.
-
-The counter has only two labels, each fixed to `true` or `false`:
-
-- `would_have_acted` is the bounded dry-run verdict: `true` means approved
-  execution would act and `false` means it would take no action;
-- `diverged` says whether the dry-run decision disagreed with the approved
-  policy for the same observation.
-
-This produces at most four series. Subjects, action classes, policy text, and
-errors are deliberately excluded from labels.
-
-Use increases over a range when checking the soak because process restarts can
-reset counters:
-
-```promql
-sum(increase(loom_mills_overseer_dry_run_decisions_total[7d]))
+```json
+{
+  "schema_version": "mill-staff-s2-soak/v1",
+  "soak": {
+    "start": "2026-08-03T00:00:00Z",
+    "end": "2026-08-10T00:00:00Z",
+    "duration_hours": 168,
+    "population": "overseer-dry-run/escalation/v1",
+    "overseer_attributed_escalations": 0,
+    "escalation_rate": { "numerator": 0, "denominator": 240 }
+  },
+  "baseline": {
+    "start": "2026-07-20T00:00:00Z",
+    "end": "2026-07-27T00:00:00Z",
+    "duration_hours": 168,
+    "population": "overseer-dry-run/escalation/v1",
+    "overseer_attributed_escalations": 3,
+    "escalation_rate": { "numerator": 3, "denominator": 240 }
+  }
+}
 ```
 
-The action path was exercised when this query is greater than zero:
+`population` is the comparability key. It pins the actor family, dry-run mode,
+event classification, and denominator definition. The two values must match
+byte-for-byte. Baseline collection happens before the soak begins and must use
+the same versioned population; a baseline from another actor family, mode,
+classification, or denominator is not comparable.
 
-```promql
-sum(increase(loom_mills_overseer_dry_run_decisions_total{would_have_acted="true"}[7d]))
+An *overseer-attributed escalation* is one durable audit event whose `actor`
+has the exact `overseer.` prefix and whose `kind` identifies an escalation
+action in the versioned population. This follows the audit contract: an
+overseer action is stored as `overseer.<agent>.<action>` and a dry-run decision
+has the `.dryrun` suffix. Observations, events from `overseerish`, and events
+without a durable audit row are never counted as evidence. The snapshot
+producer must retain the matching event identifiers (or a digest of their
+ordered IDs) with the bundle so a reviewer can reproduce the count.
+
+`escalation_rate` is an exact unitless ratio, not a rounded percentage:
+
+```
+rate = numerator / denominator
 ```
 
-The divergence exit criterion is exactly zero over the full seven-day window:
+The denominator is the number of eligible escalation opportunities in the
+same population and window. It must be positive. A zero denominator makes the
+rate undefined, including for a baseline with zero opportunities, and blocks
+promotion. An implementation must not substitute `0`, `NaN`, or infinity. In
+each snapshot, `escalation_rate.numerator` must equal
+`overseer_attributed_escalations`; a mismatch is internally inconsistent
+evidence and blocks promotion.
 
-```promql
-(sum(increase(loom_mills_overseer_dry_run_decisions_total{diverged="true"}[7d])) or vector(0)) == 0
+## Machine-checkable predicate
+
+Accept a bundle only when all structural rules above hold and all of these
+conditions are true:
+
+```text
+soak.duration_hours >= 168
+soak.overseer_attributed_escalations == 0
+soak.escalation_rate.numerator * baseline.escalation_rate.denominator
+  <= baseline.escalation_rate.numerator * soak.escalation_rate.denominator
 ```
 
-The `or vector(0)` makes an absent `diverged="true"` series evaluate as zero;
-without it, a clean soak that never creates that label combination returns an
-empty vector instead of a passing result.
+Compare rates by cross multiplication using an integer type large enough not
+to overflow; do not compare rounded floating-point values. Equality is a pass.
+The checker must emit one stable result object:
 
-Promotion requires evidence for seven complete UTC days immediately preceding
-the current UTC day, at least one decision and one `would_have_acted="true"`
-decision in that persisted window, and zero divergences. The PromQL checks are
-operational corroboration; missing day buckets, unreadable persistence, or
-inconsistent counters still fail closed in `EvaluatePersistedS2Soak`.
+```json
+{
+  "promotable": true,
+  "fail_closed": false,
+  "failure_reasons": []
+}
+```
+
+On every rejection, `promotable` is `false`, `fail_closed` is `true`, and
+`failure_reasons` contains machine-stable reason codes. Recommended codes are
+`missing_field`, `invalid_type`, `invalid_duration`, `incomplete_window`,
+`inconsistent_evidence`, `incomparable_baseline`, `undefined_rate`, `duration_too_short`,
+`overseer_escalations_present`, and `escalation_rate_regressed`.
+
+## Required fixture evaluation
+
+The following table is the minimum conformance suite for a checker. Start from
+the JSON bundle above; each row changes only the named value unless stated
+otherwise. `PASS` means the result object above; all other outcomes must be a
+fail-closed rejection with the indicated reason.
+
+| Fixture | Change | Expected result |
+| --- | --- | --- |
+| exact-duration | none (`duration_hours: 168`) | PASS |
+| duration-under | `soak.duration_hours: 167.999999` and matching timestamps | `duration_too_short` |
+| zero-escalations | none (`overseer_attributed_escalations: 0`) | PASS |
+| one-escalation | `soak.overseer_attributed_escalations: 1` | `overseer_escalations_present` |
+| inconsistent-rate-count | set `soak.escalation_rate.numerator: 1` | `inconsistent_evidence` |
+| equal-rate | soak ratio `3/240`, baseline ratio `3/240` | PASS |
+| rate-epsilon-above | soak ratio `3000001/240000000`, baseline ratio `3/240` | `escalation_rate_regressed` |
+| missing-field | remove `baseline.escalation_rate` | `missing_field` |
+| nonnumeric-rate | set `soak.escalation_rate.numerator: "0"` | `invalid_type` |
+| negative-rate | set `soak.escalation_rate.denominator: -1` | `undefined_rate` |
+| malformed-duration | set `soak.duration_hours: "168h"` | `invalid_type` |
+| negative-duration | set `soak.duration_hours: -1` | `invalid_duration` |
+| baseline-zero-denominator | set `baseline.escalation_rate.denominator: 0` | `undefined_rate` |
+| incomparable-population | set `baseline.population: "overseer-live/escalation/v1"` | `incomparable_baseline` |
+
+The isolation cases above intentionally keep the other two exit criteria
+passing. A test may report additional structural reasons only when its fixture
+also violates another structural rule.
+
+## Operator procedure
+
+1. Capture and retain a baseline bundle before enabling the dry-run soak.
+2. At the end of a closed window, produce the soak snapshot from durable audit
+   rows and the same denominator source, then evaluate the bundle.
+3. Promote only on `promotable: true`. On any other result, keep dry-run
+   enabled, preserve the source evidence and verdict, and escalate the reason
+   to the Mills operator/on-call.
+4. After repairing evidence collection or the underlying issue, collect a new
+   complete soak window. Do not repair a failed bundle by changing its window,
+   population, or denominator after evaluation.

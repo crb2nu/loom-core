@@ -97,6 +97,13 @@ public enum Endpoint: Sendable {
     // keeps the original unfiltered semantics.
     case millsPipelineRuns(state: String? = nil, limit: Int? = nil)
     case millsKPIs(window: String)
+    // Operator status (GET /api/mills/status, proxied since the mills tier
+    // landed but never read by the app): policy switch, autonomy verdict +
+    // blockers, health-gate admission, capability matrix, rolling-24h budget
+    // per tier, last council/merge, and the council_yield block. Bare JSON,
+    // snake_case keys (the handler builds a map, unlike the PascalCase
+    // store structs).
+    case millsStatus
 
     // Shift report reads (port of the web Factory panel's overlay): one
     // run's detail (failing gate names for sparks), the backlog list
@@ -129,6 +136,15 @@ public enum Endpoint: Sendable {
     // per-run intervention the widget/app can perform today.
     case millsPipelineEscalate(id: String, reason: String? = nil)
 
+    // Taste epic mobile catch-up. The aggregates read carries the rolling-14d
+    // grade-coverage ratio the S5/S6 autonomy gate holds on; the grade POST is
+    // the one-tap keep/meh/regret. Grade rides `handleProxyAdminPost`
+    // (internal/hud/domain/mills/mills.go), so it needs the admin token like
+    // spin/escalate. The merge-queue read is the serial-queue lane snapshot.
+    case millsTasteAggregates
+    case millsPipelineGrade(id: String, grade: String, note: String? = nil)
+    case millsMergeQueue
+
     // Phase 7 / weaver-qwen3 S7b — Weaver screen reads. Same proxy
     // pattern as Mills: HUD's /api/weaver/* (status/history/metrics)
     // and /api/aimodels/roles. Read-only; the daemon-without-weaver
@@ -158,9 +174,10 @@ public enum Endpoint: Sendable {
              .eventsStream, .audit, .sandbox, .spawnList, .spawnConfig, .spawnDetail, .agents,
              .pipelines, .handoffs, .namespaces,
              .spawnTelemetry, .spawnTelemetryTools, .spawnTelemetryFiles, .spawnTelemetryErrors,
-             .millsPipelineRuns, .millsKPIs,
+             .millsPipelineRuns, .millsKPIs, .millsStatus,
              .millsPipelineRunDetail, .millsBacklog, .patternsCatalog,
              .millsSpinningRoomFrames, .millsSpinRuns, .millsSpinRun,
+             .millsTasteAggregates, .millsMergeQueue,
              .plans, .planDetail,
              .alerts, .autofixProposals,
              .weaverStatus, .weaverHistory, .weaverMetrics, .aimodelsRoles,
@@ -172,6 +189,7 @@ public enum Endpoint: Sendable {
              .handoffAccept, .handoffReject,
              .spawnSendMessage, .spawnInterrupt,
              .millsSpinAsync, .planAdvance, .millsPipelineEscalate,
+             .millsPipelineGrade,
              .alertAck, .autofixApprove, .autofixReject,
              .recoveryTelemetryUpload:
             return "POST"
@@ -296,6 +314,8 @@ public enum Endpoint: Sendable {
             return "/api/mills/pipeline/runs"
         case .millsKPIs:
             return "/api/mills/kpis"
+        case .millsStatus:
+            return "/api/mills/status"
         case let .millsPipelineRunDetail(id):
             return "/api/mills/pipeline/runs/\(id)"
         case .millsBacklog:
@@ -318,6 +338,12 @@ public enum Endpoint: Sendable {
             return "/api/plans/\(id)/advance"
         case let .millsPipelineEscalate(id, _):
             return "/api/mills/pipeline/runs/\(id)/escalate"
+        case .millsTasteAggregates:
+            return "/api/mills/taste/aggregates"
+        case let .millsPipelineGrade(id, _, _):
+            return "/api/mills/pipeline/runs/\(id)/grade"
+        case .millsMergeQueue:
+            return "/api/mills/merge-queue"
         case .weaverStatus:
             return "/api/weaver/status"
         case .weaverHistory:
@@ -341,6 +367,7 @@ public enum Endpoint: Sendable {
              .spawnAgent, .spawnStop,
              .spawnSendMessage, .spawnInterrupt,
              .millsSpinAsync, .planAdvance, .millsPipelineEscalate,
+             .millsPipelineGrade,
              .alertAck, .autofixApprove, .autofixReject,
              .recoveryTelemetryUpload:
             return true
@@ -366,7 +393,7 @@ public enum Endpoint: Sendable {
     /// NOT gated and deliberately stay off this list.
     var requiresAdminToken: Bool {
         switch self {
-        case .millsSpinAsync, .millsPipelineEscalate, .autofixApprove:
+        case .millsSpinAsync, .millsPipelineEscalate, .millsPipelineGrade, .autofixApprove:
             return true
         default:
             return false
@@ -677,6 +704,15 @@ public enum Endpoint: Sendable {
             // from the phone.
             let r = (reason ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let body: [String: Any] = ["reason": r.isEmpty ? "escalated from iOS companion" : r]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        case let .millsPipelineGrade(_, grade, note):
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            // handlePipelineGrade decodes with DisallowUnknownFields — send
+            // exactly {grade, note?} and nothing else.
+            var body: [String: Any] = ["grade": grade]
+            let trimmedNote = (note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedNote.isEmpty { body["note"] = trimmedNote }
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         case let .alertAck(_, ackedBy):

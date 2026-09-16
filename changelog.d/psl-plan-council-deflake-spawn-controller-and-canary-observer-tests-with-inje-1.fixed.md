@@ -1,0 +1,1 @@
+- Deflake spawn-controller and canary-observer concurrency coverage in `internal/hud` and `pkg/mills/workflow/killtest` with injected clocks and explicit lifecycle synchronization.

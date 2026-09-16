@@ -1,0 +1,1 @@
+- Make concurrent devbox quality gates share completed build tracking and join active Buildah pods, while skipping build pods when the destination registry already contains the requested image (`cmd/mcp-devbox`, `internal/devbox/backend`).

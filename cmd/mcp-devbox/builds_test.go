@@ -1,12 +1,75 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/crb2nu/loom/internal/devbox/backend"
+	"github.com/crb2nu/loom/internal/devbox/detect"
 )
+
+type blockingBuildBackend struct {
+	fakeBackend
+	invocations atomic.Int32
+	started     chan struct{}
+	release     chan struct{}
+}
+
+func (b *blockingBuildBackend) Build(context.Context, backend.BuildOpts) (*backend.BuildResult, error) {
+	if b.invocations.Add(1) == 1 {
+		close(b.started)
+	}
+	<-b.release
+	return &backend.BuildResult{}, nil
+}
+
+func TestBuildManagerConcurrentCallsShareCompletion(t *testing.T) {
+	b := &blockingBuildBackend{started: make(chan struct{}), release: make(chan struct{})}
+	m := &manager{
+		cfg:     managerConfig{syncMode: "git-clone"},
+		backend: b,
+		builds:  newBuildTracker(),
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	fp := &detect.EnvFingerprint{Hash: "e3b0c44", ProjectName: "loom-core"}
+
+	var firstWG sync.WaitGroup
+	firstWG.Add(2)
+	for range 2 {
+		go func() {
+			defer firstWG.Done()
+			if ready, err := m.ensureAsyncBuild("/workspace/services/loom-core", "loom-core", "devbox/loom-core:e3b0c44", fp); ready != "" || err == nil {
+				t.Errorf("in-flight result = (%q, %v), want building error", ready, err)
+			}
+		}()
+	}
+	<-b.started
+	firstWG.Wait()
+	close(b.release)
+	m.buildWg.Wait()
+
+	var readyWG sync.WaitGroup
+	readyWG.Add(2)
+	for range 2 {
+		go func() {
+			defer readyWG.Done()
+			if ready, err := m.ensureAsyncBuild("/workspace/services/loom-core", "loom-core", "devbox/loom-core:e3b0c44", fp); ready != "ready" || err != nil {
+				t.Errorf("completed result = (%q, %v), want (ready, nil)", ready, err)
+			}
+		}()
+	}
+	readyWG.Wait()
+	if got := b.invocations.Load(); got != 1 {
+		t.Fatalf("backend Build invoked %d times, want 1", got)
+	}
+}
 
 // TestBuildTracker_StartOrJoinDedupes verifies that a second caller for the
 // same tag joins the in-flight build instead of starting a duplicate.
@@ -78,10 +141,10 @@ func TestBuildTracker_DoneTransition(t *testing.T) {
 	}
 }
 
-// TestBuildTracker_RestartsAfterDone verifies that once a build is done, a new
-// startOrJoin for the same tag starts a fresh build rather than joining the
-// stale finished one.
-func TestBuildTracker_RestartsAfterDone(t *testing.T) {
+// TestBuildTracker_JoinsAfterDone verifies that completion remains observable
+// until the manager consumes it, preventing a racing caller from re-arming the
+// same immutable-tag build.
+func TestBuildTracker_JoinsAfterDone(t *testing.T) {
 	tr := newBuildTracker()
 	var wg sync.WaitGroup
 
@@ -89,8 +152,8 @@ func TestBuildTracker_RestartsAfterDone(t *testing.T) {
 	wg.Wait()
 
 	_, started := tr.startOrJoin("img:x", &wg, func() error { return nil })
-	if !started {
-		t.Fatal("startOrJoin after a finished build should start a new one")
+	if started {
+		t.Fatal("startOrJoin after a finished build should share its result")
 	}
 	wg.Wait()
 }

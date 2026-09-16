@@ -49,11 +49,12 @@ func TestAnthropicRubricJudge_ErrorAndRefusal(t *testing.T) {
 		t.Fatal("transport error must propagate")
 	}
 	j = &AnthropicRubricJudge{Client: &fakeAnthropicMessenger{res: anthropicMessageResult{Refusal: true}}, Model: "claude-sonnet-5"}
-	if _, err := j.Judge(context.Background(), gates.PRSelfReviewRubricName, gates.StageInput{}); err == nil {
-		t.Fatal("refusal must be an error, not a silent verdict")
+	_, refusalErr := j.Judge(context.Background(), gates.PRSelfReviewRubricName, gates.StageInput{})
+	if e, ok := AsVendorError(refusalErr); !ok || e.Kind != VendorRefusal {
+		t.Fatal("refusal must be typed")
 	}
 	j = &AnthropicRubricJudge{Client: &fakeAnthropicMessenger{res: anthropicMessageResult{Text: "no json here"}}, Model: "claude-sonnet-5"}
-	if _, err := j.Judge(context.Background(), gates.PRSelfReviewRubricName, gates.StageInput{}); err == nil {
-		t.Fatal("unparseable envelope must be an error")
+	if _, err := j.Judge(context.Background(), gates.PRSelfReviewRubricName, gates.StageInput{}); !errors.Is(err, ErrRubricUnparseable) {
+		t.Fatal("unparseable envelope must preserve the parse sentinel")
 	}
 }

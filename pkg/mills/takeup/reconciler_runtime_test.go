@@ -42,6 +42,9 @@ func (b *blockingPlanStore) ListPlans(ctx context.Context, _, _, _ string) ([]cl
 func (b *blockingPlanStore) ListSlices(context.Context, string) ([]clients.PlanSliceSummary, error) {
 	return nil, nil
 }
+func (b *blockingPlanStore) ListSlicesIfChanged(context.Context, clients.PlanSummary) ([]clients.PlanSliceSummary, error) {
+	return nil, nil
+}
 func (b *blockingPlanStore) GetSlice(context.Context, string) (clients.PlanSliceSummary, error) {
 	return clients.PlanSliceSummary{}, nil
 }

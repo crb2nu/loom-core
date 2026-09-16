@@ -341,13 +341,20 @@ func (s *Service) HandleEngramList(ctx context.Context, args map[string]any) (*m
 	})
 }
 
-// HandleEngramGraph returns the adjacency list for the prerequisite graph
-// rooted at a given URI or family.
+// HandleEngramGraph returns the adjacency list for the prerequisite graph.
+// With a root URI it walks from that engram (direction=down for
+// prerequisites, up for dependents). Without a root it returns the FULL
+// catalog graph with rich nodes — the tech-tree contract the HUD has called
+// with empty arguments since !1532/!1535, which the previous required-root
+// schema rejected (the tree had never rendered in production).
 func (s *Service) HandleEngramGraph(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 	v := validate.NewArgs(args)
-	root := v.Required("root")
+	root := v.String("root", "")
 	if err := v.Validate(); err != nil {
 		return mcp.ErrorResult(err), nil
+	}
+	if root == "" {
+		return s.fullEngramGraph()
 	}
 
 	maxDepth := v.Int("max_depth", 3)
@@ -418,6 +425,125 @@ func (s *Service) HandleEngramGraph(ctx context.Context, args map[string]any) (*
 		"direction": direction,
 		"nodes":     nodeList,
 		"edges":     edgeList,
+	})
+}
+
+// fullGraphNodeCap bounds the root-less graph payload. The catalog grows at
+// authoring pace (tens, not thousands); the cap is a guardrail against a
+// runaway response, surfaced honestly via `truncated` rather than an error.
+const fullGraphNodeCap = 500
+
+// fullEngramGraph returns the whole catalog as a rich adjacency list. Nodes
+// carry `id` == `uri` explicitly (`id`, `uri`, `title`, `tier`,
+// `proof_status`, `content`, `prerequisites`, `last_verified`, `proof`):
+// edges reference URIs and the tree joins nodes to edges by that key, and
+// since 2026-08-30 list/recall key by URI too — one identity everywhere
+// (the backing memory-item id rides those responses as `memory_id`).
+// Prerequisite targets missing from the catalog are emitted as stub nodes
+// (`stub: true`) so every edge keeps two resolvable ends. Node and edge order
+// is deterministic (tier, then URI) so repeated fetches are cache-stable.
+func (s *Service) fullEngramGraph() (*mcp.CallToolResult, error) {
+	res, err := s.memoryHierarchy.Recall(MemoryRecallRequest{
+		Categories: []string{EngramCategory, "recipe"},
+		Tiers:      []MemoryTier{MemoryTierLongTerm},
+		Limit:      fullGraphNodeCap + 1,
+	})
+	if err != nil {
+		return mcp.ErrorResult(fmt.Errorf("engram graph: %w", err)), nil
+	}
+	items := res.Items
+	truncated := false
+	if len(items) > fullGraphNodeCap {
+		items = items[:fullGraphNodeCap]
+		truncated = true
+	}
+
+	type graphNode struct {
+		uri  string
+		tier int
+		node map[string]any
+	}
+	nodes := make([]graphNode, 0, len(items))
+	known := map[string]bool{}
+	type edge struct{ From, To string }
+	var edges []edge
+
+	for _, item := range items {
+		uri := metadataString(item.Metadata, mdEngramURI)
+		if uri == "" || known[uri] {
+			continue
+		}
+		known[uri] = true
+		prereqs := metadataStringSlice(item.Metadata, mdEngramPrerequisites)
+		if prereqs == nil {
+			prereqs = []string{}
+		}
+		tier := metadataInt(item.Metadata, mdEngramTier, DefaultEngramTier)
+		nodes = append(nodes, graphNode{uri: uri, tier: tier, node: map[string]any{
+			// id == uri, explicitly: edges and prerequisites reference URIs,
+			// and list/recall now key by URI too — one identity everywhere.
+			"id":            uri,
+			"uri":           uri,
+			"title":         item.Title,
+			"tier":          tier,
+			"proof_status":  metadataStringDefault(item.Metadata, mdEngramProofStatus, ProofStatusUnverified),
+			"content":       item.Content,
+			"prerequisites": prereqs,
+			"last_verified": metadataString(item.Metadata, mdEngramLastVerified),
+			"proof":         metadataString(item.Metadata, mdRecipeProof),
+		}})
+		for _, p := range prereqs {
+			edges = append(edges, edge{From: uri, To: p})
+		}
+	}
+	// Dangling prerequisite targets become stub nodes: the edge stays
+	// joinable and the tree renders the gap instead of dropping it. The
+	// explicit marker lets consumers that count engrams off this payload
+	// (the HUD summary rollup) leave gaps out without inferring it from shape.
+	for _, e := range edges {
+		if !known[e.To] {
+			known[e.To] = true
+			nodes = append(nodes, graphNode{uri: e.To, tier: DefaultEngramTier, node: map[string]any{
+				"id":            e.To,
+				"uri":           e.To,
+				"title":         "",
+				"tier":          DefaultEngramTier,
+				"proof_status":  ProofStatusUnverified,
+				"prerequisites": []string{},
+				"stub":          true,
+			}})
+		}
+	}
+
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].tier != nodes[j].tier {
+			return nodes[i].tier < nodes[j].tier
+		}
+		return nodes[i].uri < nodes[j].uri
+	})
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].From != edges[j].From {
+			return edges[i].From < edges[j].From
+		}
+		return edges[i].To < edges[j].To
+	})
+
+	nodeList := make([]map[string]any, 0, len(nodes))
+	for _, n := range nodes {
+		nodeList = append(nodeList, n.node)
+	}
+	edgeList := make([]map[string]string, 0, len(edges))
+	for _, e := range edges {
+		edgeList = append(edgeList, map[string]string{"from": e.From, "to": e.To})
+	}
+
+	return mcp.JSONResult(map[string]any{
+		"ok":        true,
+		"root":      "",
+		"direction": "down",
+		"nodes":     nodeList,
+		"edges":     edgeList,
+		"truncated": truncated,
 	})
 }
 
@@ -568,11 +694,25 @@ func buildEngramTags(uri, family, slug string, tier int, language, scope string,
 func engramItemToMap(item MemoryItem) map[string]any {
 	prereqs := metadataStringSlice(item.Metadata, mdEngramPrerequisites)
 	unlocked := metadataStringSlice(item.Metadata, mdEngramUnlockedIn)
+	// The engram's identity is its URI — every address in the system
+	// (prerequisites, graph edges, Pattern.engrams, the verify/graph tool
+	// inputs) speaks URI. This map used to put the backing MEMORY-ITEM id in
+	// "id", which made list/recall responses self-inconsistent: their own
+	// prerequisites could not be resolved against their own id space, and
+	// clients grew tolerant three-way matchers to survive it. The storage id
+	// stays available as memory_id; legacy recipe items without a URI keep it
+	// as their id so they remain uniquely addressable.
+	uri := metadataString(item.Metadata, mdEngramURI)
+	id := uri
+	if id == "" {
+		id = item.ID
+	}
 	return map[string]any{
-		"id":            item.ID,
+		"id":            id,
+		"memory_id":     item.ID,
 		"title":         item.Title,
 		"content":       item.Content,
-		"uri":           metadataString(item.Metadata, mdEngramURI),
+		"uri":           uri,
 		"family":        metadataString(item.Metadata, mdEngramFamily),
 		"slug":          metadataString(item.Metadata, mdEngramSlug),
 		"tier":          metadataInt(item.Metadata, mdEngramTier, DefaultEngramTier),

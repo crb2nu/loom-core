@@ -2,13 +2,31 @@ package guard
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
+
+func TestCheckCredentialPresenceNeverRetainsValues(t *testing.T) {
+	secret := "do-not-report-this"
+	got := CheckCredentialPresence([]string{"TOKEN_A", "TOKEN_B", "TOKEN_B"}, func(name string) (string, bool) {
+		if name == "TOKEN_A" {
+			return secret, true
+		}
+		return "", false
+	})
+	if len(got.Missing) != 1 || got.Missing[0] != "TOKEN_B" {
+		t.Fatalf("missing = %v", got.Missing)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", got), secret) {
+		t.Fatal("credential value retained in report")
+	}
+}
 
 // countingAgent ticks a counter and returns a scripted result.
 type countingAgent struct {

@@ -250,21 +250,67 @@ func printClusterAuthOAuthDetail(namespace string) {
 	if kubeconfig == "" {
 		return
 	}
-	// Check claude-oauth-token (Slice 2b.2a — vendor-sanctioned 1yr headless token).
-	token := readSecretKey(kubeconfig, namespace, "cluster-agent-auth", "claude-oauth-token")
-	switch {
-	case token == "":
-		fmt.Println("      CLAUDE_CODE_OAUTH_TOKEN: absent — run `claude setup-token`, set under claude-oauth-token")
-	case token == "PLACEHOLDER":
-		fmt.Println("      CLAUDE_CODE_OAUTH_TOKEN: placeholder — run `claude setup-token`")
-	case strings.HasPrefix(token, "sk-ant-oat01-"):
-		fmt.Printf("      CLAUDE_CODE_OAUTH_TOKEN: present (%dB, sk-ant-oat01-…)\n", len(token))
-	default:
-		prefix := token
-		if len(prefix) > 12 {
-			prefix = prefix[:12] + "…"
+	// Check every claude-oauth-token* key (Slice 2b.2a — vendor-sanctioned 1yr
+	// headless token). More than one key means claude-code spawns are dealt
+	// across several Claude subscriptions (SPAWN_CLAUDE_OAUTH_TOKEN_KEYS on the
+	// mobile-hud deployment); each needs its own `claude setup-token`.
+	keys := listSecretKeysWithPrefix(kubeconfig, namespace, "cluster-agent-auth", "claude-oauth-token")
+	if len(keys) == 0 {
+		keys = []string{"claude-oauth-token"}
+	}
+	for _, key := range keys {
+		label := "CLAUDE_CODE_OAUTH_TOKEN"
+		if key != "claude-oauth-token" {
+			label = "CLAUDE_CODE_OAUTH_TOKEN[" + key + "]"
 		}
-		fmt.Printf("      CLAUDE_CODE_OAUTH_TOKEN: unexpected format (prefix=%q)\n", prefix)
+		token := readSecretKey(kubeconfig, namespace, "cluster-agent-auth", key)
+		switch {
+		case token == "":
+			fmt.Printf("      %s: absent — run `claude setup-token`, set under %s\n", label, key)
+		case token == "PLACEHOLDER":
+			fmt.Printf("      %s: placeholder — run `claude setup-token`\n", label)
+		case strings.HasPrefix(token, "sk-ant-oat01-"):
+			fmt.Printf("      %s: present (%dB, sk-ant-oat01-…)\n", label, len(token))
+		default:
+			prefix := token
+			if len(prefix) > 12 {
+				prefix = prefix[:12] + "…"
+			}
+			fmt.Printf("      %s: unexpected format (prefix=%q)\n", label, prefix)
+		}
+	}
+	if len(keys) > 1 {
+		fmt.Printf("      pooled Claude accounts: %d (%s)\n", len(keys), strings.Join(keys, ", "))
+	}
+}
+
+// listSecretKeysWithPrefix returns the secret's data keys that start with
+// prefix, sorted, or nil when the secret is unreadable.
+func listSecretKeysWithPrefix(kubeconfig, namespace, secretName, prefix string) []string {
+	out, err := exec.CommandContext(context.Background(), "kubectl", "--kubeconfig", kubeconfig, //nolint:gosec // trusted args
+		"get", "secret", secretName, "-n", namespace,
+		"-o", `go-template={{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}`,
+	).Output()
+	if err != nil {
+		return nil
+	}
+	var keys []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if key := strings.TrimSpace(line); key != "" && strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	sortStrings(keys)
+	return keys
+}
+
+// sortStrings is a tiny insertion sort so this file does not pull in sort
+// for a handful of secret keys.
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
 	}
 }
 

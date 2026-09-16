@@ -837,6 +837,96 @@ func TestPathPolicy_MissingPolicyFails(t *testing.T) {
 	}
 }
 
+// TestPathPolicy_CrossRepoOverlay: a cross-repo item (TargetProject set) is
+// judged against the target repo's protected_paths_per_repo replacement, and
+// a home-repo item never consults a foreign
+// repo's overlay (the 2026-08 gap: loom-core's globs were the only protected
+// surface flexdeck/flexinfer runs were ever checked against).
+func TestPathPolicy_CrossRepoOverlay(t *testing.T) {
+	g := &PathPolicy{}
+	pol := fixturePolicy(t)
+	pol.Pipeline.ProtectedPathsPerRepo = map[string][]string{
+		"services/flexdeck": {"internal/rbac/**", "k8s/**"},
+	}
+	pol.CrossRepo.DemandProjects = []string{"services/flexdeck", "services/flexinfer"}
+	if err := pol.Validate(); err != nil {
+		t.Fatalf("overlay policy: %v", err)
+	}
+
+	item := fixtureItem()
+	item.TargetProject = "services/flexdeck"
+	in := StageInput{
+		Policy:       pol,
+		Item:         item,
+		FilesChanged: []string{"internal/rbac/store.go"},
+	}
+	if out, _ := g.Evaluate(context.Background(), in); out.Pass {
+		t.Errorf("undeclared overlay-protected touch on the target repo should fail, got %+v", out)
+	}
+
+	// A bare target-project name resolves to the same overlay entry.
+	item.TargetProject = "flexdeck"
+	if out, _ := g.Evaluate(context.Background(), in); out.Pass {
+		t.Errorf("bare target-project name should match the overlay key, got %+v", out)
+	}
+
+	// A home-repo item (no TargetProject) never inherits a foreign overlay.
+	item.TargetProject = ""
+	if out, _ := g.Evaluate(context.Background(), in); !out.Pass {
+		t.Errorf("home-repo item must not inherit a foreign repo's overlay, got %+v", out)
+	}
+
+	// The foreign replacement excludes loom-core's global paths.
+	item.TargetProject = "services/flexdeck"
+	in.FilesChanged = []string{"cmd/loomd/main.go"}
+	if out, _ := g.Evaluate(context.Background(), in); !out.Pass {
+		t.Errorf("loom-core path must not gate flexdeck, got %+v", out)
+	}
+
+	// Pre-declared overlay touches pass — the opt-in works cross-repo too.
+	item.Policy.ProtectedPathsTouched = []string{"internal/rbac/store.go"}
+	in.FilesChanged = []string{"internal/rbac/store.go"}
+	if out, _ := g.Evaluate(context.Background(), in); !out.Pass {
+		t.Errorf("declared overlay touch should pass, got %+v", out)
+	}
+
+	item.TargetProject = "services/flexinfer"
+	in.FilesChanged = []string{"cmd/loomd/main.go"}
+	if out, _ := g.Evaluate(context.Background(), in); out.Pass {
+		t.Errorf("known target without replacement should inherit global, got %+v", out)
+	}
+	item.TargetProject = "services/unknown"
+	if out, _ := g.Evaluate(context.Background(), in); out.Pass || len(out.Reasons) == 0 || !strings.Contains(out.Reasons[0], "unknown target repository") {
+		t.Errorf("unknown target must fail closed deterministically, got %+v", out)
+	}
+
+	// An item that names the HOME repository explicitly — bucket-qualified
+	// or bare — is a home-repo item: the global list applies, not the
+	// fail-closed unknown-target path. Four hand-filed items escalated on
+	// 2026-09-12 after successful implements because they carried
+	// "services/loom-core".
+	in.HomeProject = "services/loom-core"
+	for _, home := range []string{"services/loom-core", "loom-core"} {
+		item.TargetProject = home
+		item.Policy.ProtectedPathsTouched = nil
+		in.FilesChanged = []string{"docs/weaver.md"}
+		if out, _ := g.Evaluate(context.Background(), in); !out.Pass {
+			t.Errorf("home repo named as %q must resolve to the global list (unprotected touch), got %+v", home, out)
+		}
+		in.FilesChanged = []string{"cmd/loomd/main.go"}
+		if out, _ := g.Evaluate(context.Background(), in); out.Pass {
+			t.Errorf("home repo named as %q must still enforce the global list, got %+v", home, out)
+		}
+	}
+	// Without a known home the alias cannot apply and the target stays
+	// unknown — the runner always supplies HomeProject in production.
+	in.HomeProject = ""
+	item.TargetProject = "services/loom-core"
+	if out, _ := g.Evaluate(context.Background(), in); out.Pass || len(out.Reasons) == 0 || !strings.Contains(out.Reasons[0], "unknown target repository") {
+		t.Errorf("home alias must not apply without HomeProject, got %+v", out)
+	}
+}
+
 // ---------- SecretScan ----------
 
 func TestSecretScan_CleanDiffPasses(t *testing.T) {
@@ -962,7 +1052,7 @@ func TestCommitFormat_LongSubjectFails(t *testing.T) {
 func TestDefault_HasAllCoreGates(t *testing.T) {
 	r := Default()
 	got := r.Names()
-	want := []string{"branch_pushed", "commit_format", "diff_size", "docs_guardrail", "fabricated_slice", "nonempty_diff", "path_policy", "scope", "secret_scan"}
+	want := []string{"branch_pushed", "commit_format", "dependency_preflight", "diff_size", "docs_guardrail", "fabricated_slice", "nonempty_diff", "path_policy", "scope", "secret_scan", "tested_head", "tests_verdict"}
 	if len(got) != len(want) {
 		t.Fatalf("default registry: got %v want %v", got, want)
 	}

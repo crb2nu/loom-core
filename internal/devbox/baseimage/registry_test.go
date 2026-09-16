@@ -1,6 +1,13 @@
 package baseimage
 
-import "testing"
+import (
+	"context"
+	"crypto/tls"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
 
 func TestLookup_KnownVersions(t *testing.T) {
 	tests := []struct {
@@ -23,6 +30,48 @@ func TestLookup_KnownVersions(t *testing.T) {
 		got := Lookup(tt.lang, tt.ver)
 		if got != tt.wantImage {
 			t.Errorf("Lookup(%q, %q) = %q, want %q", tt.lang, tt.ver, got, tt.wantImage)
+		}
+	}
+}
+
+func TestProbeRegistry(t *testing.T) {
+	t.Run("self-signed TLS available", func(t *testing.T) {
+		s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+		defer s.Close()
+		client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} // #nosec G402 -- verifies the configured Buildah-compatible posture.
+		got := ProbeRegistry(context.Background(), client, s.URL, RegistryCredentials{})
+		assertAllOutcomes(t, got, ProbeAvailable)
+	})
+	t.Run("missing", func(t *testing.T) {
+		s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.NotFound(w, nil) }))
+		defer s.Close()
+		got := ProbeRegistry(context.Background(), s.Client(), s.URL, RegistryCredentials{})
+		assertAllOutcomes(t, got, ProbeMissing)
+	})
+	t.Run("unauthorized", func(t *testing.T) {
+		s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
+		defer s.Close()
+		got := ProbeRegistry(context.Background(), s.Client(), s.URL, RegistryCredentials{})
+		assertAllOutcomes(t, got, ProbeUnauthorized)
+	})
+	t.Run("dial failure", func(t *testing.T) {
+		s := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		client, url := s.Client(), s.URL
+		s.Close()
+		client.Timeout = 100 * time.Millisecond
+		got := ProbeRegistry(context.Background(), client, url, RegistryCredentials{})
+		assertAllOutcomes(t, got, ProbeTransport)
+	})
+}
+
+func assertAllOutcomes(t *testing.T, got []ProbeResult, want ProbeOutcome) {
+	t.Helper()
+	if len(got) != len(Languages()) {
+		t.Fatalf("got %d results, want %d", len(got), len(Languages()))
+	}
+	for _, result := range got {
+		if result.Outcome != want {
+			t.Fatalf("%s:%s outcome = %q, want %q", result.Language, result.Version, result.Outcome, want)
 		}
 	}
 }

@@ -5,23 +5,38 @@
   // mcp-agent-context redeploy; until then the catalog is empty and the panel
   // shows a "no patterns yet" state.
   import { onMount, onDestroy } from 'svelte';
-  import { patternsStore, type PatternInfo, type PatternMaterialField } from '../../stores/patterns.svelte.ts';
+  import { patternsStore, type PatternInfo } from '../../stores/patterns.svelte.ts';
+  import { buildMaterials, type RawMaterialValues } from '../../utils/spinningRoomHelpers.ts';
+  import PatternCardPicker from '../shared/PatternCardPicker.svelte';
+  import PatternMaterialsFields from '../shared/PatternMaterialsFields.svelte';
   import { engramsStore } from '../../stores/engrams.svelte.ts';
   import PanelHeader from '../shared/PanelHeader.svelte';
   import ErrorBanner from '../shared/ErrorBanner.svelte';
+  import EmptyState from '../shared/EmptyState.svelte';
   import EngramTree from './EngramTree.svelte';
+  import ProofBadge from './shared/ProofBadge.svelte';
+  import TierBadge from './shared/TierBadge.svelte';
+  import { composedEngrams, refLabel } from './shared/engramLinks.ts';
   import { relativeTime } from '../../utils/format.ts';
 
   let selectedId = $state<string | null>(null);
-  let values = $state<Record<string, string>>({});
+  let values = $state<RawMaterialValues>({});
   let project = $state('');
   let formError = $state<string | null>(null);
+  /** Selection in the engram half, lifted here so the two registers can drive
+   *  each other: a pattern's composed-engram chip opens the tree's drawer, and
+   *  that drawer's "composed into" links select a pattern back here. */
+  let selectedEngramId = $state<string | null>(null);
+  let stampFormEl = $state<HTMLElement | null>(null);
 
-  const patterns = $derived(patternsStore.patterns);
+  // The panel's list rides the view-state filter; the store itself always
+  // holds the full catalog (the old fetch-with-filter leaked this panel's
+  // filter into the Factory shelf and the shift report).
+  const patterns = $derived(patternsStore.filtered);
   const selected = $derived<PatternInfo | null>(
     patterns.find((p) => p.id === selectedId) ?? null
   );
-  const schema = $derived<PatternMaterialField[]>(selected?.materials_schema ?? []);
+  const schema = $derived(selected?.materials_schema ?? []);
 
   onMount(() => patternsStore.startPolling(30000));
   onDestroy(() => patternsStore.stopPolling());
@@ -44,55 +59,40 @@
     selectedId = p.id;
     patternsStore.clearResult();
     formError = null;
-    // Seed the form from each field's default.
-    const next: Record<string, string> = {};
-    for (const f of p.materials_schema ?? []) next[f.name] = f.default ?? '';
-    values = next;
+    // Fresh, EMPTY form: empty fields (bools included) are omitted at build
+    // time so the stamp applies the pattern's declared defaults — the same
+    // semantics as the Spin dialog now that both ride buildMaterials.
+    values = {};
     void patternsStore.fetchInstances(p.id);
   }
 
-  // Coerce the string form values into a typed materials object, validating
-  // required fields, integers, and JSON for object/list fields.
-  function buildMaterials(): Record<string, unknown> | null {
-    formError = null;
-    const materials: Record<string, unknown> = {};
-    for (const f of schema) {
-      const raw = (values[f.name] ?? '').trim();
-      if (!raw) {
-        if (f.required && !f.default) {
-          formError = `"${f.name}" is required`;
-          return null;
-        }
-        continue; // omit empty optional → server applies the default
-      }
-      if (f.type === 'int') {
-        const n = Number(raw);
-        if (!Number.isInteger(n)) {
-          formError = `"${f.name}" must be an integer`;
-          return null;
-        }
-        materials[f.name] = n;
-      } else if (f.type === 'bool') {
-        materials[f.name] = raw === 'true';
-      } else if (f.type === 'object' || f.type === 'list') {
-        try {
-          materials[f.name] = JSON.parse(raw);
-        } catch {
-          formError = `"${f.name}" must be valid JSON`;
-          return null;
-        }
-      } else {
-        materials[f.name] = raw;
-      }
-    }
-    return materials;
+  /** Arrive at a pattern from the engram drawer: select it, close the drawer,
+   *  and bring the stamp form into view so the trip ends somewhere useful. */
+  function openPattern(p: PatternInfo): void {
+    selectPattern(p);
+    selectedEngramId = null;
+    queueMicrotask(() => stampFormEl?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
   }
+
+  /** The engrams a selected pattern composes, resolved against the loaded
+   *  catalog. Unresolvable refs are kept and rendered as inert, which is the
+   *  honest reading of "this pattern names an engram the catalog lacks". */
+  const selectedComposed = $derived(composedEngrams(selected, engramsStore.graph?.nodes ?? []));
+
+
+  // Stamp→beam is the point of this page, so enqueue defaults ON. Unchecked,
+  // the stamp writes a draft Plan only (the old behavior — which this panel
+  // used to do silently while its banner implied work had started).
+  let enqueueToBeam = $state(true);
 
   async function submit(): Promise<void> {
     if (!selected) return;
-    const materials = buildMaterials();
-    if (!materials) return;
-    await patternsStore.stamp(selected.id, materials, project.trim());
+    const { materials, errors } = buildMaterials(schema, values);
+    formError = errors.length > 0 ? errors.join(' · ') : null;
+    if (errors.length > 0) return;
+    await patternsStore.stamp(selected.id, materials, project.trim(), {
+      enqueue: enqueueToBeam,
+    });
   }
 
 </script>
@@ -139,22 +139,33 @@
       <span class="engram-total text-mono">{engramTotal}</span>
       <span class="engram-groups">
         {#each engramStatuses as [status, n] (status)}
-          <span class="engram-chip status-{status}" class:zero={n === 0}>
-            <span class="text-mono">{n}</span> {status}
+          <span class="engram-stat" class:zero={n === 0}>
+            <span class="text-mono stat-n">{n}</span>
+            <ProofBadge {status} />
           </span>
         {/each}
       </span>
       {#if engramTiers.length > 0}
         <span class="engram-groups tiers">
           {#each engramTiers as [tier, n] (tier)}
-            <span class="engram-chip tier"><span class="text-mono">{n}</span> {tier.replace(':', ' ')}</span>
+            <span class="engram-stat">
+              <span class="text-mono stat-n">{n}</span>
+              <TierBadge tier={Number(tier.split(':')[1]) || 1} />
+            </span>
           {/each}
         </span>
       {/if}
     {/if}
   </div>
 
-  <EngramTree graph={engramsStore.graph} unavailable={engramsStore.catalogUnavailable} error={engramsStore.error} />
+  <EngramTree
+    graph={engramsStore.graph}
+    unavailable={engramsStore.catalogUnavailable}
+    error={engramsStore.catalogError ?? engramsStore.error}
+    {patterns}
+    bind:selectedId={selectedEngramId}
+    onOpenPattern={openPattern}
+  />
 
   {#if patternsStore.error}
     <ErrorBanner prefix="Catalog unavailable" message={patternsStore.error} />
@@ -164,36 +175,23 @@
     <!-- Pattern catalog -->
     <div class="catalog">
       {#if patterns.length === 0 && !patternsStore.loading}
-        <div class="empty">
-          <div class="empty-mark">◇</div>
-          <div class="empty-heading">No patterns in the catalog yet</div>
-          <div class="empty-sub">
-            The catalog seeds on the next <code>mcp-agent-context</code> redeploy. Once live,
-            approved patterns appear here ready to stamp.
-          </div>
-        </div>
+        <EmptyState
+          compact
+          icon="◇"
+          heading="No patterns in the catalog yet"
+          description="Patterns are stampable templates that compose engrams into a Plan. The catalog seeds on the next mcp-agent-context redeploy."
+        />
       {:else}
-        {#each patterns as p (p.id)}
-          <button class="card" class:selected={p.id === selectedId} onclick={() => selectPattern(p)}>
-            <div class="card-head">
-              <span class="card-name">{p.name}</span>
-              <span class="badge badge-{p.status}">{p.status}</span>
-            </div>
-            <div class="card-makes">{p.makes}</div>
-            {#if p.description}<div class="card-desc">{p.description}</div>{/if}
-            <div class="card-foot">
-              <span class="text-mono dim">v{p.version}</span>
-              {#if p.tags?.length}
-                <span class="tags">{#each p.tags as t (t)}<span class="tag">{t}</span>{/each}</span>
-              {/if}
-            </div>
-          </button>
-        {/each}
+        <PatternCardPicker
+          patterns={patterns}
+          selectedId={selectedId}
+          onPick={selectPattern}
+        />
       {/if}
     </div>
 
     <!-- Stamp form / result -->
-    <div class="stamp">
+    <div class="stamp" bind:this={stampFormEl}>
       {#if !selected}
         <div class="stamp-placeholder">Select a pattern to supply its materials.</div>
       {:else}
@@ -243,8 +241,26 @@
             {/if}
             {#if selected.engrams?.length}
               <div class="book-section">Composed engrams</div>
-              <div class="tags">
-                {#each selected.engrams as e (e)}<span class="tag text-mono">{e}</span>{/each}
+              <!-- The pattern -> engram edge, made navigable. These were inert
+                   spans while a working engram drawer sat on the same page. -->
+              <div class="engram-links">
+                {#each selectedComposed as composed (composed.ref)}
+                  {#if composed.node}
+                    <button
+                      type="button"
+                      class="engram-link"
+                      title="Open {composed.node.name || composed.ref} in the engram tree"
+                      onclick={() => (selectedEngramId = composed.node!.id)}
+                    >
+                      <ProofBadge status={composed.node.proof_status} subtle />
+                      {composed.node.name || refLabel(composed.ref)}
+                    </button>
+                  {:else}
+                    <span class="engram-link missing" title="{composed.ref} — not in the loaded catalog">
+                      {refLabel(composed.ref)}
+                    </span>
+                  {/if}
+                {/each}
               </div>
             {/if}
             {#if selected.deploy_contract}
@@ -255,44 +271,7 @@
         {/if}
 
         <div class="fields">
-          {#each schema as f (f.name)}
-            <div class="field">
-              <label class="field-label" for={`mat-${f.name}`}>
-                {f.name}
-                {#if f.required}<span class="req" title="required">*</span>{/if}
-                <span class="field-type text-mono">{f.type}</span>
-              </label>
-              {#if f.description}<div class="field-hint">{f.description}</div>{/if}
-
-              {#if f.type === 'enum' && f.enum?.length}
-                <select id={`mat-${f.name}`} bind:value={values[f.name]}>
-                  <option value="" disabled={f.required}>{f.required ? '— choose —' : '(default)'}</option>
-                  {#each f.enum as opt (opt)}<option value={opt}>{opt}</option>{/each}
-                </select>
-              {:else if f.type === 'bool'}
-                <select id={`mat-${f.name}`} bind:value={values[f.name]}>
-                  <option value="">(default)</option>
-                  <option value="true">true</option>
-                  <option value="false">false</option>
-                </select>
-              {:else if f.type === 'object' || f.type === 'list'}
-                <textarea
-                  id={`mat-${f.name}`}
-                  class="text-mono"
-                  rows="3"
-                  placeholder={f.example || '{ "json": "value" }'}
-                  bind:value={values[f.name]}
-                ></textarea>
-              {:else}
-                <input
-                  id={`mat-${f.name}`}
-                  type={f.type === 'int' ? 'number' : 'text'}
-                  placeholder={f.example || ''}
-                  bind:value={values[f.name]}
-                />
-              {/if}
-            </div>
-          {/each}
+          <PatternMaterialsFields schema={schema} bind:values={values} disabled={patternsStore.stamping} />
 
           <div class="field">
             <label class="field-label" for="mat-project">project <span class="field-type text-mono">scope</span></label>
@@ -304,8 +283,12 @@
         {#if patternsStore.stampError}<div class="banner error">Stamp failed: {patternsStore.stampError}</div>{/if}
 
         <div class="actions">
+          <label class="enqueue-check" title="Also queue the stamped plan as a Mills backlog item (admin-gated)">
+            <input type="checkbox" bind:checked={enqueueToBeam} />
+            <span>queue for Mills</span>
+          </label>
           <button class="btn primary" onclick={submit} disabled={patternsStore.stamping}>
-            {patternsStore.stamping ? 'Stamping…' : 'Stamp'}
+            {patternsStore.stamping ? 'Stamping…' : enqueueToBeam ? 'Stamp → beam' : 'Stamp draft'}
           </button>
         </div>
 
@@ -313,6 +296,14 @@
           {@const r = patternsStore.lastResult}
           <div class="result">
             <div class="result-head">✓ Stamped into a Plan</div>
+            {#if r.backlog_id}
+              <div class="result-row"><span class="result-key">queued</span><span class="text-mono">{r.backlog_id}</span></div>
+            {:else}
+              <div class="result-row">
+                <span class="result-key">state</span>
+                <span>draft only — advance the plan to <em>planned</em> (or restamp with "queue for Mills") to feed the beam</span>
+              </div>
+            {/if}
             <div class="result-row"><span class="result-key">plan</span><span class="text-mono">{r.plan_id}</span></div>
             <div class="result-row"><span class="result-key">slices</span><span class="text-mono">{r.slice_count}</span></div>
             {#if r.tools_required?.length}
@@ -365,6 +356,14 @@
     gap: var(--space-3);
     padding: var(--space-4);
     min-height: 0;
+    /* This root skips the shared `.panel` base class, so it must own the
+       scroll contract itself: ViewShell's .view-content clips (overflow
+       hidden), and without a scroll path here everything past the first
+       viewport — the engram tree, the pattern grid tail — was simply
+       unreachable (+930px clipped at 720p, 2026-08-15). */
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
   }
   .subtitle { font-size: var(--text-xs); color: var(--fg-tertiary); }
   .filter { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
@@ -422,20 +421,16 @@
     color: var(--fg-primary);
   }
   .engram-unavailable { color: var(--fg-tertiary); font-style: italic; }
-  .engram-groups { display: inline-flex; gap: var(--space-1); flex-wrap: wrap; }
+  .engram-groups { display: inline-flex; gap: var(--space-2); flex-wrap: wrap; }
   .engram-groups.tiers { margin-left: auto; }
-  .engram-chip {
-    padding: 1px var(--space-2);
-    border-radius: var(--radius-sm);
-    background: var(--bg-tertiary);
-    color: var(--fg-secondary);
-  }
+  /* Count + shared badge. The status vocabulary itself now lives in
+     ProofBadge/TierBadge, so the strip, the tree nodes and the pattern cards
+     cannot drift apart again. */
+  .engram-stat { display: inline-flex; align-items: center; gap: var(--space-1); }
+  .stat-n { font-weight: 700; color: var(--fg-secondary); }
   /* A zero bucket stays in the strip so its width is stable across refreshes,
      but it must not read as a signal. */
-  .engram-chip.zero { opacity: 0.45; }
-  .engram-chip.status-verified { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
-  .engram-chip.status-stale    { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
-  .engram-chip.status-failing  { background: color-mix(in srgb, var(--error) 16%, transparent); color: var(--error); }
+  .engram-stat.zero { opacity: 0.45; }
 
   .banner {
     padding: var(--space-2) var(--space-3);
@@ -448,31 +443,8 @@
   @media (max-width: 760px) { .body { grid-template-columns: 1fr; } }
 
   .catalog { display: flex; flex-direction: column; gap: var(--space-2); }
-  .card {
-    text-align: left;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: var(--space-3);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--bg-secondary);
-    cursor: pointer;
-    transition: border-color var(--transition-fast), background var(--transition-fast);
-  }
-  .card:hover { border-color: var(--accent); }
-  .card.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary)); }
-  .card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
-  .card-name { font-weight: 600; color: var(--fg-primary); }
-  .card-makes { font-size: var(--text-sm); color: var(--fg-secondary); }
-  .card-desc { font-size: var(--text-xs); color: var(--fg-tertiary); line-height: 1.4; }
-  .card-foot { display: flex; align-items: center; gap: var(--space-2); margin-top: 2px; }
   .dim { color: var(--fg-tertiary); }
 
-  .badge { font-size: var(--text-xs); padding: 1px var(--space-2); border-radius: var(--radius-sm); text-transform: capitalize; }
-  .badge-approved { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
-  .badge-candidate { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); }
-  .badge-deprecated { background: color-mix(in srgb, var(--fg-tertiary) 18%, transparent); color: var(--fg-tertiary); }
 
   .tags { display: inline-flex; gap: 4px; flex-wrap: wrap; }
   .tag { font-size: var(--text-xs); padding: 0 var(--space-1); border-radius: var(--radius-sm); background: var(--bg-tertiary); color: var(--fg-tertiary); }
@@ -540,13 +512,39 @@
   }
   .book-deploy { font-size: var(--text-xs); color: var(--fg-secondary); }
 
+  /* Composed-engram chips: same pill anatomy as the tree's link buttons, so
+     travelling pattern -> engram -> pattern feels like one surface. */
+  .engram-links { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+  .engram-link {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    border: 1px solid var(--border);
+    background: var(--bg-primary);
+    color: var(--accent);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    transition: border-color var(--transition-fast);
+  }
+  .engram-link:hover { border-color: var(--accent); }
+  /* A ref the catalog cannot resolve stays visible but inert — it is a real
+     state (pattern names an engram the library lacks), not a rendering bug. */
+  .engram-link.missing {
+    color: var(--fg-tertiary);
+    border-style: dashed;
+    cursor: default;
+    text-decoration: line-through;
+  }
+
   .fields { display: flex; flex-direction: column; gap: var(--space-3); }
   .field { display: flex; flex-direction: column; gap: 4px; }
   .field-label { font-size: var(--text-sm); color: var(--fg-secondary); display: flex; align-items: center; gap: var(--space-2); }
   .field-type { font-size: var(--text-xs); color: var(--fg-tertiary); }
-  .req { color: var(--error); }
-  .field-hint { font-size: var(--text-xs); color: var(--fg-tertiary); }
-  input, select, textarea {
+  /* Only the project input remains panel-local; the materials fields carry
+     their own styles inside PatternMaterialsFields. */
+  input {
     padding: var(--space-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -555,8 +553,16 @@
     font-size: var(--text-sm);
     font-family: inherit;
   }
-  textarea { resize: vertical; }
-  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  input:focus { outline: none; border-color: var(--accent); }
+
+  .enqueue-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: var(--text-xs);
+    color: var(--fg-secondary);
+    cursor: pointer;
+  }
 
   .actions { display: flex; gap: var(--space-2); }
 
@@ -577,9 +583,4 @@
   .history-meta code { font-family:var(--font-mono); }
   .history-meta a { color:var(--accent); }
 
-  .empty { display: flex; flex-direction: column; align-items: center; gap: var(--space-2); text-align: center; padding: var(--space-6) var(--space-4); color: var(--fg-tertiary); }
-  .empty-mark { font-size: var(--text-2xl); color: var(--fg-tertiary); }
-  .empty-heading { font-weight: 600; color: var(--fg-secondary); }
-  .empty-sub { font-size: var(--text-sm); max-width: 38ch; line-height: 1.5; }
-  .empty-sub code { font-family: var(--font-mono); background: var(--bg-tertiary); padding: 0 4px; border-radius: var(--radius-xs); }
 </style>

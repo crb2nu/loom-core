@@ -1,8 +1,11 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -99,6 +102,72 @@ func TestBaseMonitor_BackoffOnErrors(t *testing.T) {
 
 	if got := b.Snapshot(); got == 0 {
 		t.Fatal("expected recovery after transient errors")
+	}
+}
+
+// TestRefreshBackoff_LongOutageStaysVisibleWithoutFlooding pins the loop's
+// logging contract over a sustained outage: three WARNs, then silence until
+// one "still failing" summary per backoffSummaryEvery, ticks skipped up to
+// the effective-interval cap, and a single recovery line with the outage
+// duration. Driven with a fake clock so it is deterministic.
+func TestRefreshBackoff_LongOutageStaysVisibleWithoutFlooding(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	origSummary, origMax := backoffSummaryEvery, backoffMaxEffectiveInterval
+	backoffSummaryEvery, backoffMaxEffectiveInterval = 10*time.Minute, 5*time.Minute
+	t.Cleanup(func() { backoffSummaryEvery, backoffMaxEffectiveInterval = origSummary, origMax })
+
+	const interval = 15 * time.Second
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	var s refreshBackoff
+	upstream := errors.New("list sessions: connection refused")
+
+	var skips []int
+	for i := 0; i < 60; i++ {
+		skip := s.failed(logger, interval, upstream, now)
+		skips = append(skips, skip)
+		now = now.Add(time.Duration(skip+1) * interval)
+	}
+	if got := strings.Count(buf.String(), "refresh error"); got != backoffWarnCount {
+		t.Fatalf("initial warnings = %d, want %d\n%s", got, backoffWarnCount, buf.String())
+	}
+	// 60 failures with a 5-minute effective cap span well over an hour of
+	// fake time; summaries must appear, spaced by backoffSummaryEvery.
+	elapsed := now.Sub(time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC))
+	summaries := strings.Count(buf.String(), "refresh still failing")
+	wantMax := int(elapsed/backoffSummaryEvery) + 1
+	if summaries == 0 || summaries > wantMax {
+		t.Fatalf("summaries = %d over %s, want between 1 and %d\n%s", summaries, elapsed, wantMax, buf.String())
+	}
+	// Skips grow with consecutive failures and cap at the effective-interval
+	// ceiling: (5m / 15s) - 1 = 19 ticks skipped, never more.
+	if skips[0] != 0 || skips[1] != 1 || skips[2] != 2 {
+		t.Fatalf("early skips = %v, want 0,1,2,…", skips[:3])
+	}
+	maxSkip := int(backoffMaxEffectiveInterval/interval) - 1
+	for i, skip := range skips {
+		if skip > maxSkip {
+			t.Fatalf("skip[%d] = %d exceeds cap %d", i, skip, maxSkip)
+		}
+	}
+	if skips[len(skips)-1] != maxSkip {
+		t.Fatalf("final skip = %d, want the cap %d", skips[len(skips)-1], maxSkip)
+	}
+
+	buf.Reset()
+	s.recovered(logger, now)
+	if !strings.Contains(buf.String(), "refresh recovered") || !strings.Contains(buf.String(), "degraded_for=") {
+		t.Fatalf("recovery line missing duration: %s", buf.String())
+	}
+	if s.consecutive != 0 {
+		t.Fatalf("recovered must reset state, consecutive = %d", s.consecutive)
+	}
+	// A recovery with no prior failure is silent.
+	buf.Reset()
+	s.recovered(logger, now)
+	if buf.Len() != 0 {
+		t.Fatalf("recovery without an outage must not log: %s", buf.String())
 	}
 }
 

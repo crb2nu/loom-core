@@ -26,8 +26,16 @@ func (r *storeBudgetReader) CouncilCostSince(ctx context.Context, since time.Tim
 	return r.st.Council.SumCostSince(ctx, since)
 }
 
+func (r *storeBudgetReader) CouncilLocalCostSince(ctx context.Context, since time.Time) (float64, error) {
+	return r.st.Council.SumLocalCostSince(ctx, since)
+}
+
 func (r *storeBudgetReader) PipelineCostSince(ctx context.Context, since time.Time) (float64, error) {
 	return r.st.Pipeline.SumCostSince(ctx, since)
+}
+
+func (r *storeBudgetReader) PipelineSubscriptionCostSince(ctx context.Context, since time.Time) (float64, error) {
+	return r.st.Pipeline.SumSubscriptionCostSince(ctx, since)
 }
 
 func (r *storeBudgetReader) CouncilRunsSince(ctx context.Context, since time.Time) (int, error) {

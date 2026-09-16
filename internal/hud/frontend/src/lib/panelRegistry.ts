@@ -26,10 +26,10 @@ export const panelLoaders: Record<string, PanelLoader> = {
   // Unified cross-vendor session browser (claude + codex transcripts from
   // every host, joined against the live fleet).
   sessions:  () => import('./components/SessionsPanel.svelte'),
-  dispatch:  () => import('./components/DispatchPanel.svelte'),
+  // (dispatch and lifecycle were retired 2026-08-30 — router.svelte.ts
+  // redirects their hashes to the Deck and the Timeline.)
   presence:  () => import('./components/PresencePanel.svelte'),
   topology:  () => import('./components/TopologyPanel.svelte'),
-  lifecycle: () => import('./components/LifecyclePanel.svelte'),
   mrwatch:   () => import('./components/MRWatchPanel.svelte'),
   alerts:    () => import('./components/AlertsPanel.svelte'),
 
@@ -81,14 +81,13 @@ export const panelLoaders: Record<string, PanelLoader> = {
   bolts:             () => import('./components/mills/BoltsPanel.svelte'),
   telemetry:         () => import('./components/mills/TelemetryPanel.svelte'),
   'mills-workflows': () => import('./components/mills/WorkflowsPanel.svelte'),
-  // `staff` is the Mill Staff group's landing panel: the three departments in
-  // one view plus the five staff evidence reports.
-  staff:             () => import('./components/mills/MillStaffPanel.svelte'),
+  // The staff landing composes its three operational surfaces under one
+  // collapsible shell. Their dedicated tabs remain available.
+  staff:             () => import('./components/mills/MillStaffGroup.svelte'),
   council:           () => import('./components/mills/CouncilPanel.svelte'),
   eval:              () => import('./components/mills/EvalPanel.svelte'),
   squads:            () => import('./components/mills/SquadsPanel.svelte'),
   audit:             () => import('./components/mills/AuditPanel.svelte'),
-  'cross-repo':      () => import('./components/mills/CrossRepoPanel.svelte'),
   policy:            () => import('./components/mills/PolicyPanel.svelte'),
   overseers:         () => import('./components/mills/OverseersPanel.svelte'),
   patterns:          () => import('./components/mills/PatternsPanel.svelte'),

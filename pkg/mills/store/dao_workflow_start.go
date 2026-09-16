@@ -226,13 +226,13 @@ func readWorkflowStartBudgetSnapshot(
 	if err := tx.QueryRowContext(ctx, `
 		SELECT
 			COALESCE((
-				SELECT SUM(pr.cost_usd) FROM pipeline_runs pr WHERE pr.started_at >= ?
+				SELECT SUM(pr.cost_usd - pr.subscription_cost_usd) FROM pipeline_runs pr WHERE pr.started_at >= ?
 			), 0) + COALESCE((
 				SELECT SUM(wr.cost_usd) FROM workflow_runs wr
 				WHERE wr.engine = 'imperative' AND wr.started_at >= ?
 			), 0),
 			COALESCE((
-				SELECT SUM(MAX(r.reserved_usd - COALESCE(pr.cost_usd, wr.cost_usd, 0), 0))
+				SELECT SUM(MAX(r.reserved_usd - COALESCE(pr.cost_usd - pr.subscription_cost_usd, wr.cost_usd, 0), 0))
 				FROM pipeline_budget_reservations r
 				LEFT JOIN pipeline_runs pr ON pr.id = r.run_id
 				LEFT JOIN workflow_runs wr ON wr.id = r.run_id AND wr.engine = 'imperative'

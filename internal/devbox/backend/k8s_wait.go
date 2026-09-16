@@ -13,45 +13,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
+
+	"github.com/crb2nu/loom/pkg/env"
 )
 
 // waitForPodRunning watches until the pod reaches Running phase or timeout.
 // Uses the Watch API for sub-second latency instead of polling.
 func (k *K8sBackend) waitForPodRunning(ctx context.Context, name string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	if pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
-		done, waitErr := podRunningState(pod)
-		if done || waitErr != nil {
-			return waitErr
-		}
-	} else if !isNotFound(err) {
-		return fmt.Errorf("get pod before watch: %w", err)
-	}
-
-	watcher, err := k.clientset.CoreV1().Pods(k.namespace).Watch(ctx, metav1.ListOptions{
-		FieldSelector: "metadata.name=" + name,
-	})
-	if err != nil {
-		return fmt.Errorf("watch pod: %w", err)
-	}
-	defer watcher.Stop()
-
-	for event := range watcher.ResultChan() {
-		if event.Type == watch.Deleted {
-			return fmt.Errorf("pod %s was deleted before reaching Running", name)
-		}
-		pod, ok := event.Object.(*corev1.Pod)
-		if !ok {
-			continue
-		}
-		done, waitErr := podRunningState(pod)
-		if done || waitErr != nil {
-			return waitErr
-		}
-	}
-	return fmt.Errorf("watch closed for pod %s", name)
+	return k.waitForPodCondition(ctx, name, timeout, "was deleted before reaching Running", podRunningState)
 }
 
 // podFailureReason extracts a diagnostic string from a failed pod's container statuses.
@@ -78,40 +47,82 @@ func podFailureReason(pod *corev1.Pod) string {
 // Uses the Watch API for sub-second latency instead of polling.
 // Returns early on image pull errors to avoid waiting the full timeout.
 func (k *K8sBackend) waitForPodDone(ctx context.Context, name string, timeout time.Duration) error {
+	return k.waitForPodCondition(ctx, name, timeout, "was deleted before completion", podDoneState)
+}
+
+// watchReconnectBackoff spaces watch re-establishment attempts so a flapping
+// API server can't turn the reconnect loop into a Get/Watch hot spin.
+const watchReconnectBackoff = time.Second
+
+// waitForPodCondition drives Get→Watch→drain cycles until decide reports a
+// terminal outcome or the timeout elapses. The API server closes long watches
+// as a matter of routine (k3s caps them well under the 30m build budget), and
+// the previous single-cycle implementation surfaced that close as an error —
+// "watch closed for pod …" — so a cold sandbox image build was declared
+// failed at the first watch expiry and runBuildPod's deferred deletePod then
+// killed the still-running buildah pod. No build longer than one watch window
+// could ever complete (2026-08-30: every mills tests stage burned its budget
+// on "sandbox image build failed: … watch closed"). A closed watch now
+// re-syncs via Get — so a transition that landed while the watch was down is
+// never missed — and re-watches; only the deadline fails the wait.
+func (k *K8sBackend) waitForPodCondition(ctx context.Context, name string, timeout time.Duration, deletedMsg string, decide func(*corev1.Pod) (bool, error)) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
-		done, waitErr := podDoneState(pod)
-		if done || waitErr != nil {
-			return waitErr
+	seen := false
+	for {
+		if pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+			seen = true
+			done, waitErr := decide(pod)
+			if done || waitErr != nil {
+				return waitErr
+			}
+		} else if isNotFound(err) {
+			// Before the first sighting a missing pod is a creation race —
+			// keep watching for it to appear. After it, absence means deleted.
+			if seen {
+				return fmt.Errorf("pod %s %s", name, deletedMsg)
+			}
+		} else {
+			if ctx.Err() != nil {
+				return fmt.Errorf("timed out after %s waiting for pod %s", timeout, name)
+			}
+			return fmt.Errorf("get pod before watch: %w", err)
 		}
-	} else if !isNotFound(err) {
-		return fmt.Errorf("get pod before watch: %w", err)
-	}
 
-	watcher, err := k.clientset.CoreV1().Pods(k.namespace).Watch(ctx, metav1.ListOptions{
-		FieldSelector: "metadata.name=" + name,
-	})
-	if err != nil {
-		return fmt.Errorf("watch pod: %w", err)
-	}
-	defer watcher.Stop()
+		watcher, err := k.clientset.CoreV1().Pods(k.namespace).Watch(ctx, metav1.ListOptions{
+			FieldSelector: "metadata.name=" + name,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("timed out after %s waiting for pod %s", timeout, name)
+			}
+			return fmt.Errorf("watch pod: %w", err)
+		}
+		for event := range watcher.ResultChan() {
+			if event.Type == watch.Deleted {
+				watcher.Stop()
+				return fmt.Errorf("pod %s %s", name, deletedMsg)
+			}
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+			seen = true
+			done, waitErr := decide(pod)
+			if done || waitErr != nil {
+				watcher.Stop()
+				return waitErr
+			}
+		}
+		watcher.Stop()
 
-	for event := range watcher.ResultChan() {
-		if event.Type == watch.Deleted {
-			return fmt.Errorf("pod %s was deleted before completion", name)
-		}
-		pod, ok := event.Object.(*corev1.Pod)
-		if !ok {
-			continue
-		}
-		done, waitErr := podDoneState(pod)
-		if done || waitErr != nil {
-			return waitErr
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out after %s waiting for pod %s", timeout, name)
+		case <-time.After(watchReconnectBackoff):
 		}
 	}
-	return fmt.Errorf("watch closed for pod %s", name)
 }
 
 func podRunningState(pod *corev1.Pod) (bool, error) {
@@ -279,6 +290,15 @@ func (k *K8sBackend) deletePod(ctx context.Context, name string) error {
 	return nil
 }
 
+// defaultPodGoneTimeout bounds how long Start waits for a non-reusable
+// sandbox pod to disappear before recreating it under the same name.
+// Override with DEVBOX_K8S_POD_GONE_TIMEOUT.
+const defaultPodGoneTimeout = 60 * time.Second
+
+func podGoneTimeout() time.Duration {
+	return env.Duration("DEVBOX_K8S_POD_GONE_TIMEOUT", defaultPodGoneTimeout)
+}
+
 // waitForPodGone polls until the named pod is no longer present, or
 // returns an error on timeout / ctx cancellation. Caller uses this
 // before recreating under the same name to avoid the 409 AlreadyExists
@@ -286,28 +306,52 @@ func (k *K8sBackend) deletePod(ctx context.Context, name string) error {
 // kill-test (.loom/local/handoffs/mills-autonomy-killtest-2026-05-24.md).
 //
 // Watch isn't ideal for "pod is gone" because the watcher closes when
-// the pod is deleted, so we poll Get for NotFound. Polling cadence is
-// 200ms — fast enough that a typical 1-2s termination window resolves
-// in <10 polls.
+// the pod is deleted, so we poll Get for NotFound. Polling starts at
+// 200ms so a typical 1-2s termination resolves in a few polls, then
+// relaxes to 1s: the clientset is shared by every concurrent sandbox, and
+// a tight cadence under the client-side rate limiter was itself the
+// failure — the sandbox replacement wait died inside the limiter
+// ("client rate limiter Wait returned an error: context deadline
+// exceeded") in 44 of 46 cases on 2026-09-04..10 before observing the pod
+// once. A Get error other than NotFound (limiter, apiserver blip) is
+// remembered and the poll continues until the deadline, so a transient
+// error never aborts a wait the pod would have satisfied a second later.
 func (k *K8sBackend) waitForPodGone(ctx context.Context, name string, timeout time.Duration) error {
+	const (
+		fastInterval = 200 * time.Millisecond
+		slowInterval = time.Second
+		fastWindow   = 2 * time.Second
+	)
 	deadline, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	tick := time.NewTicker(200 * time.Millisecond)
-	defer tick.Stop()
+	start := time.Now()
+	timer := time.NewTimer(fastInterval)
+	defer timer.Stop()
+	var lastErr error
 	for {
 		_, err := k.clientset.CoreV1().Pods(k.namespace).Get(deadline, name, metav1.GetOptions{})
 		if isNotFound(err) {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("wait pod gone: get %s: %w", name, err)
+			lastErr = err
 		}
 		select {
 		case <-deadline.Done():
+			if ctx.Err() != nil {
+				return fmt.Errorf("wait pod gone: %s: %w", name, ctx.Err())
+			}
+			if lastErr != nil {
+				return fmt.Errorf("wait pod gone: %s still present after %s (last get error: %w)", name, timeout, lastErr)
+			}
 			return fmt.Errorf("wait pod gone: %s still present after %s", name, timeout)
-		case <-tick.C:
-			// continue
+		case <-timer.C:
 		}
+		interval := fastInterval
+		if time.Since(start) > fastWindow {
+			interval = slowInterval
+		}
+		timer.Reset(interval)
 	}
 }
 

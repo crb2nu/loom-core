@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -25,10 +26,12 @@ type PathPolicy struct{}
 // Name returns the gate identifier.
 func (g *PathPolicy) Name() string { return "path_policy" }
 
-// Evaluate consults the active policy's protected_paths globs against
-// in.FilesChanged. Pre-declared touches (item.Policy.ProtectedPathsTouched)
-// are removed from the violation list so the gate doesn't double-fire on
-// items where the council already flagged the protected scope.
+// Evaluate resolves the active policy's protected_paths globs for the item's
+// TargetProject and checks them against in.FilesChanged. Per-repo lists replace
+// the global list, while unknown foreign targets fail closed. Pre-declared touches
+// (item.Policy.ProtectedPathsTouched) are removed from the violation list so
+// the gate doesn't double-fire on items where the council already flagged the
+// protected scope.
 func (g *PathPolicy) Evaluate(_ context.Context, in StageInput) (Outcome, error) {
 	if in.Policy == nil {
 		// Without a policy snapshot we can't enforce; refuse to silently
@@ -40,7 +43,24 @@ func (g *PathPolicy) Evaluate(_ context.Context, in StageInput) (Outcome, error)
 	if len(in.FilesChanged) == 0 {
 		return pass(), nil
 	}
-	hits := in.Policy.ProtectedPathsHit(in.FilesChanged)
+	var target string
+	if in.Item != nil {
+		target = in.Item.TargetProject
+	}
+	// An item that names the home repository explicitly is a home-repo item:
+	// the protected-paths registry keys foreign overlays by repo, and the
+	// home repo is addressed by the empty target. Without this alias every
+	// hand-filed or HUD-filed item carrying "services/<home>" failed closed
+	// as an unknown foreign target after a successful implement (2026-09-12,
+	// four items in one afternoon).
+	if in.HomeProject != "" && store.SameRepo(target, in.HomeProject) {
+		target = ""
+	}
+	patterns, err := in.Policy.ResolveProtectedPaths(target)
+	if err != nil {
+		return fail("path_policy: " + err.Error()), nil
+	}
+	hits := mills.ProtectedPathsMatch(patterns, in.FilesChanged)
 	if len(hits) == 0 {
 		return pass(), nil
 	}

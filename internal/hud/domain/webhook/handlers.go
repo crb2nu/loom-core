@@ -23,11 +23,15 @@ func (d *Domain) handleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify GitLab token. When no secret is configured the verifier
-	// returns true (open by default for local dev), so production
-	// deployments must always set WEBHOOK_GITLAB_SECRET.
+	// Verify GitLab token. An empty configured secret fails closed —
+	// the verifier rejects every request — so this endpoint can never
+	// run unauthenticated. NewApp additionally refuses to start when
+	// inbound is enabled with no secret configured for either vendor.
 	token := r.Header.Get("X-Gitlab-Token")
 	if !verifyGitLabToken(token, cfg.GitLabSecret) {
+		if cfg.GitLabSecret == "" {
+			d.deps.Logger().Warn("gitlab webhook rejected: no secret configured", "remote", r.RemoteAddr)
+		}
 		d.deps.WriteError(w, http.StatusUnauthorized, "invalid gitlab token", nil)
 		return
 	}
@@ -135,9 +139,13 @@ func (d *Domain) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify GitHub HMAC signature
+	// Verify GitHub HMAC signature. Empty secret fails closed, same as
+	// the GitLab path above.
 	signature := r.Header.Get("X-Hub-Signature-256")
 	if !verifyGitHubSignature(signature, cfg.GitHubSecret, body) {
+		if cfg.GitHubSecret == "" {
+			d.deps.Logger().Warn("github webhook rejected: no secret configured", "remote", r.RemoteAddr)
+		}
 		d.deps.WriteError(w, http.StatusUnauthorized, "invalid github signature", nil)
 		return
 	}

@@ -1,0 +1,1 @@
+- Harden the OpenRouter HTTP 402 credit-exhaustion signature against whitespace and provider-message variants, and propagate its non-retryable metadata through the runtime classifier (`pkg/mills/pipeline/failure_signatures.go`, `pkg/mills/pipeline/failure_classifier.go`, `pkg/mills/pipeline/failure_signatures_test.go`).

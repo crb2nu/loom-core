@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/clients"
+	"github.com/crb2nu/loom/pkg/mills/mergequeue"
 )
 
 // fakeActor is a deterministic in-memory Actor. It records every call and can be
@@ -18,6 +19,7 @@ type fakeActor struct {
 	calls []fakeCall
 	errs  map[Action]error
 	newID int64
+	found mergequeue.PipelineStatus
 }
 
 type fakeCall struct {
@@ -46,6 +48,10 @@ func (f *fakeActor) RetryPipeline(_ context.Context, repo string, pipelineID int
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, fakeCall{kind: ActionRetryPipeline, repo: repo, pipelineID: pipelineID})
 	return f.errs[ActionRetryPipeline]
+}
+
+func (f *fakeActor) FindActivePipeline(context.Context, string, string, string) (mergequeue.PipelineStatus, error) {
+	return f.found, nil
 }
 
 func (f *fakeActor) CreatePipeline(_ context.Context, repo, ref string) (int64, error) {
@@ -114,6 +120,34 @@ func snapOf(mrs ...MergeRequest) Snapshot {
 	return Snapshot{MergeRequests: mrs}
 }
 
+func TestShepherdAdoptsAndFencesPipelineCreationPerHead(t *testing.T) {
+	now := time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC)
+	mr := MergeRequest{Repo: "services/loom-core", IID: 42, SourceBranch: "feat/x", State: StateAwaitingPipeline, SHA: headSHA, CreatedAt: now.Add(-time.Hour)}
+	actor := newFakeActor()
+	actor.found = mergequeue.PipelineStatus{ID: 77, SHA: headSHA, Status: "pending", WebURL: "https://gl/77", Found: true}
+	s := newTestShepherd(actor, now, 5)
+	s.Reconcile(context.Background(), snapOf(mr))
+	if got := len(actor.callsOf(ActionCreatePipeline)); got != 0 {
+		t.Fatalf("create calls after adoption = %d, want 0", got)
+	}
+	if recs := s.Actions(); len(recs) != 1 || recs[0].Outcome != string(OutcomeAdopted) {
+		t.Fatalf("adoption audit = %+v", recs)
+	}
+
+	actor.found = mergequeue.PipelineStatus{}
+	mr.IID = 43
+	s.Reconcile(context.Background(), snapOf(mr))
+	s.Reconcile(context.Background(), snapOf(mr))
+	if got := len(actor.callsOf(ActionCreatePipeline)); got != 1 {
+		t.Fatalf("same-head create calls = %d, want 1", got)
+	}
+	mr.SHA = movedSHA
+	s.Reconcile(context.Background(), snapOf(mr))
+	if got := len(actor.callsOf(ActionCreatePipeline)); got != 2 {
+		t.Fatalf("new-head create calls = %d, want 2", got)
+	}
+}
+
 // TestShepherd_ActionSelection is a table-driven check that each stall class
 // maps to the right (or no) bounded action, and that age gates hold.
 func TestShepherd_ActionSelection(t *testing.T) {
@@ -138,22 +172,22 @@ func TestShepherd_ActionSelection(t *testing.T) {
 		},
 		{
 			name: "skipped creates pipeline when old enough",
-			mr:   MergeRequest{Repo: "r", IID: 2, SourceBranch: "b", State: StatePipelineSkipped, PipelineID: 7, CreatedAt: old},
+			mr:   MergeRequest{Repo: "r", IID: 2, SourceBranch: "b", State: StatePipelineSkipped, PipelineID: 7, SHA: headSHA, CreatedAt: old},
 			want: ActionCreatePipeline,
 		},
 		{
 			name: "skipped but too young: no action",
-			mr:   MergeRequest{Repo: "r", IID: 2, SourceBranch: "b", State: StatePipelineSkipped, PipelineID: 7, CreatedAt: young},
+			mr:   MergeRequest{Repo: "r", IID: 2, SourceBranch: "b", State: StatePipelineSkipped, PipelineID: 7, SHA: headSHA, CreatedAt: young},
 			want: "",
 		},
 		{
 			name: "awaiting with no head pipeline creates pipeline",
-			mr:   MergeRequest{Repo: "r", IID: 3, SourceBranch: "b", State: StateAwaitingPipeline, PipelineID: 0, CreatedAt: old},
+			mr:   MergeRequest{Repo: "r", IID: 3, SourceBranch: "b", State: StateAwaitingPipeline, PipelineID: 0, SHA: headSHA, CreatedAt: old},
 			want: ActionCreatePipeline,
 		},
 		{
 			name: "awaiting WITH a pipeline id: no action (unknown-status, poll again)",
-			mr:   MergeRequest{Repo: "r", IID: 3, SourceBranch: "b", State: StateAwaitingPipeline, PipelineID: 5, CreatedAt: old},
+			mr:   MergeRequest{Repo: "r", IID: 3, SourceBranch: "b", State: StateAwaitingPipeline, PipelineID: 5, SHA: headSHA, CreatedAt: old},
 			want: "",
 		},
 		{

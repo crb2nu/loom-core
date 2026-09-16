@@ -34,13 +34,30 @@ func jsonInto(s string, dest any) error {
 	return nil
 }
 
-// timeRFC3339 serialises t as a UTC RFC3339Nano string for SQLite storage.
-// All timestamps in the mills schema are TEXT in this format.
+// timeLayout is the storage layout for every timestamp in the mills schema:
+// UTC, nine fractional digits, literal Z — always exactly timeLayoutWidth
+// bytes. Fixed width is what makes SQLite's byte-wise TEXT collation agree
+// with chronological order, so ORDER BY and range predicates on *_at columns
+// are correct for rows inside the same second. time.RFC3339Nano must NOT be
+// used for storage: it trims trailing fractional zeros, and the trimmed
+// "…28.8481Z" sorts AFTER "…28.84815Z" because 'Z' (0x5A) > '5' (0x35).
+// Migration 042 rewrote rows written in the trimmed form to this layout.
+const timeLayout = "2006-01-02T15:04:05.000000000Z"
+
+// timeLayoutWidth is len(timeRFC3339(t)) for every t with a four-digit year.
+const timeLayoutWidth = 30
+
+// timeRFC3339 serialises t for SQLite storage. The output is RFC3339Nano
+// compatible — parseTime and time.Parse(time.RFC3339Nano) both read it — but
+// fixed width; see timeLayout. All timestamps in the mills schema are TEXT in
+// this format.
 func timeRFC3339(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(timeLayout)
 }
 
-// parseTime parses an RFC3339(Nano) timestamp from a SQLite TEXT column.
+// parseTime parses an RFC3339(Nano) timestamp from a SQLite TEXT column. It
+// accepts timeLayout, the trimmed RFC3339Nano form older rows were written
+// in, and the no-fraction RFC3339 form.
 func parseTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, nil

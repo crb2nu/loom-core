@@ -65,7 +65,7 @@ func (j *AnthropicRubricJudge) Judge(ctx context.Context, rubric string, in gate
 		return gates.RubricVerdict{}, fmt.Errorf("anthropic rubric judge: %w", err)
 	}
 	if res.Refusal {
-		return gates.RubricVerdict{}, errors.New("anthropic rubric judge: request refused")
+		return gates.RubricVerdict{}, &VendorError{Vendor: "anthropic", Kind: VendorRefusal, Err: errors.New("anthropic rubric judge: request refused")}
 	}
 	score, reasons, perr := parseRubricEnvelope(res.Text)
 	if perr != nil {

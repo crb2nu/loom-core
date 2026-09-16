@@ -20,6 +20,11 @@ import (
 // Query params (checked in precedence order):
 //   - mr_iid=N      → the run(s) that produced that merge request (terminal
 //     or not), powering the HUD "audit by MR iid" lookup (Loop B attribution).
+//   - backlog_id=ID → every run spawned for that backlog item, newest-first,
+//     bounded by limit= (default 20, max 100). This is the drawer's
+//     "why is this item escalated?" cross-link: before it existed the HUD
+//     could only intersect the active set with a 7d/50-run history window,
+//     so an item whose runs aged out showed no history at all.
 //   - state=terminal → finished runs (done / escalated / paused), newest-first,
 //     bounded by since= (RFC3339, default last 7d) and limit= (default 50,
 //     max 200). This is the run-history view; without it the panel could only
@@ -37,6 +42,27 @@ func (o *operator) handlePipelineRunsList(w http.ResponseWriter, r *http.Request
 			return
 		}
 		runs, err := o.store.Pipeline.ListByMRIID(ctx, mrIID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if runs == nil {
+			runs = []*store.PipelineRun{}
+		}
+		writeJSON(w, http.StatusOK, runs)
+		return
+	}
+	if backlogID := strings.TrimSpace(q.Get("backlog_id")); backlogID != "" {
+		limit := 20
+		if raw := q.Get("limit"); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n <= 0 {
+				http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+				return
+			}
+			limit = n
+		}
+		runs, err := o.store.Pipeline.ListByBacklogID(ctx, backlogID, limit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -117,6 +143,8 @@ func (o *operator) handlePipelineRunGet(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Artifacts preserve retry_class and the stage-local effective_attempts snapshot,
+	// including zero. PipelineRun has no aggregate effective counter.
 	stages, _ := o.store.Pipeline.ListStages(ctx, id)
 	gates, _ := o.store.Pipeline.ListGates(ctx, id)
 	// Encode empty stage/gate sets as `[]`, not `null` — same contract as the
@@ -668,10 +696,14 @@ func (o *operator) handlePipelineEscalate(w http.ResponseWriter, r *http.Request
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Freeze the item's TargetProject at escalation time so the ghost-spark
+		// Freeze the item's resolved target project at escalation time so the ghost-spark
 		// merged-branch sweep can authorize a cross-repo lookup for manually
 		// escalated runs too. Best-effort — the escalation stands without it.
-		if _, err := mills.AppendEscalationTargetBinding(ctx, o.store.Events, "operator", run, item); err != nil {
+		homeProject := ""
+		if o.reconciler != nil {
+			homeProject = o.reconciler.HomeProject
+		}
+		if _, err := mills.AppendEscalationTargetBinding(ctx, o.store.Events, "operator", run, item, homeProject); err != nil {
 			o.logger.Warn("escalation target binding append failed", "run", run.ID, "error", err)
 		}
 	} else if !errors.Is(itemErr, store.ErrNotFound) {

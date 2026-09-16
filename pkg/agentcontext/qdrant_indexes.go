@@ -37,6 +37,11 @@ var keywordIndexesByKind = map[string][]string{
 // in Go after a full scroll.
 var datetimeIndexesByKind = map[string][]string{
 	CollSessions: {"started_at", "ended_at"},
+	// Context: `timestamp` backs the HUD live stream's "newest entries since
+	// X" listing (agent_context_search sort=recent). Without the index Qdrant
+	// can neither range-filter nor order_by the field, and the stream degrades
+	// to an in-process sort over a bounded scroll pool.
+	CollContext: {"timestamp"},
 }
 
 // EnsureKeywordIndex idempotently creates a keyword payload index on the named

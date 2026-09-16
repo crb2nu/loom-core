@@ -71,7 +71,7 @@ func ensureRepoRoot(ctx context.Context, cfg Config, logger *slog.Logger) error 
 		if err := runGit(ctx, home, cfg.RepoRoot, "remote", "set-url", "origin", repoURL); err != nil {
 			return err
 		}
-		if err := refreshRepoRoot(ctx, home, cfg.RepoRoot); err != nil {
+		if err := refreshRepoRoot(ctx, home, cfg.RepoRoot, logger); err != nil {
 			// Degraded mode: origin unreachable at boot must not take the
 			// operator down when a usable — merely possibly stale — checkout
 			// exists. Consumers of this tree (research grounding, spawn git
@@ -93,7 +93,11 @@ func ensureRepoRoot(ctx context.Context, cfg Config, logger *slog.Logger) error 
 	if err := os.RemoveAll(cfg.RepoRoot); err != nil {
 		return fmt.Errorf("clear incomplete repo root: %w", err)
 	}
-	return runGit(ctx, home, "", "clone", "--depth=1", "--branch", "main", repoURL, cfg.RepoRoot)
+	return cloneRepoRoot(ctx, home, repoURL, cfg.RepoRoot)
+}
+
+func cloneRepoRoot(ctx context.Context, home, repoURL, repoRoot string) error {
+	return runGit(ctx, home, "", "clone", "--branch", "main", repoURL, repoRoot)
 }
 
 // refreshRepoRoot aligns an existing clone's working tree with origin/main's
@@ -111,14 +115,29 @@ func ensureRepoRoot(ctx context.Context, cfg Config, logger *slog.Logger) error 
 // capture reads origin/ refs it fetches itself); origin is the source of
 // truth. Untracked files survive.
 //
-// The fetch refspec is explicit for the same reason attachGitContext's is:
-// the clone is minted `--depth=1 --branch main`, so its remote.origin.fetch
-// covers only main and surprises are cheap to rule out.
-func refreshRepoRoot(ctx context.Context, home, repoRoot string) error {
-	if err := runGit(ctx, home, repoRoot, "fetch", "--depth=1", "origin", "+refs/heads/main:refs/remotes/origin/main"); err != nil {
+// The fetch refspec is explicit so the operator only advances its main cache;
+// new clones retain full history for adoption probes, while legacy shallow
+// clones remain usable and can be deepened by the probe when needed.
+func refreshRepoRoot(ctx context.Context, home, repoRoot string, logger *slog.Logger) error {
+	if err := runGit(ctx, home, repoRoot, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"); err != nil {
 		return err
 	}
-	return runGit(ctx, home, repoRoot, "checkout", "-f", "-B", "main", "origin/main")
+	if err := runGit(ctx, home, repoRoot, "checkout", "-f", "-B", "main", "origin/main"); err != nil {
+		lock := filepath.Join(repoRoot, ".git", "index.lock")
+		if _, statErr := os.Stat(lock); statErr != nil {
+			return err
+		}
+		if removeErr := os.Remove(lock); removeErr != nil {
+			return fmt.Errorf("checkout failed with stale index lock; remove %s: %w (checkout: %v)", lock, removeErr, err)
+		}
+		// Boot runs before operator work starts; any surviving lock belongs to
+		// a git process from an earlier container and is definitionally stale.
+		if logger != nil {
+			logger.Warn("removed stale git index lock; retrying repo root checkout once", "repo_root", repoRoot, "lock", lock, "checkout_error", err)
+		}
+		return runGit(ctx, home, repoRoot, "checkout", "-f", "-B", "main", "origin/main")
+	}
+	return nil
 }
 
 // installRepoGitAuth persists git credentials for the operator-local

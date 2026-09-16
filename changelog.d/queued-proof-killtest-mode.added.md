@@ -1,0 +1,1 @@
+- Add a restart-owned `mills-workflow-killtest --mode queued-proof` admission kill-test and document its strict JSON evidence contract in `cmd/mills-workflow-killtest/main.go` and `docs/MILLS.md`.

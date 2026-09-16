@@ -121,6 +121,23 @@ describe('mrwatchStore.fetch', () => {
     expect(mrwatchStore.shepherdEnabled).toBe(false);
   });
 
+  it('counts only MRs that need attention as unhealthy, not ones merely in CI', () => {
+    const mr = (iid: number, state: string, pipeline_status?: string) =>
+      ({ repo: 'services/loom-core', iid, state, pipeline_status }) as (typeof mrwatchStore.mergeRequests)[number];
+    mrwatchStore.mergeRequests = [
+      mr(1, 'ci_running', 'running'),
+      mr(2, 'awaiting_pipeline'),
+      mr(3, 'draft_idle', 'pending'),
+      mr(4, 'ok', 'success'),
+      mr(5, 'automerge_unarmed', 'running'),
+      mr(6, 'conflict', 'success'),
+      mr(7, 'ok', 'failed'), // registry lag: red head pipeline still counts
+      mr(8, 'merged', 'success'),
+    ];
+    expect(mrwatchStore.liveMergeRequests).toHaveLength(7);
+    expect(mrwatchStore.unhealthyCount).toBe(3);
+  });
+
   it('reverses the audit ring so the feed reads newest-first', async () => {
     globalThis.fetch = routeFetch({
       '/api/mrwatch/summary': () => jsonResponse(200, SUMMARY_BODY),

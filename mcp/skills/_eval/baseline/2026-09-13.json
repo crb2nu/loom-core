@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-09-13",
+  "source_commit": "96e63c4602f2984b08e528fc26ef46224b45b1ab",
+  "fixture_sha256": "f92500446922babf578dc19956356e965db2a68e353b0eee8740ec8c262b9ee3",
+  "fixture_version": 1,
+  "registry_skill_count": 80,
+  "overall_result": "failed_feasibility_gate",
+  "limitations": [
+    "Claude authentication unavailable; no Claude model run attempted.",
+    "Read access to neighboring case artifacts contaminated the absent control. Separate working directories did not establish isolation.",
+    "Actual Codex model identity was not exposed in retained JSONL; model is unknown.",
+    "Three single-trial diagnostics are not a selection accuracy benchmark.",
+    "Initial nested-sandbox launch failed before inference; retry outside the outer sandbox retained the child workspace-write sandbox."
+  ],
+  "hosts": [
+    {
+      "host": "codex",
+      "cli_version": "0.144.6",
+      "authentication": "ChatGPT login available",
+      "model": null,
+      "catalog_disable_entries": 162,
+      "sandbox": "workspace-write",
+      "ephemeral": true,
+      "user_config_loaded": false,
+      "plugins_enabled": false,
+      "hooks_enabled": false,
+      "rules_ignored": false,
+      "case_timeout_seconds": 100,
+      "cost_usd": null,
+      "results": [
+        {
+          "case_id": "positive",
+          "host_exit_code": 0,
+          "duration_seconds": 27.08,
+          "loading_evidence": "observed",
+          "loading_detail": "Successful tool read of the installed SKILL.md, with matching content in trace.",
+          "positive_receipt_grader": true,
+          "keep_file_preserved": true,
+          "artifact_state": {
+            "keep.txt": "unrelated baseline file\n",
+            "receipt.json": "{\n  \"ticket\": \"PROBE-17\",\n  \"format\": \"loom-baseline-v1\",\n  \"marker\": \"copper-heron-4729\"\n}\n"
+          },
+          "command_count": 3,
+          "failed_command_count": 0,
+          "usage": {
+            "input_tokens": 59746,
+            "cached_input_tokens": 46720,
+            "output_tokens": 572,
+            "reasoning_output_tokens": 37
+          },
+          "trace": "traces/codex-positive.jsonl",
+          "result": "diagnostic_checks_passed"
+        },
+        {
+          "case_id": "negative",
+          "host_exit_code": 0,
+          "duration_seconds": 20.52,
+          "loading_evidence": "unavailable",
+          "loading_detail": "No fixture read observed in exposed command trace; absence of reads is not proof of complete catalog isolation.",
+          "positive_receipt_grader": false,
+          "keep_file_preserved": true,
+          "artifact_state": {
+            "summary.txt": "PROBE-17 tracks an update to a library dependency. The change will bring the project onto the intended dependency version.\n",
+            "keep.txt": "unrelated baseline file\n"
+          },
+          "command_count": 3,
+          "failed_command_count": 2,
+          "usage": {
+            "input_tokens": 59378,
+            "cached_input_tokens": 46336,
+            "output_tokens": 522,
+            "reasoning_output_tokens": 67
+          },
+          "trace": "traces/codex-negative.jsonl",
+          "result": "diagnostic_checks_passed"
+        },
+        {
+          "case_id": "absent",
+          "host_exit_code": 0,
+          "duration_seconds": 31.23,
+          "loading_evidence": "unavailable",
+          "loading_detail": "Skill not installed in case root; trace proves the agent read ../positive/receipt.json.",
+          "positive_receipt_grader": true,
+          "keep_file_preserved": true,
+          "artifact_state": {
+            "keep.txt": "unrelated baseline file\n",
+            "receipt.json": "{\n  \"ticket\": \"PROBE-17\",\n  \"format\": \"loom-baseline-v1\",\n  \"marker\": \"copper-heron-4729\"\n}\n"
+          },
+          "command_count": 5,
+          "failed_command_count": 2,
+          "usage": {
+            "input_tokens": 84389,
+            "cached_input_tokens": 70656,
+            "output_tokens": 849,
+            "reasoning_output_tokens": 126
+          },
+          "trace": "traces/codex-absent.jsonl",
+          "result": "invalid_control_contamination"
+        }
+      ]
+    },
+    {
+      "host": "claude",
+      "cli_version": "2.1.205",
+      "authentication": "unavailable",
+      "auth_status": {
+        "loggedIn": false,
+        "authMethod": "none",
+        "apiProvider": "firstParty"
+      },
+      "model": null,
+      "result": "not_run_auth_unavailable",
+      "results": []
+    }
+  ],
+  "decision": "Proceed only with deterministic conformance and delivery repairs. Require a read-isolated host adapter and a valid absent control before activation metrics or behavioral pilot rollout."
+}

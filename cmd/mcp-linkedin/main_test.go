@@ -2,17 +2,145 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/internal/mcptest"
 	"github.com/crb2nu/loom/pkg/httpclient"
+	"github.com/crb2nu/loom/pkg/mcperror"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 )
+
+func TestUnconfiguredLinkedInToolReturnsMCPError(t *testing.T) {
+	errConfig := mcperror.NotConfigured("LINKEDIN_ACCESS_TOKEN or LINKEDIN_SESSION_COOKIE", "set credentials")
+	h := requireConfigured(errConfig, func(context.Context, map[string]any) (*mcp.CallToolResult, error) {
+		t.Fatal("backend handler must not run")
+		return nil, nil
+	})
+	result, err := h(context.Background(), nil)
+	if err != nil || result == nil || !result.IsError || !strings.Contains(result.Content[0].Text, "LINKEDIN_ACCESS_TOKEN") || !strings.Contains(result.Content[0].Text, "LINKEDIN_SESSION_COOKIE") {
+		t.Fatalf("expected missing-config MCP error, result=%+v err=%v", result, err)
+	}
+}
+
+func TestLinkedInConfigErrorNamesExactlyTheMissingVariables(t *testing.T) {
+	cases := []struct {
+		name, mode, access, session string
+		bootstrap                   bool
+		wantMissing                 string
+		wantText                    []string
+		rejectText                  string
+	}{
+		{"auto missing both", linkedinModeAuto, "", "", false, "LINKEDIN_ACCESS_TOKEN,LINKEDIN_SESSION_COOKIE", []string{"LINKEDIN_ACCESS_TOKEN", "LINKEDIN_SESSION_COOKIE"}, ""},
+		{"auto access token", linkedinModeAuto, "tok", "", false, "", nil, ""},
+		{"auto session cookie", linkedinModeAuto, "", "li_at", false, "", nil, ""},
+		{"auto bootstrap", linkedinModeAuto, "", "", true, "", nil, ""},
+		{"official missing token", linkedinModeOfficial, "", "li_at", false, "LINKEDIN_ACCESS_TOKEN", []string{"LINKEDIN_ACCESS_TOKEN"}, "LINKEDIN_SESSION_COOKIE"},
+		{"official with token", linkedinModeOfficial, "tok", "", false, "", nil, ""},
+		{"experimental missing cookie", linkedinModeExperimental, "tok", "", false, "LINKEDIN_SESSION_COOKIE", []string{"LINKEDIN_SESSION_COOKIE"}, "LINKEDIN_ACCESS_TOKEN"},
+		{"experimental bootstrap", linkedinModeExperimental, "", "", true, "", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			missing, err := linkedInConfigError(tc.mode, tc.access, tc.session, tc.bootstrap)
+			if missing != tc.wantMissing {
+				t.Fatalf("missing_env = %q, want %q", missing, tc.wantMissing)
+			}
+			if tc.wantMissing == "" {
+				if err != nil {
+					t.Fatalf("unexpected config error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected a NotConfigured error")
+			}
+			for _, want := range tc.wantText {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q should name %s", err, want)
+				}
+			}
+			if tc.rejectText != "" && strings.Contains(err.Error(), tc.rejectText) {
+				t.Fatalf("error %q must not blame %s in %s mode", err, tc.rejectText, tc.mode)
+			}
+		})
+	}
+}
+
+func unconfiguredLinkedInEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"LINKEDIN_MODE", "LINKEDIN_ACCESS_TOKEN", "LINKEDIN_TOKEN",
+		"LINKEDIN_SESSION_COOKIE", "LINKEDIN_LI_AT", "LI_AT", "LINKEDIN_JSESSIONID", "JSESSIONID",
+		"LINKEDIN_LOGIN_USERNAME", "LINKEDIN_USERNAME", "LINKEDIN_LOGIN_PASSWORD", "LINKEDIN_PASSWORD",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+	} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("LINKEDIN_BROWSERKIT_MODE", linkedInBrowserKitModeOff)
+	t.Setenv("LINKEDIN_BROWSERKIT_STORAGE_DIR", t.TempDir())
+}
+
+func newTestLinkedInMCPServer(t *testing.T) *mcp.Server {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tp, shutdown, err := mcpotel.InitTracer(context.Background(), "mcp-linkedin-test", logger)
+	if err != nil {
+		t.Fatalf("tracer: %v", err)
+	}
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+	server, err := newLinkedInServer(logger, mcpotel.Tracer(tp, "mcp-linkedin-test"), nil)
+	if err != nil {
+		t.Fatalf("server must start without credentials: %v", err)
+	}
+	return server
+}
+
+// TestLinkedInServesHandshakeWithoutCredentials pins the degraded-start
+// contract at the server level: with no credential set the server answers
+// initialize and tools/list, and a credential-bound tool call returns an
+// MCP error naming both variables, without exiting the process.
+func TestLinkedInServesHandshakeWithoutCredentials(t *testing.T) {
+	unconfiguredLinkedInEnv(t)
+	server := newTestLinkedInMCPServer(t)
+
+	res := mcptest.Drive(t, server, "linkedin_get_profile", map[string]any{})
+	if names := mcptest.ToolNames(t, res.ToolsList); len(names) == 0 {
+		t.Fatal("tools/list must not be empty while unconfigured")
+	}
+	result := mcptest.ToolResult(t, res.ToolCall)
+	text := mcptest.Text(result)
+	if !result.IsError || !strings.Contains(text, "LINKEDIN_ACCESS_TOKEN") || !strings.Contains(text, "LINKEDIN_SESSION_COOKIE") {
+		t.Fatalf("expected NotConfigured naming both credentials, got isError=%v text=%q", result.IsError, text)
+	}
+}
+
+// TestLinkedInOfficialModeNamesOnlyTheAccessToken pins the per-mode verdict
+// through the real tool surface.
+func TestLinkedInOfficialModeNamesOnlyTheAccessToken(t *testing.T) {
+	unconfiguredLinkedInEnv(t)
+	t.Setenv("LINKEDIN_MODE", linkedinModeOfficial)
+	server := newTestLinkedInMCPServer(t)
+
+	res := mcptest.Drive(t, server, "linkedin_get_profile", map[string]any{})
+	result := mcptest.ToolResult(t, res.ToolCall)
+	text := mcptest.Text(result)
+	if !result.IsError || !strings.Contains(text, "LINKEDIN_ACCESS_TOKEN") || strings.Contains(text, "LINKEDIN_SESSION_COOKIE") {
+		t.Fatalf("expected NotConfigured naming only LINKEDIN_ACCESS_TOKEN, got isError=%v text=%q", result.IsError, text)
+	}
+}
 
 type mockSecretStore struct {
 	values map[string]string
@@ -353,6 +481,107 @@ func TestRecoverSessionCooldown(t *testing.T) {
 	now = now.Add(2 * time.Second)
 	if _, err := s.recoverSession(context.Background(), linkedInRecoveryModeSilent, false); err == nil {
 		t.Fatal("expected cooldown error on second recovery")
+	}
+}
+
+func TestBrowserKitHelperContractNonDestructiveSilentRecovery(t *testing.T) {
+	// Pins the embedded helper's recovery contract: silent recovery must probe the
+	// persisted session before clearing it, and any clear must reference a backup.
+	for _, marker := range []string{
+		"def _attempt_persisted_session(",
+		"def _backup_storage_state(",
+		"backed up persisted browser session state to",
+		"silent recovery reused persisted browser session state",
+		"persisted browser session state failed voyager probe",
+		"persisted browser session state left in place: no backup available",
+		"cleared persisted browser session state before recovery (backup:",
+	} {
+		if !strings.Contains(browserKitHelperPy, marker) {
+			t.Errorf("helper contract marker missing: %q", marker)
+		}
+	}
+	if strings.Contains(browserKitHelperPy, `cleared persisted browser session state before recovery"`) {
+		t.Error("helper clears persisted session state without referencing a backup")
+	}
+}
+
+func TestBrowserKitHelperRecoverBacksUpStorageStateBeforeClearing(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+
+	dir := t.TempDir()
+	helperPath := filepath.Join(dir, "browserkit_helper.py")
+	if err := os.WriteFile(helperPath, []byte(browserKitHelperPy), 0o700); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+
+	storageDir := filepath.Join(dir, "storage")
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		t.Fatalf("mkdir storage dir: %v", err)
+	}
+	statePath := filepath.Join(storageDir, "primary.json")
+	stateContent := []byte(`{"cookies":[{"name":"li_at","value":"still-valid"}]}`)
+	if err := os.WriteFile(statePath, stateContent, 0o600); err != nil {
+		t.Fatalf("write storage state: %v", err)
+	}
+
+	payload, err := json.Marshal(linkedInBrowserKitRequest{
+		Action:     "recover",
+		Mode:       linkedInRecoveryModeSilent,
+		URL:        "https://www.linkedin.com/feed/",
+		StorageDir: storageDir,
+		SessionID:  "primary",
+		Stealth:    false,
+		Headless:   true,
+		TimeoutMS:  1000,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	// -I -S isolates the interpreter from site-packages so the browser_kit import
+	// fails deterministically right after the backup step this test exercises.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stdout, runErr := exec.CommandContext(ctx, python, "-I", "-S", helperPath, string(payload)).Output()
+	line := lastNonEmptyLine(string(stdout))
+	if strings.TrimSpace(line) == "" {
+		t.Fatalf("helper produced no stdout (run error: %v)", runErr)
+	}
+	var out linkedInBrowserKitResponse
+	if err := json.Unmarshal([]byte(line), &out); err != nil {
+		t.Fatalf("parse helper output %q: %v", line, err)
+	}
+	if out.OK {
+		t.Fatalf("expected dependency-import failure payload, got ok=true: %q", line)
+	}
+
+	if got, err := os.ReadFile(statePath); err != nil || string(got) != string(stateContent) {
+		t.Fatalf("persisted storage state must survive the backup step (err=%v content=%q)", err, got)
+	}
+
+	backups, err := filepath.Glob(filepath.Join(storageDir, "primary.json.*.bak"))
+	if err != nil {
+		t.Fatalf("glob backups: %v", err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("expected exactly one storage state backup, got %v", backups)
+	}
+	if got, err := os.ReadFile(backups[0]); err != nil || string(got) != string(stateContent) {
+		t.Fatalf("backup content mismatch (err=%v content=%q)", err, got)
+	}
+
+	backupWarned := false
+	for _, warning := range out.Warnings {
+		if strings.Contains(warning, "backed up persisted browser session state to") &&
+			strings.Contains(warning, filepath.Base(backups[0])) {
+			backupWarned = true
+		}
+	}
+	if !backupWarned {
+		t.Fatalf("expected a warning naming backup %s, got %v", filepath.Base(backups[0]), out.Warnings)
 	}
 }
 
@@ -881,5 +1110,102 @@ func TestRequestJSON_SetsCookieAndCSRFHeaders(t *testing.T) {
 	}
 	if gotCSRF != "ajax:123" {
 		t.Fatalf("expected csrf-token header, got %q", gotCSRF)
+	}
+}
+
+func TestCookieHeaderMergesBundleAndOverrides(t *testing.T) {
+	s := newTestLinkedInServer("http://unused")
+	s.sessionToken = "li-at-fresh"
+	s.jsessionID = "ajax:fresh"
+	s.cookieBundle = `bcookie="v=2&abc"; bscookie="v=1&def"; li_at=li-at-stale; lidc="b=OB74"`
+
+	header := s.cookieHeader()
+	if !strings.Contains(header, `bcookie="v=2&abc"`) {
+		t.Fatalf("expected bundle bcookie in header, got %q", header)
+	}
+	if !strings.Contains(header, `lidc="b=OB74"`) {
+		t.Fatalf("expected bundle lidc in header, got %q", header)
+	}
+	if !strings.Contains(header, "li_at=li-at-fresh") {
+		t.Fatalf("expected dedicated li_at to win, got %q", header)
+	}
+	if strings.Contains(header, "li-at-stale") {
+		t.Fatalf("stale bundle li_at must be overridden, got %q", header)
+	}
+	if !strings.Contains(header, `JSESSIONID="ajax:fresh"`) {
+		t.Fatalf("expected quoted JSESSIONID, got %q", header)
+	}
+	if strings.Count(header, "li_at=") != 1 {
+		t.Fatalf("expected exactly one li_at, got %q", header)
+	}
+}
+
+func TestCookieHeaderEmptyWithoutSessionToken(t *testing.T) {
+	s := newTestLinkedInServer("http://unused")
+	s.sessionToken = ""
+	s.cookieBundle = `bcookie="v=2&abc"`
+	if header := s.cookieHeader(); header != "" {
+		t.Fatalf("expected empty cookie header without session token, got %q", header)
+	}
+}
+
+func TestCookieHeaderWithoutBundleMatchesLegacyShape(t *testing.T) {
+	s := newTestLinkedInServer("http://unused")
+	s.sessionToken = "li-at-cookie"
+	s.jsessionID = `"ajax:123"`
+	want := `li_at=li-at-cookie; JSESSIONID="ajax:123"`
+	if header := s.cookieHeader(); header != want {
+		t.Fatalf("expected %q, got %q", want, header)
+	}
+}
+
+func TestDoRequestSendsBrowserFidelityHeaders(t *testing.T) {
+	var gotUA, gotLang, gotCookie string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		gotLang = r.Header.Get("Accept-Language")
+		gotCookie = r.Header.Get("Cookie")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer ts.Close()
+
+	s := newTestLinkedInServer(ts.URL)
+	s.sessionToken = "li-at-cookie"
+	s.jsessionID = "ajax:123"
+	s.cookieBundle = `bcookie="v=2&abc"`
+
+	if _, err := s.doRequest(context.Background(), http.MethodGet, "/me", nil); err != nil {
+		t.Fatalf("doRequest failed: %v", err)
+	}
+	if gotUA != defaultLinkedInHTTPUserAgent {
+		t.Fatalf("expected default browser user agent, got %q", gotUA)
+	}
+	if gotLang != "en-US,en;q=0.9" {
+		t.Fatalf("expected accept-language header, got %q", gotLang)
+	}
+	if !strings.Contains(gotCookie, `bcookie="v=2&abc"`) || !strings.Contains(gotCookie, "li_at=li-at-cookie") {
+		t.Fatalf("expected merged cookie header, got %q", gotCookie)
+	}
+}
+
+func TestDoRequestHonorsUserAgentOverride(t *testing.T) {
+	var gotUA string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	s := newTestLinkedInServer(ts.URL)
+	s.sessionToken = "li-at-cookie"
+	s.userAgent = "custom-agent/1.0"
+
+	if _, err := s.doRequest(context.Background(), http.MethodGet, "/me", nil); err != nil {
+		t.Fatalf("doRequest failed: %v", err)
+	}
+	if gotUA != "custom-agent/1.0" {
+		t.Fatalf("expected UA override, got %q", gotUA)
 	}
 }

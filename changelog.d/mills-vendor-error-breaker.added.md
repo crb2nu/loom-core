@@ -1,0 +1,1 @@
+- Add typed Anthropic and OpenAI vendor failures with shared per-vendor circuit breakers, known-zero billing/auth rejection costs, and live vendor degradation reporting in Mills (`pkg/mills/clients`, `pkg/openairesponses/client.go`, `pkg/mills/metrics.go`, and `cmd/loom-mills-operator/{handlers_wiring,capabilities}.go`).

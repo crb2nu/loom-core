@@ -56,6 +56,48 @@ func registerPlanTools(server *mcp.Server, svc *agentcontext.Service, _ trace.Tr
 					"type":        "string",
 					"description": "Plan/spec body (markdown). Canonical content; the .loom mirror is rendered from this.",
 				},
+				"spec_anchor": map[string]any{
+					"type":        "string",
+					"description": "Optional section or anchor in the source spec.",
+				},
+				"budget": map[string]any{
+					"type":        "string",
+					"description": "Optional time, cost or effort budget for the plan.",
+				},
+				"riskiest_assumption": map[string]any{
+					"type":        "string",
+					"description": "The load-bearing assumption that would invalidate the plan if false.",
+				},
+				"kill_test": map[string]any{
+					"type":        "string",
+					"description": "Bounded experiment and pass/fail criteria for the riskiest assumption.",
+				},
+				"kill_test_status": map[string]any{
+					"type":        "string",
+					"description": "Current experiment status and evidence, when already known.",
+				},
+				"success": map[string]any{
+					"type":        "object",
+					"description": "Observable criteria for completing the plan.",
+					"properties": map[string]any{
+						"tests":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"metrics":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"manual_check": map[string]any{"type": "string"},
+					},
+				},
+				"dependencies": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Plan-level dependencies (distinct from slice depends_on edges).",
+				},
+				"mills_backlog_id": map[string]any{
+					"type":        "string",
+					"description": "Optional linked Mills backlog item id.",
+				},
+				"gitlab_issue_iid": map[string]any{
+					"type":        "integer",
+					"description": "Optional linked GitLab issue number within the project.",
+				},
 				"slices": map[string]any{
 					"type":        "array",
 					"description": "Optional seed slices. Beyond name/goal/files each slice may carry connective tissue: depends_on (earlier slices this one needs — referenced by slice NAME; the store resolves names to slice_ids), interface_contracts (what this slice PROVIDES for later slices / CONSUMES from earlier ones), and acceptance_criteria.",

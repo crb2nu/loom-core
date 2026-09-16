@@ -33,8 +33,8 @@ type BriefSources struct {
 	RepoRoot string
 
 	// MaxBytes caps the rendered markdown size. Zero falls back to
-	// briefDefaultMaxBytes (~16k chars ≈ 4k tokens). Sections are
-	// rendered in priority order; later sections truncate first.
+	// briefDefaultMaxBytes (~16k chars ≈ 4k tokens). The renderer reserves
+	// space for incident-classification sections before sharing the remainder.
 	MaxBytes int
 
 	// Now is injectable for deterministic test snapshots. Defaults to
@@ -112,6 +112,10 @@ const WorkspaceSignalsUnavailableBody = "_(workspace signals unavailable or empt
 // clusters returned by healthy sources.
 const WorkspaceSignalsPartialBody = "_(workspace signals partially unavailable this tick — the clusters below came from the sources that responded)_"
 
+// KPIDegradedMarker tells council consumers that the snapshot is present but
+// its telemetry substrate exceeded the external-incident threshold.
+const KPIDegradedMarker = "<!-- loom:council telemetry_degraded=true -->"
+
 // briefDefaultMaxBytes is roughly 4k tokens at 4 chars/token. Generous
 // for a planning brief; we'll tighten if reviewers consistently hit it.
 const briefDefaultMaxBytes = 16 * 1024
@@ -178,8 +182,8 @@ const crossRunBriefWindow = 8 * 24 * time.Hour
 //  3. Backlog snapshot (queued + active counts; titles for queued)
 //  4. .loom/00-index.md excerpt (operator-curated planning thread)
 //
-// Trailing sections truncate first if MaxBytes is hit, so a tight cap
-// preserves the structured signals over the prose tail.
+// When MaxBytes is hit, bodies are trimmed within their sections so headings
+// and incident-classification context survive instead of losing the tail.
 func Compile(ctx context.Context, src BriefSources) (*Brief, error) {
 	if src.Store == nil {
 		return nil, fmt.Errorf("council: brief requires a Store")
@@ -219,9 +223,13 @@ func Compile(ctx context.Context, src BriefSources) (*Brief, error) {
 	b.SourceCounts.Intents = len(intents)
 
 	if snap, err := src.Store.KPI.Latest(ctx, 86400); err == nil {
+		kpiBody := renderKPI(snap)
+		if src.ExternalIncidentVerdict != nil && !src.ExternalIncidentVerdict.Pass {
+			kpiBody = KPIDegradedMarker + "\n" + kpiBody
+		}
 		b.Sections = append(b.Sections, BriefSection{
 			Heading: "Mills KPIs (last 24h snapshot)",
-			Body:    renderKPI(snap),
+			Body:    kpiBody,
 		})
 		b.SourceCounts.KPISnapshot = true
 	}
@@ -235,7 +243,9 @@ func Compile(ctx context.Context, src BriefSources) (*Brief, error) {
 	b.SourceCounts.BacklogQueued = len(queued)
 	b.SourceCounts.BacklogActive = active
 
-	incidents, err := src.Store.Incidents.ListAggregated(ctx)
+	// Incidents are supporting evidence, not an all-history report. Keep this
+	// read aligned with the council's 24h evidence horizon and cap payload work.
+	incidents, err := src.Store.Incidents.ListAggregated(ctx, now.Add(-24*time.Hour), 200)
 	if err != nil {
 		return nil, fmt.Errorf("council: list persisted incidents: %w", err)
 	}
@@ -547,23 +557,145 @@ func firstNonEmptyString(values ...string) string {
 	return ""
 }
 
-// renderMarkdown stitches sections together with H2 headings, prefixed
-// with a deterministic "compiled at" timestamp so reviewers see when the
-// snapshot was taken. Truncation happens at section boundaries — we'd
-// rather drop a section entirely than render half of one.
+const (
+	briefSectionTruncatedMarker = "_(section truncated to fit brief byte budget)_"
+	briefEmptyReviewerNotes     = "_(no reviewer notes)_"
+	briefIncidentReserveBytes   = 1024
+)
+
+// renderMarkdown stitches sections together with H2 headings, prefixed with a
+// deterministic timestamp. It budgets bodies independently, reserving room for
+// incident sections first, and only admits complete lines. Rendered output is
+// therefore byte-bounded, UTF-8 safe, and never contains a partial list item.
 func renderMarkdown(now time.Time, sections []BriefSection, maxBytes int) string {
 	header := fmt.Sprintf("# Council Brief — compiled %s\n\n", now.Format(time.RFC3339))
-	out := strings.Builder{}
+	if maxBytes <= len(header) {
+		return truncateUTF8(header, maxBytes)
+	}
+
+	bodies := make([]string, len(sections))
+	budgets := make([]int, len(sections))
+	fixed := len(header)
+	for i, section := range sections {
+		body := strings.TrimRight(section.Body, "\n")
+		if body == "" && strings.EqualFold(section.Heading, "Reviewer notes") {
+			body = briefEmptyReviewerNotes
+		}
+		bodies[i] = body
+		fixed += len("\n## ") + len(section.Heading) + len("\n\n\n")
+	}
+	if fixed > maxBytes {
+		// Extremely small custom caps cannot carry every heading. Keep complete
+		// sections in source order; default-sized briefs always take the path below.
+		return renderHeadingsOnly(header, sections, maxBytes)
+	}
+
+	remaining := maxBytes - fixed
+	// Mandatory incident evidence gets the first claim on body capacity.
+	for i, section := range sections {
+		if !mandatoryBriefSection(section.Heading) {
+			continue
+		}
+		need := len(bodies[i])
+		if need > briefIncidentReserveBytes {
+			need = briefIncidentReserveBytes
+		}
+		if need > remaining {
+			need = remaining
+		}
+		budgets[i], remaining = need, remaining-need
+	}
+	// Stable round-robin allocation prevents an oversized early section from
+	// consuming everything while allowing small sections to finish cheaply.
+	for remaining > 0 {
+		progress := false
+		for i := range sections {
+			if budgets[i] >= len(bodies[i]) || remaining == 0 {
+				continue
+			}
+			budgets[i]++
+			remaining--
+			progress = true
+		}
+		if !progress {
+			break
+		}
+	}
+
+	var out strings.Builder
+	out.Grow(maxBytes)
 	out.WriteString(header)
-	for _, s := range sections {
-		chunk := fmt.Sprintf("\n## %s\n\n%s\n", s.Heading, strings.TrimRight(s.Body, "\n"))
-		if out.Len()+len(chunk) > maxBytes {
-			fmt.Fprintf(&out, "\n_(brief truncated at %d bytes — section %q dropped to fit)_\n", maxBytes, s.Heading)
+	for i, section := range sections {
+		fmt.Fprintf(&out, "\n## %s\n\n%s\n", section.Heading, trimBriefBody(bodies[i], budgets[i]))
+	}
+	return out.String()
+}
+
+func mandatoryBriefSection(heading string) bool {
+	switch heading {
+	case "Persisted incidents", "Workspace signals (recent errors)",
+		"Classified CI failures (last 24h)", "Incident classification planning context":
+		return true
+	default:
+		return false
+	}
+}
+
+func trimBriefBody(body string, budget int) string {
+	if len(body) <= budget {
+		return body
+	}
+	marker := briefSectionTruncatedMarker
+	if budget < len(marker) {
+		return ""
+	}
+	limit := budget - len(marker) - 1 // newline separating retained text and marker
+	if limit < 0 {
+		return marker
+	}
+	var kept strings.Builder
+	for _, line := range strings.SplitAfter(body, "\n") {
+		if kept.Len()+len(line) > limit {
+			break
+		}
+		kept.WriteString(line)
+	}
+	if kept.Len() == 0 {
+		return marker
+	}
+	return strings.TrimRight(kept.String(), "\n") + "\n" + marker
+}
+
+func renderHeadingsOnly(header string, sections []BriefSection, maxBytes int) string {
+	var out strings.Builder
+	out.WriteString(header)
+	marker := "\n" + briefSectionTruncatedMarker + "\n"
+	limit := maxBytes - len(marker)
+	if limit < out.Len() {
+		return truncateUTF8(header, maxBytes)
+	}
+	for _, section := range sections {
+		chunk := fmt.Sprintf("\n## %s\n\n", section.Heading)
+		if out.Len()+len(chunk) > limit {
 			break
 		}
 		out.WriteString(chunk)
 	}
+	out.WriteString(marker)
 	return out.String()
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	for maxBytes > 0 && (value[maxBytes]&0xc0) == 0x80 {
+		maxBytes--
+	}
+	return value[:maxBytes]
 }
 
 // readBriefFile reads up to maxBytes from path. Returns ("", 0) on any

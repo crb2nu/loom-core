@@ -15,7 +15,12 @@
   import DetailDrawer from '../shared/DetailDrawer.svelte';
   import ConfirmDialog from '../shared/ConfirmDialog.svelte';
   import { runAdminAction } from './shared/millsActions.ts';
+  import { toastStore } from '../../stores/toasts.svelte.ts';
   import { fmtCost, fmtRunTime, shortRunID } from './shared/format.ts';
+  import { relativeTime } from '../../utils/format.ts';
+  import { journeyEntries } from './shared/journey.ts';
+  import OriginChip from './shared/OriginChip.svelte';
+  import RepoChip from './shared/RepoChip.svelte';
 
   let load = $derived(millsStore.currentBacklogDetail);
   let open = $derived(millsStore.selectedBacklogID !== null);
@@ -29,6 +34,15 @@
   // Runs spawned for this item (active + history), newest-first. The
   // load-bearing cross-link: "why is this escalated?" → open its run.
   let runs = $derived(selectedID ? millsStore.pipelineRunsForBacklog(selectedID) : []);
+
+  // The item's journey: recorded events merged with its pipeline runs. The
+  // ledger alone is partial by construction (a queued→running claim writes no
+  // event), so the runs supply the stretches the events table never sees.
+  let eventsLoad = $derived(millsStore.currentBacklogEvents);
+  let ledger = $derived(
+    eventsLoad && eventsLoad.status === 'loaded' ? eventsLoad.ledger : null,
+  );
+  let journey = $derived(journeyEntries(ledger?.events ?? [], runs));
 
   // Imperative-lane runs (S7): items routed through ClaimWorkflowStart have
   // NO pipeline run — their "what happened" lives in workflow runs. Lazily
@@ -83,6 +97,47 @@
     !!detail && (ATTENTION_STATES.has((detail.State ?? '').toLowerCase()) || !!attentionRun),
   );
 
+  // Failure evidence: lazily pull the attention run's stages so the drawer
+  // answers "what actually broke?" inline — the failing stage plus the tail
+  // of its log — instead of making the operator drill run → stage → log for
+  // every triaged item. Detail rides the run-detail cache; the effect is
+  // safe to re-run (ensureRunDetailLoaded no-ops on loaded/in-flight).
+  $effect(() => {
+    if (open && attentionRun) millsStore.ensureRunDetailLoaded(attentionRun.ID);
+  });
+  const FAILING_OUTCOMES = new Set(['error', 'gate_fail']);
+  let attentionEvidence = $derived.by(() => {
+    if (!attentionRun) return null;
+    const load = millsStore.pipelineDetailByRun[attentionRun.ID];
+    if (!load || load.status !== 'loaded') return null;
+    const failing = (load.detail.stages ?? [])
+      .filter((s) => FAILING_OUTCOMES.has((s.Outcome ?? '') as string))
+      .sort((a, b) => (a.StartedAt ?? '').localeCompare(b.StartedAt ?? ''));
+    const stage = failing.length > 0 ? failing[failing.length - 1] : null;
+    if (!stage) return null;
+    // A gate_fail stage often has no log tail — the story lives in the gate
+    // outcome's reasons. Fall back so the evidence block never renders empty.
+    let text = (stage.LogTail ?? '').trim();
+    if (!text) {
+      const reasons = (load.detail.gates ?? [])
+        .filter((g) => g.AfterStage === stage.Stage && g.Outcome === 'fail')
+        .flatMap((g) => (g.Reasons ?? []).map((r) => `${g.GateName}: ${r}`));
+      text = reasons.join('\n');
+    }
+    if (!text) return null;
+    return { stage: stage.Stage, attempt: stage.Attempt, text: clampEvidence(text) };
+  });
+
+  // The drawer is a summary surface: show the informative END of the log
+  // (it's already a tail server-side), and leave the full 20k view to the
+  // run drawer one click away.
+  const MAX_EVIDENCE_CHARS = 700;
+  function clampEvidence(s: string): string {
+    const trimmed = s.trim();
+    if (trimmed.length <= MAX_EVIDENCE_CHARS) return trimmed;
+    return `…${trimmed.slice(-MAX_EVIDENCE_CHARS)}`;
+  }
+
   // Start is offered when the item has no run yet and isn't terminal —
   // re-starting a merged item or one already mid-flight would be confusing.
   // Exception: an escalated item is parked awaiting exactly this human
@@ -116,10 +171,27 @@
     const id = detail?.ID;
     if (!id) return;
     starting = true;
-    await runAdminAction(() => millsStore.startPipeline(id, { requeue: isEscalated }), {
-      success: 'Pipeline started — watch it under Pipelines',
-      failurePrefix: 'Start failed',
-    });
+    if (isEscalated) {
+      // The requeue path returns a normalized outcome instead of throwing so
+      // decision:"deferred" — the requeue LANDED but the scheduler held the
+      // start (scope overlap / starved-item reservation / budget) — reads as
+      // the success it is. Routed through startPipeline it surfaced as
+      // "Start failed: 409 …", which sent operators off to double-check the
+      // DB after a requeue that had in fact worked.
+      const outcome = await millsStore.requeuePipelineRun(id);
+      if (outcome.kind === 'started') {
+        toastStore.success('Pipeline started — watch it under Pipelines');
+      } else if (outcome.kind === 'deferred') {
+        toastStore.info(outcome.message);
+      } else {
+        toastStore.error(outcome.message);
+      }
+    } else {
+      await runAdminAction(() => millsStore.startPipeline(id), {
+        success: 'Pipeline started — watch it under Pipelines',
+        failurePrefix: 'Start failed',
+      });
+    }
     starting = false;
   }
 
@@ -136,6 +208,8 @@
       <div class="chips">
         <span class="state state-{detail.State}">{detail.State}</span>
         <span class="prio">P · {detail.Priority}</span>
+        <RepoChip targetProject={detail.TargetProject} />
+        <OriginChip item={detail} />
         {#if detail.Labels?.length}
           {#each detail.Labels as label}<span class="label">{label}</span>{/each}
         {/if}
@@ -163,6 +237,17 @@
             <button type="button" class="attention-link" onclick={() => openRun(attentionRun.ID)}>
               {attentionRun.State}{#if attentionRun.CurrentStage} at <span class="mono">{attentionRun.CurrentStage}</span>{/if} · open run {shortRunID(attentionRun.ID)} →
             </button>
+            {#if attentionEvidence}
+              <!-- Inline failure evidence: the last failing stage's log tail
+                   (or its failed gates' reasons), so the common triage ends
+                   here instead of three drill-downs deep. -->
+              <div class="evidence">
+                <span class="evidence-head">
+                  FAIL <span class="mono">{attentionEvidence.stage}</span> · attempt {attentionEvidence.attempt}
+                </span>
+                <pre class="evidence-log">{attentionEvidence.text}</pre>
+              </div>
+            {/if}
           {:else if settledWfRun}
             <!-- S7 terminal settle: the imperative run that escalated this
                  item, and the branch holding its work product. -->
@@ -219,6 +304,51 @@
         <span class="k">Created</span>
         <span class="v">{fmtRunTime(detail.CreatedAt)}{#if detail.CreatedBy} · {detail.CreatedBy}{/if}</span>
       </div>
+    </section>
+
+    <!-- Journey: the item's recorded history. Deliberately captioned as a
+         record of what was LOGGED — only some transitions write events, so
+         claiming a complete lifecycle here would be a lie the operator would
+         eventually debug against. -->
+    <section class="block">
+      <h4>Journey <span class="count">{journey.length}</span></h4>
+      {#if eventsLoad?.status === 'loading'}
+        <p class="muted">Loading history…</p>
+      {:else if eventsLoad?.status === 'error'}
+        <p class="muted">History unavailable — {eventsLoad.message}</p>
+      {:else if journey.length === 0}
+        <p class="muted">Nothing recorded yet for this item.</p>
+      {:else}
+        <ol class="journey">
+          {#each journey as entry (entry.key)}
+            <li class="jrow tone-{entry.tone}">
+              <span class="jdot" aria-hidden="true"></span>
+              <span class="jbody">
+                <span class="jhead">
+                  <span class="jlabel">{entry.label}</span>
+                  <span class="jactor mono">{entry.actor}</span>
+                  {#if entry.runID}
+                    <button
+                      type="button"
+                      class="jrun"
+                      onclick={() => entry.runID && openRun(entry.runID)}
+                      title="Open this pipeline run"
+                    >{shortRunID(entry.runID)} →</button>
+                  {/if}
+                </span>
+                {#if entry.detail}<span class="jdetail mono">{entry.detail}</span>{/if}
+              </span>
+              <span class="jtime" title={fmtRunTime(entry.timestamp)}>
+                {relativeTime(entry.timestamp)}
+              </span>
+            </li>
+          {/each}
+        </ol>
+        <p class="jnote">
+          Recorded events and run boundaries. Not every state change writes an
+          event, so quiet stretches are gaps in the log, not in the work.
+        </p>
+      {/if}
     </section>
 
     {#if wfSelection || wfRuns.length > 0}
@@ -385,6 +515,18 @@
     color: var(--mills); font-size: var(--text-xs);
   }
   .attention-link:hover { text-decoration: underline; }
+  .evidence { display: flex; flex-direction: column; gap: 0.2rem; margin-top: 0.35rem; min-width: 0; }
+  .evidence-head {
+    font-size: var(--text-2xs); color: var(--error);
+    letter-spacing: 0.04em;
+  }
+  .evidence-log {
+    margin: 0; padding: 0.4rem 0.5rem; border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle); background: var(--bg-subtle);
+    font-family: var(--font-mono); font-size: var(--text-2xs); line-height: 1.45;
+    color: var(--fg-secondary); white-space: pre-wrap; word-break: break-word;
+    max-height: 10rem; overflow-y: auto;
+  }
   .wf-branch {
     display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center;
     font-size: var(--text-2xs); color: var(--text-muted); margin-top: 0.25rem;
@@ -427,6 +569,54 @@
     font-size: var(--text-2xs); color: var(--text-muted); font-family: var(--font-mono);
   }
   .spec { overflow-wrap: anywhere; font-size: var(--text-xs); }
+
+  /* Journey — a rail of recorded history, newest first. The dot carries the
+     tone so the row text stays readable at drawer width. */
+  .journey {
+    list-style: none; margin: 0; padding: 0 0 0 0.35rem;
+    display: flex; flex-direction: column;
+    border-left: 1px solid var(--border-subtle);
+  }
+  .jrow {
+    display: flex; align-items: flex-start; gap: 0.5rem;
+    padding: 0.3rem 0 0.3rem 0.6rem; position: relative;
+    font-size: var(--text-xs);
+    --tone: var(--fg-tertiary);
+  }
+  .jrow.tone-success { --tone: var(--success); }
+  .jrow.tone-error { --tone: var(--error); }
+  .jrow.tone-warning { --tone: var(--warning); }
+  .jrow.tone-accent { --tone: var(--accent); }
+  .jrow.tone-info { --tone: var(--info); }
+  .jrow.tone-muted { --tone: var(--fg-tertiary); }
+  .jdot {
+    position: absolute; left: -4px; top: 0.6rem;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--tone);
+    border: 1px solid var(--bg-primary);
+    flex-shrink: 0;
+  }
+  .jbody { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+  .jhead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem; }
+  .jlabel { color: var(--tone); font-weight: 600; }
+  .jactor { color: var(--text-muted); font-size: var(--text-2xs); }
+  .jdetail {
+    color: var(--text-muted); font-size: var(--text-2xs);
+    overflow-wrap: anywhere;
+  }
+  .jrun {
+    padding: 0; border: 0; background: transparent; cursor: pointer;
+    color: var(--mills); font-family: var(--font-mono); font-size: var(--text-2xs);
+  }
+  .jrun:hover { text-decoration: underline; }
+  .jtime {
+    margin-left: auto; color: var(--text-muted);
+    font-size: var(--text-2xs); white-space: nowrap;
+  }
+  .jnote {
+    color: var(--fg-dim); font-size: var(--text-2xs);
+    margin: 0.35rem 0 0; line-height: 1.4;
+  }
   .runs, .slices { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
   .run-link {
     display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; width: 100%;

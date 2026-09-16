@@ -1,0 +1,1 @@
+- Flag council-brief KPI sections in `pkg/mills/council/brief.go` as telemetry-degraded when the external-incident threshold is exceeded.

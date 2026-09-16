@@ -1,6 +1,6 @@
 # One-time audit-advisory sweep
 
-Use this runbook once to close stale rolling `audit_digest` issues. The sweep
+Use this runbook once to close stale rolling `audit-digest` issues. The sweep
 is dry-run by default. It does not schedule recurring cleanup, and it cannot
 reopen an issue after an incorrect apply.
 

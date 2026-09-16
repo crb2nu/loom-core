@@ -9,6 +9,8 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 )
 
+const failedBuildRetention = 30 * time.Second
+
 // buildInfo tracks one in-flight (or just-finished) sandbox image build.
 // Builds are keyed by image tag so concurrent callers for the same project
 // fingerprint join a single build instead of each spawning their own.
@@ -49,7 +51,7 @@ func (t *buildTracker) lookup(tag string) *buildInfo {
 // existing in-flight build). wg tracks the goroutine for graceful shutdown.
 func (t *buildTracker) startOrJoin(tag string, wg *sync.WaitGroup, run func() error) (*buildInfo, bool) {
 	t.mu.Lock()
-	if b, ok := t.builds[tag]; ok && !b.done {
+	if b, ok := t.builds[tag]; ok {
 		cp := *b
 		t.mu.Unlock()
 		return &cp, false
@@ -70,12 +72,22 @@ func (t *buildTracker) startOrJoin(tag string, wg *sync.WaitGroup, run func() er
 		b.done = true
 		b.err = err
 		t.mu.Unlock()
+		if err != nil {
+			time.AfterFunc(failedBuildRetention, func() {
+				t.mu.Lock()
+				if t.builds[tag] == b {
+					delete(t.builds, tag)
+				}
+				t.mu.Unlock()
+			})
+		}
 	}()
 
 	return &snapshot, true
 }
 
-// clear removes a finished build entry so a later fingerprint change rebuilds.
+// clear removes a finished build entry. Successful entries are intentionally
+// retained by the manager because tags include the fingerprint and are immutable.
 func (t *buildTracker) clear(tag string) {
 	t.mu.Lock()
 	delete(t.builds, tag)

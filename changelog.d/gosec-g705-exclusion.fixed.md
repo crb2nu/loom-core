@@ -1,0 +1,1 @@
+- CI: exclude gosec G705 (XSS taint analysis) alongside the already-excluded G702-G704 taint family; a newer gosec added the rule and flagged the operator-authored JSON rollup write served as application/json, redding main.

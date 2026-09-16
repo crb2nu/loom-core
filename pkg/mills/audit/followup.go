@@ -166,6 +166,13 @@ func (f *Followup) digestPeriod() string {
 // otherwise it opens the digest seeded with this finding. Fail-open throughout
 // — any GitLab error is logged and swallowed so the QueueWorker keeps draining,
 // matching the legacy path's contract.
+//
+// Once a new digest is open, the newest still-open prior digest is superseded
+// (commented + closed, see SupersedePreviousDigest) when the issuer supports
+// DigestSupersessionIssuer, so each day's filing retires the previous one and
+// the open `audit-digest` pile stops growing. That step is fail-open as well:
+// a failed close leaves the prior digest open for the operator sweep
+// (`loom audit-advisory-sweep`) rather than blocking the finding.
 func (f *Followup) recordToDigest(ctx context.Context, dg DigestIssuer, finding *store.AuditFinding) error {
 	period := f.digestPeriod()
 	ref, found, err := dg.FindOpenAuditDigest(ctx, period)
@@ -202,9 +209,21 @@ func (f *Followup) recordToDigest(ctx context.Context, dg DigestIssuer, finding 
 		return nil
 	}
 
+	body := f.digestBody(period, finding)
+	if reader, ok := dg.(interface {
+		FindAuditDigestBody(context.Context, string) (string, bool, error)
+	}); ok {
+		day, _ := time.Parse("2006-01-02", period)
+		previous, exists, lookupErr := reader.FindAuditDigestBody(ctx, day.AddDate(0, 0, -1).Format("2006-01-02"))
+		if lookupErr != nil {
+			f.warn("audit/followup: previous digest lookup failed", "error", lookupErr)
+		} else if exists && NormalizeDigestBody(previous) == NormalizeDigestBody(body) {
+			return nil
+		}
+	}
 	req := pipeline.IssueRequest{
 		Title:       f.digestTitle(period),
-		Description: f.digestBody(period, finding),
+		Description: body,
 		Labels:      f.digestLabels(),
 	}
 	resp, cerr := dg.CreateIssue(ctx, req)
@@ -224,6 +243,15 @@ func (f *Followup) recordToDigest(ctx context.Context, dg DigestIssuer, finding 
 		"subject_id", finding.SubjectID,
 		"survival", finding.SurvivalScore,
 	)
+	if superseder, ok := dg.(DigestSupersessionIssuer); ok {
+		if err := SupersedePreviousDigest(ctx, superseder, period, resp.IID); err != nil {
+			f.warn("audit/followup: supersede previous digest failed",
+				"period", period,
+				"new_iid", resp.IID,
+				"error", err,
+			)
+		}
+	}
 	return nil
 }
 

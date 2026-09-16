@@ -9,7 +9,7 @@ Run it locally from a branch that is ahead of `main`:
 GOWORK=off make ci-reliability
 ```
 
-CI runs the same target with an inner 810-second deadline. Evidence is written
+CI runs the same target with a 1380-second shell budget (25-minute job). Evidence is written
 under `.loom/local/evidence/fleet-reliability/<run-id>/` and uploaded from the
 `test:reliability` job even when the job fails.
 
@@ -61,7 +61,21 @@ candidate once. It then executes 11 rounds for each benchmark with:
 - base and candidate samples adjacent for the same package;
 - first/second order reversed on alternating rounds;
 - `GOMAXPROCS=2`, `-benchmem`, and a one-second benchmark duration;
-- exactly 88 binary executions and 11 samples per side.
+- 88 binary executions and 11 samples per side in the nominal case.
+
+Each binary run is capped at 90 seconds (`fleet_benchmark_sample_timeout_seconds`
+in `scripts/ci/fleet_reliability_benchmarks.sh`). A run that exceeds the cap
+does not abort the phase: the driver (`run_paired_fleet_benchmark_rounds`)
+drops that package's pair for the round on BOTH sides — a pair reaches the
+evidence files only when both samples completed, so positional pairing never
+drifts — records a `# skipped-pair` comment, and after the eleven nominal
+rounds runs up to four make-up rounds for packages still short of eleven
+pairs. Packages already at quota sit make-up rounds out. A package that stays
+slow still fails ("need at least 11 paired samples") and the deadline still
+stops the phase; the change only stops one contended sample from zeroing the
+whole gate (2026-09-10: a runner node at load 22–27 on 28 threads pushed the
+SQLite-backed store sample past the old 30-second cap on both sides and every
+MR reported `observed 0/4 scenarios` while the benchmarks were healthy).
 
 The comparison uses the median of same-round candidate/baseline ratios. This
 discounts isolated noisy rounds while preserving a matched comparison against

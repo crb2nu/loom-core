@@ -1,0 +1,1 @@
+- Preserve exact Jaccard fallback through `JaccardScorer` in `pkg/mills/textsim/semantic.go` and verify default, embedding-backed, and invalid-backend council grounding in `pkg/mills/council/merged_work_test.go`.

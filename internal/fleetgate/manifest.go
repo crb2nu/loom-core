@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const (
@@ -19,6 +20,21 @@ type Manifest struct {
 	Thresholds    BenchmarkThresholds `json:"thresholds"`
 	TestGroups    []TestGroup         `json:"test_groups"`
 	Benchmarks    []string            `json:"benchmarks"`
+	Waivers       []BenchmarkWaiver   `json:"waivers,omitempty"`
+}
+
+// BenchmarkWaiver is an operator-approved, self-expiring exception that
+// raises one benchmark's time-regression cap. Waivers exist so a deliberate
+// trade (documented in Reason) merges without silently moving the global
+// budget: the report records every application, and past Until the gate
+// snaps back to the global threshold on its own.
+type BenchmarkWaiver struct {
+	Benchmark      string  `json:"benchmark"`
+	MaxTimePercent float64 `json:"max_time_percent"`
+	// Until is an inclusive RFC3339 date (2006-01-02); the waiver is inert
+	// on later days.
+	Until  string `json:"until"`
+	Reason string `json:"reason"`
 }
 
 type TestGroup struct {
@@ -70,6 +86,29 @@ func (m Manifest) Validate() error {
 	}
 	if m.Thresholds.TimePercent <= 0 || m.Thresholds.BytesPercent <= 0 || m.Thresholds.AllocationsPercent <= 0 {
 		return fmt.Errorf("manifest benchmark thresholds must be positive")
+	}
+	known := make(map[string]struct{}, len(m.Benchmarks))
+	for _, name := range m.Benchmarks {
+		known[name] = struct{}{}
+	}
+	seenWaivers := make(map[string]struct{}, len(m.Waivers))
+	for _, w := range m.Waivers {
+		if _, ok := known[w.Benchmark]; !ok {
+			return fmt.Errorf("waiver references unknown benchmark %q", w.Benchmark)
+		}
+		if _, dup := seenWaivers[w.Benchmark]; dup {
+			return fmt.Errorf("duplicate waiver for benchmark %q", w.Benchmark)
+		}
+		seenWaivers[w.Benchmark] = struct{}{}
+		if w.MaxTimePercent <= m.Thresholds.TimePercent {
+			return fmt.Errorf("waiver for %q must exceed the global time threshold to mean anything", w.Benchmark)
+		}
+		if w.Reason == "" {
+			return fmt.Errorf("waiver for %q requires a reason", w.Benchmark)
+		}
+		if _, err := time.Parse("2006-01-02", w.Until); err != nil {
+			return fmt.Errorf("waiver for %q has invalid until date: %w", w.Benchmark, err)
+		}
 	}
 	groups := make(map[string]struct{}, len(m.TestGroups))
 	for _, group := range m.TestGroups {

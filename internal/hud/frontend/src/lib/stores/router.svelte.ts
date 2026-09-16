@@ -84,15 +84,17 @@ export const views: ViewDef[] = [
     key: '1',
     default: 'fleet',
     subViews: [
+      // dispatch and lifecycle were retired 2026-08-30: every Dispatch
+      // section had a newer home (Deck dispatch actions, Mills ▸ Shuttles
+      // recommendations, Overview merge queue) and Lifecycle owned no data of
+      // its own. legacyRedirects below keeps their old hashes resolving.
       { id: 'fleet',     label: 'Fleet',     key: 'a' },
       // Unified cross-vendor session browser: claude + codex transcripts
       // from this host and federated Macs, repo-grouped and joined against
       // live fleet agents. 's' for Sessions.
       { id: 'sessions',  label: 'Sessions',  key: 's' },
-      { id: 'dispatch',  label: 'Dispatch',  key: 'b' },
       { id: 'presence',  label: 'Presence',  key: 'c' },
       { id: 'topology',  label: 'Topology',  key: 'd' },
-      { id: 'lifecycle', label: 'Lifecycle',  key: 'e' },
       // Classified branch→MR registry + the shepherd's auto-action audit log
       // (GET /api/mrwatch/{summary,actions}). 'm' for MRs; 'f' would collide
       // with nothing here but reads as "fleet", which is the tab next door.
@@ -211,10 +213,11 @@ export const views: ViewDef[] = [
       // and the Alley is the overlookers' walk (overseers). Code, API paths,
       // and event actors keep council/squads/overseer — the theme lives in
       // labels and docs only, so ids and hotkeys are unchanged.
-      // `staff` leads the group: the three departments side by side plus the
-      // staff evidence reports (promotion, judge calibration, regressions,
-      // config outcomes, signature candidates). The three tabs after it stay
-      // the per-department detail surfaces.
+      // `staff` leads the group: one tile per department plus the staff
+      // evidence reports (promotion, judge calibration, regressions, config
+      // outcomes, signature candidates). The three tabs after it are the
+      // per-department surfaces; `staff` links to them rather than stacking
+      // them a second time.
       { id: 'staff',      label: 'Mill Staff',     key: 'm', group: 'Mill staff' },
       { id: 'council',    label: 'Drawing Office', key: 'd', group: 'Mill staff' },
       { id: 'squads',     label: 'Drawing-in',     key: 'f', group: 'Mill staff' },
@@ -224,7 +227,6 @@ export const views: ViewDef[] = [
       { id: 'audit',      label: 'Audit',      key: 'g', group: 'Governance' },
       { id: 'policy',     label: 'Policy',     key: 'i', group: 'Governance' },
       { id: 'patterns',   label: 'Patterns',   key: 'j', group: 'Governance' },
-      { id: 'cross-repo', label: 'Cross-Repo', key: 'h', group: 'Governance' },
       { id: 'telemetry',  label: 'Telemetry',  key: 't', group: 'Governance' },
       // "Runs" (Mills workflow runs), not "Workflows" — that label collided
       // with Work ▸ Workflows, which is a different surface entirely.
@@ -265,6 +267,16 @@ legacyRedirects['overview'] = { view: 'mills', subView: 'mills-overview' };
 // #mills/pipelines/<id>.
 legacyRedirects['backlog'] = { view: 'mills', subView: 'warps' };
 legacyRedirects['pipelines'] = { view: 'mills', subView: 'shuttles' };
+// Operations-view retirements (2026-08-30). Dispatch's sections all had newer
+// homes — dispatch actions on the Deck, shuttle recommendations in Mills ▸
+// Shuttles, the merge queue on Overview — and Lifecycle derived everything
+// from stores other panels already render. Old bookmarks and cross-links
+// (`#dispatch`, `#agents/dispatch`, `#lifecycle`, …) land on the successors.
+legacyRedirects['dispatch'] = { view: 'operator', subView: 'deck' };
+legacyRedirects['lifecycle'] = { view: 'activity', subView: 'timeline' };
+// The engram tech tree lives on the Patterns page and nothing in the nav says
+// so — give the term people actually search a hash that lands there.
+legacyRedirects['engrams'] = { view: 'mills', subView: 'patterns' };
 
 // The Operator Deck is the primary operator surface, so a bare/unknown hash
 // lands there (it was agents/fleet before the deck existed).

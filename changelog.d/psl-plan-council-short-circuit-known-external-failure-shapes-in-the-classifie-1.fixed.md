@@ -1,0 +1,1 @@
+- Short-circuit known OpenRouter, ClickHouse, GitLab-agent, and GitLab CI infrastructure failures in `pkg/mills/pipeline/classifier.go`, with ordering and near-miss coverage in `pkg/mills/pipeline/classifier_test.go`.

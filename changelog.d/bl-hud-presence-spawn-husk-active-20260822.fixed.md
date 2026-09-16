@@ -1,0 +1,1 @@
+- Make the mobile agents roster and dashboard use the same heartbeat-backed activity verdict, classifying heartbeat-less presence and spawn-only rows as offline orphans (`internal/hud/domain/mobile/handler_agents.go`, `internal/hud/domain/mobile/handler_dashboard.go`).

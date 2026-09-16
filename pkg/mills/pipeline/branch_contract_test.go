@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"net/url"
+	"reflect"
 	"testing"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
@@ -96,5 +97,25 @@ func TestBranchContractFor_FanOutSliceUsesSliceBranch(t *testing.T) {
 	}
 	if got.SliceBranch != "feat/BL-PAR/api-changes" {
 		t.Errorf("slice branch = %q", got.SliceBranch)
+	}
+}
+
+func TestBranchRefCollisions(t *testing.T) {
+	item := &store.BacklogItem{ID: "BL-X"}
+	for _, tc := range []struct {
+		name     string
+		contract string
+		refs     []string
+		want     []BranchRefCollision
+	}{
+		{"legacy prefix", "feat/BL-X/api", []string{"refs/heads/feat/BL-X"}, []BranchRefCollision{{Ref: "feat/BL-X", SameItemLegacyForm: true}}},
+		{"reverse prefix is foreign", "feat/BL-X/api", []string{"feat/BL-X/api/backup"}, []BranchRefCollision{{Ref: "feat/BL-X/api/backup"}}},
+		{"exact and siblings do not collide", "feat/BL-X/api", []string{"feat/BL-X/api", "feat/BL-X-api", "feat/BL-X-retry2", "feat/BL-XY/api"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := BranchRefCollisions(tc.contract, tc.refs, item); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("collisions = %#v, want %#v", got, tc.want)
+			}
+		})
 	}
 }

@@ -2,6 +2,7 @@ package embed
 
 import (
 	"context"
+	"math"
 	"testing"
 )
 
@@ -31,7 +32,6 @@ func TestDummyEmbedder(t *testing.T) {
 		if len(vec) != 128 {
 			t.Errorf("expected vector length 128, got %d", len(vec))
 		}
-		// First element should be non-zero
 		if vec[0] != 1 {
 			t.Errorf("expected first element to be 1, got %f", vec[0])
 		}
@@ -77,7 +77,35 @@ func TestDummyEmbedder(t *testing.T) {
 }
 
 func TestEmbedderInterface(t *testing.T) {
-	// Verify interface compliance at compile time
 	var _ Embedder = (*DummyEmbedder)(nil)
 	var _ Embedder = (*MorphClient)(nil)
+}
+
+func TestCosineSimilarity(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []float64
+		want float64
+		ok   bool
+	}{
+		{name: "identical", a: []float64{1, 0}, b: []float64{1, 0}, want: 1, ok: true},
+		{name: "orthogonal", a: []float64{1, 0}, b: []float64{0, 1}, want: 0, ok: true},
+		{name: "opposite", a: []float64{1, 0}, b: []float64{-1, 0}, want: -1, ok: true},
+		{name: "large finite", a: []float64{math.MaxFloat64}, b: []float64{math.MaxFloat64}, want: 1, ok: true},
+		{name: "small finite", a: []float64{math.SmallestNonzeroFloat64}, b: []float64{math.SmallestNonzeroFloat64}, want: 1, ok: true},
+		{name: "empty", ok: false},
+		{name: "dimension mismatch", a: []float64{1}, b: []float64{1, 0}, ok: false},
+		{name: "zero vector", a: []float64{0, 0}, b: []float64{1, 0}, ok: false},
+		{name: "nan", a: []float64{math.NaN()}, b: []float64{1}, ok: false},
+		{name: "positive infinity", a: []float64{math.Inf(1)}, b: []float64{1}, ok: false},
+		{name: "negative infinity", a: []float64{1}, b: []float64{math.Inf(-1)}, ok: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := CosineSimilarity(tc.a, tc.b)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("CosineSimilarity() = (%v, %v), want (%v, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
 }

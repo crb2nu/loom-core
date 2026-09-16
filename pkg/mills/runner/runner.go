@@ -25,6 +25,7 @@ import (
 
 	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/mills"
+	"github.com/crb2nu/loom/pkg/mills/clients"
 	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/mills/eval"
 	"github.com/crb2nu/loom/pkg/mills/gates"
@@ -56,12 +57,20 @@ func (r *Runner) RouteTransientFailure(ctx context.Context, backlogID string, cl
 	}
 }
 
-// councilReviewerTimeout covers queued inference on the shared local 35B
-// backend while keeping every lens independently bounded. Three reviewers run
-// in parallel and only a majority is required, so 90 seconds allows two
-// serialized slots to complete without extending the whole Council indefinitely.
+// councilReviewerTimeout covers queued inference on the shared local
+// workhorse backend while keeping every lens independently bounded. Four
+// reviewers run in parallel and only a majority is required.
+//
+// Raised 90s → 180s (2026-09-02): the local 27B workhorse is parked between
+// councils and cold-loads on the first reviewer call. Live evidence from
+// COUNCIL-2026-09-02-000053: reviewers dispatched 00:01:12, FlexInfer logged
+// "model ready, draining queue" at 00:02:18 (66s of load), and both local
+// lenses plus the gateway lens died at the 90s deadline (00:02:42) — 1/4
+// quorum, partial verdict, no backlog delta. Identical shape on
+// COUNCIL-2026-08-30-180032. 180s leaves ~110s of generation after a cold
+// load, well above the ~40s a 384-token review takes once warm.
 const (
-	councilReviewerTimeout = 90 * time.Second
+	councilReviewerTimeout = 180 * time.Second
 	councilCleanupTimeout  = 10 * time.Second
 )
 
@@ -75,6 +84,11 @@ var ErrBudgetDenied = errors.New("council budget denied")
 // requires roadmap intents. Exported so handlers and tests can classify the
 // refusal instead of pattern-matching the message.
 var ErrIntentsMissing = errors.New("council intents missing")
+
+// ErrModelAuth is returned before admission when a configured remote model
+// provider has no credential. The wrapped clients.ModelAuthError carries the
+// stable model_auth class without exposing credential values.
+var ErrModelAuth = errors.New("council model authentication failed")
 
 // StageBudgets bounds each council phase independently so one wedged
 // participant cannot hold an admitted run — and the budget reservation it
@@ -106,9 +120,10 @@ type StageBudgets struct {
 // observed distribution of legitimate production passes.
 func DefaultStageBudgets() StageBudgets {
 	return StageBudgets{
-		Overall:   20 * time.Minute,
-		Brief:     2 * time.Minute,
-		Reviewers: 3 * time.Minute,
+		Overall: 20 * time.Minute,
+		Brief:   2 * time.Minute,
+		// Envelope over councilReviewerTimeout (180s) plus dispatch slack.
+		Reviewers: 4 * time.Minute,
 		Debate:    10 * time.Minute,
 		Editor:    8 * time.Minute,
 		Artifacts: 1 * time.Minute,
@@ -185,13 +200,13 @@ type Runner struct {
 	RepoRoot  string
 	Logger    *slog.Logger
 
-	// ConcurrencyPolicy bounds simultaneous runner admissions. Its zero value
-	// preserves the pre-policy default; an invalid explicit value is retained
-	// as an admission error so no run can bypass malformed policy.
-	ConcurrencyPolicy sharedpolicy.PipelineConcurrencyPolicy
-	concurrencyOnce   sync.Once
-	concurrency       *loomconcurrency.Concurrency
-	concurrencyErr    error
+	// ModelCredentials checks configured remote provider credentials before a
+	// run id is minted, budget is queried, or durable admission is attempted.
+	// The zero value uses the process environment.
+	ModelCredentials clients.ModelCredentialPreflight
+
+	concurrencyOnce sync.Once
+	concurrency     *loomconcurrency.Concurrency
 
 	// Signals, when set, feeds recent workspace pain (Loki error clusters)
 	// into the council brief so proposals are grounded in real failures
@@ -293,22 +308,34 @@ func (r *Runner) Run(ctx context.Context, in RunInput) (*RunResult, error) {
 	return r.Execute(ctx, adm)
 }
 
-func (r *Runner) acquireConcurrency(ctx context.Context) error {
+func (r *Runner) acquireConcurrency(ctx context.Context, policy *mills.Policy) error {
 	if r == nil {
 		return errors.New("council runner not configured")
 	}
+	limit, err := resolveConcurrencyLimit(policy)
+	if err != nil {
+		return err
+	}
 	r.concurrencyOnce.Do(func() {
-		r.concurrencyErr = r.ConcurrencyPolicy.Validate()
-		if r.concurrencyErr != nil {
-			return
-		}
-		r.concurrency = loomconcurrency.NewConcurrency(r.ConcurrencyPolicy.EffectiveLimit())
+		r.concurrency = loomconcurrency.NewConcurrency(limit)
 		r.logf("council runner concurrency configured", "concurrency_limit", r.concurrency.Limit())
 	})
-	if r.concurrencyErr != nil {
-		return fmt.Errorf("council runner concurrency policy: %w", r.concurrencyErr)
+	if err := r.concurrency.SetLimit(limit); err != nil {
+		return fmt.Errorf("council runner concurrency policy: %w", err)
 	}
 	return r.concurrency.Acquire(ctx)
+}
+
+func resolveConcurrencyLimit(policy *mills.Policy) (int, error) {
+	var configured *int
+	if policy != nil {
+		configured = policy.MaxConcurrentPipelines
+	}
+	limit, err := sharedpolicy.ResolvePipelineConcurrencyLimit(configured)
+	if err != nil {
+		return 0, fmt.Errorf("council runner concurrency policy: %w", err)
+	}
+	return limit, nil
 }
 
 // Admission is the outcome of Runner.Admit. On a non-dryrun success it is
@@ -368,6 +395,14 @@ func (r *Runner) Admit(ctx context.Context, in RunInput) (*Admission, error) {
 	if !policy.IsEnabled() {
 		return nil, errors.New("council runner: policy disabled")
 	}
+	// Validate the possibly hot-reloaded policy before credentials, run-id
+	// creation, budget access, limiter initialization, or durable work.
+	if _, err := resolveConcurrencyLimit(policy); err != nil {
+		return nil, err
+	}
+	if err := r.ModelCredentials.Check(configuredModelProviders(policy)...); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrModelAuth, err)
+	}
 	// The public run request has always treated an omitted trigger as a manual
 	// invocation. Normalize at the runner boundary so every caller, including
 	// the atomic admission record and metrics, observes the same value.
@@ -421,6 +456,19 @@ func (r *Runner) Admit(ctx context.Context, in RunInput) (*Admission, error) {
 	return adm, nil
 }
 
+func configuredModelProviders(policy *mills.Policy) []string {
+	if policy == nil {
+		return nil
+	}
+	providers := make([]string, 0, len(policy.Council.Ensemble.Reviewers)+2)
+	providers = append(providers, policy.Council.Ensemble.Editor.Backend)
+	for _, reviewer := range policy.Council.Ensemble.Reviewers {
+		providers = append(providers, reviewer.Backend)
+	}
+	providers = append(providers, policy.Council.Ensemble.Judge.Backend)
+	return providers
+}
+
 // Execute runs an admitted council pass: brief → reviewers → editor →
 // artifacts → judge → mutator. It owns the deferred finalizer, so every exit
 // path — normal, error, panic, context cancellation — writes a terminal
@@ -433,7 +481,7 @@ func (r *Runner) Execute(ctx context.Context, adm *Admission) (res *RunResult, r
 	if adm == nil || adm.Policy == nil {
 		return nil, errors.New("council runner: admission required")
 	}
-	if err := r.acquireConcurrency(ctx); err != nil {
+	if err := r.acquireConcurrency(ctx, adm.Policy); err != nil {
 		return adm.result(), err
 	}
 	defer r.concurrency.Release()
@@ -921,9 +969,25 @@ func (r *Runner) Execute(ctx context.Context, adm *Admission) (res *RunResult, r
 	}
 	res.Mutation = mutation
 
-	// Refresh BacklogDeltas on the persisted run row.
-	if !in.Dryrun && len(mutation.CreatedItems) > 0 {
-		finalRun.BacklogDeltas.Created = mutation.CreatedIDs()
+	// Refresh BacklogDeltas on the persisted run row. Proposals routed to the
+	// plan lane are yield too — the emitter turns their slices into backlog
+	// items later — so they count as created ("plan:<id>") rather than
+	// leaving council_yield reading a productive run as a dry one.
+	if !in.Dryrun {
+		created := mutation.CreatedIDs()
+		for _, planID := range mutation.RoutedPlanLane {
+			created = append(created, "plan:"+planID)
+		}
+		if len(created) > 0 {
+			finalRun.BacklogDeltas.Created = created
+		}
+		// The mutator's own accounting (created / deduped / merged-work
+		// skipped / plan-lane routed / fictional …) is the only durable
+		// explanation of a zero-yield run; the audit rows can fail under a
+		// spent stage budget and the log line is ephemeral.
+		if finalRun != nil && mutation != nil {
+			finalRun.Notes = appendCouncilNote(finalRun.Notes, "mutator: "+mutation.Summary())
+		}
 	}
 
 	// Record this run into the council lane's durable memory, AFTER everything

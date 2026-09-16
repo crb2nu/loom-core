@@ -1,24 +1,29 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/gates"
 	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/crb2nu/loom/pkg/telemetry"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeDispatcher records every Dispatch call and returns canned outputs
@@ -36,8 +41,109 @@ type fakeDispatcher struct {
 	seenFence map[string]int64
 }
 
+// reviewHeadDispatcher models a branch whose head moves under the pipeline:
+// review runs push new heads, implement retries move it too, and the tests
+// stage verifies the live head unless the runner pinned a re-test to the
+// review head through the stage retry context.
+type reviewHeadDispatcher struct {
+	mu    sync.Mutex
+	calls []string
+	// liveHead is the branch head the tests stage verifies without a pin.
+	liveHead string
+	// reviewPushes are the heads successive review runs push to; a review run
+	// past the queue leaves the head where it is.
+	reviewPushes []string
+	// implementHeads are the heads successive implement RETRIES move the
+	// branch to (the first implement run keeps liveHead).
+	implementHeads []string
+	// retestFails is how many pinned re-tests report a failing verdict.
+	retestFails int
+	// stuckAt, when set, is the revision every tests run verifies regardless
+	// of pin or live head: a checkout that never reaches the review head.
+	stuckAt string
+	// testedAtMR is prior["tests"].tested_sha when mr dispatched: the verdict
+	// the pipeline shipped on.
+	testedAtMR string
+	implements int
+}
+
+func (d *reviewHeadDispatcher) Dispatch(ctx context.Context, _ *store.PipelineRun, _ *store.BacklogItem, stage Stage, prior map[string]StageOutput) (StageOutput, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, stage.ID)
+	switch stage.ID {
+	case "implement":
+		d.implements++
+		if d.implements > 1 && len(d.implementHeads) > 0 {
+			d.liveHead, d.implementHeads = d.implementHeads[0], d.implementHeads[1:]
+		}
+	case "tests":
+		sha := d.liveHead
+		pinned := false
+		if rc := StageRetryContextFromContext(ctx); rc != nil && rc.ExpectedHeadSHA != "" {
+			pinned = true
+			sha = rc.ExpectedHeadSHA
+		}
+		if d.stuckAt != "" {
+			sha = d.stuckAt
+		}
+		if pinned && d.retestFails > 0 {
+			d.retestFails--
+			return StageOutput{Artifacts: map[string]any{
+				"passed": false, "tested_sha": sha,
+				"checks": []DevboxCheck{{Name: "test:0", Passed: false, ExitCode: 1, Output: "review commit broke a test"}},
+			}}, nil
+		}
+		return StageOutput{Artifacts: map[string]any{"passed": true, "tested_sha": sha}}, nil
+	case "pr_self_review":
+		if len(d.reviewPushes) > 0 {
+			d.liveHead, d.reviewPushes = d.reviewPushes[0], d.reviewPushes[1:]
+		}
+		return StageOutput{Artifacts: map[string]any{"pushed_commits": map[string]any{"count": 1, "head_sha": d.liveHead}}}, nil
+	case "mr":
+		d.testedAtMR, _ = prior["tests"].Artifacts["tested_sha"].(string)
+		return StageOutput{MRIID: 42}, nil
+	}
+	return StageOutput{}, nil
+}
+
+func (d *reviewHeadDispatcher) callsList() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.calls...)
+}
+
+// failOnceGate fails its first evaluation and passes afterwards: the shape of
+// a rubric judge that rejects the first review and accepts the retry.
+type failOnceGate struct {
+	name  string
+	fails int
+}
+
+func (g *failOnceGate) Name() string { return g.name }
+func (g *failOnceGate) Evaluate(_ context.Context, _ gates.StageInput) (gates.Outcome, error) {
+	if g.fails > 0 {
+		g.fails--
+		return gates.Outcome{Pass: false, JudgedBy: "go", Reasons: []string{"rubric below threshold"}}, nil
+	}
+	return gates.Outcome{Pass: true, JudgedBy: "go"}, nil
+}
+
 type failingIncidentWriter struct {
 	calls int
+}
+
+type researchFailureDispatcher struct{}
+
+func (researchFailureDispatcher) Dispatch(_ context.Context, _ *store.PipelineRun, _ *store.BacklogItem, stage Stage, _ map[string]StageOutput) (StageOutput, error) {
+	if stage.ID != "research" {
+		return StageOutput{}, nil
+	}
+	return StageOutput{
+		CostUSD: 0.09, Model: "missing-model", Backend: "flexinfer",
+		LogTail:   "POST https://models.invalid/v1/chat: status 404",
+		Artifacts: map[string]any{researchPromptTokensArtifactKey: 640},
+	}, errors.New("flexinfer chat: status 404: model endpoint not found")
 }
 
 func (w *failingIncidentWriter) Put(context.Context, *store.IncidentRecord) (bool, error) {
@@ -264,6 +370,221 @@ func newPassingGates(t *testing.T) *gates.Registry {
 	return r
 }
 
+func reviewRetestGates(t *testing.T, extra ...gates.Gate) *gates.Registry {
+	t.Helper()
+	r := gates.NewRegistry()
+	r.Register(&gates.TestsVerdictGate{})
+	r.Register(&gates.TestedHeadGate{})
+	for _, g := range extra {
+		r.Register(g)
+	}
+	return r
+}
+
+// testedHeadOutcomes returns the persisted tested_head verdicts in ledger order.
+func testedHeadOutcomes(t *testing.T, st *store.Store, runID string) []store.GateOutcomeKind {
+	t.Helper()
+	rows, err := st.Pipeline.ListGates(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list gates: %v", err)
+	}
+	var out []store.GateOutcomeKind
+	for _, g := range rows {
+		if g.GateName == gates.TestedHeadGateName {
+			out = append(out, g.Outcome)
+		}
+	}
+	return out
+}
+
+func TestRunner_ReviewHeadMovementRetestsWithoutRespawningReview(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &reviewHeadDispatcher{liveHead: "aaaaaaaa", reviewPushes: []string{"bbbbbbbb"}}
+	if err := New(st, reviewRetestGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	want := []string{"plan_slice", "research", "implement", "tests", "pr_self_review", "tests", "mr", "ci_watch", "merge", "cleanup"}
+	if got := disp.callsList(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatches = %v, want %v", got, want)
+	}
+	if disp.testedAtMR != "bbbbbbbb" {
+		t.Fatalf("mr opened on tested_sha %q, want the re-tested review head", disp.testedAtMR)
+	}
+	if got := testedHeadOutcomes(t, st, run.ID); !reflect.DeepEqual(got, []store.GateOutcomeKind{store.GateOutcomeFail, store.GateOutcomePass}) {
+		t.Fatalf("tested_head ledger = %v, want [fail pass]", got)
+	}
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.State != store.PipelineDone {
+		t.Fatalf("run state = %s, want done", got.State)
+	}
+}
+
+func TestRunner_UnchangedReviewHeadDoesNotRetest(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &reviewHeadDispatcher{liveHead: "aaaaaaaa"}
+	if err := New(st, reviewRetestGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	want := []string{"plan_slice", "research", "implement", "tests", "pr_self_review", "mr", "ci_watch", "merge", "cleanup"}
+	if got := disp.callsList(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatches = %v, want %v", got, want)
+	}
+	if got := testedHeadOutcomes(t, st, run.ID); !reflect.DeepEqual(got, []store.GateOutcomeKind{store.GateOutcomePass}) {
+		t.Fatalf("tested_head ledger = %v, want [pass]", got)
+	}
+}
+
+func TestRunner_JudgeRewindAfterRetestRespawnsReview(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &reviewHeadDispatcher{liveHead: "aaaaaaaa", reviewPushes: []string{"bbbbbbbb"}}
+	gr := reviewRetestGates(t, &failOnceGate{name: "pr_self_review", fails: 1})
+	if err := New(st, gr, disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	// The re-test skips the review once; the judge's rewind to pr_self_review
+	// is a real retry and must respawn it rather than be swallowed by the skip.
+	want := []string{"plan_slice", "research", "implement", "tests", "pr_self_review", "tests", "pr_self_review", "mr", "ci_watch", "merge", "cleanup"}
+	if got := disp.callsList(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatches = %v, want %v", got, want)
+	}
+}
+
+func TestRunner_ResumeMidRetestDoesNotRespawnReview(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 13, 6, 0, 0, 0, time.UTC)
+	success := store.StageOutcomeSuccess
+	seed := func(stage string, artifacts map[string]any) {
+		t.Helper()
+		end := now
+		if err := st.Pipeline.PutStage(ctx, &store.StageResult{
+			PipelineRunID: run.ID, Stage: stage, Attempt: 1, StartedAt: now, EndedAt: &end, Outcome: &success, Artifacts: artifacts,
+		}); err != nil {
+			t.Fatalf("seed stage %s: %v", stage, err)
+		}
+		now = now.Add(time.Minute)
+	}
+	seed("plan_slice", map[string]any{"stage_id": "plan_slice"})
+	seed("research", map[string]any{"stage_id": "research"})
+	seed("implement", map[string]any{"files_changed": []any{"foo.go"}})
+	seed("tests", map[string]any{"passed": true, "tested_sha": "aaaaaaaa"})
+	seed("pr_self_review", map[string]any{"pushed_commits": map[string]any{"count": 1, "head_sha": "bbbbbbbb"}})
+	// The last post_review_gate visit ordered a re-test; the operator restarted
+	// while that tests dispatch was in flight.
+	if err := st.Pipeline.PutGate(ctx, &store.GateOutcome{
+		PipelineRunID: run.ID, AfterStage: "post_review_gate", GateName: gates.TestedHeadGateName,
+		Outcome: store.GateOutcomeFail, Reasons: []string{"tested_head mismatch: tested_sha=aaaaaaaa review_head_sha=bbbbbbbb"},
+		JudgedBy: "go", EvaluatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed gate: %v", err)
+	}
+	run.CurrentStage = "tests"
+	run.State = store.PipelineTesting
+	if err := st.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatalf("seed run head: %v", err)
+	}
+	disp := &reviewHeadDispatcher{liveHead: "bbbbbbbb"}
+	if err := New(st, reviewRetestGates(t), disp, nil).Drive(ctx, run, item); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	want := []string{"tests", "mr", "ci_watch", "merge", "cleanup"}
+	if got := disp.callsList(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatches after resume = %v, want %v (no review respawn)", got, want)
+	}
+}
+
+func TestRunner_FailedRetestRewindsToImplementAndReviewsAgain(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	// Review pushes B on top of tested A; the re-test of B fails, implement's
+	// retry moves the branch to C, and C must be tested AND reviewed before mr.
+	disp := &reviewHeadDispatcher{liveHead: "aaaaaaaa", reviewPushes: []string{"bbbbbbbb"}, retestFails: 1, implementHeads: []string{"cccccccc"}}
+	if err := New(st, reviewRetestGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	want := []string{"plan_slice", "research", "implement", "tests", "pr_self_review", "tests", "implement", "tests", "pr_self_review", "mr", "ci_watch", "merge", "cleanup"}
+	if got := disp.callsList(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatches = %v, want %v", got, want)
+	}
+	if disp.testedAtMR != "cccccccc" {
+		t.Fatalf("mr opened on tested_sha %q, want the re-implemented head", disp.testedAtMR)
+	}
+	if got := testedHeadOutcomes(t, st, run.ID); !reflect.DeepEqual(got, []store.GateOutcomeKind{store.GateOutcomeFail, store.GateOutcomePass}) {
+		t.Fatalf("tested_head ledger = %v, want [fail pass]", got)
+	}
+}
+
+func TestRunner_ReviewHeadRetestLoopGuardEscalates(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &reviewHeadDispatcher{liveHead: "aaaaaaaa", reviewPushes: []string{"bbbbbbbb"}, stuckAt: "aaaaaaaa"}
+	if err := New(st, reviewRetestGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	want := []string{"plan_slice", "research", "implement", "tests", "pr_self_review", "tests", "tests"}
+	if got := disp.callsList(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dispatches = %v, want %v (bounded re-tests, no review respawn)", got, want)
+	}
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.State != store.PipelineEscalated || got.EscalationClass != string(ClassInfra) {
+		t.Fatalf("run state/class = %s/%q, want escalated/infra", got.State, got.EscalationClass)
+	}
+	events, err := st.Events.ListSince(context.Background(), time.Time{}, 200)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	reason := ""
+	for _, event := range events {
+		if event.Kind == "pipeline.run.escalated" {
+			reason, _ = event.Payload["reason"].(string)
+		}
+	}
+	if !strings.Contains(reason, "post-review re-tests") || !strings.Contains(reason, "bbbbbbbb") {
+		t.Fatalf("escalation reason = %q, want the re-test loop guard naming the review head", reason)
+	}
+}
+
+func TestSeedRetryContexts_IgnoresTestedHeadVerdicts(t *testing.T) {
+	st, run, _ := newRunnerEnv(t)
+	ctx := context.Background()
+	if err := st.Pipeline.PutGate(ctx, &store.GateOutcome{
+		PipelineRunID: run.ID, AfterStage: "post_review_gate", GateName: gates.TestedHeadGateName,
+		Outcome: store.GateOutcomeFail, Reasons: []string{"tested_head mismatch"}, JudgedBy: "go",
+		EvaluatedAt: time.Date(2026, 9, 13, 6, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("seed gate: %v", err)
+	}
+	got, err := New(st, reviewRetestGates(t), &fakeDispatcher{}, nil).seedRetryContexts(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("seedRetryContexts: %v", err)
+	}
+	if rc := got["pr_self_review"]; rc != nil {
+		t.Fatalf("tested_head failure seeded a review retry context: %+v", rc)
+	}
+}
+
+func TestDefaultStages_PostReviewGateRunsTestedHeadFirst(t *testing.T) {
+	ids := map[string]Stage{}
+	for _, s := range DefaultStages {
+		ids[s.ID] = s
+	}
+	for _, id := range []string{testsStageID, prSelfReviewStageID, postReviewGateStage} {
+		if _, ok := ids[id]; !ok {
+			t.Fatalf("DefaultStages lacks %q, which the post-review re-test keys on", id)
+		}
+	}
+	if gate := ids[postReviewGateStage]; len(gate.Gates) == 0 || gate.Gates[0] != gates.TestedHeadGateName {
+		t.Fatalf("post_review_gate gates = %v, want %s first", gate.Gates, gates.TestedHeadGateName)
+	}
+	if got := (&gates.TestedHeadGate{}).Name(); got != gates.TestedHeadGateName {
+		t.Fatalf("gate name %q != registry constant %q", got, gates.TestedHeadGateName)
+	}
+}
+
 func TestRunner_CIWatchFlakeRescueFenceSurvivesStoreRoundTrip(t *testing.T) {
 	st, run, _ := newRunnerEnv(t)
 	jobs := []FailedJob{{ID: 17, Name: "test:reliability", FailureReason: "script_failure"}}
@@ -349,6 +670,60 @@ func TestRunner_DriveHappyPath(t *testing.T) {
 		if sr.Outcome == nil || *sr.Outcome != store.StageOutcomeSuccess {
 			t.Errorf("stage %s outcome = %v, want success", sr.Stage, sr.Outcome)
 		}
+	}
+}
+
+type recordingGate struct {
+	input gates.StageInput
+	calls int
+}
+
+func (*recordingGate) Name() string { return "adoption_gate" }
+func (g *recordingGate) Evaluate(_ context.Context, in gates.StageInput) (gates.Outcome, error) {
+	g.calls++
+	g.input = in
+	return gates.Outcome{Pass: true}, nil
+}
+
+func TestRunner_PrePushedImplementBranchFlowsToGatesWithoutSpawn(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	// The invocation preflight demands a workdir and a deliverable prompt
+	// before the adoption probe can even run.
+	run.WorktreePath = t.TempDir()
+	spawn := &fakeSpawn{}
+	probe := &fakeAdoptionProbe{out: &StageOutput{
+		FilesChanged:   []string{"pkg/mills/pipeline/dispatcher.go"},
+		DiffPatch:      []byte("diff --git a/dispatcher.go b/dispatcher.go\n+x\n"),
+		CommitMessages: []string{"fix(mills): adopt branch"},
+		Artifacts:      map[string]any{"adopted_branch": "mills/BL-TEST-1/implement", "adopted_head_sha": "abc123"},
+	}}
+	dispatcher := NewDispatcher(map[string]Worker{"implement": &SpawnWorker{Client: spawn, AdoptionProbe: probe, PromptFor: func(JobContext) string { return "adopt the pre-pushed branch" }}}, nil)
+	gate := &recordingGate{}
+	registry := gates.NewRegistry()
+	registry.Register(gate)
+	r := New(st, registry, dispatcher, nil)
+	r.Stages = []Stage{{ID: "implement", Type: "agent_spawn", State: store.PipelineImplementing}, {ID: "post_implement_gate", Type: "auto_gate", State: store.PipelineImplementing, RetryFrom: "implement", Gates: []string{"adoption_gate"}}}
+	if err := r.Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	if len(spawn.calls) != 0 {
+		t.Fatalf("implement spawn calls = %d, want 0", len(spawn.calls))
+	}
+	if gate.calls != 1 || len(gate.input.FilesChanged) != 1 {
+		t.Fatalf("gate input = %+v calls=%d", gate.input, gate.calls)
+	}
+	rows, err := st.Pipeline.ListStages(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var adopted any
+	for _, row := range rows {
+		if row.Stage == "implement" {
+			adopted = row.Artifacts["adopted_branch"]
+		}
+	}
+	if adopted != "mills/BL-TEST-1/implement" {
+		t.Fatalf("persisted adopted_branch = %v", adopted)
 	}
 }
 
@@ -601,7 +976,7 @@ func TestRunner_CIWatchTerminalFailureEscalatesWithoutRetry(t *testing.T) {
 	}
 }
 
-func TestRunner_CIWatchRunnerSystemFailureEscalatesRetryably(t *testing.T) {
+func TestRunner_CIWatchRunnerSystemFailureEscalatesAsInfra(t *testing.T) {
 	st, run, item := newRunnerEnv(t)
 	disp := &fakeDispatcher{
 		canned: map[string]StageOutput{
@@ -622,11 +997,11 @@ func TestRunner_CIWatchRunnerSystemFailureEscalatesRetryably(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get run: %v", err)
 	}
-	if got.EscalationClass != string(ClassTransient) || got.EscalationRetryable == nil || !*got.EscalationRetryable {
-		t.Fatalf("escalation class=%q retryable=%v, want transient/true", got.EscalationClass, got.EscalationRetryable)
+	if got.EscalationClass != string(ClassInfra) || got.EscalationRetryable == nil || !*got.EscalationRetryable {
+		t.Fatalf("escalation class=%q retryable=%v, want infra/true", got.EscalationClass, got.EscalationRetryable)
 	}
-	if len(esc.reasons) != 1 || !strings.Contains(esc.reasons[0], "retryable CI runner-system failure") {
-		t.Fatalf("escalation reasons = %v, want runner-system failure guidance", esc.reasons)
+	if len(esc.reasons) != 1 || !strings.Contains(esc.reasons[0], "[class=infra]") {
+		t.Fatalf("escalation reasons = %v, want infra classification", esc.reasons)
 	}
 }
 
@@ -765,6 +1140,12 @@ func TestRunner_GateInputStampsTestsPassed(t *testing.T) {
 	r := New(st, gates.NewRegistry(), &fakeDispatcher{}, nil)
 
 	in := r.gateInputFor(ctx, Stage{ID: "post_review_gate"}, item, nil,
+		map[string]StageOutput{"tests": {Artifacts: map[string]any{"passed": false, "checks": []any{map[string]any{"name": "lint", "passed": false, "exit_code": float64(1), "output": "boom"}}}}})
+	if in.TestsPassed || in.TestsVerdict == nil || len(in.TestsVerdict.FailedChecks) != 1 {
+		t.Errorf("expected decoded failed tests verdict, got %+v", in)
+	}
+
+	in = r.gateInputFor(ctx, Stage{ID: "post_review_gate"}, item, nil,
 		map[string]StageOutput{"tests": {}})
 	if !in.TestsPassed {
 		t.Errorf("expected TestsPassed=true when a tests stage output exists")
@@ -779,6 +1160,41 @@ func TestRunner_GateInputStampsTestsPassed(t *testing.T) {
 	in = r.gateInputFor(ctx, Stage{ID: "post_review_gate"}, item, nil, nil)
 	if in.TestsPassed {
 		t.Errorf("expected TestsPassed=false with no prior outputs")
+	}
+}
+
+func TestRunner_DiffSizeItemOverrideReachesGateAndPersistsReason(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	item.Policy.MaxDiffLines = 4000
+	r := New(st, gates.NewRegistry(), &fakeDispatcher{}, nil)
+	r.Gates.Register(&gates.DiffSize{})
+
+	verdict, err := r.runGate(context.Background(), run, item, Stage{
+		ID:    "post_implement_gate",
+		Gates: []string{"diff_size"},
+	}, map[string]StageOutput{
+		"implement": {LinesRemoved: 5000},
+	}, nil)
+	if err != nil {
+		t.Fatalf("run diff_size gate: %v", err)
+	}
+	if verdict.Pass {
+		t.Fatal("5,000-line deletion passed a 4,000-line item override")
+	}
+	if verdict.Input.MaxDiffLines != 4000 {
+		t.Fatalf("gate input MaxDiffLines = %d, want 4000", verdict.Input.MaxDiffLines)
+	}
+
+	rows, err := st.Pipeline.ListGates(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("list gates: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("gate rows = %d, want 1", len(rows))
+	}
+	got := strings.Join(rows[0].Reasons, " ")
+	if !strings.Contains(got, "cap is 4000 (item override)") {
+		t.Fatalf("persisted reason %q does not identify item override", got)
 	}
 }
 
@@ -1496,6 +1912,64 @@ func TestRunner_StageErrorRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
+func TestRunner_ResearchFailurePersistsAttemptsEventsAndEscalation(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	r := New(st, newPassingGates(t), researchFailureDispatcher{}, nil)
+	r.Stages = []Stage{{ID: "research", Type: "llm", State: store.PipelinePlanning}}
+	if err := r.Drive(context.Background(), run, item); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+
+	rows, err := st.Pipeline.ListStages(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("research rows = %d, want one per attempt (2): %+v", len(rows), rows)
+	}
+	for i, row := range rows {
+		if row.Stage != "research" || row.Outcome == nil || *row.Outcome != store.StageOutcomeError {
+			t.Errorf("row %d is not an errored research attempt: %+v", i, row)
+		}
+		if !strings.Contains(row.LogTail, "status 404") || row.Model != "missing-model" || row.Backend != "flexinfer" {
+			t.Errorf("row %d lost failure provenance: %+v", i, row)
+		}
+		if row.Artifacts[researchPromptTokensArtifactKey] != float64(640) && row.Artifacts[researchPromptTokensArtifactKey] != 640 {
+			t.Errorf("row %d lost token artifacts: %+v", i, row.Artifacts)
+		}
+	}
+
+	got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.State != store.PipelineEscalated || got.EscalationClass != string(ClassInfra) {
+		t.Fatalf("run state/class = %s/%q, want escalated/infra", got.State, got.EscalationClass)
+	}
+	events, err := st.Events.ListSince(context.Background(), time.Time{}, 100)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	errorEvents := 0
+	escalationReason := ""
+	for _, event := range events {
+		switch event.Kind {
+		case "pipeline.stage.error":
+			if event.Payload["stage"] == "research" {
+				errorEvents++
+			}
+		case "pipeline.run.escalated":
+			escalationReason, _ = event.Payload["reason"].(string)
+		}
+	}
+	if errorEvents != 2 {
+		t.Errorf("pipeline.stage.error events = %d, want 2", errorEvents)
+	}
+	if !strings.Contains(escalationReason, "status 404") {
+		t.Errorf("escalation reason = %q, want final research error", escalationReason)
+	}
+}
+
 func TestRunner_ResumesFromCurrentStage(t *testing.T) {
 	st, run, item := newRunnerEnv(t)
 
@@ -1700,6 +2174,9 @@ func TestRunner_DedupesPollTimeoutAndReconciledSpawnFailure(t *testing.T) {
 	if deduped.attempt != 1 {
 		t.Errorf("deduped attempt = %d, want 1", deduped.attempt)
 	}
+	if err := r.persistAttemptClassification(context.Background(), run.ID, stage.ID, deduped.attempt, "substrate", 1); err != nil {
+		t.Fatal(err)
+	}
 
 	stages, err := st.Pipeline.ListStages(context.Background(), run.ID)
 	if err != nil {
@@ -1707,6 +2184,9 @@ func TestRunner_DedupesPollTimeoutAndReconciledSpawnFailure(t *testing.T) {
 	}
 	if len(stages) != 1 {
 		t.Fatalf("stage rows = %d, want one row for spawn-wedged", len(stages))
+	}
+	if stages[0].Artifacts["retry_class"] != "substrate" || stages[0].Artifacts["effective_attempts"] != float64(1) {
+		t.Fatalf("deduped metadata: %v", stages[0].Artifacts)
 	}
 	if stages[0].Attempt != 1 || stages[0].SpawnID != "spawn-wedged" {
 		t.Errorf("stage row = attempt %d spawn %q, want attempt 1 / spawn-wedged", stages[0].Attempt, stages[0].SpawnID)
@@ -1727,6 +2207,7 @@ func TestRunner_StalledSpawnEscalatesInsteadOfLoopingPending(t *testing.T) {
 	st, run, item := newRunnerEnv(t)
 	disp := &stalledSpawnDispatcher{stage: "plan_slice"}
 	r := New(st, nil, disp, nil)
+	r.SpawnStopper = spawnStopFunc(func(context.Context, string) error { return nil })
 	r.Stages = []Stage{{ID: "plan_slice", Type: "llm", State: store.PipelinePlanning}}
 	// Disable auto-retry so the transient hard cap escalates the item
 	// directly (deterministic terminal state for the assertion).
@@ -1892,6 +2373,7 @@ func TestRunner_ReattachErrorEscalatesInsteadOfLoopingPending(t *testing.T) {
 
 	disp := &reapedPodDispatcher{stage: "implement"}
 	r := New(st, nil, disp, nil)
+	r.SpawnStopper = spawnStopFunc(func(context.Context, string) error { return nil })
 	r.Stages = []Stage{{ID: "implement", Type: "spawn", State: store.PipelineImplementing}}
 	// Disable escalation auto-retry so the hard cap escalates the item
 	// directly (deterministic terminal state for the assertion).
@@ -2406,11 +2888,27 @@ func TestBuildFailureLogTail_Precedence(t *testing.T) {
 		notWant  []string // substrings the result must NOT contain
 	}{
 		{
-			name:     "worker tail wins",
+			name:     "worker tail leads, error line appended",
 			existing: "  HUD spawn telemetry: stop_reason=max_turns  ",
 			err:      errors.New("hud spawn xyz status=failed"),
 			stage:    "plan_slice", attempt: 1, spawn: "spawn-1",
-			want: []string{"stage=plan_slice", "attempt=1", "spawn=spawn-1", "HUD spawn telemetry"},
+			want: []string{"stage=plan_slice", "attempt=1", "spawn=spawn-1", "HUD spawn telemetry", "\nerror: hud spawn xyz status=failed"},
+		},
+		{
+			name:     "ci_watch poll timeout keeps the verdict after the status lines",
+			existing: "[t] pipeline 1 (push) status=running url\n[t] pipeline 1 (push) status=running url",
+			err:      ErrPipelinePollTimeout,
+			stage:    "ci_watch", attempt: 1, spawn: "",
+			want:    []string{"status=running url\nerror: pipeline: poll deadline exceeded"},
+			notWant: []string{"spawn="},
+		},
+		{
+			name:     "error already in tail is not duplicated",
+			existing: "devbox quality gate failed (0/0 checks marked failed)",
+			err:      errors.New("devbox quality gate failed (0/0 checks marked failed)"),
+			stage:    "tests", attempt: 1, spawn: "",
+			want:    []string{"stage=tests attempt=1: devbox quality gate failed (0/0 checks marked failed)"},
+			notWant: []string{"error:"},
 		},
 		{
 			name:     "err.Error fills empty tail",
@@ -2713,14 +3211,14 @@ func TestRunner_CodeErrorsExhaustBudgetEvenWithTransientHistory(t *testing.T) {
 	st, run, item := newRunnerEnv(t)
 	disp := &classedFailDispatcher{
 		stage: "implement",
-		// Two transients followed by three real code failures.
+		// Two transients followed by three distinct real code failures.
 		// Default MaxAttempts=3 → escalate after the 3rd code fail.
 		errs: []string{
 			"websocket: close 1006",
 			"pod not found during reconciliation",
 			"go test FAIL: TestFoo not equal",
-			"go test FAIL: TestFoo not equal",
-			"go test FAIL: TestFoo not equal",
+			"go test FAIL: TestBar unexpected nil",
+			"go test FAIL: TestBaz missing result",
 		},
 	}
 	if err := New(st, newPassingGates(t), disp, nil).Drive(context.Background(), run, item); err != nil {
@@ -3023,12 +3521,16 @@ func (g *scriptedGate) Evaluate(_ context.Context, _ gates.StageInput) (gates.Ou
 type reasonCapturingEscalator struct {
 	mu      sync.Mutex
 	reasons []string
+	runs    []store.PipelineRun
 }
 
-func (e *reasonCapturingEscalator) Handle(_ context.Context, _ *store.PipelineRun, _ *store.BacklogItem, reason string) error {
+func (e *reasonCapturingEscalator) Handle(_ context.Context, run *store.PipelineRun, _ *store.BacklogItem, reason string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reasons = append(e.reasons, reason)
+	if run != nil {
+		e.runs = append(e.runs, *run)
+	}
 	return nil
 }
 
@@ -3037,6 +3539,67 @@ func (e *reasonCapturingEscalator) Handle(_ context.Context, _ *store.PipelineRu
 type retryCtxCapturingDispatcher struct {
 	mu      sync.Mutex
 	implRCs []*StageRetryContext
+}
+
+type testsVerdictDispatcher struct {
+	mu          sync.Mutex
+	implRCs     []*StageRetryContext
+	testsCalls  int
+	alwaysFails bool
+}
+
+func (d *testsVerdictDispatcher) Dispatch(ctx context.Context, _ *store.PipelineRun, _ *store.BacklogItem, stage Stage, _ map[string]StageOutput) (StageOutput, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if stage.ID == "implement" {
+		d.implRCs = append(d.implRCs, StageRetryContextFromContext(ctx))
+		return StageOutput{FilesChanged: []string{"foo.go"}, DiffPatch: []byte("+x"), CommitMessages: []string{"fix: x"}}, nil
+	}
+	if stage.ID == "tests" {
+		d.testsCalls++
+		passed := !d.alwaysFails && d.testsCalls > 1
+		return StageOutput{Artifacts: map[string]any{"passed": passed, "checks": []DevboxCheck{{Name: "lint", Passed: passed, ExitCode: 1, Output: "lint finding"}}}}, nil
+	}
+	return StageOutput{}, nil
+}
+
+func TestRunner_TestsVerdictRewindsToImplementWithFindings(t *testing.T) {
+	t.Run("rewind", func(t *testing.T) {
+		st, run, item := newRunnerEnv(t)
+		disp := &testsVerdictDispatcher{}
+		gr := gates.NewRegistry()
+		gr.Register(&gates.TestsVerdictGate{})
+		r := New(st, gr, disp, nil)
+		if err := r.Drive(context.Background(), run, item); err != nil {
+			t.Fatalf("drive: %v", err)
+		}
+		if len(disp.implRCs) != 2 || disp.implRCs[1] == nil {
+			t.Fatalf("implement contexts = %+v", disp.implRCs)
+		}
+		rc := disp.implRCs[1]
+		if rc.GateStage != "post_tests_gate" || !reflect.DeepEqual(rc.Findings, []string{"lint[exit=1]: lint finding"}) {
+			t.Fatalf("retry context = %+v", rc)
+		}
+	})
+	t.Run("exhaustion", func(t *testing.T) {
+		st, run, item := newRunnerEnv(t)
+		disp := &testsVerdictDispatcher{alwaysFails: true}
+		esc := &reasonCapturingEscalator{}
+		gr := gates.NewRegistry()
+		gr.Register(&gates.TestsVerdictGate{})
+		r := New(st, gr, disp, nil)
+		r.Escalator = esc
+		if err := r.Drive(context.Background(), run, item); err != nil {
+			t.Fatalf("drive: %v", err)
+		}
+		got, err := st.Pipeline.GetRun(context.Background(), run.ID)
+		if err != nil || got.State != store.PipelineEscalated || got.EscalationClass != string(ClassCode) {
+			t.Fatalf("run = %+v, %v", got, err)
+		}
+		if len(esc.reasons) != 1 || !strings.Contains(esc.reasons[0], "lint") {
+			t.Fatalf("reasons = %v", esc.reasons)
+		}
+	})
 }
 
 func (d *retryCtxCapturingDispatcher) Dispatch(ctx context.Context, _ *store.PipelineRun, _ *store.BacklogItem, stage Stage, _ map[string]StageOutput) (StageOutput, error) {
@@ -3157,6 +3720,8 @@ func TestRunner_GateFailRetryThreadsRetryContextToDispatcher(t *testing.T) {
 // a gate rewind issues a second spawn create with a fresh attempt key.
 func TestGateRetryFreshSpawn(t *testing.T) {
 	st, run, item := newRunnerEnv(t)
+	// The invocation preflight demands a workdir before dispatch.
+	run.WorktreePath = t.TempDir()
 	spawn := &fakeSpawn{resp: SpawnResponse{
 		SpawnID: "spawn-retry", CostUSD: 0.01,
 		FilesChanged: []string{"pkg/retry.go"}, LinesAdded: 1,
@@ -3565,5 +4130,491 @@ func TestCarryForwardDiff(t *testing.T) {
 	diffOnly := StageOutput{DiffPatch: []byte("diff")}
 	if _, carried := carryForwardDiff(diffOnly, empty); !carried {
 		t.Error("expected carry from diff-only prev")
+	}
+}
+
+func TestRunner_ResumeTestsReissuesQualityGate(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	ctx := context.Background()
+	run.CurrentStage, run.State = "tests", store.PipelineTesting
+	if err := st.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Pipeline.PutStage(ctx, &store.StageResult{PipelineRunID: run.ID, Stage: "tests", Attempt: 2, StartedAt: run.StartedAt}); err != nil {
+		t.Fatal(err)
+	}
+	hub := &stoppingDevbox{fakeDevbox: fakeDevbox{resp: DevboxResponse{Passed: true}}}
+	worker := &DevboxWorker{Client: hub, Project: "services/loom-core", ResolveHead: func(context.Context, string) (string, error) { return "abc123", nil }}
+	r := New(st, nil, NewDispatcher(map[string]Worker{"tests": worker}, nil), nil)
+	r.Stages = []Stage{{ID: "tests", Type: "shell", State: store.PipelineTesting}}
+	var log bytes.Buffer
+	r.Logger = slog.New(slog.NewJSONHandler(&log, nil))
+	if err := r.Drive(ctx, run, item); err != nil {
+		t.Fatal(err)
+	}
+	if len(hub.calls) != 1 {
+		t.Fatalf("quality gate calls = %d", len(hub.calls))
+	}
+	if len(hub.sequence) != 4 || !strings.HasPrefix(hub.sequence[0], "stop:") || !strings.HasSuffix(hub.sequence[1], "baseline") || !strings.HasPrefix(hub.sequence[2], "gate:") || hub.sequence[3] != hub.sequence[0] {
+		t.Fatalf("resume order: %v", hub.sequence)
+	}
+	rows, err := st.Pipeline.ListStages(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[1].Attempt != 3 || rows[1].Outcome == nil {
+		t.Fatalf("attempts: %+v", rows)
+	}
+	encoded, _ := json.Marshal(rows[1])
+	if !strings.Contains(string(encoded), "resume_sandbox_cleanup") {
+		t.Fatalf("missing durable evidence: %s", encoded)
+	}
+	for _, needle := range []string{"pipeline resume: restarting stage attempt", `"stage":"tests"`, `"attempt":3`, run.ID} {
+		if !strings.Contains(log.String(), needle) {
+			t.Errorf("missing %q in %s", needle, log.String())
+		}
+	}
+}
+
+type silentDispatcher struct {
+	entered chan context.Context
+	release chan struct{}
+}
+
+func (d silentDispatcher) Dispatch(ctx context.Context, _ *store.PipelineRun, _ *store.BacklogItem, _ Stage, _ map[string]StageOutput) (StageOutput, error) {
+	d.entered <- ctx
+	<-d.release // Deliberately ignores cancellation to exercise the late-write fence.
+	return StageOutput{}, nil
+}
+
+type timedSilentDispatcher struct {
+	silentDispatcher
+	timeout time.Duration
+}
+
+func (d timedSilentDispatcher) SynchronousCallTimeout(string) time.Duration { return d.timeout }
+
+func TestRunner_SilentWatchdogHeartbeatAndLateCompletion(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	var clockNanos atomic.Int64
+	clockNanos.Store(now.UnixNano())
+	disp := timedSilentDispatcher{silentDispatcher{make(chan context.Context, 1), make(chan struct{})}, time.Hour}
+	r := New(st, nil, disp, newPolicyMgrWithRetryCap(t, 3))
+	r.Policy.Current().CrossRepo.PerRepoTimeoutMinutes = 45
+	r.Clock = func() time.Time { return time.Unix(0, clockNanos.Load()).UTC() }
+	r.Stages = []Stage{{ID: "tests", State: store.PipelineTesting}}
+	before := testutil.ToFloat64(mills.PipelineStageSilentTotal.WithLabelValues("tests", "3900"))
+	if err := r.Start(ctx, run, item); err != nil {
+		t.Fatal(err)
+	}
+	workerCtx := <-disp.entered
+	defer func() { close(disp.release); r.Wait() }()
+	// Duplicate delivery cannot reset the activity window or spawn another gate.
+	observed, err := st.Pipeline.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(ctx, observed, item); err != nil {
+		t.Fatal(err)
+	}
+	for _, elapsed := range []time.Duration{50*time.Minute + 32*time.Second, 60 * time.Minute, 65 * time.Minute} {
+		clockNanos.Store(now.Add(elapsed).UnixNano())
+		if err := r.SweepSilentRuns(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if workerCtx.Err() != nil {
+			t.Fatalf("gate cancelled at %s", elapsed)
+		}
+	}
+	RecordStageHeartbeat(workerCtx)
+	clockNanos.Store(now.Add(130 * time.Minute).UnixNano())
+	if err := r.SweepSilentRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if workerCtx.Err() != nil {
+		t.Fatal("watchdog fired at boundary or ignored heartbeat")
+	}
+	clockNanos.Store(now.Add(130*time.Minute + time.Second).UnixNano())
+	if err := r.SweepSilentRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if workerCtx.Err() == nil {
+		t.Fatal("watchdog did not cancel worker")
+	}
+	if err := r.SweepSilentRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Pipeline.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.PipelineEscalated || got.EscalationClass != "substrate" || got.EscalationRetryable == nil || !*got.EscalationRetryable {
+		t.Fatalf("watchdog run: %+v", got)
+	}
+	if delta := testutil.ToFloat64(mills.PipelineStageSilentTotal.WithLabelValues("tests", "3900")) - before; delta != 1 {
+		t.Fatalf("metric delta = %v", delta)
+	}
+	rows, err := st.Pipeline.ListStages(ctx, run.ID)
+	if err != nil || len(rows) != 1 || !strings.Contains(rows[0].LogTail, "timeout plus grace 1h5m0s") {
+		t.Fatalf("effective limit missing from reason: %+v, %v", rows, err)
+	}
+	// Release and wait before checking the durable terminal row.
+	disp.release <- struct{}{}
+	r.Wait()
+	got, err = st.Pipeline.GetRun(ctx, run.ID)
+	if err != nil || got.State != store.PipelineEscalated {
+		t.Fatalf("late completion overwrote terminal: %+v, %v", got, err)
+	}
+}
+
+func TestRunner_SilentWatchdogMissingHeartbeat(t *testing.T) {
+	st, run, _ := newRunnerEnv(t)
+	ctx := context.Background()
+	run.CurrentStage, run.State = "tests", store.PipelineTesting
+	if err := st.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, nil, &fakeDispatcher{}, newPolicyMgrWithRetryCap(t, 3))
+	r.Policy.Current().CrossRepo.PerRepoTimeoutMinutes = 1
+	r.Clock = func() time.Time { return run.StartedAt.Add(7 * time.Minute) }
+	if err := r.SweepSilentRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Pipeline.GetRun(ctx, run.ID)
+	if err != nil || got.State != store.PipelineEscalated {
+		t.Fatalf("missing heartbeat: %+v %v", got, err)
+	}
+}
+
+func TestRunner_RetryAttemptClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		errs    []string
+		classes []string
+		counts  []float64
+	}{
+		{"transport", []string{"websocket: close 1006", "websocket: close 1006", "websocket: close 1006"}, []string{"transient", "transient", "transient"}, []float64{0, 0, 0}},
+		{"mixed", []string{"websocket: close 1006", "image build failed: buildah build failed: build pod failed", "go test FAIL", "go test FAIL"}, []string{"transient", "substrate", "real", "exhausted"}, []float64{0, 1, 2, 3}},
+		{"hard cap", []string{"websocket: close 1006", "websocket: close 1006", "websocket: close 1006", "websocket: close 1006", "websocket: close 1006", "websocket: close 1006", "websocket: close 1006", "websocket: close 1006"}, []string{"transient", "transient", "transient", "transient", "transient", "transient", "transient", "exhausted"}, []float64{0, 0, 0, 0, 0, 0, 0, 0}},
+		// Hub unavailable after an operator rollout is a substrate attempt that
+		// counts against the budget; main escalates it at maxAttempts total.
+		{"substrate cap", []string{"websocket: close 1006", "MCP hub unavailable after operator rollout: mcphub connection refused", "MCP hub unavailable after operator rollout: mcphub connection refused"}, []string{"transient", "substrate", "exhausted"}, []float64{0, 1, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, run, item := newRunnerEnv(t)
+			d := &classedFailDispatcher{stage: "tests", errs: append([]string(nil), tc.errs...)}
+			r := New(st, nil, d, nil)
+			r.RetryWait = func(context.Context, time.Duration) error { return nil } // skip the substrate backoff schedule
+			r.Stages = []Stage{{ID: "tests", Type: "tool", State: store.PipelineTesting}}
+			if err := r.Drive(context.Background(), run, item); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := st.Pipeline.ListStages(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantRows := len(tc.errs)
+			if tc.classes[len(tc.classes)-1] != "exhausted" {
+				wantRows++
+			}
+			if len(rows) != wantRows {
+				t.Fatalf("rows=%d want %d", len(rows), wantRows)
+			}
+			for i, cls := range tc.classes {
+				row := rows[i]
+				if row.Attempt != i+1 || row.Artifacts["retry_class"] != cls || row.Artifacts["effective_attempts"] != tc.counts[i] || !strings.Contains(row.LogTail, tc.errs[i]) {
+					t.Fatalf("attempt %d: %+v", i+1, row)
+				}
+			}
+		})
+	}
+}
+
+func TestRunner_DevboxBaselineSingleAttempt(t *testing.T) {
+	for _, marker := range []bool{false, true} {
+		t.Run(fmt.Sprint(marker), func(t *testing.T) {
+			st, run, item := newRunnerEnv(t)
+			item.State = store.BacklogRunning
+			if err := st.Backlog.Put(context.Background(), item); err != nil {
+				t.Fatal(err)
+			}
+			disp := &fakeDispatcher{errFor: map[string]error{"tests": fmt.Errorf("lint typecheck: %w", ErrDevboxBaselineAlsoFails)}}
+			if marker {
+				var artifacts map[string]any
+				if err := json.Unmarshal([]byte(`{"baseline_verdict":"environment","passed":false}`), &artifacts); err != nil {
+					t.Fatal(err)
+				}
+				disp.errFor = nil
+				disp.canned = map[string]StageOutput{"tests": {Artifacts: artifacts, LogTail: "lint typecheck failed"}}
+			}
+			r := &Runner{Store: st, Dispatcher: disp, Stages: []Stage{
+				{ID: "implement", Type: "agent_spawn", State: store.PipelineImplementing},
+				{ID: "tests", Type: "devbox", State: store.PipelineTesting},
+				{ID: "post_tests_gate", Type: "auto_gate", State: store.PipelineTesting, RetryFrom: "implement"},
+			}}
+			if err := r.Drive(context.Background(), run, item); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(disp.callsList(), ","); got != "implement,tests" {
+				t.Fatalf("calls=%s", got)
+			}
+			saved, err := st.Pipeline.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.State != store.PipelineEscalated || saved.EscalationClass != "infra" || saved.ExternalDependencyID != "devbox_baseline" || saved.EscalationRetryable == nil || !*saved.EscalationRetryable {
+				t.Fatalf("run=%+v", saved)
+			}
+			running, err := st.Backlog.ListByState(context.Background(), store.BacklogRunning)
+			if err != nil || len(running) != 0 {
+				t.Fatalf("scope still held by running backlog: %v %v", running, err)
+			}
+			rec, err := (&Escalator{Store: st}).BuildRecord(context.Background(), saved, item, "baseline")
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), `"free_retry":true`) {
+				t.Fatalf("record=%s", raw)
+			}
+			rec.Classification = nil // Reconstruct the wire payload from durable metadata.
+			payload := map[string]any{}
+			rec.addClassificationToPayload(payload)
+			if payload["free_retry"] != true {
+				t.Fatalf("payload=%v", payload)
+			}
+
+		})
+	}
+}
+
+func TestConsecutiveFailureSignature(t *testing.T) {
+	last := map[string]string{}
+	if _, repeat := consecutiveFailure(last, "lint", ClassCode, "lint undefined symbol after 12s id 123"); repeat {
+		t.Fatal("first repeated")
+	}
+	if _, repeat := consecutiveFailure(last, "lint", ClassCode, "lint undefined symbol after 34s id 456"); !repeat {
+		t.Fatal("normalized mismatch")
+	}
+	consecutiveFailure(last, "lint", ClassTransient, "backend unavailable")
+	if _, repeat := consecutiveFailure(last, "lint", ClassCode, "lint undefined symbol after 34s id 456"); repeat {
+		t.Fatal("transient did not reset")
+	}
+	if _, repeat := consecutiveFailure(last, "tests", ClassCode, "lint undefined symbol after 34s id 456"); repeat {
+		t.Fatal("stage isolation")
+	}
+	consecutiveFailure(last, "lint", ClassSubstrate, "mcp_hub_session unavailable after operator rollout")
+	if _, repeat := consecutiveFailure(last, "lint", ClassSubstrate, "mcp_hub_session unavailable after operator rollout"); repeat {
+		t.Fatal("substrate outage tripped the streak stop")
+	}
+}
+
+type signatureDispatcher struct {
+	calls     int
+	different bool
+}
+
+func (d *signatureDispatcher) Dispatch(context.Context, *store.PipelineRun, *store.BacklogItem, Stage, map[string]StageOutput) (StageOutput, error) {
+	d.calls++
+	failures := []string{"lint undefined symbol", "lint unused import", "lint syntax problem"}
+	i := 0
+	if d.different {
+		i = (d.calls - 1) % len(failures)
+	}
+	return StageOutput{}, errors.New(failures[i])
+}
+func TestRunner_ConsecutiveFailureSignature(t *testing.T) {
+	for _, different := range []bool{false, true} {
+		t.Run(fmt.Sprint(different), func(t *testing.T) {
+			st, run, item := newRunnerEnv(t)
+			disp := &signatureDispatcher{different: different}
+			var logs bytes.Buffer
+			r := &Runner{Store: st, Dispatcher: disp, Logger: slog.New(slog.NewJSONHandler(&logs, nil)), Stages: []Stage{{ID: "lint", Type: "devbox", State: store.PipelineTesting}}}
+			if err := r.Drive(context.Background(), run, item); err != nil {
+				t.Fatal(err)
+			}
+			want := 2
+			if different {
+				want = 3
+			}
+			if disp.calls != want || run.EscalationClass != "code" {
+				t.Fatalf("calls=%d run=%+v", disp.calls, run)
+			}
+			if !strings.Contains(logs.String(), `"signature":`) {
+				t.Fatal("missing retry signature")
+			}
+		})
+	}
+}
+
+func TestRunner_RetryAttemptPreservesDurableRecord(t *testing.T) {
+	st, run, _ := newRunnerEnv(t)
+	ctx := context.Background()
+	outcome := store.StageOutcome("error")
+	end := time.Now().UTC()
+	row := &store.StageResult{PipelineRunID: run.ID, Stage: "tests", Attempt: 2, Outcome: &outcome, EndedAt: &end, SpawnID: "deduped", CostUSD: 0.25, Model: "model", Backend: "spawn", LogTail: "first\nsecond", Artifacts: map[string]any{"kept": "value"}}
+	if err := st.Pipeline.PutStage(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, nil, nil, nil)
+	for range 2 {
+		if err := r.persistAttemptClassification(ctx, run.ID, "tests", 2, "substrate", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := st.Pipeline.ListStages(ctx, run.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%v err=%v", rows, err)
+	}
+	got := rows[0]
+	if got.ID != row.ID || got.SpawnID != row.SpawnID || got.CostUSD != row.CostUSD || got.Model != row.Model || got.Backend != row.Backend || got.LogTail != row.LogTail || got.Artifacts["kept"] != "value" || got.EndedAt == nil || *got.Outcome != outcome {
+		t.Fatalf("lost durable fields: %+v", got)
+	}
+	if err := r.persistAttemptClassification(ctx, run.ID, "tests", 3, "real", 2); err == nil {
+		t.Fatal("missing attempt must fail")
+	}
+}
+
+func TestRunner_RetryAttemptWriteErrorStopsDrive(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	// Initial stage output persists, but annotating it fails. Never dispatch the
+	// next attempt after losing the classification audit write.
+	_, err := st.DB().Exec(`CREATE TRIGGER reject_retry_metadata BEFORE UPDATE ON stage_results
+		WHEN NEW.artifacts_json LIKE '%retry_class%'
+		BEGIN SELECT RAISE(FAIL, 'retry metadata unavailable'); END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &classedFailDispatcher{stage: "tests", errs: []string{"websocket: close 1006"}}
+	r := New(st, nil, d, nil)
+	r.Stages = []Stage{{ID: "tests", Type: "tool", State: store.PipelineTesting}}
+	err = r.Drive(context.Background(), run, item)
+	if err == nil || !strings.Contains(err.Error(), "persist retry attempt") || d.calls != 1 {
+		t.Fatalf("calls=%d err=%v", d.calls, err)
+	}
+}
+
+func TestRunner_ConsecutiveTestsVerdictAcrossRewind(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	disp := &fakeDispatcher{}
+	registry := gates.NewRegistry()
+	registry.Register(&alwaysFailGate{name: "tests_verdict"})
+	r := &Runner{Store: st, Dispatcher: disp, Gates: registry, Stages: []Stage{
+		{ID: "implement", Type: "agent_spawn", State: store.PipelineImplementing},
+		{ID: "tests", Type: "devbox", State: store.PipelineTesting},
+		{ID: "post_tests_gate", Type: "auto_gate", State: store.PipelineTesting, RetryFrom: "implement", Gates: []string{"tests_verdict"}},
+	}}
+	if err := r.Drive(context.Background(), run, item); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(disp.callsList(), ","); got != "implement,tests,implement,tests" {
+		t.Fatalf("calls=%s", got)
+	}
+	if run.EscalationClass != "code" {
+		t.Fatalf("class=%s", run.EscalationClass)
+	}
+}
+
+func TestDevboxBaselineClassificationFreeRetry(t *testing.T) {
+	fc := ClassifyFailureRecord(fmt.Errorf("lint: %w", ErrDevboxBaselineAlsoFails))
+	if fc.Class != FailureInfrastructure || !fc.FreeRetry || !fc.Retryable || fc.Terminal || fc.ExternalDependencyID != "devbox_baseline" {
+		t.Fatalf("classification=%+v", fc)
+	}
+	rec := &FailureRecord{}
+	rec.SetClassification(store.EscalationMetadata{FailureClass: string(FailureInfrastructure)})
+	if rec.Classification.FreeRetry == nil || *rec.Classification.FreeRetry {
+		t.Fatal("ordinary infra must not become free")
+	}
+}
+
+func TestRunner_SilentWatchdogStageBudgets(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		policy     int
+		stage      string
+		gate, want time.Duration
+	}{
+		{"gate dominates", 45, "tests", time.Hour, 65 * time.Minute},
+		{"configured gate", 45, "tests", 90 * time.Minute, 95 * time.Minute},
+		{"policy dominates", 120, "tests", time.Hour, 125 * time.Minute},
+		{"other stage", 45, "research", time.Hour, 50 * time.Minute},
+		{"unknown client", 45, "tests", 0, 50 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, run, _ := newRunnerEnv(t)
+			ctx := context.Background()
+			run.CurrentStage = tc.stage
+			run.State = store.PipelineTesting
+			if err := st.Pipeline.PutRun(ctx, run); err != nil {
+				t.Fatal(err)
+			}
+			var client DevboxClient = &fakeDevbox{}
+			if tc.gate > 0 {
+				client = &timedDevbox{timeout: tc.gate}
+			}
+			d := NewDispatcher(map[string]Worker{"tests": &DevboxWorker{Client: client}}, nil)
+			r := New(st, nil, d, newPolicyMgrWithRetryCap(t, 3))
+			r.Policy.Current().CrossRepo.PerRepoTimeoutMinutes = tc.policy
+			now := run.StartedAt.Add(tc.want)
+			r.Clock = func() time.Time { return now }
+			if err := r.SweepSilentRuns(ctx); err != nil {
+				t.Fatal(err)
+			}
+			got, err := st.Pipeline.GetRun(ctx, run.ID)
+			if err != nil || got.State == store.PipelineEscalated {
+				t.Fatalf("at boundary: %+v %v", got, err)
+			}
+			now = now.Add(time.Second)
+			if err := r.SweepSilentRuns(ctx); err != nil {
+				t.Fatal(err)
+			}
+			got, err = st.Pipeline.GetRun(ctx, run.ID)
+			if err != nil || got.State != store.PipelineEscalated {
+				t.Fatalf("past boundary: %+v %v", got, err)
+			}
+		})
+	}
+}
+
+type changingStageDispatcher struct {
+	fakeDispatcher
+	change func()
+}
+
+func (d *changingStageDispatcher) SynchronousCallTimeout(string) time.Duration {
+	if d.change != nil {
+		change := d.change
+		d.change = nil
+		change()
+	}
+	return 0
+}
+
+func TestRunner_SilentWatchdogRechecksStage(t *testing.T) {
+	st, run, _ := newRunnerEnv(t)
+	ctx := context.Background()
+	run.CurrentStage, run.State = "research", store.PipelinePlanning
+	if err := st.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	d := &changingStageDispatcher{change: func() {
+		run.CurrentStage, run.State = "tests", store.PipelineTesting
+		if err := st.Pipeline.PutRun(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	r := New(st, nil, d, nil)
+	r.Clock = func() time.Time { return run.StartedAt.Add(70 * time.Minute) }
+	if err := r.SweepSilentRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Pipeline.GetRun(ctx, run.ID)
+	if err != nil || got.State != store.PipelineTesting {
+		t.Fatalf("stale candidate escalated new stage: %+v %v", got, err)
 	}
 }

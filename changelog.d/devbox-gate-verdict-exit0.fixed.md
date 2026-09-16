@@ -1,0 +1,1 @@
+- Fix `cmd/mcp-devbox` quality gates to honor successful command exit codes and attach bounded, redacted `output_tail` diagnostics to every check result.

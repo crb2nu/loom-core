@@ -1,0 +1,1 @@
+- Promote OpenRouter HTTP 402 credit-exhaustion failures to a first-match external-dependency signature in `pkg/mills/pipeline/classifier.go`, with classifier coverage in `pkg/mills/pipeline/classifier_test.go`.

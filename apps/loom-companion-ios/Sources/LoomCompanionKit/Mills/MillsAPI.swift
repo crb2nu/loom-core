@@ -141,6 +141,24 @@ public protocol MillsAPIProtocol: Sendable {
     /// shift with no pattern attribution. Defaulted so existing conformances
     /// (test fakes) keep compiling.
     func approvedPatternsResult() async throws -> MillsPatternsResult
+
+    // Taste + merge-queue reads (mobile catch-up). Both defaulted to nil so
+    // existing conformances keep compiling, and both degrade to nil on the
+    // usual operator-absent statuses AND on 404 from a HUD predating the
+    // taste/merge-queue proxy routes — the sections simply don't render.
+    /// Rolling taste rollup (GET /api/mills/taste/aggregates); nil when the
+    /// HUD or operator predates the taste epic.
+    func tasteAggregates() async throws -> MillsTasteAggregates?
+    /// Serial merge-queue snapshot (GET /api/mills/merge-queue); nil when
+    /// unavailable.
+    func mergeQueue() async throws -> MillsMergeQueueSnapshot?
+
+    /// Operator status (GET /api/mills/status): policy switch, autonomy
+    /// verdict + blockers, health gates, capability matrix, budget tiers and
+    /// council yield. nil when the operator is absent/unreachable so the
+    /// operator card simply doesn't render. Defaulted so existing
+    /// conformances keep compiling.
+    func operatorStatus() async throws -> MillsOperatorStatus?
 }
 
 /// Outcome of a Pattern Loom catalog read.
@@ -164,6 +182,12 @@ extension MillsAPIProtocol {
     public func approvedPatternsResult() async throws -> MillsPatternsResult {
         MillsPatternsResult(patterns: try await approvedPatterns())
     }
+
+    public func tasteAggregates() async throws -> MillsTasteAggregates? { nil }
+
+    public func mergeQueue() async throws -> MillsMergeQueueSnapshot? { nil }
+
+    public func operatorStatus() async throws -> MillsOperatorStatus? { nil }
 }
 
 /// Concrete client backed by the existing `LoomAPIClientProtocol`. The
@@ -242,6 +266,40 @@ public struct MillsAPI: MillsAPIProtocol, Sendable {
 
     public func approvedPatterns() async throws -> [MillsPatternInfo] {
         try await approvedPatternsResult().patterns
+    }
+
+    public func tasteAggregates() async throws -> MillsTasteAggregates? {
+        do {
+            let agg: MillsTasteAggregates = try await client.requestRaw(.millsTasteAggregates)
+            return agg
+        } catch let LoomAPIError.apiError(code, _, _)
+            where code == .notFound || code == .notConfigured || code == .upstreamError {
+            // 404 also covers a HUD whose mills proxy predates the taste
+            // route — the taste tile simply doesn't render.
+            return nil
+        }
+    }
+
+    public func mergeQueue() async throws -> MillsMergeQueueSnapshot? {
+        do {
+            let snap: MillsMergeQueueSnapshot = try await client.requestRaw(.millsMergeQueue)
+            return snap
+        } catch let LoomAPIError.apiError(code, _, _)
+            where code == .notFound || code == .notConfigured || code == .upstreamError {
+            return nil
+        }
+    }
+
+    public func operatorStatus() async throws -> MillsOperatorStatus? {
+        do {
+            let status: MillsOperatorStatus = try await client.requestRaw(.millsStatus)
+            return status
+        } catch let LoomAPIError.apiError(code, _, _)
+            where code == .notFound || code == .notConfigured || code == .upstreamError {
+            // Operator URL unset (bare 503) or operator down (bare 502) → no
+            // operator card; the pipelines read carries the outage message.
+            return nil
+        }
     }
 
     public func approvedPatternsResult() async throws -> MillsPatternsResult {

@@ -207,6 +207,9 @@ type Harness struct {
 	deletePodFn       func(context.Context, string, string, string, string) error
 	dryRunCreatePodFn func(context.Context, string, *corev1.Pod, metav1.CreateOptions) (*corev1.Pod, error)
 	processProbeFn    func(context.Context, string, int, uint64, int, uint64) (CanaryProcessSample, error)
+	// Test seams for deterministic process-observer cadence tests.
+	processObserverNow   func() time.Time
+	processObserverAfter func(time.Duration) <-chan time.Time
 	// reviewedFluxRenderSpecsFn is a test seam for repositories synthesized
 	// with non-addressable fixture revisions. Production always reads the
 	// reviewed manifests directly from Git.

@@ -556,3 +556,47 @@ func TestScheduler_KickNow_NilReceiverNoPanic(t *testing.T) {
 	var sch *Scheduler
 	sch.KickNow()
 }
+
+// TestScheduler_KPIRecordInterval_GatesSnapshots pins the snapshot cadence:
+// with KPIRecordInterval set, steady-state ticks inside the interval skip the
+// KPI write, the first tick at or past the interval records again, and a zero
+// interval preserves the record-every-tick behaviour the other tests rely on.
+func TestScheduler_KPIRecordInterval_GatesSnapshots(t *testing.T) {
+	env := newRecEnv(t, nil)
+	env.rec.AutonomyGate = func(context.Context) (bool, []string) { return false, []string{"test no-op"} }
+	counter := &kpiTickCounter{}
+	sch := NewScheduler(env.rec)
+	sch.Logger = nil
+	sch.KPIRecorder = counter
+	sch.KPIRecordInterval = 5 * time.Minute
+	now := time.Date(2026, 9, 8, 18, 0, 0, 0, time.UTC)
+	sch.Clock = func() time.Time { return now }
+
+	tick := func() {
+		t.Helper()
+		if _, err := sch.runTick(context.Background(), true); err != nil {
+			t.Fatalf("runTick: %v", err)
+		}
+	}
+	tick() // first steady-state tick records
+	now = now.Add(time.Minute)
+	tick() // inside the interval: skipped
+	now = now.Add(3 * time.Minute)
+	tick() // 4m: still inside
+	if got := counter.count(); got != 1 {
+		t.Fatalf("records inside the interval = %d, want 1", got)
+	}
+	now = now.Add(time.Minute)
+	tick() // 5m: due again
+	if got := counter.count(); got != 2 {
+		t.Fatalf("records at the interval = %d, want 2", got)
+	}
+
+	// Zero interval: every tick records.
+	sch.KPIRecordInterval = 0
+	tick()
+	tick()
+	if got := counter.count(); got != 4 {
+		t.Fatalf("records with a zero interval = %d, want 4", got)
+	}
+}

@@ -6,9 +6,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/crb2nu/loom/pkg/mcperror"
 	"gitlab.flexinfer.ai/libs/mcp-go"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/crb2nu/loom/pkg/mcperror"
 )
 
 func TestGetClient_MissingConfig(t *testing.T) {

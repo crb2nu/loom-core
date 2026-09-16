@@ -17,7 +17,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--registry", default="", help="Path to skills-registry.yaml (optional)."
     )
-    p.add_argument("--name", required=True, help="Skill name (kebab-case preferred).")
+    p.add_argument(
+        "--name",
+        required=True,
+        help="Skill name (normalized to kebab-case, at most 64 characters).",
+    )
     p.add_argument(
         "--description",
         default="",
@@ -121,8 +125,15 @@ Use this skill when the user asks for this workflow by name or asks for tasks in
 
 
 def build_entry(name: str, description: str, categories: list[str]) -> str:
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) or len(name) > 64:
+        raise SystemExit(
+            "Invalid --name; use 1-64 lowercase letters, digits, and single hyphens."
+        )
+    description = description.strip()
     if not description:
         description = f"Scaffolded Loom skill for {name.replace('-', ' ')} workflows."
+    if len(description) > 1024:
+        raise SystemExit(f"Description is {len(description)} characters; maximum is 1024.")
     instructions = build_instructions(name)
     cats = ", ".join(categories)
     return (
@@ -143,7 +154,7 @@ def build_entry(name: str, description: str, categories: list[str]) -> str:
         "        type: skill\n"
         "      claude:\n"
         "        enabled: true\n"
-        "        type: command\n"
+        "        type: skill\n"
         "      kilocode:\n"
         "        enabled: true\n"
         "        type: rule\n"

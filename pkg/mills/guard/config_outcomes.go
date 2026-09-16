@@ -150,6 +150,12 @@ type runOutcome struct {
 	regressions   int
 }
 
+// judgeRoleShadow mirrors gates.JudgeRoleShadow (guard does not import gates;
+// a test pins the two equal). Shadow verdicts are calibration evidence about a
+// candidate judge, not the gate's grading, so the per-run judge score below
+// never includes them.
+const judgeRoleShadow = "shadow"
+
 // judgeRollup accumulates one run's verdicts before they are averaged into a
 // single per-run data point.
 type judgeRollup struct {
@@ -276,7 +282,7 @@ func BuildConfigOutcomeReport(ctx context.Context, events EventLister, runs RunO
 			}
 		case store.JudgeVerdictEventKind:
 			v, ok := parseJudgeVerdict(e)
-			if !ok {
+			if !ok || v.role == judgeRoleShadow {
 				continue
 			}
 			g, ok := grades[v.runID]

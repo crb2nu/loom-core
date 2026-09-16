@@ -1,0 +1,1 @@
+- Split HUD Factory fuel into metered API and subscription tanks, with precise spend/cap and total tooltips, legacy fallback, and full unbounded subscription bars; preserve metered-only Andon alerts (`factoryHelpers.ts`, `factoryHelpers.test.ts`, `FactoryPanel.svelte`, and `mills.svelte.ts`).

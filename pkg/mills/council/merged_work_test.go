@@ -1,8 +1,13 @@
 package council
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"math"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +29,22 @@ type stubMergedWork struct {
 	err    error
 	calls  int
 	since  time.Time
+}
+
+type semanticOverride textsim.Similarity
+
+func (s semanticOverride) Score(context.Context, string, string) textsim.Similarity {
+	return textsim.Similarity(s)
+}
+
+type countingScorer struct {
+	result textsim.Similarity
+	calls  int
+}
+
+func (s *countingScorer) Score(context.Context, string, string) textsim.Similarity {
+	s.calls++
+	return s.result
 }
 
 func (s *stubMergedWork) ListMergedWork(_ context.Context, since time.Time) ([]MergedWork, error) {
@@ -107,6 +128,177 @@ func TestApply_MergedWork_SuppressesShippedProposal(t *testing.T) {
 	}
 	if got := res.Summary(); !strings.Contains(got, "merged_work_skipped=1") {
 		t.Errorf("summary = %q want it to report merged_work_skipped=1", got)
+	}
+}
+
+func TestApply_MergedWork_SemanticGrounding(t *testing.T) {
+	t.Run("semantic scorer can reject lexical hit", func(t *testing.T) {
+		m, _, _ := newMutatorEnv(t)
+		m.MergedWork = &stubMergedWork{merged: []MergedWork{shippedMR(6 * time.Hour)}}
+		m.MergedWorkSemantic = semanticOverride(textsim.Similarity{
+			Semantic: 0, Combined: 0, SemanticAvailable: true,
+		})
+
+		res, err := m.Apply(context.Background(), "COUNCIL-T", mergedWorkProposal(), MutationOptions{})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if len(res.MergedWorkSkipped) != 0 || len(res.CreatedItems) != 1 {
+			t.Fatalf("created=%d skipped=%d; configured semantic score did not control the decision", len(res.CreatedItems), len(res.MergedWorkSkipped))
+		}
+	})
+
+	t.Run("semantic scorer can ground a lexical miss", func(t *testing.T) {
+		// The configured scorer is authoritative even when the lexical score
+		// misses the gray band.
+		m, _, _ := newMutatorEnv(t)
+		m.MergedWork = &stubMergedWork{merged: []MergedWork{{
+			IID: 42, Title: "Repair webhook retries", MergedAt: mergedWorkAnchor.Add(-time.Hour),
+		}}}
+		m.MergedWorkSemantic = semanticOverride(textsim.Similarity{
+			Semantic: 1, Combined: 1, SemanticAvailable: true,
+		})
+
+		res, err := m.Apply(context.Background(), "COUNCIL-P", mergedWorkProposal(), MutationOptions{})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if len(res.CreatedItems) != 0 || len(res.MergedWorkSkipped) != 1 {
+			t.Fatalf("created=%d skipped=%d; configured semantic score did not ground the match", len(res.CreatedItems), len(res.MergedWorkSkipped))
+		}
+	})
+
+	t.Run("live 2026-09-02 pair: HUD panel unification is not fi-fhir spawn admission", func(t *testing.T) {
+		candidates := []MergedWork{{
+			IID: 1798, Title: "feat(mills): admit libs/fi-fhir to HUD spawning", MergedAt: mergedWorkAnchor.Add(-time.Hour),
+		}}
+		scorer := semanticOverride(textsim.Similarity{
+			Semantic: 0.8397933101064353, Combined: 0.8397933101064353, SemanticAvailable: true,
+		})
+		if hit := findMergedWorkGrounded(context.Background(), scorer, "Unify Mill Staff HUD panels into a single group (S4 finish)", candidates, 0.7, mergedWorkAnchor); hit == nil {
+			t.Fatal("configured semantic score should control the hard band")
+		}
+	})
+
+	t.Run("semantic promotes a lexical gray-band pair into a hard hit", func(t *testing.T) {
+		// !978's phrasing against !970's merged title: lexical 0.6 (gray band).
+		// The MR is OLD, so the gray band alone would admit the proposal; a
+		// semantic score above the threshold lifts the plausible pair to hard.
+		candidates := []MergedWork{{
+			IID: 970, Title: "Add external CI incident classification for GitLab pipeline failures", MergedAt: mergedWorkAnchor.Add(-30 * 24 * time.Hour),
+		}}
+		title := "Add GitLab CI external dependency incident classification to Mills"
+		lexical := textsim.WorkTitleJaccard(title, candidates[0].Title)
+		if lexical < textsim.GrayBandFloor || lexical >= 0.7 {
+			t.Fatalf("fixture lexical score %.2f is not in the gray band", lexical)
+		}
+		scorer := semanticOverride(textsim.Similarity{Semantic: 0.9, Combined: 0.9, SemanticAvailable: true})
+		hit := findMergedWorkGrounded(context.Background(), scorer, title, candidates, 0.7, mergedWorkAnchor)
+		if hit == nil || hit.basis != mergedWorkBasisHard {
+			t.Fatalf("semantic corroboration of a gray-band pair should be a hard hit, got %+v", hit)
+		}
+	})
+
+	t.Run("unrelated work remains admitted", func(t *testing.T) {
+		candidates := []MergedWork{{
+			IID: 42, Title: "Repair webhook retries", MergedAt: mergedWorkAnchor.Add(-time.Hour),
+		}}
+		scorer := semanticOverride(textsim.Similarity{
+			Semantic: 0, Combined: 0, SemanticAvailable: true,
+		})
+		if hit := findMergedWorkGrounded(context.Background(), scorer, mergedWorkProposal().BacklogProposals[0].Title, candidates, 0.7, mergedWorkAnchor); hit != nil {
+			t.Fatalf("unrelated work was grounded: %+v", hit)
+		}
+	})
+
+	t.Run("unavailable backend scores at most one candidate", func(t *testing.T) {
+		candidates := []MergedWork{
+			{IID: 1, Title: "Repair webhook retries", MergedAt: mergedWorkAnchor.Add(-time.Hour)},
+			{IID: 2, Title: "Harden council quorum", MergedAt: mergedWorkAnchor.Add(-time.Hour)},
+			{IID: 3, Title: "Split HUD spawn files", MergedAt: mergedWorkAnchor.Add(-time.Hour)},
+		}
+		scorer := &countingScorer{}
+		findMergedWorkGrounded(context.Background(), scorer, mergedWorkProposal().BacklogProposals[0].Title, candidates, 0.7, mergedWorkAnchor)
+		if scorer.calls != 1 {
+			t.Fatalf("scorer called %d times; want 1 — an unavailable backend must not add one timeout per merged-work candidate", scorer.calls)
+		}
+	})
+
+	t.Run("semantic ranking wins and every candidate is observed", func(t *testing.T) {
+		candidates := []MergedWork{
+			{IID: 1, Title: "alpha beta gamma", MergedAt: mergedWorkAnchor.Add(-time.Hour)},
+			{IID: 2, Title: "unrelated title", MergedAt: mergedWorkAnchor.Add(-time.Hour)},
+		}
+		scorer := &sequenceScorer{results: []textsim.Similarity{
+			{Semantic: .71, Combined: .71, SemanticAvailable: true},
+			{Semantic: .95, Combined: .95, SemanticAvailable: true},
+		}}
+		var observed []mergedWorkScore
+		hit := findMergedWorkGroundedObserved(context.Background(), scorer, "alpha beta gamma", candidates, .7, mergedWorkAnchor, func(s mergedWorkScore) { observed = append(observed, s) })
+		if hit == nil || hit.work.IID != 2 || len(observed) != 2 {
+			t.Fatalf("hit=%+v observed=%d; semantic ranking must win and all candidates must be observed", hit, len(observed))
+		}
+		for _, score := range observed {
+			if !score.semanticAvailable || score.lexicalScore < 0 || score.semanticScore == 0 {
+				t.Fatalf("incomplete dual-score observation: %+v", score)
+			}
+		}
+	})
+
+	t.Run("exact score boundaries are unchanged", func(t *testing.T) {
+		candidate := []MergedWork{{IID: 1, Title: "candidate", MergedAt: mergedWorkAnchor.Add(-time.Hour)}}
+		for _, tc := range []struct {
+			name  string
+			score float64
+			want  string
+		}{
+			{"hard", .7, mergedWorkBasisHard},
+			{"gray floor", textsim.GrayBandFloor, mergedWorkBasisGray},
+			{"below gray", textsim.GrayBandFloor - .001, ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				hit := findMergedWorkGrounded(context.Background(), semanticOverride(textsim.Similarity{Semantic: tc.score, Combined: tc.score, SemanticAvailable: true}), "proposal", candidate, .7, mergedWorkAnchor)
+				if tc.want == "" && hit != nil {
+					t.Fatalf("got %+v, want no hit", hit)
+				}
+				if tc.want != "" && (hit == nil || hit.basis != tc.want) {
+					t.Fatalf("got %+v, want basis %s", hit, tc.want)
+				}
+			})
+		}
+	})
+}
+
+type sequenceScorer struct {
+	results []textsim.Similarity
+	calls   int
+}
+
+func (s *sequenceScorer) Score(context.Context, string, string) textsim.Similarity {
+	r := s.results[s.calls]
+	s.calls++
+	return r
+}
+
+func TestApply_MergedWork_LogsBothScoresAndFallback(t *testing.T) {
+	for _, available := range []bool{true, false} {
+		t.Run(strconv.FormatBool(available), func(t *testing.T) {
+			m, _, _ := newMutatorEnv(t)
+			m.MergedWork = &stubMergedWork{merged: []MergedWork{shippedMR(time.Hour)}}
+			m.MergedWorkSemantic = semanticOverride(textsim.Similarity{Semantic: .8, Combined: .8, SemanticAvailable: available})
+			var logs bytes.Buffer
+			m.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			_, err := m.Apply(context.Background(), "COUNCIL-LOG", mergedWorkProposal(), MutationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := logs.String()
+			for _, field := range []string{"lexical_score", "semantic_score", "semantic_available", "configured_score"} {
+				if !strings.Contains(got, field) {
+					t.Errorf("log missing %q: %s", field, got)
+				}
+			}
+		})
 	}
 }
 
@@ -295,5 +487,56 @@ func TestFindMergedWork_ThresholdEscapeHatch(t *testing.T) {
 	}
 	if hit := findMergedWork("", corpus, 0.7, mergedWorkAnchor); hit != nil {
 		t.Errorf("empty title must never match, got hit %+v", hit)
+	}
+}
+
+// groundingEmbedder exercises the production semantic scorer through council
+// selection, including responses that must preserve the lexical decision.
+type groundingEmbedder struct {
+	vectors [][]float64
+	err     error
+}
+
+func (e groundingEmbedder) EmbedDocuments(context.Context, []string) ([][]float64, error) {
+	return e.vectors, e.err
+}
+
+func TestMergedWorkGroundingScorerSelection(t *testing.T) {
+	candidates := []MergedWork{{IID: 1, Title: "Repair webhook retries", MergedAt: mergedWorkAnchor}}
+	title := "Add semantic grounding"
+	for _, tc := range []struct {
+		name    string
+		scorer  textsim.Scorer
+		wantHit bool
+	}{
+		{name: "default Jaccard"},
+		{name: "explicit Jaccard", scorer: textsim.JaccardScorer{}},
+		{name: "configured embeddings", scorer: textsim.NewSemanticScorer(groundingEmbedder{vectors: [][]float64{{1, 0}, {1, 0}}}), wantHit: true},
+		{name: "nil backend", scorer: textsim.NewSemanticScorer(nil)},
+		{name: "backend error", scorer: textsim.NewSemanticScorer(groundingEmbedder{err: errors.New("offline")})},
+		{name: "empty response", scorer: textsim.NewSemanticScorer(groundingEmbedder{})},
+		{name: "empty vectors", scorer: textsim.NewSemanticScorer(groundingEmbedder{vectors: [][]float64{nil, nil}})},
+		{name: "mismatched vectors", scorer: textsim.NewSemanticScorer(groundingEmbedder{vectors: [][]float64{{1}, {1, 0}}})},
+		{name: "invalid vectors", scorer: textsim.NewSemanticScorer(groundingEmbedder{vectors: [][]float64{{math.NaN()}, {1}}})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hit := findMergedWorkGrounded(context.Background(), tc.scorer, title, candidates, .7, mergedWorkAnchor)
+			if (hit != nil) != tc.wantHit {
+				t.Fatalf("hit = %+v, wantHit = %v", hit, tc.wantHit)
+			}
+			if tc.wantHit {
+				if hit.score != 1 || hit.lexicalScore != 0 || !hit.semanticAvailable {
+					t.Fatalf("expected semantic-only match, got %+v", hit)
+				}
+				return
+			}
+			// Fallback must also preserve positive matches and their exact scores.
+			lexicalTitle := "Repair webhook retries safely"
+			want := findMergedWork(lexicalTitle, candidates, .7, mergedWorkAnchor)
+			got := findMergedWorkGrounded(context.Background(), tc.scorer, lexicalTitle, candidates, .7, mergedWorkAnchor)
+			if want == nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("fallback hit = %+v, want exact lexical hit %+v", got, want)
+			}
+		})
 	}
 }

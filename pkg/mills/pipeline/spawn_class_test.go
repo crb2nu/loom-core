@@ -233,7 +233,7 @@ func TestSpawnReasonErrorClass(t *testing.T) {
 			t.Errorf("spawnReasonErrorClass(%q) = %q, want %q", reason, got, ClassInfra)
 		}
 	}
-	transient := []string{SpawnReasonRuntimeIdentityConflict, SpawnReasonPodLifecycle}
+	transient := []string{SpawnReasonRuntimeIdentityConflict, SpawnReasonPodLifecycle, SpawnReasonLivenessStall}
 	for _, reason := range transient {
 		if got := spawnReasonErrorClass(reason); got != ClassTransient {
 			t.Errorf("spawnReasonErrorClass(%q) = %q, want %q", reason, got, ClassTransient)
@@ -253,6 +253,7 @@ func TestSpawnInfraReason(t *testing.T) {
 		{"exited 124 without stdout tail", "agent CLI exited 124", SpawnReasonAgentTimeout, true},
 		{"exited 143 deadline SIGTERM", "agent CLI exited 143 (no stderr; stdout: {\"type\":\"item.started\"})", SpawnReasonAgentTimeout, true},
 		{"reconciler deadline backstop", "spawn deadline exceeded during reconciliation", SpawnReasonAgentTimeout, true},
+		{"liveness watchdog stall", realLivenessWatchdogStall, SpawnReasonLivenessStall, true},
 		{"spawn-state safety budget", "persist owned spawn before dispatch: exceeding the 917504-byte spawn-state safety budget", SpawnReasonStateBudget, true},
 		{"unrelated build failure stays unmatched", "go build ./...: undefined: Foo", "", false},
 		{"genuine nonzero agent exit stays unmatched", "agent CLI exited 2: panic: test failed", "", false},
@@ -324,5 +325,24 @@ func TestSpawnInfraReason(t *testing.T) {
 	}
 	if reason, ok := SpawnInfraReason(nil); ok || reason != "" {
 		t.Fatalf("SpawnInfraReason(nil) = (%q, %v), want (\"\", false)", reason, ok)
+	}
+}
+
+func TestSpawnInfraReason_LivenessStallReasonAndSignatureAreStable(t *testing.T) {
+	equivalent := "liveness watchdog: agent produced no output within stall timeout: spawn 0198ffff-1111-2222-3333-444455556666 stalled: no agent output for 15m0s"
+	for _, msg := range []string{realLivenessWatchdogStall, equivalent} {
+		reason, ok := SpawnInfraReason(errors.New(msg))
+		if !ok || reason != SpawnReasonLivenessStall {
+			t.Fatalf("SpawnInfraReason(%q) = (%q, %v), want (%q, true)", msg, reason, ok, SpawnReasonLivenessStall)
+		}
+		if !strings.HasPrefix(reason, "spawn-") {
+			t.Fatalf("reason %q is not spawn-prefixed", reason)
+		}
+	}
+
+	first := escalationMetadataFromEvidence(ClassTransient, realLivenessWatchdogStall, realLivenessWatchdogStall)
+	second := escalationMetadataFromEvidence(ClassTransient, equivalent, equivalent)
+	if first.FailureSignature == "" || first.FailureSignature != second.FailureSignature {
+		t.Fatalf("equivalent stalls produced unstable signatures %q and %q", first.FailureSignature, second.FailureSignature)
 	}
 }

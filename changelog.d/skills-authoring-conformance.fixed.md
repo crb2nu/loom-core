@@ -1,0 +1,1 @@
+- Validate skill registry field names, target keys, unique portable names and description limits before generation; count Unicode characters correctly in Claude listing validation. New skill scaffolds emit Claude skill bundles, and plan-create discovery now includes the optional planning fields already accepted by its handler, with executable example and schema regression checks.

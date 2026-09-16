@@ -1,0 +1,1 @@
+- **Mills pipeline recovery counters** (`pkg/mills/metrics.go`, `pkg/mills/pipeline/runner.go`): expose stalled-spawn conversions by stage and out-of-band terminal drive aborts by state.

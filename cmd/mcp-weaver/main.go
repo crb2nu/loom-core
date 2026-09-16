@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/flexinfer"
 	"github.com/crb2nu/loom/pkg/lifecycle"
+	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mcplog"
 	"github.com/crb2nu/loom/pkg/mcpotel"
 	"github.com/crb2nu/loom/pkg/openairesponses"
@@ -39,22 +42,68 @@ func run(ctx context.Context) error {
 	}
 	defer shutdownTracer(ctx)
 
-	// Load configuration.
+	server, err := newWeaverServer(ctx, logger, mcpotel.Tracer(tp, "mcp-weaver"))
+	if err != nil {
+		return err
+	}
+	return server.Run(ctx)
+}
+
+// weaverBackendEnv names the environment variables the backends need. The
+// server starts without them and every backend-bound tool answers
+// NotConfigured until they are set; only their absence is degraded, every
+// other configuration error still refuses to start.
+var weaverBackendEnv = []string{"FLEXINFER_URL", "MCP_HUB_URL"}
+
+// weaverMissingEnv returns the backend variables that are unset right now.
+// It reads the environment on every call so the NotConfigured verdict names
+// exactly what is missing at call time, not what was missing at startup.
+func weaverMissingEnv() []string {
+	var missing []string
+	for _, name := range weaverBackendEnv {
+		if env.String(name, "") == "" {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+// weaverConfigError is the lazy per-call configuration check behind every
+// backend-bound tool.
+func weaverConfigError() error {
+	missing := weaverMissingEnv()
+	if len(missing) == 0 {
+		return nil
+	}
+	return mcperror.NotConfigured(strings.Join(missing, " and "), "set "+strings.Join(missing, " and ")+" in the server environment")
+}
+
+// newWeaverServer builds the MCP server from the environment without running
+// it, so tests can drive initialize, tools/list and tool calls in-process.
+func newWeaverServer(ctx context.Context, logger *slog.Logger, tracer trace.Tracer) (*mcp.Server, error) {
 	cfg := weaver.LoadConfigFromEnv()
 	cfg.Enabled = true // standalone binary is always enabled
+	return newWeaverServerWithConfig(ctx, cfg, logger, tracer)
+}
 
+// newWeaverServerWithConfig builds the MCP server for cfg. cfg is validated
+// unconditionally: the model/timeout/concurrency contract does not depend on
+// the backend URLs, so a bad value refuses to start whether or not the
+// backends are configured. The backend URLs themselves are optional (see
+// weaverConfigError).
+func newWeaverServerWithConfig(ctx context.Context, cfg weaver.Config, logger *slog.Logger, tracer trace.Tracer) (*mcp.Server, error) {
 	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("invalid weaver config: %w", err)
+		return nil, fmt.Errorf("invalid weaver config: %w", err)
 	}
 
-	// Require FLEXINFER_URL and MCP_HUB_URL.
+	// The backends are optional at startup: without them the server still
+	// answers initialize and tools/list, and backend-bound tools return
+	// NotConfigured naming the variable(s) actually missing.
 	flexinferURL := env.String("FLEXINFER_URL", "")
-	if flexinferURL == "" {
-		return fmt.Errorf("FLEXINFER_URL is required")
-	}
 	hubURL := env.String("MCP_HUB_URL", "")
-	if hubURL == "" {
-		return fmt.Errorf("MCP_HUB_URL is required")
+	missing := weaverMissingEnv()
+	if len(missing) > 0 {
+		logger.Warn("Weaver backends are not configured; backend-bound tool calls return NotConfigured", "missing_env", strings.Join(missing, ","))
 	}
 
 	// Create FlexInfer client. When FLEXINFER_URL points at a keyed
@@ -90,8 +139,6 @@ func run(ctx context.Context) error {
 	// Create the weaver router.
 	router := weaver.NewRouter(cfg, flexClient, executor, lister, logger)
 	router.SetMetrics(weaver.NewMetrics(nil))
-
-	tracer := mcpotel.Tracer(tp, "mcp-weaver")
 	router.SetTracer(tracer)
 
 	// Load YAML domain overrides (same file the daemon path honors).
@@ -111,7 +158,10 @@ func run(ctx context.Context) error {
 	// the FlexInfer catalog so loom/weaver/status reports degraded
 	// bindings instead of silent 404s on the first query. The deployed
 	// standalone server previously had no preflight at all.
-	preflight := weaver.RunPreflight(ctx, flexClient, cfg, router.Registry())
+	preflight := weaver.Preflight{}
+	if len(missing) == 0 {
+		preflight = weaver.RunPreflight(ctx, flexClient, cfg, router.Registry())
+	}
 	if preflight.Degraded {
 		logger.Warn("model preflight degraded",
 			"missing_models", preflight.MissingModels,
@@ -164,13 +214,18 @@ Environment:
 - WEAVER_MAX_ITERATIONS: Max tool-call iterations per subagent
 - WEAVER_MAX_CONCURRENT: Max parallel domain dispatches`)
 
-	registerWeaverTools(server, router, preflight, logger)
+	registerWeaverTools(server, router, preflight, logger, weaverConfigError)
 
-	return server.Run(ctx)
+	return server, nil
 }
 
-// registerWeaverTools registers all weaver tools on the MCP server.
-func registerWeaverTools(server *mcp.Server, router *weaver.Router, preflight weaver.Preflight, logger *slog.Logger) {
+// registerWeaverTools registers all weaver tools on the MCP server. Every
+// tool that reaches a backend is wrapped by configCheck; loom/weaver/status
+// and loom/weaver/history stay unwrapped on purpose — they report local
+// state (preflight, degraded bindings, query history) and are how an
+// operator sees that the backends are missing.
+func registerWeaverTools(server *mcp.Server, router *weaver.Router, preflight weaver.Preflight, logger *slog.Logger, configCheck func() error) {
+	requireConfig := func(handler mcp.ToolHandler) mcp.ToolHandler { return requireConfigured(configCheck, handler) }
 	// weaver__query
 	server.AddTool(mcp.Tool{
 		Name:        "weaver__query",
@@ -194,7 +249,7 @@ func registerWeaverTools(server *mcp.Server, router *weaver.Router, preflight we
 			},
 			Required: []string{"query"},
 		},
-	}, handleQuery(router, logger))
+	}, requireConfig(handleQuery(router, logger)))
 
 	// weaver__gather
 	server.AddTool(mcp.Tool{
@@ -215,7 +270,7 @@ func registerWeaverTools(server *mcp.Server, router *weaver.Router, preflight we
 			},
 			Required: []string{"query", "domains"},
 		},
-	}, handleGather(router, logger))
+	}, requireConfig(handleGather(router, logger)))
 
 	// Compound tools.
 	for _, ct := range weaver.DefaultCompoundTools() {
@@ -232,7 +287,7 @@ func registerWeaverTools(server *mcp.Server, router *weaver.Router, preflight we
 					},
 				},
 			},
-		}, handleCompound(router, ct, logger))
+		}, requireConfig(handleCompound(router, ct, logger)))
 	}
 
 	// loom/weaver/status
@@ -261,7 +316,20 @@ func registerWeaverTools(server *mcp.Server, router *weaver.Router, preflight we
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, handleMetrics(router))
+	}, requireConfig(handleMetrics(router)))
+}
+
+// requireConfigured gates a backend-bound tool on configCheck, evaluated on
+// every call so the verdict tracks the live environment.
+func requireConfigured(configCheck func() error, handler mcp.ToolHandler) mcp.ToolHandler {
+	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		if configCheck != nil {
+			if err := configCheck(); err != nil {
+				return mcp.ErrorResult(err), nil
+			}
+		}
+		return handler(ctx, args)
+	}
 }
 
 // handleQuery returns a tool handler for weaver__query.

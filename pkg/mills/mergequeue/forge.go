@@ -1,10 +1,10 @@
-// Package mergequeue is the serial merge queue (phase 1, no speculation) for
+// Package mergequeue is the serial merge queue for
 // the Mills pipeline. GitLab CE has no merge trains, so parallel Mills
 // branches go stale while long pipelines run; main moves and MRs die with
 // has_conflicts at the merge PUT. The queue guarantees every MR is CI-tested
-// on the exact target-branch tip it lands on: one candidate per
+// on the exact target-branch tree it lands on: one candidate per
 // (project, target_branch) lane is driven through rebase-if-behind →
-// await-pipeline-on-rebased-head → SHA-preconditioned merge, then the next
+// await-pipeline-on-rebased-tree → SHA-preconditioned merge, then the next
 // head is promoted. On red CI or a rebase conflict the candidate is EVICTED
 // with a distinct reason and the owning run falls through to the normal
 // escalation path — the queue never retries internally.
@@ -57,9 +57,40 @@ type MRSnapshot struct {
 type PipelineStatus struct {
 	ID     int64
 	SHA    string
+	Ref    string
+	Source string
 	Status string
 	WebURL string
 	Found  bool
+}
+
+// PipelineTiming is GitLab's terminal timing data for one pipeline.
+type PipelineTiming struct {
+	Duration       *float64
+	QueuedDuration *float64
+}
+
+// PipelineProof is a pipeline whose commit proves the candidate tree.
+// Source is one of sha, tree, or speculative.
+type PipelineProof struct {
+	PipelineStatus
+	Tree   string
+	Source string
+}
+
+type SpeculativeHead struct {
+	Ref      string
+	SHA      string
+	Pipeline PipelineStatus
+	Adopted  bool
+}
+
+// SpeculativeForge is the optional mutation surface used when speculation is
+// enabled. Keeping it separate preserves compatibility for non-GitLab forges.
+type SpeculativeForge interface {
+	PrepareSpeculativeHead(ctx context.Context, mrIID int64, ontoSHA, ref string) (SpeculativeHead, error)
+	CancelQueuePipeline(ctx context.Context, pipelineID int64) error
+	DeleteQueueRef(ctx context.Context, ref string) error
 }
 
 // Forge is the GitLab surface the processor drives. *clients.GitLabClient
@@ -80,9 +111,22 @@ type Forge interface {
 	// BranchPipelineStatus resolves the newest branch pipeline for (sha, ref),
 	// preferring push pipelines and falling back to api-created ones.
 	BranchPipelineStatus(ctx context.Context, sha, ref string) (PipelineStatus, error)
+	// MRPipelineStatus resolves the newest merge-request pipeline (source
+	// merge_request_event) attached to the MR whose built SHA matches sha.
+	// Repos that gate MRs on detached MR pipelines instead of branch
+	// pipelines (flexinfer) prove external candidates here. Not-found is not
+	// an error.
+	MRPipelineStatus(ctx context.Context, mrIID int64, sha string) (PipelineStatus, error)
+	FindActivePipeline(ctx context.Context, ref, sha string) (PipelineStatus, error)
+	// PipelineProof resolves a project pipeline for headSHA. Implementations
+	// must prefer an exact SHA and may otherwise return only a pipeline whose
+	// commit tree equals headSHA's tree. Missing tree data fails closed.
+	PipelineProof(ctx context.Context, headSHA string) (PipelineProof, error)
 	// CreateQueuePipeline creates a fresh branch pipeline on ref (the queue's
 	// bounded recovery when the rebase push minted none).
-	CreateQueuePipeline(ctx context.Context, ref string) (PipelineStatus, error)
+	CreateQueuePipeline(ctx context.Context, ref string, mrIID int64) (PipelineStatus, error)
+	// PipelineTiming retrieves terminal wall and runner-queue durations.
+	PipelineTiming(ctx context.Context, pipelineID int64) (PipelineTiming, error)
 	// Merge performs the SHA-preconditioned merge with the full bounded
 	// 405/409/422 recovery machinery.
 	Merge(ctx context.Context, req pipeline.MergeRequestArgs) (pipeline.MergeResponse, error)

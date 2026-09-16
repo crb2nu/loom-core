@@ -15,6 +15,9 @@ func TestClassifyPersistedFailureSignatureOpenRouterCreditsExhausted(t *testing.
 		`OpenRouter response: {"error":{"code":402,"message":"This request requires more credits"}}`,
 		`provider=openrouter HTTP/1.1 402 Payment Required: This request requires more credits`,
 		`OPENROUTER response status_code=402: this request REQUIRES MORE CREDITS`,
+		"OpenRouter status 402: request requires\n  more\tcredits to continue",
+		`OpenRouter error code: 402: insufficient credits for this request`,
+		`OpenRouter status 402: insufficient credit`,
 	}
 
 	for _, evidence := range tests {
@@ -44,6 +47,8 @@ func TestClassifyPersistedFailureSignatureOpenRouterCreditsExhaustedNearMisses(t
 		`OpenRouter status 402: Payment Required`,
 		`OpenRouter status 429: This request requires more credits`,
 		`OpenRouter billing note: insufficient credits; please top up`,
+		`OpenRouter status 402: credit limit exceeded`,
+		`OpenRouter status 402: requires more compute`,
 		`status 402: This request requires more credits`,
 		`Documentation mentions OpenRouter in section 402 and requires more credits for examples`,
 	}

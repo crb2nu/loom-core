@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 
 	"github.com/crb2nu/loom/pkg/mills"
+	"github.com/crb2nu/loom/pkg/transport"
 )
 
 // MCPHubConfig captures connection settings for the loom MCP hub. The
@@ -61,6 +61,8 @@ type MCPHubClient struct {
 	initialized map[string]bool          // serverName → has the session been initialized
 	serverState map[string]*mcpHubServerState
 	nextID      int64
+	closed      bool
+	dedicated   map[*MCPHubClient]context.CancelFunc
 
 	// dial is the function used to obtain a transport. Production
 	// uses the mcp-go websocket client; tests inject a fake. Set via
@@ -137,6 +139,7 @@ func newMCPHubClientWithDefaults(cfg MCPHubConfig, dial func(ctx context.Context
 		transports:  make(map[string]mcp.Transport),
 		initialized: make(map[string]bool),
 		serverState: make(map[string]*mcpHubServerState),
+		dedicated:   make(map[*MCPHubClient]context.CancelFunc),
 		dial:        dial,
 	}
 	if c.dial == nil {
@@ -178,7 +181,29 @@ func (c *MCPHubClient) realDial(ctx context.Context, serverName string) (mcp.Tra
 // surfacing an error to the operator until the next Send/Recv. Without
 // this, the cached broken transport poisons every subsequent call until
 // the operator process is restarted.
+// CallToolWithTimeout is CallTool with an explicit per-call round-trip cap in
+// place of the client default. Long-running tools must not be cut off by the
+// 10-minute default sized for ordinary calls: the devbox quality gate runs fmt,
+// lint and every declared test command, each under its own server-side budget
+// (300s per check, 900-1200s per test command), so a legitimate gate exceeded
+// the default and surfaced as "read message: i/o timeout" on every attempt
+// (2026-09-14). timeout <= 0 falls back to the default.
+func (c *MCPHubClient) CallToolWithTimeout(ctx context.Context, serverName, toolName string, args map[string]any, timeout time.Duration) (string, error) {
+	return c.callTool(ctx, serverName, toolName, args, timeout, false)
+}
+
 func (c *MCPHubClient) CallTool(ctx context.Context, serverName, toolName string, args map[string]any) (string, error) {
+	return c.callTool(ctx, serverName, toolName, args, 0, false)
+}
+
+// CallToolDedicatedWithTimeout gives a long-running call its own stream, closed
+// on return. Pipeline admission (max_concurrent_runs) bounds quality-gate
+// concurrency; ordinary calls retain their shared single-slot stream.
+func (c *MCPHubClient) CallToolDedicatedWithTimeout(ctx context.Context, serverName, toolName string, args map[string]any, timeout time.Duration) (string, error) {
+	return c.callTool(ctx, serverName, toolName, args, timeout, true)
+}
+
+func (c *MCPHubClient) callTool(ctx context.Context, serverName, toolName string, args map[string]any, timeout time.Duration, dedicated bool) (string, error) {
 	if c == nil {
 		return "", errors.New("mcphub: client nil")
 	}
@@ -194,32 +219,57 @@ func (c *MCPHubClient) CallTool(ctx context.Context, serverName, toolName string
 
 	started := time.Now()
 	state := c.serverStateFor(serverName)
-	waitStarted := time.Now()
-	select {
-	case state.callSlot <- struct{}{}:
-		mills.MCPHubQueueWaitSeconds.WithLabelValues(serverName, toolName).Observe(time.Since(waitStarted).Seconds())
-	case <-ctx.Done():
-		mills.MCPHubQueueWaitSeconds.WithLabelValues(serverName, toolName).Observe(time.Since(waitStarted).Seconds())
-		outcome := "queue_cancelled"
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			outcome = "queue_timeout"
-			state.recordFailure(time.Now(), fmt.Errorf("wait for call slot: %w", ctx.Err()))
+	stream := c
+	if dedicated {
+		// Register before dialing so shutdown cancels even a pending dial or
+		// initialize. Each child owns only this invocation's transport/retry.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		stream = newMCPHubClientWithDefaults(c.cfg, c.dial)
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			cancel()
+			return "", errors.New("mcphub: client closed")
 		}
-		mills.MCPHubCallsTotal.WithLabelValues(serverName, toolName, outcome).Inc()
-		mills.MCPHubCallDurationSeconds.WithLabelValues(serverName, toolName).Observe(time.Since(started).Seconds())
-		return "", fmt.Errorf("mcphub: wait for %s call slot: %w", serverName, ctx.Err())
+		c.dedicated[stream] = cancel
+		c.mu.Unlock()
+		defer func() {
+			cancel()
+			_ = stream.Close()
+			c.mu.Lock()
+			delete(c.dedicated, stream)
+			c.mu.Unlock()
+		}()
+		mills.MCPHubQueueWaitSeconds.WithLabelValues(serverName, toolName).Observe(0)
+	} else {
+		waitStarted := time.Now()
+		select {
+		case state.callSlot <- struct{}{}:
+			mills.MCPHubQueueWaitSeconds.WithLabelValues(serverName, toolName).Observe(time.Since(waitStarted).Seconds())
+		case <-ctx.Done():
+			mills.MCPHubQueueWaitSeconds.WithLabelValues(serverName, toolName).Observe(time.Since(waitStarted).Seconds())
+			outcome := "queue_cancelled"
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				outcome = "queue_timeout"
+				state.recordFailure(time.Now(), fmt.Errorf("wait for call slot: %w", ctx.Err()))
+			}
+			mills.MCPHubCallsTotal.WithLabelValues(serverName, toolName, outcome).Inc()
+			mills.MCPHubCallDurationSeconds.WithLabelValues(serverName, toolName).Observe(time.Since(started).Seconds())
+			return "", fmt.Errorf("mcphub: wait for %s call slot: %w", serverName, ctx.Err())
+		}
+		defer func() { <-state.callSlot }()
 	}
-	defer func() { <-state.callSlot }()
 
-	body, err := c.callOnce(ctx, serverName, toolName, args)
-	if err != nil && isTransportError(err) {
+	body, err := stream.callOnce(ctx, serverName, toolName, args, timeout)
+	if err != nil && ctx.Err() == nil && isTransportError(err) {
 		// Transport-level failure on the cached connection: drop it and retry
 		// once with a fresh dial while retaining exclusive ownership of this
 		// server stream. No sibling can race the close/redial or receive from the
 		// replacement transport before this logical call completes.
 		mills.MCPHubTransportRetriesTotal.WithLabelValues(serverName, toolName).Inc()
-		c.invalidate(serverName)
-		body, err = c.callOnce(ctx, serverName, toolName, args)
+		stream.invalidate(serverName)
+		body, err = stream.callOnce(ctx, serverName, toolName, args, timeout)
 	}
 
 	outcome := mcpHubCallOutcome(err)
@@ -306,13 +356,16 @@ func (s *mcpHubServerState) recordFailure(now time.Time, err error) {
 // callOnce performs a single tools/call round trip without retry. On
 // any error the transport is left in c.transports (so CallTool can
 // decide whether to invalidate it based on isTransportError).
-func (c *MCPHubClient) callOnce(ctx context.Context, serverName, toolName string, args map[string]any) (string, error) {
+func (c *MCPHubClient) callOnce(ctx context.Context, serverName, toolName string, args map[string]any, timeout time.Duration) (string, error) {
 	transport, err := c.transportFor(ctx, serverName)
 	if err != nil {
 		return "", err
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
+	if timeout <= 0 {
+		timeout = c.cfg.CallTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	id := atomic.AddInt64(&c.nextID, 1)
@@ -350,6 +403,13 @@ func (c *MCPHubClient) callOnce(ctx context.Context, serverName, toolName string
 		if res.IsError {
 			return text, fmt.Errorf("mcphub: %s/%s reported error: %s", serverName, toolName, truncateText(text, 512))
 		}
+		if res.StructuredContent != nil {
+			structured, err := json.Marshal(res.StructuredContent)
+			if err != nil {
+				return "", fmt.Errorf("mcphub: encode %s/%s structured result: %w", serverName, toolName, err)
+			}
+			return string(structured), nil
+		}
 		return text, nil
 	}
 }
@@ -367,42 +427,19 @@ func (c *MCPHubClient) invalidate(serverName string) {
 	delete(c.initialized, serverName)
 }
 
-// isTransportError returns true for the WebSocket / TCP failure modes
-// that mean the cached connection is dead and we should redial. We
-// match on error text rather than wrapped types because the gorilla
-// websocket library and the mcp-go transport both wrap errors as
-// strings before they reach us. Conservative on purpose — JSON-RPC
-// errors and tool-reported errors (IsError=true) must NOT match.
-func isTransportError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	s := err.Error()
-	for _, needle := range []string{
-		"websocket: close",         // gorilla close-frame errors (1006, 1001, etc.)
-		"unexpected EOF",           // half-closed read
-		"broken pipe",              // EPIPE on Send after peer closed
-		"connection reset by peer", // RST mid-flight
-		"use of closed network connection",
-		"transport closed", // mcp-go / fake transport
-		"i/o timeout",      // ReadDeadline expiry
-		"EOF",              // bare io.EOF wrapped as string
-	} {
-		if strings.Contains(s, needle) {
-			return true
-		}
-	}
-	return false
-}
+func isTransportError(err error) bool { return transport.IsError(err) }
 
 // transportFor returns the transport for serverName, dialing + initializing
 // on first use. Subsequent calls reuse the existing connection.
 func (c *MCPHubClient) transportFor(ctx context.Context, serverName string) (mcp.Transport, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil, errors.New("mcphub: client closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if t, ok := c.transports[serverName]; ok && c.initialized[serverName] {
 		return t, nil
 	}
@@ -474,11 +511,19 @@ func (c *MCPHubClient) initialize(ctx context.Context, t mcp.Transport) error {
 	}
 }
 
-// Close releases every per-server transport. Safe to call multiple times.
+// Close cancels dedicated calls and releases all transports. The client cannot
+// be reused after Close. Safe to call multiple times.
 func (c *MCPHubClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closed = true
 	var first error
+	for stream, cancel := range c.dedicated {
+		cancel()
+		if err := stream.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
 	for name, t := range c.transports {
 		if err := t.Close(); err != nil && first == nil {
 			first = fmt.Errorf("close %s: %w", name, err)

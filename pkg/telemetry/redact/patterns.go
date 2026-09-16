@@ -37,6 +37,10 @@ var builtInPatterns = []*regexp.Regexp{
 
 	// Connection strings with embedded credentials.
 	regexp.MustCompile(`(?i)(postgres|postgresql|mysql|mongodb|redis|amqp)://[^:/@\s]+:[^@\s]+@`),
+
+	// Git HTTPS credentials, including OAuth tokens that do not have a
+	// provider-specific prefix.
+	regexp.MustCompile(`(?i)https?://(?:oauth2|token):[^@/\s]+@`),
 }
 
 // MaskSecrets replaces every occurrence of any built-in secret pattern in s

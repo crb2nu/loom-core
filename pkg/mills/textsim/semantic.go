@@ -2,31 +2,95 @@ package textsim
 
 import (
 	"context"
-	"math"
+	"strconv"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/crb2nu/loom/pkg/codebase/embed"
 )
 
 const semanticEmbedTimeout = 5 * time.Second
 
-// Scorer compares two work titles. Implementations must return a score in
-// [0,1]; callers can inspect SemanticAvailable to observe lexical fallback.
-type Scorer interface {
-	Score(ctx context.Context, a, b string) Similarity
+// MergedWorkSemanticScoresTotal counts whether embedding-backed semantic
+// grounding was available when a title comparison resolved. It lives in
+// textsim so Score can record every outcome without creating a textsim -> mills
+// import cycle; mills re-exports it from its conventional metrics surface.
+var MergedWorkSemanticScoresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "mills_mergedwork_semantic_scores_total",
+	Help: "Merged-work semantic title scores by embedding availability.",
+}, []string{"available"})
+
+// Band is the decision band a title score occupies. Unavailable is reserved
+// for a semantic result that could not be computed; lexical scores never use
+// it.
+type Band string
+
+const (
+	BandNone        Band = "none"
+	BandGray        Band = "gray_band"
+	BandHard        Band = "hard"
+	BandUnavailable Band = "unavailable"
+)
+
+// ShadowComparison describes the lexical gate and the embedding-backed
+// shadow result for one title pair. Gate is deliberately derived only from
+// LexicalBand; CombinedBand is observation data and must not affect callers.
+type ShadowComparison struct {
+	Similarity
+	LexicalBand  Band
+	CombinedBand Band
+	Gate         bool
+	Disagrees    bool
 }
 
-// Similarity describes both inputs to the combined score. Semantic is zero
-// when SemanticAvailable is false and Combined is then exactly Lexical.
-type Similarity struct {
-	Lexical           float64
-	Semantic          float64
-	Combined          float64
-	SemanticAvailable bool
+// CompareShadow runs scorer beside the lexical gate. grayEligible lets callers
+// preserve their own recency rule for the gray band. A nil/failing scorer
+// reports semantic unavailability while returning the exact lexical gate.
+func CompareShadow(ctx context.Context, scorer Scorer, a, b string, threshold float64, grayEligible bool) ShadowComparison {
+	lexical := WorkTitleJaccard(a, b)
+	lexicalBand := SimilarityBand(lexical, threshold, grayEligible)
+	result := ShadowComparison{
+		Similarity:   Similarity{Lexical: lexical, Combined: lexical},
+		LexicalBand:  lexicalBand,
+		CombinedBand: BandUnavailable,
+		Gate:         lexicalBand != BandNone,
+	}
+	if scorer == nil {
+		return result
+	}
+
+	result.Similarity = scorer.Score(ctx, a, b)
+	// Pin the lexical value locally: even a custom scorer cannot smuggle a
+	// semantic decision into the established Jaccard gate.
+	result.Lexical = lexical
+	if !result.SemanticAvailable {
+		result.Combined = lexical
+		return result
+	}
+	result.CombinedBand = SimilarityBand(result.Combined, threshold, grayEligible)
+	result.Disagrees = result.CombinedBand != result.LexicalBand
+	return result
+}
+
+// SimilarityBand maps a score onto the same hard/gray/none bands used by
+// merged-work grounding. Invalid thresholds disable every band.
+func SimilarityBand(score, threshold float64, grayEligible bool) Band {
+	if threshold <= 0 || threshold > 1 {
+		return BandNone
+	}
+	if score >= threshold {
+		return BandHard
+	}
+	if grayEligible && threshold > GrayBandFloor && score >= GrayBandFloor {
+		return BandGray
+	}
+	return BandNone
 }
 
 // SemanticScorer combines decoration-blind lexical Jaccard and embedding
-// cosine similarity with equal weight. A nil or failing backend, invalid
+// cosine similarity by taking their maximum. A nil or failing backend, invalid
 // vectors, and empty titles all degrade to the unchanged lexical score.
 type SemanticScorer struct {
 	backend embed.DocumentEmbedder
@@ -40,9 +104,13 @@ func NewSemanticScorer(backend embed.DocumentEmbedder) *SemanticScorer {
 
 // Score computes the combined title similarity. Both normalized titles are
 // embedded in one batch so remote providers need at most one request per pair.
-func (s *SemanticScorer) Score(ctx context.Context, a, b string) Similarity {
-	lexical := WorkTitleJaccard(a, b)
-	fallback := Similarity{Lexical: lexical, Combined: lexical}
+func (s *SemanticScorer) Score(ctx context.Context, a, b string) (result Similarity) {
+	defer func() {
+		MergedWorkSemanticScoresTotal.WithLabelValues(strconv.FormatBool(result.SemanticAvailable)).Inc()
+	}()
+
+	fallback := (JaccardScorer{}).Score(ctx, a, b)
+	fallback.Fallback = true
 	if s == nil || s.backend == nil {
 		return fallback
 	}
@@ -62,14 +130,14 @@ func (s *SemanticScorer) Score(ctx context.Context, a, b string) Similarity {
 	if err != nil || len(vectors) != 2 {
 		return fallback
 	}
-	semantic, ok := CosineSimilarity(vectors[0], vectors[1])
+	combined, semantic, ok := CombineWorkTitleSimilarity(fallback.Lexical, vectors[0], vectors[1])
 	if !ok {
 		return fallback
 	}
 	return Similarity{
-		Lexical:           lexical,
+		Lexical:           fallback.Lexical,
 		Semantic:          semantic,
-		Combined:          (lexical + semantic) / 2,
+		Combined:          combined,
 		SemanticAvailable: true,
 	}
 }
@@ -78,30 +146,9 @@ func (s *SemanticScorer) Score(ctx context.Context, a, b string) Similarity {
 // The boolean is false for empty, mismatched, zero-norm, NaN, or infinite
 // vectors, preventing invalid backend data from contaminating grounding.
 func CosineSimilarity(a, b []float64) (float64, bool) {
-	if len(a) == 0 || len(a) != len(b) {
+	cosine, ok := embed.CosineSimilarity(a, b)
+	if !ok {
 		return 0, false
 	}
-	var normA, normB float64
-	for i := range a {
-		if math.IsNaN(a[i]) || math.IsInf(a[i], 0) || math.IsNaN(b[i]) || math.IsInf(b[i], 0) {
-			return 0, false
-		}
-		// Hypot accumulates the norm without overflowing or underflowing when
-		// otherwise valid vectors contain components near float64's limits.
-		normA = math.Hypot(normA, a[i])
-		normB = math.Hypot(normB, b[i])
-	}
-	if normA == 0 || normB == 0 || math.IsInf(normA, 0) || math.IsInf(normB, 0) {
-		return 0, false
-	}
-	var cosine float64
-	for i := range a {
-		cosine += (a[i] / normA) * (b[i] / normB)
-	}
-	if math.IsNaN(cosine) || math.IsInf(cosine, 0) {
-		return 0, false
-	}
-	// Floating-point accumulation can stray just outside the cosine range.
-	cosine = math.Max(-1, math.Min(1, cosine))
 	return (cosine + 1) / 2, true
 }

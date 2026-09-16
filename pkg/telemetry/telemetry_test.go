@@ -2,9 +2,29 @@ package telemetry
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"testing"
 )
+
+type captureScopeFailureRecorder struct{ classes []ScopeFailureClass }
+
+func (r *captureScopeFailureRecorder) RecordScopeFailure(_ context.Context, class ScopeFailureClass) {
+	r.classes = append(r.classes, class)
+}
+
+func TestRecordScopeFailureBoundsClass(t *testing.T) {
+	recorder := &captureScopeFailureRecorder{}
+	restore := SetScopeFailureRecorderForTest(recorder)
+	defer restore()
+
+	RecordScopeFailure(context.Background(), ScopeFailureMissingDirectory)
+	RecordScopeFailure(context.Background(), ScopeFailureClass("unbounded"))
+	want := []ScopeFailureClass{ScopeFailureMissingDirectory, ScopeFailureGenuineDetour}
+	if !reflect.DeepEqual(recorder.classes, want) {
+		t.Fatalf("classes = %v, want %v", recorder.classes, want)
+	}
+}
 
 func TestCouncilIntentsMissingCounterConcurrent(t *testing.T) {
 	const calls = 100

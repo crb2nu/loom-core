@@ -477,3 +477,19 @@ func TestHandleWriteFile_NotRunning(t *testing.T) {
 		t.Errorf("expected error result for write failure")
 	}
 }
+
+func TestHandleStop_AbsentRunSandboxIsIdempotent(t *testing.T) {
+	mgr := newTestManager(t, &fakeBackend{statuses: map[string]*fakeStatus{}})
+	for i := 0; i < 2; i++ {
+		result, err := mgr.handleStop(context.Background(), map[string]any{"project": "test-project", "agent_id": "loom-mills-operator-run-baseline"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.IsError {
+			t.Fatalf("absent sandbox stop failed: %v", result)
+		}
+		if resultMap(t, result)["stopped"] != true {
+			t.Fatal("expected stopped result")
+		}
+	}
+}

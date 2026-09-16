@@ -59,6 +59,40 @@ func TestHydrateSliceScope_StampsAndPersists(t *testing.T) {
 	}
 }
 
+func TestHydrateSliceScope_TestCommandsDoNotBecomeScope(t *testing.T) {
+	st, run, item := newRunnerEnv(t)
+	item.PlanID = "plan-file-only-scope"
+	if err := st.Backlog.Put(context.Background(), item); err != nil {
+		t.Fatalf("stamp plan id: %v", err)
+	}
+	hyd := &fakeSliceHydrator{
+		slices: []store.Slice{{
+			Name:  "scope-hydration-fix",
+			Files: []string{"pkg/mills/pipeline/slice_hydration.go"},
+			Tests: []string{"GOWORK=off go build ./cmd/custom-server"},
+		}},
+		files: []string{"pkg/mills/pipeline/slice_hydration.go"},
+	}
+	r := New(st, nil, &fakeDispatcher{}, nil)
+	r.SliceHydrator = hyd
+
+	r.hydrateSliceScope(context.Background(), run, item)
+
+	if got := item.Slices[0].Tests; len(got) != 1 || got[0] != "GOWORK=off go build ./cmd/custom-server" {
+		t.Fatalf("in-memory execution metadata = %v, want test command retained", got)
+	}
+	persisted, err := st.Backlog.Get(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("get persisted: %v", err)
+	}
+	if got := persisted.Slices[0].Tests; len(got) != 1 || got[0] != "GOWORK=off go build ./cmd/custom-server" {
+		t.Fatalf("persisted execution metadata = %v, want test command retained", got)
+	}
+	if got := persisted.Slices[0].Files; len(got) != 1 || got[0] != "pkg/mills/pipeline/slice_hydration.go" {
+		t.Fatalf("persisted files = %v, want file-derived scope", got)
+	}
+}
+
 // TestHydrateSliceScope_NoFileBearingSlicesLeavesItemUntouched: a plan whose
 // slices declare no files (the #332 shape — a council docs slice) hydrates
 // nothing; the item stays slice-less and the scope gate skips downstream.

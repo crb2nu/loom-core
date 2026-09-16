@@ -23,15 +23,154 @@ const (
 	EmbedderLatencyMetric            = "embedder_latency_seconds"
 	IntakeFailclosedRejectionsMetric = "intake_failclosed_rejections_total"
 	GateVerdictParseMetric           = "gate_verdict_parse_total"
+	ScopeFailureClassMetric          = "scope_failure_class"
 	EscalationRequeueEligibleMetric  = "mills_escalation_requeue_eligible_total"
 	EscalationRequeueBlockedMetric   = "mills_escalation_requeue_blocked_total"
 	OverseerDryRunDecisionsMetric    = "loom_mills_overseer_dry_run_decisions_total"
+	CouncilReviewerOutcomesMetric    = "loom_mills_council_reviewer_outcomes_total"
 
 	EmbedderProviderMorph     = "morph"
 	EmbedderProviderFlexInfer = "flexinfer"
 	EmbedderProviderOllama    = "ollama"
 	EmbedderProviderUnknown   = "unknown"
 )
+
+// CouncilReviewerOutcomeRecorder observes one normalized reviewer result.
+// Both labels are closed vocabularies; reviewer names and error text are
+// deliberately excluded to keep metric cardinality bounded.
+type CouncilReviewerOutcomeRecorder interface {
+	RecordCouncilReviewerOutcome(context.Context, string, string)
+}
+
+var councilReviewerOutcomeRecorder = struct {
+	sync.RWMutex
+	recorder CouncilReviewerOutcomeRecorder
+}{recorder: newOTelCouncilReviewerOutcomeRecorder()}
+
+// RecordCouncilReviewerOutcome increments the bounded per-reviewer outcome
+// counter. Unknown values are normalized before reaching the recorder.
+func RecordCouncilReviewerOutcome(ctx context.Context, outcome, classification string) {
+	councilReviewerOutcomeRecorder.RLock()
+	recorder := councilReviewerOutcomeRecorder.recorder
+	councilReviewerOutcomeRecorder.RUnlock()
+	if recorder != nil {
+		recorder.RecordCouncilReviewerOutcome(ctx, normalizeCouncilReviewerOutcome(outcome), normalizeCouncilReviewerClassification(classification))
+	}
+}
+
+// SetCouncilReviewerOutcomeRecorderForTest replaces the process-wide recorder
+// and returns a function that restores it.
+func SetCouncilReviewerOutcomeRecorderForTest(recorder CouncilReviewerOutcomeRecorder) func() {
+	councilReviewerOutcomeRecorder.Lock()
+	previous := councilReviewerOutcomeRecorder.recorder
+	councilReviewerOutcomeRecorder.recorder = recorder
+	councilReviewerOutcomeRecorder.Unlock()
+	return func() {
+		councilReviewerOutcomeRecorder.Lock()
+		councilReviewerOutcomeRecorder.recorder = previous
+		councilReviewerOutcomeRecorder.Unlock()
+	}
+}
+
+type otelCouncilReviewerOutcomeRecorder struct{ counter metric.Int64Counter }
+
+func newOTelCouncilReviewerOutcomeRecorder() *otelCouncilReviewerOutcomeRecorder {
+	meter := otel.GetMeterProvider().Meter("github.com/crb2nu/loom/pkg/telemetry")
+	counter, _ := meter.Int64Counter(CouncilReviewerOutcomesMetric,
+		metric.WithDescription("Total Council reviewer results by bounded outcome and classification."))
+	return &otelCouncilReviewerOutcomeRecorder{counter: counter}
+}
+
+func (r *otelCouncilReviewerOutcomeRecorder) RecordCouncilReviewerOutcome(ctx context.Context, outcome, classification string) {
+	r.counter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", outcome),
+		attribute.String("classification", classification),
+	))
+}
+
+func normalizeCouncilReviewerOutcome(outcome string) string {
+	switch outcome {
+	case "ok", "empty", "error", "timeout":
+		return outcome
+	default:
+		return "error"
+	}
+}
+
+func normalizeCouncilReviewerClassification(classification string) string {
+	switch classification {
+	case "none", "reviewer_failure", "external_dependency_incident":
+		return classification
+	default:
+		return "reviewer_failure"
+	}
+}
+
+// ScopeFailureClass is the bounded explanation for a failed scope gate.
+type ScopeFailureClass string
+
+const (
+	ScopeFailureMissingDirectory ScopeFailureClass = "missing_directory"
+	ScopeFailureWrongBasename    ScopeFailureClass = "wrong_basename"
+	ScopeFailureGenuineDetour    ScopeFailureClass = "genuine_detour"
+)
+
+// ScopeFailureRecorder observes one failed scope evaluation. Callers must
+// invoke it exactly once for a failed verdict and never for passes or skips.
+type ScopeFailureRecorder interface {
+	RecordScopeFailure(context.Context, ScopeFailureClass)
+}
+
+var scopeFailureRecorder = struct {
+	sync.RWMutex
+	recorder ScopeFailureRecorder
+}{recorder: newOTelScopeFailureRecorder()}
+
+// RecordScopeFailure increments the bounded scope-failure counter.
+func RecordScopeFailure(ctx context.Context, class ScopeFailureClass) {
+	scopeFailureRecorder.RLock()
+	recorder := scopeFailureRecorder.recorder
+	scopeFailureRecorder.RUnlock()
+	if recorder != nil {
+		recorder.RecordScopeFailure(ctx, normalizeScopeFailureClass(class))
+	}
+}
+
+// SetScopeFailureRecorderForTest replaces the process-wide recorder and
+// returns a function that restores it.
+func SetScopeFailureRecorderForTest(recorder ScopeFailureRecorder) func() {
+	scopeFailureRecorder.Lock()
+	previous := scopeFailureRecorder.recorder
+	scopeFailureRecorder.recorder = recorder
+	scopeFailureRecorder.Unlock()
+	return func() {
+		scopeFailureRecorder.Lock()
+		scopeFailureRecorder.recorder = previous
+		scopeFailureRecorder.Unlock()
+	}
+}
+
+type otelScopeFailureRecorder struct{ counter metric.Int64Counter }
+
+func newOTelScopeFailureRecorder() *otelScopeFailureRecorder {
+	meter := otel.GetMeterProvider().Meter("github.com/crb2nu/loom/pkg/telemetry")
+	counter, _ := meter.Int64Counter(ScopeFailureClassMetric,
+		metric.WithDescription("Total failed Mills scope evaluations by bounded failure class."))
+	return &otelScopeFailureRecorder{counter: counter}
+}
+
+func (r *otelScopeFailureRecorder) RecordScopeFailure(ctx context.Context, class ScopeFailureClass) {
+	r.counter.Add(ctx, 1, metric.WithAttributes(attribute.String("class", string(class))))
+}
+
+func normalizeScopeFailureClass(class ScopeFailureClass) ScopeFailureClass {
+	switch class {
+	case ScopeFailureMissingDirectory, ScopeFailureWrongBasename, ScopeFailureGenuineDetour:
+		return class
+	default:
+		return ScopeFailureGenuineDetour
+	}
+}
 
 // OverseerDryRunDecisionRecorder observes successfully persisted overseer
 // dry-run decisions. The two booleans are a closed vocabulary: the dry-run
@@ -494,13 +633,14 @@ func (f GateResultEventSinkFunc) RecordGateResultEvent(event GateResultEvent) {
 // InputDigest identifies evaluations that must agree even when they belong to
 // different pipeline runs. Inputs themselves are never emitted.
 type GateEvaluation struct {
-	GateID          string              `json:"gate_id"`
-	RunID           string              `json:"run_id"`
-	InputDigest     string              `json:"input_digest"`
-	Verdict         GateVerdict         `json:"verdict"`
-	FailureCategory GateFailureCategory `json:"failure_category,omitempty"`
-	Reason          string              `json:"reason"`
-	DurationMS      int64               `json:"duration_ms"`
+	GateID            string              `json:"gate_id"`
+	RunID             string              `json:"run_id"`
+	InputDigest       string              `json:"input_digest"`
+	Verdict           GateVerdict         `json:"verdict"`
+	FailureCategory   GateFailureCategory `json:"failure_category,omitempty"`
+	Reason            string              `json:"reason"`
+	DurationMS        int64               `json:"duration_ms"`
+	ScopeFailureClass ScopeFailureClass   `json:"scope_failure_class,omitempty"`
 }
 
 // GateEvaluationSinkFunc adapts a function to GateEvaluationSink.

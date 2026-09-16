@@ -1,0 +1,1 @@
+- Add the default-off Factory Health Plane S1 poller and durable-store factory gauges/counters in `pkg/mills`, wire it into `cmd/loom-mills-operator`, and document its telemetry contract in `docs/MILLS.md`.

@@ -28,6 +28,13 @@ type ActorPrefixLister interface {
 	ListSinceByActorPrefix(ctx context.Context, prefix string, since time.Time, limit int) ([]*store.Event, error)
 }
 
+// ActorWindowWalker streams event metadata for a complete actor window. The
+// promotion report prefers it to capped lists so busy windows remain reviewable
+// without retaining or decoding payloads. *store.EventDAO satisfies it.
+type ActorWindowWalker interface {
+	WalkActorWindow(ctx context.Context, prefix string, since, until time.Time, visit func(*store.Event) error) error
+}
+
 // KindLister is the same optional upgrade keyed by event kind, for the
 // reports that aggregate specific kinds (judge verdicts, provenance stamps)
 // instead of actor families.
@@ -36,7 +43,7 @@ type KindLister interface {
 }
 
 const (
-	// promotionReportEventLimit bounds the window scan. Saturating it is an
+	// promotionReportEventLimit bounds legacy list scans. Saturating it is an
 	// error rather than a truncation: a promotion review that silently
 	// under-counts executed actions is worse than no review.
 	promotionReportEventLimit = 10000
@@ -116,32 +123,14 @@ func BuildPromotionReport(ctx context.Context, events EventLister, actorPrefix s
 			since.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
 	}
 
-	// Prefer the prefix-filtered scan so the truncation cap below counts the
-	// reviewed actors' events, not every writer in the table. The in-memory
-	// HasPrefix filter stays: it also guards the fallback path.
-	var raw []*store.Event
-	var err error
-	if pl, ok := events.(ActorPrefixLister); ok {
-		raw, err = pl.ListSinceByActorPrefix(ctx, actorPrefix, since, promotionReportEventLimit)
-	} else {
-		raw, err = events.ListSince(ctx, since, promotionReportEventLimit)
-	}
-	if err != nil {
-		return PromotionReport{}, fmt.Errorf("promotion report: %w", err)
-	}
-	if len(raw) >= promotionReportEventLimit {
-		return PromotionReport{}, fmt.Errorf("promotion report: window holds at least %d events; narrow the window rather than review a truncated count", promotionReportEventLimit)
-	}
-
 	byActor := make(map[string]map[string]*promotionAgg)
-	for _, e := range raw {
+	accumulate := func(e *store.Event) error {
 		if e == nil || !strings.HasPrefix(e.Actor, actorPrefix) {
-			continue
+			return nil
 		}
-		// ListSince bounds the window's start; the end is bounded here so a
-		// clock-skewed future event cannot land in a closed review window.
+		// Keep both bounds here as well for legacy listers.
 		if e.OccurredAt.Before(since) || e.OccurredAt.After(now) {
-			continue
+			return nil
 		}
 		action, dry := splitActionKind(e.Actor, e.Kind)
 		actions, ok := byActor[e.Actor]
@@ -167,6 +156,33 @@ func BuildPromotionReport(ctx context.Context, events EventLister, actorPrefix s
 		}
 		if e.OccurredAt.After(agg.last) {
 			agg.last = e.OccurredAt
+		}
+		return nil
+	}
+
+	if walker, ok := events.(ActorWindowWalker); ok {
+		if err := walker.WalkActorWindow(ctx, actorPrefix, since, now, accumulate); err != nil {
+			return PromotionReport{}, fmt.Errorf("promotion report: %w", err)
+		}
+	} else {
+		// Legacy listers must still fail closed when their cap is reached.
+		var raw []*store.Event
+		var err error
+		if pl, ok := events.(ActorPrefixLister); ok {
+			raw, err = pl.ListSinceByActorPrefix(ctx, actorPrefix, since, promotionReportEventLimit)
+		} else {
+			raw, err = events.ListSince(ctx, since, promotionReportEventLimit)
+		}
+		if err != nil {
+			return PromotionReport{}, fmt.Errorf("promotion report: %w", err)
+		}
+		if len(raw) >= promotionReportEventLimit {
+			return PromotionReport{}, fmt.Errorf("promotion report: window holds at least %d events; narrow the window rather than review a truncated count", promotionReportEventLimit)
+		}
+		for _, e := range raw {
+			if err := accumulate(e); err != nil {
+				return PromotionReport{}, fmt.Errorf("promotion report: %w", err)
+			}
 		}
 	}
 

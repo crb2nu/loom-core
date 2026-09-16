@@ -667,6 +667,13 @@ func routeExternalDependencyEscalation(md store.EscalationMetadata, id, dependen
 		return md
 	}
 	md.EscalationClass = telemetry.EscalationClassExternalDependency
+	// The devbox sandbox dependencies stay retryable infra: the fix is the substrate.
+	if id == "devbox_baseline" || id == DevboxQuotaDependency {
+		md.EscalationClass = string(ClassInfra)
+		md.FailureClass = string(FailureInfrastructure)
+		retryable := true
+		md.Retryable = &retryable
+	}
 	md.ExternalDependencyID = id
 	md.ExternalDependency = dependency
 	return md
@@ -699,7 +706,7 @@ func (r *FailureRecord) SetClassification(md store.EscalationMetadata) {
 		RetryExhausted:       md.RetryExhausted,
 	}
 	if md.FailureClass != "" {
-		fc := failureClassificationForClass(FailureClassFromString(md.FailureClass))
+		fc := failureClassificationForMetadata(md)
 		r.Classification.Classifier = fc.Classifier
 		r.Classification.FreeRetry = &fc.FreeRetry
 		r.Classification.Terminal = &fc.Terminal
@@ -771,7 +778,7 @@ func (r *FailureRecord) addClassificationToPayload(payload map[string]any) {
 			RetryExhausted:       md.RetryExhausted,
 		}
 		if md.FailureClass != "" {
-			fc := failureClassificationForClass(FailureClassFromString(md.FailureClass))
+			fc := failureClassificationForMetadata(md)
 			cls.Classifier = fc.Classifier
 			cls.FreeRetry = &fc.FreeRetry
 			cls.Terminal = &fc.Terminal
@@ -965,4 +972,16 @@ func (e *Escalator) logger() *slog.Logger {
 		return e.Logger
 	}
 	return slog.Default()
+}
+
+// The durable dependency identity preserves the baseline exception without
+// changing the policy wire contract or making ordinary infra retries free.
+func failureClassificationForMetadata(md store.EscalationMetadata) FailureClassification {
+	fc := failureClassificationForClass(FailureClassFromString(md.FailureClass))
+	if md.ExternalDependencyID == "devbox_baseline" {
+		fc.FreeRetry = true
+		fc.Retryable = true
+		fc.Terminal = false
+	}
+	return fc
 }

@@ -2,7 +2,10 @@
 package skills
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,8 +80,26 @@ func Load(path string) (*Registry, error) {
 	}
 
 	var reg Registry
-	if err := yaml.Unmarshal(data, &reg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&reg); err != nil {
 		return nil, fmt.Errorf("parse skills registry: %w", err)
+	}
+	// Registries are a single document. Do not silently ignore entries or
+	// misspelled fields in a second YAML document.
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("parse skills registry: %w", err)
+		}
+		return nil, fmt.Errorf("parse skills registry: expected a single YAML document")
+	}
+	if problems := validateRegistry(reg); len(problems) > 0 {
+		errs := make([]error, len(problems))
+		for i := range problems {
+			errs[i] = problems[i]
+		}
+		return nil, fmt.Errorf("validate skills registry: %w", errors.Join(errs...))
 	}
 
 	return &reg, nil

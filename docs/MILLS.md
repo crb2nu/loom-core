@@ -64,6 +64,16 @@ The Mac is read-mostly; the operator pod is the only writer. SQLite + WAL + Long
 | **HUD `Mills` view** | `internal/hud/frontend/src/lib/components/mills/` | Mill-floor spine `WarpsPanel` (queued plans by priority), `ShuttlesPanel` (active runs), `SparksPanel` (escalations), `BoltsPanel` (merged cloth) — these replaced the retired generic `BacklogPanel`/`PipelinesPanel` (legacy `#mills/backlog`→warps, `#mills/pipelines`→shuttles redirects kept). Plus `CouncilPanel`, `EvalPanel`, `FactoryPanel`, `TelemetryPanel`, etc. Shared drawers `BacklogDetail`/`PipelineRunDetail` reused across views. |
 | **Mac CLI** | `cmd/loom/cmd_mills*.go` | `loom mills status`, `loom mills council {dryrun,run}`, `loom mills backlog {list,get}`, `loom mills eval list`, `loom mills pipelines {list,get}`. |
 
+The `tests` stage runs formatting and touched-package lint parity, followed by
+the backlog item's declared `go test` commands. For every Go package named by
+the implement-stage diff, it also appends one uncached module-mode command
+(`GOWORK=off go test -count=1 ...`) unless the declared commands already cover
+all of those packages. Diffs touching more than 25 packages collapse to their
+common parent `/...` pattern. The stage records the effective package list in
+the `touched_test_packages` artifact and places the effective command at the
+top of its `test:*` check output; non-`go test` declarations remain visible in
+`skipped_declared_tests`.
+
 ## Deployment
 
 The operator runs as a single-replica Deployment in the `loom-mills` namespace on k3s.
@@ -92,6 +102,8 @@ Healthz and readyz live on the metrics listener (`:9090` by default). `/healthz`
 
 Autonomy readiness is reported by `/api/mills/status` and `/api/mills/capabilities`. These responses include `autonomy_ready`, `autonomy_blockers`, and a capability matrix with rows for SQLite, policy, admin auth, repo root, FlexInfer, GitLab, HUD spawn, MCP hub/session, dispatcher write stages, council participants, branch contract, and KPI writer. When `policy.enabled=true`, required red or stubbed rows keep `autonomy_ready=false` while read-only API surfaces can remain available.
 
+`/api/mills/status` also carries a `council_yield` block: `runs_since_last_delta` (finished council runs, newest first, before one that intended any backlog mutation), `cost_since_last_delta_usd`, `last_delta_at` / `last_delta_run_id`, and `sample_size` (the operator examines the 50 most recent runs; a nil `last_delta_at` with `runs_since_last_delta == sample_size` means the dry spell is at least that long, not that it began there). `last_council_at` advancing while `runs_since_last_delta` climbs is the "council is deliberating but minting nothing" signal — every proposal dropped as external-only or merely labeled. `loom mills status` renders the block as one line together with build sha, autonomy verdict, health gates, capability rollup, and both budget tiers.
+
 ## Configuration
 
 Environment variables (canonical prefix `LOOM_MILLS_*`); see `cmd/loom-mills-operator/config.go` for the authoritative list.
@@ -110,7 +122,9 @@ Environment variables (canonical prefix `LOOM_MILLS_*`); see `cmd/loom-mills-ope
 | `LITELLM_PROXY_URL` / `LOOM_MILLS_LITELLM_KEY` | unset | Cluster LiteLLM gateway + bearer key (OpenAI-compatible). Required for `litellm`-backed council lenses, judge, or weaver. |
 | `MILLS_JUDGE_BACKEND` | `flexinfer` | `flexinfer` (default) or `litellm`. `litellm` routes the rubric judge **and** the council contradiction judge through the gateway on `FLEXINFER_JUDGE_MODEL`; judge hardening (truncation recovery, echo-stripping, `FLEXINFER_JUDGE_MAX_TOKENS`, length-retry) and provider `usage.cost` accounting ride through unchanged. Missing `LITELLM_PROXY_URL`/`FLEXINFER_JUDGE_MODEL` fails loud at startup and degrades to FlexInfer. |
 | `MILLS_WEAVER_BACKEND` | `flexinfer` | As above for the research/weaver stage, on `FLEXINFER_WEAVER_MODEL`. Independent of `MILLS_JUDGE_BACKEND`. |
+| `MILLS_TRIAGE_BACKEND` / `FLEXINFER_TRIAGE_MODEL` | unset | Overseer triage (backlog-groomer dedup/zombie verdicts, foreman issue bodies). Unset inherits the judge client + model. `flexinfer` pins the proxy client on `FLEXINFER_TRIAGE_MODEL` (a **serving name**, e.g. `qwen38-27b-xtx-warm-canary`; labels 404) so the 512-token JSON verdicts run on a warm local lane while the gates keep the frontier judge; `litellm` binds the gateway on that model. A non-default backend without its model/client fails loud at startup and degrades to the judge wiring. An explicit triage model has **no fallback chain**: a lane outage degrades the overseers to deterministic-only (their designed fail-safe), never to the judge. Usage lands on `mills_llm_prompt_tokens_total{component="mills-triage"}`. |
 | `FLEXINFER_JUDGE_MAX_TOKENS` / `FLEXINFER_WEAVER_MAX_TOKENS` | `1024` | Completion budget for the rubric judge / research (weaver) stages. Default `1024` fits the local qwen models. **Set `>= 4096` for a reasoning model** (e.g. `or/kimi-k3`): a thinking model returns its chain-of-thought in a separate `message.reasoning_content` field whose tokens count against `max_tokens`, so at `1024` the reasoning consumes the whole completion and the judge envelope / research notes come back empty. Both paths also make one reasoning-aware boosted retry (floored to 4096 when the squeezed response showed reasoning activity) so a squeeze never surfaces empty without a retry, but the env budget is the durable fix. Non-positive/blank ⇒ default. |
+| `FLEXINFER_SHADOW_JUDGE_MODEL` / `FLEXINFER_SHADOW_JUDGE_TIMEOUT` | unset / `2m` | Calibration **shadow judge** for the LLM-judged gates (loom-core #755). A FlexInfer-proxy serving model (e.g. `qwen38-27b-autoround-workhorse`; `oa/`/`or/` gateway ids are refused) that grades every `spec_conformance` / `pr_self_review` verdict concurrently with the primary. Its score is persisted as a `judge.verdict` event with `role=shadow` and never touches `pass`, `judged_by` or `reasons`; a shadow error or timeout records nothing. The shadow client dials exactly that model (no registry or env fallback chain). Calibration rows, the `mills_judge_calibration_*` gauges and the HUD Mill Staff panel key on `(gate, role)` so the candidate's discrimination can be compared with the primary's; alerts must select `role="primary"`. Unset disables it. |
 | `MILLS_TELEMETRY_CACHE_TTL_SECONDS` | `8` | Stage telemetry roll-up cache TTL in seconds. Valid integer values are clamped to `1`-`60`; unset, blank, or non-integer values use the default. |
 | `FLEXINFER_JUDGE_MODEL_FALLBACKS` / `FLEXINFER_WEAVER_MODEL_FALLBACKS` | unset | Comma-separated degrade chain. On a `litellm` backend these are interpreted as **gateway-routable** ids (backend-local: the aimodels-registry FlexInfer chain is suppressed so a frontier outage never walks to a proxy model the gateway can't route). Empty ⇒ no fallback; the gate soft-fails/escalates like any FlexInfer outage rather than wedging. |
 | `GITLAB_API_URL` / `GITLAB_TOKEN` / `GITLAB_PROJECT` | unset | Required for `mr/ci_watch/merge/cleanup` stages and escalation issues. |
@@ -124,6 +138,8 @@ Environment variables (canonical prefix `LOOM_MILLS_*`); see `cmd/loom-mills-ope
 | Admin token | env (operator-side) | Required for mutating endpoints; check `cmd/loom-mills-operator/auth.go`. |
 
 At startup, the operator attempts to bootstrap `LOOM_MILLS_REPO_ROOT` as a shallow `services/loom-core` checkout when GitLab URL/project/token configuration and the `git` binary are available. In k3s this path is mounted from the singleton Longhorn PVC at `/workspace/loom-core`, sharing the same single-writer ownership model as SQLite. If the clone, fetch, git metadata, `.loom` existence, or writability check fails, the pod still serves read-only APIs but the `repo_root` capability stays red and unattended backlog execution remains blocked.
+
+The `tests` stage is pinned to the pushed source-branch head. The operator resolves that immutable SHA from an explicit override, an adopted-branch artifact, GitLab, or a legacy local worktree, in that order, and sends both branch and SHA to devbox. If none can resolve the head, the stage fails as checkout infrastructure; it never runs against an ambient `main` checkout or records a passing `tested_sha=unresolved`. Go test commands run with `-count=1` so the gate's evidence is fresh.
 
 When a backing service env is missing, the operator boots in a degraded mode: affected stages fall back to a NoOp dispatcher and the gap is logged and exposed in the capability matrix. The scheduler and read-only APIs may still run, but the reconciler skips queued work while `autonomy_ready=false`; no unattended pipeline starts are allowed until the required capability rows are green.
 
@@ -148,16 +164,29 @@ then pass or report a real gate failure.
 
 `pkg/mills/policy.go` defines the schema. The on-disk YAML maps 1:1.
 
+The shift report exposes `throughput_guardrail.breached` and ordered `reasons`
+in JSON and a verdict in Markdown. It evaluates current KPI values using the
+live budget policy; it does not stop admission. Values strictly above a limit
+breach it; equality is healthy. Omitted or zero rate, cost, and age thresholds
+use the defaults below. Zero `max_starved_queues` means any starvation reservation
+breaches the guardrail. Missing KPI values are skipped; reported zeros are evaluated.
+
 ```yaml
 version: 1
 enabled: true                            # kill switch (defaults to enabled when omitted)
 budgets:
+  throughput_guardrail:                   # advisory shift-report thresholds
+    max_escalation_rate: 0.25
+    max_cost_per_merged_pipeline_usd: 5
+    max_scope_queue_age_seconds: 21600
+    max_starved_queues: 0
   council:
     max_usd_per_run:  15.00
     max_usd_per_day:  50.00
   pipeline:
     max_usd_per_run:   5.00
-    max_usd_per_day:  75.00
+    max_usd_per_day:  75.00                # metered (API-billed) spend only
+    max_subscription_usd_per_day: 0        # optional cap on Claude Code / Codex subscription turns; 0 = uncapped
     max_concurrent_runs: 4
     max_runs_per_day:   20
 council:
@@ -167,12 +196,26 @@ council:
     on_incident:        true
     on_merge_drift_hours: 48
   ensemble:
-    editor:    { name: editor,   model: claude-opus,           backend: spawn }
+    # Editor backends: anthropic | openai | openai-responses | flexinfer (each
+    # frontier backend falls back to the local flexinfer editor per run).
+    # Reviewer backends: litellm | flexinfer only — there is no native
+    # Anthropic/OpenAI reviewer client, so a frontier lens goes through the
+    # LiteLLM gateway (oa/…, or/…). "spawn" is not a council backend.
+    editor:    { model: claude-fable-5-1, backend: anthropic }
+    # Cross-vendor hop, tried between the editor and the local flexinfer
+    # fallback when the primary fails for THAT run (billing hold, outage,
+    # refusal, timeout). An anthropic editor defaults to
+    # { model: gpt-5.5, backend: openai } when this key is omitted; any other
+    # primary has no default. `backend: none` opts out. The hop is skipped at
+    # boot when the other vendor's key is absent, so naming it never
+    # hard-fails a deployment. Pin the LOCAL third hop with
+    # editor_fallback_model (a flexinfer id; empty = the proxy weaver chain).
+    editor_fallback: { model: gpt-5.5, backend: openai }
     reviewers:
-      - { name: architect, model: claude-opus,         backend: spawn,     lens: architecture }
-      - { name: security,  model: codex-gpt5,          backend: spawn,     lens: security }
-      - { name: tech_debt, model: llama-4-70b-instruct, backend: flexinfer, lens: tech_debt }
-    judge:     { name: judge,    model: llama-4-70b-instruct,  backend: flexinfer }
+      - { name: security,    model: qwen38-27b-autoround-workhorse, backend: flexinfer }
+      - { name: user-impact, model: or/deepseek-chat,               backend: litellm }
+      - { name: frontier,    model: or/kimi-k3,                     backend: litellm }
+    # judge omitted → the operator's default judge wiring (see /wiring)
   artifacts_branch:           "council/{date}"
   artifacts_merge_strategy:   "fast-merge-loom-only"   # or "always-mr"
   # Fail-closed intent guardrail (default ON when omitted). A council run whose
@@ -205,6 +248,22 @@ pipeline:
     - "cmd/loomd/**"
     - "**/*auth*.go"
     - "**/secret*.yaml"
+  # Per-target-repo replacement for cross-repo runs (BacklogItem.TargetProject).
+  # Keys name a repo — bucket-qualified or bare, case-insensitive — and their
+  # globs REPLACE protected_paths when a run targets that repo, so a
+  # demand repo's own sensitive surface (its auth code, deploy manifests, CI
+  # config) is judged in ITS layout, not the home repo's. Globs are evaluated
+  # against paths relative to the TARGET repo root. Home-repo items (empty
+  # TargetProject) use the global list. Known repositories without an entry
+  # also inherit the global list; foreign targets not named here or in
+  # cross_repo.demand_projects fail closed. An empty list is an explicit empty
+  # replacement. Malformed keys/globs and two aliases naming the same repo are
+  # rejected at policy load, including hot reload (which retains the previous
+  # valid snapshot).
+  protected_paths_per_repo:
+    services/flexdeck:
+      - "internal/rbac/**"
+      - "k8s/**"
   per_label_overrides:
     - { label: "auto",         auto_merge: true,  human_review: false }
     - { label: "human_review", auto_merge: false, human_review: true }
@@ -240,6 +299,17 @@ human_handoff:
 ```
 
 Edits to the mounted ConfigMap are picked up via fsnotify within seconds; the operator logs `policy reloaded` on success and continues on the prior version on parse error. In-flight runs continue under the policy they captured at start; new runs use the latest.
+
+Scope fairness reserves an overlapping envelope only for a starved queued item
+that autonomous admission could currently start. Human-review items (including
+per-repository overrides), items with unmet dependencies, and items over their
+repository run budget are excluded and produce an auditable
+`reconciler.skipped` event whose reason begins
+`starved_candidate_excluded:`. Eligibility is recalculated each pass. For
+fairness reservations, a glob such as `docs/*.md` does not reserve its coarse
+`docs` ancestor against a literal such as `docs/MILLS.md`; directory fallback
+applies only when both declarations are globs. Active-run scope serialization
+remains the stricter concurrency guard.
 
 ### Per-stage spawn selectors (`stage_substrate` / `stage_agents` / `stage_models`)
 
@@ -354,6 +424,8 @@ Runs escalate for many reasons; a large share are *retryable* — flaky infra, a
 **Eligibility** (in order): an item whose latest run opened an MR is skipped (a merged MR is the ghost-spark sweep's; an open/closed MR needs a human branch-fix — requeuing would re-implement). An external-dependency escalation is eligible only once the matching incident is no longer active (below the degraded-mode threshold in the rolling window). Otherwise the run's `escalation_class` decides: `infra` / `transient` / `transient_quota` are eligible after the cooldown; `code` / `config` / unclassified are **never** auto-requeued (a human signal). The sweep also never requeues into an exhausted `budgets.pipeline.max_runs_per_day` (via `CountBudgetedSince`).
 
 Every requeue appends a first-writer-wins audit event (`reconciler.auto_requeued`, keyed on the backlog item), increments `mills_auto_requeues_total{class}`, logs `class`/attempt/cap state, and shows up in the KPI snapshot as `auto_requeues`. Escalation-issue commenting (`auto-requeued (n/cap)`) is an optional injected hook (`Reconciler.AutoRequeueIssueCommenter`); until the Escalator's GitLab issue client is exposed to the reconciler it is **log-only** (a follow-up). Like the spawn selectors, production is a gitops ConfigMap edit plus a policy-checksum bump.
+
+**Starved passes are reported, not disguised.** The sweep runs under the escalation sweeper's sub-budget (one third of the pass). If that budget expires mid-batch the pass stops at the next candidate instead of walking the rest of the batch on a dead context: the candidates it never judged are counted as `unreached` (on `AutoRequeueSweepResult`, the `reconciler.auto_requeue_sweep` row, and `auto_requeue_unreached` on the `reconciler.escalation_sweep` row), no `auto_requeue_failed` row is written for them, they are not parked on the 15-minute recheck cooldown, and the sweep returns the context error so the escalation sweep records outcome `timeout` (not `ok`) and the escalation-sweep timeout counter ticks. A genuine per-item failure still writes `reconciler.auto_requeue_failed`, now with `stage: lookup` (the run lookup failed; no requeue was attempted) or `stage: transition` (the item was eligible and the escalated→queued commit failed). Before 2026-09-08 a starved boot pass appended 16 phantom `auto_requeue_failed` rows for items it never looked at — all of which then died on the same expired context — and reported outcome `ok`.
 
 ### Spawn-transport breaker (`spawn_breaker`)
 
@@ -613,45 +685,6 @@ Ordering note: the section sits above the `.loom/00-index.md` excerpt. Brief
 sections truncate tail-first at `MaxBytes`, and under pressure the structured
 list of open flakes is worth more than the prose planning index.
 
-### One-time stale audit-digest cleanup
-
-`scripts/bulk_close_audit_advisories.sh` is the operator-only cleanup for old
-rolling audit-advisory digests. It is not scheduled or wired into Mills. The
-operator needs `glab`, `jq`, GitLab authentication with permission to update
-issues in the target project, and the exact GitLab username used by the Mills
-automation that created the digests.
-
-Selection is deliberately narrow. An issue must be open, carry the canonical
-`audit-digest` label, have the exact daily digest title and matching body marker,
-be authored by the supplied automation username, and have a UTC period strictly
-older than `--before` (today by default). Current digests, legacy per-finding
-`audit-followup` issues, human-authored issues, and malformed or mismatched
-digests are excluded. Selector strings come from `pkg/mills/audit/audit.go`.
-
-Run and review the non-mutating default first:
-
-```bash
-scripts/bulk_close_audit_advisories.sh \
-  --repo services/loom-core \
-  --author <mills-bot-gitlab-username> \
-  --before 2026-08-06
-```
-
-Verify every `WOULD_CLOSE` line. Then repeat the identical command with
-`--execute`. The script fetches every page before the first update, prints a
-`CLOSED` line with the IID and URL for each mutation, and stops loudly on API
-errors. If an update fails partway through, retain the output, fix the upstream
-problem, and rerun: already-closed issues are absent from the open-issue query,
-so the operation is idempotent. A successful repeat reports zero selections.
-
-After execution, rerun without `--execute` and confirm zero selections; also
-inspect the GitLab closed-issue list for the printed IIDs. To roll back, reopen
-exactly those IIDs from the recorded `CLOSED` lines, for example:
-
-```bash
-glab api -X PUT projects/services%2Floom-core/issues/<iid> -f state_event=reopen
-```
-
 Policy (Mills ConfigMap):
 
 ```yaml
@@ -669,6 +702,36 @@ paired with a `loom.flexinfer.ai/policy-checksum` bump on
 `platform/gitops/k3s/mills/deployment.yaml` — fsnotify misses the Kubernetes
 `..data` symlink swap, so the operator will not otherwise pick it up.
 
+### One-time stale audit-digest cleanup
+
+`scripts/close-stale-audit-advisories.sh` is the canonical operator-only
+cleanup for old rolling audit-advisory digests. (The near-duplicate
+`audit-advisory-sweep.sh`, `bulk_close_audit_advisories.sh`, and
+`close_stale_audit_advisories.sh` variants that earlier council deliveries
+accumulated are removed.) It is not scheduled or wired into Mills, and it is
+dry-run by default: `--execute` first applies the rollback label from
+`pkg/mills/audit/advisory.go` to each selected issue and only then closes it,
+so no issue can be closed without its recovery marker. Selection identity —
+digest label, dated title, body marker, bot author, staleness window — is read
+from the producer contract in `pkg/mills/audit/audit.go` and
+`pkg/mills/audit/advisory.go`, so the closer cannot drift from the digests
+Mills actually writes.
+
+The full triage, dry-run review, execution, verification, and label-based
+rollback procedure is `docs/runbook-audit-advisory-bulk-close.md`. The Go
+`loom audit-advisory-sweep` subcommand is a separate API-token operator
+surface, documented in `docs/runbook-audit-advisory-sweep.md`.
+
+Approved sweep reports can be executed through the audit package's explicit
+second-phase API. Execution fails closed unless a named human approval matches
+the report identifier. Immediately before each mutation it fetches the current
+issue, confirms that the issue remains an open audit digest allowlisted by the
+report, and refuses issues updated within (or exactly at the edge of) the prior
+24 hours. It posts a closing comment containing the sweep identifier before
+closing. The first comment or close failure stops the batch and returns the
+successfully closed prefix; already-closed members are skipped on retry. The
+ordinary sweep remains mutation-free unless its legacy apply mode is selected.
+
 ### Brief sources
 
 Each Council run assembles a deterministic brief, scoped to ≤16k tokens:
@@ -684,6 +747,13 @@ Each Council run assembles a deterministic brief, scoped to ≤16k tokens:
 9. Current KPI snapshot (`kpi_snapshots` latest row).
 10. Cross-run findings (Eval Loop C) — most recent contradictions or stale plans.
 11. Factory exhaust — open `flaky-test` / `audit-digest` issues the mill filed against itself (see "Factory exhaust as demand").
+
+The GitLab issue importer can poll an explicit fail-closed repository allowlist
+through `intake.gitlab.projects`. The operator always checks its home project
+first; an omitted or empty list retains the legacy home-only behavior. Imported
+issues from another repository carry that repository in `TargetProject`, while
+home-project issues keep the field empty for backward-compatible routing. A
+listing failure in one repository is logged and does not block the others.
 
 The brief is wrapped with a fixed system prompt (in `pkg/mills/council/prompts/`); reviewers receive a lens-specific addendum; the editor receives the full brief plus reviewer outputs as tool-result content.
 
@@ -703,13 +773,15 @@ plan_slice → research → implement → tests → pr_self_review → mr → ci
 | `research` | weaver (FlexInfer) | Domain-bounded subagent; populates context. |
 | `implement` | spawn + worktree | Allocates a per-DAG worktree via `agent_worktree_allocate`; commits with conventional format. |
 | `tests` | `devbox_quality_gate` MCP tool | Auto-detects language; fmt → lint → test. |
-| `pr_self_review` | spawn (Claude/Codex) | Pre-MR self-review per `mcp/skills/pr-self-review`. |
+| `pr_self_review` | spawn (Claude/Codex) | Pre-MR self-review per `mcp/skills/pr-self-review`. May push fixes; a moved head is re-tested before `mr` (`tested_head`). |
 | `mr` | mcp-gitlab | Opens MR; links backlog issue. |
 | `ci_watch` | mcp-gitlab | Polls CI to terminal state; fix-and-retry on red (`ci-failure-recovery` skill). |
 | `merge` | mcp-gitlab | Auto-merge if policy allows (label + path policy). |
 | `cleanup` | mcp-gitlab + mcp-git | Delete remote branch, release worktree, delete local branch. |
 
 Fan-out: when the council sidecar marks slices as parallel, the runner fans out one sub-run per slice (each with its own worktree); the integrator merges sub-run branches in dependency order. See `pkg/mills/pipeline/integrator.go`.
+
+For `ci_watch`, pipeline selection is deterministic: Mills prefers the exact-SHA push pipeline, falls back immediately to the exact MR IID's `merge_request_event` pipeline at `refs/merge-requests/<iid>/head`, and reports a terminal configuration error only when neither appears within the bounded lookup window. The same successful MR-event pipeline is valid merge authorization, so MR-pipeline-only projects do not require an API-created branch pipeline.
 
 Escalation: per-issue retry cap from `policy.pipeline.retry.max_attempts` (default 3). On exceed, the escalator opens a GitLab issue with the failure record (stage stack, last 200 lines of worker output, gate verdicts, total cost), creates an `agent-context` handoff, and transitions the canonical row to `escalated`.
 
@@ -749,15 +821,26 @@ Gates are evaluated between every stage transition. Pure-Go gates run inline; LL
 |---|---|---|
 | `diff_size` | `pkg/mills/gates/diff_size.go` | Diff line count vs. policy threshold. |
 | `scope` | `pkg/mills/gates/scope.go` | Files touched fall inside the sidecar slice's declared scope. |
-| `path_policy` | `pkg/mills/gates/path_policy.go` | None of the touched paths match `policy.pipeline.protected_paths`; protected paths force human review. |
+| `path_policy` | `pkg/mills/gates/path_policy.go` | None of the touched paths match the resolved protected-path policy: `policy.pipeline.protected_paths_per_repo` replaces the global list for its target, known targets without a replacement inherit the global list, and unknown foreign targets fail closed. Undeclared protected touches force human review. |
 | `secret_scan` | `pkg/mills/gates/secret_scan.go` | Heuristic regex scan for tokens/keys/PEMs in the diff. |
 | `commit_format` | `pkg/mills/gates/commit_format.go` | Conventional Commits header check. |
 | `docs_guardrail` | `pkg/mills/gates/docs_guardrail.go` | Mirrors CI `scripts/ci/check_docs_guardrails.sh` locally: a code-facing change (`cmd/`, `internal/`, `pkg/`, `scripts/`, `Makefile`, `go.mod`/`go.sum`, `.gitlab-ci.yml`, `.github/workflows/`) with no doc update (`README.md`/`CHANGELOG.md`/`ROADMAP.md`/`AGENTS.md`/`docs/`) fails **retryably** so the retry adds a CHANGELOG entry — instead of opening an MR that fails `guardrails:docs-cli` at ci_watch. Excludes tests/generated artifacts (`*_test.go`, `/testdata/`, `*_golden.*`, `/dist/`, `*_mock.go`, …); `[skip-docs-check]` in a commit message opts out. |
 | `spec_conformance` | `pkg/mills/gates/spec_conformance.go` | LLM-judged: diff implements the slice as specified. FlexInfer only. |
 | `pr_self_review_gate` | `pkg/mills/gates/pr_self_review_gate.go` | LLM-judged: PR matches `pr_self_review_v1` rubric. FlexInfer only. |
+| `tested_head` | `pkg/mills/gates/tested_head.go` | `post_review_gate`, evaluated before the judges: the review's resulting branch head equals the `tested_sha` the tests stage verified. A mismatch re-dispatches `tests` for the review head (no implement or review respawn); an unresolved side is an advisory skip. |
 | `regression` | `pkg/mills/gates/regression.go` | Post-merge: subscribes to Alertmanager webhook; correlates alert bursts with merges in last 30 minutes. |
 
+Per-repository path policy is the rollout precondition for the operator-approved-in-principle `libs/` token grant. Do not enable that grant until this resolver is deployed: target-relative replacement is what prevents loom-core-shaped rules from mis-governing a foreign `libs/` repository.
+
 Each verdict is persisted to `gate_outcomes` with `pass`/`fail`/`skip` and a `reasons[]` array. A `fail` halts the run at the current stage; the reconciler retries (with cooldown) up to `policy.pipeline.retry.max_attempts`.
+
+Each LLM-judged gate can also carry a **shadow judge** (`FLEXINFER_SHADOW_JUDGE_MODEL`):
+a second, local model graded on the same rubric and diff, recorded as a `judge.verdict`
+event with `role: shadow` beside the primary's `role: primary` (and the tiebreaker's
+`role: tiebreaker` on dissent). The shadow never decides — it exists so
+`GET /api/mills/judge-calibration` and `mills_judge_calibration_discrimination{role=...}`
+can say whether a candidate local judge separates merged from escalated work as well as
+the frontier primary before anyone flips the primary.
 
 Structured FlexInfer judges send `chat_template_kwargs.enable_thinking=false` so
 their bounded completion budget is reserved for the required JSON verdict. Council
@@ -783,7 +866,7 @@ Authoritative source: `cmd/loom-mills-operator/handlers_*.go`. All mutating endp
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/mills/status` | Quick state summary. |
+| GET | `/api/mills/status` | Quick state summary (`queue_depth`, `queue_held_human`, active runs, budget, health gates). |
 | GET | `/api/mills/wiring` | Resolved model-wiring snapshot: judge/weaver/council/per-stage backends + models the operator resolved at startup (read-only, no auth, no secrets). |
 | GET | `/api/mills/safety/quiescence` | Fail-closed snapshot of durable and in-memory work before maintenance or fault injection. |
 | POST | `/api/mills/safety/crash-lease` | Acquire a short, target-bound admission fence after proving one canary is the sole activity (admin). |
@@ -837,6 +920,30 @@ config. Cloudflare headers are omitted for loopback targets.
 
 ## Telemetry
 
+### Advisory auto-remediation
+
+The health plane polls failed `security:govulncheck` jobs and parses the JSON
+stream into an advisory, module, and minimum fixed version. Identity is the
+SHA-256 digest of those three fields, so repeated ticks cannot create duplicate
+work. Only this named job is actionable; other main-red failures remain health
+signals.
+
+Renovate-first capability decision (2026-08-31): the workspace image used for
+this slice has no `renovate` executable or pinned Renovate runtime, and the
+repository's `renovate.json` contains only its schema. Consequently neither
+`osvVulnerabilityAlerts` nor `vulnerabilityAlerts` can be validated against the
+deployed version or proven in a dry run. S5 therefore leaves Renovate config
+unchanged and uses the narrow template fallback: one P0 backlog item carrying
+the `remediation` label. When a pinned runtime is deployed, enable the
+`RenovateEnabled` capability only after its validator accepts the option and a
+dry run demonstrates a module MR for the captured GO-2026-6303 report. In that
+mode the tick matches the module and fixed version in an open Renovate MR and
+arms auto-merge with the observed head SHA.
+
+Both paths are digest-only events. They do not page; paging remains restricted
+to main red for at least 90 minutes together with north-star starvation for at
+least 36 hours.
+
 Every Prometheus metric registered by the operator is in `pkg/mills/metrics.go`. Dashboards live at `platform/gitops/monitoring/dashboards/mills.json`. Headline KPIs:
 
 - `sum(increase(mills_pipeline_cost_usd_total[30d])) / sum(increase(mills_pipeline_runs_total{state="done"}[30d]))` — cost per merged change.
@@ -849,6 +956,16 @@ Every Prometheus metric registered by the operator is in `pkg/mills/metrics.go`.
 - `mills_autonomous_merges_real{window="1d"}` — real-work north star with heartbeat canaries removed.
 - Council ROI from Eval Loop B (in `eval_scores`, surfaced via HUD).
 
+## Operator boot order
+
+Every long-running loop used to fire its first pass in the same few milliseconds after `loom-mills-operator booting`. On a cold page cache (every Recreate rollout) the single SQLite store then served the report-rollup warm-up (~30s of event-window scans: overseers alone 16s), the reconciler's boot tick with all four housekeeping sweeps due, the escalation sweep and the intake ticks at once, and the loops with the shortest budgets lost — the 2026-09-07/08 boot bursts (`scheduler: initial tick failed … context deadline exceeded`, 17× `reconciler: append event failed`). The boot is now ordered (`cmd/loom-mills-operator/boot_order.go`, `pkg/mills.BootPhase`):
+
+1. Listeners, the minute/hour pollers and the report-rollup warm-up start immediately. The warm-up is the widest read the operator performs, so everything after it reads a warm cache. Its completion releases the `report_rollup_warmup` boot phase (log: `boot phase released phase=report_rollup_warmup elapsed=…`).
+2. The reconciler's boot tick and the intake loops (GitLab importer, plan-slice emitter, take-up, canary GC) start once that phase is released (wait capped at 90s). The boot tick carries only the control law — dispatch pickup, terminal sync, queue admission, in-flight re-drive; the regression, signature-mining, learning-signal and retention sweeps are staggered onto the four ticks that follow (`Scheduler.HousekeepingStagger`, one per tick interval, cheapest first and the DELETE-heavy retention sweep last) instead of all falling due on the boot tick. The tick's return releases `reconciler_boot_tick`.
+3. The escalation sweeper's first pass (ghost sparks, auto-requeue, vaccine attention) starts once the boot tick has returned (wait capped at 150s).
+
+The waits are budgets, not dependencies: a wedged phase logs `boot phase not released within budget; proceeding without it` and the waiter continues. Independently of the ordering, the event ledger's INSERTs (`store.EventDAO.Append` / `AppendOnceBySubjectKind`) ride a dedicated single-connection write handle so they never queue behind the read pool's long scans, and the reconciler's bookkeeping rows are written under their own 5s budget detached from the sweep context — a slow read can no longer cost the ledger the row that would have explained it.
+
 ## Common operator scenarios
 
 - **Trigger a council run on demand.** `loom mills council run` (admin). Outputs paths to new artifacts and the sidecar. Useful when a roadmap change has just landed and you don't want to wait for the daily cron.
@@ -859,6 +976,10 @@ Every Prometheus metric registered by the operator is in `pkg/mills/metrics.go`.
 - **Investigate eval drift.** HUD `Mills` view → `Eval` panel; sort by score ascending. Cross-reference subjects in `pipeline_runs`/`council_runs` via the link.
 
 ## External-dependency incidents and S2 overseer soak
+
+For the ClickHouse, Longhorn, LiteLLM, and Postgres agent response procedure—
+including observed signatures, fail-closed containment, ownership boundaries,
+and bounded recovery evidence—see [External-dependency incident runbook](runbook-external-incidents.md).
 
 Treat a failure as `external_dependency_incident` only when its evidence
 attributes a recognized failure pattern to a dependency outside this repository.
@@ -911,15 +1032,33 @@ use.
 
 ### S2 overseer soak exit criteria (machine-checkable)
 
-Use the promotion-report endpoint as the authoritative evidence artifact:
+The canonical contract and operator procedure are in the
+[S2 overseer dry-run soak runbook](mills-staff-s2-soak.md). It defines the
+stable machine-readable thresholds, required evidence window, fail-closed
+response, and the human promotion check; it is the source of truth for whether
+an overseer action class may be proposed for promotion.
+
+The runtime consumer of that decision is `overseer.PromotionGate`, documented
+in [mill-staff-s2-promotion.md](mill-staff-s2-promotion.md): it reads the
+deposited soak-complete artifact (the shift report's `generated_at` plus
+`soak_progress` projection) and returns `active` only when
+`SoakProgress.CompleteAt` accepts it, otherwise `dry-run` with a logged reason.
+Nothing consults the gate live yet; overseer mode still comes from
+`overseers.<agent>.dry_run` in the policy.
+
+### S2 implementation evidence details
+
+These implementation-level checks supply evidence for the canonical contract;
+they do not replace its thresholds or human promotion approval. Use the
+promotion-report endpoint as an authoritative evidence artifact:
 `GET /api/mills/promotion-report?actor=overseer.&window=168h`. Its default
 window is exactly `168h` (seven days); do not substitute an open-ended log
 search. The report is built from append-only `overseer.*` action events and
 contains `window_start`, `window_end`, `total_actions`, `total_dry_run`,
 `total_executed`, per-action `unique_subjects`, and `zero_evidence`.
 
-An S2 overseer soak **passes** only if all conditions below hold for one closed
-`168h` report window:
+The implementation-level evaluator reports a supporting pass only if all
+conditions below hold for one closed `168h` report window:
 
 Every dry-run policy decision must also call `overseer.RecordDryRunDecision`.
 The Mills store persists one append-only record per decision and aggregates it
@@ -948,7 +1087,7 @@ are recorded `.dryrun` actions; a divergence is a reviewed disagreement with
 the approved policy for the same subject and observation, and any committed
 action found inside the dry-run window also counts as a divergence.
 
-The exact S2 thresholds are: elapsed window **≥ 7 whole days**
+The evaluator's implementation thresholds are: elapsed window **≥ 7 whole days**
 (`168h`), dry-run decisions **≥ 1**, would-have-acted decisions **≥ 1**, and
 divergences **= 0**. These constants are respectively
 `S2SoakMinimumDuration`, `S2SoakMinimumDryRunDecisions`,
@@ -998,6 +1137,48 @@ A handoff (or plan-slice) can target a project that has **no GitLab repo yet** �
 
 ## Live queued-proof kill-test
 
+### Pattern Loom stamp identity
+
+Pattern Loom delivery stamps use the normalized `(target_project, pattern_id)`
+tuple as their durable identity. A pattern may therefore be stamped once into
+each target project. Repeating the same tuple does not overwrite the original
+stamp: the API returns `crossrepo.ErrStampCollision`, which callers can detect
+with `errors.Is`. Blank or whitespace-only target projects and pattern IDs are
+rejected before persistence.
+
+For a restart-owned admission proof against an isolated operator, use
+`--mode queued-proof`. The harness refuses a non-empty state directory, starts
+the worker with `LOOM_MILLS_DB_PATH` bound inside that directory, seeds one
+stamped target and two stamped control items, waits until the target admission
+request has been written to the worker and immediately kills it while the
+request is in flight, then restarts the same command and replays the target
+identity:
+
+```bash
+mills-workflow-killtest \
+  --mode queued-proof \
+  --operator-url http://127.0.0.1:18090 \
+  --admin-token "$LOOM_MILLS_ADMIN_TOKEN" \
+  --queued-proof-worker-command './bin/loom-mills-operator --listen 127.0.0.1:18090 --metrics-addr ""' \
+  --queued-proof-state-dir "$(mktemp -d)" \
+  --queued-proof-worker-timeout 30s \
+  --evidence queued-proof-admission.json
+```
+
+The worker command must start a controlled operator, never a shared or
+production instance. The directory is preserved across the one restart and is
+not deleted by the harness, so failed evidence remains inspectable.
+
+The command prints and writes the same JSON verdict. `verdict` is `PASS` only
+when the post-restart store contains exactly one run for `target_id`, both
+control items retain their state and claim version, and the worker restarted
+once. `target_admissions`, `collateral_transitions`, `before`, and `after`
+provide the machine-readable proof. Invalid configuration, malformed or
+contradictory operator evidence, worker failures, duplicate admissions, and
+collateral transitions emit `verdict: FAIL` with a stable `reason_code` and
+exit status 1. This is distinct from `--scenario queued-proof`, which verifies
+an already-collected transition fixture or drives the terminal-MR proof below.
+
 `mills-workflow-killtest` can seed a plan-linked Pattern Loom backlog item and
 prove that the live operator auto-merges a real, non-empty merge request:
 
@@ -1037,6 +1218,50 @@ token. Do not delete it or start fresh after interruption: restart with
 `--queued-proof-resume`. For `EXTERNAL_DEPENDENCY`, preserve the evidence, repair
 or wait for the dependency named in `detail`, then queue a new proof attempt.
 
+## MR-awareness scripted kill-test
+
+`scripts/mills-mr-awareness-killtest.sh` proves restart adoption after a real
+MR has been created. Use only an isolated operator and state directory plus a
+disposable, already-queued backlog item and test GitLab project. The source
+branch must be unique to that backlog item.
+
+```bash
+make build
+export LOOM_MILLS_ADMIN_TOKEN=...
+export GITLAB_TOKEN=...
+export GITLAB_PROJECT=services/loom-core-killtests
+export MILLS_MR_AWARENESS_WORKER_COMMAND='./bin/loom-mills-operator --listen 127.0.0.1:18090 --metrics-addr ""'
+export MILLS_OPERATOR_URL=http://127.0.0.1:18090
+export MILLS_MR_AWARENESS_STATE_DIR=/tmp/loom-mr-awareness-state
+export MILLS_MR_AWARENESS_BACKLOG_ID=KILLTEST-MR-1
+export MILLS_MR_AWARENESS_SOURCE_BRANCH=feat/killtest-mr-1
+export MILLS_MR_AWARENESS_SUMMARY=/tmp/loom-mr-awareness-summary.json
+scripts/mills-mr-awareness-killtest.sh
+```
+
+The binary waits for the canonical run row to contain an MR IID, persists that
+durable boundary, kills the controlled worker, restarts it against the same
+`LOOM_MILLS_DB_PATH`, and verifies the original run resumes at `mr` or a later
+stage. It then lists all GitLab MRs for the recorded source branch and requires
+exactly one with the persisted IID. It never kills based on a sleep or log line.
+
+The summary is the recovery token. Preserve both it and the state directory.
+Repeating the same command adopts `run_id`, `mr_iid`, `mr_project`, and
+`source_branch` from that file and does not call the start endpoint again.
+Malformed or contradictory existing evidence fails closed rather than being
+replaced.
+
+The stable JSON envelope contains `mode`, `verdict`, `passed`, `reason_code`,
+`detail`, `backlog_id`, `run_id`, `mr_project`, `mr_iid`, `mr_url`,
+`source_branch`, `mr_count`, `stage_before_kill`, `stage_after_restart`,
+`worker_restarts`, `recovered`, and `captured_at`. Recovery evidence older than
+24 hours fails closed by default; tune `MILLS_MR_AWARENESS_RECOVERY_MAX_AGE`
+for a deliberately longer live exercise. `PASS` requires preserved run/MR identity,
+a resume stage at or beyond `mr`, and `mr_count: 1`. Malformed or stale recovery
+state, identity mismatch, a second MR, worker start/restart failure, timeout, or
+GitLab failure writes `FAIL` and exits non-zero. The wrapper also writes a
+minimal failure envelope if prerequisites prevent the binary from starting.
+
 ## Mills v2 architecture (shipped)
 
 Mills v2 promotes the flat v1 two-tier (council + pipeline) design into a hierarchical swarm. The list below is the as-of state — every feature has shipped code; default-on flips happen sequentially per Phase 8.3 with a one-week soak between flips. Rollback playbook for any flip: [MILLS_V2_ROLLBACK.md](MILLS_V2_ROLLBACK.md).
@@ -1047,12 +1272,52 @@ Mills v2 promotes the flat v1 two-tier (council + pipeline) design into a hierar
 |---|---|---|---|
 | **Squads** — persistent domain-owning ensembles; backlog items route by path-class confidence with per-squad outcome attribution and working memory | `pkg/mills/squads/`, `cmd/loom-mills-operator/handlers_squads*.go` | `policy.squads.enabled = false` (8.3-1) | 2 |
 | **Adversarial Audit** — independent rubric pool emitting findings on artifacts + merges | `pkg/mills/audit/`, `cmd/loom-mills-operator/handlers_audit*.go` | `policy.audit.enabled = false`; will land `enabled: true, advisory_only: true` (8.3-2) | 3 |
-| **Cross-Repo** atomic merges (loom-core + loom etc.) | `pkg/mills/crossrepo/`, `cmd/loom-mills-operator/handlers_crossrepo*.go` | `policy.cross_repo.enabled = false` (8.3-4, gated on 3 dogfood successes) | 4 |
+| **Cross-Repo** per-item execution — a backlog item carries `TargetProject` and runs through the ordinary single-repo pipeline against that repo | `pkg/mills/pipeline/` (`effectiveProject`), `pkg/mills/reconciler.go`, `pkg/mills/policy.go` | `policy.cross_repo.enabled = false` (two-key gate; see runbook) | 4 |
 | **Council Debate Mode** — multi-round editor/reviewer/moderator | `pkg/mills/council/debate*.go` (Phase 5 slices 5.1–5.3) | `policy.council.debate.enabled.{cron,roadmap,incident}: false` (8.3-3 starts with incident-only) | 5 |
 | **Bounded pipeline Recursion** — `SubrunGuard` with depth/budget/cycle guards + `mills_pipeline_recursion_depth` histogram | `pkg/mills/pipeline/recursion.go`, `cmd/loom-mills-operator/handlers_subrun*.go` | `policy.recursion.enabled = false`; opt-in per ensemble | 6 |
 | **Adaptive Policy** Sunday job — relax/tighten/rotate proposals from kpi_snapshots + eval_scores + audit_findings + gate_outcomes | `pkg/mills/adaptive/`, `cmd/loom-mills-operator/handlers_policy_proposals.go` | `policy.adaptive_policy.enabled = false`; manual-apply only (8.3-5) | 7 |
 | **Cost Preview** estimator — pre-spawn `$X.XX` per backlog item with confidence band | `pkg/mills/budget/estimator.go`, `GET /api/mills/cost-preview?backlog_id=` | always on (read-only) | 7 |
 | **Mobile Mills parity** — companion app KPI cards + in-flight pipeline tree | `apps/loom-companion-ios/Sources/LoomCompanion(Kit)/Mills/` | always on (read-only) | 7 |
+
+### Per-repository execution safety rails
+
+Cross-repository execution can be narrowed per target under
+`pipeline.per_repo_overrides`. Repository keys use the same case-insensitive
+bare-name or bucket-qualified matching as `protected_paths_per_repo`:
+
+```yaml
+pipeline:
+  per_repo_overrides:
+    services/example:
+      auto_merge: false
+      require_human_review: true
+      max_usd_per_run: 2.50
+      max_runs_per_day: 3
+```
+
+These settings are safety rails, not grants. `auto_merge: false` suppresses
+item and label auto-merge intent, while `true` never arms an MR by itself.
+`require_human_review: true` prevents autonomous admission. Budget settings
+narrow the global pipeline limits; `max_runs_per_day` is counted per target on
+UTC calendar days. Omitted repositories retain existing behavior. Roll values
+out one repository at a time after merge; configuration values and defaults
+remain GitOps operations outside the code rollout.
+
+A human-gated hold is observable as a hold, not as a skip. `GET /api/mills/status`
+reports `queue_held_human` beside `queue_depth`: the number of queued items whose
+effective policy (item flag or per-repo override, resolved by
+`Policy.RequiresHumanReview`) requires a human hand-off. A reconciler tick whose
+only unstarted work is human-gated lands in
+`mills_reconciler_ticks_total{outcome="held_human"}`; `outcome="skipped"` is
+reserved for the policy-disabled / autonomy-blocked early returns and genuine
+per-item skips (claim conflicts, the cross-repo gate, workflow-selection holds).
+A queue that sits at `queue_depth=1, queue_held_human=1` with every tick
+`held_human` is waiting on a person, not on the reconciler — the 2026-09-07
+reading of 568/568 "skipped" ticks against a single `require_human_review`
+item was exactly this and looked like a dispatch outage.
+
+KPI snapshots expose `pipeline_merged_by_repo`, including home-repository runs
+whose backlog item has an empty `TargetProject`, for staged-rollout visibility.
 
 ### KPIs the dashboards track
 
@@ -1074,7 +1339,7 @@ Phase 8.1 will run a cluster smoke that exercises all of these against dev k3s; 
 
 - Squads route ≥ 30% of items end-to-end without escalation rate increase.
 - Audit advisory pass rate ≥ 90% on merged work; one critical finding inside the 24h window opens an issue + agent_handoff automatically.
-- Cross-repo runs achieve atomic merge or full revert within 60s of failure injection. Three consecutive successful loom-core+loom dogfood merges before flipping `policy.cross_repo.enabled = true`.
+- Cross-repo execution: a `TargetProject` item lands an MR on a non-home repo without touching the home repo. Proven against a non-home repo 2026-07-05.
 - Council debate at incident trigger reduces post-incident regressions vs. single-pass baseline (measured over a 4-week window).
 - Bounded recursion: depth=1 round-trip lands in HUD; depth-cap + budget-share + cycle-detector all reject on the canonical fixture.
 - Adaptive policy: one fixture proposal applies cleanly via `POST /api/mills/policy/proposals/{id}/apply` and reflects in the live ConfigMap diff after a manual gitops edit.
@@ -1102,3 +1367,241 @@ Phase 8.1 will run a cluster smoke that exercises all of these against dev k3s; 
 - Anthropic multi-agent research: <https://www.anthropic.com/engineering/built-multi-agent-research-system>
 - MCP Streamable HTTP: <https://modelcontextprotocol.io/specification>
 - Flux GitOps: <https://fluxcd.io/flux/concepts/>
+
+## Factory health plane (S1)
+
+The factory health poller is default-off. Enable it in the
+Mills policy with `health.enabled: true`, set `health.project`, and optionally
+set `ref` (default `main`), `poll_interval_seconds` (default 60), and the
+RFC3339 `operator_built_at` used for image-lag measurement. When the section is
+omitted or disabled the operator creates no poller, timer, or GitLab request,
+and the reconciler tick performs none of the queue-gauge reads below — the
+default-off operator is byte-identical to one built before the health plane.
+
+The existing `:9090/metrics` endpoint exposes:
+
+- `mills_main_pipeline_green` and `mills_main_red_duration_seconds`: only
+  terminal `success` and `failed` pipelines change the remembered state. The
+  detector orders pipeline details by `finished_at`; `skipped`, `canceled`,
+  `manual`, running, and pending pipelines never flip it.
+- `mills_operator_image_lag_seconds`: operator build time behind the newest
+  successful main-pipeline commit that changed `pkg/mills/`,
+  `cmd/loom-mills-operator/`, or this document — the maximum commit time
+  across every green Mills-touching pipeline in the scanned window (pipeline
+  finish order is not commit order). The scan reads one page of twenty
+  pipelines per poll and follows up to two more only while the window has not
+  yet produced both a terminal pipeline and a green Mills-touching one; a
+  window with neither keeps the previous observation instead of erasing it.
+- `mills_runs_active` and `mills_runs_capacity`: current non-terminal runs and
+  the configured `budgets.pipeline.max_concurrent_runs` capacity.
+- `mills_oldest_queued_item_age_seconds` and `mills_wedged_dependencies`: queue
+  pressure and queued items with at least one escalated or retired dependency.
+  Each queued item counts once even if several dependencies are terminally bad.
+- `mills_deferrals_total{reason}`, `mills_escalations_total{reason}`, and
+  `mills_pipeline_escalation_class_total{class}`: successful durable event
+  writes, with every bounded label initialized at zero on startup. The two
+  escalation dimensions preserve the existing reason/class metric contract.
+
+### Base-red admission hold (S4)
+
+The optional `health.base_red` policy uses the S1 observation at the shared
+`Reconciler.tryStart` admission door. When main has remained red beyond the
+configured threshold, code-producing backlog items defer before any start
+claim with outcome `base_red`; manual starts, dependency releases,
+auto-requeues, and shepherd relaunches therefore inherit the same decision.
+Items labeled `ci-fix` or `remediation` are exempt. A red-to-green observation
+kicks the existing scheduler, so held work is admitted on the next tick.
+
+```yaml
+health:
+  enabled: true
+  project: services/loom-core
+  base_red:
+    enabled: true
+    mode: dry-log             # dry-log or enforce
+    threshold_minutes: 90     # 90 when omitted
+```
+
+Roll out with `mode: dry-log` for a soak week: matching decisions are logged
+but work starts and `mills_deferrals_total` does not increment. Review that
+evidence and exemption use before changing the GitOps policy to `mode:
+enforce`. Enforced holds increment
+`mills_deferrals_total{reason="base_red"}`. Disabling or omitting `base_red`
+restores the prior admission results and event stream. The 90-minute default
+matches one leg of the paging policy; a mobile PAGE still requires both
+`main_red>=90m` and north-star starvation `>=36h`, while all other health
+signals remain digest-only.
+
+### Watch-to-notify and paging (S2)
+
+Authenticated operators can create durable watches for backlog items and
+pipeline runs through `POST /api/mills/watches` and filter them through
+`GET /api/mills/watches`. A reconciler sweep resolves a watch when its exact
+terminal condition is observed or its bounded TTL expires. Resolution and its
+HUD event commit atomically, so repeated or concurrent sweeps produce one
+digest event. Watch resolution and escalation `{class,cost}` events stay on
+the non-push HUD event feed until flightdeck ingest is available.
+
+### Flightdeck lifecycle export
+
+Mills can publish pipeline lifecycle events to Flightdeck's authenticated
+`POST /api/v1/events/batch` ingest contract. It is disabled by default:
+
+```yaml
+health:
+  flightdeck:
+    enabled: true
+    endpoint: https://flightdeck.example.com
+    token: ${FLIGHTDECK_INGEST_TOKEN}
+    timeout_seconds: 2
+    queue_size: 128
+```
+
+The operator emits `factory.run.started`, `factory.stage.transition`, and
+`factory.run.terminal` envelopes. Each carries `run_id`, `backlog_id`, stage,
+and attempt; terminal events also carry the outcome class and cumulative USD
+cost. Spawn requests independently carry `LOOM_MILLS_RUN_ID`,
+`LOOM_MILLS_BACKLOG_ID`, `LOOM_MILLS_STAGE`, and `LOOM_MILLS_ATTEMPT`.
+
+Export is fail-open. Calls enqueue without waiting for HTTP; a full bounded
+queue, timeout, non-2xx response, or exhausted retry is dropped and increments
+`loom_mills_flightdeck_delivery_errors_total`. These failures never alter run
+state. Roll back by removing or disabling `health.flightdeck`; the disabled
+path constructs no client, goroutine, callback, request, or metric.
+
+For a flagged-on smoke test, run one backlog item and query Flightdeck's
+authenticated `/api/v2/board` JSON for its Mills run/backlog correlation keys.
+
+Only two factory-health classes page mobile devices:
+
+- known-red `main` continuously reaching 90 minutes;
+- a known `autonomous_merges_24h == 0` observation continuously reaching 36
+  hours.
+
+Each signal has independent state and fires once per unhealthy window. A known
+healthy observation re-arms it; an unknown observation breaks continuous time
+but is not recovery and therefore cannot re-page an already-fired window.
+State is process-local, so an operator restart during an unhealthy window can
+page again after the threshold is observed anew. Other health and watch events
+are digest-only and never enter mobile push. This routing does not add or
+rename an attention lane: the mobile contract remains exactly
+`{agent,namespace,merge,conflict}`.
+
+### Audit digest dry-run census
+
+Run `loom audit-advisory-sweep --dry-run --project services/loom-core` to
+report every open issue labeled `audit-digest`, including issues too young for
+closure. Each row includes its age and `recently_modified` flag. Modification
+exactly 24 hours ago counts as recent; missing or invalid modification timestamps
+also flag the issue conservatively. The selected count remains the narrower stale
+bot-digest closure set. Dry runs perform no mutations; `--dry-run` and
+`--apply` cannot be combined.
+
+Before opening a daily digest, the generator compares its body with the previous
+UTC day's digest (open or closed), ignoring only the generated header date, recording timestamp, and
+period marker. Identical bodies suppress filing; changed finding content remains
+significant. Missing previous digests or lookup failures allow filing.
+
+After a new day's digest is opened, the generator supersedes the newest
+still-open prior digest: it posts a `superseded by #<new>` note (skipped when
+that exact note already exists, so a retried close never duplicates it) and
+closes that one issue. Older open digests are deliberately left alone — the
+pre-supersession backlog, or a stray left by a failed close, is drained only by
+the confirm-gated `loom audit-advisory-sweep` — so an unattended filing can
+never mass-close issues. Supersession is fail-open: an error is logged and the
+finding is still recorded.
+
+### OpenRouter editor and rubric judge
+
+| Backend | API | Credential | Billing |
+| --- | --- | --- | --- |
+| `openrouter` | OpenRouter Chat Completions | `OPENROUTER_API_KEY` | `api` |
+
+Use `backend: openrouter` for the council editor, `editor_fallback`, spinning-room
+frames, room/frame fallbacks, and gate tiebreaker primary or fallback hops. Supply
+an explicit native OpenRouter model ID, such as `anthropic/claude-sonnet-5`,
+`openai/gpt-5.5`, or `moonshotai/kimi-k3`. Requests preserve the configured ID.
+Missing credentials skip the remote hop; local fallback keeps its own model.
+
+`OPENROUTER_BASE_URL` optionally replaces `https://openrouter.ai/api/v1`.
+`OPENROUTER_HTTP_REFERER` and `OPENROUTER_X_TITLE` optionally set `HTTP-Referer`
+and `X-Title`. Provisioning `loom-mills-openrouter/api-key` into the operator's
+`OPENROUTER_API_KEY` is a separate platform/gitops deployment change.
+
+```yaml
+council:
+  ensemble:
+    editor: {backend: anthropic, model: claude-sonnet-5}
+    editor_fallback: {backend: openrouter, model: moonshotai/kimi-k3}
+gates:
+  tiebreaker:
+    backend: openai
+    model: gpt-5.5
+    fallbacks:
+      - {backend: openrouter, model: anthropic/claude-sonnet-5}
+      - {backend: flexinfer} # resolves the local judge model
+```
+
+Price direct requests with `budgets.model_prices` entries keyed by the exact
+native model ID and `provider: openrouter`. Explicit `or/` rows continue to price
+gateway aliases; no short alias is guessed to be a native provider/model ID.
+Cached-input rates apply to reported cached tokens. Unknown models remain
+unpriced. OpenRouter has an independent breaker: 402 is billing, 401/403 auth,
+429 rate limit, and 5xx overload. Billing/auth rejections with no usage count as
+known zero spend; uncertain failures retain the unpriced marker.
+
+OpenRouter may route to Anthropic upstream: this is a **billing-path fallback**,
+not a guarantee of model diversity. Existing default fallback chains are unchanged.
+
+### Claude spawn authentication fallback
+
+Claude spawns classify the terminal stream-json `result` on stdout, including
+`is_error=true` with process exit 0. A successful result supersedes earlier API
+retry diagnostics. Unrecognized failures and API authentication errors (`401`,
+invalid API key without an OAuth/login diagnostic) never trigger rotation.
+
+`SPAWN_CLAUDE_AUTH_FALLBACK` selects `oauth-then-api` (default), `api-then-oauth`,
+or `none`. Unknown policy values disable fallback. OAuth rejection or quota
+failures try each healthy configured OAuth account at most once, then allow one
+cross-mode relaunch to the API key. With API-first policy, insufficient API
+credit allows one relaunch onto a healthy OAuth account. No further auth retries
+are allowed after crossing modes. The replacement pod receives exactly the
+selected credential: `CLAUDE_CODE_OAUTH_TOKEN` from `cluster-agent-auth`, or
+`ANTHROPIC_API_KEY` from `cluster-agent-api-keys`. The old
+`LOOM_SPAWN_CLAUDE_API_KEY_FALLBACK` switch no longer enables implicit CLI fallback
+in the spawn lifecycle. Missing alternative secrets prevent retry on backends
+that expose secret resolution.
+
+`SPAWN_CLAUDE_API_FALLBACK_MAX_PER_DAY` limits cross-mode reservations across the
+HUD ledger (default **6**, UTC calendar day). Zero, negative, or malformed values
+disable cross-mode reservations. Same-mode account rotation does not spend this
+cap. Reservations are persisted before runtime replacement, survive HUD
+restarts, and remain counted if launching the replacement fails. Shared
+ConfigMap stores enforce the cap inside their resource-version transaction.
+Current-day reservations and active exclusions are protected from retention,
+pressure pruning, and manual spawn deletion. A persistence error fails closed.
+
+OAuth rejection excludes that account for **10 minutes**. A quota failure
+excludes it until the printed reset time and timezone; timezone data is embedded
+in the HUD binary. Without a usable reset, the configured weekly window applies
+(or seven days for an unannotated account). To clear older exclusions after
+repairing credentials, set `SPAWN_CLAUDE_AUTH_CLEAR_BEFORE` to the repair's RFC3339
+UTC timestamp and restart the HUD. Failures occurring after that timestamp still
+exclude the account. This does not clear the daily cap or revisit accounts
+already attempted by the same spawn.
+
+The state exposes `auth_outcome`, `auth_failures`, `auth_fallback_at`, and
+`auth_fallback_from`. `auth_retry_pending` makes interrupted runtime replacement
+recoverable. A cross-mode reservation emits `claude spawn auth fallback` with
+`from`, `to`, and `reason`, and increments
+`hud_spawn_auth_fallback_total{from,to,reason}`. Same-mode rotations emit neither.
+
+Regression fixtures in `internal/hud/testdata/claude-auth-*.jsonl` are stdout
+captured from **Claude Code 2.1.220**, with dummy credentials against a loopback
+HTTP server, using `claude -p 'Say hello' --output-format stream-json --verbose
+--max-turns 1 --tools ''` with `CLAUDE_CODE_MAX_RETRIES=0` for the API-401 capture. The upstream responses were mocked: OAuth rejection
+(401 authentication_error), quota with reset (400 invalid_request_error), API
+credit balance (400 invalid_request_error), and API key rejection (401 authentication_error). These are CLI-generated streams, not production incident
+captures; only temporary working-directory paths were sanitized. Captured
+processes exited 1; the same bytes are also tested with exit 0 to cover the
+previously observed clean-exit failure shape.

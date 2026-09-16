@@ -2,7 +2,6 @@ package main
 
 import (
 	"net/http"
-	"sort"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/overseer"
@@ -48,48 +47,15 @@ type overseersStatusResponse struct {
 	Enabled       bool                      `json:"enabled"` // master gate
 	Agents        []overseerAgentView       `json:"agents"`
 	RecentActions map[string][]*store.Event `json:"recent_actions"`
+	// Soak is the S2 dry-run promotion verdict over the last seven complete
+	// UTC days (persisted decisions, not the Prometheus counter).
+	Soak *overseer.SoakMetrics `json:"soak,omitempty"`
 }
 
 // handleOverseersStatus is the open read: policy gates + harness snapshots +
 // each agent's 24h audit trail.
 func (o *operator) handleOverseersStatus(w http.ResponseWriter, r *http.Request) {
-	pol := o.policy.Current()
-	resp := overseersStatusResponse{
-		Agents:        make([]overseerAgentView, 0, len(o.overseers)),
-		RecentActions: make(map[string][]*store.Event, len(o.overseers)),
-	}
-	if pol != nil {
-		resp.Enabled = pol.Overseers.Enabled
-	}
-	names := make([]string, 0, len(o.overseers))
-	for name := range o.overseers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	since := time.Now().UTC().Add(-overseerRecentActionsWindow)
-	for _, name := range names {
-		entry := o.overseers[name]
-		view := overseerAgentView{AgentStatus: entry.Harness.Status()}
-		if entry.Enabled != nil {
-			view.Enabled = entry.Enabled()
-		}
-		if entry.DryRun != nil {
-			view.DryRun = entry.DryRun()
-		}
-		if entry.Suppression != nil {
-			view.Suppression = entry.Suppression()
-		}
-		resp.Agents = append(resp.Agents, view)
-		if o.store != nil && o.store.Events != nil {
-			events, err := o.store.Events.ListByActorSince(r.Context(), "overseer."+name, since, overseerRecentActionsLimit)
-			if err != nil {
-				o.logger.Warn("overseers status: recent actions read failed", "agent", name, "error", err)
-				continue
-			}
-			resp.RecentActions[name] = events
-		}
-	}
-	writeJSON(w, http.StatusOK, resp)
+	o.writeReportRollup(w, r, "overseers", overseerRecentActionsWindow, "")
 }
 
 // overseerFromPath resolves the {agent} path segment or writes a 404.

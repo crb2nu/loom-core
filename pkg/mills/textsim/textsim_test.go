@@ -1,6 +1,11 @@
 package textsim
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
+
+var _ Scorer = JaccardScorer{}
 
 func TestNormalizeTitleTokens(t *testing.T) {
 	cases := []struct {
@@ -49,6 +54,13 @@ func TestTitleJaccard(t *testing.T) {
 	}
 	if got := TitleJaccard("Add the HUD panel", "add HUD panel"); got != 1.0 {
 		t.Errorf("stopword-only difference = %v want 1.0", got)
+	}
+}
+
+func TestJaccardScorer(t *testing.T) {
+	got := (JaccardScorer{}).Score(context.Background(), "feat(mills): Add the HUD panel", "add HUD panel")
+	if got.Lexical != 1 || got.Combined != 1 || got.Semantic != 0 || got.SemanticAvailable || got.Fallback {
+		t.Fatalf("Score() = %+v, want lexical-only score without fallback", got)
 	}
 }
 

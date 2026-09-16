@@ -2,13 +2,15 @@ package policy
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"gopkg.in/yaml.v3"
+
+	"github.com/crb2nu/loom/internal/loomconcurrency"
 )
 
 func TestPipelineConcurrencyPolicy(t *testing.T) {
@@ -22,43 +24,76 @@ func TestPipelineConcurrencyPolicy(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "absent", want: loomconcurrency.DefaultLimit},
+		{name: "minimum", limit: intPointer(MinConcurrency), want: MinConcurrency},
 		{name: "explicit", limit: intPointer(3), want: 3},
+		{name: "maximum", limit: intPointer(MaxConcurrency), want: MaxConcurrency},
 		{name: "zero", limit: intPointer(0), want: 0, wantErr: true},
 		{name: "negative", limit: intPointer(-1), want: -1, wantErr: true},
-		{name: "overflow", limit: intPointer(loomconcurrency.MaxLimit + 1), want: loomconcurrency.MaxLimit + 1, wantErr: true},
+		{name: "overflow", limit: intPointer(MaxConcurrency + 1), want: MaxConcurrency + 1, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := PipelineConcurrencyPolicy{MaxConcurrency: tc.limit}
 			if got := p.EffectiveLimit(); got != tc.want {
 				t.Fatalf("EffectiveLimit() = %d, want %d", got, tc.want)
 			}
-			err := p.Validate()
+			got, err := p.ResolveLimit()
 			if gotErr := err != nil; gotErr != tc.wantErr {
-				t.Fatalf("Validate() error = %v, want error %v", err, tc.wantErr)
+				t.Fatalf("ResolveLimit() error = %v, want error %v", err, tc.wantErr)
 			}
 			if tc.wantErr && !strings.Contains(err.Error(), "max_concurrency ") {
-				t.Fatalf("Validate() error = %q, want field and rejected value", err)
+				t.Fatalf("ResolveLimit() error = %q, want field and rejected value", err)
+			}
+			if tc.wantErr {
+				var validationErr *ConcurrencyPolicyValidationError
+				if !errors.As(err, &validationErr) {
+					t.Fatalf("ResolveLimit() error = %T, want *ConcurrencyPolicyValidationError", err)
+				}
+				if len(validationErr.Fields) != 1 || validationErr.Fields[0] != "max_concurrency" ||
+					validationErr.Value != tc.want || validationErr.Min != MinConcurrency || validationErr.Max != MaxConcurrency {
+					t.Fatalf("validation error = %#v, want field/value and bounds [%d, %d]", validationErr, MinConcurrency, MaxConcurrency)
+				}
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Fatalf("ResolveLimit() = %d, want %d", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestPipelineConcurrencyPolicyDecodesMaxConcurrency(t *testing.T) {
+func TestPipelineConcurrencyPolicyDecodeAndResolve(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		data   []byte
-		decode func([]byte, any) error
+		name    string
+		data    string
+		decode  func([]byte, any) error
+		want    int
+		wantErr bool
 	}{
-		{name: "json", data: []byte(`{"max_concurrency":3}`), decode: json.Unmarshal},
-		{name: "yaml", data: []byte("max_concurrency: 3\n"), decode: yaml.Unmarshal},
+		{name: "json default", data: `{}`, decode: json.Unmarshal, want: DefaultPipelineConcurrencyLimit},
+		{name: "yaml default", data: `{}`, decode: yaml.Unmarshal, want: DefaultPipelineConcurrencyLimit},
+		{name: "json canonical", data: `{"max_concurrent_pipelines":3}`, decode: json.Unmarshal, want: 3},
+		{name: "yaml canonical", data: "max_concurrent_pipelines: 3\n", decode: yaml.Unmarshal, want: 3},
+		{name: "json compatibility", data: `{"max_concurrency":4}`, decode: json.Unmarshal, want: 4},
+		{name: "yaml compatibility", data: "max_concurrency: 4\n", decode: yaml.Unmarshal, want: 4},
+		{name: "json zero", data: `{"max_concurrent_pipelines":0}`, decode: json.Unmarshal, wantErr: true},
+		{name: "yaml zero", data: "max_concurrent_pipelines: 0\n", decode: yaml.Unmarshal, wantErr: true},
+		{name: "json negative", data: `{"max_concurrent_pipelines":-1}`, decode: json.Unmarshal, wantErr: true},
+		{name: "yaml negative", data: "max_concurrent_pipelines: -1\n", decode: yaml.Unmarshal, wantErr: true},
+		{name: "json overflow", data: `{"max_concurrent_pipelines":1000000}`, decode: json.Unmarshal, wantErr: true},
+		{name: "yaml overflow", data: "max_concurrent_pipelines: 1000000\n", decode: yaml.Unmarshal, wantErr: true},
+		{name: "json conflict", data: `{"max_concurrent_pipelines":3,"max_concurrency":4}`, decode: json.Unmarshal, wantErr: true},
+		{name: "yaml conflict", data: "max_concurrent_pipelines: 3\nmax_concurrency: 4\n", decode: yaml.Unmarshal, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var configured PipelineConcurrencyPolicy
-			if err := tc.decode(tc.data, &configured); err != nil {
+			if err := tc.decode([]byte(tc.data), &configured); err != nil {
 				t.Fatal(err)
 			}
-			if configured.MaxConcurrency == nil || *configured.MaxConcurrency != 3 {
-				t.Fatalf("MaxConcurrency = %v, want 3", configured.MaxConcurrency)
+			got, err := configured.ResolveLimit()
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("ResolveLimit() error = %v, want error %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Fatalf("ResolveLimit() = %d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -107,6 +142,28 @@ func TestPipelineConcurrencyPolicyRejectsWrongType(t *testing.T) {
 
 func intPointer(value int) *int {
 	return &value
+}
+
+func TestStampTargetPolicy(t *testing.T) {
+	p := StampTargetPolicy{AllowedTargets: map[string][]string{
+		" services/loom-core ": {" services/flexdeck "},
+	}}
+	for _, tc := range []struct {
+		name, source, target string
+		want                 bool
+	}{
+		{name: "same project needs no entry", source: "services/loom-core", target: "services/loom-core", want: true},
+		{name: "allowlisted cross project", source: "services/loom-core", target: "services/flexdeck", want: true},
+		{name: "missing cross project entry", source: "services/loom-core", target: "services/other"},
+		{name: "reverse relationship absent", source: "services/flexdeck", target: "services/loom-core"},
+		{name: "missing source", target: "services/loom-core"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Allows(tc.source, tc.target); got != tc.want {
+				t.Fatalf("Allows(%q, %q) = %v, want %v", tc.source, tc.target, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestExternalIncidentThreshold(t *testing.T) {

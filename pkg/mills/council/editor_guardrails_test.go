@@ -91,6 +91,10 @@ func TestApplyEditorGuardrails_DropsExternalOnlyRemediation(t *testing.T) {
 	}
 }
 
+// The incident contract is scoped to proposals that address the external
+// dependency. A file-backed proposal about the outside system that is not an
+// allowed follow-up is dropped; a file-backed proposal that never mentions the
+// outside system is ordinary repo work and survives, unlabeled.
 func TestApplyEditorGuardrails_DropsFileBackedExternalIncidentOutsideAllowedFollowup(t *testing.T) {
 	out := &EditorOutput{
 		Documents: []ArtifactDoc{{
@@ -121,17 +125,92 @@ func TestApplyEditorGuardrails_DropsFileBackedExternalIncidentOutsideAllowedFoll
 
 	guard := ApplyEditorGuardrails(out)
 
-	if guard.ExternalOnlyDropped != 2 {
-		t.Fatalf("dropped=%d, want 2", guard.ExternalOnlyDropped)
+	if guard.ExternalOnlyDropped != 1 {
+		t.Fatalf("dropped=%d, want 1 (only the runner restart)", guard.ExternalOnlyDropped)
 	}
-	if len(out.BacklogProposals) != 0 {
-		t.Fatalf("proposals=%d, want empty fallback: %#v", len(out.BacklogProposals), out.BacklogProposals)
+	if guard.RepoScopedPreserved != 1 {
+		t.Fatalf("repo-scoped preserved=%d, want 1", guard.RepoScopedPreserved)
 	}
-	if out.Sidecar.BacklogDeltas.Created != 0 {
-		t.Fatalf("created=%d, want 0 after drop", out.Sidecar.BacklogDeltas.Created)
+	if len(out.BacklogProposals) != 1 || out.BacklogProposals[0].Title != "Patch unrelated parser behavior" {
+		t.Fatalf("proposals=%#v, want only the unrelated parser proposal", out.BacklogProposals)
 	}
-	if out.Sidecar.OmitReason != ExternalIncidentNoInRepoFollowUpReason {
-		t.Fatalf("omit_reason=%q, want %q", out.Sidecar.OmitReason, ExternalIncidentNoInRepoFollowUpReason)
+	if hasLabel(out.BacklogProposals[0].Labels, ExternalDependencyIncidentLabel) {
+		t.Fatalf("unrelated repo work was labeled as an incident follow-up: %v", out.BacklogProposals[0].Labels)
+	}
+	if out.Sidecar.BacklogDeltas.Created != 1 {
+		t.Fatalf("created=%d, want 1 after drop", out.Sidecar.BacklogDeltas.Created)
+	}
+	if out.Sidecar.OmitReason != "" {
+		t.Fatalf("omit_reason=%q, want empty because a proposal survived", out.Sidecar.OmitReason)
+	}
+	if !containsAny(guard.Note(), []string{"1 repo-scoped proposal preserved"}) {
+		t.Fatalf("guard note should count the preserved proposal, got %q", guard.Note())
+	}
+}
+
+// TestApplyEditorGuardrails_PreservesRepoScopedWorkDuringIncident replays the
+// live 2026-09-02 12:00Z council run: the research section classified the
+// workspace's GitLab CI / Longhorn error clusters as an external dependency
+// incident, and the twelve-step implementation plan it emitted alongside was
+// entirely repo-scoped. The guard used to drop every step as "external-only";
+// `council_yield` then read 50 runs / $133 with no backlog delta.
+func TestApplyEditorGuardrails_PreservesRepoScopedWorkDuringIncident(t *testing.T) {
+	out := &EditorOutput{
+		Documents: []ArtifactDoc{{
+			Kind: KindResearch,
+			Body: "### External dependency incidents (classified, no outside-system remediation proposed)\n" +
+				"`ci/main` GitLab CI pipeline failures and Longhorn replica-scheduler storage errors are `external_dependency_incident`.",
+		}},
+		BacklogProposals: []BacklogProposal{
+			{
+				Title: "Cross-repo stamp target project",
+				PlanSlices: []PlanSliceSpec{{
+					Name:  "schema",
+					Goal:  "add a target project field to the stamp type and honor it on apply",
+					Files: []string{"pkg/mills/store/stamp.go", "pkg/mills/crossrepo/apply.go"},
+				}},
+			},
+			{
+				Title: "Split internal/hud/spawn.go",
+				PlanSlices: []PlanSliceSpec{{
+					Name:  "extract",
+					Goal:  "mechanical extraction, no API change",
+					Files: []string{"internal/hud/spawn.go"},
+				}},
+			},
+			{
+				Title: "Rerun the ci/main GitLab pipeline until green",
+				Notes: "external remediation with no repo files",
+			},
+		},
+		Sidecar: Sidecar{BacklogDeltas: SidecarBacklog{Created: 3}},
+	}
+
+	guard := ApplyEditorGuardrails(out)
+
+	if !guard.ExternalDependencyIncident {
+		t.Fatal("guard did not classify the run's external dependency incident")
+	}
+	if guard.ExternalOnlyDropped != 1 {
+		t.Fatalf("dropped=%d, want 1 (the pipeline rerun)", guard.ExternalOnlyDropped)
+	}
+	if guard.RepoScopedPreserved != 2 {
+		t.Fatalf("repo-scoped preserved=%d, want 2", guard.RepoScopedPreserved)
+	}
+	if guard.LabelsAdded != 0 {
+		t.Fatalf("labels added=%d, want 0 — unrelated work must not carry the incident label", guard.LabelsAdded)
+	}
+	if len(out.BacklogProposals) != 2 {
+		t.Fatalf("proposals=%d, want 2: %#v", len(out.BacklogProposals), out.BacklogProposals)
+	}
+	if out.Sidecar.BacklogDeltas.Created != 2 {
+		t.Fatalf("created=%d, want 2", out.Sidecar.BacklogDeltas.Created)
+	}
+	if out.Sidecar.OmitReason != "" {
+		t.Fatalf("omit_reason=%q, want empty", out.Sidecar.OmitReason)
+	}
+	if !containsAny(guard.Note(), []string{"2 repo-scoped proposals preserved"}) {
+		t.Fatalf("guard note = %q, want the preserved count", guard.Note())
 	}
 }
 
@@ -205,10 +284,12 @@ func TestApplyEditorGuardrails_AllowedTermsRequireDelimitedMatch(t *testing.T) {
 		}},
 		BacklogProposals: []BacklogProposal{
 			{
-				Title: "Patch login behavior",
+				// References the provider (so the incident contract applies)
+				// but "login" must not satisfy the "log" follow-up term.
+				Title: "Patch OpenAI login behavior",
 				PlanSlices: []PlanSliceSpec{{
 					Name:  "login",
-					Goal:  "change login behavior even though no repository defect was found",
+					Goal:  "change OpenAI login behavior even though no repository defect was found",
 					Files: []string{"pkg/mills/council/brief.go"},
 				}},
 			},

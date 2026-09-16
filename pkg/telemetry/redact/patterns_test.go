@@ -53,6 +53,7 @@ func TestMaskSecrets_Patterns(t *testing.T) {
 		{"postgres_positive", "DATABASE_URL=postgres://user:pw@host/db", true, ""},
 		{"mysql_positive", "mysql://root:secret@localhost/app", true, ""},
 		{"redis_positive", "redis://default:abcdef@cache.lan:6379/0", true, ""},
+		{"git_oauth_url", "https://oauth2:opaque-token-value@gitlab.flexinfer.ai/group/repo", true, ""},
 		{"conn_negative", "postgres://localhost/db (no creds)", false, "no creds"},
 
 		// Plain text untouched

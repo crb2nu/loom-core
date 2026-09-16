@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
 // fakeGreenMRAdopter records adoption attempts and replays a scripted verdict

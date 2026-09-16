@@ -1,0 +1,1 @@
+- Add the default-off Mills `health.base_red` admission hold in `pkg/mills`, with enforce and dry-log rollout modes, remediation exemptions, metrics, tests, and operator health wiring.

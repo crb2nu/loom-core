@@ -1,0 +1,1 @@
+- Mills confirms stalled workers have stopped before retrying, preventing overlapping implementations from pushing conflicting histories to the same branch. Stop intent survives operator restarts and failed cleanup acknowledgements.

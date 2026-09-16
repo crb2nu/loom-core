@@ -28,8 +28,14 @@ type EditorGuardrailOutcome struct {
 	ExternalDependencyIncident bool
 	LabelsAdded                int
 	ExternalOnlyDropped        int
-	OmitReason                 string
-	Incident                   ExternalIncidentPlanningDecision
+	// RepoScopedPreserved counts proposals kept during an external-dependency
+	// incident because they do not reference the outside system at all —
+	// ordinary roadmap work that happened to share a council run with an
+	// incident. Surfaced in the sidecar note so a zero-yield run can be told
+	// apart from a run whose proposals were all genuinely external.
+	RepoScopedPreserved int
+	OmitReason          string
+	Incident            ExternalIncidentPlanningDecision
 }
 
 // Applied reports whether the guard changed or classified the output.
@@ -58,6 +64,9 @@ func (o EditorGuardrailOutcome) Note() string {
 	if o.LabelsAdded > 0 {
 		parts = append(parts, pluralize(o.LabelsAdded, "proposal", "proposals")+" labeled")
 	}
+	if o.RepoScopedPreserved > 0 {
+		parts = append(parts, pluralize(o.RepoScopedPreserved, "repo-scoped proposal", "repo-scoped proposals")+" preserved")
+	}
 	if o.OmitReason != "" {
 		parts = append(parts, "omit_reason: "+o.OmitReason)
 	}
@@ -68,6 +77,18 @@ func (o EditorGuardrailOutcome) Note() string {
 // repo-scoped proposals are preserved, but external-remediation proposals with
 // no file-backed in-repo guardrail/docs/telemetry/config action are removed
 // before the mutator can create work the pipeline cannot complete.
+//
+// The incident flag is derived from the WHOLE editor output, and the scheduled
+// council's brief nearly always carries a workspace error-cluster section that
+// the editor dutifully classifies as an external dependency incident. The
+// incident rules therefore apply per proposal: only a proposal that itself
+// references the outside system is held to the in-repo follow-up contract.
+// Ordinary roadmap work that merely shares the run with an incident is kept
+// (and counted in RepoScopedPreserved). Before this scoping, 50 consecutive
+// cron runs (2026-08-21 → 2026-09-02, ~$133) dropped every proposal — including
+// twelve-step implementation plans for pkg/mills/overseer, pkg/mills/gates and
+// internal/hud — as "external-only" because the research section mentioned
+// GitLab CI and Longhorn failures.
 func ApplyEditorGuardrails(out *EditorOutput) EditorGuardrailOutcome {
 	if out == nil {
 		return EditorGuardrailOutcome{}
@@ -92,7 +113,13 @@ func ApplyEditorGuardrails(out *EditorOutput) EditorGuardrailOutcome {
 			outcome.ExternalOnlyDropped++
 			continue
 		}
-		if incident || isCanonicalExternalIncidentText(proposalText(p)) {
+		text := proposalText(p)
+		switch {
+		case incident && !proposalReferencesExternalDependency(text):
+			// Repo-scoped work unrelated to the incident: keep, and do not
+			// stamp it with an incident label it has nothing to do with.
+			outcome.RepoScopedPreserved++
+		case incident || isCanonicalExternalIncidentText(text):
 			if !hasLabel(p.Labels, ExternalDependencyIncidentLabel) {
 				p.Labels = append(p.Labels, ExternalDependencyIncidentLabel)
 				outcome.LabelsAdded++
@@ -128,16 +155,32 @@ func truncateGuardrailNote(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
+// isNonActionableExternalProposal decides whether a single proposal must be
+// dropped. Outside an incident only the speculative "remediate <provider>"
+// shape (external dependency + remediation verb, no repo files) is dropped.
+// During an incident the in-repo follow-up contract applies — but only to
+// proposals that reference the outside system; a proposal that never mentions
+// an external dependency is ordinary repo work and stays actionable.
 func isNonActionableExternalProposal(p BacklogProposal, incident bool) bool {
 	hasFiles := proposalHasFiles(p)
-	if hasFiles && (!incident || isAllowedExternalIncidentFollowUp(p)) {
+	txt := strings.ToLower(proposalText(p))
+	if !incident {
+		if hasFiles {
+			return false
+		}
+		return containsAny(txt, externalDependencyTerms) && containsAny(txt, externalRemediationTerms)
+	}
+	if !proposalReferencesExternalDependency(txt) {
 		return false
 	}
-	txt := strings.ToLower(proposalText(p))
-	if containsAny(txt, externalDependencyTerms) && containsAny(txt, externalRemediationTerms) {
-		return true
-	}
-	return incident
+	return !hasFiles || !isAllowedExternalIncidentFollowUp(p)
+}
+
+// proposalReferencesExternalDependency reports whether a proposal's own text
+// names an outside system (provider, GitLab, registry, network, …). Case-
+// insensitive; accepts either raw or already-lowercased text.
+func proposalReferencesExternalDependency(text string) bool {
+	return containsAny(strings.ToLower(text), externalDependencyTerms)
 }
 
 func isAllowedExternalIncidentFollowUp(p BacklogProposal) bool {

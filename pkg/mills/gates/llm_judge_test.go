@@ -526,3 +526,29 @@ func TestLLMGate_NoTiebreakerOnPrimaryPass(t *testing.T) {
 		t.Fatal("tiebreaker must not run on a primary pass (zero happy-path cost)")
 	}
 }
+
+func TestLLMGateTiebreakChainAudit(t *testing.T) {
+	for _, name := range []string{"spec_conformance", "pr_self_review"} {
+		for _, score := range []float64{.2, .9, -1} {
+			t.Run(fmt.Sprintf("%s/score=%.1f", name, score), func(t *testing.T) {
+				last := &FakeRubricJudge{Default: RubricVerdict{Score: score, Model: "gpt", Reasons: []string{"second opinion"}}}
+				if score < 0 {
+					last.Err = errors.New("billing")
+				}
+				chain := &ChainRubricJudge{Classify: func(error) string { return "billing" }, Hops: []RubricJudgeHop{{Vendor: "anthropic", Judge: &FakeRubricJudge{Err: errors.New("billing")}}, {Vendor: "openai", Judge: last}}}
+				g := &LLMGate{GateName: name, RubricName: name, Tiebreaker: chain, TiebreakerName: chain.String()}
+				out, err := g.breakTie(context.Background(), StageInput{}, Outcome{Reasons: []string{"primary"}, Judgements: []Judgement{{Model: "local"}}}, "local", .8)
+				if err != nil || out.Pass != (score >= .8) || !strings.Contains(strings.Join(out.Reasons, " "), "tiebreak anthropic skipped: billing") {
+					t.Fatal(out, err)
+				}
+				if score < 0 {
+					if !strings.Contains(strings.Join(out.Reasons, " "), "verdict stands unresolved") {
+						t.Fatal(out)
+					}
+				} else if out.JudgedBy != "tiebreak:openai/gpt" || len(out.Judgements) != 2 || !strings.Contains(strings.Join(out.Reasons, " "), "second opinion") {
+					t.Fatal(out)
+				}
+			})
+		}
+	}
+}

@@ -69,11 +69,14 @@
           detail: eff.detail, tone: eff.tone, view: ['mills', 'factory'],
         });
       }
-      const sparks = millsStore.escalatedRuns.length;
+      // Items still escalated — not the all-time escalated-run history
+      // (which counted every past attempt of long-merged items).
+      const sparks = millsStore.openSparks.length;
       if (sparks > 0) {
         out.push({
           id: 'sparks', label: 'Sparks', value: `${sparks}`,
-          detail: 'escalated, need review', tone: 'error', view: ['mills', 'sparks'],
+          detail: sparks === 1 ? 'item escalated, needs review' : 'items escalated, need review',
+          tone: 'error', view: ['mills', 'sparks'],
         });
       }
     }
@@ -87,7 +90,7 @@
       value: mrsUnreachable ? '?' : `${liveMRs.length}`,
       detail: mrsUnreachable
         ? 'unreachable'
-        : unhealthy > 0 ? `${unhealthy} unhealthy` : 'all healthy',
+        : unhealthy > 0 ? `${unhealthy} need${unhealthy === 1 ? 's' : ''} attention` : 'none need attention',
       tone: mrsUnreachable ? 'error' : unhealthy > 0 ? 'warn' : 'ok',
       view: ['agents', 'mrwatch'],
     });

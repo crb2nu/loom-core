@@ -1,0 +1,1 @@
+Mills promotion reports now stream event metadata across the full review window, so more than 10,000 overseer events no longer prevent the report from refreshing. Legacy capped event sources still reject incomplete counts.

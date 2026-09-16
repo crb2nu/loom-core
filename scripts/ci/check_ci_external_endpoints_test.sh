@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Tests for scripts/ci/check_ci_external_endpoints.sh.
 #
-# A lint that cannot fail is decoration. These cases pin the four behaviours the
+# A lint that cannot fail is decoration. These cases pin the behaviours the
 # guard is bought for: it flags a direct endpoint, it does NOT flag one that is
-# only named in a comment, the allowlist actually suppresses, and an allowlist
-# entry without a reason is itself an error.
+# only named in a comment, the allowlist actually suppresses, an allowlist
+# entry without a reason is itself an error, and implicit fetches (bare
+# `golangci-lint config verify`) are caught alongside literal URLs.
 
 set -uo pipefail
 
@@ -86,7 +87,38 @@ else
   fail "expected a missing-reason error; got rc=${RC}: ${OUT}"
 fi
 
-# --- 5. the repo's own CI YAML is clean -------------------------------------
+# --- 5. bare `config verify` is an implicit schema fetch ---------------------
+# golangci-lint's `config verify` downloads its JSON schema from
+# golangci-lint.run unless --schema points at the vendored copy (pipeline
+# 23729 job 235686 timed out on exactly that fetch). The rule must flag the
+# bare invocation and the literal domain, but not the --schema form.
+cat >"${TMP}/verify.yml" <<'EOF'
+job:
+  script:
+    - $(go env GOPATH)/bin/golangci-lint config verify
+    - curl https://golangci-lint.run/jsonschema/golangci.v2.8.jsonschema.json
+EOF
+run "${TMP}/empty-allowlist.txt" "${TMP}/verify.yml"
+if [ "$RC" -ne 0 ] &&
+  [ "$(printf '%s' "$OUT" | grep -c "endpoint 'golangci-lint.run'")" -eq 2 ]; then
+  pass "flags bare config verify and the literal schema URL"
+else
+  fail "expected two golangci-lint.run findings; got rc=${RC}: ${OUT}"
+fi
+
+cat >"${TMP}/verify-schema.yml" <<'EOF'
+job:
+  script:
+    - golangci-lint config verify --schema ci/golangci.v2.8.jsonschema.json
+EOF
+run "${TMP}/empty-allowlist.txt" "${TMP}/verify-schema.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "config verify --schema <vendored> is clean"
+else
+  fail "--schema form should not be flagged; got rc=${RC}: ${OUT}"
+fi
+
+# --- 6. the repo's own CI YAML is clean -------------------------------------
 OUT="$(bash "$CHECK" 2>&1)"
 RC=$?
 if [ "$RC" -eq 0 ]; then

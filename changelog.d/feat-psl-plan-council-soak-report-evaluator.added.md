@@ -1,0 +1,1 @@
+- Add the machine-readable overseer S2 soak report contract and pure, fail-closed evaluator in `pkg/mills/overseer/soak.go`, with fixture-driven contract tests in `pkg/mills/overseer/soak_test.go`.

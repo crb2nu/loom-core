@@ -1,0 +1,1 @@
+- Gate live queued-proof execution on a fresh, healthy embedder snapshot with zero trailing-window fail-closed counts in `cmd/mills-workflow-killtest/main.go`, backed by the reusable probe contract in `pkg/agentcontext/embed.go`.

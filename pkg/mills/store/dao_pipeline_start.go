@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -138,14 +139,22 @@ type ClaimPipelineStartRequest struct {
 	ExpectedRevision           int64
 	SerializeOverlappingScopes bool
 	EnforceScopeReservations   bool
-	HomeProject                string
-	Template                   string
-	EstimateUSD                float64
-	Limits                     PipelineStartLimits
-	RunID                      string
-	ParentSessionID            string
-	Now                        time.Time
-	FaultHook                  ClaimPipelineStartFaultHook
+	// ReservationPolicy is a pure policy lookup on the current reserver row.
+	// Return a hold and/or a repository daily-run cap (zero means uncapped).
+	// Store-dependent eligibility is read through the claim transaction.
+	ReservationPolicy func(*BacklogItem) (held bool, maxRunsPerDay int)
+	// UndeployedReservationDependencies records deployment holds by dependency
+	// revision. Transactional reads must still match before using this evidence;
+	// changed or newly added dependencies retain reservation protection.
+	UndeployedReservationDependencies map[string]int64
+	HomeProject                       string
+	Template                          string
+	EstimateUSD                       float64
+	Limits                            PipelineStartLimits
+	RunID                             string
+	ParentSessionID                   string
+	Now                               time.Time
+	FaultHook                         ClaimPipelineStartFaultHook
 }
 
 // ClaimPipelineStartResult contains the rows committed by one successful
@@ -193,7 +202,7 @@ func (s *Store) ClaimPipelineStart(ctx context.Context, req ClaimPipelineStartRe
 			return nil, fmt.Errorf("pipeline start: load reservation candidate: %w", err)
 		}
 		if err == nil && item.State == BacklogQueued {
-			conflict, err := findPipelineStartReservationConflict(ctx, s.db, item, req.HomeProject)
+			conflict, err := findPipelineStartReservationConflict(ctx, s.db, item, req.HomeProject, req.ReservationPolicy, req.Now, req.UndeployedReservationDependencies)
 			if err != nil {
 				return nil, err
 			}
@@ -268,7 +277,7 @@ func (s *Store) ClaimPipelineStart(ctx context.Context, req ClaimPipelineStartRe
 			return nil, conflict
 		}
 		if req.EnforceScopeReservations {
-			reservationConflict, err := findPipelineStartReservationConflict(ctx, tx, item, req.HomeProject)
+			reservationConflict, err := findPipelineStartReservationConflict(ctx, tx, item, req.HomeProject, req.ReservationPolicy, req.Now, req.UndeployedReservationDependencies)
 			if err != nil {
 				return nil, err
 			}
@@ -506,48 +515,216 @@ func findPipelineStartScopeConflict(
 	return nil, nil
 }
 
-// findPipelineStartReservationConflict closes the race between the
-// reconciler's advisory reservation check and the atomic start claim. A
-// reservation created by another reconciler before this transaction obtains
-// its write lock must win over a newer overlapping admission.
+// ScopeReservationPrecedes orders reserved claimants by priority, reservation
+// age, creation age, then ID. Both admission layers must use this ordering.
+func ScopeReservationPrecedes(a *BacklogItem, aReserved time.Time, b *BacklogItem, bReserved time.Time) bool {
+	if a.Priority != b.Priority {
+		return a.Priority < b.Priority
+	}
+	if !aReserved.Equal(bReserved) {
+		return aReserved.Before(bReserved)
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return a.ID < b.ID
+}
+
 type pipelineStartQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
+// scopeReservationScanner extends the shared backlog scanner with the joined
+// reservation timestamp without duplicating backlog column decoding.
+type scopeReservationScanner struct {
+	scanner
+	reservedAt *string
+}
+
+func (s scopeReservationScanner) Scan(dest ...any) error {
+	return s.scanner.Scan(append(dest, s.reservedAt)...)
+}
+
+// findPipelineStartReservationConflict closes the race between the
+// reconciler's advisory reservation check and the atomic start claim. A
+// reservation created by another reconciler before this transaction obtains
+// its write lock participates in the same ordering as the reconciler, provided
+// its owner can run. The contender CAS is excluded from active blockers.
 func findPipelineStartReservationConflict(
 	ctx context.Context,
 	q pipelineStartQueryer,
 	item *BacklogItem,
 	homeProject string,
+	policy func(*BacklogItem) (bool, int),
+	now time.Time,
+	undeployed map[string]int64,
 ) (*ScopeReservationConflictError, error) {
+	// Include self even after its provisional RUNNING CAS. Read reservation
+	// ages with the items so advisory reads also see a consistent snapshot.
 	rows, err := q.QueryContext(ctx, `
-		SELECT `+backlogColumns+`
+		SELECT `+backlogColumns+`, s.reserved_at
 		FROM backlog_items b
 		JOIN scope_fairness_state s ON s.backlog_id = b.id
-		WHERE b.state = ? AND b.id <> ? AND s.reserved_at IS NOT NULL
-		ORDER BY s.reserved_at ASC, b.id ASC
+		WHERE (b.state = ? OR b.id = ?) AND s.reserved_at IS NOT NULL
 	`, string(BacklogQueued), item.ID)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline start: scope reservation check: %w", err)
 	}
-	defer rows.Close()
+	// Close the cursor before nested queries (also supports a one-connection
+	// pool in the advisory check).
+	var reservers []*BacklogItem
+	reservedAt := make(map[string]time.Time)
 	for rows.Next() {
-		other, err := scanBacklog(rows)
+		var raw string
+		other, err := scanBacklog(scopeReservationScanner{scanner: rows, reservedAt: &raw})
 		if err != nil {
-			return nil, fmt.Errorf("pipeline start: scope reservation scan: %w", err)
+			_ = rows.Close()
+			return nil, err
 		}
-		if hit, witness := BacklogScopesOverlap(item, other, homeProject); hit {
-			return &ScopeReservationConflictError{
-				BacklogID: item.ID,
-				BlockerID: other.ID,
-				Witness:   witness,
-			}, nil
+		at, err := parseTime(raw)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		reservedAt[other.ID] = at
+		if other.ID != item.ID {
+			reservers = append(reservers, other)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("pipeline start: scope reservation rows: %w", err)
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(reservers, func(i, j int) bool {
+		return ScopeReservationPrecedes(reservers[i], reservedAt[reservers[i].ID], reservers[j], reservedAt[reservers[j].ID])
+	})
+	selfReserved, hasReservation := reservedAt[item.ID]
+	for _, other := range reservers {
+		if hasReservation && ScopeReservationPrecedes(item, selfReserved, other, reservedAt[other.ID]) {
+			continue
+		}
+		if item.Priority < other.Priority || other.Policy.RequireHumanReview {
+			continue
+		}
+		hit, witness := BacklogScopesOverlap(item, other, homeProject)
+		if !hit {
+			continue
+		}
+		// Exclude the contender's provisional RUNNING row: its CAS must not
+		// make every overlapping reservation appear blocked by an active run.
+		blocked, err := reservationBlockedByActive(ctx, q, other, item.ID, homeProject)
+		if err != nil {
+			return nil, err
+		}
+		if blocked {
+			continue
+		}
+		met, err := reservationDependenciesMet(ctx, q, other, undeployed)
+		if err != nil {
+			return nil, err
+		}
+		if !met {
+			continue
+		}
+		if policy != nil {
+			held, cap := policy(other)
+			if held {
+				continue
+			}
+			if cap > 0 {
+				count, err := reservationRepoRuns(ctx, q, other, homeProject, normalizeDispatchNow(now).Truncate(24*time.Hour))
+				if err != nil {
+					return nil, err
+				}
+				if count >= cap {
+					continue
+				}
+			}
+		}
+		return &ScopeReservationConflictError{BacklogID: item.ID, BlockerID: other.ID, Witness: witness}, nil
 	}
 	return nil, nil
+}
+
+func reservationBlockedByActive(ctx context.Context, q pipelineStartQueryer, reserver *BacklogItem, contenderID, homeProject string) (bool, error) {
+	rows, err := q.QueryContext(ctx, `SELECT `+backlogColumns+` FROM backlog_items WHERE state = ? AND id <> ? ORDER BY id`, string(BacklogRunning), contenderID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		active, err := scanBacklog(rows)
+		if err != nil {
+			return false, err
+		}
+		if hit, _ := BacklogScopesOverlap(reserver, active, homeProject); hit {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// Match countRepoBudgetedRunsSince, including its no-work exclusions, while
+// keeping all mutable admission reads on the serialized claim connection.
+func reservationRepoRuns(ctx context.Context, q pipelineStartQueryer, item *BacklogItem, homeProject string, since time.Time) (int, error) {
+	rows, err := q.QueryContext(ctx, `SELECT b.target_project FROM pipeline_runs p JOIN backlog_items b ON b.id = p.backlog_id
+ WHERE p.started_at >= ? AND p.state IN ('done','queued','planning','slicing','implementing','testing','reviewing','mr','ci','merging','escalated','preflight_failed','paused')
+ AND NOT (p.state = 'escalated' AND ((p.cost_usd = 0 AND COALESCE(p.escalation_class,'') = 'transient_quota') OR COALESCE(p.escalation_class,'') = 'config'))`, timeRFC3339(since))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	target := strings.TrimSpace(item.TargetProject)
+	if target == "" {
+		target = strings.TrimSpace(homeProject)
+	}
+	if target == "" {
+		return 0, nil
+	}
+	count := 0
+	for rows.Next() {
+		var repo sql.NullString
+		if err := rows.Scan(&repo); err != nil {
+			return 0, err
+		}
+		project := strings.TrimSpace(repo.String)
+		if project == "" {
+			project = strings.TrimSpace(homeProject)
+		}
+		if SameRepo(project, target) {
+			count++
+		}
+	}
+	return count, rows.Err()
+}
+
+func reservationDependenciesMet(ctx context.Context, q pipelineStartQueryer, item *BacklogItem, undeployed map[string]int64) (bool, error) {
+	for _, id := range item.Dependencies {
+		rows, err := q.QueryContext(ctx, `SELECT state, row_version FROM backlog_items WHERE id = ?`, id)
+		if err != nil {
+			return false, err
+		}
+		state := ""
+		var revision int64
+		if rows.Next() {
+			err = rows.Scan(&state, &revision)
+		}
+		if err == nil {
+			err = rows.Err()
+		}
+		_ = rows.Close()
+		if err != nil {
+			return false, err
+		}
+		if state != string(BacklogMerged) {
+			return false, nil
+		}
+		if observed, ok := undeployed[id]; ok && observed == revision {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func runClaimPipelineStartFault(hook ClaimPipelineStartFaultHook, point ClaimPipelineStartFaultPoint) error {
@@ -584,9 +761,14 @@ func readPipelineStartBudgetSnapshot(
 func buildPipelineStartBudgetSnapshotQuery(since time.Time, limits PipelineStartLimits) (string, []any) {
 	expressions := []string{"0", "0", "0", "0"}
 	args := make([]any, 0, 5)
+	// The daily USD cap governs METERED spend only: pipeline_runs.cost_usd
+	// carries the list-price equivalent of every stage, and subscription_cost_usd
+	// the slice billed to a Claude Code / Codex subscription (store.BillingClass).
+	// Counting the total here stalled the factory at $81 "spent" with $1.82
+	// metered (2026-09-14). Keep this in lockstep with Budget.spentSince.
 	if limits.MaxUSDPerDay > 0 {
 		expressions[0] = `COALESCE((
-			SELECT SUM(pr.cost_usd)
+			SELECT SUM(pr.cost_usd - pr.subscription_cost_usd)
 			FROM pipeline_runs pr
 			WHERE pr.started_at >= ?
 		), 0)`
@@ -599,7 +781,7 @@ func buildPipelineStartBudgetSnapshotQuery(since time.Time, limits PipelineStart
 		// engine predicate excludes DAG mirror rows (same id as the pipeline
 		// run) from double-matching.
 		expressions[1] = `COALESCE((
-			SELECT SUM(MAX(r.reserved_usd - COALESCE(pr.cost_usd, wr.cost_usd, 0), 0))
+			SELECT SUM(MAX(r.reserved_usd - COALESCE(pr.cost_usd - pr.subscription_cost_usd, wr.cost_usd, 0), 0))
 			FROM pipeline_budget_reservations r
 			LEFT JOIN pipeline_runs pr ON pr.id = r.run_id
 			LEFT JOIN workflow_runs wr ON wr.id = r.run_id AND wr.engine = 'imperative'

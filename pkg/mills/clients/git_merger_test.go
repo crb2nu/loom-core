@@ -2,6 +2,9 @@ package clients
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +16,50 @@ import (
 
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 )
+
+func TestGitLabClient_CrossProjectMRUsesCachedDefaultBranch(t *testing.T) {
+	t.Helper()
+	projectGets := 0
+	created := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/projects/services/flexinfer":
+			projectGets++
+			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "master"})
+		case r.Method == http.MethodGet && r.URL.Path == "/projects/services/flexinfer/merge_requests":
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPost && r.URL.Path == "/projects/services/flexinfer/merge_requests":
+			var body createMRBody
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create MR: %v", err)
+			}
+			if body.TargetBranch != "master" {
+				t.Errorf("target_branch = %q, want master", body.TargetBranch)
+			}
+			created++
+			_ = json.NewEncoder(w).Encode(mrResponse{IID: int64(created), WebURL: "https://gitlab.example/mr"})
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	base, err := NewGitLabClient(GitLabConfig{APIURL: server.URL, Token: "token", Project: "services/loom-core"})
+	if err != nil {
+		t.Fatalf("NewGitLabClient: %v", err)
+	}
+	target := base.ForProject("services/flexinfer")
+	for _, source := range []string{"feat/one", "feat/two"} {
+		if _, err := target.CreateMR(context.Background(), pipeline.CreateMRRequest{
+			SourceBranch: source, TargetBranch: "main", Title: source,
+		}); err != nil {
+			t.Fatalf("CreateMR(%s): %v", source, err)
+		}
+	}
+	if projectGets != 1 {
+		t.Errorf("project metadata GETs = %d, want 1", projectGets)
+	}
+}
 
 // fakeGitRunner records every git command and returns canned stdout/
 // stderr/exit code keyed on the args. Tests register expectations

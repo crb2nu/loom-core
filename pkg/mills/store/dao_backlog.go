@@ -331,21 +331,14 @@ func (d *BacklogDAO) Put(ctx context.Context, item *BacklogItem) error {
 	return nil
 }
 
-// GradeRun atomically updates a terminal run's backlog item grade and appends
-// its immutable history event. The returned item is the new denormalized head.
-func (d *BacklogDAO) GradeRun(ctx context.Context, runID, grade, note, actor string, gradedAt time.Time) (*BacklogItem, error) {
+// GradeItem atomically updates a terminal backlog item's grade and appends its
+// immutable history event. runID may be nil for work without a pipeline run.
+func (d *BacklogDAO) GradeItem(ctx context.Context, itemID, grade, note, actor string, gradedAt time.Time, runID *string) (*BacklogItem, error) {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("grade run %s begin: %w", runID, err)
+		return nil, fmt.Errorf("grade backlog item %s begin: %w", itemID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-
-	var itemID string
-	if err := tx.QueryRowContext(ctx, `SELECT backlog_id FROM pipeline_runs WHERE id = ?`, runID).Scan(&itemID); errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	} else if err != nil {
-		return nil, fmt.Errorf("grade run %s lookup: %w", runID, err)
-	}
 
 	item, err := scanBacklog(tx.QueryRowContext(ctx, `SELECT `+backlogColumns+` FROM backlog_items WHERE id = ?`, itemID))
 	if err != nil {
@@ -367,6 +360,12 @@ func (d *BacklogDAO) GradeRun(ctx context.Context, runID, grade, note, actor str
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, &StaleWriteError{Entity: "backlog item", ID: item.ID, ExpectedRevision: item.Revision, Reason: "row revision changed"}
 	}
+	// A grade commonly arrives after the terminal transition. Keep the
+	// dedicated feature row joined to the denormalized grade in the same
+	// transaction; no row is created here for legacy/unwritten outcomes.
+	if _, err := tx.ExecContext(ctx, `UPDATE outcome_writebacks SET grade = ? WHERE backlog_id = ?`, grade, item.ID); err != nil {
+		return nil, fmt.Errorf("grade outcome writeback %s: %w", item.ID, err)
+	}
 	payload, err := jsonField(map[string]any{
 		"grade": grade, "prior_grade": prior, "note": note, "actor": actor,
 		"run_id": runID, "item_id": item.ID, "plan_id": item.PlanID,
@@ -374,18 +373,48 @@ func (d *BacklogDAO) GradeRun(ctx context.Context, runID, grade, note, actor str
 	if err != nil {
 		return nil, fmt.Errorf("grade event payload: %w", err)
 	}
+	subjectKind, subjectID := "backlog_item", item.ID
+	if runID != nil {
+		subjectKind, subjectID = "pipeline_run", *runID
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO events (occurred_at, actor, kind, subject_kind, subject_id, payload_json)
-		VALUES (?,?,?,?,?,?)`, timeRFC3339(gradedAt), actor, "bolt.graded", "pipeline_run", runID, payload); err != nil {
+		VALUES (?,?,?,?,?,?)`, timeRFC3339(gradedAt), actor, "bolt.graded", subjectKind, subjectID, payload); err != nil {
 		return nil, fmt.Errorf("grade event append: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("grade run %s commit: %w", runID, err)
+		return nil, fmt.Errorf("grade backlog item %s commit: %w", itemID, err)
 	}
 	item.Grade, item.GradeNote, item.GradeActor, item.GradedAt = grade, note, actor, &gradedAt
 	item.Revision++
 	item.UpdatedAt = gradedAt
 	return item, nil
+}
+
+// GradeRun resolves runID then delegates to canonical item grading.
+func (d *BacklogDAO) GradeRun(ctx context.Context, runID, grade, note, actor string, gradedAt time.Time) (*BacklogItem, error) {
+	var itemID string
+	if err := d.db.QueryRowContext(ctx, `SELECT backlog_id FROM pipeline_runs WHERE id = ?`, runID).Scan(&itemID); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("grade run %s lookup: %w", runID, err)
+	}
+	return d.GradeItem(ctx, itemID, grade, note, actor, gradedAt, &runID)
+}
+
+// ListRunlessTerminal returns bounded merged/escalated/retired items that have
+// no pipeline run. updated_at is their only durable terminal-time anchor.
+func (d *BacklogDAO) ListRunlessTerminal(ctx context.Context, since time.Time, limit int) ([]*BacklogItem, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	return d.queryMany(ctx, `SELECT `+backlogColumns+` FROM backlog_items bi
+		WHERE bi.state IN (?,?,?) AND bi.updated_at >= ?
+		AND NOT EXISTS (SELECT 1 FROM pipeline_runs pr WHERE pr.backlog_id = bi.id)
+		ORDER BY bi.updated_at DESC LIMIT ?`, string(BacklogMerged), string(BacklogEscalated), string(BacklogRetired), timeRFC3339(since), limit)
 }
 
 // TasteAggregates returns per-plan taste over all merged work and overall
@@ -683,6 +712,11 @@ func (d *BacklogDAO) transitionStateWithEventOnce(
 	} else if err != nil {
 		return nil, false, fmt.Errorf("backlog transition with event once %s: %w", id, err)
 	}
+	if from == BacklogEscalated && to != BacklogEscalated {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM escalation_sweep_state WHERE backlog_id = ?`, id); err != nil {
+			return nil, false, fmt.Errorf("clear escalation recheck %s: %w", id, err)
+		}
+	}
 	if err := runTransitionStateWithEventOnceFault(faultHook, transitionEventOnceAfterBacklog); err != nil {
 		return nil, false, err
 	}
@@ -753,6 +787,31 @@ func (d *BacklogDAO) ListByStateLimit(ctx context.Context, state BacklogState, l
 	)
 }
 
+// ListByStatePage returns the next ordered state slice after the supplied
+// cursor. A nil cursor starts at the FIFO head. The cursor fields match
+// idx_backlog_claim_queue, so admission can move past deferred heads without
+// OFFSET scans or disturbing priority/FIFO ordering.
+func (d *BacklogDAO) ListByStatePage(ctx context.Context, state BacklogState, after *BacklogItem, limit int) ([]*BacklogItem, error) {
+	if limit <= 0 {
+		return d.ListByState(ctx, state)
+	}
+	if after == nil {
+		return d.ListByStateLimit(ctx, state, limit)
+	}
+	createdAt := timeRFC3339(after.CreatedAt)
+	return d.queryMany(ctx, `
+		SELECT `+backlogColumns+`
+		FROM backlog_items
+		WHERE state = ?
+		  AND (priority > ?
+		       OR (priority = ? AND created_at > ?)
+		       OR (priority = ? AND created_at = ? AND id > ?))
+		ORDER BY priority ASC, created_at ASC, id ASC
+		LIMIT ?
+	`, string(state), string(after.Priority), string(after.Priority), createdAt,
+		string(after.Priority), createdAt, after.ID, limit)
+}
+
 // ListTerminalRepairCandidates returns running backlog rows that have at least
 // one pipeline run and no non-terminal run. Filtering in SQL prevents an active
 // FIFO head from consuming every bounded repair slot and starving terminal
@@ -772,24 +831,28 @@ func (d *BacklogDAO) ListTerminalRepairCandidates(ctx context.Context, limit int
 		  AND NOT EXISTS (
 			SELECT 1 FROM pipeline_runs pr
 			WHERE pr.backlog_id = bi.id
-			  AND pr.state NOT IN ('done', 'escalated', 'paused')
+			  AND pr.state NOT IN ('done', 'escalated', 'preflight_failed', 'paused')
 		  )
 		ORDER BY bi.priority ASC, bi.created_at ASC, bi.id ASC
 		LIMIT ?
 	`, string(BacklogRunning), limit)
 }
 
-// ListEscalatedWithMR returns escalated backlog items whose most-recent pipeline
-// run carries both a non-zero mr_iid and consistent durable project provenance,
-// oldest-first by updated_at. It powers the reconciler's ghost-spark reap sweep:
-// an item that escalated at the merge stage whose MR later merged out-of-band
-// via merge-when-pipeline-succeeds. Filtering both predicates in SQL excludes
-// legacy/unroutable escalations before LIMIT so they cannot starve candidates
-// that the caller can actually resolve.
+// ListEscalatedWithMR returns escalated backlog items whose most-recent
+// MR-BEARING pipeline run carries both a non-zero mr_iid and consistent durable
+// project provenance, oldest-first by updated_at. It powers the reconciler's
+// ghost-spark reap sweep: an item that escalated at the merge stage whose MR
+// later merged out-of-band via merge-when-pipeline-succeeds. "Most-recent
+// MR-bearing" (not "most-recent") keeps items reachable whose newest attempt
+// was a requeue that died before the mr stage while the earlier attempt's MR
+// went on to merge (observed 2026-08-19). Filtering both predicates in SQL
+// excludes legacy/unroutable escalations before LIMIT so they cannot starve
+// candidates that the caller can actually resolve.
 //
 // Project routing is deliberately not filtered through mutable target_project.
-// The sweep resolves each candidate from successful stage provenance before
-// issuing a per-project lookup.
+// The sweep resolves each candidate from successful stage provenance, or from
+// the immutable project binding recorded when a pre-MR run escalated. When
+// both arms exist they must agree.
 //
 // Oldest updated_at first drains the longest-stuck escalations first. A
 // non-positive limit falls back to 128.
@@ -807,10 +870,10 @@ func (d *BacklogDAO) ListEscalatedWithMR(ctx context.Context, limit int) ([]*Bac
 				SELECT latest.id
 				FROM pipeline_runs latest
 				WHERE latest.backlog_id = bi.id
+				  AND latest.mr_iid > 0
 				ORDER BY latest.started_at DESC, latest.attempts DESC
 				LIMIT 1
 			)
-			  AND pr.mr_iid > 0
 			  AND NOT EXISTS (
 				SELECT 1
 				FROM stage_results malformed
@@ -824,7 +887,8 @@ func (d *BacklogDAO) ListEscalatedWithMR(ctx context.Context, limit int) ([]*Bac
 					END) <> 'object'
 				  )
 			  )
-			  AND EXISTS (
+			  AND (
+			  EXISTS (
 				SELECT 1
 				FROM stage_results sr
 				JOIN json_each(CASE
@@ -846,18 +910,52 @@ func (d *BacklogDAO) ListEscalatedWithMR(ctx context.Context, limit int) ([]*Bac
 				END) = 0
 				  AND COUNT(DISTINCT trim(project.value)) = 1
 			  )
+			  OR EXISTS (
+				SELECT 1
+				FROM events binding_event
+				JOIN json_each(binding_event.payload_json) binding
+				WHERE binding_event.subject_kind = 'pipeline_run'
+				  AND binding_event.subject_id = pr.id
+				  AND binding_event.kind = 'pipeline.run.escalation_target'
+				  AND json_valid(binding_event.payload_json)
+				  AND json_type(binding_event.payload_json) = 'object'
+				  AND binding.key = 'target_project'
+				  AND binding.type = 'text'
+				  AND trim(binding.value) <> ''
+				  AND NOT EXISTS (
+					SELECT 1
+					FROM stage_results conflicting
+					JOIN json_each(CASE
+						WHEN json_valid(conflicting.artifacts_json) THEN conflicting.artifacts_json
+						ELSE '{}'
+					END) project
+					WHERE conflicting.pipeline_run_id = pr.id
+					  AND conflicting.outcome = ?
+					  AND (
+						(conflicting.stage = 'mr' AND project.key = 'mr_project')
+						OR (conflicting.stage = 'ci_watch' AND project.key = 'ci_project')
+						OR (conflicting.stage = 'merge' AND project.key = 'merged_project')
+						OR (conflicting.stage = 'cleanup' AND project.key = 'cleanup_project')
+					  )
+					  AND (project.type <> 'text' OR trim(project.value) = '' OR trim(project.value) <> trim(binding.value))
+				  )
+			  )
+			  )
 		  )
 		ORDER BY bi.updated_at ASC, bi.id ASC
 		LIMIT ?
-	`, string(BacklogEscalated), string(StageOutcomeSuccess), limit)
+	`, string(BacklogEscalated), string(StageOutcomeSuccess), string(StageOutcomeSuccess), limit)
 }
 
 // ListEscalatedWithoutMR is the complement of ListEscalatedWithMR: escalated
-// items whose most-recent run never recorded an MR IID because it escalated
+// items where NO run ever recorded an MR IID because every attempt escalated
 // before the mr stage (a scope or docs gate, a failed preflight). Those items
 // are invisible to the MR-IID-driven sweep, yet their branch is frequently
 // pushed and merged by hand afterwards — leaving the item escalated forever
-// with its work already on main.
+// with its work already on main. Items with any MR-bearing run belong to the
+// IID pass (which resolves the newest MR-bearing run), keeping the two passes
+// disjoint so the branch pass's smaller lookup budget is spent only where a
+// branch lookup is the ONLY available evidence.
 //
 // Deliberately NOT filtered on stage provenance the way ListEscalatedWithMR is:
 // a run that never reached the mr stage has no mr_project/ci_project artifact
@@ -887,6 +985,11 @@ func (d *BacklogDAO) ListEscalatedWithoutMR(ctx context.Context, limit int) ([]*
 				LIMIT 1
 			)
 			  AND (pr.mr_iid IS NULL OR pr.mr_iid = 0)
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM pipeline_runs any_mr
+			WHERE any_mr.backlog_id = bi.id
+			  AND any_mr.mr_iid > 0
 		  )
 		ORDER BY bi.updated_at ASC, bi.id ASC
 		LIMIT ?
@@ -1015,4 +1118,45 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// AutoRequeueCursor survives removal or state changes of the saved item. The
+// singleton belongs to the serialized escalation sweeper, not to a backlog row.
+func (d *BacklogDAO) AutoRequeueCursor(ctx context.Context) (*BacklogItem, error) {
+	var item BacklogItem
+	var created string
+	err := d.db.QueryRowContext(ctx, `SELECT backlog_id, priority, created_at FROM auto_requeue_sweep_cursor WHERE singleton = 1`).Scan(&item.ID, &item.Priority, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	item.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	return &item, err
+}
+
+// SaveAutoRequeueCursor checkpoints completed judgments; nil starts a new lap.
+func (d *BacklogDAO) SaveAutoRequeueCursor(ctx context.Context, item *BacklogItem) error {
+	if item == nil {
+		_, err := d.db.ExecContext(ctx, `DELETE FROM auto_requeue_sweep_cursor WHERE singleton = 1`)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx, `INSERT INTO auto_requeue_sweep_cursor(singleton, backlog_id, priority, created_at) VALUES(1,?,?,?)
+ ON CONFLICT(singleton) DO UPDATE SET backlog_id=excluded.backlog_id, priority=excluded.priority, created_at=excluded.created_at`, item.ID, string(item.Priority), timeRFC3339(item.CreatedAt))
+	return err
+}
+
+// CountAutoRequeueRemaining includes candidates beyond the bounded page.
+func (d *BacklogDAO) CountAutoRequeueRemaining(ctx context.Context, after *BacklogItem) (int, error) {
+	query := `SELECT COUNT(*) FROM backlog_items WHERE state = ?`
+	args := []any{string(BacklogEscalated)}
+	if after != nil {
+		query += ` AND (priority > ? OR (priority = ? AND created_at > ?) OR (priority = ? AND created_at = ? AND id > ?))`
+		created := timeRFC3339(after.CreatedAt)
+		args = append(args, string(after.Priority), string(after.Priority), created, string(after.Priority), created, after.ID)
+	}
+	var n int
+	err := d.db.QueryRowContext(ctx, query, args...).Scan(&n)
+	return n, err
 }

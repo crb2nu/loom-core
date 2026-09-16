@@ -1,0 +1,1 @@
+- Tests-stage baseline oracle (B3, policy pipeline.tests_baseline_oracle, default off): a failed gate re-runs only its failed checks against the bare main checkout, and a subset that also fails there classifies as infrastructure instead of burning code-class attempts; the verdict rides the stage artifacts.

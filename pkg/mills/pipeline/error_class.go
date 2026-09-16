@@ -13,6 +13,8 @@ import (
 type CIPipelineTerminalError struct {
 	Status           string
 	MRIID            int64
+	PipelineID       string
+	ObservedRuntime  time.Duration
 	FailedJobReasons []string
 	FailedJobs       []FailedJob
 	FirstFailedJobs  []FailedJob
@@ -20,24 +22,42 @@ type CIPipelineTerminalError struct {
 }
 
 func (e *CIPipelineTerminalError) Error() string {
+	identity := ""
+	if e.PipelineID != "" {
+		identity = fmt.Sprintf(" pipeline %s after %s", e.PipelineID, e.ObservedRuntime.Round(time.Second))
+	}
 	if e.AutoRetried && len(e.FirstFailedJobs) > 0 {
 		second := failedJobNames(e.FailedJobs)
 		if second == "" {
 			second = "unknown job"
 		}
-		return fmt.Sprintf("ci pipeline %s for mr %d: %s failed, auto-retried once, failed again (%s): %v", e.Status, e.MRIID, failedJobNames(e.FirstFailedJobs), second, ErrCIPipelineTerminal)
+		return fmt.Sprintf("ci pipeline %s for mr %d%s: %s failed, auto-retried once, failed again (%s): %v", e.Status, e.MRIID, identity, failedJobNames(e.FirstFailedJobs), second, ErrCIPipelineTerminal)
 	}
-	return fmt.Sprintf("ci pipeline %s for mr %d: %v", e.Status, e.MRIID, ErrCIPipelineTerminal)
+	return fmt.Sprintf("ci pipeline %s for mr %d%s: %v", e.Status, e.MRIID, identity, ErrCIPipelineTerminal)
 }
 
 func (e *CIPipelineTerminalError) Unwrap() error { return ErrCIPipelineTerminal }
 
-func (e *CIPipelineTerminalError) allRunnerSystemFailures() bool {
+// gitLabRunnerLevelFailureReasons is the closed set of GitLab failure_reason
+// values that identify runner or scheduler infrastructure failures rather than
+// a failure in the repository's job script.
+var gitLabRunnerLevelFailureReasons = map[string]struct{}{
+	"runner_system_failure":    {},
+	"job_execution_timeout":    {},
+	"stuck_or_timeout_failure": {},
+}
+
+func isGitLabRunnerLevelFailureReason(reason string) bool {
+	_, ok := gitLabRunnerLevelFailureReasons[strings.ToLower(strings.TrimSpace(reason))]
+	return ok
+}
+
+func (e *CIPipelineTerminalError) allRunnerLevelFailures() bool {
 	if e == nil || len(e.FailedJobReasons) == 0 {
 		return false
 	}
 	for _, reason := range e.FailedJobReasons {
-		if strings.TrimSpace(reason) != "runner_system_failure" {
+		if !isGitLabRunnerLevelFailureReason(reason) {
 			return false
 		}
 	}
@@ -51,6 +71,9 @@ func (e *CIPipelineTerminalError) allRunnerSystemFailures() bool {
 type ErrorClass string
 
 const (
+	// ClassSubstrate is a bounded retry for hub availability after a rollout.
+	ClassSubstrate ErrorClass = "substrate"
+
 	// ClassTransient: a flaky-but-not-terminal failure. Free retry —
 	// does not consume MaxAttempts budget. Cap retries via the
 	// runner's transientRetryCap to bound permanent transients.
@@ -100,6 +123,7 @@ const (
 // new class can't be added without deciding whether it is a valid metric
 // label (see ErrorClass.Valid, consumed by the escalation-class counter).
 var allErrorClasses = []ErrorClass{
+	ClassSubstrate,
 	ClassTransient,
 	ClassTransientQuota,
 	ClassInfra,
@@ -132,15 +156,48 @@ func (c ErrorClass) Valid() bool {
 // the 2026-05-24 kill-test; new failure modes get added here as the
 // operator surfaces them.
 func Classify(err error) ErrorClass {
+	if err != nil && hubUnavailable(err.Error()) && (strings.Contains(strings.ToLower(err.Error()), "mcp_hub_session") || strings.Contains(strings.ToLower(err.Error()), "after operator rollout")) {
+		return ClassSubstrate
+	}
+	if errors.Is(err, ErrBranchContractRefCollision) {
+		return ClassConfig
+	}
 	if err == nil {
 		return ""
 	}
 	if errors.Is(err, ErrMergeRequestLocked) {
 		return ClassTransient
 	}
+	// A typed merge-queue eviction is a terminal queue verdict for THIS
+	// candidate — a same-attempt retry only re-reads the settled row, so
+	// none of these may burn the code-class budget on no-op loops. A fresh
+	// attempt re-enters the queue through the full enqueue-time
+	// authorization (031 re-admission), which is why the retryable reasons
+	// are honest to retry. head_moved is not seen here: the stage
+	// reconstructs *MergeSourceSHAMismatchError so the runner rewinds.
+	var evicted *MergeQueueEvictedError
+	if errors.As(err, &evicted) {
+		switch evicted.Reason {
+		case "ci_timeout", "queue_full":
+			// The queue waited out a pipeline (45m) or the lane was at
+			// depth: infrastructure pacing, not this change's fault.
+			return ClassInfra
+		case "mr_closed":
+			// A human (or sweep) closed the MR under the queue: terminal
+			// configuration state, identical re-poll forever.
+			return ClassConfig
+		case "ci_red", "rebase_conflict", "rebase_ambiguous":
+			// The rebased tree failed CI or cannot rebase: real signal
+			// about this change against the moved target.
+			return ClassCode
+		}
+		// merge_failed and unknown reasons fall through to the needle
+		// classifiers below — the Detail text preserves the GitLab error
+		// (405/422/cannot be merged → ClassConfig via existing needles).
+	}
 	var terminalCI *CIPipelineTerminalError
-	if errors.As(err, &terminalCI) && terminalCI.allRunnerSystemFailures() {
-		return ClassTransient
+	if errors.As(err, &terminalCI) && terminalCI.allRunnerLevelFailures() {
+		return ClassInfra
 	}
 	if errors.Is(err, ErrMergeRequestClosed) ||
 		errors.Is(err, ErrMergeAuthorizationStale) ||
@@ -171,16 +228,16 @@ func Classify(err error) ErrorClass {
 	if errors.Is(err, ErrSpawnPollTimeout) {
 		return ClassTransient
 	}
-	// A ci_watch pipeline-poll timeout is infra, not code: the branch
-	// pipeline never reached a terminal state within PollDeadline, so the
-	// fix is at the CI/cluster layer (a stuck or genuinely slow pipeline),
-	// not in the diff. Unlike a spawn poll timeout, re-polling re-attaches to
-	// the SAME pipeline, so it is NOT a free transient retry — Infra counts
-	// against MaxAttempts, bounding total wall-clock at MaxAttempts ×
-	// PollDeadline while keeping the escalation-class metric honest
-	// (escalations #149/#153 previously mis-classed these as code). Checked
-	// via errors.Is (before the string matching) so the wrapped web_url in
-	// the message can't accidentally match a different needle.
+	// The independent wall-clock ceiling is an infrastructure escalation. A
+	// per-session pipeline-poll timeout below that ceiling is a free transient:
+	// Runner re-dispatches ci_watch against the same durable MR/head identity
+	// without spending MaxAttempts.
+	if errors.Is(err, ErrCIWatchCeiling) {
+		return ClassInfra
+	}
+	if errors.Is(err, ErrCIWatchPollTimeout) {
+		return ClassTransient
+	}
 	if errors.Is(err, ErrPipelinePollTimeout) {
 		return ClassInfra
 	}
@@ -205,12 +262,31 @@ func Classify(err error) ErrorClass {
 	if errors.Is(err, ErrDevboxGateNoChecks) {
 		return ClassTransient
 	}
+	if errors.Is(err, ErrDevboxCheckoutInfra) {
+		return ClassInfra
+	}
+	// The baseline oracle proved the failed checks also fail WITHOUT the
+	// change: environment/baseline breakage. The runner escalates immediately
+	// as free-retry infra instead of retrying checks the change cannot fix.
+	if errors.Is(err, ErrDevboxBaselineAlsoFails) {
+		return ClassInfra
+	}
 	// Net layer eofs always wrap up to a transport class.
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return ClassTransient
 	}
 	s := err.Error()
 	lower := strings.ToLower(s)
+	if strings.Contains(lower, "lint_parity_no_output") {
+		return ClassInfra
+	}
+	// A missing model route/deployment is provider infrastructure. Keep this
+	// scoped to research/FlexInfer wording: an ordinary GitLab or git-clone 404
+	// remains a terminal configuration error below.
+	if strings.Contains(lower, "status 404") &&
+		(strings.Contains(lower, "flexinfer") || strings.Contains(lower, "stage=research") || strings.Contains(lower, "model endpoint")) {
+		return ClassInfra
+	}
 
 	// Terminal config errors first — these must never fall through to a
 	// retryable class. "status 405" matches the GitLab client's error
@@ -252,13 +328,25 @@ func Classify(err error) ErrorClass {
 		return gc.Class
 	}
 
+	// A synchronous Kubernetes API validation rejection while creating the
+	// devbox pod is deterministic: retrying the same pod spec can only return
+	// the same rejection. Keep this as a safety net for the whole validation
+	// class, not only the label-length incident fixed on 2026-08-20. Both
+	// phrases are required so transient create failures and unrelated
+	// "is invalid" messages retain their existing classes. This check stays
+	// after ClassifyGitCloneError so captured git failures keep precedence.
+	if strings.Contains(lower, "create pod:") && strings.Contains(lower, "is invalid:") {
+		return ClassConfig
+	}
+
 	// Spawn-infrastructure defects: the agent CLI was killed by the exec
 	// timeout (exit 124 / "command timed out"), ran with no usable credential
 	// (auth preflight / 401 missing-auth-header, escalation #368), lost its
 	// turn driver to a controller restart, started without a usable
 	// stdin/prompt ("Reading additional input from stdin"), was refused by the
-	// keyed-spawn runtime preflight over a terminating pod, or never got a pod
-	// into Running at all. No verdict was produced on the diff, so these are
+	// keyed-spawn runtime preflight over a terminating pod, never got a pod into
+	// Running, or was killed by the liveness watchdog after producing no output.
+	// No verdict was produced on the diff, so these are
 	// infrastructure, not code, and the escalation is attributed at the
 	// spawn/cluster layer with a distinct reason (SpawnInfraReason). Left in the
 	// default ClassCode, escalations #356-#359 (timeout, up to 1h/attempt at
@@ -278,6 +366,20 @@ func Classify(err error) ErrorClass {
 	// TERMINAL spawn-layer failure.
 	if reason, ok := spawnInfraReasonFromString(s); ok {
 		return spawnReasonErrorClass(reason)
+	}
+
+	// The devbox namespace ResourceQuota refused the run's sandbox pod ("create
+	// pod: pods … is forbidden: exceeded quota: devbox-quota, requested:
+	// limits.memory=6Gi, used: …, limited: …"): no check ran. Budgeted infra —
+	// the bottom "is forbidden" needle already said so — but recognized here,
+	// ahead of the rate-limit needles, because the quantities and the pod name's
+	// hashed run token can contain "429" and would launder the refusal into a
+	// seconds-scale transient_quota retry; retryBackoff then spaces the attempts
+	// on the minutes scale quota frees on (live 2026-09-13: three tests attempts
+	// inside one minute, then an infra escalation with the quota still draining).
+	// After the spawn reasons so a spawn pod's own refusal keeps its token.
+	if isDevboxQuotaRefusal(err) {
+		return ClassInfra
 	}
 
 	// Quota first — a "429" can be embedded inside a transport-shaped
@@ -418,6 +520,73 @@ func Classify(err error) ErrorClass {
 		}
 	}
 
+	// A sandbox image that is STILL BUILDING when the quality gate's bounded
+	// build wait (cmd/mcp-devbox awaitSandboxBuild, 8m) expires is not a
+	// broken image: the async build keeps running and the next gate call
+	// re-attaches to it. Live 2026-09-01 on every adopted loom-core branch:
+	// tests#1 failed at 8m "still building", tests#2 at 16m still building,
+	// tests#3 passed — two of the three MaxAttempts burned on a build that was
+	// never going to fail, and any build slower than 24m escalated as infra.
+	// Free-transient so the wait is bounded by the transient cap
+	// (MaxAttempts + transientRetryCap sessions of the gate's build wait)
+	// instead of the code/infra budget. A build that actually FAILS reports
+	// "buildah build failed" / "image build failed" and stays ClassInfra
+	// below. Checked before the generic "sandbox image" infra needle, which
+	// would otherwise claim the same message.
+	for _, needle := range []string{
+		"sandbox image still building",
+		"sandbox image build in progress",
+	} {
+		if strings.Contains(lower, needle) {
+			return ClassTransient
+		}
+	}
+
+	// Two sandbox conditions that clear on their own and produced NO
+	// verdict, so an identical retry is honest and free. Kill-test
+	// 2026-09-12 (.loom/brainstorm-loom-core-mills-critical-improvements-
+	// 2026-09-12.md): 14 runs whose last tests attempt was one of the
+	// sandbox families below escalated as ClassCode — a human was told the
+	// diff was wrong when the sandbox never ran it.
+	//   - golangci-lint's start-up file lock: every concurrent run shares the
+	//     per-repo sandbox pod, so the second runner exits 3 with "parallel
+	//     golangci-lint is running" (21 attempts 2026-09-06..12). The lint
+	//     parity command now disables the lock; this needle covers an older
+	//     operator image and any other lock-taking command.
+	//   - the devbox replacing a non-running sandbox pod and timing out
+	//     waiting for the old one to be gone (internal/devbox/backend/
+	//     k8s_wait.go "wait pod gone"): the next attempt finds it gone.
+	for _, needle := range []string{
+		"parallel golangci-lint is running",
+		"wait to replace non-running pod",
+		"wait pod gone",
+	} {
+		if strings.Contains(lower, needle) {
+			return ClassTransient
+		}
+	}
+
+	// The sandbox accepted the exec but could not start the process — the
+	// cgroup memory limit, or containerd failing to create the exec task
+	// ("failed to exec in container", "setns process"). The devbox wraps the
+	// memory case as "could not start the exec process (container memory
+	// limit …)" (k8s_wait.go execMemoryHint). No check ran, so this is never
+	// a verdict on the diff; it counts against attempts as ClassInfra because
+	// a `pkg/mills` test package that exceeds the limit fails identically
+	// every time and the fix is the sandbox's memory or the test's
+	// parallelism, not the code.
+	for _, needle := range []string{
+		"could not start the exec process",
+		"failed to exec in container",
+		"error executing command in container",
+		"failed to create exec",
+		"setns process",
+	} {
+		if strings.Contains(lower, needle) {
+			return ClassInfra
+		}
+	}
+
 	// Buildah / sandbox infrastructure failures. Persistent — counts
 	// against attempts, but reported as ClassInfra so the operator
 	// sees that the fix is at the image/k8s layer not the pipeline.
@@ -474,6 +643,9 @@ func isSpawnSaturation(err error) bool {
 // carry their own schedule regardless of class: the missing-credential
 // rollout window and the keyed-runtime identity collision.
 func retryBackoff(cls ErrorClass, err error, attempt int) time.Duration {
+	if cls == ClassSubstrate {
+		return quotaBackoff(attempt) * 10
+	}
 	if reason, ok := SpawnInfraReason(err); ok {
 		switch reason {
 		// A credential-less spawn (spawn-auth-missing) is a delivery-window
@@ -490,6 +662,10 @@ func retryBackoff(cls ErrorClass, err error, attempt int) time.Duration {
 		case SpawnReasonRuntimeIdentityConflict:
 			return identityConflictBackoff(attempt)
 		}
+	}
+	// A devbox quota refusal (budgeted infra) waits out the quota: never immediate.
+	if isDevboxQuotaRefusal(err) {
+		return devboxQuotaBackoff(attempt)
 	}
 	if cls != ClassTransientQuota {
 		return 0
@@ -613,3 +789,28 @@ func identityConflictBackoff(attempt int) time.Duration {
 	}
 	return d
 }
+
+// isDevboxQuotaRefusal reports whether err is the kube-apiserver ResourceQuota
+// rejection of a devbox sandbox pod (`pods "…" is forbidden: exceeded quota: …`).
+func isDevboxQuotaRefusal(err error) bool {
+	return err != nil && devboxQuotaRefusalText(err.Error())
+}
+
+// devboxQuotaRefusalText requires a ResourceQuota exhaustion message tied to
+// a devbox pod or its quota. Provider quotas and other namespaces must retain
+// their own retry policy; a truncated tail still works if it names devbox-quota.
+func devboxQuotaRefusalText(msg string) bool {
+	lower := strings.ToLower(msg)
+	if !strings.Contains(lower, "exceeded quota") {
+		return false
+	}
+	return strings.Contains(lower, "exceeded quota: devbox-quota") ||
+		(strings.Contains(lower, `pods "devbox-`) && strings.Contains(lower, "is forbidden"))
+}
+
+// devboxQuotaBackoff spaces the retries of a devbox quota refusal. Quota comes
+// back when another gate finishes or the devbox reaper stops an orphan
+// (DEVBOX_MILLS_IDLE_TIMEOUT, 5m) — the slot-release timescale — so it shares
+// saturationBackoff's 1m·2^(n-1) schedule capped at 5m: every retry at least a
+// minute apart, and a run's budgeted retries spanning the reaper's backstop.
+func devboxQuotaBackoff(attempt int) time.Duration { return saturationBackoff(attempt) }

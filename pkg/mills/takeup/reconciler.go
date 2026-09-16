@@ -44,7 +44,7 @@ import (
 // *clients.PlanClient. Narrow so tests fake it without the MCP hub.
 type PlanStore interface {
 	ListPlans(ctx context.Context, project, namespace, phase string) ([]clients.PlanSummary, error)
-	ListSlices(ctx context.Context, planID string) ([]clients.PlanSliceSummary, error)
+	ListSlicesIfChanged(ctx context.Context, plan clients.PlanSummary) ([]clients.PlanSliceSummary, error)
 	GetSlice(ctx context.Context, sliceID string) (clients.PlanSliceSummary, error)
 	UpdateSlicePhase(ctx context.Context, sliceID, phase string) error
 	AppendSliceDecision(ctx context.Context, sliceID, note string) error
@@ -295,7 +295,7 @@ func isActivePlanPhase(phase string) bool {
 // reconcilePlan trues one plan's slices to MR reality and rolls the plan
 // forward when everything has merged.
 func (r *Reconciler) reconcilePlan(ctx context.Context, pl clients.PlanSummary, stats *TickStats) {
-	slices, err := r.plans.ListSlices(ctx, pl.ID)
+	slices, err := r.plans.ListSlicesIfChanged(ctx, pl)
 	if err != nil {
 		r.logger.Warn("take-up list slices failed", "plan_id", pl.ID, "err", err)
 		stats.Errors++

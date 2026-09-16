@@ -45,8 +45,11 @@ RUN mkdir -p /out/services/loom-core/bin && \
 FROM registry.harbor.lan/dockerhub-cache/library/alpine:3.24
 
 # Keep in sync with Dockerfile.custom-server -- see there for why mcp-k8s-ops
-# needs kubectl and mcp-helm needs a 3.19-line helm on PATH.
-RUN apk add --no-cache ca-certificates kubectl "helm=~3.19"
+# needs kubectl, mcp-helm needs a 3.19-line helm, and context7 needs the pinned
+# Node package on PATH.
+RUN apk add --no-cache ca-certificates kubectl "helm=~3.19" nodejs npm && \
+    npm install --global --omit=dev --ignore-scripts @upstash/context7-mcp@1.0.26 && \
+    test -x "$(command -v context7-mcp)"
 
 RUN adduser -D -u 1000 mcp
 USER mcp

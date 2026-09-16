@@ -16,6 +16,9 @@ import SwiftUI
 
 struct ShiftReportSheet: View {
     let api: MillsAPIProtocol
+    /// Control surface for the one-tap taste grade. nil (test init without a
+    /// control fake, or an unpaired admin token) renders the bolts read-only.
+    var controlAPI: MillsControlAPIProtocol?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -25,6 +28,14 @@ struct ShiftReportSheet: View {
     @State private var loadError: String?
     @State private var stats: MillsShiftStats?
     @State private var gateSummaries: [MillsSparkGateSummary] = []
+    /// backlogID → grade for bolts already graded (seeded from the backlog
+    /// read, updated optimistically after a successful one-tap).
+    @State private var gradeByBacklogID: [String: String] = [:]
+    /// runID currently being graded — disables that row's buttons.
+    @State private var gradingRunID: String?
+    /// Last grade failure, rendered under the bolts header until the next
+    /// successful tap.
+    @State private var gradeError: String?
     /// True when the Pattern Loom catalog could not be read (older daemon
     /// without /api/patterns in the mobile allowlist → 403, or an operator
     /// that is down). The report still renders; pattern attribution is just
@@ -105,8 +116,17 @@ struct ShiftReportSheet: View {
         let patternsResult = await patternsTask
         patternsUnavailable = patternsResult.unavailable
         let shift = MillsShiftReport.window(runs, now: openedAt)
-        let built = MillsShiftReport.stats(shift, patterns: patternsResult.patterns, backlog: await backlogTask)
+        let backlog = await backlogTask
+        let built = MillsShiftReport.stats(shift, patterns: patternsResult.patterns, backlog: backlog)
         stats = built
+        // Seed graded state so an already-graded bolt shows its grade instead
+        // of offering the one-tap again.
+        gradeByBacklogID = Dictionary(
+            backlog.compactMap { item in
+                guard let grade = item.grade, !grade.isEmpty else { return nil }
+                return (item.id, grade)
+            },
+            uniquingKeysWith: { a, _ in a })
         loading = false
 
         // Background gate enrichment: sequential keeps it gentle on the
@@ -156,6 +176,10 @@ struct ShiftReportSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if !stats.bolts.isEmpty {
+                boltsSection(stats)
+            }
+
             if !stats.sparks.isEmpty {
                 sparksSection(stats, gatesByRun: gatesByRun)
             }
@@ -186,6 +210,109 @@ struct ShiftReportSheet: View {
                 LoomPill("$\(String(format: "%.2f", stats.costUSD))", color: LoomColors.fgMuted, style: .outlined)
             }
         }
+    }
+
+    // MARK: - Bolts + taste
+
+    /// The bolts of the shift, each with the one-tap taste grade. Grading is
+    /// the human half of the taste loop — the S5/S6 autonomy gate holds until
+    /// enough merged bolts carry a grade — so the report is where the tap
+    /// should live: you just read what the bolt did.
+    private func boltsSection(_ stats: MillsShiftStats) -> some View {
+        VStack(alignment: .leading, spacing: LoomSpacing.sm) {
+            Text("BOLTS OFF THE LOOM")
+                .font(LoomTypography.sectionTitle)
+                .tracking(0.8)
+                .foregroundStyle(LoomColors.fgSecondary)
+            if let gradeError {
+                Text(gradeError)
+                    .font(LoomTypography.monoCaption)
+                    .foregroundStyle(LoomColors.statusDegraded)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(stats.bolts, id: \.runID) { bolt in
+                boltRow(bolt)
+            }
+        }
+    }
+
+    private func boltRow(_ bolt: MillsShiftRun) -> some View {
+        VStack(alignment: .leading, spacing: LoomSpacing.xxs) {
+            HStack(spacing: LoomSpacing.xs) {
+                Text(bolt.endedAt, format: .dateTime.hour().minute())
+                    .font(LoomTypography.monoCaption)
+                    .foregroundStyle(LoomColors.fgMuted)
+                Text(bolt.backlogID.isEmpty ? bolt.runID : bolt.backlogID)
+                    .font(LoomTypography.monoMedium)
+                    .foregroundStyle(LoomColors.fgPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: LoomSpacing.xs) {
+                Text(boltMeta(bolt))
+                    .font(LoomTypography.monoCaption)
+                    .foregroundStyle(LoomColors.fgMuted)
+                Spacer(minLength: 0)
+                if let grade = gradeByBacklogID[bolt.backlogID], let known = MillsGrade(rawValue: grade) {
+                    LoomPill(grade, icon: known.icon, color: gradeColor(known), style: .tinted)
+                } else if controlAPI != nil {
+                    gradeButtons(bolt)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .loomCard(priority: .compact, accent: .severity(LoomColors.statusHealthy))
+    }
+
+    private func gradeButtons(_ bolt: MillsShiftRun) -> some View {
+        HStack(spacing: LoomSpacing.xs) {
+            ForEach(MillsGrade.allCases, id: \.rawValue) { grade in
+                Button {
+                    Task { await gradeBolt(bolt, grade: grade) }
+                } label: {
+                    Image(systemName: grade.icon)
+                        .font(.footnote)
+                        .foregroundStyle(gradeColor(grade))
+                        .frame(width: 30, height: 26)
+                        .background(gradeColor(grade).opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .disabled(gradingRunID != nil)
+                .accessibilityLabel("Grade \(grade.rawValue)")
+            }
+        }
+        .opacity(gradingRunID == bolt.runID ? 0.4 : 1)
+    }
+
+    private func gradeBolt(_ bolt: MillsShiftRun, grade: MillsGrade) async {
+        guard let controlAPI else { return }
+        gradingRunID = bolt.runID
+        defer { gradingRunID = nil }
+        do {
+            let ack = try await controlAPI.gradeRun(id: bolt.runID, grade: grade, note: nil)
+            gradeByBacklogID[ack.itemID] = ack.grade
+            gradeError = nil
+        } catch {
+            gradeError = millsMutationFailureMessage(error)
+        }
+    }
+
+    private func gradeColor(_ grade: MillsGrade) -> Color {
+        switch grade {
+        case .keep: return LoomColors.statusHealthy
+        case .meh: return LoomColors.fgMuted
+        case .regret: return LoomColors.statusDegraded
+        }
+    }
+
+    private func boltMeta(_ bolt: MillsShiftRun) -> String {
+        let template = bolt.template.isEmpty ? "pipeline" : bolt.template
+        var meta = "\(template) · \(bolt.attempts) attempt\(bolt.attempts == 1 ? "" : "s")"
+        if let cost = bolt.costUSD, cost > 0 {
+            meta += " · $\(String(format: "%.2f", cost))"
+        }
+        return meta
     }
 
     private func sparksSection(_ stats: MillsShiftStats, gatesByRun: [String: [String]]) -> some View {

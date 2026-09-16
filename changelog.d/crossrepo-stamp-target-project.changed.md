@@ -1,0 +1,1 @@
+- Key Pattern Loom stamps by normalized target project and pattern ID, returning a collision error instead of overwriting an existing stamp (`pkg/mills/crossrepo/stamp.go`, `pkg/mills/store/stamps.go`).

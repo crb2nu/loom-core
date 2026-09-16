@@ -1,10 +1,13 @@
 package mills
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,8 +17,404 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	millshealth "github.com/crb2nu/loom/pkg/mills/health"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
+
+func TestReconcilerBaseRedAdmissionHold(t *testing.T) {
+	ctx := context.Background()
+	newItem := func(id string, labels ...string) *store.BacklogItem {
+		return &store.BacklogItem{ID: id, Title: id, Labels: labels, State: store.BacklogQueued,
+			Priority: store.P2, CreatedBy: "test", Budget: store.Budget{MaxCostUSD: 1}}
+	}
+	red := millshealth.Observation{Known: true, Green: false, RedDuration: 91 * time.Minute}
+
+	t.Run("enforced deferral and green release", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		item := newItem("BASE-RED")
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+		obs := red
+		env.rec.HealthObservation = func() millshealth.Observation { return obs }
+		policy := env.policy.Current()
+		policy.Health.BaseRed = BaseRedPolicy{Enabled: true, Mode: "enforce"}
+		before := testutil.ToFloat64(DeferralsTotal.WithLabelValues("base_red"))
+		decision, run, reason, err := env.rec.tryStart(ctx, item, policy)
+		if err != nil || decision != decisionDeferred || run != nil || reason != "base_red" {
+			t.Fatalf("red decision=(%v,%+v,%q) err=%v", decision, run, reason, err)
+		}
+		if got := testutil.ToFloat64(DeferralsTotal.WithLabelValues("base_red")); got != before+1 {
+			t.Fatalf("base_red deferrals=%v want %v", got, before+1)
+		}
+		obs = millshealth.Observation{Known: true, Green: true}
+		res, err := env.rec.Tick(ctx)
+		if err != nil || res.Started != 1 {
+			t.Fatalf("green tick=%+v err=%v", res, err)
+		}
+	})
+
+	for _, label := range []string{"ci-fix", "remediation"} {
+		t.Run("exempt_"+label, func(t *testing.T) {
+			env := newRecEnv(t, nil)
+			item := newItem("EXEMPT-"+label, label)
+			if err := env.store.Backlog.Put(ctx, item); err != nil {
+				t.Fatal(err)
+			}
+			env.rec.HealthObservation = func() millshealth.Observation { return red }
+			policy := env.policy.Current()
+			policy.Health.BaseRed = BaseRedPolicy{Enabled: true}
+			decision, run, _, err := env.rec.tryStart(ctx, item, policy)
+			if err != nil || decision != decisionStarted || run == nil {
+				t.Fatalf("decision=%v run=%+v err=%v", decision, run, err)
+			}
+		})
+	}
+
+	t.Run("dry-log starts without deferral", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		item := newItem("DRY-LOG")
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+		var logs bytes.Buffer
+		env.rec.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		env.rec.HealthObservation = func() millshealth.Observation { return red }
+		policy := env.policy.Current()
+		policy.Health.BaseRed = BaseRedPolicy{Enabled: true, Mode: "dry-log"}
+		before := testutil.ToFloat64(DeferralsTotal.WithLabelValues("base_red"))
+		decision, run, _, err := env.rec.tryStart(ctx, item, policy)
+		if err != nil || decision != decisionStarted || run == nil || !strings.Contains(logs.String(), "dry-log") {
+			t.Fatalf("decision=%v run=%+v logs=%q err=%v", decision, run, logs.String(), err)
+		}
+		if got := testutil.ToFloat64(DeferralsTotal.WithLabelValues("base_red")); got != before {
+			t.Fatalf("dry-log incremented deferrals: %v -> %v", before, got)
+		}
+	})
+
+	t.Run("disabled emits no evidence", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		item := newItem("DISABLED")
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+		env.rec.HealthObservation = func() millshealth.Observation { return red }
+		policy := env.policy.Current()
+		decision, run, _, err := env.rec.tryStart(ctx, item, policy)
+		if err != nil || decision != decisionStarted || run == nil {
+			t.Fatalf("decision=%v run=%+v err=%v", decision, run, err)
+		}
+		events, err := env.store.Events.ListSince(ctx, time.Time{}, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event.Payload["outcome"] == "base_red" {
+				t.Fatalf("disabled base_red event: %+v", event)
+			}
+		}
+	})
+}
+
+func TestReconciler_DependencyDeploymentGate(t *testing.T) {
+	repo, deployedSHA, undeployedSHA := dependencyGitHistory(t)
+	cases := []struct {
+		name        string
+		files       []string
+		mergeSHA    string
+		buildSHA    string
+		wantMet     bool
+		wantOutcome string
+		wantWarning bool
+	}{
+		{name: "operator dependency deployed", files: []string{"pkg/mills/reconciler.go"}, mergeSHA: deployedSHA, buildSHA: deployedSHA, wantMet: true},
+		{name: "operator dependency undeployed", files: []string{"cmd/loom-mills-operator/main.go"}, mergeSHA: undeployedSHA, buildSHA: deployedSHA, wantOutcome: "dependency_undeployed"},
+		{name: "non-operator dependency unchanged", files: []string{"pkg/env/env.go"}, mergeSHA: undeployedSHA, buildSHA: deployedSHA, wantMet: true},
+		{name: "ancestry error degrades open", files: []string{"pkg/mills/reconciler.go"}, mergeSHA: "unknown-sha", buildSHA: deployedSHA, wantMet: true, wantWarning: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newRecEnv(t, nil)
+			ctx := context.Background()
+			dep := &store.BacklogItem{ID: "DEP", Title: "dependency", State: store.BacklogMerged, Priority: store.P2, CreatedBy: "test"}
+			child := &store.BacklogItem{ID: "CHILD", Title: "child", State: store.BacklogQueued, Priority: store.P2, CreatedBy: "test", Dependencies: []string{dep.ID}}
+			if err := env.store.Backlog.Put(ctx, dep); err != nil {
+				t.Fatal(err)
+			}
+			if err := env.store.Backlog.Put(ctx, child); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			run := &store.PipelineRun{ID: "DEP-RUN", BacklogID: dep.ID, Template: "test", State: store.PipelineDone, Attempts: 1, StartedAt: now, EndedAt: &now}
+			if err := env.store.Pipeline.PutRun(ctx, run); err != nil {
+				t.Fatal(err)
+			}
+			success := store.StageOutcomeSuccess
+			if err := env.store.Pipeline.PutStage(ctx, &store.StageResult{PipelineRunID: run.ID, Stage: "implement", Attempt: 1, StartedAt: now, EndedAt: &now, Outcome: &success, Artifacts: map[string]any{"files_changed": tc.files}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := env.store.Pipeline.PutStage(ctx, &store.StageResult{PipelineRunID: run.ID, Stage: "merge", Attempt: 1, StartedAt: now.Add(time.Second), EndedAt: &now, Outcome: &success, Artifacts: map[string]any{"merged_sha": tc.mergeSHA}}); err != nil {
+				t.Fatal(err)
+			}
+			var logs bytes.Buffer
+			env.rec.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+			env.rec.OperatorRepoRoot = repo
+			env.rec.OperatorBuildSHA = tc.buildSHA
+
+			met, blocker, outcome, err := env.rec.dependenciesMet(ctx, child)
+			if err != nil {
+				t.Fatalf("dependenciesMet: %v", err)
+			}
+			if met != tc.wantMet || outcome != tc.wantOutcome {
+				t.Fatalf("dependenciesMet = (%v, %q, %q), want met=%v outcome=%q", met, blocker, outcome, tc.wantMet, tc.wantOutcome)
+			}
+			if tc.wantWarning && !strings.Contains(logs.String(), "ancestry unavailable") {
+				t.Fatalf("missing fail-open warning: %s", logs.String())
+			}
+			if tc.wantOutcome == "dependency_undeployed" {
+				// A merged-but-undeployed dependency also deactivates the
+				// child's reservation through the transactional admission check.
+				child.Slices = []store.Slice{{Name: "s", Files: []string{"pkg/shared/child.go"}}}
+				if err := env.store.Backlog.Put(ctx, child); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := env.store.Backlog.RecordScopeDeferral(ctx, child.ID, env.now, 1, time.Hour); err != nil {
+					t.Fatal(err)
+				}
+				contender := itemWithFiles("contender", "pkg/shared/contender.go")
+				if err := env.store.Backlog.Put(ctx, contender); err != nil {
+					t.Fatal(err)
+				}
+				decision, _, reason, err := env.rec.tryStart(ctx, contender, env.policy.Current())
+				if err != nil || decision != decisionStarted {
+					t.Fatalf("undeployed reserver convoy: decision=%v reason=%s err=%v", decision, reason, err)
+				}
+				res, err := env.rec.StartQueuedItem(ctx, child.ID)
+				if err != nil || res.Run != nil {
+					t.Fatalf("undeployed dependency start = %+v, err=%v", res, err)
+				}
+				events, err := env.store.Events.ListSince(ctx, time.Time{}, 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				found := false
+				for _, event := range events {
+					if event.Kind == "reconciler.deferred" && event.Payload["outcome"] == "dependency_undeployed" {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatal("missing reconciler.deferred outcome=dependency_undeployed event")
+				}
+			}
+		})
+	}
+}
+
+// TestReconciler_DependencyDeploymentGate_MergeSHAFallbacks covers merged
+// operator-code dependencies whose run never ran a merge stage (hand-finished
+// MRs reaped by the ghost-spark sweep, external merge-queue candidates): the
+// gate must recover the landed commit from the ledger, the closure event, or
+// GitLab, and when nothing names it, admit once loudly and then quietly.
+func TestReconciler_DependencyDeploymentGate_MergeSHAFallbacks(t *testing.T) {
+	repo, deployedSHA, undeployedSHA := dependencyGitHistory(t)
+	ctx := context.Background()
+
+	t.Run("no merge sha anywhere admits and warns once", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		_, child, _ := depGateFixture(t, env, nil)
+		var logs bytes.Buffer
+		env.rec.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		env.rec.OperatorRepoRoot, env.rec.OperatorBuildSHA = repo, deployedSHA
+		before := testutil.ToFloat64(DependencyAncestryUnavailableTotal.WithLabelValues("no_merge_sha"))
+		for i := 0; i < 3; i++ {
+			met, _, outcome, err := env.rec.dependenciesMet(ctx, child)
+			if err != nil || !met || outcome != "" {
+				t.Fatalf("tick %d: dependenciesMet = (%v, %q, %v), want fail-open admission", i, met, outcome, err)
+			}
+		}
+		if got := strings.Count(logs.String(), "ancestry unavailable"); got != 1 {
+			t.Fatalf("fail-open WARN logged %d times across 3 ticks, want 1:\n%s", got, logs.String())
+		}
+		if !strings.Contains(logs.String(), "reason=no_merge_sha") {
+			t.Fatalf("WARN missing reason attribute:\n%s", logs.String())
+		}
+		if got := testutil.ToFloat64(DependencyAncestryUnavailableTotal.WithLabelValues("no_merge_sha")) - before; got != 3 {
+			t.Fatalf("unavailable counter delta = %v, want 3 (one per tick)", got)
+		}
+	})
+
+	t.Run("merge sha recovered from merge-queue ledger by run MR iid", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		iid := int64(4242)
+		_, child, run := depGateFixture(t, env, &iid)
+		settleMergeQueueMR(t, env, run.ID, iid, undeployedSHA)
+		env.rec.OperatorRepoRoot, env.rec.OperatorBuildSHA = repo, deployedSHA
+		met, blocker, outcome, err := env.rec.dependenciesMet(ctx, child)
+		if err != nil || met || blocker != "DEP" || outcome != "dependency_undeployed" {
+			t.Fatalf("dependenciesMet = (%v, %q, %q, %v), want held dependency_undeployed via merge-queue SHA", met, blocker, outcome, err)
+		}
+	})
+
+	t.Run("merge sha recovered from ghost-spark closure and ledger", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		_, child, run := depGateFixture(t, env, nil)
+		// The closure event's mr_iid is a float64 after the JSON round trip
+		// through the store, as it is on the live operator.
+		if err := env.store.Events.Append(ctx, &store.Event{
+			Actor: "reconciler", Kind: GhostSparkClosedEventKind, SubjectKind: "pipeline_run", SubjectID: run.ID,
+			Payload: map[string]any{"backlog_id": "DEP", "run_id": run.ID, "mr_iid": float64(77), "outcome": "merged_branch", "project": "services/loom-core"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		settleMergeQueueMR(t, env, run.ID, 77, undeployedSHA)
+		env.rec.OperatorRepoRoot, env.rec.OperatorBuildSHA = repo, deployedSHA
+		met, _, outcome, err := env.rec.dependenciesMet(ctx, child)
+		if err != nil || met || outcome != "dependency_undeployed" {
+			t.Fatalf("dependenciesMet = (%v, %q, %v), want held dependency_undeployed via ghost-spark closure", met, outcome, err)
+		}
+	})
+
+	t.Run("merge sha resolved through the GitLab hook once and cached", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		iid := int64(9001)
+		_, child, _ := depGateFixture(t, env, &iid)
+		env.rec.OperatorRepoRoot, env.rec.OperatorBuildSHA = repo, deployedSHA
+		calls := 0
+		env.rec.DependencyMergeSHA = func(_ context.Context, project string, got int64) (string, error) {
+			calls++
+			if project != "services/loom-core" || got != iid {
+				t.Fatalf("hook called with (%q, %d), want (services/loom-core, %d)", project, got, iid)
+			}
+			return undeployedSHA, nil
+		}
+		for i := 0; i < 2; i++ {
+			met, _, outcome, err := env.rec.dependenciesMet(ctx, child)
+			if err != nil || met || outcome != "dependency_undeployed" {
+				t.Fatalf("tick %d: dependenciesMet = (%v, %q, %v), want held via GitLab SHA", i, met, outcome, err)
+			}
+		}
+		if calls != 1 {
+			t.Fatalf("GitLab hook called %d times across 2 ticks, want 1 (cached after the first)", calls)
+		}
+		cached, err := env.store.Events.FirstBySubjectKind(ctx, "backlog", "DEP", DependencyMergeSHAEventKind)
+		if err != nil || cached == nil || cached.Payload["merged_sha"] != undeployedSHA {
+			t.Fatalf("cached merge SHA event = %+v, err=%v", cached, err)
+		}
+		// A build that contains the landed commit releases the hold from the
+		// cache alone; the hook must not be consulted again.
+		env.rec.DependencyMergeSHA = func(context.Context, string, int64) (string, error) {
+			return "", errors.New("must not be called once cached")
+		}
+		env.rec.OperatorBuildSHA = undeployedSHA
+		met, _, outcome, err := env.rec.dependenciesMet(ctx, child)
+		if err != nil || !met || outcome != "" {
+			t.Fatalf("dependenciesMet after deploy = (%v, %q, %v), want met", met, outcome, err)
+		}
+	})
+
+	t.Run("failed GitLab lookup is not retried inside the cooldown", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		iid := int64(1313)
+		_, child, _ := depGateFixture(t, env, &iid)
+		env.rec.OperatorRepoRoot, env.rec.OperatorBuildSHA = repo, deployedSHA
+		calls := 0
+		env.rec.DependencyMergeSHA = func(context.Context, string, int64) (string, error) {
+			calls++
+			return "", errors.New("gitlab: mr 1313 state \"opened\", want merged")
+		}
+		for i := 0; i < 3; i++ {
+			met, _, _, err := env.rec.dependenciesMet(ctx, child)
+			if err != nil || !met {
+				t.Fatalf("tick %d: dependenciesMet = (%v, %v), want fail-open admission", i, met, err)
+			}
+		}
+		if calls != 1 {
+			t.Fatalf("failed GitLab lookup retried %d times across 3 ticks inside the cooldown, want 1", calls)
+		}
+	})
+}
+
+// depGateFixture seeds a merged operator-code dependency whose only run
+// escalated before any merge stage ran (so it carries no merged_sha artifact)
+// and a queued child that depends on it.
+func depGateFixture(t *testing.T, env *recTestEnv, mrIID *int64) (dep, child *store.BacklogItem, run *store.PipelineRun) {
+	t.Helper()
+	ctx := context.Background()
+	dep = &store.BacklogItem{ID: "DEP", Title: "dependency", State: store.BacklogMerged, Priority: store.P2, CreatedBy: "test", TargetProject: "services/loom-core"}
+	child = &store.BacklogItem{ID: "CHILD", Title: "child", State: store.BacklogQueued, Priority: store.P2, CreatedBy: "test", Dependencies: []string{dep.ID}}
+	for _, item := range []*store.BacklogItem{dep, child} {
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	run = &store.PipelineRun{ID: "DEP-RUN", BacklogID: dep.ID, Template: "test", State: store.PipelineEscalated, Attempts: 1, StartedAt: now, EndedAt: &now, MRIID: mrIID}
+	if err := env.store.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	success := store.StageOutcomeSuccess
+	if err := env.store.Pipeline.PutStage(ctx, &store.StageResult{
+		PipelineRunID: run.ID, Stage: "implement", Attempt: 1, StartedAt: now, EndedAt: &now, Outcome: &success,
+		Artifacts: map[string]any{"files_changed": []string{"pkg/mills/reconciler.go"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return dep, child, run
+}
+
+// settleMergeQueueMR records a merge-queue row for the MR that settled as
+// merged at sha, the way the serial queue does for its own and external
+// candidates.
+func settleMergeQueueMR(t *testing.T, env *recTestEnv, runID string, mrIID int64, sha string) {
+	t.Helper()
+	ctx := context.Background()
+	entry, _, err := env.store.MergeQueue.Enqueue(ctx, &store.MergeQueueEntry{
+		PipelineRunID: runID, BacklogID: "DEP", Project: "services/loom-core", MRIID: mrIID,
+		SourceBranch: "feat/dep", TargetBranch: "main", EnqueuedSHA: "enqueued-" + sha,
+	}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.store.MergeQueue.MarkMerged(ctx, entry.ID, store.MergeQueueQueued, sha); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func dependencyGitHistory(t *testing.T) (repo, deployedSHA, undeployedSHA string) {
+	t.Helper()
+	repo = t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), "git", append([]string{"-C", repo}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-b", "main")
+	git("config", "user.name", "Mills Test")
+	git("config", "user.email", "mills@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "history"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "history")
+	git("commit", "-m", "base")
+	baseSHA := git("rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "history"), []byte("base\ndeployed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git("commit", "-am", "deployed")
+	deployedSHA = git("rev-parse", "HEAD")
+	git("checkout", "-b", "future", baseSHA)
+	if err := os.WriteFile(filepath.Join(repo, "history"), []byte("base\nfuture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git("commit", "-am", "future")
+	undeployedSHA = git("rev-parse", "HEAD")
+	return repo, deployedSHA, undeployedSHA
+}
 
 // recordingStarter captures pipeline-start invocations for assertion.
 type recordingStarter struct {
@@ -23,6 +422,216 @@ type recordingStarter struct {
 	runs  []*store.PipelineRun
 	items []*store.BacklogItem
 	fail  error
+}
+
+type fakeRanker struct {
+	calls  int
+	result RankingResult
+	err    error
+}
+
+type fakeVaccineMinter struct {
+	ref   string
+	err   error
+	calls int
+}
+
+func TestReconcilerPerRepoHumanReviewSkipsAutonomousStart(t *testing.T) {
+	env := newRecEnv(t, nil)
+	yes := true
+	pol := env.policy.Current()
+	pol.Pipeline.PerRepoOverrides = map[string]RepoExecutionOverride{"services/flexdeck": {RequireHumanReview: &yes}}
+	item := &store.BacklogItem{ID: "REPO-REVIEW", Title: "review", State: store.BacklogQueued, Priority: store.P2, CreatedBy: "test", TargetProject: "flexdeck"}
+	decision, _, reason, err := env.rec.tryStart(context.Background(), item, pol)
+	if err != nil || decision != decisionHeldHuman || !strings.Contains(reason, "per-repo override") {
+		t.Fatalf("decision=%v reason=%q err=%v", decision, reason, err)
+	}
+}
+
+// A per-repo require_human_review override must surface through Tick the same
+// way the item-level flag does: HeldHuman, not Skipped, and the held_human
+// tick outcome — the gate sits ahead of the cross-repo gate, so a foreign
+// target with cross_repo disabled still reads as "waiting on a human".
+func TestReconciler_PerRepoHumanReviewHoldsTick(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	env.rec.HomeProject = "services/loom-core"
+	yes := true
+	pol := env.policy.Current()
+	pol.Pipeline.PerRepoOverrides = map[string]RepoExecutionOverride{"services/flexdeck": {RequireHumanReview: &yes}}
+	item := &store.BacklogItem{ID: "REPO-HELD", Title: "held", State: store.BacklogQueued, Priority: store.P2, CreatedBy: "test", TargetProject: "flexdeck"}
+	if err := env.store.Backlog.Put(ctx, item); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	beforeHeld := testutil.ToFloat64(ReconcileTicksTotal.WithLabelValues("held_human"))
+	res, err := env.rec.Tick(ctx)
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if res.HeldHuman != 1 || res.Skipped != 0 || res.Started != 0 {
+		t.Errorf("expected held_human=1 skipped=0 started=0, got %+v", res)
+	}
+	if got := testutil.ToFloat64(ReconcileTicksTotal.WithLabelValues("held_human")); got != beforeHeld+1 {
+		t.Errorf("held_human ticks = %v, want %v", got, beforeHeld+1)
+	}
+	if env.starter.calls() != 0 {
+		t.Errorf("starter must not run for a per-repo human-review target")
+	}
+}
+
+func TestReconcilerPerRepoDailyRunCapDefersExcess(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	env.rec.HomeProject = "services/loom-core"
+	pol := env.policy.Current()
+	pol.CrossRepo.Enabled = true
+	pol.Pipeline.PerRepoOverrides = map[string]RepoExecutionOverride{"services/flexdeck": {MaxRunsPerDay: 1}}
+	old := &store.BacklogItem{ID: "REPO-OLD", Title: "old", State: store.BacklogMerged, Priority: store.P2, CreatedBy: "test", TargetProject: "flexdeck"}
+	if err := env.store.Backlog.Put(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{ID: "PIPE-REPO-OLD", BacklogID: old.ID, Template: "mills-default", State: store.PipelineDone, StartedAt: env.now.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	next := &store.BacklogItem{ID: "REPO-NEXT", Title: "next", State: store.BacklogQueued, Priority: store.P2, CreatedBy: "test", TargetProject: "services/flexdeck"}
+	decision, _, reason, err := env.rec.tryStart(ctx, next, pol)
+	if err != nil || decision != decisionDeferred || !strings.Contains(reason, "per-repo max_runs_per_day") {
+		t.Fatalf("decision=%v reason=%q err=%v", decision, reason, err)
+	}
+}
+
+func (f *fakeVaccineMinter) MintVaccine(context.Context, string, string, string, string) (string, error) {
+	f.calls++
+	return f.ref, f.err
+}
+
+func TestSetEscalationVaccineMintsThenPersists(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := env.store.Backlog.Put(ctx, &store.BacklogItem{ID: "vaccine-item", Title: "rescue", State: store.BacklogMerged, Priority: store.P2, CreatedBy: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{ID: "vaccine-run", BacklogID: "vaccine-item", Template: "mills-default-pipeline", State: store.PipelineEscalated, Attempts: 1, StartedAt: now, EndedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	minter := &fakeVaccineMinter{ref: "pattern-vaccine-run"}
+	env.rec.VaccineMinter = minter
+	ref, err := env.rec.SetEscalationVaccine(ctx, "vaccine-run", "vaccine-item", "rescue", "pkg/mills/reconciler_test.go:1")
+	if err != nil || ref != minter.ref || minter.calls != 1 {
+		t.Fatalf("set vaccine = %q, calls=%d, err=%v", ref, minter.calls, err)
+	}
+	run, err := env.store.Pipeline.GetRun(ctx, "vaccine-run")
+	if err != nil || run.VaccineRef != minter.ref {
+		t.Fatalf("persisted vaccine = %q, err=%v", run.VaccineRef, err)
+	}
+
+	minter.err = errors.New("pattern unavailable")
+	if _, err := env.rec.SetEscalationVaccine(ctx, "vaccine-run", "vaccine-item", "rescue", "proof"); err == nil {
+		t.Fatal("expected mint error")
+	}
+}
+
+func TestGhostSparkRescueMRUsesEscalationBindingOnNextSweep(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	const project = "services/loom-core"
+
+	type rescueCase struct {
+		id       string
+		binding  *string
+		artifact string
+		wantMR   bool
+	}
+	valid := project
+	blank := "   "
+	conflicting := project
+	cases := []rescueCase{
+		{id: "valid", binding: &valid, wantMR: true},
+		{id: "absent"},
+		// A blank binding on a home item resolves to the home project (the
+		// production shape of every pre-fix home escalation), so it settles too.
+		{id: "blank", binding: &blank, wantMR: true},
+		{id: "conflicting", binding: &conflicting, artifact: "services/other"},
+	}
+	states := make(map[int64]string, len(cases))
+	for i, tc := range cases {
+		item := &store.BacklogItem{
+			ID: "rescue-" + tc.id, Title: "scope rescue " + tc.id,
+			State: store.BacklogEscalated, Priority: store.P2, CreatedBy: "test",
+			TargetProject: project,
+		}
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatalf("put %s item: %v", tc.id, err)
+		}
+		iid := int64(7000 + i)
+		run := &store.PipelineRun{
+			ID: "PIPE-RESCUE-" + strings.ToUpper(tc.id), BacklogID: item.ID,
+			Template: "mills-default-pipeline", State: store.PipelineEscalated,
+			Attempts: 1, MRIID: &iid, StartedAt: env.now.Add(time.Duration(i) * time.Minute),
+		}
+		if err := env.store.Pipeline.PutRun(ctx, run); err != nil {
+			t.Fatalf("put %s run: %v", tc.id, err)
+		}
+		if tc.binding != nil {
+			boundItem := *item
+			boundItem.TargetProject = *tc.binding
+			if _, err := AppendEscalationTargetBinding(ctx, env.store.Events, "test", run, &boundItem, env.rec.HomeProject); err != nil {
+				t.Fatalf("bind %s run: %v", tc.id, err)
+			}
+		}
+		if tc.artifact != "" {
+			success := store.StageOutcomeSuccess
+			ended := env.now.Add(time.Second)
+			if err := env.store.Pipeline.PutStage(ctx, &store.StageResult{
+				PipelineRunID: run.ID, Stage: "mr", Attempt: 1,
+				StartedAt: env.now, EndedAt: &ended, Outcome: &success,
+				Artifacts: map[string]any{"mr_project": tc.artifact},
+			}); err != nil {
+				t.Fatalf("put %s artifact: %v", tc.id, err)
+			}
+		}
+		states[iid] = "merged"
+	}
+
+	mrs := &fakeMRStateClient{states: states}
+	branches := &fakeMergedBranchClient{merged: map[string]struct {
+		iid  int64
+		when time.Time
+	}{}}
+	env.rec.HomeProject = project
+	env.rec.GhostSparkMRState = mrs
+	env.rec.GhostSparkMergedBranch = branches
+	env.rec.GhostSparkBranchesFor = func(*store.BacklogItem) []string { return []string{"must-not-run"} }
+
+	res, err := env.rec.SweepGhostSparks(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if res.Merged != 2 || res.Inspected != 2 || mrs.callCount() != 2 {
+		t.Fatalf("sweep result = %+v, MR calls=%d; want two IID merges (valid binding + blank home binding)", res, mrs.callCount())
+	}
+	if len(branches.asked) != 0 {
+		t.Fatalf("branch lookup ran for rescue MR: %v", branches.asked)
+	}
+	for _, tc := range cases {
+		item, err := env.store.Backlog.Get(ctx, "rescue-"+tc.id)
+		if err != nil {
+			t.Fatalf("get %s item: %v", tc.id, err)
+		}
+		want := store.BacklogEscalated
+		if tc.wantMR {
+			want = store.BacklogMerged
+		}
+		if item.State != want {
+			t.Errorf("%s state = %s, want %s", tc.id, item.State, want)
+		}
+	}
+}
+
+func (f *fakeRanker) Rank(_ context.Context, _ []RankingInput, _ RankingBudget) (RankingResult, error) {
+	f.calls++
+	return f.result, f.err
 }
 
 type blockingStarter struct {
@@ -131,6 +740,11 @@ func writePolicyYAMLForTest(t *testing.T, path string, p *Policy) {
 			"pipeline:\n  default_template: mills-default-pipeline",
 			"pipeline:\n  auto_requeue: { include_code_config: true }\n  default_template: mills-default-pipeline", 1)
 	}
+	if p.Health.Enabled {
+		body = strings.Replace(body,
+			"pipeline:\n  default_template: mills-default-pipeline",
+			"health: { enabled: true, project: services/loom-core }\npipeline:\n  default_template: mills-default-pipeline", 1)
+	}
 	if p.Enabled != nil && !*p.Enabled {
 		body = "version: 1\nenabled: false\n" +
 			"budgets:\n  council:  { max_usd_per_run: 1, max_usd_per_day: 1 }\n  pipeline: { max_usd_per_run: 1, max_usd_per_day: 1 }\n" +
@@ -157,6 +771,109 @@ func TestReconciler_PolicyDisabledShortCircuits(t *testing.T) {
 	}
 	if env.starter.calls() != 0 {
 		t.Errorf("starter should not be invoked when policy is off")
+	}
+}
+
+func TestReconciler_FactoryGaugesRideTickOnlyWhenHealthEnabled(t *testing.T) {
+	// Default-off must leave the operator byte-identical: no extra store
+	// reads and no gauge mutations on the tick path. The capacity gauge is
+	// the witness — a refresh always sets it to the policy cap, so a
+	// surviving sentinel proves the refresh never ran.
+	const sentinel = -1
+
+	RunsCapacity.Set(sentinel)
+	env := newRecEnv(t, nil) // health omitted → disabled
+	if _, err := env.rec.Tick(context.Background()); err != nil {
+		t.Fatalf("tick (health off): %v", err)
+	}
+	if got := testutil.ToFloat64(RunsCapacity); got != sentinel {
+		t.Fatalf("health disabled: RunsCapacity = %v, want untouched sentinel", got)
+	}
+
+	RunsCapacity.Set(sentinel)
+	envOn := newRecEnv(t, func(p *Policy) {
+		p.Health.Enabled = true
+		p.Health.Project = "services/loom-core"
+	})
+	if _, err := envOn.rec.Tick(context.Background()); err != nil {
+		t.Fatalf("tick (health on): %v", err)
+	}
+	if got := testutil.ToFloat64(RunsCapacity); got == sentinel {
+		t.Fatal("health enabled: RunsCapacity still at sentinel — factory gauges never refreshed")
+	}
+}
+
+func TestReconciler_RankedOrderAndStrictFIFOFallback(t *testing.T) {
+	env := newRecEnv(t, nil)
+	a := &store.BacklogItem{ID: "a", PlanID: "plan-a", Priority: store.P2}
+	b := &store.BacklogItem{ID: "b", PlanID: "plan-b", Priority: store.P2}
+	fifo := []*store.BacklogItem{a, b}
+	p := Default()
+	p.Pipeline.RankerEnabled = true
+	p.Pipeline.RankerMaxCandidates = 2
+	p.Pipeline.RankerMaxCost = 2
+	fake := &fakeRanker{result: RankingResult{Items: []*store.BacklogItem{b, a}, CandidatesEvaluated: 2, Cost: 2}}
+	env.rec.Ranker = fake
+	got, evaluated, cost := env.rec.rankQueued(context.Background(), fifo, p)
+	if order := ids(got); order[0] != "b" || evaluated != 2 || cost != 2 || fake.calls != 1 {
+		t.Fatalf("ranked order/accounting = %v %d %.1f calls=%d", order, evaluated, cost, fake.calls)
+	}
+	fake.err = errors.New("ranker unavailable")
+	fake.result = RankingResult{}
+	got, _, _ = env.rec.rankQueued(context.Background(), fifo, p)
+	if got[0] != fifo[0] || got[1] != fifo[1] {
+		t.Fatalf("fallback mutated FIFO: %v", ids(got))
+	}
+	fake.err = nil
+	fake.result = RankingResult{Items: []*store.BacklogItem{b, a}, CandidatesEvaluated: 2, Cost: 3}
+	got, _, _ = env.rec.rankQueued(context.Background(), fifo, p)
+	if got[0] != fifo[0] || got[1] != fifo[1] {
+		t.Fatalf("cost-cap fallback mutated FIFO: %v", ids(got))
+	}
+	fake.err = context.DeadlineExceeded
+	fake.result = RankingResult{}
+	got, _, _ = env.rec.rankQueued(context.Background(), fifo, p)
+	if got[0] != fifo[0] || got[1] != fifo[1] {
+		t.Fatalf("timeout fallback mutated FIFO: %v", ids(got))
+	}
+	events, err := env.store.Events.ListSince(context.Background(), time.Time{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Kind == "reconciler.ranker_fallback" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing structured ranker fallback event")
+	}
+}
+
+func TestReconciler_RankerCannotInvertPriorityOrSubstituteCandidates(t *testing.T) {
+	env := newRecEnv(t, nil)
+	p0 := &store.BacklogItem{ID: "p0", PlanID: "plan", Priority: store.P0}
+	p1 := &store.BacklogItem{ID: "p1", PlanID: "plan", Priority: store.P1}
+	fifo := []*store.BacklogItem{p0, p1}
+	p := Default()
+	p.Pipeline.RankerEnabled = true
+	p.Pipeline.RankerMaxCandidates = 2
+	p.Pipeline.RankerMaxCost = 2
+	fake := &fakeRanker{result: RankingResult{
+		Items: []*store.BacklogItem{p1, p0}, CandidatesEvaluated: 2, Cost: 2,
+	}}
+	env.rec.Ranker = fake
+
+	got, _, _ := env.rec.rankQueued(context.Background(), fifo, p)
+	if got[0] != p0 || got[1] != p1 {
+		t.Fatalf("priority inversion did not fall back to FIFO: %v", ids(got))
+	}
+
+	fake.result.Items = []*store.BacklogItem{p0, p0}
+	got, _, _ = env.rec.rankQueued(context.Background(), fifo, p)
+	if got[0] != p0 || got[1] != p1 {
+		t.Fatalf("candidate substitution did not fall back to FIFO: %v", ids(got))
 	}
 }
 
@@ -327,6 +1044,78 @@ func TestReconciler_StampsOperatorSessionOnStartedRun(t *testing.T) {
 	}
 	if started.ParentSessionID != "session-op-1" {
 		t.Errorf("starter run ParentSessionID = %q, want session-op-1", started.ParentSessionID)
+	}
+}
+
+func TestReconciler_AdmissionPagesPastDependencyBlockedHeads(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	blocker := &store.BacklogItem{ID: "BLOCKER", Title: "blocker", State: store.BacklogEscalated, Priority: store.P1, CreatedBy: "test"}
+	if err := env.store.Backlog.Put(ctx, blocker); err != nil {
+		t.Fatal(err)
+	}
+	for i := range queuedAdmissionBatchSize(env.policy.Current()) {
+		item := &store.BacklogItem{ID: fmt.Sprintf("BLOCKED-%02d", i), Title: "blocked", State: store.BacklogQueued, Priority: store.P1, CreatedBy: "test", Dependencies: []string{blocker.ID}}
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ready := &store.BacklogItem{ID: "READY-BEHIND-HEADS", Title: "ready", State: store.BacklogQueued, Priority: store.P1, CreatedBy: "test"}
+	if err := env.store.Backlog.Put(ctx, ready); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := env.rec.Tick(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Started != 1 || res.Deferred != 4 || res.Inspected != 5 {
+		t.Fatalf("tick = %+v, want started=1 deferred=4 inspected=5", res)
+	}
+}
+
+func TestReconciler_AdmissionAllBlockedQueueTerminatesAtExhaustion(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	blocker := &store.BacklogItem{ID: "ALL-BLOCKER", Title: "blocker", State: store.BacklogEscalated, Priority: store.P1, CreatedBy: "test"}
+	if err := env.store.Backlog.Put(ctx, blocker); err != nil {
+		t.Fatal(err)
+	}
+	const blocked = 9
+	for i := range blocked {
+		item := &store.BacklogItem{ID: fmt.Sprintf("ALL-BLOCKED-%02d", i), Title: "blocked", State: store.BacklogQueued, Priority: store.P1, CreatedBy: "test", Dependencies: []string{blocker.ID}}
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res, err := env.rec.Tick(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Started != 0 || res.Deferred != blocked || res.Inspected != blocked {
+		t.Fatalf("tick = %+v, want started=0 deferred/inspected=%d", res, blocked)
+	}
+}
+
+func TestReconciler_AdmissionPagingRespectsConcurrencyCap(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	const queued = 10
+	for i := range queued {
+		item := &store.BacklogItem{ID: fmt.Sprintf("READY-%02d", i), Title: "ready", State: store.BacklogQueued, Priority: store.P1, CreatedBy: "test"}
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res, err := env.rec.Tick(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := env.policy.Current().Budgets.Pipeline.MaxConcurrentRuns
+	if res.Started != cap || res.Inspected != cap || env.starter.calls() != cap {
+		t.Fatalf("tick=%+v starter_calls=%d, want cap=%d", res, env.starter.calls(), cap)
 	}
 }
 
@@ -655,15 +1444,43 @@ func TestReconciler_RespectsHumanReviewPolicy(t *testing.T) {
 	if err := env.store.Backlog.Put(ctx, item); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	// The hold must be its own tick outcome. A queue whose only item waits on
+	// a human hand-off previously counted as "skipped" every tick — the same
+	// label as policy-disabled / autonomy-blocked — and read as a dispatch
+	// outage (568/568 ticks on 2026-09-07).
+	beforeHeld := testutil.ToFloat64(ReconcileTicksTotal.WithLabelValues("held_human"))
+	beforeSkipped := testutil.ToFloat64(ReconcileTicksTotal.WithLabelValues("skipped"))
 	res, err := env.rec.Tick(ctx)
 	if err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if res.Skipped != 1 || res.Started != 0 {
-		t.Errorf("expected skipped=1 started=0, got %+v", res)
+	if res.HeldHuman != 1 || res.Skipped != 0 || res.Started != 0 {
+		t.Errorf("expected held_human=1 skipped=0 started=0, got %+v", res)
+	}
+	if got := testutil.ToFloat64(ReconcileTicksTotal.WithLabelValues("held_human")); got != beforeHeld+1 {
+		t.Errorf("held_human ticks = %v, want %v", got, beforeHeld+1)
+	}
+	if got := testutil.ToFloat64(ReconcileTicksTotal.WithLabelValues("skipped")); got != beforeSkipped {
+		t.Errorf("skipped ticks = %v, want unchanged %v", got, beforeSkipped)
 	}
 	if env.starter.calls() != 0 {
 		t.Errorf("starter must not run for human-review items")
+	}
+	// The durable event still records the policy reason so the ledger and
+	// the metric agree on why nothing started.
+	events, err := env.store.Events.ListSince(ctx, time.Time{}, 100)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	var sawHold bool
+	for _, ev := range events {
+		if ev.Kind == "reconciler.skipped" && ev.Payload["item"] == item.ID &&
+			ev.Payload["reason"] == "require_human_review=true" {
+			sawHold = true
+		}
+	}
+	if !sawHold {
+		t.Errorf("expected a reconciler.skipped policy event naming require_human_review, got %d events", len(events))
 	}
 }
 
@@ -1708,4 +2525,15 @@ func TestScheduler_DoubleRunErrors(t *testing.T) {
 		t.Errorf("expected error on second Run()")
 	}
 	sch.Stop()
+}
+
+func TestReconcilerSilentWatchdogBeforeAdmission(t *testing.T) {
+	env := newRecEnv(t, nil)
+	called := false
+	sentinel := errors.New("watchdog persistence failure")
+	env.rec.SweepSilentRuns = func(context.Context) error { called = true; return sentinel }
+	_, err := env.rec.Tick(context.Background())
+	if !called || !errors.Is(err, sentinel) {
+		t.Fatalf("watchdog called=%v err=%v", called, err)
+	}
 }

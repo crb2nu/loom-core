@@ -38,15 +38,9 @@ spec:
             # f26fa5da3ea96cd8, namespace loom-core/codebase-memory).
             - name: LOOM_MCP_OUTPUT_FORMAT
               value: json
-            - name: MORPH_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  key: MORPH_API_KEY
-                  name: loom-secrets
-            - name: MORPH_BASE_URL
-              value: https://api.morphllm.com/v1
-            - name: MORPH_EMBED_MODEL
-              value: morph-embedding-v3
+            # Embeddings: intentionally unset so pkg/codebase/config.go falls
+            # through to the FlexInfer defaults (flexinfer-proxy,
+            # embeddings-1536). The retired MORPH_* trio used to sit here.
             - name: QDRANT_API_KEY
               valueFrom:
                 secretKeyRef:

@@ -61,9 +61,11 @@ export interface FailureClassEntry {
 }
 
 // ModelEconomicsEntry attributes stage cost + reliability to one (model,
-// backend) tier over the window. Unattributed rows (historical, or a worker
-// that doesn't surface identity) arrive bucketed as model="unknown"/
-// backend="unknown" so the tier totals stay complete.
+// backend) tier over the window. Unattributed rows that carry cost
+// (historical, or a delegator that doesn't surface identity) arrive bucketed
+// as model="unknown"/backend="unknown" so the tier totals stay complete;
+// deterministic stages (tests, ci_watch, merge, … — no identity, no cost) are
+// not model calls and the DAO leaves them out of this array entirely.
 export interface ModelEconomicsEntry {
   model: string;
   backend: string;

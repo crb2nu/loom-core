@@ -2,7 +2,6 @@ package hud
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,7 +9,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/crb2nu/loom/internal/devbox/backend"
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/spawn"
 )
@@ -30,36 +28,6 @@ func (o *SpawnOrchestrator) finishStoppedSpawn(ctx context.Context, state *Spawn
 			summarize := false
 			o.agentBridge.EndSession(bridge.SessionEndParams{AgentID: agentID, Summarize: &summarize})
 		}(state.AgentID)
-	}
-}
-
-func (o *SpawnOrchestrator) cleanupLateSpawn(
-	be backend.Backend,
-	spawnID, containerID string,
-	owner *spawnDriverOwner,
-) {
-	if be == nil || containerID == "" {
-		return
-	}
-	_, _, persistPodErr := o.ctrl.RecordStoppingPod(context.Background(), spawnID, containerID)
-	if persistPodErr != nil {
-		o.setStopCleanupError(spawnID, owner, persistPodErr)
-	}
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	state, ok := o.ctrl.Get(spawnID)
-	if !ok {
-		o.setStopCleanupError(spawnID, owner, fmt.Errorf("clean up spawn pod %s: state not found", containerID))
-		return
-	}
-	if err := o.stopSpawnRuntime(cleanupCtx, be, state, containerID); err != nil {
-		wrapped := fmt.Errorf("clean up spawn pod returned after cancellation: %w", err)
-		_, _, persistFailureErr := o.ctrl.RecordStopCleanupFailure(context.Background(), spawnID, containerID, wrapped.Error())
-		o.setStopCleanupError(spawnID, owner, errors.Join(wrapped, persistFailureErr))
-		if o.logger != nil {
-			o.logger.Warn("failed to clean up spawn pod returned after cancellation",
-				"spawn_id", spawnID, "pod", containerID, "error", err)
-		}
 	}
 }
 
@@ -280,26 +248,4 @@ func spawnGenerationMatches(left, right *spawn.State) bool {
 		left.DriverOwnerID == right.DriverOwnerID &&
 		left.Request.IdempotencyKey == right.Request.IdempotencyKey &&
 		left.StartedAt.Equal(right.StartedAt)
-}
-
-func (o *SpawnOrchestrator) stopSpawnRuntime(
-	ctx context.Context,
-	be backend.Backend,
-	state *spawn.State,
-	runtimeName string,
-) error {
-	if be == nil {
-		return errors.New("no substrate backend")
-	}
-	if state == nil || state.DriverOwnerID == "" {
-		return be.Stop(ctx, runtimeName)
-	}
-	stopper, ok := be.(backend.IdentityStopper)
-	if !ok {
-		return fmt.Errorf(
-			"shared spawn runtime cleanup: backend cannot conditionally stop %s",
-			runtimeName,
-		)
-	}
-	return stopper.StopIfIdentity(ctx, runtimeName, spawn.RuntimeIdentityLabelsForState(state))
 }

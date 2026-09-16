@@ -42,7 +42,7 @@ type safetyInMemoryActivity struct {
 func durableCountsIdleForWorkflow(counts store.QuiescenceCounts, expected int) bool {
 	return counts.QueuedBacklog == 0 && counts.ActivePipelineRuns == 0 &&
 		counts.ActiveWorkflowRuns == expected && counts.ActiveSpinningRoomRuns == 0 &&
-		counts.ActiveCouncilRuns == 0 && counts.ActiveCrossRepoRuns == 0 && counts.PendingDispatches == 0
+		counts.ActiveCouncilRuns == 0 && counts.PendingDispatches == 0
 }
 
 func (a safetyInMemoryActivity) Quiescent() bool {

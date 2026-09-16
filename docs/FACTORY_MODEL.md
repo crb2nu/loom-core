@@ -9,7 +9,8 @@ doc set (`.loom/130–135`), and a dozen shipped-MR trails. When a subsystem doc
 and this map disagree, fix whichever is stale — this file is the index, not a
 fork.
 
-Last full reconciliation: 2026-08-01.
+Last full reconciliation: 2026-09-10 (junction statuses in §4 and the
+sequence in §5; §2–§3 inventory last swept 2026-08-01).
 
 ## 1. The line
 
@@ -62,7 +63,7 @@ Everything below is merged and live unless marked otherwise.
 | **Engram tech tree** | proven techniques | Tier-1 engrams seeded from patterns (10), prerequisite DAG, proof contracts; `agent_engram_*` tools | !836, !911 |
 | **Weaving (pipeline)** | shuttle + reed | `pkg/mills/pipeline/` — research → plan_slice → implement → gates → mr → ci_watch → merge → cleanup; scope envelopes + amendment, keyed stage spawns, carry-forward diffs, health-gate admission (observe), escalation classification + auto-requeue | continuous |
 | **Weaving (workflow programs)** | jacquard loom | `pkg/mills/workflow/` — Starlark imperative runtime, durable memoized-step journal, exactly-once spawn across dual crash (S1c 3/3), `implement-gate@v1` template, `ClaimWorkflowStart` kernel; **lane LIVE 2026-08-01**, first production run succeeded | !645–!663, !1339–!1355 |
-| **Overseers** | overlookers walking the alley | `pkg/mills/overseer/` — groomer (dedup/zombie/stale), sentinel (probes + admission suppression), foreman (stuck/throughput/storm/burn rules); guarded auto-act substrate extracted to `pkg/mills/guard` (harness + audit recorder, default dry-run; council mutator = second consumer, actor `council.mutator`); observability via `mills_overseer_*` metrics (ticks, actions by mode, suppression gauge) | !1170–!1174, soak live 2026-08-01 |
+| **Overseers** | overlookers walking the alley | `pkg/mills/overseer/` — groomer (dedup/zombie/stale), sentinel (probes + admission suppression), foreman (stuck/throughput/storm/burn rules), shepherd (escalated-shelf drain: bounded relaunch of auto-requeue-unreachable escalations + closed-MR orphan attention); guarded auto-act substrate extracted to `pkg/mills/guard` (harness + audit recorder, default dry-run; council mutator = second consumer, actor `council.mutator`); observability via `mills_overseer_*` metrics (ticks, actions by mode, suppression gauge) | !1170–!1174, soak live 2026-08-01 |
 | **Mill-floor views** | windows onto the floor | Factory panel (loom animation, bolt archive, andon, departure board, creel, fuel gauge, shift report, pattern shelf), Warps/Shuttles/Sparks/Bolts views, Operator Deck, iOS companion Mills tab | !1008–!1040, !1210, !1248 |
 | **Demand intakes** | bale breaking | plan-slice emitter (`psl-*` items), canary scheduler, GitLab-issue import, REST enqueue (stamp `enqueue:true`), plan→repo bootstrap, roadmap intents | various |
 | **Governance** | line shaft + governor | GitOps policy ConfigMap (frames, budgets, gates, overseers; **every edit needs a policy-checksum bump**), budget enforcer with escalation-class discounting, kill-switch | continuous |
@@ -100,21 +101,26 @@ The pieces above work; what makes the factory feel scattered is that the
 **connections between them** were never built. Six junctions, ordered by
 leverage:
 
-### J1 — Spinning Room ⊥ Pattern Loom (pattern-first spinning)
+### J1 — Spinning Room ⊥ Pattern Loom (pattern-first spinning) — **HALF BUILT**
 
-The factory has two demand front-doors that don't know about each other: spins
-author **free-form** plans (the spinner never consults the catalog), and
-pattern stamps go through a separate HUD path that skips ideation entirely.
-The 2026-07-03 brainstorm named the combination explicitly ("choosing a frame
-also chooses card constraints") and it was never built. `pkg/mills/spin/spin.go`
-has zero pattern references; `clients.PatternClient.ListApprovedPatterns`
-already exists (council A1 uses it).
+The factory had two demand front-doors that didn't know about each other:
+spins author **free-form** plans (the spinner never consults the catalog),
+and pattern stamps went through a separate HUD path that skips ideation
+entirely. The 2026-07-03 brainstorm named the combination explicitly
+("choosing a frame also chooses card constraints").
 
-**Build**: the spin request gains an optional `pattern_id`; the SpinPlanDialog
-offers the approved catalog ("spin on this card"). A patterned spin extracts
-materials from the brief, runs the stamp core for structure (pins, slice
-template, gauge), and uses the frame model only to fill the pattern's open
-axes. Free-form spinning remains the fallback for unpatterned work.
+**Built (front door, 2026-08-01 `5daca548`, consolidated 2026-08-30
+`b91513df`)**: the SpinPlanDialog has a `pattern` mode next to the classic
+`free` mode — pick an approved card from the shared `patternsStore`
+(`PatternCardPicker`), fill its materials (`PatternMaterialsFields`), stamp.
+One dialog, both doors.
+
+**Still open (the spinning half)**: `pkg/mills/spin/spin.go` still has zero
+pattern references. A patterned *spin* — extract materials from the brief,
+run the stamp core for structure (pins, slice template, gauge), use the frame
+model only to fill the pattern's open axes — is unbuilt, and per §6 stays
+behind catalog coverage: at ~5% coverage of real demand the dialog's pattern
+mode is the honest scope.
 
 ### J2 — Green merges don't feed the taste gate (auto-harvest) — **SHIPPED 2026-08-01**
 
@@ -137,7 +143,7 @@ merged-instance tree (or the verify moves operator-side behind a trusted
 seam). Also unharvested: a stamped plan advanced to merged by an agent rather
 than by take-up.
 
-### J3 — Patterns don't compile to workflow programs (dobby/jacquard cards)
+### J3 — Patterns don't compile to workflow programs (dobby/jacquard cards) — **NOT STARTED**
 
 Patterns produce prose slices executed by the general pipeline; the workflow
 engine executes hand-written templates (`implement-gate@v1`). F8's tiering —
@@ -152,23 +158,62 @@ authoring was deliberately deferred "until a proven live run" — satisfied
 `ClaimWorkflowStart`. Start with one card (e.g. changelog-fragment/docs-drift
 class), measure merge rate vs the pipeline lane.
 
-### J4 — Cloth Hall (grading feeds nothing)
+### J4 — Cloth Hall (grading feeds nothing) — **SHIPPED 2026-08-13 (S1–S4)**
 
-Eval verdicts and KPI snapshots exist, but the operator's judgment never
-re-enters the system, and eval grades don't route future work. One-tap
-grading (keep / meh / regret + one line) on bolts — surfaces already exist
-(BoltArchive, ShiftReport, Operator Deck) — stored on the plan/backlog item,
-consumed by squad routing weights and pattern taste.
+Eval verdicts and KPI snapshots existed, but the operator's judgment never
+re-entered the system, and eval grades didn't route future work.
 
-### J5 — Finishing House (merged ≠ delivered)
+**Built** (taste-gated demand epic, `.loom/195-plan-taste-gated-demand-autonomy-2026-08-12.md`):
+one-tap grading (keep / meh / regret + one line) on bolts —
+`POST /api/mills/pipeline/runs/{id}/grade`, `pkg/mills/run_grade.go`
+(S1 !1582); the one-tap UI on the Factory surfaces (S2 !1585); taste
+aggregates with a rolling-14d coverage ratio, a guarded squad-routing blend
+and record-only pattern grades (S3 !1594); workspace-signal verification
+(S4 !1596). The bolt-card read model (`pkg/mills/boltcard`, 2026-08-22) and
+the server shift ledger (`GET /api/mills/shift-report`, `pkg/mills/shiftreport`,
+!1780 2026-09-01) put grades in context. Coverage went 0% → 85.6% in the
+2026-08-15 catch-up batch; the operator's standing policy is
+best-instance-per-theme keep, duplicate re-proposals regret.
+
+**Still open**: S5 ranked-dispatch extension and S6 outcome-grade writeback
+hold for the 14-day grade-coverage soak (≥60% gate); grade-in-context web
+(S3 web) is queued and retires the triplicated TS shift derivation; grade
+calibration (S4 calibration) is escalated; items merged without a pipeline
+run have no grade endpoint (item-level grading is a known gap).
+
+### J5 — Finishing House (merged ≠ delivered) — **BUILT**
 
 The line ends at merge + eval. Deploy verification (did Flux actually roll the
 image the merge produced?), docs freshness, and a finished-goods digest are
-ad-hoc. The shift report proved deterministic narrative works — extend it:
-per-bolt deploy confirmation (image tag observed live) and a daily finished-
-goods digest. No LLM required.
+ad-hoc.
 
-### J6 — Carding (demand refinement stays manual)
+**Built**: the deployment-aware dependency gate — the reconciler holds a
+queued item whose merged dependency changed operator code until that merge
+commit is an ancestor of the running operator build
+(`Reconciler.OperatorBuildSHA`, `gitIsAncestor`, hold reason
+`dependency_undeployed`). And, since 2026-09-10 (!1894, slice S2), the
+docs-freshness departure: the operator compares Git blob IDs of `docs/`
+against the flexinfer-site mirror hourly; missing and stale files appear in
+the shift ledger and as Prometheus metrics, an unavailable source or API is
+reported as `unknown` and never blocks the ledger, and sync remains an
+explicit human or agent action in the site repository
+(`docs/FLEXINFER_SITE_INTEGRATION.md`).
+
+**Built (S1, 2026-09-11)**: per-bolt deploy confirmation in the shift ledger
+— each merged home-project bolt is compared with the running operator build
+and reports `live`, `pending`, or `unknown` deployment evidence, reusing the
+reconciler's git-ancestry gate; gauges `mills_finishing_bolts_pending` and
+`mills_finishing_bolts_unknown`.
+
+**Built (S3, 2026-09-16)**: the daily finished-goods digest.
+`pkg/mills/finishing/digest` composes it deterministically from the shared
+24-hour shift-report composer; the operator appends it once per UTC day to
+the event ledger (`finishing.digest`), delivers it through the reconciler's
+digest and mobile push hooks, and serves it — read, and admin rerun of a
+completed day — through the operator and HUD proxy APIs
+(`docs/MILLS_RUNBOOK.md`, "Finished-goods digest"). No LLM is used.
+
+### J6 — Carding (demand refinement stays manual) — **NOT STARTED, EVIDENCE-GATED**
 
 Intakes exist but nothing continuously turns raw fiber (TODOs, flaky tests,
 docs drift, audit findings, renovate leftovers) into combed, value-gated
@@ -201,13 +246,16 @@ systems, not a new system. Sequence reflects the §6 kill-test result
    green instance after human force-promote.
 3. **J3 dobby cards** — compile the proven cards to frozen workflow
    selections on the imperative lane; measure merge rate vs the pipeline
-   lane.
-4. **J1 pattern-first spinning** (connects the two front-doors) — spin
-   `pattern_id` + dialog picker + stamp-guided drafting, once the catalog
-   demonstrably covers demand.
-5. **J4 cloth-hall grading** (cheap; surfaces exist; can run in parallel
-   with 2–4) — grade storage + display; routing consumption can trail.
-6. **J5 finishing** (independent; do when deploy-verify pain next bites).
+   lane. **Not started.**
+4. **J1 pattern-first spinning** (connects the two front-doors) — **dialog
+   picker SHIPPED 2026-08-01**; the stamp-guided *spin* stays behind catalog
+   coverage (§6).
+5. **J4 cloth-hall grading** — **SHIPPED 2026-08-13 (S1–S4)**; S5/S6 hold
+   for the grade-coverage soak.
+6. **J5 finishing** — **SHIPPED 2026-09-16 (S1–S3)**: the deploy-verify pain
+   bit, and the docs mirror drifted unnoticed. Three deterministic slices,
+   each a shift-ledger departure: per-bolt deploy confirmation (S1),
+   docs-freshness drift (S2), daily finished-goods digest (S3).
 7. **J6 carding** (evidence-gated; only on sustained empty-beam days).
 
 ## 6. Riskiest assumption + kill-test

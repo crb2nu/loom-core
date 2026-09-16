@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/httpclient"
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 )
 
@@ -79,7 +81,23 @@ type GitLabClient struct {
 	// headObserveInterval is the poll cadence ObserveHead uses while a rebase
 	// is in flight. Zero resolves to headObserveDefaultInterval (2s); tests
 	// shorten it so a settle-deadline case stays sub-second.
-	headObserveInterval time.Duration
+	headObserveInterval  time.Duration
+	defaultBranches      *defaultBranchCache
+	resolveDefaultBranch bool
+	// commitTrees memoizes tree-equality verdicts between commit pairs per
+	// project (commit trees are immutable); the merge queue's proof scan
+	// (gitlab_mergequeue.go) would otherwise re-compare on every 15s tick.
+	commitTrees *commitTreeCache
+}
+
+type commitTreeCache struct {
+	mu    sync.Mutex
+	trees map[string]string
+}
+
+type defaultBranchCache struct {
+	mu       sync.Mutex
+	branches map[string]string
 }
 
 // GitLabHTTPError preserves status while retaining the historical error text.
@@ -149,7 +167,12 @@ func NewGitLabClient(cfg GitLabConfig) (*GitLabClient, error) {
 	// another mutation. This also keeps POST/DELETE behavior explicit.
 	hcfg.MaxRetries = 0
 	c := httpclient.New(hcfg)
-	return &GitLabClient{cfg: cfg, http: c}, nil
+	return &GitLabClient{
+		cfg:             cfg,
+		http:            c,
+		defaultBranches: &defaultBranchCache{branches: make(map[string]string)},
+		commitTrees:     &commitTreeCache{trees: make(map[string]string)},
+	}, nil
 }
 
 // HeadSHADeadline and BranchPipelineDeadline expose the two ci_watch bounds
@@ -211,6 +234,35 @@ func (c *GitLabClient) requestJSON(ctx context.Context, method, path string, bod
 	return nil
 }
 
+func (c *GitLabClient) requestText(ctx context.Context, path string, limit int64) (string, error) {
+	full := strings.TrimRight(c.cfg.APIURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: new request: %w", err)
+	}
+	req.Header.Set("PRIVATE-TOKEN", c.cfg.Token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: GET %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	buf, readErr := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if readErr != nil {
+		return "", fmt.Errorf("gitlab: read %s: %w", path, readErr)
+	}
+	if resp.StatusCode >= 400 {
+		return "", &GitLabHTTPError{Method: http.MethodGet, Path: path, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(buf))}
+	}
+	text := string(buf)
+	// The unit-test transport JSON-encodes scalar payloads; accept that shape
+	// while production continues to consume GitLab's text/plain trace.
+	var decoded string
+	if json.Unmarshal(buf, &decoded) == nil {
+		text = decoded
+	}
+	return text, nil
+}
+
 // ForProject returns a client scoped to a different GitLab project path, for
 // per-item cross-repo routing (a backlog item's TargetProject). An empty
 // project or the current project returns the receiver unchanged. The HTTP
@@ -225,6 +277,7 @@ func (c *GitLabClient) ForProject(project string) *GitLabClient {
 	}
 	cp := *c
 	cp.cfg.Project = project
+	cp.resolveDefaultBranch = true
 	return &cp
 }
 
@@ -237,6 +290,55 @@ func (c *GitLabClient) projectPath() string {
 	return url.PathEscape(c.cfg.Project)
 }
 
+// BranchHeadSHA returns the commit currently at branch in project.
+func (c *GitLabClient) BranchHeadSHA(ctx context.Context, project, branch string) (string, error) {
+	client := c.ForProject(project)
+	path := fmt.Sprintf("/projects/%s/repository/branches/%s", client.projectPath(), url.PathEscape(branch))
+	var response struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	if err := client.requestJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return "", fmt.Errorf("gitlab: resolve branch head %q: %w", branch, err)
+	}
+	sha := strings.TrimSpace(response.Commit.ID)
+	if sha == "" {
+		return "", fmt.Errorf("gitlab: resolve branch head %q: response missing commit.id", branch)
+	}
+	return sha, nil
+}
+
+// DefaultBranch returns the project's configured default branch. Results are
+// cached across clients derived with ForProject so concurrent cross-repository
+// work performs at most one metadata lookup per target project.
+func (c *GitLabClient) DefaultBranch(ctx context.Context) (string, error) {
+	cache := c.defaultBranches
+	if cache == nil {
+		cache = &defaultBranchCache{branches: make(map[string]string)}
+		c.defaultBranches = cache
+	}
+	key := c.cfg.Project
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if branch := cache.branches[key]; branch != "" {
+		return branch, nil
+	}
+	var project struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	path := fmt.Sprintf("/projects/%s", c.projectPath())
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &project); err != nil {
+		return "", fmt.Errorf("gitlab: resolve default branch for %q: %w", key, err)
+	}
+	project.DefaultBranch = strings.TrimSpace(project.DefaultBranch)
+	if project.DefaultBranch == "" {
+		return "", fmt.Errorf("gitlab: project %q returned an empty default_branch", key)
+	}
+	cache.branches[key] = project.DefaultBranch
+	return project.DefaultBranch, nil
+}
+
 // MRState returns a merge request's lifecycle state ("opened", "merged",
 // "closed", "locked") by IID. Read-only; the take-up reconciler polls this to
 // true plan/slice phases to MR reality.
@@ -247,6 +349,30 @@ func (c *GitLabClient) MRState(ctx context.Context, mrIID int64) (string, error)
 		return "", err
 	}
 	return mr.State, nil
+}
+
+// MergedSHAForMR returns the commit that landed a MERGED merge request, with
+// the same identity precedence the merge stage applies (merged_commit_sha,
+// merge_commit_sha, squash_commit_sha, then sha). The reconciler's
+// deployment-aware dependency gate calls it once per merged dependency whose
+// run left no merged_sha artifact; an open or closed MR is an error, not "".
+func (c *GitLabClient) MergedSHAForMR(ctx context.Context, mrIID int64) (string, error) {
+	if mrIID <= 0 {
+		return "", errors.New("gitlab: positive MR IID required")
+	}
+	mr, err := c.getMR(ctx, mrIID)
+	if err != nil {
+		return "", err
+	}
+	if mr.State != "merged" {
+		return "", fmt.Errorf("gitlab: mr %d state %q, want merged", mrIID, mr.State)
+	}
+	for _, sha := range []string{mr.MergedCommitSHA, mr.MergeCommitSHA, mr.SquashCommitSHA, mr.SHA} {
+		if sha = strings.TrimSpace(sha); sha != "" {
+			return sha, nil
+		}
+	}
+	return "", fmt.Errorf("gitlab: merged mr %d has no authoritative commit identity", mrIID)
 }
 
 // VerifyMR confirms that an MR GET in this client's exact project returns the
@@ -304,6 +430,8 @@ type createMRBody struct {
 type mrResponse struct {
 	IID          int64      `json:"iid"`
 	WebURL       string     `json:"web_url"`
+	Title        string     `json:"title"`
+	Draft        bool       `json:"draft"`
 	State        string     `json:"state"`
 	HeadPipeline mrHeadPipe `json:"head_pipeline"`
 	// MergeStatus is GitLab's legacy mergeability summary and
@@ -337,6 +465,13 @@ type mrHeadPipe struct {
 
 // CreateMR implements pipeline.GitLabClient.
 func (c *GitLabClient) CreateMR(ctx context.Context, req pipeline.CreateMRRequest) (pipeline.CreateMRResponse, error) {
+	if c.resolveDefaultBranch {
+		defaultBranch, err := c.DefaultBranch(ctx)
+		if err != nil {
+			return pipeline.CreateMRResponse{}, fmt.Errorf("mr: target project default branch: %w", err)
+		}
+		req.TargetBranch = defaultBranch
+	}
 	// NB: req.AutoMerge is intentionally NOT mapped to MergeWhenPipelineSucceeds
 	// here. Arming MWPS at create time triggers a detached merge-request pipeline
 	// that this repo's workflow rules empty into a `failed` head pipeline,
@@ -354,7 +489,7 @@ func (c *GitLabClient) CreateMR(ctx context.Context, req pipeline.CreateMRReques
 		slog.Default().Info("mr: adopted existing", "mr_iid", existing.IID, "source_branch", req.SourceBranch)
 		return pipeline.CreateMRResponse{
 			MRIID: existing.IID, URL: existing.WebURL, Project: c.cfg.Project,
-			SourceBranch: req.SourceBranch, TargetBranch: req.TargetBranch, Adopted: true,
+			SourceBranch: req.SourceBranch, TargetBranch: req.TargetBranch, SHA: existing.SHA, Adopted: true,
 		}, nil
 	}
 
@@ -389,6 +524,7 @@ func (c *GitLabClient) CreateMR(ctx context.Context, req pipeline.CreateMRReques
 					Project:      c.cfg.Project,
 					SourceBranch: req.SourceBranch,
 					TargetBranch: req.TargetBranch,
+					SHA:          existing.SHA,
 					Adopted:      true,
 				}, nil
 			}
@@ -401,6 +537,7 @@ func (c *GitLabClient) CreateMR(ctx context.Context, req pipeline.CreateMRReques
 		Project:      c.cfg.Project,
 		SourceBranch: req.SourceBranch,
 		TargetBranch: req.TargetBranch,
+		SHA:          got.SHA,
 	}, nil
 }
 
@@ -566,12 +703,14 @@ func (c *GitLabClient) MergedMRForBranch(ctx context.Context, sourceBranch strin
 
 // shaPipeline is one entry of GET /projects/:id/pipelines?sha=.
 type shaPipeline struct {
-	ID     int64  `json:"id"`
-	SHA    string `json:"sha"`
-	Ref    string `json:"ref"`
-	Status string `json:"status"`
-	Source string `json:"source"`
-	WebURL string `json:"web_url"`
+	ID             int64    `json:"id"`
+	SHA            string   `json:"sha"`
+	Ref            string   `json:"ref"`
+	Status         string   `json:"status"`
+	Source         string   `json:"source"`
+	WebURL         string   `json:"web_url"`
+	Duration       *float64 `json:"duration"`
+	QueuedDuration *float64 `json:"queued_duration"`
 }
 
 type pipelineJob struct {
@@ -598,13 +737,41 @@ func (c *GitLabClient) failedJobs(ctx context.Context, pipelineID int64) ([]pipe
 		}
 		for _, job := range jobs {
 			if job.Status == "failed" && !job.Retried {
-				failed = append(failed, pipeline.FailedJob{ID: job.ID, Name: job.Name, FailureReason: job.FailureReason})
+				trace, traceErr := c.requestText(ctx, fmt.Sprintf("/projects/%s/jobs/%d/trace", c.projectPath(), job.ID), 256<<10)
+				if traceErr != nil {
+					trace = ""
+				} // names still permit the safer subset match
+				failed = append(failed, pipeline.FailedJob{ID: job.ID, Name: job.Name, FailureReason: job.FailureReason, Trace: trace})
 			}
 		}
 		if len(jobs) < perPage {
 			return failed, nil
 		}
 	}
+}
+
+// LatestPipelineForRef returns the newest pipeline for a target ref and its
+// current failed jobs when (and only when) that pipeline is red.
+func (c *GitLabClient) LatestPipelineForRef(ctx context.Context, ref string) (pipeline.BaselinePipeline, error) {
+	path := fmt.Sprintf("/projects/%s/pipelines?ref=%s&order_by=id&sort=desc&per_page=1", c.projectPath(), url.QueryEscape(ref))
+	var pipelines []shaPipeline
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &pipelines); err != nil {
+		return pipeline.BaselinePipeline{}, err
+	}
+	if len(pipelines) == 0 {
+		return pipeline.BaselinePipeline{}, nil
+	}
+	p := pipelines[0]
+	result := pipeline.BaselinePipeline{Status: p.Status, URL: p.WebURL}
+	if p.Status != "failed" {
+		return result, nil
+	}
+	jobs, err := c.failedJobs(ctx, p.ID)
+	if err != nil {
+		return pipeline.BaselinePipeline{}, err
+	}
+	result.FailedJobs = jobs
+	return result, nil
 }
 
 func (c *GitLabClient) failedJobReasons(ctx context.Context, pipelineID int64) ([]string, error) {
@@ -632,8 +799,9 @@ func (c *GitLabClient) RetryJob(ctx context.Context, jobID int64) error {
 // budget across its one eligible terminal-job rescue.
 func (c *GitLabClient) PipelinePollDeadline() time.Duration { return c.cfg.PollDeadline }
 
-// PollPipeline implements pipeline.GitLabClient. It resolves the *branch*
-// pipeline for the MR's head SHA and polls its state until terminal.
+// PollPipeline implements pipeline.GitLabClient. It prefers the push pipeline
+// for the MR's head SHA, falling back to the exact MR-event pipeline when the
+// project does not create push pipelines, and polls its state until terminal.
 //
 // It deliberately does NOT poll mr.head_pipeline: when an MR is opened on a
 // repo whose `workflow.rules` block merge_request_event pipelines (loom-core
@@ -673,6 +841,8 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 	// directly actionable (a human can open the stuck pipeline) instead of
 	// leaving the operator to hunt for it (escalations #149/#153).
 	var lastPipelineURL string
+	var lastPipelineID int64
+	var pipelineObservedAt time.Time
 	// lastStatus is the most recent NON-terminal branch pipeline status observed
 	// (running/pending/created). Surfaced on the timeout response so the ci_watch
 	// stage can log the actual state while extending the watch. (S3)
@@ -694,7 +864,7 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 	// ci_watch stage appended an empty tail and the escalation lost the very
 	// poll history that explains the failure.
 	partialResp := func() pipeline.PollPipelineResponse {
-		return pipeline.PollPipelineResponse{LogTail: logTail.String(), PipelineURL: lastPipelineURL, LastStatus: lastStatus}
+		return pipeline.PollPipelineResponse{LogTail: logTail.String(), PipelineURL: lastPipelineURL, PipelineID: lastPipelineID, PipelineObservedAt: pipelineObservedAt, LastStatus: lastStatus}
 	}
 	timeoutResp := func() (pipeline.PollPipelineResponse, error) {
 		urlNote := ""
@@ -706,7 +876,7 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 		// default ClassCode. See pipeline.ErrPipelinePollTimeout. PipelineURL /
 		// LastStatus let the ci_watch stage extend the watch and, at its hard
 		// cap, key the external-dependency stall on the stuck pipeline. (S3)
-		return pipeline.PollPipelineResponse{Status: "timeout", LogTail: logTail.String(), PipelineURL: lastPipelineURL, LastStatus: lastStatus},
+		return pipeline.PollPipelineResponse{Status: "timeout", LogTail: logTail.String(), PipelineURL: lastPipelineURL, PipelineID: lastPipelineID, PipelineObservedAt: pipelineObservedAt, LastStatus: lastStatus},
 			fmt.Errorf("gitlab: pipeline poll timed out after %s%s: %w", c.cfg.PollDeadline, urlNote, pipeline.ErrPipelinePollTimeout)
 	}
 	for {
@@ -781,7 +951,7 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 				return partialResp(),
 					headSHAUnavailableError(mr, req.MRIID, waited, c.cfg.HeadSHADeadline)
 			}
-		} else if pipe, ok, err := c.branchPipelineForSHA(pollCtx, mr.SHA, mr.SourceBranch, "push"); err != nil {
+		} else if pipe, ok, err := c.pipelineForCIWatch(pollCtx, req, mr.SHA); err != nil {
 			if ctx.Err() != nil {
 				return partialResp(), ctx.Err()
 			}
@@ -789,9 +959,34 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 				return timeoutResp()
 			}
 			return partialResp(), err
-		} else if !ok {
-			// Only the spurious merge_request_event pipeline (or none) exists so
-			// far — keep polling until the branch pipeline appears, but BOUNDED.
+		} else if ok {
+			branchPipelinePendingSHA = ""
+			lastPipelineURL = pipe.WebURL
+			lastPipelineID = pipe.ID
+			if pipelineObservedAt.IsZero() {
+				pipelineObservedAt = time.Now().UTC()
+			}
+			lastStatus = pipe.Status
+			fmt.Fprintf(&logTail, "[%s] pipeline %d (%s) status=%s %s\n", time.Now().Format(time.RFC3339), pipe.ID, pipe.Source, pipe.Status, pipe.WebURL)
+			if terminal[pipe.Status] {
+				var failedJobReasons []string
+				var failedJobs []pipeline.FailedJob
+				if pipe.Status != "success" {
+					var jobErr error
+					failedJobs, jobErr = c.failedJobs(pollCtx, pipe.ID)
+					if jobErr != nil {
+						fmt.Fprintf(&logTail, "[%s] failed-job inspection unavailable: %v; retaining code classification\n", time.Now().Format(time.RFC3339), jobErr)
+						failedJobs = nil
+					} else {
+						for _, job := range failedJobs {
+							failedJobReasons = append(failedJobReasons, job.FailureReason)
+						}
+					}
+				}
+				return pipeline.PollPipelineResponse{Status: pipe.Status, Project: c.cfg.Project, SourceBranch: mr.SourceBranch, TargetBranch: mr.TargetBranch, SHA: mr.SHA, LogTail: logTail.String(), PipelineURL: pipe.WebURL, PipelineID: pipe.ID, PipelineObservedAt: pipelineObservedAt, FailedJobReasons: failedJobReasons, FailedJobs: failedJobs}, nil
+			}
+		} else {
+			// Neither supported pipeline exists yet. Keep polling, but BOUNDED.
 			// GitLab enqueues a push pipeline as part of accepting the push, so a
 			// head that still has none minutes later is a project-configuration
 			// state no re-poll can change (workflow:rules admitting only
@@ -818,48 +1013,28 @@ func (c *GitLabClient) PollPipeline(ctx context.Context, req pipeline.PollPipeli
 					mr, req.MRIID, waited, c.cfg.BranchPipelineDeadline,
 					c.pipelineDigestForSHA(pollCtx, mr.SHA))
 			}
-		} else {
-			branchPipelinePendingSHA = ""
-			lastPipelineURL = pipe.WebURL
-			lastStatus = pipe.Status
-			fmt.Fprintf(&logTail, "[%s] pipeline %d (%s) status=%s %s\n", time.Now().Format(time.RFC3339), pipe.ID, pipe.Source, pipe.Status, pipe.WebURL)
-			if terminal[pipe.Status] {
-				var failedJobReasons []string
-				var failedJobs []pipeline.FailedJob
-				if pipe.Status != "success" {
-					var jobErr error
-					failedJobs, jobErr = c.failedJobs(pollCtx, pipe.ID)
-					if jobErr != nil {
-						fmt.Fprintf(&logTail, "[%s] failed-job inspection unavailable: %v; retaining code classification\n", time.Now().Format(time.RFC3339), jobErr)
-						failedJobReasons = nil
-						failedJobs = nil
-					} else {
-						for _, job := range failedJobs {
-							failedJobReasons = append(failedJobReasons, job.FailureReason)
-						}
-					}
-				}
-				return pipeline.PollPipelineResponse{
-					Status:           pipe.Status,
-					Project:          c.cfg.Project,
-					SourceBranch:     mr.SourceBranch,
-					TargetBranch:     mr.TargetBranch,
-					SHA:              mr.SHA,
-					LogTail:          logTail.String(),
-					PipelineURL:      pipe.WebURL,
-					FailedJobReasons: failedJobReasons,
-					FailedJobs:       failedJobs,
-				}, nil
-			}
 		}
 
+		interval := c.cfg.PollInterval
+		if req.Wake != nil && req.FallbackInterval > 0 {
+			interval = req.FallbackInterval
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-pollCtx.Done():
+			timer.Stop()
 			if ctx.Err() != nil {
 				return partialResp(), ctx.Err()
 			}
 			return timeoutResp()
-		case <-time.After(c.cfg.PollInterval):
+		case <-req.Wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
 		}
 	}
 }
@@ -940,7 +1115,7 @@ func branchPipelineUnavailableError(mr mrResponse, mrIID int64, waited, deadline
 		detail += "; pipelines for this sha: " + digest
 	}
 	return fmt.Errorf(
-		"gitlab: mr %d head %s has no push pipeline after %s (bound %s): %s%s: %w",
+		"gitlab: mr %d head %s has no push or merge-request pipeline after %s (bound %s): %s%s: %w",
 		mrIID, shortSHA(mr.SHA), waited.Round(time.Second), deadline, detail, mrURLNote(mr),
 		pipeline.ErrBranchPipelineUnavailable)
 }
@@ -994,6 +1169,78 @@ func (c *GitLabClient) branchPipelineForSHA(ctx context.Context, sha, ref, sourc
 		return shaPipeline{}, false, fmt.Errorf("gitlab: pipeline %d identity %s:%s@%s does not match requested %s:%s@%s: %w", p.ID, p.Source, p.Ref, p.SHA, source, ref, sha, pipeline.ErrMergeAuthorizationStale)
 	}
 	return p, true, nil
+}
+
+// mrEventPipelineForSHA returns the newest detached pipeline for the exact MR
+// head. The IID-specific /head ref prevents a pipeline for another MR sharing
+// the same commit from becoming CI or merge authorization.
+func (c *GitLabClient) mrEventPipelineForSHA(ctx context.Context, sha string, mrIID int64) (shaPipeline, bool, error) {
+	if strings.TrimSpace(sha) == "" || mrIID == 0 {
+		return shaPipeline{}, false, fmt.Errorf("gitlab: sha and mr iid required to resolve merge-request pipeline: %w", pipeline.ErrMergeAuthorizationStale)
+	}
+	ref := fmt.Sprintf("refs/merge-requests/%d/head", mrIID)
+	// Tolerant by design: GitLab's list filters are advisory, and the merge
+	// superseder path legitimately leaves same-SHA `api` pipelines on the
+	// source branch. Skip anything that is not the exact detached head instead
+	// of treating it as an identity error (which broke the fenced-restart and
+	// detached-head merge recoveries in tests).
+	path := fmt.Sprintf("/projects/%s/pipelines?sha=%s&ref=%s&source=merge_request_event&order_by=id&sort=desc&per_page=20",
+		c.projectPath(), url.QueryEscape(sha), url.QueryEscape(ref))
+	var pipes []shaPipeline
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &pipes); err != nil {
+		return shaPipeline{}, false, err
+	}
+	newest := shaPipeline{}
+	for _, p := range pipes {
+		if p.SHA != sha || p.Ref != ref || p.Source != "merge_request_event" {
+			continue
+		}
+		if p.ID > newest.ID {
+			newest = p
+		}
+	}
+	if newest.ID == 0 {
+		return shaPipeline{}, false, nil
+	}
+	return newest, true, nil
+}
+
+func (c *GitLabClient) pipelineForMRHead(ctx context.Context, sha, sourceBranch string, mrIID int64) (shaPipeline, bool, error) {
+	// Preserve push as ci_watch's first-class proof. The shared lookup fills the
+	// historical gap only when no push pipeline exists, notably API pipelines
+	// minted by the merge queue or shepherd.
+	if push, ok, err := c.branchPipelineForSHA(ctx, sha, sourceBranch, "push"); err != nil || ok {
+		return push, ok, err
+	}
+	active, err := c.findActivePipelineSources(ctx, sourceBranch, sha, []string{"api", "web", "trigger"})
+	if err != nil {
+		return shaPipeline{}, false, err
+	}
+	if active.Found {
+		return shaPipeline{ID: active.ID, SHA: active.SHA, Ref: sourceBranch, Status: active.Status, Source: "branch", WebURL: active.WebURL}, true, nil
+	}
+	return c.mrEventPipelineForSHA(ctx, sha, mrIID)
+}
+
+func (c *GitLabClient) pipelineForCIWatch(ctx context.Context, req pipeline.PollPipelineRequest, headSHA string) (shaPipeline, bool, error) {
+	if req.PipelineID == 0 {
+		return c.pipelineForMRHead(ctx, headSHA, req.SourceBranch, req.MRIID)
+	}
+	var pipe shaPipeline
+	path := fmt.Sprintf("/projects/%s/pipelines/%d", c.projectPath(), req.PipelineID)
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &pipe); err != nil {
+		return shaPipeline{}, false, err
+	}
+	// The initial lookup also accepts the IID-specific detached MR head.
+	// Preserve that identity on reattachment without accepting another MR's ref.
+	validRef := pipe.Ref == req.SourceBranch
+	if pipe.Source == "merge_request_event" {
+		validRef = pipe.Ref == fmt.Sprintf("refs/merge-requests/%d/head", req.MRIID)
+	}
+	if pipe.ID != req.PipelineID || pipe.SHA != headSHA || !validRef {
+		return shaPipeline{}, false, fmt.Errorf("gitlab: pinned pipeline %d identity changed (sha=%q ref=%q, want sha=%q ref=%q): %w", req.PipelineID, pipe.SHA, pipe.Ref, headSHA, req.SourceBranch, pipeline.ErrMergeAuthorizationStale)
+	}
+	return pipe, true, nil
 }
 
 func shortSHA(sha string) string {
@@ -1219,6 +1466,11 @@ func (c *GitLabClient) retryMerge(ctx context.Context, mrIID int64, auth mergeAu
 	recoveryInProgress := false
 	sawLocked := false
 	var mergeErr error
+	var remediations []string
+	withRemediations := func(resp pipeline.MergeResponse) pipeline.MergeResponse {
+		resp.Remediations = append(resp.Remediations, remediations...)
+		return resp
+	}
 	activeDeadline := func() time.Time {
 		if recoveryInProgress {
 			return overallDeadline
@@ -1260,7 +1512,33 @@ func (c *GitLabClient) retryMerge(ctx context.Context, mrIID int64, auth mergeAu
 			return pipeline.MergeResponse{}, fmt.Errorf("gitlab: reconcile mr %d before merge: %w", mrIID, stateErr)
 		}
 		if state == mergeMRAlreadyMerged {
-			return reconciled, nil
+			return withRemediations(reconciled), nil
+		}
+		if mrIsDraft(mr) {
+			oldTitle := mr.Title
+			newTitle := undraftMRTitle(oldTitle)
+			if newTitle == "" {
+				return pipeline.MergeResponse{}, fmt.Errorf("gitlab: mr %d draft title %q cannot be safely un-drafted", mrIID, oldTitle)
+			}
+			if err := c.updateMRTitle(mergeCtx, mrIID, newTitle); err != nil {
+				return pipeline.MergeResponse{}, fmt.Errorf("gitlab: un-draft owned mr %d: %w", mrIID, err)
+			}
+			remediations = append(remediations, fmt.Sprintf("merge remediation: un-drafted owned MR !%d (%q -> %q)", mrIID, oldTitle, newTitle))
+			mergeErr = nil
+			continue
+		}
+		// GitLab can retain the legacy cannot_be_merged summary while its
+		// detailed status is still checking. Honor the explicit transient state
+		// first; a later reconciliation will name a genuine conflict.
+		if strings.EqualFold(strings.TrimSpace(mr.MergeStatus), "checking") || strings.EqualFold(strings.TrimSpace(mr.DetailedMergeStatus), "checking") {
+			remediations = append(remediations, fmt.Sprintf("merge remediation: MR !%d merge_status=checking; bounded retry", mrIID))
+			if err := c.waitForMergeRetry(mergeCtx, activeDeadline()); err != nil {
+				return pipeline.MergeResponse{}, fmt.Errorf("gitlab: mr %d merge_status=checking until merge readiness deadline: %w", mrIID, err)
+			}
+			continue
+		}
+		if reason, blocked := unrecoverableMergeState(mr); blocked {
+			return pipeline.MergeResponse{}, fmt.Errorf("gitlab: mr %d unrecoverable merge state: %s", mrIID, reason)
 		}
 		if mergeRecoveryPipelineRequired(mergeErr, mr) {
 			recoveryInProgress = true
@@ -1309,7 +1587,7 @@ func (c *GitLabClient) retryMerge(ctx context.Context, mrIID int64, auth mergeAu
 				return pipeline.MergeResponse{}, fmt.Errorf("gitlab: reconcile mr %d after locked merge response: %w", mrIID, stateErr)
 			}
 			if state == mergeMRAlreadyMerged {
-				return reconciled, nil
+				return withRemediations(reconciled), nil
 			}
 			if state == mergeMRLocked {
 				mergeErr = nil
@@ -1393,7 +1671,7 @@ func (c *GitLabClient) retryMerge(ctx context.Context, mrIID int64, auth mergeAu
 				return pipeline.MergeResponse{}, fmt.Errorf("gitlab: reconcile mr %d after merge wait: %w", mrIID, stateErr)
 			}
 			if state == mergeMRAlreadyMerged {
-				return reconciled, nil
+				return withRemediations(reconciled), nil
 			}
 			if mergeRecoveryPipelineRequired(mergeErr, mr) {
 				recoveryInProgress = true
@@ -1416,9 +1694,12 @@ func (c *GitLabClient) retryMerge(ctx context.Context, mrIID int64, auth mergeAu
 		opCompletedWithinDeadline = time.Now().Before(opDeadline)
 		opCancel()
 		if err == nil {
-			return resp, nil
+			return withRemediations(resp), nil
 		}
 		mergeErr = err
+		if status, ok := GitLabHTTPStatus(err); ok && (status == http.StatusMethodNotAllowed || status == http.StatusConflict) {
+			remediations = append(remediations, fmt.Sprintf("merge remediation: MR !%d transient HTTP %d; bounded retry", mrIID, status))
+		}
 		if opCompletedWithinDeadline && mergeRecoveryPipelineRequired(mergeErr, mr) {
 			recoveryInProgress = true
 		}
@@ -1429,6 +1710,43 @@ func (c *GitLabClient) retryMerge(ctx context.Context, mrIID int64, auth mergeAu
 			return pipeline.MergeResponse{}, deadlineErr
 		}
 	}
+}
+
+func mrIsDraft(mr mrResponse) bool {
+	if mr.Draft {
+		return true
+	}
+	title := strings.ToLower(strings.TrimSpace(mr.Title))
+	return strings.HasPrefix(title, "draft:") || strings.HasPrefix(title, "draft ") ||
+		strings.HasPrefix(title, "wip:") || strings.HasPrefix(title, "wip ")
+}
+
+func unrecoverableMergeState(mr mrResponse) (string, bool) {
+	legacy := strings.ToLower(strings.TrimSpace(mr.MergeStatus))
+	detailed := strings.ToLower(strings.TrimSpace(mr.DetailedMergeStatus))
+	if mr.HasConflicts || legacy == "cannot_be_merged" || detailed == "conflict" {
+		return fmt.Sprintf("has_conflicts=%t merge_status=%s detailed_merge_status=%s",
+			mr.HasConflicts, orUnknownMRField(mr.MergeStatus), orUnknownMRField(mr.DetailedMergeStatus)), true
+	}
+	return "", false
+}
+
+func undraftMRTitle(title string) string {
+	title = strings.TrimSpace(title)
+	lower := strings.ToLower(title)
+	for _, prefix := range []string{"draft:", "draft ", "wip:", "wip "} {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(title[len(prefix):])
+		}
+	}
+	return title
+}
+
+func (c *GitLabClient) updateMRTitle(ctx context.Context, mrIID int64, title string) error {
+	path := fmt.Sprintf("/projects/%s/merge_requests/%d", c.projectPath(), mrIID)
+	return c.requestJSON(ctx, http.MethodPut, path, struct {
+		Title string `json:"title"`
+	}{Title: title}, nil)
 }
 
 var errMergeRetryDeadline = errors.New("gitlab: merge readiness deadline reached")
@@ -1519,6 +1837,18 @@ func (c *GitLabClient) prepareMergeNotReady(ctx context.Context, mr mrResponse, 
 	if supersederHandled {
 		return false, nil
 	}
+	// On MR-pipeline-only projects the detached head is the real, GitLab-gated
+	// proof. A green exact-IID pipeline authorizes the retry directly; creating
+	// an API branch pipeline would fail under the same workflow rules.
+	if mr.HeadPipeline.Source == "merge_request_event" {
+		mrPipe, ok, err := c.mrEventPipelineForSHA(opCtx, auth.sha, mr.IID)
+		if err != nil {
+			return false, fmt.Errorf("find green merge-request pipeline: %w", mergeOperationError(ctx, deadline, err))
+		}
+		if ok && mrPipe.Status == "success" {
+			return true, nil
+		}
+	}
 
 	pipe, ok, err := c.branchPipelineForSHA(opCtx, auth.sha, auth.sourceBranch, "api")
 	if err != nil {
@@ -1557,6 +1887,19 @@ func (c *GitLabClient) prepareMergeNotReady(ctx context.Context, mr mrResponse, 
 		}
 		return true, nil
 	}
+	active, err := c.FindActivePipeline(opCtx, auth.sourceBranch, auth.sha)
+	if err != nil {
+		return false, fmt.Errorf("find active pipeline before ci_watch re-proof: %w", mergeOperationError(ctx, deadline, err))
+	}
+	if active.Found && active.ID > mr.HeadPipeline.ID {
+		adopted := shaPipeline{ID: active.ID, SHA: active.SHA, Ref: active.Ref, Source: active.Source, Status: active.Status, WebURL: active.WebURL}
+		slog.Default().Info("ci_watch: adopted re-proof pipeline", "adopted_pipeline_id", active.ID, "ref", auth.sourceBranch, "sha", auth.sha, "minted_by", "ci_watch.reprove")
+		mills.PipelineAdoptionsTotal.WithLabelValues("ci_watch.reprove").Inc()
+		if err := c.awaitSupersedingPipeline(opCtx, mr.IID, adopted, auth.sha, auth.sourceBranch, deadline); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 	if err := pipeline.RecordMergeRecoveryPipelineCreate(ctx); err != nil {
 		return false, fmt.Errorf("persist recovery pipeline creation fence for mr %d: %w", mr.IID, err)
 	}
@@ -1588,6 +1931,8 @@ func (c *GitLabClient) prepareMergeNotReady(ctx context.Context, mr mrResponse, 
 		}
 		return true, nil
 	}
+	slog.Default().Info("ci_watch: minted re-proof pipeline", "pipeline_id", newPipe.ID, "ref", auth.sourceBranch, "sha", auth.sha, "minted_by", "ci_watch.reprove")
+	mills.PipelineMintsTotal.WithLabelValues("ci_watch.reprove").Inc()
 	if newPipe.ID <= mr.HeadPipeline.ID {
 		return false, fmt.Errorf("created superseding pipeline %d is not newer than pinned head pipeline %d: %w", newPipe.ID, mr.HeadPipeline.ID, pipeline.ErrMergeAuthorizationStale)
 	}
@@ -1897,8 +2242,8 @@ func (c *GitLabClient) awaitSupersedingPipeline(ctx context.Context, mrIID int64
 	}
 	// GitLab's create-pipeline response omits source; list/get responses include
 	// it. Reject a contradictory source here and require "api" on every poll.
-	if pipe.Source != "" && pipe.Source != "api" {
-		return fmt.Errorf("pipeline %d for mr %d has source %q, want api: %w", pipe.ID, mrIID, pipe.Source, pipeline.ErrMergeAuthorizationStale)
+	if pipe.Source != "" && !adoptablePipelineSources[pipe.Source] {
+		return fmt.Errorf("pipeline %d for mr %d has ineligible source %q: %w", pipe.ID, mrIID, pipe.Source, pipeline.ErrMergeAuthorizationStale)
 	}
 	if pipe.SHA != expectedSHA {
 		return fmt.Errorf("superseding pipeline %d sha %q does not match CI-tested sha %q: %w", pipe.ID, pipe.SHA, expectedSHA, pipeline.ErrMergeAuthorizationStale)
@@ -1920,11 +2265,17 @@ func (c *GitLabClient) awaitSupersedingPipeline(ctx context.Context, mrIID int64
 // The new pipeline supersedes the failed merge_request_event placeholder as the
 // MR head_pipeline without mutating MR state. Returns the created pipeline so
 // the caller can verify its SHA and poll it to success.
-func (c *GitLabClient) createBranchPipeline(ctx context.Context, ref string) (shaPipeline, error) {
+func (c *GitLabClient) createBranchPipeline(ctx context.Context, ref string, variables ...map[string]string) (shaPipeline, error) {
 	path := fmt.Sprintf("/projects/%s/pipeline", c.projectPath())
 	body := struct {
-		Ref string `json:"ref"`
+		Ref       string              `json:"ref"`
+		Variables []map[string]string `json:"variables,omitempty"`
 	}{Ref: ref}
+	if len(variables) > 0 {
+		for key, value := range variables[0] {
+			body.Variables = append(body.Variables, map[string]string{"key": key, "value": value})
+		}
+	}
 	var got shaPipeline
 	if err := c.requestJSON(ctx, http.MethodPost, path, body, &got); err != nil {
 		return shaPipeline{}, err
@@ -1965,8 +2316,8 @@ func (c *GitLabClient) pollPipelineToSuccess(ctx context.Context, id int64, expe
 		if p.Ref != expectedRef {
 			return "", fmt.Errorf("pipeline %d ref %q does not match MR source branch %q: %w", id, p.Ref, expectedRef, pipeline.ErrMergeAuthorizationStale)
 		}
-		if p.Source != "api" {
-			return "", fmt.Errorf("pipeline %d source %q, want api: %w", id, p.Source, pipeline.ErrMergeAuthorizationStale)
+		if !adoptablePipelineSources[p.Source] {
+			return "", fmt.Errorf("pipeline %d source %q is ineligible: %w", id, p.Source, pipeline.ErrMergeAuthorizationStale)
 		}
 		if terminal[p.Status] {
 			return p.Status, nil
@@ -1996,6 +2347,7 @@ func isMergeNotReady(err error) bool {
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "status 405") ||
+		strings.Contains(s, "status 409") ||
 		strings.Contains(s, "method not allowed") ||
 		(strings.Contains(s, "status 422") && strings.Contains(s, "branch cannot be merged"))
 }
@@ -2128,12 +2480,37 @@ type IssueListItem struct {
 	WebURL      string   `json:"web_url"`
 	CreatedAt   string   `json:"created_at"`
 	UpdatedAt   string   `json:"updated_at"`
+	Author      struct {
+		Username string `json:"username"`
+	} `json:"author"`
 }
 
 // ListIssues returns issues for the configured project, filtered by opts.
 // Scope is intentionally single-project (matches GitLabConfig.Project);
 // multi-project intake is a future-Slice concern.
 func (c *GitLabClient) ListIssues(ctx context.Context, opts ListIssuesOpts) ([]IssueListItem, error) {
+	return c.listIssuesPage(ctx, opts, 0)
+}
+
+// ListAllIssues returns every matching issue, requesting deterministic
+// 100-item pages until the final short page. A failed later page returns no
+// partial result, allowing callers to complete selection before mutation.
+func (c *GitLabClient) ListAllIssues(ctx context.Context, opts ListIssuesOpts) ([]IssueListItem, error) {
+	opts.PerPage = 100
+	var all []IssueListItem
+	for page := 1; ; page++ {
+		items, err := c.listIssuesPage(ctx, opts, page)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, items...)
+		if len(items) < opts.PerPage {
+			return all, nil
+		}
+	}
+}
+
+func (c *GitLabClient) listIssuesPage(ctx context.Context, opts ListIssuesOpts, page int) ([]IssueListItem, error) {
 	q := url.Values{}
 	if len(opts.Labels) > 0 {
 		q.Set("labels", strings.Join(opts.Labels, ","))
@@ -2143,6 +2520,9 @@ func (c *GitLabClient) ListIssues(ctx context.Context, opts ListIssuesOpts) ([]I
 	}
 	if opts.PerPage > 0 {
 		q.Set("per_page", strconv.Itoa(opts.PerPage))
+	}
+	if page > 0 {
+		q.Set("page", strconv.Itoa(page))
 	}
 	path := fmt.Sprintf("/projects/%s/issues", c.projectPath())
 	if encoded := q.Encode(); encoded != "" {
@@ -2259,6 +2639,62 @@ func (c *GitLabClient) FindOpenAuditDigest(ctx context.Context, period string) (
 		}
 	}
 	return pipeline.IssueRef{}, false, nil
+}
+
+// FindPreviousOpenAuditDigest returns the newest open audit digest other than
+// the current period. GitLab's issue list is newest-first, so the first match
+// is the digest immediately preceding the one just filed.
+func (c *GitLabClient) FindPreviousOpenAuditDigest(ctx context.Context, currentPeriod string) (int64, bool, error) {
+	items, err := c.ListIssues(ctx, ListIssuesOpts{
+		Labels: []string{pipeline.AuditDigestLabel}, State: "opened", PerPage: 100,
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	currentMarker := pipeline.AuditDigestMarker(strings.TrimSpace(currentPeriod))
+	for _, it := range items {
+		if currentPeriod != "" && strings.Contains(it.Description, currentMarker) {
+			continue
+		}
+		const markerPrefix = "<!-- mills-audit-digest:period="
+		start := strings.Index(it.Description, markerPrefix)
+		if start < 0 {
+			continue
+		}
+		rest := it.Description[start+len(markerPrefix):]
+		end := strings.Index(rest, " -->")
+		if end < 0 || strings.TrimSpace(rest[:end]) >= currentPeriod {
+			continue
+		}
+		return it.IID, true, nil
+	}
+	return 0, false, nil
+}
+
+// IssueHasComment reports whether an issue has a note whose body exactly
+// matches body. Supersession uses this before posting its stable marker so a
+// retry after a failed close never duplicates the note.
+func (c *GitLabClient) IssueHasComment(ctx context.Context, iid int64, body string) (bool, error) {
+	if iid == 0 {
+		return false, errors.New("gitlab: IssueHasComment requires a non-zero iid")
+	}
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/projects/%s/issues/%d/notes?per_page=100&page=%d", c.projectPath(), iid, page)
+		var notes []struct {
+			Body string `json:"body"`
+		}
+		if err := c.requestJSON(ctx, http.MethodGet, path, nil, &notes); err != nil {
+			return false, err
+		}
+		for _, note := range notes {
+			if note.Body == body {
+				return true, nil
+			}
+		}
+		if len(notes) < 100 {
+			return false, nil
+		}
+	}
 }
 
 // CommentIssue implements pipeline.DedupIssueClient. It appends a note to an
@@ -2444,4 +2880,18 @@ func (c *GitLabClient) CreateCommit(ctx context.Context, req CreateCommitRequest
 		return CreateCommitResponse{}, err
 	}
 	return CreateCommitResponse(got), nil
+}
+
+// FindAuditDigestBody finds the previous day's digest, including closed issues.
+func (c *GitLabClient) FindAuditDigestBody(ctx context.Context, period string) (string, bool, error) {
+	items, err := c.ListAllIssues(ctx, ListIssuesOpts{Labels: []string{pipeline.AuditDigestLabel}, State: "all", PerPage: 100})
+	if err != nil {
+		return "", false, err
+	}
+	for _, item := range items {
+		if strings.Contains(item.Description, pipeline.AuditDigestMarker(period)) {
+			return item.Description, true, nil
+		}
+	}
+	return "", false, nil
 }

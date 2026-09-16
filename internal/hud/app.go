@@ -164,7 +164,10 @@ type Config struct {
 	// Pipeline monitoring (GitLab CI).
 	PipelineProjects string // Comma-separated GitLab project paths to monitor.
 
-	// Inbound webhook event bridge (CI → agent dispatch).
+	// Inbound webhook event bridge (CI → agent dispatch). Enabling inbound
+	// requires at least one secret — NewApp refuses to start otherwise —
+	// and an endpoint whose secret is empty rejects every request
+	// (fail closed, see internal/hud/domain/webhook/verify.go).
 	WebhookInboundEnabled bool   // Enable inbound webhook endpoints (default: false).
 	WebhookGitLabSecret   string // X-Gitlab-Token secret for verifying GitLab webhooks.
 	WebhookGitHubSecret   string // HMAC secret for verifying GitHub X-Hub-Signature-256.

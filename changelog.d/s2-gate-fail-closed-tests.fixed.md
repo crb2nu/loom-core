@@ -1,0 +1,1 @@
+- Make the overseer S2 promotion gate reject missing evidence windows and add fail-closed contract coverage in `pkg/mills/overseer/overseer.go` and `pkg/mills/overseer/overseer_test.go`.

@@ -30,12 +30,13 @@ type stopRaceBackend struct {
 	execEntered  chan struct{}
 	releaseExec  chan struct{}
 
-	buildCalls int
-	startCalls int
-	stopCalls  []string
-	startDone  bool
-	startID    string
-	stopErr    error
+	buildCalls     int
+	startCalls     int
+	stopCalls      []string
+	startDone      bool
+	startID        string
+	stopErr        error
+	latePodCleaned chan string
 	// failStopAfterStart models a pod that did not exist for StopSpawn's
 	// first delete but whose late Start result cannot then be cleaned up.
 	failStopAfterStart bool
@@ -164,6 +165,12 @@ func (b *stopRaceBackend) Stop(_ context.Context, id string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.stopCalls = append(b.stopCalls, id)
+	if b.latePodCleaned != nil && b.startDone {
+		select {
+		case b.latePodCleaned <- id:
+		default:
+		}
+	}
 	if b.failStopAfterStart && b.startDone {
 		return errors.New("injected late cleanup failure")
 	}
@@ -422,8 +429,14 @@ func TestStopSpawnRefusesCleanupWhenIntentPersistenceFails(t *testing.T) {
 }
 
 func TestStopSpawnDuringPodStartCleansLatePodWithoutRevival(t *testing.T) {
-	be := &stopRaceBackend{startEntered: make(chan struct{}), releaseStart: make(chan struct{})}
+	be := &stopRaceBackend{
+		startEntered:   make(chan struct{}),
+		releaseStart:   make(chan struct{}),
+		latePodCleaned: make(chan string, 1),
+	}
 	o := newStopRaceOrchestrator(t, be)
+	stopIntentPersisted := make(chan string, 1)
+	o.stopIntentPersisted = func(spawnID string) { stopIntentPersisted <- spawnID }
 	spawnID, err := o.Spawn(t.Context(), stopRaceRequest())
 	if err != nil {
 		t.Fatalf("Spawn() error = %v", err)
@@ -433,9 +446,17 @@ func TestStopSpawnDuringPodStartCleansLatePodWithoutRevival(t *testing.T) {
 	stopped := make(chan error, 1)
 	go func() { stopped <- o.StopSpawn(t.Context(), spawnID) }()
 	select {
+	case got := <-stopIntentPersisted:
+		if got != spawnID {
+			t.Fatalf("persisted stop intent for %q, want %q", got, spawnID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopSpawn did not persist stop intent")
+	}
+	select {
 	case err := <-stopped:
-		t.Fatalf("StopSpawn returned before the pod-start driver exited: %v", err)
-	case <-time.After(25 * time.Millisecond):
+		t.Fatalf("StopSpawn returned while pod start was blocked: %v", err)
+	default:
 	}
 	state, _ := o.ctrl.Get(spawnID)
 	if state.Status == SpawnStatusStopped {
@@ -453,13 +474,12 @@ func TestStopSpawnDuringPodStartCleansLatePodWithoutRevival(t *testing.T) {
 		t.Fatalf("Start calls = %d, want the one in-flight call", starts)
 	}
 	wantPod := "spawn-" + spawnID
-	found := false
-	for _, pod := range stops {
-		if pod == wantPod {
-			found = true
+	select {
+	case got := <-be.latePodCleaned:
+		if got != wantPod {
+			t.Fatalf("cleaned pod = %q, want late-created pod %q", got, wantPod)
 		}
-	}
-	if !found {
+	default:
 		t.Fatalf("late-created pod %q was not cleaned up; Stop calls = %v", wantPod, stops)
 	}
 }

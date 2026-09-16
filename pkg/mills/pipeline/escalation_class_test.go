@@ -187,10 +187,36 @@ func TestEscalationMetadataFromEvidence(t *testing.T) {
 			tail:   "",
 			want:   store.EscalationMetadata{},
 		},
+		{
+			// bl-honest-verdicts-s1: the 2026-08-20 storm shape — a declared
+			// verdict whose evidence normalizes below the miner's four-token
+			// shape floor. Fingerprint stamps nothing, and before the synthetic
+			// fallback these escalations landed with an EMPTY failure signature
+			// the miner and shepherd could not join. The per-case signature
+			// assertion below requires a stamp here.
+			name:   "declared class with sub-floor evidence still stamps a signature",
+			cls:    ClassConfig,
+			reason: "tests failed",
+			want: store.EscalationMetadata{
+				EscalationClass: "config",
+				FailureClass:    "configuration",
+				Retryable:       &retryableFalse,
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := escalationMetadataFromEvidence(tc.cls, tc.reason, tc.tail)
+			// bl-honest-verdicts-s1: a classified escalation must never land
+			// with an empty failure signature — evidence under the miner's
+			// shape floor gets a synthetic verdict-keyed stamp instead. The
+			// no-verdict, no-evidence safety pin stays unstamped.
+			if got.EscalationClass != "" && got.FailureSignature == "" {
+				t.Fatalf("classified escalation landed unstamped: %+v", got)
+			}
+			if got.EscalationClass == "" && tc.reason == "" && tc.tail == "" && got.FailureSignature != "" {
+				t.Fatalf("empty evidence must stay unstamped, got %q", got.FailureSignature)
+			}
 			if got.EscalationClass != tc.want.EscalationClass ||
 				got.FailureClass != tc.want.FailureClass ||
 				got.ExternalDependencyID != tc.want.ExternalDependencyID ||

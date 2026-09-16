@@ -1,0 +1,1 @@
+- Add a read-only Factory rescue shelf with bounded escalation hydration in `mills.svelte.ts`, evidence-based verdicts and scope amendment clipboard commands in `rescueHelpers.ts`, and expandable violation tables, MR links, filtering, and counts in `RescueShelf.svelte` and `FactoryPanel.svelte`. Missing plan, live branch, and MR-title evidence remains explicitly unknown.

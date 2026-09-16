@@ -1,0 +1,1 @@
+- Fix `cmd/mcp-devbox` test checkouts to use shared clones of the sandbox repository, avoiding full-history fetch memory spikes on fresh sandboxes.

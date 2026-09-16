@@ -80,7 +80,10 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 
 		if p.SkillsDirectToHome {
 			manifestDir := skillsHomeManifestDir(p, homePath)
-			manifest, _ := skills.ReadManifest(manifestDir)
+			manifest, err := skills.ReadManifest(manifestDir)
+			if err != nil {
+				return fmt.Errorf("read generated skill manifest: %w", err)
+			}
 			if manifest != nil && len(manifest.Generated) > 0 {
 				fmt.Printf("Generated %d skill files directly to %s\n", len(manifest.Generated), manifestDir)
 			}
@@ -127,6 +130,30 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 			if err := m.Backup(profileName, "home"); err != nil {
 				return fmt.Errorf("backup failed: %w", err)
 			}
+		}
+	}
+
+	// Deliver skills through the same verified path as `loom sync skills`.
+	// Exclude the manifest and its files from the general config copy so it
+	// cannot publish them early or overwrite the verified delivery afterward.
+	copyExcludes := append([]string(nil), p.Excludes...)
+	if p.SkillsManifest != "" {
+		copyExcludes = append(copyExcludes, skills.ManifestFilename)
+		manifest, err := skills.ReadManifest(repoPath)
+		if err != nil {
+			return fmt.Errorf("read source skill manifest: %w", err)
+		}
+		if manifest != nil {
+			copyExcludes = append(copyExcludes, manifest.Generated...)
+		}
+		if p.SkillsDirectToHome {
+			copyExcludes = append(copyExcludes, "skills")
+		} else {
+			count, err := skills.SyncGeneratedFiles(repoPath, homePath)
+			if err != nil {
+				return fmt.Errorf("sync skills for %s: %w", p.Name, err)
+			}
+			fmt.Printf("Synced %d skill files for %s\n", count, p.Name)
 		}
 	}
 
@@ -190,36 +217,8 @@ func (m *Manager) SyncToHome(profileName string, backup bool, regen bool, repoOn
 			}
 		}
 	} else {
-		if err := CopyDir(repoPath, homePath, p.Excludes); err != nil {
+		if err := CopyDir(repoPath, homePath, copyExcludes); err != nil {
 			return err
-		}
-	}
-
-	// Sync skill files from manifest (skip when skills are generated directly to home)
-	if p.SkillsManifest != "" && !p.SkillsDirectToHome {
-		manifest, _ := skills.ReadManifest(repoPath)
-		if manifest != nil && len(manifest.Generated) > 0 {
-			for _, relPath := range manifest.Generated {
-				srcFile := filepath.Join(repoPath, relPath)
-				dstFile := filepath.Join(homePath, relPath)
-				if Exists(srcFile) {
-					if err := os.MkdirAll(filepath.Dir(dstFile), 0755); err != nil {
-						fmt.Fprintf(os.Stderr, "Warning: could not create dir for skill file %s: %v\n", relPath, err)
-						continue
-					}
-					if err := CopyFile(srcFile, dstFile); err != nil {
-						fmt.Fprintf(os.Stderr, "Warning: could not sync skill file %s: %v\n", relPath, err)
-					}
-				}
-			}
-			// Also copy the manifest itself
-			manifestSrc := filepath.Join(repoPath, skills.ManifestFilename)
-			if Exists(manifestSrc) {
-				if err := CopyFile(manifestSrc, filepath.Join(homePath, skills.ManifestFilename)); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: could not sync manifest: %v\n", err)
-				}
-			}
-			fmt.Printf("Synced %d skill files for %s\n", len(manifest.Generated), p.Name)
 		}
 	}
 

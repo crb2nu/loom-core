@@ -133,9 +133,18 @@ func (d *Dispatcher) Dispatch(ctx context.Context, brief *Brief, lenses []Review
 	}
 	wg.Wait()
 
+	// Sort before evaluation so both returned results and editor-facing status
+	// are byte-stable regardless of goroutine completion order.
+	sort.Slice(out, func(i, j int) bool { return out[i].Lens.Name < out[j].Lens.Name })
+	outcomes, outcomeErr := EvaluateReviewerOutcomes(ctx, out)
+	ApplyReviewerOutcomes(brief, outcomes)
+	if outcomeErr != nil {
+		return out, outcomeErr
+	}
+
 	successes := 0
-	for _, o := range out {
-		if o.Err == nil {
+	for _, outcome := range outcomes {
+		if outcome.Status == ReviewerOutcomeOK {
 			successes++
 		}
 	}
@@ -144,8 +153,6 @@ func (d *Dispatcher) Dispatch(ctx context.Context, brief *Brief, lenses []Review
 			successes, len(out), quorum)
 	}
 
-	// Deterministic order so the editor's prompt is reproducible.
-	sort.Slice(out, func(i, j int) bool { return out[i].Lens.Name < out[j].Lens.Name })
 	return out, nil
 }
 

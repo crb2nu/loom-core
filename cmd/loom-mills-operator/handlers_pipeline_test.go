@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,5 +74,74 @@ func TestHandlePipelineGrade_RejectsNonTerminalItem(t *testing.T) {
 	seedGradeRun(t, op, store.BacklogRunning)
 	if rec := postGrade(op, `{"grade":"keep"}`, "grade-secret"); rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("non-terminal = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlePipelineRunRetryAttempts(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	seedGradeRun(t, op, store.BacklogRunning)
+	ctx := context.Background()
+	run, err := op.store.Pipeline.GetRun(ctx, "RUN-GRADE-HTTP")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.Attempts = 7
+	if err := op.store.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	for i, cls := range []string{"transient", "substrate", "real", "exhausted", ""} {
+		art := map[string]any{}
+		if cls != "" {
+			art["retry_class"] = cls
+			art["effective_attempts"] = i
+		}
+		if err := op.store.Pipeline.PutStage(ctx, &store.StageResult{PipelineRunID: run.ID, Stage: "tests", Attempt: i + 1, Artifacts: art}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs/"+run.ID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Run    map[string]any
+		Stages []*store.StageResult
+		Gates  []any
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Run["Attempts"] != float64(7) || body.Run["EffectiveAttempts"] != nil || body.Gates == nil || len(body.Stages) != 5 {
+		t.Fatalf("response: %s", rec.Body.String())
+	}
+	for i, cls := range []string{"transient", "substrate", "real", "exhausted"} {
+		if body.Stages[i].Artifacts["retry_class"] != cls || body.Stages[i].Artifacts["effective_attempts"] != float64(i) {
+			t.Fatalf("stage: %+v", body.Stages[i])
+		}
+	}
+	if _, ok := body.Stages[4].Artifacts["effective_attempts"]; ok {
+		t.Fatal("legacy count invented")
+	}
+}
+
+func TestHandlePipelineRunEmptyAttempts(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	seedGradeRun(t, op, store.BacklogRunning)
+	rec := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs/RUN-GRADE-HTTP", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%d: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"stages", "gates"} {
+		if string(body[key]) != "[]" {
+			t.Fatalf("%s = %s, want []", key, body[key])
+		}
 	}
 }

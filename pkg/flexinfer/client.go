@@ -124,6 +124,10 @@ func (c *Client) SetUsageSink(sink llmusage.Sink) {
 // operators can distinguish a configuration fault from a remote outage.
 var ErrLiteLLMMissingAPIKey = errors.New("flexinfer: LiteLLM API key is not configured; configure the gateway API key")
 
+// ErrModelNotReady classifies a transient FlexInfer cold-start response. It is
+// retryable, but this package deliberately leaves retry policy to callers.
+var ErrModelNotReady = errors.New("flexinfer: model not ready")
+
 // HTTPStatusError is returned when FlexInfer responds with an HTTP error
 // status. Callers can inspect it with errors.As.
 type HTTPStatusError struct {
@@ -139,6 +143,28 @@ func (e *HTTPStatusError) Error() string {
 		return fmt.Sprintf("flexinfer: status %d", e.StatusCode)
 	}
 	return fmt.Sprintf("flexinfer: status %d: %s", e.StatusCode, e.Body)
+}
+
+// ModelNotReadyError preserves the HTTP response that identified a model
+// cold-start while exposing ErrModelNotReady through errors.Is.
+type ModelNotReadyError struct {
+	HTTPError *HTTPStatusError
+}
+
+func (e *ModelNotReadyError) Error() string {
+	if e == nil || e.HTTPError == nil {
+		return ErrModelNotReady.Error()
+	}
+	return e.HTTPError.Error()
+}
+
+// Unwrap keeps both the retryable classification and HTTP status available to
+// callers using errors.Is and errors.As.
+func (e *ModelNotReadyError) Unwrap() []error {
+	if e == nil || e.HTTPError == nil {
+		return []error{ErrModelNotReady}
+	}
+	return []error{ErrModelNotReady, e.HTTPError}
 }
 
 // NewClient creates a Client targeting the given base URL.
@@ -273,7 +299,11 @@ func (c *Client) doComplete(ctx context.Context, reqBody ChatCompletionRequest) 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		c.logger.Warn("flexinfer non-200", "model", reqBody.Model, "status", resp.StatusCode, "body", string(respBody))
-		return nil, &HTTPStatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		statusErr := &HTTPStatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		if isModelNotReadyResponse(statusErr.StatusCode, statusErr.Body) {
+			return nil, &ModelNotReadyError{HTTPError: statusErr}
+		}
+		return nil, statusErr
 	}
 
 	var result ChatCompletionResponse
@@ -338,6 +368,35 @@ func (c *Client) APIKey() string {
 // IsCircuitOpen reports whether err is the local circuit-breaker-open sentinel.
 func IsCircuitOpen(err error) bool {
 	return errors.Is(err, ErrCircuitOpen)
+}
+
+// IsModelNotReady reports whether err represents a retryable model cold-start.
+func IsModelNotReady(err error) bool {
+	return errors.Is(err, ErrModelNotReady)
+}
+
+func isModelNotReadyResponse(status int, body string) bool {
+	switch status {
+	case http.StatusNotFound, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	default:
+		return false
+	}
+
+	// Fields makes matching insensitive to casing and JSON/plain-text spacing
+	// differences while keeping the signatures intentionally narrow.
+	normalized := strings.ToLower(strings.Join(strings.Fields(body), " "))
+	for _, signal := range []string{
+		"runtime pod is starting",
+		"no runtime endpoint found",
+		"runtime endpoint is not ready",
+		"runtime endpoint not ready",
+	} {
+		if strings.Contains(normalized, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsProviderOverload reports whether err looks like provider overload or rate

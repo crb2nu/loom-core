@@ -1,0 +1,1 @@
+- Add Mills vaccine obligations, rescued-without-vaccine attention telemetry, and idempotent Pattern Loom candidate minting across `pkg/mills/store`, the escalation sweeper, and operator wiring.

@@ -83,17 +83,30 @@ describe('activeShuttleCount', () => {
 
 describe('millFloorSpine bolt/spark tallies', () => {
   it('reports the archive the Sparks and Bolts views read, not zero', () => {
-    millsStore.pipelineRuns = [run({ ID: 'live', State: 'escalated' })];
+    millsStore.pipelineRuns = [run({ ID: 'live', BacklogID: 'bl-live', State: 'escalated' })];
     millsStore.archiveRuns = [
       run({ ID: 'm1', State: 'merged' }),
       run({ ID: 'm2', State: 'done' }),
-      run({ ID: 'e1', State: 'escalated' }),
+      run({ ID: 'e1', BacklogID: 'bl-e1', State: 'escalated' }),
     ];
     const bolt = millsStore.millFloorSpine.find((s) => s.kind === 'bolt') as { count: number };
     const spark = millsStore.millFloorSpine.find((s) => s.kind === 'spark') as { count: number };
     expect(bolt.count).toBe(millsStore.boltRuns.length);
     expect(bolt.count).toBe(2);
-    expect(spark.count).toBe(millsStore.escalatedRuns.length);
+    // Sparks is the open set — what needs a human — not the all-time history.
+    expect(spark.count).toBe(millsStore.openSparks.length);
     expect(spark.count).toBe(2); // one live + one archived, de-duped by id
+  });
+
+  it('drops an archived spark whose item has since merged from the spine tally', () => {
+    millsStore.pipelineRuns = [run({ ID: 'live', BacklogID: 'bl-live', State: 'escalated' })];
+    millsStore.archiveRuns = [run({ ID: 'e1', BacklogID: 'bl-done', State: 'escalated' })];
+    millsStore.backlog = [
+      { ID: 'bl-live', Title: '', State: 'escalated', Priority: '', TargetProject: '' },
+      { ID: 'bl-done', Title: '', State: 'merged', Priority: '', TargetProject: '' },
+    ];
+    const spark = millsStore.millFloorSpine.find((s) => s.kind === 'spark') as { count: number };
+    expect(millsStore.escalatedRuns.length).toBe(2);
+    expect(spark.count).toBe(1);
   });
 });

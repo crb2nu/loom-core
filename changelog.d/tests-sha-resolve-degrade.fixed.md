@@ -1,0 +1,1 @@
+- HOTFIX: an unresolvable tests-stage expected SHA (spawn-driven runs have no operator-local worktree) degrades to unenforced execution with a visible tested_sha=unresolved artifact instead of failing the stage — the fatal path escalated 8 of 9 runs in 24h.

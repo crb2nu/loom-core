@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/mergequeue"
 	"github.com/crb2nu/loom/pkg/mills/store"
@@ -27,7 +28,8 @@ func (o *operator) handleMergeQueueList(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "merge queue store unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	active, err := o.store.MergeQueue.ListActive(r.Context())
+	ctx := r.Context()
+	active, err := o.store.MergeQueue.ListActive(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -35,14 +37,23 @@ func (o *operator) handleMergeQueueList(w http.ResponseWriter, r *http.Request) 
 	if active == nil {
 		active = []*store.MergeQueueEntry{}
 	}
+	recentSettled, err := o.store.MergeQueue.ListSettled(ctx, time.Now().UTC().Add(-24*time.Hour), 20)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if recentSettled == nil {
+		recentSettled = []*store.MergeQueueEntry{}
+	}
 	lanes := map[string]int{}
 	for _, e := range active {
 		lanes[e.Project+"→"+e.TargetBranch]++
 	}
 	enabled := o.policy != nil && o.policy.Current().MergeQueueEnabled()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active":  active,
-		"summary": map[string]any{"depth": len(active), "lanes": lanes, "enabled": enabled},
+		"active":         active,
+		"recent_settled": recentSettled,
+		"summary":        map[string]any{"depth": len(active), "lanes": lanes, "enabled": enabled},
 	})
 }
 
@@ -65,6 +76,13 @@ func (o *operator) handleMergeQueueEnqueue(w http.ResponseWriter, r *http.Reques
 		status = http.StatusOK
 	}
 	if result.Outcome == "disabled" {
+		status = http.StatusConflict
+	}
+	// conflicted: the queue already evicted this exact head for a rebase
+	// conflict, so nothing was enqueued. 409 tells the producer the arm did
+	// not happen (mrwatch records the action as an error and its per-MR daily
+	// budget bounds retries); the body names the prior verdict.
+	if result.Outcome == "conflicted" {
 		status = http.StatusConflict
 	}
 	if result.Outcome == "full" {

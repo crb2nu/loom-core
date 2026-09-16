@@ -5,8 +5,11 @@
 //
 // Prereqs (local machine):
 //
-//	pip install flexinfer-browser-kit playwright
-//	python3 -m playwright install chromium
+//	bash scripts/browserkit/install_deps.sh
+//
+// The installer carries the SHA pin for flexinfer-browser-kit (an internal
+// library); a bare `pip install flexinfer-browser-kit` pulls an unpinned PyPI
+// release instead.
 //
 // Note: Mark this server as local-only in the MCP registry so it is not deployed to the hub.
 package main
@@ -80,8 +83,7 @@ Tools:
 - screenshot: Capture a PNG/JPEG screenshot of a URL (optionally scoped to a CSS selector).
 
 Prerequisites (run once on the host):
-- pip install flexinfer-browser-kit playwright
-- python3 -m playwright install chromium
+- bash scripts/browserkit/install_deps.sh  (pinned flexinfer-browser-kit + playwright + chromium)
 `))
 
 	server.AddTool(mcp.Tool{
@@ -362,7 +364,7 @@ func runPythonHelper(ctx context.Context, req map[string]any) (*helperResponse, 
 			return nil, mcperror.NotConfigured("BROWSERKIT_PYTHON", fmt.Sprintf("python executable not found: %q", py))
 		}
 		if errorsLikeMissingBrowserKit(msg) {
-			return nil, mcperror.NotConfigured("flexinfer-browser-kit", fmt.Sprintf("%s. Install:\n  python3 -m pip install -U flexinfer-browser-kit playwright\n  python3 -m playwright install chromium", msg))
+			return nil, mcperror.NotConfigured("flexinfer-browser-kit", fmt.Sprintf("%s. Install:\n  bash scripts/browserkit/install_deps.sh", msg))
 		}
 		if errorsLikeMissingChromium(msg) {
 			return nil, mcperror.NotConfigured("playwright chromium", fmt.Sprintf("%s. Fix:\n  python3 -m playwright install chromium", msg))

@@ -1,0 +1,1 @@
+- Ghost-spark sweep reaches items whose latest attempt died before the mr stage: the IID pass falls back to the newest MR-bearing run (closing still requires GitLab to report that MR merged), and the branch pass's budget is reserved for items where no run ever opened an MR.

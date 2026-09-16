@@ -1,0 +1,1 @@
+- Added the Cloth Hall Bolt Card read model (`pkg/mills/boltcard`): a server-side, per-item card aggregating pipeline runs, MR refs, grades, and escalation state, with an item-level grade endpoint — replacing the drifting client-side derivations.

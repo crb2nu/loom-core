@@ -1,0 +1,1 @@
+- Run the repository-configured `golangci-lint` against only Go packages touched by Mills implementations, surfacing lint failures in-run and warning explicitly when the sandbox linter is unavailable (`pkg/mills/gates`, `pkg/mills/pipeline`, `cmd/mcp-devbox`).

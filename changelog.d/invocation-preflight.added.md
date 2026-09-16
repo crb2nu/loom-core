@@ -1,0 +1,1 @@
+- Add redacted implement invocation preflight checks and durable `preflight_failed` pipeline transitions in `pkg/mills/spin/preflight.go`, `pkg/mills/guard/guard.go`, and `pkg/mills/pipeline/transitions.go`.

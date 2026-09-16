@@ -16,9 +16,11 @@ type advisorySweepFake struct {
 	listErr    error
 	closeErrAt int64
 	closeCalls []int64
+	listed     int
 }
 
 func (f *advisorySweepFake) ListOpenIssues(context.Context) ([]DigestIssue, error) {
+	f.listed++
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -163,5 +165,34 @@ func TestParseAdvisorySweepFlags(t *testing.T) {
 	}
 	if _, err := ParseAdvisorySweepFlags([]string{"-cutoff", "2026-07-01"}, now); err == nil {
 		t.Fatal("invalid cutoff accepted")
+	}
+}
+
+func TestSweepRejectsUnsafeAgeBeforeListing(t *testing.T) {
+	client := &advisorySweepFake{}
+	_, err := SweepAuditAdvisories(context.Background(), client, AdvisorySweepOptions{StaleAfter: 6 * 24 * time.Hour})
+	if err == nil || !strings.Contains(err.Error(), "at least 7d") {
+		t.Fatalf("error = %v, want seven-day refusal", err)
+	}
+	if client.listed != 0 {
+		t.Fatalf("ListOpenIssues called %d times", client.listed)
+	}
+}
+
+func TestConfirmedSweepEmitsOneAggregateEventOnPartialFailure(t *testing.T) {
+	now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+	one := digestFixture(1, now.Add(-31*24*time.Hour))
+	two := digestFixture(2, now.Add(-32*24*time.Hour))
+	client := &advisorySweepFake{issues: []DigestIssue{one, two}, closeErrAt: 2}
+	var events []SweepEvent
+	result, err := SweepAuditAdvisories(context.Background(), client, AdvisorySweepOptions{
+		Now: now, StaleAfter: 30 * 24 * time.Hour, Confirm: true,
+		Emitter: SweepEmitterFunc(func(_ context.Context, event SweepEvent) { events = append(events, event) }),
+	})
+	if err == nil || len(result.Closed) != 1 || result.Closed[0] != 1 {
+		t.Fatalf("result = %+v, error = %v", result, err)
+	}
+	if len(events) != 1 || len(events[0].Selected) != 2 || len(events[0].Closed) != 1 || events[0].Error == "" {
+		t.Fatalf("events = %+v, want one aggregate partial-failure event", events)
 	}
 }

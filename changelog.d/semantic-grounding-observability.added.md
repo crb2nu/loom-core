@@ -1,0 +1,1 @@
+- Add `mills_mergedwork_semantic_scores_total{available="true|false"}` to expose embedding availability for merged-work semantic grounding in `pkg/mills/textsim/semantic.go` and `pkg/mills/metrics.go`.

@@ -5,9 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/mills/finishing"
+	millshealth "github.com/crb2nu/loom/pkg/mills/health"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -26,8 +31,41 @@ type Reconciler struct {
 	Policy  *PolicyManager
 	Budget  *Budget
 	Starter PipelineStarter
-	Clock   func() time.Time
-	Logger  *slog.Logger
+	// SweepSilentRuns cancels stalled workers before recovery/admission.
+	SweepSilentRuns func(context.Context) error
+	Clock           func() time.Time
+	Logger          *slog.Logger
+	// HealthObservation reads the S1 detector's latest snapshot. Nil keeps the
+	// default-off admission path byte-identical.
+	HealthObservation func() millshealth.Observation
+	// MobilePushEvent receives only the two factory-health PAGE classes.
+	// DigestEvent receives non-page HUD events after their durable store event
+	// commits. Both are optional; the durable event feed remains authoritative.
+	MobilePushEvent func(context.Context, store.Event) error
+	DigestEvent     func(context.Context, store.Event) error
+	pageMu          sync.Mutex
+	pageSignals     factoryPageSignals
+	// OperatorRepoRoot and OperatorBuildSHA enable the deployment-aware
+	// dependency gate. A merged dependency that changed operator code remains
+	// held until its merge commit is contained in the running operator build.
+	OperatorRepoRoot string
+	OperatorBuildSHA string
+	// DependencyMergeSHA resolves the commit that landed a MERGED merge request
+	// for the deployment-aware gate when the store carries no merge SHA for a
+	// merged dependency: hand-finished MRs and ghost-spark closures never run a
+	// merge stage, so their runs leave no merged_sha artifact. Optional; nil
+	// keeps the gate store-only. A resolved SHA is cached as a
+	// reconciler.dependency_merge_sha event on the dependency, so GitLab is
+	// asked once per dependency, never once per tick.
+	DependencyMergeSHA func(ctx context.Context, project string, mrIID int64) (string, error)
+	// ancestryNoise rate-limits the fail-open admissions dependenciesMet logs:
+	// one WARN per (dependency, merge SHA, build, reason) per eventNoiseCooldown
+	// and DEBUG in between. Before it, three merged dependencies with no
+	// recorded merge SHA produced ~3k identical WARN lines per hour — 97% of
+	// the operator log on 2026-09-13. It also spaces the GitLab lookups for a
+	// dependency whose SHA could not be resolved.
+	ancestryNoise noiseGate
+	VaccineMinter VaccineMinter
 	// DispatchLeaseDuration bounds exclusive ownership of one outbox delivery.
 	// It is not a worker-execution lease or fencing token; PipelineStarter must
 	// still use run-id idempotency after a crash and lease expiry.
@@ -37,6 +75,9 @@ type Reconciler struct {
 	// Production leaves it nil; reliability tests use it to prove Tick work is
 	// bounded independently of queue depth.
 	ClaimFaultHook store.ClaimPipelineStartFaultHook
+	// Ranker is invoked only when policy enables ranked dispatch. Nil selects
+	// DispatchRanker; tests inject deterministic implementations here.
+	Ranker Ranker
 
 	// HomeProject is the repo this operator executes against by default
 	// (the GitLab project it is configured with). It is the reference for the
@@ -101,6 +142,9 @@ type Reconciler struct {
 	// merge stage). Nil disables the sweep entirely — the reconciler is
 	// otherwise unchanged. The GitLab client (pkg/mills/clients) satisfies it.
 	GhostSparkMRState MRStateClient
+	// WatchMRState optionally evaluates durable merge-request watches. Backlog
+	// and pipeline watches are always evaluated from the canonical store.
+	WatchMRState MRStateClient
 	// GhostSparkMRStateForProject scopes a ghost-spark lookup to the durable
 	// project recorded by the run's successful MR lifecycle stages. Production
 	// wires GitLabClient.ForProject. When nil, only HomeProject may use the base
@@ -149,6 +193,9 @@ type Reconciler struct {
 	// deferred follow-up (see docs/MILLS.md). The requeue itself, its event,
 	// and its metric never depend on this hook.
 	AutoRequeueIssueCommenter AutoRequeueIssueCommenter
+
+	// AutoRequeuePerCandidateAllowance defaults to four seconds.
+	AutoRequeuePerCandidateAllowance time.Duration
 	// ExternalIncidentRetryDecision applies the persisted paid-retry
 	// guardrail before the auto-requeue sweep releases an external incident.
 	// Production wires pipeline.RetryPolicy; nil preserves legacy behavior.
@@ -254,6 +301,94 @@ type Reconciler struct {
 	// nextLearningSignals is the earliest tick at which the learning-signal
 	// export sweep runs again (see learningSignalDue). Process-local.
 	nextLearningSignals time.Time
+
+	// RetentionInterval bounds how often SweepRetention runs; zero uses
+	// DefaultRetentionInterval (24h). RetentionDisabled turns the sweep off
+	// (tests that assert exact event counts). See reconciler_retention.go.
+	RetentionInterval time.Duration
+	RetentionDisabled bool
+	nextRetention     time.Time
+
+	// noise is the per-process cooldown for repeated bookkeeping rows
+	// (reconciler_retention.go). Lazily built on first use.
+	noise     *noiseGate
+	noiseOnce sync.Once
+}
+
+// staggerHousekeeping schedules the four rate-limited housekeeping sweeps at
+// fixed offsets after from — regression attribution at +1×step, signature
+// mining +2×step, learning-signal export +3×step, retention +4×step — instead
+// of letting all four fall due on the same tick. Scheduler.Run calls it before
+// the boot tick so that tick carries only the control law (dispatch pickup,
+// terminal sync, queue admission, in-flight re-drive): on 2026-09-07/08 every
+// boot tick died at its 30s deadline inside whichever housekeeping sweep the
+// cold page cache reached first ("learning signal sweep" / "retention sweep" /
+// "signature mining sweep: context deadline exceeded"), and the tick after
+// boot then lost its budget to the retention DELETE batches. The order runs
+// the cheapest, network-bound sweep first and the DELETE-heavy retention
+// sweep last; each later sweep then gets a mostly idle tick to itself. A
+// schedule is only ever pushed later, never earlier, so a sweep that already
+// stamped its next run keeps it.
+func (r *Reconciler) staggerHousekeeping(from time.Time, step time.Duration) {
+	if r == nil || step <= 0 {
+		return
+	}
+	later := func(current, candidate time.Time) time.Time {
+		if candidate.After(current) {
+			return candidate
+		}
+		return current
+	}
+	r.nextRegressionSweep = later(r.nextRegressionSweep, from.Add(1*step))
+	r.nextSignatureMining = later(r.nextSignatureMining, from.Add(2*step))
+	r.nextLearningSignals = later(r.nextLearningSignals, from.Add(3*step))
+	r.nextRetention = later(r.nextRetention, from.Add(4*step))
+}
+
+// VaccineMinter records prevention obligations in the shared Pattern Loom
+// taste system. PatternClient satisfies this interface in production.
+type VaccineMinter interface {
+	MintVaccine(context.Context, string, string, string, string) (string, error)
+}
+
+const RescuedWithoutVaccineEventKind = "reconciler.rescued_without_vaccine"
+
+// SweepVaccineAttention emits one durable attention signature per rescued
+// item and returns the current obligation count for the gauge.
+func (r *Reconciler) SweepVaccineAttention(ctx context.Context) (int, error) {
+	if r == nil || r.Store == nil {
+		return 0, nil
+	}
+	items, err := r.Store.Backlog.ListRescuedWithoutVaccine(ctx, 200)
+	if err != nil {
+		return 0, err
+	}
+	for _, item := range items {
+		if _, err := r.Store.Events.AppendOnceBySubjectKind(ctx, &store.Event{
+			Actor: "escalation-sweeper", Kind: RescuedWithoutVaccineEventKind,
+			SubjectKind: "backlog_item", SubjectID: item.BacklogID,
+			Payload: map[string]any{"escalation_run": item.EscalationRun, "regression_path": item.RegressionPath},
+		}); err != nil {
+			return len(items), err
+		}
+	}
+	return len(items), nil
+}
+
+// SetEscalationVaccine mints the idempotent candidate before fulfilling the
+// local obligation, so an unavailable Pattern Loom never silently loses it.
+func (r *Reconciler) SetEscalationVaccine(ctx context.Context, runID, backlogID, title, regressionPath string) (string, error) {
+	if r == nil || r.Store == nil || r.VaccineMinter == nil {
+		return "", errors.New("vaccine minting is not configured")
+	}
+	ref, err := r.VaccineMinter.MintVaccine(ctx, runID, backlogID, title, regressionPath)
+	if err != nil {
+		return "", err
+	}
+	if err := r.Store.Pipeline.SetVaccineRef(ctx, runID, ref); err != nil {
+		return "", err
+	}
+	return ref, nil
 }
 
 // AutoRequeueIssueCommenter posts a short recurrence note on an escalated item's
@@ -473,6 +608,12 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 	if r == nil || r.Store == nil {
 		return TickResult{}, errors.New("reconciler: not configured")
 	}
+	if r.SweepSilentRuns != nil {
+		if err := r.SweepSilentRuns(ctx); err != nil {
+			return TickResult{}, err
+		}
+	}
+	ctx = withStarvedExclusionAudit(ctx)
 	tickStart := r.now()
 	defer func() {
 		ReconcileTickDurationSeconds.Observe(r.now().Sub(tickStart).Seconds())
@@ -499,6 +640,11 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 		res.Inspected += terminalSync.Inspected
 		res.Errored += terminalSync.Errored
 	}
+	if _, watchErr := r.SweepWatches(ctx); watchErr != nil {
+		res.Inspected++
+		res.Errored++
+		r.append(ctx, "reconciler.watch_sweep_failed", "error", map[string]any{"error": watchErr.Error()})
+	}
 
 	policy := r.Policy.Current()
 	if !policy.IsEnabled() {
@@ -515,6 +661,13 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 		})
 		r.refreshDispatchOutboxGauge(ctx)
 		return res, nil
+	}
+	// Factory queue gauges ride the tick only when the health plane is
+	// enabled: default-off must leave the operator byte-identical — no extra
+	// store reads and no gauge mutations — and a disabled policy must skip
+	// them for the same reason (the early return above).
+	if policy.Health.Enabled {
+		r.refreshFactoryGauges(ctx, policy)
 	}
 	ready, blockers := true, []string(nil)
 	if r.AutonomyGate != nil {
@@ -555,34 +708,16 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 		return res, nil
 	}
 
-	queued, err := r.Store.Backlog.ListByStateLimit(
-		ctx, store.BacklogQueued, queuedAdmissionBatchSize(policy),
-	)
-	if err != nil {
-		ReconcileTicksTotal.WithLabelValues("errored").Inc()
-		return res, fmt.Errorf("read queue: %w", err)
-	}
-	// Heuristic dispatch ranker (W3.2, default-off). When enabled, reorder the
-	// queued slice by expected merge probability so the limited dispatch slots
-	// go to the work most likely to merge — chronically-escalating items yield
-	// to fresher work. Best-effort: an escalation-history read error keeps the
-	// store's FIFO-within-priority order (the ranker is a strict refinement).
-	if policy.Pipeline.RankerEnabled {
-		escSince := time.Now().Add(-rankerEscalationWindow)
-		if escRuns, eErr := r.Store.Pipeline.ListByStateSince(ctx, store.PipelineEscalated, escSince); eErr == nil {
-			escCounts := make(map[string]int, len(escRuns))
-			for _, run := range escRuns {
-				if run != nil {
-					escCounts[run.BacklogID]++
-				}
-			}
-			queued = Rank(queued, escCounts, time.Now())
-		} else {
-			r.append(ctx, "reconciler.ranker_skipped", "warn", map[string]any{"error": eErr.Error()})
+	startTarget := maxQueuedAdmissionBatchSize
+	if cap := policy.Budgets.Pipeline.MaxConcurrentRuns; cap > 0 {
+		active, err := r.Store.Pipeline.CountActive(ctx)
+		if err != nil {
+			ReconcileTicksTotal.WithLabelValues("errored").Inc()
+			return res, fmt.Errorf("count active runs: %w", err)
 		}
+		startTarget = max(0, cap-active)
 	}
 	r.refreshActiveGauges(ctx)
-	res.Inspected += len(queued)
 
 	// startedThisTick records run IDs already started earlier in this same
 	// tick (queued-item launches + queued subruns). pickupInFlightRuns must
@@ -592,25 +727,60 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 	// runner's active-guard then no-ops). It looked like a double-start
 	// (DEBT-079 #176); the active-guard always prevented an actual second
 	// drive, but the count was wrong and flaky under the race scheduler.
-	for _, item := range queued {
-		decision, run, _, err := r.tryStart(ctx, item, policy)
+	pageSize := queuedAdmissionBatchSize(policy)
+	var cursor *store.BacklogItem
+	admissionStarted, admissionInspected := 0, 0
+	for admissionInspected < maxQueuedAdmissionBatchSize && admissionStarted < startTarget {
+		pageLimit := min(pageSize, maxQueuedAdmissionBatchSize-admissionInspected)
+		page, err := r.Store.Backlog.ListByStatePage(ctx, store.BacklogQueued, cursor, pageLimit)
 		if err != nil {
-			r.append(ctx, "reconciler.start_failed", "error", map[string]any{
-				"item": item.ID, "error": err.Error(),
-			})
-			res.Errored++
-			continue
+			ReconcileTicksTotal.WithLabelValues("errored").Inc()
+			return res, fmt.Errorf("read queue: %w", err)
 		}
-		switch decision {
-		case decisionStarted:
-			res.Started++
-			if run != nil {
-				startedThisTick[run.ID] = true
+		if len(page) == 0 {
+			break
+		}
+		cursor = page[len(page)-1]
+		// Ranked dispatch remains a best-effort ordering layer within each
+		// bounded FIFO page; claiming remains exclusively in tryStart.
+		if policy.Pipeline.RankerEnabled {
+			var evaluated int
+			var cost float64
+			page, evaluated, cost = r.rankQueued(ctx, page, policy)
+			res.RankingCandidatesEvaluated += evaluated
+			res.RankingCost += cost
+		}
+		for _, item := range page {
+			if admissionStarted >= startTarget {
+				break
 			}
-		case decisionDeferred:
-			res.Deferred++
-		case decisionSkipped:
-			res.Skipped++
+			res.Inspected++
+			admissionInspected++
+			decision, run, _, err := r.tryStart(ctx, item, policy)
+			if err != nil {
+				r.append(ctx, "reconciler.start_failed", "error", map[string]any{
+					"item": item.ID, "error": err.Error(),
+				})
+				res.Errored++
+				continue
+			}
+			switch decision {
+			case decisionStarted:
+				res.Started++
+				admissionStarted++
+				if run != nil {
+					startedThisTick[run.ID] = true
+				}
+			case decisionDeferred:
+				res.Deferred++
+			case decisionSkipped:
+				res.Skipped++
+			case decisionHeldHuman:
+				res.HeldHuman++
+			}
+		}
+		if len(page) < pageLimit {
+			break
 		}
 	}
 
@@ -736,6 +906,15 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 			})
 		}
 	}
+
+	// Store retention: prune bookkeeping event rows and stale KPI snapshots
+	// (reconciler_retention.go). Bounded and kept OUT of TickResult like the
+	// sweeps above — housekeeping must never mark reconcile health errored. A
+	// pass that finishes backs off to its daily interval; one that hits its
+	// budget retries on the catch-up cadence until the store is clean.
+	if err := r.sweepRetentionDue(ctx, r.now()); err != nil {
+		return res, err
+	}
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}
@@ -744,7 +923,8 @@ func (r *Reconciler) Tick(ctx context.Context) (TickResult, error) {
 	ReconcileTicksTotal.WithLabelValues(tickOutcome).Inc()
 	r.append(ctx, "reconciler.tick", "ok", map[string]any{
 		"inspected": res.Inspected, "started": res.Started,
-		"deferred": res.Deferred, "skipped": res.Skipped, "errored": res.Errored,
+		"deferred": res.Deferred, "skipped": res.Skipped, "held_human": res.HeldHuman,
+		"errored":          res.Errored,
 		"dispatch_started": dispatchStarted, "dispatch_errored": dispatchErrs,
 		"terminal_synced": terminalSync.Updated, "terminal_sync_errored": terminalSync.Errored,
 		"subrun_started": subStarted, "subrun_errored": subErrs,
@@ -791,6 +971,7 @@ func (r *Reconciler) StartQueuedItemOpts(ctx context.Context, backlogID string, 
 	if r == nil || r.Store == nil {
 		return StartQueuedResult{}, errors.New("reconciler: not configured")
 	}
+	ctx = withStarvedExclusionAudit(ctx)
 	backlogID = strings.TrimSpace(backlogID)
 	if backlogID == "" {
 		return StartQueuedResult{}, errors.New("reconciler: backlog id required")
@@ -988,6 +1169,176 @@ func isTerminalPipelineState(state store.PipelineState) bool {
 	}
 }
 
+const watchSweepBatchSize = 200
+
+type WatchSweepResult struct{ Inspected, Resolved, Expired, Skipped int }
+
+const (
+	MainRedPageThreshold            = 90 * time.Minute
+	AutonomousMergePageThreshold    = 36 * time.Hour
+	PageEventMainRed                = "attention.page.main_red"
+	PageEventAutonomousMergeStarved = "attention.page.autonomous_merge_starvation"
+)
+
+// FactoryHealthObservation is the known/unknown S1 health snapshot consumed
+// by paging policy. A nil merge count is unknown; negative counts are treated
+// as unknown. Unknown observations break continuity without counting as a
+// recovery, so an already-fired unhealthy window cannot page again.
+type FactoryHealthObservation struct {
+	MainKnown           bool
+	MainGreen           bool
+	MainRedDuration     time.Duration
+	AutonomousMerges24h *int
+}
+
+type factoryPageSignal struct {
+	since time.Time
+	fired bool
+}
+type factoryPageSignals struct {
+	mainRed, mergeStarved factoryPageSignal
+}
+
+// ObserveFactoryHealth advances the two independent, process-local page
+// signals and emits at most one mobile event for each unhealthy window.
+func (r *Reconciler) ObserveFactoryHealth(ctx context.Context, observation FactoryHealthObservation) error {
+	if r == nil {
+		return nil
+	}
+	r.pageMu.Lock()
+	defer r.pageMu.Unlock()
+	now := r.now()
+	var events []store.Event
+	if advancePageSignal(&r.pageSignals.mainRed, now, observation.MainKnown, observation.MainKnown && !observation.MainGreen, observation.MainRedDuration, MainRedPageThreshold) {
+		events = append(events, store.Event{OccurredAt: now, Actor: "reconciler", Kind: PageEventMainRed, SubjectKind: "factory_health", SubjectID: "main", Payload: map[string]any{"threshold_seconds": MainRedPageThreshold.Seconds()}})
+	}
+	mergesKnown := observation.AutonomousMerges24h != nil && *observation.AutonomousMerges24h >= 0
+	mergeStarved := mergesKnown && *observation.AutonomousMerges24h == 0
+	if advancePageSignal(&r.pageSignals.mergeStarved, now, mergesKnown, mergeStarved, 0, AutonomousMergePageThreshold) {
+		events = append(events, store.Event{OccurredAt: now, Actor: "reconciler", Kind: PageEventAutonomousMergeStarved, SubjectKind: "factory_health", SubjectID: "autonomous_merges_24h", Payload: map[string]any{"threshold_seconds": AutonomousMergePageThreshold.Seconds()}})
+	}
+	for _, event := range events {
+		if r.MobilePushEvent != nil {
+			if err := r.MobilePushEvent(ctx, event); err != nil {
+				return fmt.Errorf("emit factory health page %s: %w", event.Kind, err)
+			}
+		}
+	}
+	return nil
+}
+
+func advancePageSignal(signal *factoryPageSignal, now time.Time, known, unhealthy bool, observedDuration, threshold time.Duration) bool {
+	if !known {
+		signal.since = time.Time{}
+		return false
+	}
+	if !unhealthy {
+		*signal = factoryPageSignal{}
+		return false
+	}
+	if signal.since.IsZero() {
+		signal.since = now
+		if observedDuration > 0 {
+			signal.since = now.Add(-observedDuration)
+		}
+	}
+	if signal.fired || now.Sub(signal.since) < threshold {
+		return false
+	}
+	signal.fired = true
+	return true
+}
+
+// SweepWatches transfers session-armed intent into durable operator custody.
+// It only resolves and notifies; it deliberately performs no remediation.
+func (r *Reconciler) SweepWatches(ctx context.Context) (WatchSweepResult, error) {
+	var out WatchSweepResult
+	if r == nil || r.Store == nil || r.Store.Watches == nil {
+		return out, nil
+	}
+	watches, err := r.Store.Watches.ListActive(ctx, watchSweepBatchSize)
+	if err != nil {
+		return out, fmt.Errorf("list active watches: %w", err)
+	}
+	now := r.now()
+	for _, w := range watches {
+		out.Inspected++
+		state := store.WatchMet
+		resolution := "terminal condition met"
+		if !now.Before(w.ExpiresAt) {
+			state = store.WatchExpired
+			resolution = "watch TTL expired"
+		} else {
+			met, e := r.watchConditionMet(ctx, w)
+			if e != nil {
+				r.append(ctx, "reconciler.watch_evaluation_failed", "error", map[string]any{"watch_id": w.ID, "error": e.Error()})
+				out.Skipped++
+				continue
+			}
+			if !met {
+				out.Skipped++
+				continue
+			}
+		}
+		kind := "attention.watch.met"
+		if state == store.WatchExpired {
+			kind = "attention.watch.expired"
+		}
+		event := &store.Event{OccurredAt: now, Actor: "reconciler", Kind: kind, SubjectKind: "watch", SubjectID: w.ID, Payload: map[string]any{"subject_kind": w.SubjectKind, "subject_id": w.SubjectID, "terminal_condition": w.TerminalCondition, "note": w.Note, "resolution": resolution}}
+		won, e := r.Store.Watches.ResolveWithEvent(ctx, w.ID, state, resolution, now, event)
+		if e != nil {
+			return out, fmt.Errorf("resolve watch %s: %w", w.ID, e)
+		}
+		if !won {
+			continue
+		}
+		if r.DigestEvent != nil {
+			if e := r.DigestEvent(ctx, *event); e != nil {
+				return out, fmt.Errorf("emit watch digest %s: %w", w.ID, e)
+			}
+		}
+		if state == store.WatchExpired {
+			out.Expired++
+		} else {
+			out.Resolved++
+		}
+	}
+	return out, nil
+}
+
+func (r *Reconciler) watchConditionMet(ctx context.Context, w *store.Watch) (bool, error) {
+	switch w.SubjectKind {
+	case store.WatchSubjectBacklogItem:
+		item, err := r.Store.Backlog.Get(ctx, w.SubjectID)
+		if err != nil {
+			return false, err
+		}
+		return string(item.State) == w.TerminalCondition, nil
+	case store.WatchSubjectPipelineRun:
+		run, err := r.Store.Pipeline.GetRun(ctx, w.SubjectID)
+		if err != nil {
+			return false, err
+		}
+		return string(run.State) == w.TerminalCondition, nil
+	case store.WatchSubjectMergeRequest:
+		client := r.WatchMRState
+		if client == nil {
+			client = r.GhostSparkMRState
+		}
+		if client == nil {
+			return false, nil
+		}
+		iid, err := strconv.ParseInt(w.SubjectID, 10, 64)
+		if err != nil {
+			return false, err
+		}
+		state, err := client.MRState(ctx, iid)
+		return strings.EqualFold(state, w.TerminalCondition), err
+	default:
+		return false, fmt.Errorf("unknown watch subject kind %q", w.SubjectKind)
+	}
+}
+
 const (
 	// ghostSparkGitLabLookupsPerPass caps how many GitLab MR-state lookups the
 	// reap sweep performs per pass so a large escalated backlog (91/141 items
@@ -1161,22 +1512,46 @@ func (r *Reconciler) SweepGhostSparks(ctx context.Context) (GhostSparkSweepResul
 	}
 	candidates := []*store.BacklogItem(nil)
 	if iidPass {
-		var err error
-		candidates, err = r.Store.Backlog.ListEscalatedWithMR(ctx, ghostSparkCandidateBatchSize)
+		// Keep routable MR-bearing candidates first so a large diagnostic tail
+		// cannot starve the settlement lookup budget. Then add the raw escalated
+		// population: ListEscalatedWithMR filters IID/provenance predicates in
+		// SQL, which otherwise makes a failed precondition indistinguishable from
+		// "there are no candidates". Acceptance below remains fail-closed.
+		preferred, err := r.Store.Backlog.ListEscalatedWithMR(ctx, ghostSparkCandidateBatchSize)
 		if err != nil {
 			if cancelErr := contextCancellationError(ctx, err); cancelErr != nil {
 				return res, cancelErr
 			}
 			return res, fmt.Errorf("list escalated-with-mr: %w", err)
 		}
+		diagnostic, err := r.Store.Backlog.ListByStateLimit(ctx, store.BacklogEscalated, ghostSparkCandidateBatchSize)
+		if err != nil {
+			if cancelErr := contextCancellationError(ctx, err); cancelErr != nil {
+				return res, cancelErr
+			}
+			return res, fmt.Errorf("list escalated candidates: %w", err)
+		}
+		candidates = append(candidates, preferred...)
+		seen := make(map[string]struct{}, len(preferred))
+		for _, item := range preferred {
+			if item != nil {
+				seen[item.ID] = struct{}{}
+			}
+		}
+		for _, item := range diagnostic {
+			if item == nil {
+				continue
+			}
+			if _, ok := seen[item.ID]; ok {
+				continue
+			}
+			candidates = append(candidates, item)
+		}
 	}
 iidLoop:
 	for _, item := range candidates {
 		if err := ctx.Err(); err != nil {
 			return res, err
-		}
-		if lookups >= ghostSparkGitLabLookupsPerPass {
-			break
 		}
 		if item == nil {
 			continue
@@ -1202,26 +1577,51 @@ iidLoop:
 			continue
 		}
 		run := mostRecentRun(runs)
-		if run == nil || run.MRIID == nil || *run.MRIID == 0 {
-			// The most-recent attempt never opened an MR (e.g. a requeue that
-			// escalated before the mr stage) — an earlier attempt's stale MR must
-			// not drive a ghost-close. Nothing to reconcile; no GitLab call.
+		if run == nil {
+			r.appendGhostSparkSkip(ctx, item, nil, "candidate_exclusion", "no pipeline run")
 			continue
+		}
+		if run.MRIID == nil || *run.MRIID == 0 {
+			// The most-recent attempt never opened an MR (e.g. a requeue that
+			// escalated before the mr stage). The item's work may still have
+			// LANDED: an earlier attempt's MR can merge after that retry
+			// failed (manual rescue trains, merge-when-pipeline-succeeds
+			// races — observed 2026-08-19, two items parked escalated behind
+			// merged MRs). Fall back to the newest MR-bearing run: closing
+			// still requires GitLab to report that exact MR merged, and the
+			// close event carries the run id so the provenance is auditable.
+			// An open or closed (unmerged) MR from the earlier attempt still
+			// never drives a close — those arms leave the item escalated.
+			run = mostRecentRunWithMR(runs)
+			if run == nil {
+				r.appendGhostSparkSkip(ctx, item, mostRecentRun(runs), "candidate_exclusion", "no MR-bearing pipeline run; reserved for merged-branch pass")
+				continue
+			}
 		}
 		due, dueErr := r.ghostSparkRecheckDue(ctx, item.ID, now, *run.MRIID)
 		if dueErr != nil {
 			return res, fmt.Errorf("ghost-spark recheck state %s: %w", item.ID, dueErr)
 		}
 		if !due {
+			r.appendGhostSparkSkip(ctx, item, run, "cooldown", "durable escalation recheck is not due")
 			continue
 		}
-		project, perr := r.Store.Pipeline.AuthorizedProject(ctx, run.ID)
+		// A merged MR is terminal evidence about the durable identity stamped by
+		// the run: project + IID. Do not rebuild that identity from later CI,
+		// merge, or cleanup provenance. Those stages can describe a successor
+		// head (including one pushed by an external rebase actor), while the MR
+		// stage remains the authoritative namespace for the per-project IID.
+		project, perr := r.ghostSparkMRProject(ctx, item, run.ID)
 		if perr != nil {
-			r.append(ctx, "reconciler.ghost_spark_failed", "error", map[string]any{
-				"backlog": item.ID, "run": run.ID, "mr_iid": *run.MRIID, "error": perr.Error(),
-			})
-			if err := r.deferGhostSparkRecheck(ctx, item.ID, now); err != nil {
-				return res, err
+			r.appendGhostSparkSkip(ctx, item, run, "project_provenance", perr.Error())
+			if _, err := r.Store.Events.AppendOnceBySubjectKind(ctx, &store.Event{
+				Actor: "reconciler", Kind: "reconciler.ghost_spark_failed",
+				SubjectKind: "pipeline_run", SubjectID: run.ID,
+				Payload: map[string]any{
+					"backlog": item.ID, "run": run.ID, "mr_iid": *run.MRIID, "error": perr.Error(),
+				},
+			}); err != nil {
+				return res, fmt.Errorf("append ghost-spark provenance failure: %w", err)
 			}
 			res.Errored++
 			continue
@@ -1233,6 +1633,7 @@ iidLoop:
 			mrState = nil
 		}
 		if mrState == nil {
+			r.appendGhostSparkSkip(ctx, item, run, "client_selection", "no MR-state client for authorized project")
 			r.append(ctx, "reconciler.ghost_spark_failed", "error", map[string]any{
 				"backlog": item.ID, "run": run.ID, "mr_iid": *run.MRIID,
 				"project": project, "error": "no MR-state client for durable project",
@@ -1241,6 +1642,10 @@ iidLoop:
 				return res, err
 			}
 			res.Errored++
+			continue
+		}
+		if lookups >= ghostSparkGitLabLookupsPerPass {
+			r.appendGhostSparkSkip(ctx, item, run, "candidate_exclusion", "per-pass MR lookup budget exhausted")
 			continue
 		}
 		lookups++
@@ -1365,6 +1770,38 @@ iidLoop:
 	return res, nil
 }
 
+// ghostSparkMRProject resolves the project half of the durable (project, IID)
+// identity used by the IID settle pass. The successful MR-stage stamp wins;
+// escalationAuthorizedProject remains the fail-closed legacy fallback for runs
+// that predate mr_project. In particular, later head or actor provenance is not
+// part of merged-state settlement.
+func (r *Reconciler) ghostSparkMRProject(ctx context.Context, item *store.BacklogItem, runID string) (string, error) {
+	stages, err := r.Store.Pipeline.ListStages(ctx, runID)
+	if err != nil {
+		return "", err
+	}
+	project := ""
+	for _, sr := range stages {
+		if sr == nil || sr.Stage != "mr" || sr.Outcome == nil || *sr.Outcome != store.StageOutcomeSuccess {
+			continue
+		}
+		raw, exists := sr.Artifacts["mr_project"]
+		if !exists {
+			continue
+		}
+		value, ok := raw.(string)
+		value = strings.TrimSpace(value)
+		if !ok || value == "" || (project != "" && !store.SameRepo(project, value)) {
+			return "", store.ErrPipelineProjectUnavailable
+		}
+		project = value
+	}
+	if project != "" {
+		return project, nil
+	}
+	return escalationAuthorizedProject(ctx, r.Store.Pipeline, r.Store.Events, item, r.HomeProject, runID)
+}
+
 // sweepMergedBranchSparks is the sweep's second pass: escalated items whose
 // most-recent run never recorded an MRIID, whose deterministic branch GitLab
 // reports as merged. The IID pass structurally cannot reach these — a run that
@@ -1419,13 +1856,12 @@ func (r *Reconciler) sweepMergedBranchSparks(
 		}
 		return fmt.Errorf("list escalated-without-mr: %w", err)
 	}
+	// Ledger reads are local and do not spend the bounded GitLab budget.
+	settled, _ := r.Store.MergeQueue.ListSettled(ctx, time.Time{}, 100)
 	res.BranchCandidates = len(candidates)
 	for _, item := range candidates {
 		if err := ctx.Err(); err != nil {
 			return err
-		}
-		if lookups >= ghostSparkBranchLookupsPerPass {
-			break
 		}
 		if item == nil {
 			continue
@@ -1434,14 +1870,12 @@ func (r *Reconciler) sweepMergedBranchSparks(
 		if dueErr != nil {
 			return fmt.Errorf("merged-branch recheck state %s: %w", item.ID, dueErr)
 		}
-		if !due {
-			continue
-		}
 		target := strings.TrimSpace(item.TargetProject)
 		isHome := target == "" || (r.HomeProject != "" && store.SameRepo(target, r.HomeProject))
 		// Guard 1 fast path: with no per-project client the pass is home-only,
 		// exactly the pre-binding behavior — skip before any store read.
 		if !isHome && r.GhostSparkMergedBranchForProject == nil {
+			r.appendGhostSparkSkip(ctx, item, nil, "client_selection", "no per-project merged-branch client")
 			continue
 		}
 		runs, lerr := r.Store.Pipeline.ListByBacklog(ctx, item.ID)
@@ -1457,6 +1891,23 @@ func (r *Reconciler) sweepMergedBranchSparks(
 		}
 		run := mostRecentRun(runs)
 		if run == nil {
+			r.appendGhostSparkSkip(ctx, item, nil, "candidate_exclusion", "no pipeline run")
+			continue
+		}
+		branches := r.GhostSparkBranchesFor(item)
+		if len(branches) == 0 {
+			r.appendGhostSparkSkip(ctx, item, run, "candidate_exclusion", "no deterministic rescue branch")
+			continue
+		}
+		// This hint only decides whether local ledger evidence warrants checking
+		// a cooled-down item. Durable project authorization below still gates closure.
+		project := target
+		if isHome {
+			project = r.HomeProject
+		}
+		ledger := r.mergedBranchLedgerEvidence(ctx, settled, project, branches, run.StartedAt)
+		if !due && ledger == nil {
+			r.appendGhostSparkSkip(ctx, item, run, "cooldown", "durable escalation recheck is not due")
 			continue
 		}
 		// Guard 1: authorize the lookup project against the immutable
@@ -1468,8 +1919,7 @@ func (r *Reconciler) sweepMergedBranchSparks(
 		if !ok {
 			continue
 		}
-		branches := r.GhostSparkBranchesFor(item)
-		if len(branches) == 0 {
+		if ledger == nil && lookups >= ghostSparkBranchLookupsPerPass {
 			continue
 		}
 		// One heavily-sliced item must not spend the whole tick's budget; the
@@ -1483,7 +1933,13 @@ func (r *Reconciler) sweepMergedBranchSparks(
 			found     bool
 			lookupErr error
 		)
+		if ledger != nil {
+			foundIID, foundWhen, found = ledger.MRIID, *ledger.SettledAt, true
+		}
 		for _, branch := range branches {
+			if found {
+				break
+			}
 			if strings.TrimSpace(branch) == "" {
 				continue
 			}
@@ -1549,6 +2005,29 @@ func (r *Reconciler) sweepMergedBranchSparks(
 	return nil
 }
 
+// mergedBranchLedgerEvidence accepts only the latest settled MR row, with
+// exact branch and authorized project identity, newer than this attempt.
+func (r *Reconciler) mergedBranchLedgerEvidence(ctx context.Context, entries []*store.MergeQueueEntry, project string, branches []string, started time.Time) *store.MergeQueueEntry {
+	if project == "" {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.State != store.MergeQueueMerged || entry.MergedSHA == "" || entry.SettledAt == nil || entry.SettledAt.Before(started) || !store.SameRepo(entry.Project, project) {
+			continue
+		}
+		for _, branch := range branches {
+			if branch == "" || entry.SourceBranch != branch {
+				continue
+			}
+			latest, err := r.Store.MergeQueue.LatestSettledByMR(ctx, entry.Project, entry.MRIID)
+			if err == nil && latest != nil && latest.ID == entry.ID {
+				return entry
+			}
+		}
+	}
+	return nil
+}
+
 // mergedBranchClientFor resolves which MergedBranchMRClient (and project) may
 // answer a candidate's branch lookups. Home items keep the home client — with
 // one hardening: a home item whose run's escalation-time binding froze a
@@ -1585,6 +2064,7 @@ func (r *Reconciler) mergedBranchClientFor(
 	if isHome {
 		if haveBinding && !boundHome {
 			res.BranchBindingSkipped++
+			r.appendGhostSparkSkip(ctx, item, run, "project_provenance", "escalation binding points at a foreign project")
 			if err := r.deferGhostSparkRecheck(ctx, item.ID, now); err != nil {
 				return nil, "", false, err
 			}
@@ -1594,6 +2074,11 @@ func (r *Reconciler) mergedBranchClientFor(
 	}
 	if !haveBinding || !store.SameRepo(bound, target) {
 		res.BranchBindingSkipped++
+		detail := "missing escalation-time project binding"
+		if haveBinding {
+			detail = "escalation-time project binding does not match current target"
+		}
+		r.appendGhostSparkSkip(ctx, item, run, "project_provenance", detail)
 		if err := r.deferGhostSparkRecheck(ctx, item.ID, now); err != nil {
 			return nil, "", false, err
 		}
@@ -1601,6 +2086,7 @@ func (r *Reconciler) mergedBranchClientFor(
 	}
 	client := r.GhostSparkMergedBranchForProject(bound)
 	if client == nil {
+		r.appendGhostSparkSkip(ctx, item, run, "client_selection", "no merged-branch client for authorized project")
 		r.append(ctx, "reconciler.ghost_spark_failed", "error", map[string]any{
 			"backlog": item.ID, "run": run.ID,
 			"project": bound, "error": "no merged-branch client for bound project",
@@ -1612,6 +2098,34 @@ func (r *Reconciler) mergedBranchClientFor(
 		return nil, "", false, nil
 	}
 	return client, bound, true, nil
+}
+
+// appendGhostSparkSkip records why an escalated settle candidate was not
+// examined. Durable events make selection, cooldown, provenance, and client
+// wiring failures diagnosable after a process restart.
+func (r *Reconciler) appendGhostSparkSkip(ctx context.Context, item *store.BacklogItem, run *store.PipelineRun, precondition, detail string) {
+	if r == nil || r.Store == nil || r.Store.Events == nil || item == nil {
+		return
+	}
+	payload := map[string]any{
+		"outcome": "skipped", "backlog": item.ID,
+		"precondition": precondition, "detail": detail,
+	}
+	subjectKind, subjectID := "backlog_item", item.ID
+	if run != nil {
+		payload["run"] = run.ID
+		payload["mr_iid"] = derefInt64(run.MRIID)
+		subjectKind, subjectID = "pipeline_run", run.ID
+	}
+	if !r.allowNoise("reconciler.ghost_spark_skipped", "skipped", payload) {
+		return
+	}
+	if err := r.Store.Events.Append(ctx, &store.Event{
+		Actor: "reconciler", Kind: "reconciler.ghost_spark_skipped",
+		SubjectKind: subjectKind, SubjectID: subjectID, Payload: payload,
+	}); err != nil && r.Logger != nil {
+		r.Logger.Warn("reconciler: append ghost-spark skip event failed", "backlog", item.ID, "precondition", precondition, "error", err)
+	}
 }
 
 // contextCancellationError distinguishes cancellation from ordinary per-item
@@ -1714,6 +2228,9 @@ func (r *Reconciler) closeGhostSparkWithMR(
 	}
 	if project != "" {
 		closePayload["project"] = project
+		if sha := r.mergeQueueMergedSHA(ctx, project, mrIID); sha != "" {
+			closePayload["merged_sha"] = sha
+		}
 	}
 	event := &store.Event{
 		Actor:       "reconciler",
@@ -1858,6 +2375,26 @@ func mostRecentRun(runs []*store.PipelineRun) *store.PipelineRun {
 	return latest
 }
 
+// mostRecentRunWithMR returns the newest run that opened an MR, or nil when no
+// run did. The ghost-spark IID pass falls back to it when the item's very
+// latest attempt died before the mr stage (a failed requeue): the earlier
+// attempt's MR can still merge after the retry failed — rescue trains and
+// merge-when-pipeline-succeeds races both produce exactly that shape — and
+// without the fallback such items are unreachable by the IID pass forever.
+func mostRecentRunWithMR(runs []*store.PipelineRun) *store.PipelineRun {
+	var latest *store.PipelineRun
+	for _, run := range runs {
+		if run == nil || run.MRIID == nil || *run.MRIID == 0 {
+			continue
+		}
+		if latest == nil || run.StartedAt.After(latest.StartedAt) ||
+			(run.StartedAt.Equal(latest.StartedAt) && run.Attempts > latest.Attempts) {
+			latest = run
+		}
+	}
+	return latest
+}
+
 // derefInt64 safely dereferences a *int64 (0 for nil) for log/event payloads.
 func derefInt64(p *int64) int64 {
 	if p == nil {
@@ -1870,10 +2407,10 @@ const pendingDispatchBatchSize = 128
 
 const terminalBacklogSyncBatchSize = 128
 
-// maxQueuedAdmissionBatchSize is the hard per-tick admission ceiling when a
-// policy leaves MaxConcurrentRuns uncapped. With a configured concurrency cap,
-// Tick inspects the smaller of the two limits. Manual StartQueuedItem calls are
-// deliberately unaffected.
+// maxQueuedAdmissionBatchSize is the hard per-tick inspection ceiling for
+// queued admission. A configured MaxConcurrentRuns limits starts to the
+// available headroom, while inspection may continue to this ceiling to move
+// past deferred FIFO heads. Manual StartQueuedItem calls are unaffected.
 const maxQueuedAdmissionBatchSize = 128
 
 func queuedAdmissionBatchSize(policy *Policy) int {
@@ -2162,12 +2699,130 @@ func derefString(s *string) string {
 // TickResult summarises the work one Tick performed. Useful for tests +
 // HUD; the scheduler also exports it as a Prometheus gauge in slice 5.1.
 type TickResult struct {
-	Inspected  int
-	Started    int
-	Deferred   int
-	Skipped    int
-	Errored    int
-	SkipReason string
+	Inspected int
+	Started   int
+	Deferred  int
+	Skipped   int
+	// HeldHuman counts queued items tryStart withheld because their effective
+	// policy requires human review (item flag or per-repo override). Kept
+	// apart from Skipped so the ticks_total label can tell "the queue is
+	// waiting on a person" from "the reconciler skipped work".
+	HeldHuman                  int
+	Errored                    int
+	SkipReason                 string
+	RankingCandidatesEvaluated int
+	RankingCost                float64
+}
+
+func (r *Reconciler) rankQueued(ctx context.Context, fifo []*store.BacklogItem, policy *Policy) ([]*store.BacklogItem, int, float64) {
+	fallback := func(err error, evaluated int, cost float64) ([]*store.BacklogItem, int, float64) {
+		r.append(ctx, "reconciler.ranker_fallback", "fifo", map[string]any{"error": err.Error(), "candidates_evaluated": evaluated, "ranking_cost": cost})
+		return fifo, evaluated, cost
+	}
+	escRuns, err := r.Store.Pipeline.ListByStateSince(ctx, store.PipelineEscalated, r.now().Add(-rankerEscalationWindow))
+	if err != nil {
+		return fallback(err, 0, 0)
+	}
+	escalations := make(map[string]int, len(escRuns))
+	for _, run := range escRuns {
+		if run != nil {
+			escalations[run.BacklogID]++
+		}
+	}
+	taste, err := r.Store.Backlog.TasteAggregates(ctx, r.now(), 14*24*time.Hour)
+	if err != nil {
+		return fallback(err, 0, 0)
+	}
+	byPlan := rankerTasteFeatures(taste)
+	outcomes, err := r.Store.Outcomes.Features(ctx, r.now().Add(-rankerEscalationWindow))
+	if err != nil {
+		return fallback(err, 0, 0)
+	}
+	inputs := make([]RankingInput, len(fifo))
+	for i, item := range fifo {
+		inputs[i] = RankingInput{Item: item}
+		if item != nil {
+			inputs[i].Escalations = escalations[item.ID]
+			if outcome, ok := outcomes[item.PlanID]; ok {
+				inputs[i].Outcome = &outcome
+			}
+			inputs[i].Taste = byPlan[item.PlanID]
+		}
+	}
+	timeout := DefaultRankerTimeout
+	if policy.Pipeline.RankerTimeoutMilliseconds > 0 {
+		timeout = time.Duration(policy.Pipeline.RankerTimeoutMilliseconds) * time.Millisecond
+	}
+	maxCandidates := policy.Pipeline.RankerMaxCandidates
+	if maxCandidates == 0 {
+		maxCandidates = DefaultRankerMaxCandidates
+	}
+	maxCost := policy.Pipeline.RankerMaxCost
+	if maxCost == 0 {
+		maxCost = DefaultRankerMaxCost
+	}
+	ranker := r.Ranker
+	if ranker == nil {
+		ranker = DispatchRanker{}
+	}
+	rankInputs := inputs
+	if len(rankInputs) > maxCandidates {
+		rankInputs = rankInputs[:maxCandidates]
+	}
+	rankCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result, err := ranker.Rank(rankCtx, rankInputs, RankingBudget{MaxCandidates: maxCandidates, MaxCost: maxCost})
+	if err != nil {
+		return fallback(err, result.CandidatesEvaluated, result.Cost)
+	}
+	if result.CandidatesEvaluated < 0 || result.CandidatesEvaluated > maxCandidates ||
+		result.Cost < 0 || result.Cost > maxCost || !validRankedItems(rankInputs, result.Items) {
+		return fallback(ErrRankingBudgetExceeded, result.CandidatesEvaluated, result.Cost)
+	}
+	ranked := make([]*store.BacklogItem, 0, len(fifo))
+	ranked = append(ranked, result.Items...)
+	for i := len(rankInputs); i < len(inputs); i++ {
+		ranked = append(ranked, inputs[i].Item)
+	}
+	return ranked, result.CandidatesEvaluated, result.Cost
+}
+
+// rankerTasteFeatures applies the S3 rolling-aggregate kill gate at read time.
+// Missing coverage and coverage below 60% both fail closed to outcome-only.
+func rankerTasteFeatures(taste store.TasteAggregates) map[string]*store.PlanTasteAggregate {
+	byPlan := make(map[string]*store.PlanTasteAggregate, len(taste.Plans))
+	if taste.OverallMerged14d == 0 || taste.OverallCoverage14d < minimumTasteCoverage {
+		return byPlan
+	}
+	for i := range taste.Plans {
+		aggregate := taste.Plans[i]
+		byPlan[aggregate.PlanID] = &aggregate
+	}
+	return byPlan
+}
+
+// validRankedItems keeps the pluggable Ranker boundary from weakening queue
+// admission invariants. A ranker may permute the exact candidates within a
+// priority band; it may not inject/drop/duplicate work or move work across a
+// band. Invalid output takes the same strict FIFO fallback as a budget breach.
+func validRankedItems(inputs []RankingInput, ranked []*store.BacklogItem) bool {
+	if len(ranked) != len(inputs) {
+		return false
+	}
+	want := make(map[*store.BacklogItem]int, len(inputs))
+	for _, input := range inputs {
+		want[input.Item]++
+	}
+	for i, item := range ranked {
+		if want[item] == 0 {
+			return false
+		}
+		want[item]--
+		if item == nil || inputs[i].Item == nil || item.Priority != inputs[i].Item.Priority {
+			return false
+		}
+	}
+	return true
 }
 
 // IsNoOp reports whether the tick had nothing to look at — either the
@@ -2181,10 +2836,17 @@ func (r TickResult) IsNoOp() bool {
 
 type startDecision int
 
+type starvedExclusionAuditKey struct{}
+
+func withStarvedExclusionAudit(ctx context.Context) context.Context {
+	return context.WithValue(ctx, starvedExclusionAuditKey{}, make(map[string]struct{}))
+}
+
 const (
-	decisionStarted  startDecision = iota
-	decisionDeferred               // dependencies unmet or budget exhausted
-	decisionSkipped                // explicitly out of scope (e.g. paused)
+	decisionStarted   startDecision = iota
+	decisionDeferred                // dependencies unmet or budget exhausted
+	decisionSkipped                 // explicitly out of scope (e.g. paused)
+	decisionHeldHuman               // effective policy requires a human hand-off
 )
 
 func (d startDecision) String() string {
@@ -2195,6 +2857,8 @@ func (d startDecision) String() string {
 		return "deferred"
 	case decisionSkipped:
 		return "skipped"
+	case decisionHeldHuman:
+		return "held_human"
 	default:
 		return "unknown"
 	}
@@ -2213,6 +2877,7 @@ func (r *Reconciler) startImperativeRun(
 	sel *store.WorkflowSelection,
 	estimate float64,
 ) (startDecision, *store.PipelineRun, string, error) {
+	limits := policy.PipelineBudgetLimitsFor(item.TargetProject, r.HomeProject)
 	claim, err := r.Store.ClaimWorkflowStart(ctx, store.ClaimWorkflowStartRequest{
 		BacklogID:            item.ID,
 		ExpectedClaimVersion: item.ClaimVersion,
@@ -2221,7 +2886,7 @@ func (r *Reconciler) startImperativeRun(
 		EstimateUSD:          estimate,
 		ParentSessionID:      r.operatorSessionID(),
 		Limits: store.PipelineStartLimits{
-			MaxUSDPerRun:      policy.Budgets.Pipeline.MaxUSDPerRun,
+			MaxUSDPerRun:      limits.MaxUSDPerRun,
 			MaxUSDPerDay:      policy.Budgets.Pipeline.MaxUSDPerDay,
 			MaxRunsPerDay:     policy.Budgets.Pipeline.MaxRunsPerDay,
 			MaxConcurrentRuns: policy.Budgets.Pipeline.MaxConcurrentRuns,
@@ -2275,17 +2940,37 @@ func (r *Reconciler) startImperativeRun(
 // pipeline run (returning decisionStarted) or defers / skips with a reason
 // recorded in the events log.
 func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, policy *Policy) (startDecision, *store.PipelineRun, string, error) {
+	// This is the single admission door shared by manual starts, dependency
+	// release, auto-requeue and shepherd relaunch. Evaluate before any claim.
+	if cfg := policy.Health.BaseRed; cfg.Enabled && !cfg.Exempt(item.Labels) && r.HealthObservation != nil {
+		observation := r.HealthObservation()
+		if observation.Known && !observation.Green && observation.RedDuration >= cfg.Threshold() {
+			if cfg.Enforced() {
+				r.append(ctx, "reconciler.deferred", "base_red", map[string]any{
+					"item": item.ID, "red_duration_seconds": observation.RedDuration.Seconds(),
+				})
+				return decisionDeferred, nil, "base_red", nil
+			}
+			if r.Logger != nil {
+				r.Logger.Info("base_red admission hold decision", "item", item.ID,
+					"mode", "dry-log", "red_duration", observation.RedDuration)
+			}
+		}
+	}
 	// Dependency check: every backlog item in item.Dependencies must be in
 	// state=merged. Anything else (running, paused, escalated) blocks.
 	if len(item.Dependencies) > 0 {
-		ok, blocker, err := r.dependenciesMet(ctx, item)
+		ok, blocker, outcome, err := r.dependenciesMet(ctx, item)
 		if err != nil {
 			return decisionDeferred, nil, "", err
 		}
 		if !ok {
-			r.append(ctx, "reconciler.deferred", "deps", map[string]any{
+			r.append(ctx, "reconciler.deferred", outcome, map[string]any{
 				"item": item.ID, "blocked_by": blocker,
 			})
+			if outcome == "dependency_undeployed" {
+				return decisionDeferred, nil, fmt.Sprintf("blocked by dependency %s (merged but not deployed)", blocker), nil
+			}
 			return decisionDeferred, nil, fmt.Sprintf("blocked by dependency %s (not merged)", blocker), nil
 		}
 	}
@@ -2298,7 +2983,7 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 	if policy.Pipeline.SerializeOverlappingScopesEnabled() {
 		fairness := policy.Pipeline.ScopeFairness
 		if fairness.IsEnabled() {
-			blocker, witness, err := r.scopeReservationBlocker(ctx, item, fairness.Hold())
+			blocker, witness, err := r.scopeReservationBlocker(ctx, item, policy, fairness.Hold())
 			if err != nil {
 				return decisionDeferred, nil, "", fmt.Errorf("scope reservation check: %w", err)
 			}
@@ -2337,15 +3022,36 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 	// read here would both duplicate SQL and reopen the check-then-claim race the
 	// reservation transaction is designed to close.
 	estimate := item.Budget.MaxCostUSD
+	limits := policy.PipelineBudgetLimitsFor(item.TargetProject, r.HomeProject)
 
-	// Policy gate: items flagged require_human_review without an explicit
-	// human handoff in flight are deferred — the reconciler doesn't pick
-	// them up autonomously; a human (or the escalation path) does.
-	if item.Policy.RequireHumanReview {
+	// Policy gate: items flagged require_human_review (on the item or via the
+	// per-repo override) are held — the reconciler doesn't pick them up
+	// autonomously; a human (or the escalation path) does. This is a distinct
+	// decision from decisionSkipped so a tick whose only unstarted work is
+	// human-gated lands in the held_human outcome rather than reading as a
+	// dispatch outage (568 consecutive "skipped" ticks on 2026-09-07 were one
+	// require_human_review item waiting for a hand-off).
+	if held, reason := policy.RequiresHumanReview(item, r.HomeProject); held {
 		r.append(ctx, "reconciler.skipped", "policy", map[string]any{
-			"item": item.ID, "reason": "require_human_review=true",
+			"item": item.ID, "reason": reason,
 		})
-		return decisionSkipped, nil, "require_human_review=true; a human hand-off must start this item", nil
+		return decisionHeldHuman, nil, reason + "; a human hand-off must start this item", nil
+	}
+
+	// The store claim below continues to enforce the global daily-run cap
+	// transactionally. Only perform this repository-scoped count when the
+	// repository actually defines its additional cap; otherwise an absent
+	// override must preserve the existing global-only behaviour.
+	if repoRunCap, ok := policy.PerRepoRunCapFor(item.TargetProject, r.HomeProject); ok {
+		count, err := r.countRepoBudgetedRunsSince(ctx, item.TargetProject, r.now().UTC().Truncate(24*time.Hour))
+		if err != nil {
+			return decisionDeferred, nil, "", err
+		}
+		if count >= repoRunCap {
+			reason := fmt.Sprintf("per-repo max_runs_per_day reached (%d/%d)", count, repoRunCap)
+			r.append(ctx, "reconciler.deferred", "budget", map[string]any{"item": item.ID, "reason": reason})
+			return decisionDeferred, nil, "budget: " + reason, nil
+		}
 	}
 
 	// Cross-repo gate (fail-closed): an item targeting a repo other than this
@@ -2419,19 +3125,62 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 	// reconciler can therefore lose only with ErrClaimConflict, never by
 	// leaving a half-created run or oversubscribing a checked cap.
 	now := r.now().UTC()
+	// Resolve external deployment evidence before entering the claim transaction.
+	// The store validates dependency revisions before applying these holds.
+	undeployed := make(map[string]int64)
+	if policy.Pipeline.SerializeOverlappingScopesEnabled() && policy.Pipeline.ScopeFairness.IsEnabled() {
+		reservations, err := r.Store.Backlog.ScopeReservations(ctx)
+		if err != nil {
+			return decisionDeferred, nil, "", err
+		}
+		for _, reservation := range reservations {
+			reserver, err := r.Store.Backlog.Get(ctx, reservation.BacklogID)
+			if err != nil {
+				return decisionDeferred, nil, "", err
+			}
+			if item.Priority < reserver.Priority {
+				continue
+			}
+			if hit, _ := store.BacklogScopesOverlap(item, reserver, r.HomeProject); !hit {
+				continue
+			}
+			for _, id := range reserver.Dependencies {
+				dep, err := r.Store.Backlog.Get(ctx, id)
+				if errors.Is(err, store.ErrNotFound) {
+					continue // The transaction rejects missing dependencies.
+				}
+				if err != nil {
+					return decisionDeferred, nil, "", err
+				}
+				_, _, outcome, err := r.dependenciesMet(ctx, &store.BacklogItem{Dependencies: []string{id}})
+				if err != nil {
+					return decisionDeferred, nil, "", err
+				}
+				if outcome == "dependency_undeployed" {
+					undeployed[id] = dep.Revision
+				}
+			}
+		}
+	}
 	claimStarted := time.Now()
 	claim, err := r.Store.ClaimPipelineStart(ctx, store.ClaimPipelineStartRequest{
-		BacklogID:                  item.ID,
-		ExpectedClaimVersion:       item.ClaimVersion,
-		ExpectedRevision:           item.Revision,
-		SerializeOverlappingScopes: policy.Pipeline.SerializeOverlappingScopesEnabled(),
-		EnforceScopeReservations:   policy.Pipeline.ScopeFairness.IsEnabled(),
-		HomeProject:                r.HomeProject,
-		Template:                   policy.Pipeline.DefaultTemplate,
-		EstimateUSD:                estimate,
-		ParentSessionID:            r.operatorSessionID(),
+		BacklogID:                         item.ID,
+		ExpectedClaimVersion:              item.ClaimVersion,
+		ExpectedRevision:                  item.Revision,
+		SerializeOverlappingScopes:        policy.Pipeline.SerializeOverlappingScopesEnabled(),
+		EnforceScopeReservations:          policy.Pipeline.ScopeFairness.IsEnabled(),
+		UndeployedReservationDependencies: undeployed,
+		ReservationPolicy: func(reserver *store.BacklogItem) (bool, int) {
+			held, _ := policy.RequiresHumanReview(reserver, r.HomeProject)
+			cap, _ := policy.PerRepoRunCapFor(reserver.TargetProject, r.HomeProject)
+			return held, cap
+		},
+		HomeProject:     r.HomeProject,
+		Template:        policy.Pipeline.DefaultTemplate,
+		EstimateUSD:     estimate,
+		ParentSessionID: r.operatorSessionID(),
 		Limits: store.PipelineStartLimits{
-			MaxUSDPerRun:      policy.Budgets.Pipeline.MaxUSDPerRun,
+			MaxUSDPerRun:      limits.MaxUSDPerRun,
 			MaxUSDPerDay:      policy.Budgets.Pipeline.MaxUSDPerDay,
 			MaxRunsPerDay:     policy.Budgets.Pipeline.MaxRunsPerDay,
 			MaxConcurrentRuns: policy.Budgets.Pipeline.MaxConcurrentRuns,
@@ -2520,6 +3269,93 @@ func (r *Reconciler) tryStart(ctx context.Context, item *store.BacklogItem, poli
 		return decisionStarted, claim.Run, "", err
 	}
 	return decisionStarted, claim.Run, "", nil
+}
+
+// starvedCandidateExclusion mirrors the autonomous-admission checks that can
+// never be repaired by waiting for a running scope blocker. It is evaluated
+// afresh on every fairness pass because dependencies and repository budgets
+// are dynamic.
+func (r *Reconciler) starvedCandidateExclusion(ctx context.Context, item *store.BacklogItem, policy *Policy) (string, error) {
+	if item.Policy.RequireHumanReview {
+		return "require_human_review", nil
+	}
+	if override, ok := policy.PerRepoOverrideFor(item.TargetProject, r.HomeProject); ok &&
+		override.RequireHumanReview != nil && *override.RequireHumanReview {
+		return "per_repo_require_human_review", nil
+	}
+	if len(item.Dependencies) > 0 {
+		met, _, _, err := r.dependenciesMet(ctx, item)
+		if err != nil {
+			return "", err
+		}
+		if !met {
+			return "dependencies_unmet", nil
+		}
+	}
+	if cap, ok := policy.PerRepoRunCapFor(item.TargetProject, r.HomeProject); ok {
+		count, err := r.countRepoBudgetedRunsSince(ctx, item.TargetProject, r.now().UTC().Truncate(24*time.Hour))
+		if err != nil {
+			return "", err
+		}
+		if count >= cap {
+			return "per_repo_budget_exhausted", nil
+		}
+	}
+	return "", nil
+}
+
+func (r *Reconciler) appendStarvedCandidateExclusion(ctx context.Context, itemID, reason string) {
+	if seen, ok := ctx.Value(starvedExclusionAuditKey{}).(map[string]struct{}); ok {
+		if _, duplicate := seen[itemID]; duplicate {
+			return
+		}
+		seen[itemID] = struct{}{}
+	}
+	r.append(ctx, "reconciler.skipped", "scope_fairness", map[string]any{
+		"item": itemID, "reason": "starved_candidate_excluded:" + reason,
+	})
+}
+
+func (r *Reconciler) countRepoBudgetedRunsSince(ctx context.Context, targetProject string, since time.Time) (int, error) {
+	target := strings.TrimSpace(targetProject)
+	if target == "" {
+		target = strings.TrimSpace(r.HomeProject)
+	}
+	if target == "" {
+		return 0, nil
+	}
+	rows, err := r.Store.Pipeline.ListByStateSince(ctx, store.PipelineDone, since)
+	if err != nil {
+		return 0, fmt.Errorf("per-repo run budget: %w", err)
+	}
+	// Include every state, then apply the same no-work exclusions as the global
+	// budget counter. ListByStateSince is used per state to stay within the DAO.
+	states := []store.PipelineState{store.PipelineQueued, store.PipelinePlanning, store.PipelineSlicing, store.PipelineImplementing, store.PipelineTesting, store.PipelineReviewing, store.PipelineMR, store.PipelineCI, store.PipelineMerging, store.PipelineEscalated, store.PipelinePreflightFailed, store.PipelinePaused}
+	for _, state := range states {
+		rs, e := r.Store.Pipeline.ListByStateSince(ctx, state, since)
+		if e != nil {
+			return 0, fmt.Errorf("per-repo run budget: %w", e)
+		}
+		rows = append(rows, rs...)
+	}
+	count := 0
+	for _, run := range rows {
+		if run.State == store.PipelineEscalated && ((run.CostUSD == 0 && run.EscalationClass == "transient_quota") || run.EscalationClass == "config") {
+			continue
+		}
+		item, e := r.Store.Backlog.Get(ctx, run.BacklogID)
+		if e != nil {
+			return 0, fmt.Errorf("per-repo run budget backlog: %w", e)
+		}
+		repo := strings.TrimSpace(item.TargetProject)
+		if repo == "" {
+			repo = strings.TrimSpace(r.HomeProject)
+		}
+		if store.SameRepo(repo, target) {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // ensureTargetRepo runs the plan→repo bootstrap pre-flight for a cross-repo
@@ -2751,6 +3587,8 @@ func (r *Reconciler) escalateBootstrapFailure(
 		ctx, item.ID, item.ClaimVersion, store.BacklogQueued, store.BacklogEscalated, terminalEvent,
 	)
 	if err == nil {
+		EscalationsTotal.WithLabelValues("bootstrap").Inc()
+		EscalationClassTotal.WithLabelValues("unclassified").Inc()
 		return nil
 	}
 	if !errors.Is(err, store.ErrStaleWrite) {
@@ -2843,24 +3681,296 @@ func (r *Reconciler) routeToSquadSubject(ctx context.Context, subjectKind, runID
 	}
 }
 
-// dependenciesMet returns (true, "", nil) when every Dependency item is
-// in state=merged. Otherwise returns the first blocker's id.
-func (r *Reconciler) dependenciesMet(ctx context.Context, item *store.BacklogItem) (bool, string, error) {
+// DependencyMergeSHAEventKind caches a merge SHA the reconciler resolved for a
+// merged dependency outside its own run artifacts (subject backlog/<id>).
+// Written once per dependency by dependencyDeploymentEvidence after a
+// successful DependencyMergeSHA lookup; read back on every later tick so the
+// network is never on the reconcile path twice for the same dependency.
+const DependencyMergeSHAEventKind = "reconciler.dependency_merge_sha"
+
+// dependenciesMet returns met, blocker id, deferred-event outcome, and error.
+// Merged operator-code dependencies additionally require deployment ancestry.
+func (r *Reconciler) dependenciesMet(ctx context.Context, item *store.BacklogItem) (bool, string, string, error) {
 	for _, dep := range item.Dependencies {
 		got, err := r.Store.Backlog.Get(ctx, dep)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				// A dependency that no longer exists blocks indefinitely;
 				// surface as a clear blocker rather than silently passing.
-				return false, dep, nil
+				return false, dep, "deps", nil
 			}
-			return false, dep, fmt.Errorf("read dep %s: %w", dep, err)
+			return false, dep, "deps", fmt.Errorf("read dep %s: %w", dep, err)
 		}
 		if got.State != store.BacklogMerged {
-			return false, dep, nil
+			return false, dep, "deps", nil
+		}
+		evidence, err := r.dependencyDeploymentEvidence(ctx, got)
+		if err != nil {
+			return false, dep, "deps", fmt.Errorf("read deployment evidence for dep %s: %w", dep, err)
+		}
+		if !evidence.operatorChange {
+			continue
+		}
+		if evidence.mergeSHA == "" {
+			// Nothing in the store or GitLab names the commit that landed this
+			// dependency, so there is no ancestry to check. Fail open — the
+			// pre-gate behaviour — and say so once, not once per tick.
+			r.admitDependencyUnproven(dep, "", "no_merge_sha", "no merge SHA recorded for the merged dependency")
+			continue
+		}
+		deployed, err := gitIsAncestor(ctx, r.OperatorRepoRoot, evidence.mergeSHA, r.OperatorBuildSHA)
+		if err != nil {
+			r.admitDependencyUnproven(dep, evidence.mergeSHA, "ancestry_error", err.Error())
+			continue
+		}
+		if !deployed {
+			return false, dep, "dependency_undeployed", nil
 		}
 	}
-	return true, "", nil
+	return true, "", "", nil
+}
+
+// admitDependencyUnproven records a fail-open admission of a merged
+// operator-code dependency whose deployment could not be proven. The WARN is
+// rate-limited per identity through ancestryNoise (DEBUG inside the cooldown);
+// the counter is not, so the unresolved rate stays visible on :9090.
+func (r *Reconciler) admitDependencyUnproven(dep, mergeSHA, reason, detail string) {
+	DependencyAncestryUnavailableTotal.WithLabelValues(reason).Inc()
+	if r.Logger == nil {
+		return
+	}
+	attrs := []any{
+		"dependency", dep, "merge_sha", mergeSHA, "build_sha", r.OperatorBuildSHA,
+		"reason", reason, "error", detail,
+	}
+	key := strings.Join([]string{"ancestry", dep, mergeSHA, r.OperatorBuildSHA, reason}, "|")
+	if r.ancestryNoise.allow(key, r.now()) {
+		r.Logger.Warn("reconciler: dependency deployment ancestry unavailable; admitting merged dependency",
+			append(attrs, "suppressed_for", eventNoiseCooldown.String())...)
+		return
+	}
+	r.Logger.Debug("reconciler: dependency deployment ancestry still unavailable; admitting merged dependency", attrs...)
+}
+
+// dependencyEvidence is what the deployment-aware gate needs to know about one
+// merged dependency: whether it changed operator code and which commit landed
+// it. source names where the SHA came from (run_artifact, cached_event,
+// merge_queue, gitlab) for logs and metrics.
+type dependencyEvidence struct {
+	operatorChange bool
+	mergeSHA       string
+	source         string
+}
+
+// dependencyDeploymentEvidence resolves deployment evidence for a merged
+// dependency. The run's own merge-stage artifact is authoritative. When the
+// item was finished outside a merge stage — a hand-merged MR reaped by the
+// ghost-spark sweep, an external merge-queue candidate — the SHA is recovered
+// from, in order: a resolution cached by an earlier tick, the serial
+// merge-queue ledger for the item's MR, and the optional GitLab resolver
+// (cached on success, spaced by eventNoiseCooldown on failure). Every step is
+// store-only except the last.
+func (r *Reconciler) dependencyDeploymentEvidence(ctx context.Context, dep *store.BacklogItem) (dependencyEvidence, error) {
+	var evidence dependencyEvidence
+	runs, err := r.Store.Pipeline.ListByBacklog(ctx, dep.ID)
+	if err != nil {
+		return evidence, err
+	}
+	if len(runs) == 0 {
+		return evidence, nil
+	}
+	// Newest attempt first: its merge stage, when it ran, names the landed
+	// commit. Operator-code evidence is OR-ed across attempts so a retry that
+	// re-implemented the same operator change still holds the gate.
+	for i := len(runs) - 1; i >= 0; i-- {
+		stages, err := r.Store.Pipeline.ListStages(ctx, runs[i].ID)
+		if err != nil {
+			return evidence, err
+		}
+		operatorChange, mergeSHA := finishing.DeploymentEvidence(stages)
+		evidence.operatorChange = evidence.operatorChange || operatorChange
+		if evidence.mergeSHA == "" && mergeSHA != "" {
+			evidence.mergeSHA, evidence.source = mergeSHA, "run_artifact"
+		}
+	}
+	if !evidence.operatorChange || evidence.mergeSHA != "" {
+		return evidence, nil
+	}
+	if sha := r.cachedDependencyMergeSHA(ctx, dep.ID); sha != "" {
+		evidence.mergeSHA, evidence.source = sha, "cached_event"
+		DependencyMergeSHAResolvedTotal.WithLabelValues(evidence.source).Inc()
+		return evidence, nil
+	}
+	project, mrIID := r.dependencyMRIdentity(ctx, dep, runs)
+	if mrIID <= 0 {
+		return evidence, nil
+	}
+	if sha := r.mergeQueueMergedSHA(ctx, project, mrIID); sha != "" {
+		evidence.mergeSHA, evidence.source = sha, "merge_queue"
+		DependencyMergeSHAResolvedTotal.WithLabelValues(evidence.source).Inc()
+		return evidence, nil
+	}
+	if r.DependencyMergeSHA == nil {
+		return evidence, nil
+	}
+	// One network lookup per dependency per cooldown: a success is cached
+	// below and never reaches this point again; a failure (MR not merged,
+	// GitLab unreachable) waits out the cooldown instead of retrying per tick.
+	lookupKey := strings.Join([]string{"merge_sha_lookup", dep.ID, project, strconv.FormatInt(mrIID, 10)}, "|")
+	if !r.ancestryNoise.allow(lookupKey, r.now()) {
+		return evidence, nil
+	}
+	sha, err := r.DependencyMergeSHA(ctx, project, mrIID)
+	if err != nil {
+		if cancelErr := contextCancellationError(ctx, err); cancelErr != nil {
+			return evidence, cancelErr
+		}
+		if r.Logger != nil {
+			r.Logger.Debug("reconciler: dependency merge SHA lookup failed",
+				"dependency", dep.ID, "project", project, "mr_iid", mrIID, "error", err)
+		}
+		return evidence, nil
+	}
+	if sha = strings.TrimSpace(sha); sha == "" {
+		return evidence, nil
+	}
+	evidence.mergeSHA, evidence.source = sha, "gitlab"
+	DependencyMergeSHAResolvedTotal.WithLabelValues(evidence.source).Inc()
+	r.cacheDependencyMergeSHA(ctx, dep.ID, project, mrIID, sha)
+	return evidence, nil
+}
+
+// cachedDependencyMergeSHA reads a merge SHA an earlier tick resolved for the
+// dependency; "" when none is cached or the store is unreadable.
+func (r *Reconciler) cachedDependencyMergeSHA(ctx context.Context, backlogID string) string {
+	if r.Store == nil || r.Store.Events == nil {
+		return ""
+	}
+	for _, kind := range []string{DependencyMergeSHAEventKind, "backlog.settled"} {
+		event, err := r.Store.Events.FirstBySubjectKind(ctx, "backlog", backlogID, kind)
+		if err != nil || event == nil {
+			continue
+		}
+		sha, _ := event.Payload["merged_sha"].(string)
+		if strings.TrimSpace(sha) != "" {
+			return strings.TrimSpace(sha)
+		}
+	}
+	return ""
+}
+
+// cacheDependencyMergeSHA persists a resolved merge SHA on the dependency's
+// event subject. First-writer-wins: a racing tick that resolved the same
+// dependency leaves the existing row untouched.
+func (r *Reconciler) cacheDependencyMergeSHA(ctx context.Context, backlogID, project string, mrIID int64, sha string) {
+	if r.Store == nil || r.Store.Events == nil {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reconcilerLedgerWriteBudget)
+	defer cancel()
+	if _, err := r.Store.Events.AppendOnceBySubjectKind(writeCtx, &store.Event{
+		Actor:       "reconciler",
+		Kind:        DependencyMergeSHAEventKind,
+		SubjectKind: "backlog",
+		SubjectID:   backlogID,
+		Payload: map[string]any{
+			"backlog_id": backlogID, "project": project, "mr_iid": mrIID,
+			"merged_sha": sha, "source": "gitlab",
+		},
+	}); err != nil && r.Logger != nil {
+		r.Logger.Warn("reconciler: cache dependency merge SHA failed", "dependency", backlogID, "error", err)
+	}
+}
+
+// dependencyMRIdentity names the merge request that landed a dependency: the
+// newest run's MR IID, else the IID the ghost-spark sweep recorded when it
+// reaped that run (its verdict event first, then the legacy closure event).
+// The project comes from the closure event when it carries one, else the
+// item's target project, else the operator's home project.
+func (r *Reconciler) dependencyMRIdentity(ctx context.Context, dep *store.BacklogItem, runs []*store.PipelineRun) (project string, mrIID int64) {
+	fallbackProject := strings.TrimSpace(dep.TargetProject)
+	if fallbackProject == "" {
+		fallbackProject = strings.TrimSpace(r.HomeProject)
+	}
+	for i := len(runs) - 1; i >= 0; i-- {
+		run := runs[i]
+		if run == nil {
+			continue
+		}
+		if run.MRIID != nil && *run.MRIID > 0 {
+			return fallbackProject, *run.MRIID
+		}
+		if r.Store == nil || r.Store.Events == nil {
+			continue
+		}
+		for _, kind := range []string{RunVerdictKindGhostSparkMerged, GhostSparkClosedEventKind} {
+			event, err := r.Store.Events.FirstBySubjectKind(ctx, "pipeline_run", run.ID, kind)
+			if err != nil || event == nil {
+				continue
+			}
+			iid := payloadInt64(event.Payload["mr_iid"])
+			if iid <= 0 {
+				continue
+			}
+			if p, _ := event.Payload["project"].(string); strings.TrimSpace(p) != "" {
+				return strings.TrimSpace(p), iid
+			}
+			return fallbackProject, iid
+		}
+	}
+	return fallbackProject, 0
+}
+
+// mergeQueueMergedSHA returns the commit the serial merge queue recorded for a
+// settled-merged MR, or "" when the MR never settled through the queue.
+func (r *Reconciler) mergeQueueMergedSHA(ctx context.Context, project string, mrIID int64) string {
+	if r.Store == nil || r.Store.MergeQueue == nil || project == "" || mrIID <= 0 {
+		return ""
+	}
+	entry, err := r.Store.MergeQueue.LatestSettledByMR(ctx, project, mrIID)
+	if err != nil || entry == nil || entry.State != store.MergeQueueMerged {
+		return ""
+	}
+	return strings.TrimSpace(entry.MergedSHA)
+}
+
+// payloadInt64 reads an integer event-payload field, which is an int64 when
+// written in-process and a float64 after the JSON round trip through SQLite.
+func payloadInt64(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case float64:
+		return int64(n)
+	case string:
+		i, _ := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+		return i
+	}
+	return 0
+}
+
+func gitIsAncestor(ctx context.Context, repoRoot, ancestor, descendant string) (bool, error) {
+	if strings.TrimSpace(repoRoot) == "" || strings.TrimSpace(ancestor) == "" || strings.TrimSpace(descendant) == "" {
+		return false, errors.New("repo root, dependency merge SHA, and operator build SHA are required")
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "merge-base", "--is-ancestor", ancestor, descendant)
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git merge-base --is-ancestor: %w", err)
+}
+
+// DeploymentIsAncestor exposes the reconciler's read-only git ancestry seam
+// to deployment reporting while keeping its implementation here.
+func DeploymentIsAncestor(ctx context.Context, repoRoot, ancestor, descendant string) (bool, error) {
+	return gitIsAncestor(ctx, repoRoot, ancestor, descendant)
 }
 
 func (r *Reconciler) now() time.Time {
@@ -2905,6 +4015,44 @@ func (r *Reconciler) refreshActiveGauges(ctx context.Context) {
 	}
 }
 
+func (r *Reconciler) refreshFactoryGauges(ctx context.Context, policy *Policy) {
+	if r == nil || r.Store == nil || r.Store.Pipeline == nil || r.Store.Backlog == nil || policy == nil {
+		return
+	}
+	active, err := r.Store.Pipeline.CountActive(ctx)
+	if err == nil {
+		RunsActive.Set(float64(active))
+	}
+	RunsCapacity.Set(float64(policy.Budgets.Pipeline.MaxConcurrentRuns))
+	queued, err := r.Store.Backlog.ListByState(ctx, store.BacklogQueued)
+	if err != nil {
+		return
+	}
+	oldest, wedged := summarizeFactoryQueue(r.now(), queued, func(depID string) (*store.BacklogItem, error) {
+		return r.Store.Backlog.Get(ctx, depID)
+	})
+	OldestQueuedItemAgeSeconds.Set(oldest)
+	WedgedDependencies.Set(float64(wedged))
+}
+
+func summarizeFactoryQueue(now time.Time, queued []*store.BacklogItem, getDependency func(string) (*store.BacklogItem, error)) (float64, int) {
+	oldest, wedged := 0.0, 0
+	for _, item := range queued {
+		age := now.Sub(item.CreatedAt).Seconds()
+		if age > oldest {
+			oldest = age
+		}
+		for _, depID := range item.Dependencies {
+			dep, err := getDependency(depID)
+			if err == nil && (dep.State == store.BacklogEscalated || dep.State == store.BacklogRetired) {
+				wedged++
+				break
+			}
+		}
+	}
+	return oldest, wedged
+}
+
 func (r *Reconciler) refreshDispatchOutboxGauge(ctx context.Context) {
 	if r == nil || r.Store == nil {
 		return
@@ -2917,7 +4065,11 @@ func (r *Reconciler) refreshDispatchOutboxGauge(ctx context.Context) {
 }
 
 // tickOutcomeLabel collapses TickResult into a single label value for
-// ReconcileTicksTotal so cardinality stays bounded.
+// ReconcileTicksTotal so cardinality stays bounded. "held_human" is emitted
+// only when the sole unstarted work was human-gated: any genuine skip
+// (claim conflict, cross-repo gate, workflow hold) still wins as "skipped",
+// and the policy-disabled / autonomy-blocked early returns never reach a
+// HeldHuman count, so they keep their "skipped" label too.
 func tickOutcomeLabel(res TickResult) string {
 	switch {
 	case res.Errored > 0:
@@ -2928,10 +4080,24 @@ func tickOutcomeLabel(res TickResult) string {
 		return "deferred"
 	case res.Skipped > 0:
 		return "skipped"
+	case res.HeldHuman > 0:
+		return "held_human"
 	default:
 		return "no_op"
 	}
 }
+
+// reconcilerLedgerWriteBudget bounds one bookkeeping row's write. The row is
+// the only durable record of what a sweep did or why it could not, so it is
+// written under its own short budget, detached from the caller's context —
+// the same pattern as council.BacklogMutator.auditSubject. On every operator
+// boot of 2026-09-07/08 the auto-requeue sweep spent its 20s budget on
+// cold-cache reads and then all 17 rows that should have explained the pass
+// (auto_requeue_failed ×16, auto_requeue_sweep ×1) died "context deadline
+// exceeded" on the already-expired sweep context. The ledger INSERT rides the
+// store's dedicated write connection, so this budget is only ever spent on
+// SQLite's own writer lock, never on read-pool queueing.
+const reconcilerLedgerWriteBudget = 5 * time.Second
 
 func (r *Reconciler) append(ctx context.Context, kind, outcome string, payload map[string]any) {
 	if r.Store == nil || r.Store.Events == nil {
@@ -2940,12 +4106,46 @@ func (r *Reconciler) append(ctx context.Context, kind, outcome string, payload m
 	if payload == nil {
 		payload = map[string]any{}
 	}
+	subjectID, _ := payload["item"].(string)
+	subjectKind := ""
+	if kind == "reconciler.deferred" {
+		reason := admissionDeferralReason(outcome)
+		AdmissionDeferredTotal.WithLabelValues(reason).Inc()
+		// Preserve existing explanatory reasons (notably repository budgets).
+		// The metric uses the bounded vocabulary regardless of event detail.
+		if _, ok := payload["reason"]; !ok {
+			payload["reason"] = reason
+		}
+		payload["blocker"], _ = payload["blocked_by"].(string)
+		payload["shared_scope"], _ = payload["witness"].(string)
+	}
+	if subjectID != "" && (kind == "reconciler.deferred" || kind == "reconciler.scope_reservation_override") {
+		subjectKind = "backlog_item"
+	} else {
+		subjectID = ""
+	}
+	if !r.allowNoise(kind, outcome, payload) {
+		// Same statement about the same subject inside the cooldown: the
+		// metric still counts it; the row would only restate the last one.
+		if kind == "reconciler.deferred" {
+			DeferralsTotal.WithLabelValues(outcome).Inc()
+		}
+		return
+	}
 	payload["outcome"] = outcome
-	if err := r.Store.Events.Append(ctx, &store.Event{
-		Actor:   "reconciler",
-		Kind:    kind,
-		Payload: payload,
-	}); err != nil && r.Logger != nil {
-		r.Logger.Warn("reconciler: append event failed", "error", err, "kind", kind)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reconcilerLedgerWriteBudget)
+	defer cancel()
+	if err := r.Store.Events.Append(writeCtx, &store.Event{
+		Actor:       "reconciler",
+		SubjectKind: subjectKind,
+		SubjectID:   subjectID,
+		Kind:        kind,
+		Payload:     payload,
+	}); err != nil {
+		if r.Logger != nil {
+			r.Logger.Warn("reconciler: append event failed", "error", err, "kind", kind)
+		}
+	} else if kind == "reconciler.deferred" {
+		DeferralsTotal.WithLabelValues(outcome).Inc()
 	}
 }

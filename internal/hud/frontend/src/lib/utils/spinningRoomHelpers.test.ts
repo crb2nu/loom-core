@@ -99,3 +99,31 @@ describe('patternPickerGroups / greenCount', () => {
     expect(greenCount(p({ provenance: { instances_shipped_green: 3 } }))).toBe(3);
   });
 });
+
+describe('buildMaterials bool tri-state', () => {
+  const schema: PatternMaterialField[] = [
+    f({ name: 'flag', type: 'bool' }),
+    f({ name: 'must_flag', type: 'bool', required: true }),
+  ];
+
+  it('omits an untouched optional bool so the pattern default applies', () => {
+    // The old checkbox semantics wrote explicit false for every untouched
+    // bool — silently overriding `default: true` materials. Absence must
+    // mean absence.
+    const { materials, errors } = buildMaterials(schema, { must_flag: 'true' });
+    expect(errors).toEqual([]);
+    expect('flag' in materials).toBe(false);
+    expect(materials.must_flag).toBe(true);
+  });
+
+  it('accepts both boolean and select-string forms', () => {
+    const { materials } = buildMaterials(schema, { flag: false, must_flag: 'false' });
+    expect(materials.flag).toBe(false);
+    expect(materials.must_flag).toBe(false);
+  });
+
+  it('requires an explicit choice for a required bool', () => {
+    const { errors } = buildMaterials(schema, {});
+    expect(errors).toContain('must_flag is required');
+  });
+});

@@ -318,6 +318,99 @@ public struct CompletedSessionWidgetData: Codable, Sendable {
     }
 }
 
+// MARK: - Snapshot Builder
+
+/// Single source of truth for deriving the App-Group widget snapshot from a
+/// mobile dashboard payload. Both the classic `DashboardView` and the
+/// Operator deck publish through this builder: the deck replaced the classic
+/// dashboard as the home tab (2026-07-14), and while this mapping lived only
+/// inside `DashboardViewModel` the home-screen widgets froze at whatever the
+/// last classic-dashboard visit wrote.
+public enum WidgetSnapshotBuilder {
+    public static func snapshot(dashboard: DashboardData, counts: MobileTaskCounts?) -> WidgetData {
+        let counts = counts ?? MobileTaskCounts(
+            pending: 0,
+            inProgress: 0,
+            blocked: 0,
+            completed: 0
+        )
+        return WidgetData(
+            fleet: FleetWidgetData(
+                daemonRunning: dashboard.daemonRunning,
+                serverCount: dashboard.serverCount,
+                sessionCount: dashboard.activeSessions,
+                activeAgents: dashboard.activeAgents,
+                idleAgents: dashboard.idleAgents,
+                offlineAgents: dashboard.offlineAgents,
+                healthyServers: dashboard.health.healthyServers,
+                degradedServers: dashboard.health.degradedServers,
+                downServers: dashboard.health.downServers
+            ),
+            tasks: TaskWidgetData(
+                pending: counts.pending,
+                inProgress: counts.inProgress,
+                blocked: counts.blocked,
+                completed: counts.completed,
+                recentTitles: recentTaskTitles(from: dashboard.recentTimeline)
+            ),
+            sessions: SessionWidgetData(
+                activeCount: dashboard.activeSessions,
+                topSessions: recentSessions(from: dashboard.recentTimeline)
+            ),
+            attentionLanes: dashboard.coordination.attentionLanes.prefix(4).map { lane in
+                AttentionLaneWidgetEntry(
+                    type: lane.type,
+                    laneID: lane.id,
+                    label: lane.label,
+                    route: lane.route,
+                    scope: lane.scope,
+                    summary: lane.summary,
+                    severity: lane.severity
+                )
+            }
+        )
+    }
+
+    static func recentTaskTitles(from timeline: [TimelineEntry]) -> [String] {
+        timeline.compactMap { entry in
+            guard
+                entry.eventType.contains("task"),
+                let title = entry.data?["title"]?.stringValue,
+                !title.isEmpty
+            else {
+                return nil
+            }
+            return title
+        }
+    }
+
+    static func recentSessions(from timeline: [TimelineEntry]) -> [SessionWidgetEntry] {
+        timeline.compactMap { entry -> SessionWidgetEntry? in
+            guard entry.eventType.contains("session") else { return nil }
+
+            let agentId = entry.agentId ?? entry.data?["agent_id"]?.stringValue ?? "unknown"
+            return SessionWidgetEntry(
+                id: entry.id,
+                namespace: entry.data?["namespace"]?.stringValue ?? entry.eventType,
+                agentId: agentId,
+                agentType: entry.data?["agent_type"]?.stringValue ?? inferAgentType(from: agentId),
+                startedAt: entry.timestamp,
+                lastHeartbeat: Date()
+            )
+        }
+    }
+
+    public static func inferAgentType(from agentId: String) -> String {
+        let id = agentId.lowercased()
+        if id.contains("claude") { return "claude-code" }
+        if id.contains("gemini") { return "gemini" }
+        if id.contains("codex") { return "codex" }
+        if id.contains("kilo") { return "kilocode" }
+        if id.contains("antigravity") { return "antigravity" }
+        return "unknown"
+    }
+}
+
 // MARK: - App Group Data Store
 
 public enum SharedDataStore {

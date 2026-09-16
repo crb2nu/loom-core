@@ -35,8 +35,10 @@
     isZeroTime,
     severityTone,
     type Alert,
+    type AlertRule,
     type AutoFixProposal,
   } from '../stores/alerts.svelte.ts';
+  import AlertRuleDialog from './AlertRuleDialog.svelte';
   import PanelShell from './shared/PanelShell.svelte';
   import ErrorBanner from './shared/ErrorBanner.svelte';
   import ConfirmDialog from './shared/ConfirmDialog.svelte';
@@ -84,6 +86,77 @@
     if (strategy === 'agent_fix') return 'accent';
     if (strategy === 'retry') return 'warning';
     return 'muted';
+  }
+
+  // ── Rule editing ─────────────────────────────────────────────────────────
+  // The PUT is whole-set replace with no CAS and no server validation, so
+  // every write goes through alertsStore.updateRules (fresh-GET → mutate →
+  // PUT) and the dialog validates inputs. Deletion is the one destructive
+  // action; it confirms first.
+  let ruleDialogOpen = $state(false);
+  let ruleDialogMode = $state<'create' | 'edit'>('create');
+  let ruleDialogSeed = $state<AlertRule | null>(null);
+  let ruleToDelete = $state<AlertRule | null>(null);
+
+  function openAddRule(): void {
+    ruleDialogMode = 'create';
+    ruleDialogSeed = null;
+    ruleDialogOpen = true;
+  }
+
+  function openEditRule(rule: AlertRule): void {
+    ruleDialogMode = 'edit';
+    ruleDialogSeed = rule;
+    ruleDialogOpen = true;
+  }
+
+  async function toggleRule(rule: AlertRule): Promise<void> {
+    await runAdminAction(
+      () =>
+        alertsStore.updateRules((fresh) =>
+          fresh.map((r) => (r.id === rule.id ? { ...r, enabled: !r.enabled } : r)),
+        ),
+      {
+        success: `${rule.enabled ? 'Disabled' : 'Enabled'} ${rule.name}`,
+        failurePrefix: 'Rule update failed',
+      },
+    );
+  }
+
+  async function saveRuleFromDialog(rule: AlertRule): Promise<void> {
+    const mode = ruleDialogMode;
+    const ok = await runAdminAction(
+      () =>
+        alertsStore.updateRules((fresh) => {
+          if (mode === 'create') {
+            if (fresh.some((r) => r.id === rule.id)) {
+              throw new Error(`a rule with id ${rule.id} already exists`);
+            }
+            return [...fresh, rule];
+          }
+          // Edit: merge onto the FRESH row so last_fired (live cooldown
+          // state) rides along verbatim even if the dialog sat open a while.
+          return fresh.map((r) => (r.id === rule.id ? { ...rule, last_fired: r.last_fired } : r));
+        }),
+      {
+        success: mode === 'create' ? `Added rule ${rule.id}` : `Saved rule ${rule.id}`,
+        failurePrefix: 'Rule save failed',
+      },
+    );
+    if (ok) ruleDialogOpen = false;
+  }
+
+  async function deleteRule(): Promise<void> {
+    const rule = ruleToDelete;
+    ruleToDelete = null;
+    if (!rule) return;
+    await runAdminAction(
+      () =>
+        alertsStore.updateRules((fresh) => fresh.filter((r) => r.id !== rule.id), {
+          allowEmpty: true,
+        }),
+      { success: `Deleted rule ${rule.id}`, failurePrefix: 'Rule delete failed' },
+    );
   }
 
   // Only `agent_fix` actually does work on approval. `retry` is the documented
@@ -378,9 +451,14 @@
     {/if}
   </section>
 
-  <!-- ── Rules (read-only) ── -->
+  <!-- ── Rules ── -->
   <section class="block">
-    <h3>Rules</h3>
+    <div class="rules-head">
+      <h3>Rules</h3>
+      <button type="button" class="btn btn-xs" onclick={openAddRule} disabled={alertsStore.savingRules}>
+        ＋ Add rule
+      </button>
+    </div>
     {#if rules.length === 0}
       <p class="dim empty-note">
         No rules configured. The engine seeds three defaults (pipeline failed,
@@ -399,6 +477,7 @@
               <th class="col-num">cooldown</th>
               <th>last fired</th>
               <th>state</th>
+              <th>actions</th>
             </tr>
           </thead>
           <tbody>
@@ -422,15 +501,39 @@
                 <td>
                   <Badge text={r.enabled ? 'enabled' : 'disabled'} variant={r.enabled ? 'success' : 'muted'} />
                 </td>
+                <td class="rule-actions">
+                  <!-- Flex on an inner wrapper keeps the td a real table-cell. -->
+                  <div class="rule-actions-row">
+                    <button
+                      type="button"
+                      class="btn btn-xs btn-ghost"
+                      disabled={alertsStore.savingRules}
+                      title={r.enabled ? 'Disable this rule' : 'Enable this rule'}
+                      onclick={() => toggleRule(r)}
+                    >{r.enabled ? 'Disable' : 'Enable'}</button>
+                    <button
+                      type="button"
+                      class="btn btn-xs btn-ghost"
+                      disabled={alertsStore.savingRules}
+                      onclick={() => openEditRule(r)}
+                    >Edit</button>
+                    <button
+                      type="button"
+                      class="btn btn-xs btn-ghost btn-danger"
+                      disabled={alertsStore.savingRules}
+                      onclick={() => (ruleToDelete = r)}
+                    >Delete</button>
+                  </div>
+                </td>
               </tr>
             {/each}
           </tbody>
         </table>
       </div>
       <p class="dim rules-note">
-        Read-only. Rules are editable over PUT /api/alerts/rules, which replaces
-        the whole set in one call — an inline editor would need to round-trip
-        every rule, so it is deliberately not wired here.
+        Edits replace the whole rule set over PUT /api/alerts/rules (no
+        conflict detection — last write wins) and live in engine memory only:
+        a HUD restart restores the three built-in defaults.
       </p>
     {/if}
   </section>
@@ -461,6 +564,25 @@
   variant={confirmCopy?.variant ?? 'default'}
   onConfirm={runPending}
   onCancel={() => (pending = null)}
+/>
+
+<ConfirmDialog
+  open={ruleToDelete !== null}
+  title="Delete this alert rule?"
+  message={`Removes ${ruleToDelete?.name ?? 'the rule'} (${ruleToDelete?.id ?? ''}) from the live set. No undo — though a HUD restart restores the built-in defaults.`}
+  confirmLabel="Delete"
+  variant="danger"
+  onConfirm={deleteRule}
+  onCancel={() => (ruleToDelete = null)}
+/>
+
+<AlertRuleDialog
+  open={ruleDialogOpen}
+  mode={ruleDialogMode}
+  seed={ruleDialogSeed}
+  saving={alertsStore.savingRules}
+  onSave={saveRuleFromDialog}
+  onCancel={() => (ruleDialogOpen = false)}
 />
 
 <style>
@@ -598,6 +720,19 @@
 
   .proposal-caveat,
   .proposal-files,
+  .rules-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+  .rule-actions { white-space: nowrap; }
+  .rule-actions-row {
+    display: flex;
+    gap: 0.25rem;
+  }
+  .btn-danger:hover { color: var(--error); }
+
   .rules-note {
     margin: 0 0 0.35rem;
     font-size: var(--text-xs);

@@ -566,11 +566,14 @@ func (a *AgentBridge) Sessions() ([]SessionInfo, error) {
 // Sessions() is reserved for callers that need session metadata
 // (descriptions, working dirs). See svc_sessions_list.go and
 // project_hud_no_agents_session_list_timeout.
+//
+// Fetches are coalesced and briefly cached across callers, and the recv
+// budget adapts to the store's latency (agent_session_light.go).
 func (a *AgentBridge) FleetSessions() ([]SessionInfo, error) {
-	return a.SessionsWithParams(map[string]any{
+	return a.lightSessionList(sessionListKindFleet, map[string]any{
 		"limit": defaultSessionListLimit,
 		"light": true,
-	}, 3*time.Second)
+	})
 }
 
 // ActiveSessions returns sessions explicitly filtered to status="active".
@@ -586,12 +589,15 @@ func (a *AgentBridge) FleetSessions() ([]SessionInfo, error) {
 // Callers that need to count live work or reap stale sessions should
 // merge ActiveSessions() into Sessions() rather than trust the
 // unfiltered fetch alone.
+//
+// Fetches are coalesced and briefly cached across callers, and the recv
+// budget adapts to the store's latency (agent_session_light.go).
 func (a *AgentBridge) ActiveSessions() ([]SessionInfo, error) {
-	return a.SessionsWithParams(map[string]any{
+	return a.lightSessionList(sessionListKindActive, map[string]any{
 		"limit":  defaultSessionListLimit,
 		"status": "active",
 		"light":  true,
-	}, 3*time.Second)
+	})
 }
 
 // SessionsWithParams returns sessions for an arbitrary session-list parameter

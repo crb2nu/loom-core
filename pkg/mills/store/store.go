@@ -15,22 +15,37 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"testing"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/telemetry"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered as "sqlite"
+
+	"github.com/crb2nu/loom/pkg/telemetry"
 )
 
 // Store wraps the SQLite database handle and exposes typed DAOs.
 type Store struct {
 	db *sql.DB
+	// writer is a second handle on the same file, capped at ONE pooled
+	// connection and reserved for the event ledger's INSERTs (EventDAO.Append
+	// / AppendOnceBySubjectKind). The read pool above is shared by every
+	// report scan, sweep, and HUD request; when a cold page cache turns those
+	// into multi-second reads the pool drains and a ledger append queues in
+	// database/sql behind them until its context expires — the 2026-09-07/08
+	// boot bursts, where 17 auto-requeue rows died "context deadline
+	// exceeded" per operator boot. SQLite serialises writers anyway, so one
+	// connection loses nothing; what it buys is that a bookkeeping row never
+	// waits for a read connection. See ledgerWriterMaxOpenConns.
+	writer *sql.DB
 
 	Backlog  *BacklogDAO
 	Council  *CouncilDAO
 	Pipeline *PipelineDAO
 	KPI      *KPIDAO
+	Reports  *ReportRollupDAO
 	Eval     *EvalDAO
 	Events   *EventDAO
+	Watches  *WatchDAO
 	// Incidents persists deterministic external-dependency classifications.
 	Incidents *IncidentDAO
 	// ClassificationVerdicts persists the first resolved dual-source failure
@@ -39,9 +54,8 @@ type Store struct {
 	Roadmap                *RoadmapDAO
 
 	// Mills v2 — Hierarchical Swarm DAOs.
-	Squads    *SquadDAO
-	Audit     *AuditDAO
-	CrossRepo *CrossRepoDAO
+	Squads *SquadDAO
+	Audit  *AuditDAO
 	// Stamps persists target-bound cross-repository stamp intents. A stamp can
 	// never be written without an explicit destination project.
 	Stamps          *StampDAO
@@ -88,6 +102,8 @@ type Store struct {
 	// drives one head per (project, target_branch) lane through
 	// rebase → pipeline → merge. Gated by policy merge_queue.enabled.
 	MergeQueue *MergeQueueDAO
+	// Outcomes is the terminal outcome/grade feature and calibration store.
+	Outcomes *OutcomeWritebackDAO
 }
 
 const transientRequeueEventKind = "pipeline.transient_requeue.claimed"
@@ -308,6 +324,61 @@ type Options struct {
 	// SkipMigrations omits the goose migration step. Useful for tests that
 	// want to inspect a known-empty file.
 	SkipMigrations bool
+
+	// QueryTimeout bounds each hot read while preserving any earlier caller
+	// deadline. Zero uses the conservative default.
+	QueryTimeout time.Duration
+
+	// EventReadLimit, IncidentReadLimit, and KPIReadLimit are hard upper bounds
+	// for the corresponding hot reads. Non-positive values use defaults.
+	EventReadLimit    int
+	IncidentReadLimit int
+	KPIReadLimit      int
+}
+
+const (
+	defaultQueryTimeout      = 5 * time.Second
+	defaultEventReadLimit    = 5000
+	defaultIncidentReadLimit = 2000
+	defaultKPIReadLimit      = 5000
+
+	// readPoolMaxOpenConns bounds the shared pool every DAO reads (and most
+	// write) through: one writer + many readers under WAL.
+	readPoolMaxOpenConns = 8
+	// ledgerWriterMaxOpenConns is the event ledger's private write handle. A
+	// single connection is deliberate — SQLite admits one writer at a time,
+	// and the point of the handle is isolation from read-pool exhaustion, not
+	// write parallelism.
+	ledgerWriterMaxOpenConns = 1
+)
+
+type hotReadConfig struct {
+	timeout time.Duration
+	limit   int
+}
+
+func newHotReadConfig(timeout time.Duration, limit, defaultLimit int) hotReadConfig {
+	if timeout <= 0 {
+		timeout = defaultQueryTimeout
+	}
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	return hotReadConfig{timeout: timeout, limit: limit}
+}
+
+func (c hotReadConfig) context(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, c.timeout)
+}
+
+func (c hotReadConfig) bound(requested, defaultValue int) int {
+	if requested <= 0 {
+		requested = defaultValue
+	}
+	if requested > c.limit {
+		return c.limit
+	}
+	return requested
 }
 
 // Open opens (or creates) the SQLite database at opts.Path, sets the required
@@ -329,13 +400,35 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 
 	// One writer + many readers under WAL. busy_timeout retries inside the
 	// driver, so concurrent writers serialise without surfacing SQLITE_BUSY.
-	db.SetMaxOpenConns(8)
+	db.SetMaxOpenConns(readPoolMaxOpenConns)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(time.Hour)
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: ping: %w", err)
+	}
+
+	// journal_mode=WAL is the one PRAGMA deliberately NOT in the DSN. It is
+	// persistent — SQLite records it in the file header — so a single
+	// statement on one connection switches every present and future
+	// connection, unlike the per-connection PRAGMAs above. Running it here
+	// rather than as a DSN pragma matters for a brand-new file: the driver
+	// applies DSN pragmas in sorted order (busy_timeout first, then
+	// alphabetical), which put journal_mode ahead of synchronous, so the WAL
+	// switch's header commit ran under SQLite's default synchronous=FULL and
+	// fsync'd on every store a test opened — the open-path stall in the
+	// 2026-09-15 test:unit timeouts (see buildDSNFor). On this connection the
+	// DSN's synchronous level is already in force. In-memory databases cannot
+	// use WAL and report "memory"; everything file-backed must come back "wal".
+	var journalMode string
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&journalMode); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: set journal_mode=WAL: %w", err)
+	}
+	if !isMemoryPath(opts.Path) && !strings.EqualFold(journalMode, "wal") {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: journal_mode=WAL not honoured for %q (got %q)", opts.Path, journalMode)
 	}
 
 	if !opts.SkipMigrations {
@@ -345,24 +438,50 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		}
 	}
 
-	s := &Store{db: db}
+	// The event ledger's private write handle (see Store.writer). Same DSN,
+	// so it inherits every PRAGMA; opened after migrations so it never races
+	// a table rebuild. An in-memory database is per-connection, so a second
+	// handle would be a second, empty database: in-process test stores keep
+	// the ledger on the shared pool instead.
+	writer := db
+	if !isMemoryPath(opts.Path) {
+		writer, err = sql.Open("sqlite", dsn)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("store: open ledger writer: %w", err)
+		}
+		writer.SetMaxOpenConns(ledgerWriterMaxOpenConns)
+		writer.SetMaxIdleConns(ledgerWriterMaxOpenConns)
+		writer.SetConnMaxLifetime(time.Hour)
+		if err := writer.PingContext(ctx); err != nil {
+			_ = writer.Close()
+			_ = db.Close()
+			return nil, fmt.Errorf("store: ping ledger writer: %w", err)
+		}
+	}
+
+	s := &Store{db: db, writer: writer}
 	s.Backlog = &BacklogDAO{db: db}
 	s.Council = &CouncilDAO{db: db}
 	s.Pipeline = &PipelineDAO{
 		db:                       db,
 		terminalConflictRecorder: telemetry.DefaultTerminalStateConflictRecorder(),
 	}
-	s.KPI = &KPIDAO{db: db}
+	kpiRead := newHotReadConfig(opts.QueryTimeout, opts.KPIReadLimit, defaultKPIReadLimit)
+	eventRead := newHotReadConfig(opts.QueryTimeout, opts.EventReadLimit, defaultEventReadLimit)
+	incidentRead := newHotReadConfig(opts.QueryTimeout, opts.IncidentReadLimit, defaultIncidentReadLimit)
+	s.KPI = &KPIDAO{db: db, hotRead: kpiRead}
+	s.Reports = &ReportRollupDAO{db: db}
 	s.Eval = &EvalDAO{db: db}
-	s.Events = &EventDAO{db: db}
-	s.Incidents = &IncidentDAO{db: db, events: s.Events}
+	s.Events = &EventDAO{db: db, writer: writer, hotRead: eventRead}
+	s.Watches = &WatchDAO{db: db}
+	s.Incidents = &IncidentDAO{db: db, events: s.Events, hotRead: incidentRead}
 	s.ClassificationVerdicts = &ClassificationVerdictDAO{events: s.Events}
 	s.Roadmap = &RoadmapDAO{db: db}
 
 	// Mills v2.
 	s.Squads = &SquadDAO{db: db}
 	s.Audit = &AuditDAO{db: db}
-	s.CrossRepo = &CrossRepoDAO{db: db}
 	s.Stamps = &StampDAO{db: db}
 	s.Debate = &DebateDAO{db: db}
 	s.PolicyProposals = &PolicyProposalDAO{db: db}
@@ -379,6 +498,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 
 	// MR source-head movement ledger.
 	s.MRHeadTransitions = &MRHeadTransitionDAO{db: db}
+	s.Outcomes = &OutcomeWritebackDAO{db: db}
 
 	// Per-backlog-item cross-stage memory journal.
 	s.ItemMemory = &ItemMemoryDAO{db: db}
@@ -475,12 +595,22 @@ func (d *ClassificationVerdictDAO) GetClassificationVerdict(
 	return v, nil
 }
 
-// Close releases the underlying database handle.
+// Close releases the underlying database handles.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	var writerErr error
+	if s.writer != nil && s.writer != s.db {
+		writerErr = s.writer.Close()
+	}
+	return errors.Join(s.db.Close(), writerErr)
+}
+
+// isMemoryPath reports whether path names an in-memory SQLite database, for
+// which every connection is its own database (see Open's ledger writer).
+func isMemoryPath(path string) bool {
+	return path == ":memory:" || strings.Contains(path, "mode=memory") || strings.HasPrefix(path, "file::memory:")
 }
 
 // DB exposes the raw handle for advanced callers (migrations, ad-hoc reads).
@@ -489,19 +619,54 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
-// buildDSN composes a modernc.org/sqlite DSN with the PRAGMAs every mills
-// connection needs:
-//   - journal_mode=WAL: durable + concurrent-read friendly.
+// buildDSN composes a modernc.org/sqlite DSN with the per-connection PRAGMAs
+// every mills connection needs:
 //   - synchronous=NORMAL: safe under WAL with negligible durability cost.
+//     Test binaries get synchronous=OFF instead — see buildDSNFor.
 //   - foreign_keys=ON: enforce REFERENCES; off-by-default in SQLite.
 //   - busy_timeout=5000: in-driver retry on SQLITE_BUSY for up to 5s.
+//   - temp_store=MEMORY: see the note inside buildDSNFor.
 //
-// The driver evaluates `_pragma=` query params on every new pooled connection,
-// so each acquired conn arrives with the right settings.
+// journal_mode=WAL is persistent in the file, not per connection, and is set
+// once in Open after these are in force — see the comment there.
+//
+// The driver evaluates `_pragma=` query params on every new pooled connection
+// (busy_timeout first, the rest in sorted order), so each acquired conn
+// arrives with the right settings.
 func buildDSN(path string) string {
+	return buildDSNFor(path, testing.Testing())
+}
+
+// buildDSNFor is buildDSN with the "running inside a `go test` binary"
+// decision made explicit so both branches stay unit-testable.
+//
+// synchronous=OFF in test binaries is deliberate. Every unit test that opens a
+// store creates a fresh SQLite file, and under synchronous=NORMAL that used to
+// cost at least two fsync(2) calls per store: one when the fresh file was
+// switched to WAL (the header commit's pager syncJournal — and because the
+// driver applied DSN pragmas in sorted order, that commit ran under SQLite's
+// default FULL, before any synchronous pragma) and one at Close, when the WAL
+// checkpoint syncs the database (walCheckpoint). On a shared CI node whose
+// disk is saturated by neighbouring jobs each fsync waits behind the whole
+// device queue. On 2026-09-15 four `test:unit` jobs on cblevins-radeonvii
+// (nvme0n1 91–95 % busy, average queue depth 43–132, ~110 MB/s of writes from
+// 22–26 concurrent runner pods) hit `panic: test timed out after 10m0s` in
+// exactly the store-heaviest packages — pkg/mills, pkg/mills/store,
+// pkg/mills/pipeline, cmd/loom-mills-operator — with every in-flight goroutine
+// parked in libc.Xfsync under _unixSync, and every store-touching test running
+// 15–30× slower than in a quiet run. Unit tests never need crash durability
+// (the process, not the kernel, is what ends them), so dropping the fsyncs
+// removes the one syscall that turns a busy disk into a red pipeline. Open
+// switches the file to WAL only after this level is in force. Production
+// binaries keep NORMAL: testing.Testing() is false in anything built by
+// `go build`.
+func buildDSNFor(path string, inTestBinary bool) string {
+	synchronous := "synchronous(NORMAL)"
+	if inTestBinary {
+		synchronous = "synchronous(OFF)"
+	}
 	pragmas := []string{
-		"journal_mode(WAL)",
-		"synchronous(NORMAL)",
+		synchronous,
 		"foreign_keys(ON)",
 		"busy_timeout(5000)",
 		// temp_store(MEMORY): statements that need SQLite temp storage — the

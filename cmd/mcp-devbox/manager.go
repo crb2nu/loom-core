@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"github.com/crb2nu/loom/internal/devbox/dockerfile"
 	"github.com/crb2nu/loom/internal/devbox/state"
 	"github.com/crb2nu/loom/pkg/env"
+	"github.com/crb2nu/loom/pkg/lifecycle"
 )
 
 type managerConfig struct {
@@ -28,6 +31,11 @@ type managerConfig struct {
 	idleTimeout   time.Duration
 	defaultCPU    float64
 	defaultMemMB  int
+
+	// millsIdleTimeout (DEVBOX_MILLS_IDLE_TIMEOUT) bounds how long a Mills per-run
+	// sandbox orphaned by a gate that died mid-call keeps holding devbox quota;
+	// the gate releases it itself on every verdict. Zero falls back to idleTimeout.
+	millsIdleTimeout time.Duration
 
 	// K8s-specific
 	kubeconfig                   string
@@ -45,8 +53,20 @@ type managerConfig struct {
 	buildEphemeralStorageLimit   string
 	buildAvoidNodes              string
 	maxConcurrentBuilds          int
+	buildTimeout                 time.Duration
 	gitCloneMemoryRequest        string
 	gitCloneMemoryLimit          string
+
+	// goCachePVC names a shared RWX claim mounted into every K8s sandbox as
+	// the Go build + module cache (DEVBOX_K8S_GO_CACHE_PVC). Empty disables
+	// the mount. newManager clears it when the claim does not exist so a
+	// missing claim degrades to cold caches instead of unschedulable pods.
+	goCachePVC string
+
+	// Quality gate per-check budgets in seconds; zero means the defaults
+	// (300 for fmt/lint style checks, 900 for the test commands).
+	gateCheckTimeoutSec int
+	gateTestTimeoutSec  int
 
 	// NFS cache flush before each exec (default true for K8s backend)
 	nfsFlush bool
@@ -54,6 +74,10 @@ type managerConfig struct {
 	// Git-clone mode: populate workspace via git clone instead of NFS PVC
 	gitBaseURL string // base git URL (e.g., "https://gitlab.blevins.dev/homelab")
 	gitSecret  string // K8s secret name with git token (key: "token")
+	// gitToken overrides the secret-sourced token for git host API calls
+	// (DEVBOX_GIT_TOKEN); remoteManifestTTL bounds manifest cache reuse.
+	gitToken          string
+	remoteManifestTTL time.Duration
 
 	// Tar-pipe sync: stream local files into pods via SPDY exec
 	syncMode     string   // "tar-pipe", "git-clone", "nfs"
@@ -76,6 +100,7 @@ type managerConfig struct {
 }
 
 type manager struct {
+	drain          *lifecycle.Drain
 	cfg            managerConfig
 	backend        backend.Backend
 	backends       map[string]backend.Backend
@@ -94,6 +119,16 @@ type manager struct {
 	// call times out.
 	builds *buildTracker
 
+	// Remote manifest fingerprinting (git-clone mode): manifests fetches the
+	// dependency manifests the hub has no local copy of, so a sandbox image
+	// is keyed by real content instead of the empty-input hash. nil disables
+	// hydration (fingerprints degrade to the generic image as before).
+	manifests   manifestSource
+	manifestTTL time.Duration
+	gitTokenMu  sync.Mutex
+	gitTokenVal string
+	gitTokenAt  time.Time
+
 	// buildWg tracks async build goroutines. Shutdown does NOT wait on it:
 	// the underlying build runs detached cluster-side (the K8s backend
 	// re-derives its own background context), so gating daemon shutdown on a
@@ -102,7 +137,9 @@ type manager struct {
 	buildWg sync.WaitGroup
 
 	// Per-project lifecycle lock prevents concurrent ensureRunning races (TOCTOU).
-	projectMu sync.Map // map[string]*sync.Mutex
+	projectMu           sync.Map // map[string]*sync.Mutex
+	gateCleanupFailures sync.Map // map[string]error; cleared only by confirmed stop
+	gateCancels         sync.Map // map[string]context.CancelFunc
 
 	// Active exec counter per project — reaper skips projects with active execs.
 	activeExecs sync.Map // map[string]*atomic.Int32
@@ -292,7 +329,7 @@ func newManager(ctx context.Context, logger *slog.Logger, cfg managerConfig) (*m
 		return nil, fmt.Errorf("init state store: %w", err)
 	}
 
-	return &manager{
+	m := &manager{
 		cfg:            cfg,
 		backend:        b,
 		backends:       backends,
@@ -300,7 +337,36 @@ func newManager(ctx context.Context, logger *slog.Logger, cfg managerConfig) (*m
 		store:          store,
 		logger:         logger,
 		builds:         newBuildTracker(),
-	}, nil
+		manifestTTL:    cfg.remoteManifestTTL,
+	}
+	// The shared Go cache is K8s-only and must exist before a pod references
+	// it: a missing claim makes every sandbox unschedulable, so verify once
+	// here and fall back to cold caches with a WARN.
+	if cfg.goCachePVC != "" {
+		kb, ok := backends["k8s"].(*backend.K8sBackend)
+		switch {
+		case !ok:
+			logger.Warn("sandbox Go cache claim configured without a K8s backend; ignoring", "claim", cfg.goCachePVC)
+			m.cfg.goCachePVC = ""
+		default:
+			present, err := kb.HasClaim(ctx, cfg.goCachePVC)
+			if err != nil || !present {
+				logger.Warn("sandbox Go cache claim unavailable; sandboxes run with cold caches", "claim", cfg.goCachePVC, "namespace", cfg.k8sNamespace, "error", err)
+				m.cfg.goCachePVC = ""
+			} else {
+				logger.Info("sandbox Go cache enabled", "claim", cfg.goCachePVC, "mount", sandboxGoCacheMountPath)
+			}
+		}
+	}
+	// git-clone mode has no local checkout to fingerprint; fetch the
+	// dependency manifests from the git host instead (see
+	// remote_fingerprint.go). DEVBOX_REMOTE_MANIFESTS=0 restores the
+	// generic-image behavior.
+	if cfg.syncMode == "git-clone" && strings.TrimSpace(cfg.gitBaseURL) != "" && env.Bool("DEVBOX_REMOTE_MANIFESTS", true) {
+		m.manifests = newGitLabManifestSource(cfg.gitBaseURL, m.gitToken)
+		logger.Info("remote manifest fingerprinting enabled", "git_base_url", cfg.gitBaseURL, "ttl", m.manifestTTL)
+	}
+	return m, nil
 }
 
 func initBackends(cfg managerConfig, logger *slog.Logger) (map[string]backend.Backend, string, error) {
@@ -362,6 +428,7 @@ func newK8sBackend(cfg managerConfig) (*backend.K8sBackend, error) {
 		BuildEphemeralStorageLimit:   cfg.buildEphemeralStorageLimit,
 		BuildAvoidNodes:              cfg.buildAvoidNodes,
 		MaxConcurrentBuilds:          cfg.maxConcurrentBuilds,
+		BuildTimeout:                 cfg.buildTimeout,
 		GitCloneMemoryRequest:        cfg.gitCloneMemoryRequest,
 		GitCloneMemoryLimit:          cfg.gitCloneMemoryLimit,
 		SyncMode:                     cfg.syncMode,
@@ -465,14 +532,70 @@ func (m *manager) imageTag(projectName, hash string) string {
 func (m *manager) containerName(projectName, agentID string) string {
 	base := "devbox-" + sanitizeContainerName(projectName)
 	if agentID != "" {
-		id := sanitizeContainerName(agentID)
-		if len(id) > 12 {
-			id = id[:12]
-			id = strings.Trim(id, "-")
-		}
-		return base + "-" + id
+		return base + "-" + agentSandboxSuffix(agentID)
 	}
 	return base
+}
+
+// agentSuffixBudget caps the agent part of a sandbox name so the whole name
+// stays inside the K8s name budget alongside the project.
+const agentSuffixBudget = 12
+
+// agentSandboxSuffix renders the agent part of a sandbox name. Short ids stay
+// readable (claude-code, codex). A longer id becomes its first characters
+// plus a five-hex digest of the WHOLE id: plain truncation collapsed every
+// Mills run (loom-mills-operator-<run hash>) onto one pod name, so four
+// concurrent runs shared one sandbox and each "restart" of it killed the
+// other runs' quality gates mid-flight (2026-09-13). The digest is
+// deterministic, so a restarted devbox server maps the same agent to the
+// same pod.
+func agentSandboxSuffix(agentID string) string {
+	id := sanitizeContainerName(agentID)
+	if len(id) <= agentSuffixBudget {
+		return id
+	}
+	sum := sha256.Sum256([]byte(agentID))
+	digest := hex.EncodeToString(sum[:])[:5]
+	prefix := strings.Trim(id[:agentSuffixBudget-len(digest)-1], "-")
+	return prefix + "-" + digest
+}
+
+// sandboxGoCacheMountPath is where the shared Go cache claim surfaces inside
+// a sandbox pod. Same layout as the HUD spawn fleet's /gocache (go-build,
+// gomod) but a SEPARATE claim: sandboxes run as root while spawn pods run as
+// uid 1000 under fsGroup 1000, and root-created cache directories (0755)
+// would be unwritable for the spawns.
+const sandboxGoCacheMountPath = "/gocache"
+
+// sandboxGoCache returns the pod env and cache mounts for a sandbox. With a
+// claim it points GOCACHE, GOMODCACHE and GOLANGCI_LINT_CACHE at the shared
+// mount so a quality gate no longer recompiles the world in every fresh pod
+// (2026-09-13: 1.7 GB of caches lived on the pod's ephemeral disk and every
+// replaced pod rebuilt them; the 900s test check died at 887s). Without a
+// claim the input env is returned untouched and no mount is added, so the
+// legacy pod spec stays byte-identical. The input map is never mutated: it
+// belongs to the cached fingerprint.
+func sandboxGoCache(env map[string]string, claim string) (map[string]string, []backend.CachePVCMount) {
+	if claim == "" {
+		return env, nil
+	}
+	out := make(map[string]string, len(env)+4)
+	for k, v := range env {
+		out[k] = v
+	}
+	out["GOCACHE"] = sandboxGoCacheMountPath + "/go-build"
+	out["GOMODCACHE"] = sandboxGoCacheMountPath + "/gomod"
+	out["GOLANGCI_LINT_CACHE"] = sandboxGoCacheMountPath + "/golangci-lint"
+	// A module index built during concurrent extraction can persist file-open
+	// errors on the shared cache even after the files become readable.
+	settings := make([]string, 0)
+	for _, setting := range strings.Split(out["GODEBUG"], ",") {
+		if setting != "" && !strings.HasPrefix(setting, "goindex=") {
+			settings = append(settings, setting)
+		}
+	}
+	out["GODEBUG"] = strings.Join(append(settings, "goindex=0"), ",")
+	return out, []backend.CachePVCMount{{ClaimName: claim, MountPath: sandboxGoCacheMountPath}}
 }
 
 // storeKey returns the state store key for a project+agent combination.
@@ -488,8 +611,8 @@ func storeKey(projectName, agentID string) string {
 // Returns the container ID. When agentID is provided, each agent gets
 // its own isolated pod for the project.
 func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, agentID string) (string, error) {
-	// Fingerprint the project
-	fp, err := detect.Fingerprint(projectDir)
+	// Fingerprint the project (git-clone mode hydrates from the git host).
+	fp, err := m.fingerprintProject(ctx, projectDir)
 	if err != nil {
 		return "", fmt.Errorf("fingerprint: %w", err)
 	}
@@ -548,14 +671,16 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 				return "", fmt.Errorf("generate dockerfile: %w", err)
 			}
 
-			_, err = m.backend.Build(ctx, backend.BuildOpts{
-				Tag:        tag,
-				Dockerfile: dockerfileContent,
-				ContextDir: projectDir,
+			result, err := m.backend.Build(ctx, backend.BuildOpts{
+				Tag:             tag,
+				Dockerfile:      dockerfileContent,
+				ContextDir:      projectDir,
+				DetectBaseImage: m.detectBaseImageAfterClone(fp),
 			})
 			if err != nil {
 				return "", fmt.Errorf("build image: %w", err)
 			}
+			m.recordBaseImageFallback(projectName, result)
 		}
 	}
 
@@ -565,14 +690,11 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 	// Start new container
 	mounts := m.buildMounts(projectDir)
 
-	memMB := m.cfg.defaultMemMB
+	memMB := m.sandboxMemoryMB(fp)
 	cpu := m.cfg.defaultCPU
 	network := true
 	if fp.Overrides != nil {
 		if fp.Overrides.Limits != nil {
-			if fp.Overrides.Limits.MemoryMB > 0 {
-				memMB = fp.Overrides.Limits.MemoryMB
-			}
 			if fp.Overrides.Limits.CPU > 0 {
 				cpu = fp.Overrides.Limits.CPU
 			}
@@ -593,17 +715,19 @@ func (m *manager) ensureRunning(ctx context.Context, projectDir, projectName, ag
 	}
 
 	workDir := m.projectWorkDir(projectDir)
-	m.logger.Info("starting sandbox", "project", projectName, "agent", agentID, "image", tag, "workdir", workDir)
+	startEnv, cachePVCs := sandboxGoCache(fp.EnvVars, m.cfg.goCachePVC)
+	m.logger.Info("starting sandbox", "project", projectName, "agent", agentID, "image", tag, "workdir", workDir, "go_cache_claim", m.cfg.goCachePVC)
 	result, err := m.backend.Start(ctx, backend.StartOpts{
-		Name:     containerID,
-		ImageTag: tag,
-		WorkDir:  workDir,
-		Mounts:   mounts,
-		Env:      fp.EnvVars,
-		MemoryMB: memMB,
-		CPUs:     cpu,
-		Network:  network,
-		AgentID:  agentID,
+		Name:      containerID,
+		ImageTag:  tag,
+		WorkDir:   workDir,
+		Mounts:    mounts,
+		Env:       startEnv,
+		CachePVCs: cachePVCs,
+		MemoryMB:  memMB,
+		CPUs:      cpu,
+		Network:   network,
+		AgentID:   agentID,
 	})
 	if err != nil {
 		return "", fmt.Errorf("start container: %w", err)
@@ -648,13 +772,12 @@ func (m *manager) asyncBuildEnabled() bool {
 // ensureAsyncBuild drives the asynchronous build state machine for tag.
 //
 //   - Build still running (or just kicked off): returns ("", buildInProgressError).
-//   - Build finished with an error: returns ("", wrapped error) and clears the
-//     entry so the next call retries the build.
-//   - Build finished successfully: clears the entry and returns ("ready", nil)
-//     so the caller falls through to Start.
+//   - Build finished with an error: returns ("", wrapped error). The tracker
+//     retains it briefly so concurrent callers share the verdict, then permits a retry.
+//   - Build finished successfully: retains the immutable-tag result and returns
+//     ("ready", nil) so every caller falls through to Start.
 func (m *manager) ensureAsyncBuild(projectDir, projectName, tag string, fp *detect.EnvFingerprint) (string, error) {
 	if bi := m.builds.lookup(tag); bi != nil && bi.done {
-		m.builds.clear(tag)
 		if bi.err != nil {
 			return "", fmt.Errorf("sandbox image build failed: %w", bi.err)
 		}
@@ -668,16 +791,18 @@ func (m *manager) ensureAsyncBuild(projectDir, projectName, tag string, fp *dete
 	}
 
 	bi, started := m.builds.startOrJoin(tag, &m.buildWg, func() error {
-		_, berr := m.backend.Build(context.Background(), backend.BuildOpts{
-			Tag:            tag,
-			Dockerfile:     dockerfileContent,
-			ContextDir:     projectDir,
-			PreferExisting: true,
+		result, berr := m.backend.Build(context.Background(), backend.BuildOpts{
+			Tag:             tag,
+			Dockerfile:      dockerfileContent,
+			ContextDir:      projectDir,
+			PreferExisting:  true,
+			DetectBaseImage: m.detectBaseImageAfterClone(fp),
 		})
 		if berr != nil {
 			m.logger.Warn("sandbox image build failed", "project", projectName, "tag", tag, "error", berr)
 			return berr
 		}
+		m.recordBaseImageFallback(projectName, result)
 		m.totalBuilds.Add(1)
 		return nil
 	})
@@ -685,6 +810,26 @@ func (m *manager) ensureAsyncBuild(projectDir, projectName, tag string, fp *dete
 		m.logger.Info("building sandbox image (async)", "project", projectName, "hash", fp.Hash[:7], "tag", tag)
 	}
 	return "", &buildInProgressError{tag: tag, project: projectName, elapsed: time.Since(bi.startedAt), started: started}
+}
+
+func (m *manager) detectBaseImageAfterClone(fp *detect.EnvFingerprint) bool {
+	return m.cfg.syncMode == "git-clone" && fp != nil && len(fp.Languages) == 0
+}
+
+func (m *manager) recordBaseImageFallback(project string, result *backend.BuildResult) {
+	if result == nil || result.BaseImageFallback == nil {
+		return
+	}
+	f := result.BaseImageFallback
+	if m.metrics != nil {
+		m.metrics.baseImageFallbacks.WithLabelValues(project, f.Language, f.Version, f.Reason).Inc()
+	}
+	if m.events != nil {
+		m.events.EmitBaseImageFallback(context.Background(), project, f.Language, f.Version, f.Reason)
+	}
+	if m.logger != nil {
+		m.logger.Warn("devbox base image registry fallback", "project", project, "language", f.Language, "version", f.Version, "reason", f.Reason)
+	}
 }
 
 func (m *manager) generateSandboxDockerfile(fp *detect.EnvFingerprint) ([]byte, error) {
@@ -707,12 +852,21 @@ func (m *manager) generateSandboxDockerfile(fp *detect.EnvFingerprint) ([]byte, 
 
 func genericGitCloneDockerfile() []byte {
 	return []byte(`# Auto-generated by mcp-devbox for git-clone source hydration.
-FROM registry.harbor.lan/mcp/devbox-base/go:1.25
+ARG DEVBOX_BASE_IMAGE=registry.harbor.lan/mcp/devbox-base/go:1.25
+FROM ${DEVBOX_BASE_IMAGE}
 ENV PATH="/usr/local/go/bin:${PATH}"
 RUN apk add --no-cache nodejs npm python3 py3-pip
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
 `)
+}
+
+// sandboxMemoryMB is shared by sandbox creation and gate process budgeting.
+func (m *manager) sandboxMemoryMB(fp *detect.EnvFingerprint) int {
+	if fp != nil && fp.Overrides != nil && fp.Overrides.Limits != nil && fp.Overrides.Limits.MemoryMB > 0 {
+		return fp.Overrides.Limits.MemoryMB
+	}
+	return m.cfg.defaultMemMB
 }
 
 // projectWorkDir returns the working directory inside the container for a project.
@@ -886,14 +1040,48 @@ func parseStoreKey(key string) (projectName, agentID string) {
 	return key, ""
 }
 
+// millsAgentIDPrefix identifies the Mills tests stage's per-run sandboxes
+// (pkg/mills/pipeline devboxAgentID: operator agent id + run token [+ "-baseline"]).
+const millsAgentIDPrefix = "loom-mills-operator-"
+
+// defaultMillsIdleTimeout is short on purpose: an idle Mills sandbox is an orphan
+// holding a sandbox of devbox quota (bl-devbox-sandbox-quota-headroom-20260913).
+const defaultMillsIdleTimeout = 5 * time.Minute
+
+// millsBackstop reports whether the Mills idle backstop governs agentID: a Mills
+// per-run sandbox while DEVBOX_MILLS_IDLE_TIMEOUT is set (zero = global policy).
+func (m *manager) millsBackstop(agentID string) bool {
+	return strings.HasPrefix(agentID, millsAgentIDPrefix) && m.cfg.millsIdleTimeout > 0
+}
+
+// idleTimeoutFor returns the idle timeout one sandbox is held to.
+func (m *manager) idleTimeoutFor(agentID string) time.Duration {
+	if m.millsBackstop(agentID) {
+		return m.cfg.millsIdleTimeout
+	}
+	return m.cfg.idleTimeout
+}
+
+// idleScanTimeout is the shortest configured timeout, so one store scan covers
+// both populations; reapIdle re-checks each entry against its own.
+func (m *manager) idleScanTimeout() time.Duration {
+	if t := m.cfg.millsIdleTimeout; t > 0 && t < m.cfg.idleTimeout {
+		return t
+	}
+	return m.cfg.idleTimeout
+}
+
 // reapIdle pauses containers that have been idle beyond the timeout.
 // Paused containers can be resumed instantly (~5ms) vs cold start (~2-5s).
 // Falls back to stop if pause is not supported by the backend.
 //
 // K8s-aware: sleeping K8s pods use ~0 CPU. On first idle timeout, just log
 // "keeping warm". Hard-reap (stop) only after 2× idle timeout.
+//
+// Mills per-run sandboxes under millsBackstop are stopped as soon as they pass
+// millsIdleTimeout, with no keep-warm grace: a sleeping pod still holds quota.
 func (m *manager) reapIdle(ctx context.Context) {
-	idle := m.store.IdleEntries(m.cfg.idleTimeout)
+	idle := m.store.IdleEntries(m.idleScanTimeout())
 	for key, entry := range idle {
 		// Skip entries with active exec calls
 		if m.hasActiveExecs(key) {
@@ -907,19 +1095,28 @@ func (m *manager) reapIdle(ctx context.Context) {
 			continue
 		}
 
+		// The scan used the shortest timeout; hold each entry to its own.
+		backstop := m.millsBackstop(agentID)
+		idleTimeout := m.idleTimeoutFor(agentID)
+		idleDuration := time.Since(entry.LastUsed)
+		if idleDuration < idleTimeout {
+			continue
+		}
+
 		containerName := m.containerName(projectName, agentID)
 
 		// K8s-aware: keep pods warm on first idle, hard-reap at 2× timeout.
+		// A Mills sandbox under the backstop gets no warm grace.
 		if m.isK8sBackend() {
-			idleDuration := time.Since(entry.LastUsed)
-			if idleDuration < 2*m.cfg.idleTimeout {
+			if !backstop && idleDuration < 2*idleTimeout {
 				m.logger.Debug("keeping K8s pod warm", "key", key,
 					"idle_since", entry.LastUsed.Format(time.RFC3339))
 				continue
 			}
-			// Exceeded 2× timeout — hard-reap.
+			// Past the warm grace (or a Mills sandbox past its backstop) — hard-reap.
 			m.logger.Info("hard-reaping idle K8s pod", "key", key,
-				"idle_since", entry.LastUsed.Format(time.RFC3339))
+				"idle_since", entry.LastUsed.Format(time.RFC3339),
+				"idle_timeout", idleTimeout, "mills_backstop", backstop)
 			if err := m.backend.Stop(ctx, containerName); err != nil {
 				m.logger.Warn("failed to stop idle sandbox", "key", key, "error", err)
 				continue
@@ -981,6 +1178,14 @@ func (m *manager) reconcileState(ctx context.Context) {
 // It cancels running async execs and waits for goroutines to finish
 // before stopping containers.
 func (m *manager) shutdownAll(ctx context.Context) {
+	m.gateCancels.Range(func(key, value any) bool {
+		value.(context.CancelFunc)()
+		if err := m.lockGateLifecycle(ctx, key.(string), true); err == nil {
+			m.projectLock(key.(string)).Unlock()
+		}
+		return ctx.Err() == nil
+	})
+
 	// Cancel all running async execs so goroutines exit promptly.
 	if m.asyncExecs != nil {
 		m.asyncExecs.mu.RLock()
@@ -993,11 +1198,22 @@ func (m *manager) shutdownAll(ctx context.Context) {
 	}
 
 	// Wait for all async goroutines to complete.
-	m.asyncWg.Wait()
+	done := make(chan struct{})
+	go func() { m.asyncWg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 
 	entries := m.store.List()
 	for key, entry := range entries {
 		if entry.Status == "running" {
+			if m.isK8sBackend() && m.hasActiveExecs(key) {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
 			projectName, agentID := parseStoreKey(key)
 			containerName := m.containerName(projectName, agentID)
 			m.logger.Info("shutting down sandbox", "key", key)

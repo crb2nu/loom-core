@@ -1,0 +1,1 @@
+- Add `max_concurrent_pipelines` to the Mills policy schema and enforce its validated value during runner admission in `pkg/mills/runner/runner.go`, with shared limit resolution in `internal/loomconcurrency/limit.go`.

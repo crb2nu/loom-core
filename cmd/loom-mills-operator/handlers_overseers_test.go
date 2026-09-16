@@ -40,6 +40,7 @@ func TestHandleOverseersStatus_Shape(t *testing.T) {
 	op, cleanup := newTestOperator(t)
 	defer cleanup()
 	withTestOverseers(op)
+	materializeTestReport(t, op, "overseers", overseerRecentActionsWindow, "")
 
 	rec := httptest.NewRecorder()
 	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/overseers", nil))
@@ -86,6 +87,7 @@ func TestHandleOverseersStatus_RegisteredAgentAccessors(t *testing.T) {
 		DryRun:      func() bool { return false },
 		Suppression: func() *overseer.Suppression { return lease },
 	}}
+	materializeTestReport(t, op, "overseers", overseerRecentActionsWindow, "")
 
 	rec := httptest.NewRecorder()
 	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/overseers", nil))

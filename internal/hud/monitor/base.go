@@ -133,13 +133,78 @@ func (b *BaseMonitor[T]) doRefresh(refreshFn RefreshFunc[T]) (T, error) {
 	return val, nil
 }
 
-// pollLoop runs the refresh function on a ticker with exponential backoff.
-// On consecutive errors it skips up to 4 ticks (5x the base interval).
+// Backoff tuning for the poll loops. Package variables, not constants, so
+// tests can shrink the windows.
+var (
+	// backoffWarnCount is how many consecutive failures log at WARN before
+	// the loop goes quiet between summaries.
+	backoffWarnCount = 3
+	// backoffMaxEffectiveInterval caps how far a failing monitor backs off:
+	// the effective poll interval never exceeds it, however long the outage.
+	// The old cap (5× the base interval) kept a 15s monitor polling a dead
+	// upstream every 75s for the whole 2026-09-10 qdrant outage — ~950
+	// identical warnings per monitor in a day.
+	backoffMaxEffectiveInterval = 5 * time.Minute
+	// backoffSummaryEvery spaces the "still failing" reminders once the loop
+	// has gone quiet, so a long outage stays visible without flooding.
+	backoffSummaryEvery = 5 * time.Minute
+)
+
+// refreshBackoff tracks consecutive refresh failures for one poll loop and
+// decides how many ticks to skip and when to log. The first
+// backoffWarnCount failures log at WARN; after that the loop backs off
+// exponentially up to backoffMaxEffectiveInterval and logs one "still
+// failing" summary per backoffSummaryEvery, then a single recovery line
+// that carries the outage duration.
+type refreshBackoff struct {
+	consecutive  int
+	firstFailure time.Time
+	lastSummary  time.Time
+}
+
+// failed records a failure and returns how many ticker ticks to skip before
+// the next attempt.
+func (s *refreshBackoff) failed(logger *slog.Logger, interval time.Duration, err error, now time.Time) int {
+	s.consecutive++
+	if s.consecutive == 1 {
+		s.firstFailure = now
+		s.lastSummary = now
+	}
+	switch {
+	case s.consecutive <= backoffWarnCount:
+		logger.Warn("refresh error", "error", err, "consecutive", s.consecutive)
+	case now.Sub(s.lastSummary) >= backoffSummaryEvery:
+		logger.Warn("refresh still failing", "error", err,
+			"consecutive", s.consecutive,
+			"degraded_for", now.Sub(s.firstFailure).Round(time.Second))
+		s.lastSummary = now
+	}
+	maxSkip := 4
+	if interval > 0 {
+		if m := int(backoffMaxEffectiveInterval/interval) - 1; m > maxSkip {
+			maxSkip = m
+		}
+	}
+	return min(s.consecutive-1, maxSkip)
+}
+
+// recovered logs the end of an outage (if there was one) and resets.
+func (s *refreshBackoff) recovered(logger *slog.Logger, now time.Time) {
+	if s.consecutive > 0 {
+		logger.Info("refresh recovered",
+			"after_errors", s.consecutive,
+			"degraded_for", now.Sub(s.firstFailure).Round(time.Second))
+	}
+	*s = refreshBackoff{}
+}
+
+// pollLoop runs the refresh function on a ticker with exponential backoff
+// (see refreshBackoff).
 func (b *BaseMonitor[T]) pollLoop(interval time.Duration, refreshFn RefreshFunc[T]) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	consecutiveErrors := 0
+	var backoff refreshBackoff
 	for {
 		select {
 		case <-b.stopCh:
@@ -147,11 +212,7 @@ func (b *BaseMonitor[T]) pollLoop(interval time.Duration, refreshFn RefreshFunc[
 			return
 		case <-ticker.C:
 			if _, err := b.doRefresh(refreshFn); err != nil {
-				consecutiveErrors++
-				if consecutiveErrors <= 3 {
-					b.Logger.Warn("refresh error", "error", err)
-				}
-				skipTicks := min(consecutiveErrors-1, 4)
+				skipTicks := backoff.failed(b.Logger, interval, err, time.Now())
 				for range skipTicks {
 					select {
 					case <-b.stopCh:
@@ -160,10 +221,7 @@ func (b *BaseMonitor[T]) pollLoop(interval time.Duration, refreshFn RefreshFunc[
 					}
 				}
 			} else {
-				if consecutiveErrors > 0 {
-					b.Logger.Info("refresh recovered", "after_errors", consecutiveErrors)
-				}
-				consecutiveErrors = 0
+				backoff.recovered(b.Logger, time.Now())
 			}
 		}
 	}
@@ -182,13 +240,13 @@ func (b *BaseMonitor[T]) StartLoop(interval time.Duration, refreshFn func() erro
 	go b.runLoop(interval, refreshFn)
 }
 
-// runLoop runs refreshFn on a ticker with exponential backoff.
-// On consecutive errors it skips up to 4 ticks (5x the base interval).
+// runLoop runs refreshFn on a ticker with exponential backoff (see
+// refreshBackoff).
 func (b *BaseMonitor[T]) runLoop(interval time.Duration, refreshFn func() error) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	consecutiveErrors := 0
+	var backoff refreshBackoff
 	for {
 		select {
 		case <-b.stopCh:
@@ -196,11 +254,7 @@ func (b *BaseMonitor[T]) runLoop(interval time.Duration, refreshFn func() error)
 			return
 		case <-ticker.C:
 			if err := refreshFn(); err != nil {
-				consecutiveErrors++
-				if consecutiveErrors <= 3 {
-					b.Logger.Warn("refresh error", "error", err)
-				}
-				skipTicks := min(consecutiveErrors-1, 4)
+				skipTicks := backoff.failed(b.Logger, interval, err, time.Now())
 				for range skipTicks {
 					select {
 					case <-b.stopCh:
@@ -209,10 +263,7 @@ func (b *BaseMonitor[T]) runLoop(interval time.Duration, refreshFn func() error)
 					}
 				}
 			} else {
-				if consecutiveErrors > 0 {
-					b.Logger.Info("refresh recovered", "after_errors", consecutiveErrors)
-				}
-				consecutiveErrors = 0
+				backoff.recovered(b.Logger, time.Now())
 			}
 		}
 	}

@@ -99,6 +99,40 @@ func TestClassifyGitCloneError_Classes(t *testing.T) {
 			wantMsgSubs: []string{"network error", "retry"},
 		},
 		{
+			// The exact captured tail from PIPE-psl-plan-council-split-internal-
+			// hud-spawn-… (2026-09-13): it used to fall through to the exit-128
+			// default and escalate terminal config as "no git message was captured".
+			name:        "GitLab HTTP 502 mid-clone (RPC failed + expected flush) → transient transport",
+			msg:         "pod not ready: container git-clone terminated exit_code=128 reason=Error — git-clone log: Cloning into 'loom-core'... | error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502 | fatal: expected flush after ref listing",
+			wantClass:   ClassTransient,
+			wantFound:   true,
+			wantMsgSubs: []string{"transport error", "loom-core", "retry"},
+		},
+		{
+			name:        "early EOF in the pack stream → transient transport",
+			msg:         "image build failed: buildah build failed: container git-clone terminated exit_code=128 reason=Error — git-clone log: Cloning into 'familyforge'... | fatal: early EOF | fatal: fetch-pack: invalid index-pack output",
+			wantClass:   ClassTransient,
+			wantFound:   true,
+			wantMsgSubs: []string{"transport error", "familyforge", "retry"},
+		},
+		{
+			name:        "remote end hung up → transient transport",
+			msg:         "pod not ready: container git-clone terminated exit_code=128 — git-clone log: fatal: the remote end hung up unexpectedly",
+			wantClass:   ClassTransient,
+			wantFound:   true,
+			wantMsgSubs: []string{"transport error", "retry"},
+		},
+		{
+			name:      "a non-git early EOF must NOT be claimed as a clone transport failure",
+			msg:       "stage tests errored: devbox exec stream: early EOF",
+			wantFound: false,
+		},
+		{
+			name:      "a gRPC rpc error is not git's RPC failed",
+			msg:       "spawn: rpc error: code = Unavailable desc = transport is closing",
+			wantFound: false,
+		},
+		{
 			name:        "exit 128 with empty/unrecognized stderr → safe generic terminal-config",
 			msg:         "image build failed: buildah build failed: container git-clone terminated exit_code=128 reason=Error",
 			wantClass:   ClassConfig,
@@ -170,6 +204,11 @@ func TestClassifyGitCloneError_FeedsErrorClass(t *testing.T) {
 			want: ClassTransient,
 		},
 		{
+			name: "GitLab 502 clone transport blip is TRANSIENT, not the exit-128 config default",
+			msg:  "image build failed: buildah build failed: container git-clone terminated exit_code=128 reason=Error — git-clone log: error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502 | fatal: expected flush after ref listing",
+			want: ClassTransient,
+		},
+		{
 			name: "exit-128 empty stderr fallback is CONFIG not INFRA",
 			msg:  "image build failed: buildah build failed: container git-clone terminated exit_code=128 reason=Error",
 			want: ClassConfig,
@@ -207,6 +246,10 @@ func TestClassifyGitCloneError_Terminality(t *testing.T) {
 	if !IsFreeRetry(net.Class) {
 		t.Errorf("network class %q should be a free retry", net.Class)
 	}
+	blip, _ := ClassifyGitCloneError("container git-clone terminated exit_code=128 — git-clone log: error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502 | fatal: expected flush after ref listing")
+	if IsTerminal(blip.Class) || !IsFreeRetry(blip.Class) {
+		t.Errorf("transport class %q must be a free, non-terminal retry (a GitLab 5xx blip should retry)", blip.Class)
+	}
 }
 
 // TestGitCloneEscalationReasonFeedsMetadata proves the end-to-end contract: the
@@ -241,3 +284,28 @@ func TestGitCloneEscalationReasonFeedsMetadata(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestClassifyGitCloneError_TransportFailures covers callers that pass only
+// git's stderr tail (no `git-clone` container name in the text): git's own
+// transport failure lines are enough to enter the classifier, and every
+// HTTP 5xx / pack-stream shape lands in the transient transport family.
+func TestClassifyGitCloneError_TransportFailures(t *testing.T) {
+	tails := []string{
+		"error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502 | fatal: expected flush after ref listing",
+		"error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503",
+		"error: RPC failed; HTTP 504 curl 22 The requested URL returned error: 504",
+		"error: RPC failed; curl 22 The requested URL returned error: 500",
+		"fatal: early EOF",
+		"fatal: the remote end hung up unexpectedly",
+		"error: RPC failed; curl 56 GnuTLS recv error (-54): Error in the pull function.",
+		"fatal: unexpected disconnect while reading sideband packet",
+	}
+	for _, tail := range tails {
+		t.Run(tail, func(t *testing.T) {
+			got, ok := ClassifyGitCloneError(tail)
+			if !ok || got.Class != ClassTransient || !strings.Contains(got.Message, "transport error") {
+				t.Fatalf("got (%+v, %t), want transient transport", got, ok)
+			}
+		})
+	}
+}

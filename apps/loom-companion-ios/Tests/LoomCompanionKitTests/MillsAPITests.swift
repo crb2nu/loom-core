@@ -55,6 +55,31 @@ struct MillsAPITests {
         #expect(snap == nil)
     }
 
+    @Test("operatorStatus returns the status when present")
+    func operatorStatusSuccess() async throws {
+        let mock = MockAPIClient()
+        mock.millsStatusResponse = MillsOperatorStatus(buildSHA: "c9fe3ed7", policyEnabled: true, autonomyReady: true)
+        let api = MillsAPI(client: mock)
+        let status = try await api.operatorStatus()
+        #expect(status?.buildSHA == "c9fe3ed7")
+        #expect(status?.verdict == .ready)
+    }
+
+    @Test("operatorStatus degrades to nil on 404 / 503 / bare 502, propagates auth failures")
+    func operatorStatusDegrades() async throws {
+        for code in [APIErrorCode.notFound, .notConfigured, .upstreamError] {
+            let mock = MockAPIClient()
+            mock.endpointFailures["/api/mills/status"] = .apiError(code: code, message: "down", requestId: "")
+            let status = try await MillsAPI(client: mock).operatorStatus()
+            #expect(status == nil, "\(code) should read as no operator card")
+        }
+        let mock = MockAPIClient()
+        mock.endpointFailures["/api/mills/status"] = .apiError(code: .forbidden, message: "restricted", requestId: "")
+        await #expect(throws: LoomAPIError.self) {
+            _ = try await MillsAPI(client: mock).operatorStatus()
+        }
+    }
+
     @Test("PipelineRun JSON decoder handles operator-shaped payload")
     func decodesPipelineRunFromOperatorJSON() throws {
         let json = """

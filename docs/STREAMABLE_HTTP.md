@@ -226,3 +226,14 @@ loom proxy --remote https://host:8088/mcp  # Uses LOOM_REMOTE_TOKEN env
 | `/oauth2/authorize` | No | OAuth authorization endpoint (when `http.oauth.enabled=true`) |
 | `/oauth2/token` | No | OAuth token endpoint (when `http.oauth.enabled=true`) |
 | `/oauth2/revoke` | No | OAuth token revocation endpoint (when `http.oauth.enabled=true`) |
+
+## Hub servers (`custom-server`)
+
+Every in-cluster MCP server pod runs the same `custom-server` binary in front of its stdio server. It serves exactly two MCP transports:
+
+| Path | Transport | Clients |
+|------|-----------|---------|
+| `POST /mcp` (`MCP_HTTP_PATH`) | Streamable HTTP | mcpo OpenAPI gateway, external clients through the `mcp-*.flexinfer.ai` ingress hosts |
+| `/ws` (`MCP_WS_PATH`) | WebSocket (hubproto envelopes) | `loomd`, the HUD, Mills spawn pods |
+
+The legacy MCP HTTP+SSE transport (`GET /sse` + `POST /messages`) was removed on 2026-09-12, after all 22 mcpo consumers had moved to Streamable HTTP and a 45-hour soak showed no `/sse` traffic on the hub (`.loom/197-research-mcpo-sse-migration-2026-08.md` §4). Both retired routes answer `404` with a body naming the replacements, so a straggler configured against the old endpoint sees why it fails. `/health` and `/ready` are unchanged.

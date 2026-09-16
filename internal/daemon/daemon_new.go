@@ -363,8 +363,11 @@ func New(cfg Config) (*Daemon, error) {
 	// Create manifest manager for persistent tool cache
 	manifest := NewManifestManager()
 
-	// Create profiles manager for tool filtering
+	// Create profiles manager for tool filtering. The built-in "full" ceiling
+	// is replaced by the daemon's own (unlimited by default) before any custom
+	// profile file loads, so an explicit file definition still takes precedence.
 	profileMgr := profiles.NewManager()
+	applyToolCeiling(profileMgr, fileCfg.Context.MaxTools)
 	if fileCfg.Context.CustomProfilePath != "" {
 		if err := profileMgr.LoadFromFile(fileCfg.Context.CustomProfilePath); err != nil {
 			logger.Warn("failed to load custom profiles", "path", fileCfg.Context.CustomProfilePath, "error", err)

@@ -32,6 +32,31 @@ describe('normalizeRequeueResponse', () => {
     });
   });
 
+  describe('409 deferred — the requeue that LANDED', () => {
+    it('reports a scope-overlap deferral as held, not failed', () => {
+      // decision:"deferred" means the item is back to queued and the
+      // scheduler held only the start. "Can't requeue" here once sent an
+      // operator to the DB to verify an action that had already worked.
+      const out = normalizeRequeueResponse(409, {
+        backlog_id: 'MILLS-1',
+        decision: 'deferred',
+        reason: 'scope overlap with running item X (shared scope: cmd/loom-mills-operator)',
+      });
+      expect(out.kind).toBe('deferred');
+      expect(out.message).toBe(
+        'Requeued — start held by the scheduler: scope overlap with running item X (shared scope: cmd/loom-mills-operator). It starts when the hold clears.',
+      );
+    });
+
+    it('still reads as held when the operator omits the reason', () => {
+      const out = normalizeRequeueResponse(409, { backlog_id: 'MILLS-1', decision: 'deferred' });
+      expect(out.kind).toBe('deferred');
+      expect(out.message).toBe(
+        'Requeued — start held by the scheduler; it starts when the hold clears.',
+      );
+    });
+  });
+
   describe('409 conflict', () => {
     it('reads a merged-state conflict as already-completed (the ghost spark)', () => {
       const out = normalizeRequeueResponse(409, {

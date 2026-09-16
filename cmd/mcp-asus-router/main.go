@@ -18,10 +18,15 @@ import (
 )
 
 var (
-	version              = "0.1.0"
-	hostAlias            = env.String("ASUS_ROUTER_HOST", "asus-router")
-	hostPort             = env.Int("ASUS_ROUTER_PORT", 22)
-	hostUser             = env.String("ASUS_ROUTER_USER", "admin")
+	version   = "0.1.0"
+	hostAlias = env.String("ASUS_ROUTER_HOST", "asus-router")
+	hostPort  = env.Int("ASUS_ROUTER_PORT", 22)
+	hostUser  = env.String("ASUS_ROUTER_USER", "admin")
+	// sshKeyPath, when set, is passed as `ssh -i <path>` with IdentitiesOnly so
+	// a container with no ~/.ssh (the loom-hub deployment mounts the key from a
+	// Secret at a fixed path) can still authenticate. Empty keeps the
+	// workstation behaviour: ssh's default identity search + ~/.ssh/config.
+	sshKeyPath           = env.String("ASUS_ROUTER_SSH_KEY", "")
 	routerTimeoutSeconds = env.Int("ASUS_ROUTER_TIMEOUT_SECONDS", 20)
 )
 
@@ -41,7 +46,13 @@ func run(ctx context.Context) error {
 	}
 	defer func() { _ = cleanup(ctx) }()
 
-	srv.Logger.Info("router config", "host", hostAlias)
+	srv.Logger.Info("router config", "host", hostAlias, "port", hostPort, "user", hostUser, "ssh_key", sshKeyPath)
+	if _, err := exec.LookPath("ssh"); err != nil {
+		// Every tool shells out to ssh; say so at boot instead of failing
+		// each call with an opaque exec error (the loom-hub custom-server
+		// image shipped without openssh-client until 2026-09-02).
+		srv.Logger.Warn("ssh binary not found in PATH; every router tool will fail", "err", err)
+	}
 
 	// Register tools
 	registerTools(srv)
@@ -134,15 +145,20 @@ func runRemote(ctx context.Context, cmd string) (string, error) {
 	args := []string{
 		"-p", fmt.Sprintf("%d", hostPort),
 		"-l", hostUser,
+	}
+	if sshKeyPath != "" {
+		args = append(args, "-i", sshKeyPath, "-o", "IdentitiesOnly=yes")
+	}
+	args = append(args,
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=3",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + controlPath,
+		"-o", "ControlPath="+controlPath,
 		"-o", "ControlPersist=60",
 		hostAlias,
-		"sh", "-c", "PATH=/opt/bin:/opt/sbin:$PATH; " + cmd,
-	}
+		"sh", "-c", "PATH=/opt/bin:/opt/sbin:$PATH; "+cmd,
+	)
 
 	c := exec.CommandContext(ctx, "ssh", args...)
 	out, err := c.CombinedOutput()

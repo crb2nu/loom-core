@@ -1,3 +1,5 @@
+import { latestTerminalRun, type RescueEvidence } from '../utils/rescueHelpers.ts';
+
 // Mills store — backlog / pipeline runs / council runs / eval scores from
 // the in-cluster loom-mills-operator, proxied through /api/mills/* by the
 // HUD's domain/mills package. Each panel owns a slice of this store and
@@ -85,6 +87,68 @@ type BacklogDetailLoadState =
   | { status: 'loaded'; detail: BacklogItemDetail }
   | { status: 'error'; message: string };
 
+// --- Backlog item event ledger (journey strip) ----------------------------
+//
+// GET /api/mills/backlog/{id}/events serves store.Event rows whose
+// subject_kind is "backlog_item", newest-first. Fields are PascalCase (untagged
+// Go struct), matching BacklogItem above.
+
+/** One recorded event on an item's timeline. */
+export interface MillsEvent {
+  ID: number;
+  OccurredAt: string;
+  Actor: string;
+  Kind: string;
+  SubjectKind: string;
+  SubjectID: string;
+  Payload?: Record<string, unknown> | null;
+}
+
+/**
+ * The ledger response.
+ *
+ * `partial` is always true and is a PERMANENT property of the endpoint, not a
+ * transient state: only transitions routed through TransitionStateWithEvent
+ * (bootstrap escalation, auto-requeue, groomer) plus explicit appends (operator
+ * overrides, agent routing) are recorded — a plain queued→running claim writes
+ * no event. The UI must caption the strip as a record of what was logged and
+ * never imply a complete state history it can't prove.
+ */
+export interface BacklogEventLedger {
+  backlog_id: string;
+  events: MillsEvent[];
+  partial: boolean;
+}
+
+type BacklogEventsLoadState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'loaded'; ledger: BacklogEventLedger }
+  | { status: 'error'; message: string };
+
+// --- Fleet-gate benchmark waivers ----------------------------------------
+
+/** One operator-approved, self-expiring benchmark exception. */
+export interface FleetGateWaiver {
+  benchmark: string;
+  max_time_percent: number;
+  /** Inclusive RFC3339 date (YYYY-MM-DD) — the waiver is still live on this day. */
+  until: string;
+  reason: string;
+  /** Whole days to `until`, inclusive: 0 means "expires today, still active". */
+  days_remaining: number;
+  expired: boolean;
+}
+
+export interface FleetGateWaivers {
+  waivers: FleetGateWaiver[];
+  /** The global cap each waiver raises — without it a "cap 60%" chip has no scale. */
+  global_time_percent: number;
+  suite_version: number;
+  /** Manifest mtime; the operator's checkout can be stale if origin was unreachable. */
+  manifest_modified?: string;
+}
+
 export interface PipelineRun {
   ID: string;
   BacklogID: string;
@@ -96,6 +160,7 @@ export interface PipelineRun {
   // requiring an extra detail fetch.
   CurrentStage?: string;
   Attempts: number;
+  EffectiveAttempts?: number;
   StartedAt?: string;
   EndedAt?: string;
   // Phase 6 (bounded recursion): top-level runs have ParentRunID == null
@@ -128,6 +193,45 @@ export interface PipelineRun {
 }
 
 export type BoltGrade = 'keep' | 'meh' | 'regret';
+
+export interface BoltCard {
+  run_id: string | null;
+  backlog_id: string;
+  title: string;
+  spec_headline: string;
+  outcome: string;
+  merged_at: string | null;
+  mr: { iid: number | null; url: string };
+  diff: { files: number; added: number; removed: number; source: string };
+  eval: { min_score: number | null; verdicts: unknown[] };
+  gates_failed: string[];
+  attempts: number;
+  cost_usd: number;
+  template: string;
+  escalation: { class: string; signature: string; week_occurrences: number } | null;
+  grade: { value: BoltGrade; note: string; actor: string; at: string } | null;
+}
+
+export interface BoltsResponse {
+  generated_at: string;
+  window_seconds: number;
+  bolts: BoltCard[];
+}
+
+export interface ShiftReportResponse extends BoltsResponse {
+  sparks: BoltCard[];
+  kpi_delta: Record<string, { now: number; prev: number }>;
+  taste: {
+    graded_this_shift: number;
+    bolts_this_shift: number;
+    coverage_14d: number;
+    coverage_gate?: number;
+    ranker_armed: boolean;
+    last_grade_at: string | null;
+  };
+  narrative_lines: string[];
+  markdown: string;
+}
 
 interface GradeRunResponse {
   run_id: string;
@@ -164,6 +268,11 @@ export interface StageResult {
   EndedAt?: string | null;
   Outcome?: 'success' | 'gate_fail' | 'error' | null;
   SpawnID?: string;
+  // Who ran the pick: the routed model and the backend (spawn/local). The
+  // operator writes both on every stage row; Artifacts.agent_routing
+  // carries the same pair plus the routing rule that chose them.
+  Model?: string;
+  Backend?: string;
   CostUSD: number;
   Artifacts?: Record<string, unknown>;
   LogTail?: string;
@@ -259,6 +368,36 @@ export interface DemandLogRow {
   dry_run?: boolean;
 }
 
+// Serial merge queue (the press): active entries holding or waiting on a
+// per-lane head slot. Wire shape is snake_case straight off the operator's
+// GET /api/mills/merge-queue open read (handlers_merge_queue.go) — unlike
+// the PascalCase backlog/pipeline payloads.
+export interface MergeQueueEntry {
+  id: number;
+  pipeline_run_id: string;
+  backlog_id: string;
+  project: string;
+  mr_iid: number;
+  source_branch: string;
+  target_branch: string;
+  enqueued_sha: string;
+  current_sha: string;
+  // queued | rebasing | awaiting_pipeline | merging | merged | evicted.
+  state: string;
+  eviction_reason?: string;
+  attempts: number;
+  merged_sha?: string;
+  enqueued_at: string;
+  updated_at: string;
+  settled_at?: string;
+}
+
+export interface MergeQueueSnapshot {
+  active: MergeQueueEntry[];
+  recent_settled?: MergeQueueEntry[];
+  summary: { depth: number; lanes: Record<string, number>; enabled: boolean };
+}
+
 export interface PipelineRunDetail {
   run: PipelineRun;
   // Older operators omit the block; every consumer must null-guard.
@@ -294,7 +433,7 @@ export interface RequeueResponseBody {
   blockers?: string[];
 }
 
-export type RequeueOutcomeKind = 'started' | 'conflict' | 'forbidden' | 'error';
+export type RequeueOutcomeKind = 'started' | 'deferred' | 'conflict' | 'forbidden' | 'error';
 
 export interface RequeueOutcome {
   kind: RequeueOutcomeKind;
@@ -354,6 +493,20 @@ export function normalizeRequeueResponse(status: number, body: unknown): Requeue
   }
 
   if (status === 409) {
+    // decision:"deferred" is a 409 that means the requeue LANDED: the item is
+    // back to queued but the scheduler held the start (scope overlap, scope
+    // reservation for a starved item, budget). Reporting it as "Can't
+    // requeue" told the operator their action failed when it succeeded — the
+    // exact misread that sent one operator to the DB to double-check.
+    if (parsed?.decision === 'deferred') {
+      return {
+        kind: 'deferred',
+        reason: reason || undefined,
+        message: reason
+          ? `Requeued — start held by the scheduler: ${reason}. It starts when the hold clears.`
+          : 'Requeued — start held by the scheduler; it starts when the hold clears.',
+      };
+    }
     // The one-way terminal-state guard refuses to requeue an item that already
     // reached merged/done — the MWPS-merged-later "ghost spark". Phrase that as
     // already-completed rather than an error the operator must chase.
@@ -594,10 +747,17 @@ export interface MillsCapabilityRow {
 // spend/runs against the active policy caps. Zero caps mean "not
 // configured" (an uncapped tank), not an empty one.
 export interface BudgetWindowUsage {
+  /** Metered spend — what an API account is billed. Excludes subscription turns and local inference. */
   spent_usd: number;
   cap_usd: number;
   runs: number;
   runs_cap: number;
+  /** Every attributed dollar in the window regardless of who pays (older operators omit it). */
+  total_spent_usd?: number;
+  /** List-price equivalent of Claude Code / Codex subscription turns; absent on legacy operators. */
+  subscription_spent_usd?: number;
+  /** Subscription tank ceiling, separate from the metered hard cap; zero or absent means no cap. */
+  subscription_cap_usd?: number;
 }
 
 export interface MillsStatus {
@@ -852,6 +1012,16 @@ class MillsStore {
   // (same close-cancels-fetch contract as detailAbort above).
   private backlogAbort: AbortController | null = null;
 
+  // Recorded-event ledger per backlog item, feeding the drawer's journey strip.
+  // Cached by id alongside the detail so re-opening a drawer is instant.
+  backlogEventsByID = $state<Record<string, BacklogEventsLoadState>>({});
+
+  // Fleet-gate benchmark waivers (Telemetry card). Null until first fetch;
+  // waiversError holds a reason when the operator can't read its manifest so
+  // the card can say why instead of rendering an unexplained blank.
+  waivers = $state<FleetGateWaivers | null>(null);
+  waiversError = $state<string | null>(null);
+
   // Pending adaptive policy proposals (Phase 7 slice 7.1/7.2). Refreshed
   // alongside the rest of fetchAll so the card stays in sync with the
   // 15s poll cadence used elsewhere.
@@ -874,6 +1044,14 @@ class MillsStore {
   historyLoading = $state(false);
   historyError = $state<string | null>(null);
   historyActive = $state(false);
+
+  // Serial merge queue (the press). Refreshed on the shared tick only while
+  // mergeQueueActive is true — the same opt-in contract as historyActive,
+  // so panels that never show the merge lane pay nothing for it. Errors
+  // stay local (mergeQueueError) so a press hiccup never reds the floor.
+  mergeQueue = $state<MergeQueueSnapshot | null>(null);
+  mergeQueueError = $state<string | null>(null);
+  mergeQueueActive = $state(false);
 
   // Durable workflow step-log (plan .loom/134 §S4b). The workflow_runs /
   // workflow_steps journal is a separate surface from the DAG pipeline
@@ -929,6 +1107,16 @@ class MillsStore {
   });
   private eventUnsubs: Array<() => void> = [];
 
+  // True once any fetchAll has been issued this session. primeOnce reads it
+  // so the Mills-view entry hook can fill the nav badges on a tab that does
+  // not poll this store without doubling a polling panel's first fetch.
+  private primed = false;
+
+  primeOnce(): void {
+    if (this.primed) return;
+    void this.fetchAll();
+  }
+
   get pipelinesByState(): Record<string, number> {
     const out: Record<string, number> = {};
     for (const r of this.pipelineRuns) {
@@ -981,6 +1169,7 @@ class MillsStore {
   }
 
   async fetchAll(): Promise<void> {
+    this.primed = true;
     this.loading = true;
     try {
       const results = await Promise.allSettled([
@@ -1083,6 +1272,9 @@ class MillsStore {
         // Keep run history fresh on the same cadence, but only while the
         // Pipelines panel is actually showing the History view.
         if (this.historyActive) void this.fetchPipelineHistory();
+        // Same opt-in for the press: refresh the serial merge lane only
+        // while a panel rendering it (Bolts / Factory) is mounted.
+        if (this.mergeQueueActive) void this.fetchMergeQueue();
       }
       // Prime the terminal archive once so millFloorSpine's bolt/spark
       // tallies are populated on every mill-floor view, not only the two
@@ -1470,6 +1662,8 @@ class MillsStore {
       }
     });
     void this.fetchBacklogDetail(id, this.backlogAbort.signal);
+    void this.fetchBacklogEvents(id, this.backlogAbort.signal);
+    void this.fetchBacklogRuns(id, this.backlogAbort.signal);
   }
 
   closeBacklogDetail(): void {
@@ -1482,22 +1676,100 @@ class MillsStore {
     const id = this.selectedBacklogID;
     if (!id) return;
     await this.fetchBacklogDetail(id, this.backlogAbort?.signal);
+    await this.fetchBacklogRuns(id, this.backlogAbort?.signal);
+  }
+
+  // Server-fetched run history per backlog item, from
+  // GET /api/mills/pipeline/runs?backlog_id=X. The poll windows alone can't
+  // answer "why is this item escalated?" once the culprit runs age out of
+  // the 7d/50-run terminal window; this cache holds the authoritative
+  // per-item list for whatever drawer is (or was) open.
+  backlogRunsByID = $state<Record<string, PipelineRun[]>>({});
+
+  // fetchBacklogRuns pulls the per-item run list. Failure is silent by
+  // design: pipelineRunsForBacklog still merges the poll windows, so the
+  // drawer degrades to exactly the pre-endpoint behavior. The BacklogID
+  // filter below also makes the response harmless on an older operator
+  // that ignores unknown query params and serves the ACTIVE-run union —
+  // filtering strips the unrelated rows instead of rendering them.
+  private async fetchBacklogRuns(id: string, signal?: AbortSignal): Promise<void> {
+    try {
+      const raw = await this.getJSON<unknown>(
+        `/api/mills/pipeline/runs?backlog_id=${encodeURIComponent(id)}&limit=20`,
+        { signal },
+      );
+      if (!Array.isArray(raw)) return;
+      const runs = (raw as PipelineRun[]).filter((r) => r && r.BacklogID === id);
+      this.backlogRunsByID = { ...this.backlogRunsByID, [id]: runs };
+    } catch {
+      // Aborted, offline, or an HUD build without the route (SPA fallback
+      // parses as SyntaxError) — keep last-good and let the merge degrade.
+    }
   }
 
   // pipelineRunsForBacklog returns every known run (active + history)
   // spawned for a backlog item, newest-first. This is the load-bearing
   // cross-link in the drawer: "why is this item escalated?" → its runs.
+  // Sources: the server's per-item list (survives archive windows) merged
+  // with the active + terminal poll windows (fresher mid-poll).
   pipelineRunsForBacklog(backlogID: string): PipelineRun[] {
     if (!backlogID) return [];
     const seen = new Set<string>();
     const out: PipelineRun[] = [];
-    for (const r of [...this.pipelineRuns, ...this.pipelineHistory]) {
+    for (const r of [
+      ...(this.backlogRunsByID[backlogID] ?? []),
+      ...this.pipelineRuns,
+      ...this.pipelineHistory,
+    ]) {
       if (r.BacklogID !== backlogID || seen.has(r.ID)) continue;
       seen.add(r.ID);
       out.push(r);
     }
     out.sort((a, b) => (b.StartedAt ?? '').localeCompare(a.StartedAt ?? ''));
     return out;
+  }
+
+  // Run ids with an ensureRunDetailLoaded fetch currently in flight. A
+  // plain Set (not $state): it only guards duplicate fetches, nothing
+  // renders off it, and an aborted fetch can strand a 'loading' cache
+  // entry — so the cache status alone can't tell "being fetched right now"
+  // from "a previous fetch died mid-flight".
+  private runDetailEnsures = new Set<string>();
+
+  // ensureRunDetailLoaded primes the run-detail cache for a run WITHOUT
+  // opening the run drawer — the backlog drawer inlines the failing stage's
+  // log tail for its attention run, and needs the stages without stealing
+  // the selection. Loaded entries and in-flight ensures are left alone so
+  // this is safe to call from a $effect on every derivation tick. The fetch
+  // rides the backlog drawer's abort controller: closing the drawer
+  // cancels it (and the guard set is cleared so a reopen refetches).
+  // invalidateRunDetail drops a cached (non-open) run's stages/gates so the
+  // next ensureRunDetailLoaded refetches. The shuttle board calls it when a
+  // run advances a stage or its in-flight log should be re-read; the open
+  // drawer's run is left alone because fetchAll already refreshes it.
+  invalidateRunDetail(runID: string): void {
+    if (!runID || runID === this.selectedRunID) return;
+    if (this.runDetailEnsures.has(runID)) return;
+    if (!(runID in this.pipelineDetailByRun)) return;
+    const next = { ...this.pipelineDetailByRun };
+    delete next[runID];
+    this.pipelineDetailByRun = next;
+  }
+
+  ensureRunDetailLoaded(runID: string): void {
+    if (!runID || this.runDetailEnsures.has(runID)) return;
+    const cached = untrack(() => this.pipelineDetailByRun[runID]);
+    if (cached && cached.status === 'loaded') return;
+    this.runDetailEnsures.add(runID);
+    untrack(() => {
+      this.pipelineDetailByRun = {
+        ...this.pipelineDetailByRun,
+        [runID]: { status: 'loading' },
+      };
+    });
+    void this.fetchPipelineDetail(runID, this.backlogAbort?.signal).finally(() => {
+      this.runDetailEnsures.delete(runID);
+    });
   }
 
   // --- Mill-floor views (Warps · Shuttles · Sparks · Bolts) --------------
@@ -1622,6 +1894,32 @@ class MillsStore {
     return out;
   }
 
+  // openSparks is what still needs a human: escalatedRuns collapsed to one
+  // run per backlog item (newest first) and restricted to items whose
+  // CURRENT state is escalated/paused. escalatedRuns is the all-time history
+  // the Sparks view browses — every escalated attempt of every item, merged
+  // or retired since — which is why the Deck strip read "Sparks 110" while
+  // 11 backlog items were actually escalated (2026-09-02). An item absent
+  // from the loaded backlog (not fetched yet, or beyond the list cap) is
+  // kept, so the count degrades toward escalatedRuns rather than to zero.
+  get openSparks(): PipelineRun[] {
+    const stateByID = new Map<string, string>();
+    for (const item of this.backlog ?? []) {
+      stateByID.set(item.ID, (item.State ?? '').toLowerCase());
+    }
+    const seen = new Set<string>();
+    const out: PipelineRun[] = [];
+    for (const r of this.escalatedRuns) {
+      const key = r.BacklogID || r.ID;
+      if (seen.has(key)) continue;
+      const state = stateByID.get(key);
+      if (state !== undefined && state !== 'escalated' && state !== 'paused') continue;
+      seen.add(key);
+      out.push(r);
+    }
+    return out;
+  }
+
   // boltRuns are the archived terminal runs that wound onto the take-up roll
   // (done/merged). Feeds the Bolts view.
   get boltRuns(): PipelineRun[] {
@@ -1637,13 +1935,15 @@ class MillsStore {
   }
 
   // millFloorSpine assembles the floor-nav ribbon from the same derivations
-  // the four views read, so the spine can never drift from them.
+  // the four views read, so the spine can never drift from them. Sparks is
+  // openSparks — what needs a human — the number the Sparks header, its nav
+  // badge, and the Deck strip all carry; escalatedRuns is history.
   get millFloorSpine(): LineageSegment[] {
     return spineSegments({
       backlogByPriority: this.backlogByPriority,
       activeShuttles: this.activeShuttleCount,
       bolts: this.boltRuns.length,
-      sparks: this.escalatedRuns.length,
+      sparks: this.openSparks.length,
     });
   }
 
@@ -1671,6 +1971,71 @@ class MillsStore {
         ...this.backlogDetailByID,
         [id]: { status: 'error', message },
       };
+    }
+  }
+
+  /** Load state for the open item's event ledger. */
+  get currentBacklogEvents(): BacklogEventsLoadState | null {
+    if (!this.selectedBacklogID) return null;
+    return this.backlogEventsByID[this.selectedBacklogID] ?? { status: 'idle' };
+  }
+
+  /**
+   * Fetch one item's recorded-event ledger for the journey strip.
+   *
+   * Deliberately independent of fetchBacklogDetail: the ledger is an
+   * enrichment, so a 404/500 here must leave the drawer's primary content
+   * intact. The strip renders its own error inline instead.
+   */
+  private async fetchBacklogEvents(id: string, signal?: AbortSignal): Promise<void> {
+    // Untracked for the same reason openBacklogDetail's cache write is: callers
+    // open this drawer from tracking $effects (WarpsPanel's router sync), and a
+    // tracked read+write of backlogEventsByID re-arms that effect on every
+    // completion — an infinite fetch loop, which mills_loop.dom.test.ts guards.
+    untrack(() => {
+      const cached = this.backlogEventsByID[id];
+      if (!cached || cached.status === 'idle' || cached.status === 'error') {
+        this.backlogEventsByID = { ...this.backlogEventsByID, [id]: { status: 'loading' } };
+      }
+    });
+    try {
+      const ledger = await this.getJSON<BacklogEventLedger>(
+        `/api/mills/backlog/${encodeURIComponent(id)}/events`,
+        { signal },
+      );
+      this.backlogEventsByID = {
+        ...this.backlogEventsByID,
+        [id]: {
+          status: 'loaded',
+          ledger: ledger ?? { backlog_id: id, events: [], partial: true },
+        },
+      };
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return;
+      const message = e instanceof Error ? e.message : String(e);
+      this.backlogEventsByID = {
+        ...this.backlogEventsByID,
+        [id]: { status: 'error', message },
+      };
+    }
+  }
+
+  /**
+   * Fetch the fleet-gate benchmark waivers.
+   *
+   * The endpoint answers 503 with a reason when the operator has no repo
+   * checkout to read the manifest from — an expected degraded mode, not a
+   * failure, so it clears the card rather than showing an alarming error.
+   */
+  async fetchWaivers(): Promise<void> {
+    try {
+      const snap = await this.getJSON<FleetGateWaivers>('/api/mills/fleet-gate/waivers');
+      this.waivers = snap ?? null;
+      this.waiversError = null;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.waivers = null;
+      this.waiversError = msg.includes('503') ? null : msg;
     }
   }
 
@@ -1835,6 +2200,20 @@ class MillsStore {
     return true;
   }
 
+  // resumeRun un-parks a paused run via
+  // POST /api/mills/pipeline/runs/{id}/resume?reason=… — the run AND its
+  // backlog item flip back to queued and the runner re-drives the same run
+  // (it is not a fresh spark). Pause was one-way in the HUD until this
+  // existed: an operator could stop a run from the drawer but un-stopping
+  // it took an admin curl. The reason rides the query string because the
+  // operator's override ledger records it (appendOverrideEvent).
+  async resumeRun(runID: string, reason: string = 'resumed from HUD'): Promise<boolean> {
+    const qs = reason.trim() ? `?reason=${encodeURIComponent(reason.trim())}` : '';
+    await this.postJSON(`/api/mills/pipeline/runs/${encodeURIComponent(runID)}/resume${qs}`, {});
+    await this.fetchAll();
+    return true;
+  }
+
   // startPipeline kicks off a pipeline run for a backlog item via
   // POST /api/mills/pipeline/runs/{backlog_id}/start. Surfaced from the
   // backlog drawer so an operator can act on an item without leaving the
@@ -1914,7 +2293,9 @@ class MillsStore {
       return { kind: 'error', message: `Requeue failed: ${message}` };
     }
     const outcome = normalizeRequeueResponse(res.status, parsedBody);
-    if (outcome.kind === 'started') {
+    // 'deferred' also mutated state (item back to queued, start held), so the
+    // open surfaces must re-read or they keep rendering "escalated".
+    if (outcome.kind === 'started' || outcome.kind === 'deferred') {
       await this.fetchAll();
     }
     return outcome;
@@ -1952,6 +2333,27 @@ class MillsStore {
     }
   }
 
+  // fetchMergeQueue refreshes the press — the serial merge lane's active
+  // entries plus per-lane depth (GET /api/mills/merge-queue). A failed read
+  // holds the last-good snapshot and reports via mergeQueueError instead of
+  // red-flagging the floor; 503 (operator unconfigured) stays quiet because
+  // fetchAll already surfaces that via `disabled`.
+  async fetchMergeQueue(): Promise<void> {
+    try {
+      const snap = await this.getJSON<MergeQueueSnapshot>('/api/mills/merge-queue');
+      this.mergeQueue = snap ?? null;
+      this.mergeQueueError = null;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('503') || msg.toLowerCase().includes('not configured')) {
+        this.mergeQueue = null;
+        this.mergeQueueError = null;
+      } else {
+        this.mergeQueueError = msg;
+      }
+    }
+  }
+
   async fetchPipelineHistory(limit = 50): Promise<void> {
     this.historyLoading = true;
     this.historyError = null;
@@ -1970,6 +2372,59 @@ class MillsStore {
       }
     } finally {
       this.historyLoading = false;
+    }
+  }
+
+  rescueItems = $state<BacklogItem[]>([]);
+  rescueRunsByItem = $state<Record<string, RescueEvidence>>({});
+  rescueError = $state<string | null>(null);
+  private rescueLoading = false;
+  private rescueChecked = new Map<string, { signature: string; at: number }>();
+
+  // Eight item hydration jobs per pass, each with a list + optional detail
+  // read. Least-recently checked first prevents a large shelf starving rows.
+  // This cache is isolated from the loom's pipelineHistory seen-set.
+  async fetchRescueShelf(): Promise<void> {
+    if (this.rescueLoading) return;
+    this.rescueLoading = true;
+    try {
+      const raw = await this.getJSON<BacklogItem[]>('/api/mills/backlog?state=escalated');
+      if (!Array.isArray(raw)) throw new Error('Escalated backlog unavailable');
+      const items = raw.filter(i => i?.State === 'escalated');
+      this.rescueItems = items;
+      const ids = new Set(items.map(i => i.ID));
+      this.rescueRunsByItem = Object.fromEntries(Object.entries(this.rescueRunsByItem).filter(([id]) => ids.has(id)));
+      for (const id of this.rescueChecked.keys()) if (!ids.has(id)) this.rescueChecked.delete(id);
+      const signature = (i: BacklogItem) => i.UpdatedAt ?? i.CreatedAt ?? '';
+      for (const item of items) {
+        if (this.rescueChecked.get(item.ID)?.signature !== signature(item)) {
+          delete this.rescueRunsByItem[item.ID];
+          this.rescueChecked.delete(item.ID);
+        }
+      }
+      const jobs = [...items].sort((a, b) => (this.rescueChecked.get(a.ID)?.at ?? 0) - (this.rescueChecked.get(b.ID)?.at ?? 0));
+      const results = await Promise.allSettled(jobs.slice(0, 8).map(async item => {
+        this.rescueChecked.set(item.ID, { signature: signature(item), at: Date.now() });
+        const runs = await this.getJSON<PipelineRun[]>(`/api/mills/pipeline/runs?backlog_id=${encodeURIComponent(item.ID)}&state=terminal&limit=20`);
+        if (!Array.isArray(runs)) throw new Error('Rescue runs unavailable');
+        const latest = latestTerminalRun(runs, item.ID);
+        if (!latest) { this.rescueRunsByItem[item.ID] = { detail: null }; return; }
+        const cached = this.rescueRunsByItem[item.ID]?.detail?.run;
+        const runSignature = (r: PipelineRun) => JSON.stringify([
+          r.ID, r.State, r.MRIID, r.Attempts, r.EndedAt,
+          r.EscalationClass, r.FailureClass, r.EscalationRetryable,
+        ]);
+        if (cached && runSignature(cached) === runSignature(latest)) return;
+        delete this.rescueRunsByItem[item.ID];
+        const detail = await this.fetchArchiveRunDetail(latest.ID);
+        if (!detail || detail.run?.ID !== latest.ID || detail.run.BacklogID !== item.ID) throw new Error('Rescue detail unavailable');
+        this.rescueRunsByItem[item.ID] = { detail };
+      }));
+      this.rescueError = results.some(r => r.status === 'rejected') ? 'Some rescue evidence is unavailable; retrying on the next refresh.' : null;
+    } catch (e) {
+      this.rescueError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.rescueLoading = false;
     }
   }
 
@@ -1992,6 +2447,35 @@ class MillsStore {
         ? { ...run, Grade: item.Grade, GradeNote: item.GradeNote ?? '' }
         : run;
     });
+  }
+
+  async fetchBolts(window = '7d'): Promise<BoltsResponse | null> {
+    try {
+      return await this.getJSON<BoltsResponse>(`/api/mills/bolts?window=${encodeURIComponent(window)}`);
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchShiftReport(window = '24h'): Promise<ShiftReportResponse | null> {
+    try {
+      return await this.getJSON<ShiftReportResponse>(`/api/mills/shift-report?window=${encodeURIComponent(window)}`);
+    } catch {
+      return null;
+    }
+  }
+
+  async gradeItem(itemID: string, grade: BoltGrade, note = ''): Promise<GradeRunResponse | null> {
+    return await this.postJSON<GradeRunResponse>(
+      `/api/mills/backlog/${encodeURIComponent(itemID)}/grade`,
+      { grade, note },
+    );
+  }
+
+  async gradeBolt(card: BoltCard, grade: BoltGrade, note = ''): Promise<GradeRunResponse | null> {
+    return card.run_id
+      ? await this.gradeRun(card.run_id, grade, note)
+      : await this.gradeItem(card.backlog_id, grade, note);
   }
 
   // gradeRun records a supervised taste signal and immediately reflects it in

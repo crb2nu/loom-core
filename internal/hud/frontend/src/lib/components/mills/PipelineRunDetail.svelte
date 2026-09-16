@@ -31,6 +31,28 @@
   let open = $derived(millsStore.selectedRunID !== null);
   let detail = $derived(load && load.status === 'loaded' ? load.detail : null);
 
+  function retryClass(stage: StageResult): string | null {
+    const value = stage.Artifacts?.retry_class;
+    return typeof value === 'string' && ['transient', 'substrate', 'real', 'exhausted'].includes(value) ? value : null;
+  }
+
+  function attemptCount(value: unknown): number | null {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+  }
+
+  let effectiveLabel = $derived.by(() => {
+    const total = attemptCount(detail?.run.EffectiveAttempts);
+    if (total !== null) return `effective ${total}`;
+    // Use the latest failed tests snapshot, never a maximum: resume resets
+    // this stage-local budget. Do not skip newer unclassified failures and
+    // accidentally present a stale budget from before a resume. Successful
+    // and pending attempts do not carry retry accounting.
+    const latest = detail?.stages.filter(s => s.Stage === 'tests' && (s.Outcome === 'error' || retryClass(s)))
+      .sort((a, b) => b.Attempt - a.Attempt || b.ID - a.ID)[0];
+    const count = latest && retryClass(latest) ? attemptCount(latest.Artifacts?.effective_attempts) : null;
+    return count === null ? null : `tests-effective ${count}`;
+  });
+
   // A 502 (proxy couldn't reach the operator) or a client-side timeout
   // almost always means the operator pod is mid-rollout (Recreate strategy
   // — a short gap every deploy). Name that instead of showing a bare
@@ -88,6 +110,26 @@
     pausing = false;
   }
 
+  // Resume: the inverse of pause, offered ONLY on paused runs. Pause was
+  // one-way in the HUD (un-parking took an admin curl) even though the
+  // operator endpoint existed. Resume flips this run and its item back to
+  // queued — the runner re-drives the SAME run, unlike Requeue which starts
+  // a fresh one for an escalated item.
+  let resuming = $state(false);
+  let confirmResume = $state(false);
+  let canResume = $derived(!!detail && detail.run.State === 'paused');
+  async function doResume(): Promise<void> {
+    confirmResume = false;
+    const id = detail?.run.ID;
+    if (!id) return;
+    resuming = true;
+    await runAdminAction(() => millsStore.resumeRun(id, 'resumed from HUD'), {
+      success: 'Run resumed — back in the queue',
+      failurePrefix: 'Resume failed',
+    });
+    resuming = false;
+  }
+
   // Requeue (plan wave-2 W3): recover an escalated run without an admin curl.
   // Only escalated runs are parked awaiting exactly this human action; the
   // requeue flips the backlog item back to queued and starts a fresh run.
@@ -99,9 +141,14 @@
 
   // After a successful requeue THIS run stays escalated (the fresh run is a
   // new row), so drop the button once started to avoid a confusing re-click —
-  // the success banner stays.
+  // the success banner stays. 'deferred' also landed (item queued, start held
+  // by the scheduler): a re-click would 409 "state is queued" and read as a
+  // failure, so the button drops for it too.
   let canRequeue = $derived(
-    !!detail && detail.run.State === 'escalated' && requeueOutcome?.kind !== 'started',
+    !!detail &&
+      detail.run.State === 'escalated' &&
+      requeueOutcome?.kind !== 'started' &&
+      requeueOutcome?.kind !== 'deferred',
   );
 
   // Clear a stale requeue banner when the drawer switches to a different run.
@@ -447,6 +494,17 @@
           {pausing ? 'Stopping…' : '■ Stop'}
         </button>
       {/if}
+      {#if canResume}
+        <button
+          type="button"
+          class="run-requeue"
+          disabled={resuming}
+          onclick={() => (confirmResume = true)}
+          title="Resume this paused run — it and its item return to queued and the runner re-drives the same run"
+        >
+          {resuming ? 'Resuming…' : '▶ Resume'}
+        </button>
+      {/if}
       <dl class="run-meta">
         <div class="run-meta-row">
           <dt>Run ID</dt>
@@ -487,7 +545,7 @@
         </div>
         <div class="run-meta-row">
           <dt>Attempts</dt>
-          <dd class="mono">{detail.run.Attempts}</dd>
+          <dd class="mono">{detail.run.Attempts}{#if effectiveLabel}{` (${effectiveLabel})`}{/if}</dd>
         </div>
         <div class="run-meta-row">
           <dt>Cost</dt>
@@ -587,7 +645,7 @@
               >
                 <span class="stage-glyph">{expanded ? '▾' : '▸'}</span>
                 <span class="stage-name">{stage.Stage}</span>
-                <span class="stage-attempt">try {stage.Attempt}</span>
+                <span class="stage-attempt" class:retry-chip={retryClass(stage) !== null} data-retry-class={retryClass(stage)} title={stage.LogTail?.split(/\r?\n/, 1)[0]}>try {stage.Attempt}{#if retryClass(stage)}{` · ${retryClass(stage)}`}{/if}</span>
                 <span class="stage-outcome o-{stage.Outcome ?? 'pending'}">
                   {stageOutcomeLabel(stage)}
                 </span>
@@ -699,6 +757,16 @@
   variant="warn"
   onConfirm={doRequeue}
   onCancel={() => (confirmRequeue = false)}
+/>
+
+<ConfirmDialog
+  open={confirmResume}
+  title="Resume this paused run?"
+  message="Returns this run and its backlog item to queued; the runner re-drives the same run and it may consume budget again."
+  confirmLabel="Resume"
+  variant="warn"
+  onConfirm={doResume}
+  onCancel={() => (confirmResume = false)}
 />
 
 <style>
@@ -919,6 +987,13 @@
     border-color: rgba(var(--success-rgb), 0.35);
     color: var(--success);
   }
+  /* Deferred = landed-but-held: success tone would overclaim (nothing runs
+     yet) and warning tone reads as failure, so it gets the info treatment. */
+  .requeue-result.requeue-deferred {
+    background: rgba(var(--info-rgb), 0.12);
+    border-color: rgba(var(--info-rgb), 0.35);
+    color: var(--info);
+  }
   .requeue-result.requeue-conflict {
     background: rgba(var(--warning-rgb), 0.12);
     border-color: rgba(var(--warning-rgb), 0.35);
@@ -1068,6 +1143,9 @@
     color: var(--text-muted);
     font-family: var(--font-mono);
   }
+  .retry-chip { padding: 0.05rem 0.4rem; border-radius: var(--radius-xs); background: rgba(128, 128, 128, 0.15); }
+  .retry-chip[data-retry-class="substrate"] { color: var(--warning); background: rgba(var(--warning-rgb), 0.15); }
+  .retry-chip[data-retry-class="real"], .retry-chip[data-retry-class="exhausted"] { color: var(--error); background: rgba(var(--error-rgb), 0.15); }
   .stage-outcome {
     padding: 0.05rem 0.4rem;
     border-radius: var(--radius-xs);

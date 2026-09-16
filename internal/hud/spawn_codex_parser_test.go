@@ -1,7 +1,9 @@
 package hud
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"math"
 	"strings"
 	"testing"
@@ -31,12 +33,77 @@ func TestCodexParser_ThreadStarted_ModelMetadata(t *testing.T) {
 	p.HandleLine(line)
 	p.HandleLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":150}}`))
 
-	want := bridge.EstimateCodexCost("gpt-5-mini", 300, 200, 150)
-	if want == 0 {
-		t.Fatalf("price table sanity: bridge.EstimateCodexCost returned 0 for gpt-5-mini")
+	want, known := bridge.EstimateCodexCost("gpt-5-mini", 300, 200, 150)
+	if !known || want == 0 {
+		t.Fatalf("price table sanity: bridge.EstimateCodexCost(gpt-5-mini) = (%v, %v)", want, known)
 	}
 	if math.Abs(sink.estimatedCost-want) > 1e-9 {
 		t.Errorf("estimated cost = %v, want %v (delta %v)", sink.estimatedCost, want, sink.estimatedCost-want)
+	}
+}
+
+// TestCodexParser_ThreadStarted_ProductionModelIsPriced is the regression
+// for every codex-run Mills stage recording $0: thread.started reports the
+// model the spawn actually ran (policy pins gpt-5.6-terra for implement),
+// the old table stopped at gpt-5, and EstimateCodexCost returned 0 for the
+// unknown id — which the parser then dropped without calling
+// AddEstimatedCost, so TotalCostUSD stayed 0 all the way to the stage record.
+func TestCodexParser_ThreadStarted_ProductionModelIsPriced(t *testing.T) {
+	for _, model := range []string{"gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5"} {
+		t.Run(model, func(t *testing.T) {
+			sink := &mockSink{}
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			p := NewCodexJSONLParser(sink, "test-codex", "", nil, logger)
+
+			p.HandleLine([]byte(`{"type":"thread.started","thread_id":"t1","model":"` + model + `"}`))
+			p.HandleLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":150}}`))
+
+			want, known := bridge.EstimateCodexCost(model, 300, 200, 150)
+			if !known || want == 0 {
+				t.Fatalf("%s must be in the price snapshot: EstimateCodexCost = (%v, %v)", model, want, known)
+			}
+			if math.Abs(sink.estimatedCost-want) > 1e-9 {
+				t.Errorf("estimated cost = %v, want %v", sink.estimatedCost, want)
+			}
+			if !sink.costEstimated {
+				t.Error("costEstimated flag not set")
+			}
+			if strings.Contains(logs.String(), "missing from price snapshot") {
+				t.Errorf("known model must not trigger the unpriced warning; log:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestCodexParser_ThreadStarted_UnknownModelBillsAtDefaultRate: a model id
+// newer than the price snapshot is charged at the default model's rate and
+// warned about once, rather than silently recorded as free.
+func TestCodexParser_ThreadStarted_UnknownModelBillsAtDefaultRate(t *testing.T) {
+	sink := &mockSink{}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	p := NewCodexJSONLParser(sink, "test-codex", "", nil, logger)
+
+	p.HandleLine([]byte(`{"type":"thread.started","thread_id":"t1","model":"gpt-7-nova"}`))
+	p.HandleLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":150}}`))
+	p.HandleLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":150}}`))
+
+	perTurn, known := bridge.EstimateCodexCost(bridge.DefaultCodexModel, 300, 200, 150)
+	if !known || perTurn == 0 {
+		t.Fatalf("default model must be priced: EstimateCodexCost = (%v, %v)", perTurn, known)
+	}
+	if want := 2 * perTurn; math.Abs(sink.estimatedCost-want) > 1e-9 {
+		t.Errorf("estimated cost = %v, want default-rate %v (never 0 for an unknown model)", sink.estimatedCost, want)
+	}
+	if !sink.costEstimated {
+		t.Error("costEstimated flag not set")
+	}
+	if got := strings.Count(logs.String(), "missing from price snapshot"); got != 1 {
+		t.Errorf("unpriced warning logged %d times, want exactly 1 per spawn; log:\n%s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "model=gpt-7-nova") {
+		t.Errorf("warning should name the unknown model; log:\n%s", logs.String())
 	}
 }
 
@@ -48,9 +115,9 @@ func TestCodexParser_ThreadStarted_NestedModelMetadata(t *testing.T) {
 	p.HandleLine(line)
 	p.HandleLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":150}}`))
 
-	want := bridge.EstimateCodexCost("gpt-5-mini", 300, 200, 150)
-	if want == 0 {
-		t.Fatalf("price table sanity: bridge.EstimateCodexCost returned 0 for gpt-5-mini")
+	want, known := bridge.EstimateCodexCost("gpt-5-mini", 300, 200, 150)
+	if !known || want == 0 {
+		t.Fatalf("price table sanity: bridge.EstimateCodexCost(gpt-5-mini) = (%v, %v)", want, known)
 	}
 	if math.Abs(sink.estimatedCost-want) > 1e-9 {
 		t.Errorf("estimated cost = %v, want %v (delta %v)", sink.estimatedCost, want, sink.estimatedCost-want)
@@ -118,9 +185,9 @@ func TestCodexParser_TurnCompleted_FallsBackToDefaultModel(t *testing.T) {
 	line := []byte(`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":150}}`)
 	p.HandleLine(line)
 
-	want := bridge.EstimateCodexCost(bridge.DefaultCodexModel, 300, 200, 150)
-	if want == 0 {
-		t.Fatalf("price table sanity: bridge.EstimateCodexCost returned 0 for default model")
+	want, known := bridge.EstimateCodexCost(bridge.DefaultCodexModel, 300, 200, 150)
+	if !known || want == 0 {
+		t.Fatalf("price table sanity: bridge.EstimateCodexCost(default) = (%v, %v)", want, known)
 	}
 	if math.Abs(sink.estimatedCost-want) > 1e-9 {
 		t.Errorf("estimated cost = %v, want %v (delta %v)", sink.estimatedCost, want, sink.estimatedCost-want)

@@ -1,0 +1,1 @@
+- Expand signature-miner stop-phrase filtering for generic build, repository-status, and infrastructure-plan commands, with explicit placeholder-only regression coverage (`pkg/mills/reconciler_signature_mining.go`, `pkg/mills/reconciler_signature_mining_test.go`).

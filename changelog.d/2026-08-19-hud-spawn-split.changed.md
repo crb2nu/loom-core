@@ -1,0 +1,1 @@
+- Split `internal/hud/spawn.go` lifecycle and configuration concerns into `internal/hud/spawn_lifecycle.go` and `internal/hud/spawn_config.go` without changing spawn behavior.

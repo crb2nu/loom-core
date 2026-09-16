@@ -12,6 +12,8 @@ import (
 	"time"
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/pkg/mills/pipeline"
 )
 
 // fakeTransport is a deterministic in-memory mcp.Transport stand-in.
@@ -70,6 +72,9 @@ func (f *concurrencyProbeTransport) Send(_ context.Context, msg *mcp.Message) er
 		return err
 	}
 	marker, _ := params.Arguments["marker"].(string)
+	if marker == "" {
+		marker, _ = params.Arguments["agent_id"].(string)
+	}
 	f.inFlight++
 	if f.inFlight > f.maxInFlight {
 		f.maxInFlight = f.inFlight
@@ -92,7 +97,7 @@ func (f *concurrencyProbeTransport) Send(_ context.Context, msg *mcp.Message) er
 }
 
 func makeCallToolResultForProbe(marker string) []byte {
-	body, _ := json.Marshal(map[string]string{"marker": marker})
+	body, _ := json.Marshal(map[string]any{"marker": marker, "passed": true, "tested_sha": marker})
 	result, _ := json.Marshal(mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: string(body)}}})
 	return result
 }
@@ -276,6 +281,38 @@ func TestCallTool_PerformsInitializeOnFirstCall(t *testing.T) {
 	}
 	if sent[2].Method != "tools/call" {
 		t.Errorf("third message = %q, want tools/call", sent[2].Method)
+	}
+}
+
+func TestCallTool_PrefersStructuredContentOverText(t *testing.T) {
+	res, err := json.Marshal(mcp.CallToolResult{
+		Content: []mcp.Content{{Type: "text", Text: `{"source":"text","files":[]}`}},
+		StructuredContent: map[string]any{
+			"source": "structured",
+			"files":  []string{"alpha.go", "beta.go"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	ft := &fakeTransport{responses: map[string][]byte{
+		"initialize": []byte(`{}`),
+		"tools/call": res,
+	}}
+
+	body, err := newTestHubClient(t, ft).CallTool(context.Background(), "agent_context", "agent_plan_slice_list", nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	var got struct {
+		Source string   `json:"source"`
+		Files  []string `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode preferred body: %v", err)
+	}
+	if got.Source != "structured" || len(got.Files) != 2 || got.Files[1] != "beta.go" {
+		t.Fatalf("preferred body = %#v", got)
 	}
 }
 
@@ -816,6 +853,10 @@ func TestIsTransportError(t *testing.T) {
 		{"raw io.EOF", io.EOF, true},
 		{"jsonrpc error", errors.New("mcphub: srv/tool: invalid args (code=-32602)"), false},
 		{"tool reported error", errors.New("mcphub: srv/tool reported error: bad project"), false},
+		{"dial DNS", errors.New("dial tcp: lookup hub: i/o timeout"), true},
+		{"refused", errors.New("connect: connection refused"), true},
+		{"auth with transport text", errors.New("401 unauthorized: EOF"), false},
+		{"tool quotes transport", errors.New("mcphub: srv/tool reported error: EOF"), false},
 		{"nil", nil, false},
 	}
 	for _, tc := range cases {
@@ -858,5 +899,218 @@ func TestMCPHubConfigFromEnv(t *testing.T) {
 func TestMCPHubConfigFromEnv_NoURLDisables(t *testing.T) {
 	if _, ok := MCPHubConfigFromEnv(func(string) string { return "" }); ok {
 		t.Error("ok should be false when HubURL unset")
+	}
+}
+
+func TestDevboxQualityGatesOverlap(t *testing.T) {
+	probes := make(chan *concurrencyProbeTransport, 2)
+	hub := newMCPHubClientWithDefaults(MCPHubConfig{}, func(context.Context, string) (mcp.Transport, error) {
+		p := newConcurrencyProbeTransport()
+		probes <- p
+		return p, nil
+	})
+	defer hub.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	results := make(chan error, 2)
+	for _, marker := range []string{"run-a", "run-b"} {
+		go func() {
+			r, err := NewDevboxClient(hub).QualityGate(ctx, pipeline.DevboxRequest{Project: "repo", AgentID: marker})
+			if err == nil && (!r.Passed || r.TestedSHA != marker) {
+				err = fmt.Errorf("wrong result: %+v", r)
+			}
+			results <- err
+		}()
+	}
+	var active []*concurrencyProbeTransport
+	defer func() {
+		for _, p := range active {
+			close(p.release)
+		}
+	}()
+	for range 2 {
+		select {
+		case p := <-probes:
+			active = append(active, p)
+			select {
+			case <-p.started:
+			case <-ctx.Done():
+				t.Fatal("gate did not start")
+			}
+		case <-ctx.Done():
+			t.Fatal("gates did not overlap")
+		}
+	}
+	completed := active
+	for _, p := range active {
+		close(p.release)
+	}
+	active = nil
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range completed {
+		p.mu.Lock()
+		if !p.closed {
+			t.Error("successful stream leaked")
+		}
+		p.mu.Unlock()
+	}
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+	if len(hub.dedicated) != 0 || len(hub.transports) != 0 {
+		t.Fatal("dedicated streams retained")
+	}
+}
+
+func TestDedicatedCallFailureIsolatedFromSibling(t *testing.T) {
+	for _, mode := range []string{"retry", "retry-exhausted", "timeout", "initialize"} {
+		t.Run(mode, func(t *testing.T) {
+			sibling := newConcurrencyProbeTransport()
+			defer close(sibling.release)
+			var streams []*transportErrSequence
+			var mu sync.Mutex
+			dials := 0
+			hub := newMCPHubClientWithDefaults(MCPHubConfig{}, func(context.Context, string) (mcp.Transport, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				dials++
+				if dials == 1 {
+					return sibling, nil
+				}
+				if mode == "timeout" {
+					return &slowToolTransport{delay: time.Second}, nil
+				}
+				p := &transportErrSequence{defaultResults: map[string][]byte{"tools/call": makeCallToolResultForProbe("other")}}
+				if mode == "initialize" {
+					p.failsInit = true
+				} else if dials == 2 || mode == "retry-exhausted" {
+					p.sendErrOnTry = 1
+					p.sendErr = io.ErrUnexpectedEOF
+				}
+				streams = append(streams, p)
+				return p, nil
+			})
+			defer hub.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				body, err := hub.CallToolDedicatedWithTimeout(ctx, "devbox", "gate", map[string]any{"marker": "sibling"}, time.Second)
+				if err == nil && !strings.Contains(body, "sibling") {
+					err = fmt.Errorf("wrong sibling result: %s", body)
+				}
+				done <- err
+			}()
+			select {
+			case <-sibling.started:
+			case <-ctx.Done():
+				t.Fatal("sibling did not start")
+			}
+			_, err := hub.CallToolDedicatedWithTimeout(ctx, "devbox", "gate", nil, 20*time.Millisecond)
+			if (err == nil) != (mode == "retry") {
+				t.Fatalf("mode %s: %v", mode, err)
+			}
+			if mode == "timeout" && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("expected deadline: %v", err)
+			}
+			mu.Lock()
+			wantDials := 3
+			if mode == "timeout" || mode == "initialize" {
+				wantDials = 2
+			}
+			if dials != wantDials {
+				t.Errorf("dials = %d, want %d", dials, wantDials)
+			}
+			for _, p := range streams {
+				p.mu.Lock()
+				if !p.closed {
+					t.Error("failed/retried stream not closed")
+				}
+				p.mu.Unlock()
+			}
+			mu.Unlock()
+			sibling.mu.Lock()
+			if sibling.closed {
+				t.Error("sibling stream closed by failure")
+			}
+			sibling.mu.Unlock()
+			// Release without closing: the deferred close also cleans up on failure.
+			sibling.release <- struct{}{}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDedicatedCallCloseCancelsPendingDial(t *testing.T) {
+	started := make(chan struct{})
+	hub := newMCPHubClientWithDefaults(MCPHubConfig{}, func(ctx context.Context, _ string) (mcp.Transport, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := hub.CallToolDedicatedWithTimeout(context.Background(), "devbox", "gate", nil, time.Second)
+		done <- err
+	}()
+	<-started
+	if err := hub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel dial")
+	}
+}
+
+func TestDedicatedCallCancellationClosesTransport(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shutdown=%t", shutdown), func(t *testing.T) {
+			probe := newConcurrencyProbeTransport()
+			defer close(probe.release)
+			hub := newMCPHubClientWithDefaults(MCPHubConfig{}, func(context.Context, string) (mcp.Transport, error) { return probe, nil })
+			defer hub.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, err := hub.CallToolDedicatedWithTimeout(ctx, "devbox", "gate", nil, time.Second)
+				done <- err
+			}()
+			select {
+			case <-probe.started:
+			case <-time.After(time.Second):
+				t.Fatal("call did not start")
+			}
+			if shutdown {
+				if err := hub.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("cancelled call succeeded")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("call did not stop")
+			}
+			probe.mu.Lock()
+			defer probe.mu.Unlock()
+			if !probe.closed {
+				t.Fatal("transport leaked")
+			}
+		})
 	}
 }

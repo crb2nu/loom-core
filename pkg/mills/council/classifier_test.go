@@ -222,6 +222,49 @@ func TestClassifyRecurringInfrastructureWorkspaceSignal(t *testing.T) {
 	}
 }
 
+func TestClassifyRecurringInfrastructureWorkspaceSignal_StorageSignatures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		service    string
+		sample     string
+		dependency string
+	}{
+		{
+			name:       "langfuse S3 event upload",
+			service:    "langfuse/langfuse-worker",
+			sample:     "Failed to upload event to S3",
+			dependency: "s3",
+		},
+		{
+			name:       "longhorn replica disk availability",
+			service:    "longhorn-system/longhorn-manager",
+			sample:     "no available disk for replica",
+			dependency: "storage",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, matched := ClassifyRecurringInfrastructureWorkspaceSignal(WorkspaceSignal{
+				Source: "loki", Service: tc.service, Sample: tc.sample,
+			})
+			if !matched {
+				t.Fatalf("signal did not match: %+v", got)
+			}
+			if got.IncidentClass != CIIncidentExternalDependency {
+				t.Fatalf("class = %q, want %q", got.IncidentClass, CIIncidentExternalDependency)
+			}
+			if got.ExternalDependency != tc.dependency {
+				t.Fatalf("dependency = %q, want %q", got.ExternalDependency, tc.dependency)
+			}
+		})
+	}
+}
+
 func TestClassifyExternalWorkspaceSignals_UsesRecurringInfrastructureAllowlist(t *testing.T) {
 	t.Parallel()
 

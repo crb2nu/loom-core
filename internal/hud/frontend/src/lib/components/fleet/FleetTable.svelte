@@ -20,6 +20,8 @@
     onSessionClick,
     onTraceClick,
     onSpawnClick,
+    onDispatchClick,
+    onNudgeClick,
   }: {
     rows: FleetRow[];
     loading: boolean;
@@ -31,6 +33,11 @@
     onSessionClick: (sessionId: string) => void;
     onTraceClick: (agentId: string) => void;
     onSpawnClick: (e: Event, spawnId: string) => void;
+    // Task/Nudge came here from the retired Presence ▸ Agents tab — Fleet is
+    // the canonical roster, so the per-agent actions live on its rows.
+    // Optional so embedders without the modals mounted render without them.
+    onDispatchClick?: (agentId: string) => void;
+    onNudgeClick?: (agentId: string) => void;
   } = $props();
 
   import { fleetStore } from '../../stores/fleet.svelte.ts';
@@ -53,7 +60,7 @@
     { key: 'namespace', label: 'Namespace', sortable: true, width: '150px', hideBelow: 620 },
     { key: 'activity', label: 'Activity', sortable: false, width: '200px', hideBelow: 940 },
     { key: 'heartbeat', label: 'Heartbeat', sortable: true, width: '96px' },
-    { key: 'actions', label: 'Actions', sortable: false, width: '164px' },
+    { key: 'actions', label: 'Actions', sortable: false, width: '236px' },
   ];
 
   function unifiedAgentStatus(agent: UnifiedAgent): 'healthy' | 'degraded' | 'down' {
@@ -239,6 +246,24 @@
           >
             Traces
           </button>
+          {#if onDispatchClick}
+            <button
+              class="btn btn-xs btn-ghost"
+              title="Dispatch a task to this agent"
+              onclick={(e) => { e.stopPropagation(); onDispatchClick(agent.agent_id); }}
+            >
+              Task
+            </button>
+          {/if}
+          {#if onNudgeClick}
+            <button
+              class="btn btn-xs btn-ghost"
+              title="Send this agent a nudge message"
+              onclick={(e) => { e.stopPropagation(); onNudgeClick(agent.agent_id); }}
+            >
+              Nudge
+            </button>
+          {/if}
           </div>
         </td>
       {/snippet}

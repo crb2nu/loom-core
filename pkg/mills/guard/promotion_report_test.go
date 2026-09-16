@@ -15,6 +15,7 @@ import (
 
 // The report reads the events table through its narrowest surface.
 var _ EventLister = (*store.EventDAO)(nil)
+var _ ActorWindowWalker = (*store.EventDAO)(nil)
 
 // fakeEvents mirrors EventDAO.ListSince (window-bounded, newest-first,
 // limit-capped) so aggregation can be tested at exact timestamps.
@@ -352,5 +353,66 @@ func TestBuildPromotionReportOverEventDAO(t *testing.T) {
 	row := rep.PerActor[0].PerAction[0]
 	if row.Action != "retire" || row.UniqueSubjects != 2 {
 		t.Fatalf("action row = %+v", row)
+	}
+}
+
+func TestBuildPromotionReportOverEventDAOBusyWindow(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, store.Options{Path: filepath.Join(t.TempDir(), "busy.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	tx, err := st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	const total = 10005
+	stamp := reportNow.Add(-time.Minute).Format("2006-01-02T15:04:05.000000000Z")
+	for i := range total {
+		kind := "overseer.groomer.retire"
+		if i%2 == 0 {
+			kind += ".dryrun"
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO events
+			(occurred_at, actor, kind, subject_kind, subject_id, payload_json)
+			VALUES (?, 'overseer.groomer', ?, 'backlog_item', ?, '{}')`, stamp, kind, fmt.Sprintf("s%d", i%7))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := BuildPromotionReport(ctx, st.Events, "overseer.", reportNow.Add(-time.Hour), reportNow)
+	if err != nil {
+		t.Fatalf("complete busy window: %v", err)
+	}
+	if rep.TotalActions != total || rep.TotalDryRun != 5003 || rep.TotalExecuted != 5002 {
+		t.Fatalf("report dropped evidence: %+v", rep)
+	}
+	if len(rep.PerActor) != 1 || len(rep.PerActor[0].PerAction) != 1 {
+		t.Fatalf("unexpected actors/actions: %+v", rep.PerActor)
+	}
+	if got := rep.PerActor[0].PerAction[0].UniqueSubjects; got != 7 {
+		t.Fatalf("unique subjects = %d, want 7 despite repeated events", got)
+	}
+}
+
+// An interrupted stream cannot publish its partial aggregate as a full review.
+type interruptedActorWalker struct{ fakeEvents }
+
+func (*interruptedActorWalker) WalkActorWindow(_ context.Context, _ string, _, _ time.Time, visit func(*store.Event) error) error {
+	if err := visit(ev("overseer.groomer", "overseer.groomer.retire", "backlog", "one", time.Minute)); err != nil {
+		return err
+	}
+	return context.DeadlineExceeded
+}
+
+func TestBuildPromotionReportRejectsInterruptedWalk(t *testing.T) {
+	rep, err := BuildPromotionReport(context.Background(), &interruptedActorWalker{}, "overseer.", reportNow.Add(-time.Hour), reportNow)
+	if !errors.Is(err, context.DeadlineExceeded) || !reflect.DeepEqual(rep, PromotionReport{}) {
+		t.Fatalf("interrupted report must return no partial evidence: report=%+v err=%v", rep, err)
 	}
 }

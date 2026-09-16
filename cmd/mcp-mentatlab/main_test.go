@@ -3,15 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/internal/mcptest"
 	"github.com/crb2nu/loom/pkg/httpclient"
+	"github.com/crb2nu/loom/pkg/mcpotel"
 )
 
 func TestMain(m *testing.M) {
@@ -47,13 +52,48 @@ func newTestMentatlabServer(baseURL string) *mentatlabServer {
 	}
 }
 
-func TestNewMentatlabServerFromEnvRequiresBaseURL(t *testing.T) {
+func TestNewMentatlabServerFromEnvDegradesWithoutBaseURL(t *testing.T) {
 	t.Setenv("MENTATLAB_BASE_URL", "")
 	t.Setenv("ORCHESTRATOR_BASE_URL", "")
 
-	_, err := newMentatlabServerFromEnv()
-	if err == nil {
-		t.Fatal("expected missing base URL to return an error")
+	srv, err := newMentatlabServerFromEnv()
+	if err != nil {
+		t.Fatalf("server construction must succeed: %v", err)
+	}
+	result, err := srv.handleHealth(context.Background(), nil)
+	if err != nil || result == nil || !result.IsError || !strings.Contains(result.Content[0].Text, "MENTATLAB_BASE_URL") {
+		t.Fatalf("expected missing-config MCP error, result=%+v err=%v", result, err)
+	}
+}
+
+// TestMentatlabServesHandshakeWithoutBackend pins the degraded-start
+// contract at the server level: with no base URL set the server answers
+// initialize and tools/list, and a tool call returns an MCP error naming
+// MENTATLAB_BASE_URL, without exiting the process.
+func TestMentatlabServesHandshakeWithoutBackend(t *testing.T) {
+	t.Setenv("MENTATLAB_BASE_URL", "")
+	t.Setenv("ORCHESTRATOR_BASE_URL", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tp, shutdown, err := mcpotel.InitTracer(context.Background(), "mcp-mentatlab-test", logger)
+	if err != nil {
+		t.Fatalf("tracer: %v", err)
+	}
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+	server, err := newMentatlabMCPServer(logger, mcpotel.Tracer(tp, "mcp-mentatlab-test"))
+	if err != nil {
+		t.Fatalf("server must start without backend configuration: %v", err)
+	}
+
+	res := mcptest.Drive(t, server, "mentatlab_health", map[string]any{})
+	if names := mcptest.ToolNames(t, res.ToolsList); len(names) == 0 {
+		t.Fatal("tools/list must not be empty while unconfigured")
+	}
+	result := mcptest.ToolResult(t, res.ToolCall)
+	text := mcptest.Text(result)
+	if !result.IsError || !strings.Contains(text, "MENTATLAB_BASE_URL") {
+		t.Fatalf("expected NotConfigured naming MENTATLAB_BASE_URL, got isError=%v text=%q", result.IsError, text)
 	}
 }
 

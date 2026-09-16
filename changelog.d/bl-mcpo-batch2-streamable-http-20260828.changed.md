@@ -1,0 +1,1 @@
+- Migrate the mcpo alertmanager, prometheus, loki, and grafana entries in `k8s/base/servers/mcpo/configmap.yaml` to Streamable HTTP, with the rollout checksum updated in `k8s/base/servers/mcpo/deployment.yaml`.

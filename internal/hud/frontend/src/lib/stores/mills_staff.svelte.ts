@@ -63,6 +63,8 @@ export interface JudgeGate {
   mean_score_merged: number;
   mean_score_escalated: number;
   histogram: JudgeScoreBucket[];
+  /** Judge role the row aggregates: primary (the gate's grading), tiebreaker or shadow. */
+  role: string;
 }
 
 export interface JudgeModel {
@@ -168,11 +170,12 @@ export interface ReportSlot<T> {
   data: T | null;
   error: string | null;
   disabled: boolean;
+  snapshotUnavailable?: boolean;
   lastUpdated: Date | null;
 }
 
 function emptySlot<T>(): ReportSlot<T> {
-  return { data: null, error: null, disabled: false, lastUpdated: null };
+  return { data: null, error: null, disabled: false, snapshotUnavailable: false, lastUpdated: null };
 }
 
 // Window options offered by the panel. The operator defaults to 336h for four
@@ -240,6 +243,7 @@ function normaliseJudge(raw: JudgeCalibrationReport | null): JudgeCalibrationRep
       mean_score_merged: g?.mean_score_merged ?? 0,
       mean_score_escalated: g?.mean_score_escalated ?? 0,
       histogram: g?.histogram ?? [],
+      role: g?.role ?? 'primary',
     })),
     buckets: raw.buckets ?? [],
     outcomes: raw.outcomes ?? [],
@@ -387,16 +391,18 @@ async function fetchSlot<T>(
 ): Promise<ReportSlot<T>> {
   try {
     const raw = await getJSON<T>(path);
-    return { data: normalise(raw), error: null, disabled: false, lastUpdated: new Date() };
+    return { data: normalise(raw), error: null, disabled: false, snapshotUnavailable: false, lastUpdated: new Date() };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    const notConfigured = msg.includes('503') || msg.toLowerCase().includes('not configured');
+    const unavailable = e instanceof ReportHTTPError && e.status === 503 && e.detail.includes('snapshot not yet available');
+    const notConfigured = e instanceof ReportHTTPError && e.status === 503 && !unavailable;
     return {
       // Keep the last good snapshot so a transient blip doesn't blank the tile
       // — the error rides on top of stale numbers.
-      data: notConfigured ? null : prev.data,
-      error: notConfigured ? null : msg,
+      data: notConfigured || unavailable ? null : prev.data,
+      error: notConfigured || unavailable ? null : msg,
       disabled: notConfigured,
+      snapshotUnavailable: unavailable,
       lastUpdated: prev.lastUpdated,
     };
   }
@@ -405,7 +411,14 @@ async function fetchSlot<T>(
 async function getJSON<T>(path: string): Promise<T | null> {
   const res = await globalThis.fetch(path);
   if (res.status === 503) {
-    throw new Error('mills proxy: 503 (operator not configured)');
+    let detail = '';
+    try {
+      const body = (await res.json()) as { error?: unknown };
+      if (typeof body.error === 'string') detail = body.error;
+    } catch {
+      detail = await res.text().catch(() => '');
+    }
+    throw new ReportHTTPError(503, detail);
   }
   if (res.status === 404) {
     return null;
@@ -426,6 +439,15 @@ async function getJSON<T>(path: string): Promise<T | null> {
   const text = await res.text();
   if (!text) return null;
   return JSON.parse(text) as T;
+}
+
+class ReportHTTPError extends Error {
+  constructor(
+    readonly status: number,
+    readonly detail: string,
+  ) {
+    super(detail ? `${detail} (HTTP ${status})` : `mills proxy: ${status}`);
+  }
 }
 
 export const millsStaffStore = new MillsStaffStore();

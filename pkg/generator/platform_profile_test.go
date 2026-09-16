@@ -59,8 +59,8 @@ func TestGetPlatformProfile_Claude(t *testing.T) {
 	if p.LoomProxy.ToolProfile != "llm-core" {
 		t.Errorf("loom_proxy.tool_profile = %q, want llm-core", p.LoomProxy.ToolProfile)
 	}
-	if p.LoomProxy.MaxTools != 167 {
-		t.Errorf("loom_proxy.max_tools = %d, want 167", p.LoomProxy.MaxTools)
+	if p.LoomProxy.MaxTools != 175 {
+		t.Errorf("loom_proxy.max_tools = %d, want 175", p.LoomProxy.MaxTools)
 	}
 }
 
@@ -87,8 +87,8 @@ func TestGetPlatformProfile_Codex(t *testing.T) {
 	if p.LoomProxy.ToolProfile != "llm-core" {
 		t.Errorf("loom_proxy.tool_profile = %q, want llm-core", p.LoomProxy.ToolProfile)
 	}
-	if p.LoomProxy.MaxTools != 167 {
-		t.Errorf("loom_proxy.max_tools = %d, want 167", p.LoomProxy.MaxTools)
+	if p.LoomProxy.MaxTools != 175 {
+		t.Errorf("loom_proxy.max_tools = %d, want 175", p.LoomProxy.MaxTools)
 	}
 }
 
@@ -140,8 +140,8 @@ func TestGetPlatformProfile_ClaudeDesktopProxy(t *testing.T) {
 	if p.LoomProxy.ToolProfile != "llm-core" {
 		t.Errorf("loom_proxy.tool_profile = %q, want llm-core", p.LoomProxy.ToolProfile)
 	}
-	if p.LoomProxy.MaxTools != 167 {
-		t.Errorf("loom_proxy.max_tools = %d, want 167", p.LoomProxy.MaxTools)
+	if p.LoomProxy.MaxTools != 175 {
+		t.Errorf("loom_proxy.max_tools = %d, want 175", p.LoomProxy.MaxTools)
 	}
 	if got := p.LoomProxy.Env["LOOM_PROXY_IDLE_EXIT_SECONDS"]; got != "0" {
 		t.Errorf("loom_proxy.env[LOOM_PROXY_IDLE_EXIT_SECONDS] = %q, want 0", got)

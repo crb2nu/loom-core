@@ -255,9 +255,12 @@
               </td>
               <td class="cell-desc" title={srv.description}>{srv.description || '\u2014'}</td>
               <td class="cell-cats">
-                {#each srv.categories ?? [] as cat}
-                  <span class="cat-badge">{cat}</span>
-                {/each}
+                <!-- Flex on an inner wrapper keeps the td a real table-cell. -->
+                <div class="cats-row">
+                  {#each srv.categories ?? [] as cat}
+                    <span class="cat-badge">{cat}</span>
+                  {/each}
+                </div>
               </td>
               <td class="cell-tools">
                 <span class="tool-count">{srv.tool_count ?? 0}</span>
@@ -604,7 +607,7 @@
     white-space: nowrap;
   }
 
-  .cell-cats {
+  .cats-row {
     display: flex;
     gap: 4px;
     flex-wrap: wrap;

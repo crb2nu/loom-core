@@ -13,13 +13,14 @@ import (
 
 // metrics holds all Prometheus metrics for mcp-devbox.
 type metrics struct {
-	sandboxesActive *prometheus.GaugeVec
-	execDuration    *prometheus.HistogramVec
-	execTotal       *prometheus.CounterVec
-	builds          *prometheus.CounterVec
-	buildDuration   *prometheus.HistogramVec
-	idleReaps       *prometheus.CounterVec
-	errors          *prometheus.CounterVec
+	sandboxesActive    *prometheus.GaugeVec
+	execDuration       *prometheus.HistogramVec
+	execTotal          *prometheus.CounterVec
+	builds             *prometheus.CounterVec
+	buildDuration      *prometheus.HistogramVec
+	idleReaps          *prometheus.CounterVec
+	errors             *prometheus.CounterVec
+	baseImageFallbacks *prometheus.CounterVec
 
 	registry *prometheus.Registry
 }
@@ -100,6 +101,10 @@ func newMetrics() *metrics {
 		},
 		[]string{"operation"},
 	)
+	m.baseImageFallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "loom", Subsystem: "devbox", Name: "base_image_fallbacks_total",
+		Help: "Builds that could not select a registered pre-built base image",
+	}, []string{"project", "language", "version", "reason"})
 
 	m.registry.MustRegister(
 		m.sandboxesActive,
@@ -109,6 +114,7 @@ func newMetrics() *metrics {
 		m.buildDuration,
 		m.idleReaps,
 		m.errors,
+		m.baseImageFallbacks,
 	)
 
 	return m

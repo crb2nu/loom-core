@@ -1,9 +1,10 @@
 // Engram summary store — proof-status and tier counts for the engram tech
 // tree.
 //
-// GET /api/engrams/summary (internal/hud/api_engrams.go) aggregates
-// agent_engram_list so a panel can render a one-line badge without walking the
-// whole library:
+// GET /api/engrams/summary (internal/hud/api_engrams.go) rolls up the same
+// agent_engram_graph fetch that serves /api/engrams/graph — the bridge shares
+// one upstream call between the two requests fetchAll fires together — so a
+// panel can render a one-line badge without walking the whole library:
 //
 //   {"total":int,
 //    "by_status":{"unverified":int,"verified":int,"stale":int,"failing":int},
@@ -62,7 +63,12 @@ class EngramsStore {
   unavailable = $state(false);
   /** True when either catalog endpoint is not registered by this HUD build. */
   catalogUnavailable = $state(false);
-  engrams = $state<EngramInfo[]>([]);
+  /** Catalog fetch failure (a 502 from a route that exists), owned by
+   *  fetchCatalog itself. Kept separate from `error` (the summary channel):
+   *  routing catalog failures through fetchAll's shared catch let the summary
+   *  fetch's success handler null the message an instant later — the promise
+   *  race behind the production tree's eternal "loading engram graph…". */
+  catalogError = $state<string | null>(null);
   graph = $state<EngramGraph | null>(null);
 
   // 60s: the catalog changes at authoring pace, not run pace.
@@ -118,23 +124,32 @@ class EngramsStore {
   }
 
   async fetchCatalog(): Promise<void> {
-    const [list, graph] = await Promise.all([
-      fetchJSON<{ engrams?: EngramInfo[]; degraded?: boolean }>('/api/engrams'),
-      fetchJSON<Partial<EngramGraph>>('/api/engrams/graph'),
-    ]);
-    if (list === null || graph === null) {
-      this.catalogUnavailable = true;
-      this.engrams = [];
-      this.graph = null;
-      return;
+    try {
+      // Graph only. The flat GET /api/engrams list was fetched alongside for
+      // months and never rendered anywhere (and /api/engrams/summary already
+      // calls the same MCP tool with the same args) — three requests a minute
+      // where one carried all the pixels. The graph nodes are the catalog.
+      const graph = await fetchJSON<Partial<EngramGraph>>('/api/engrams/graph');
+      if (graph === null) {
+        this.catalogUnavailable = true;
+        this.catalogError = null;
+        this.graph = null;
+        return;
+      }
+      this.catalogUnavailable = false;
+      this.catalogError = null;
+      this.graph = {
+        nodes: graph.nodes ?? [],
+        edges: graph.edges ?? [],
+        degraded: graph.degraded === true,
+      };
+    } catch (e) {
+      // Own the failure; never reject up to fetchAll. Last-good data is
+      // kept so a transient 502 doesn't blank a rendered tree — the error
+      // branch takes precedence in the template regardless.
+      this.catalogUnavailable = false;
+      this.catalogError = errorMessage(e);
     }
-    this.catalogUnavailable = false;
-    this.engrams = list.engrams ?? [];
-    this.graph = {
-      nodes: graph.nodes ?? [],
-      edges: graph.edges ?? [],
-      degraded: list.degraded === true || graph.degraded === true,
-    };
   }
 
   async fetchAll(): Promise<void> {

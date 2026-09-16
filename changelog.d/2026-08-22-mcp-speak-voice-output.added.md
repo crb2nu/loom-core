@@ -1,0 +1,1 @@
+mcp-speak: new MCP server giving agents voice output through the homelab tts.lan lane — speak(text, voice, blocking) synthesizes via /v1/audio/speech (piper CPU voices, orpheus GPU voices) and plays on the host machine; list_voices queries the lane. Registered in the MCP registry with always_allow (non-mutating, audible-only).

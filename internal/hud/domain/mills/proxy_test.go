@@ -97,6 +97,71 @@ func TestProxy_InjectsBearerOnMutations(t *testing.T) {
 	}
 }
 
+// TestProxy_CallerOperatorTokenWinsOnMutations pins the seam for callers
+// that hold the operator admin token themselves: X-Loom-Operator-Token
+// becomes the upstream Bearer, replacing the HUD's own copy, and the header
+// never reaches the operator. A caller-sent Authorization header is still
+// replaced (browser/mobile sessions authenticate to the HUD with their own
+// tokens).
+func TestProxy_CallerOperatorTokenWinsOnMutations(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer caller-operator-token" {
+			t.Errorf("upstream Authorization = %q, want Bearer caller-operator-token", got)
+		}
+		if got := r.Header.Get(OperatorTokenHeader); got != "" {
+			t.Errorf("upstream must not see %s, got %q", OperatorTokenHeader, got)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer upstream.Close()
+
+	d := New(&fakeDeps{
+		cfg:          Config{BaseURL: upstream.URL, AdminToken: "stale-hud-copy"},
+		adminAllowed: true,
+	})
+	mux := http.NewServeMux()
+	d.RegisterRoutes(mux, func(h http.HandlerFunc) http.HandlerFunc { return h })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/mills/backlog", strings.NewReader(`{"ID":"X","Title":"x"}`))
+	req.Header.Set("Authorization", "Bearer hud-session-token")
+	req.Header.Set(OperatorTokenHeader, "caller-operator-token")
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestProxy_CallerAuthorizationIsReplacedOnMutations pins that a plain
+// Authorization header from the caller does not reach the operator when
+// the HUD holds a token: sessions authenticate to the HUD, not the operator.
+func TestProxy_CallerAuthorizationIsReplacedOnMutations(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer cluster-admin-token" {
+			t.Errorf("upstream Authorization = %q, want the HUD's operator token", got)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+
+	d := New(&fakeDeps{
+		cfg:          Config{BaseURL: upstream.URL, AdminToken: "cluster-admin-token"},
+		adminAllowed: true,
+	})
+	mux := http.NewServeMux()
+	d.RegisterRoutes(mux, func(h http.HandlerFunc) http.HandlerFunc { return h })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/mills/council/dryrun", strings.NewReader(`{"reason":"smoke"}`))
+	req.Header.Set("Authorization", "Bearer hud-session-token")
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestProxy_HUDAdminGateBlocksUnauthorizedMutations verifies the HUD admin
 // gate runs *before* the proxy reaches upstream, so an unauthenticated
 // caller never even hits the operator.
@@ -425,78 +490,6 @@ func TestProxy_ForwardsSpinRunsReadsWithoutAdmin(t *testing.T) {
 	}
 }
 
-// TestProxy_ForwardsCrossRepoReadsWithoutAdmin verifies cross-repo
-// list + per-run detail proxy through without the HUD admin gate
-// firing — the HUD's CrossRepo card must poll these from a browser
-// without elevated auth.
-func TestProxy_ForwardsCrossRepoReadsWithoutAdmin(t *testing.T) {
-	cases := []struct{ method, path string }{
-		{http.MethodGet, "/api/mills/cross-repo/runs"},
-		{http.MethodGet, "/api/mills/cross-repo/runs/XR-1"},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.path, func(t *testing.T) {
-			seen := ""
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				seen = r.URL.Path
-				if got := r.Header.Get("X-Loom-Admin-Token"); got != "" {
-					t.Errorf("upstream got X-Loom-Admin-Token=%q, want empty", got)
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{}`))
-			}))
-			defer upstream.Close()
-
-			d := New(&fakeDeps{cfg: Config{BaseURL: upstream.URL}})
-			mux := http.NewServeMux()
-			d.RegisterRoutes(mux, func(h http.HandlerFunc) http.HandlerFunc { return h })
-
-			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(tc.method, tc.path, nil)
-			mux.ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-			}
-			if seen != tc.path {
-				t.Errorf("upstream saw path = %q, want %q", seen, tc.path)
-			}
-		})
-	}
-}
-
-// TestProxy_CrossRepoAbortRequiresAdmin verifies the admin POST gate
-// blocks unauthenticated callers before the request reaches the
-// operator's own admin gate.
-func TestProxy_CrossRepoAbortRequiresAdmin(t *testing.T) {
-	hits := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
-	d := New(&fakeDeps{
-		cfg:          Config{BaseURL: upstream.URL, AdminToken: "x"},
-		adminAllowed: false,
-	})
-	mux := http.NewServeMux()
-	d.RegisterRoutes(mux, func(h http.HandlerFunc) http.HandlerFunc { return h })
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost,
-		"/api/mills/cross-repo/runs/XR-1/abort", nil)
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", rec.Code)
-	}
-	if hits != 0 {
-		t.Errorf("upstream was called %d times, want 0 (HUD gate must block)", hits)
-	}
-}
-
 // TestProxy_BadGatewayWhenUpstreamDown returns 502 when the upstream is
 // unreachable, with the underlying error in the body.
 func TestProxy_BadGatewayWhenUpstreamDown(t *testing.T) {
@@ -784,5 +777,46 @@ func TestProxy_ForwardsWiringWithoutAdmin(t *testing.T) {
 	}
 	if seen != "/api/mills/wiring" {
 		t.Errorf("upstream saw path = %q, want /api/mills/wiring", seen)
+	}
+}
+
+// TestProxy_ForwardsDrawerAndClothHallReads pins the allowlist entries that
+// history proved easy to miss: the drawer's journey ledger and the Telemetry
+// waivers section shipped WITHOUT their proxy entries and read the SPA
+// fallback in production for weeks, and the Cloth Hall card surfaces (bolts /
+// shift-report / taste calibration) are consumed by slices that do not own
+// this file. Each is an open read: no admin header required, path preserved.
+func TestProxy_ForwardsDrawerAndClothHallReads(t *testing.T) {
+	paths := []string{
+		"/api/mills/backlog/bl-x/events",
+		"/api/mills/fleet-gate/waivers",
+		"/api/mills/bolts",
+		"/api/mills/shift-report",
+		"/api/mills/finishing/digest?day=2026-09-10",
+		"/api/mills/taste/calibration",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			var got string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.URL.RequestURI()
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer upstream.Close()
+
+			d := New(&fakeDeps{cfg: Config{BaseURL: upstream.URL, AdminToken: "unused"}})
+			mux := http.NewServeMux()
+			d.RegisterRoutes(mux, func(h http.HandlerFunc) http.HandlerFunc { return h })
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s (route not allowlisted?)", rec.Code, rec.Body.String())
+			}
+			if got != path {
+				t.Fatalf("upstream saw %q, want %q", got, path)
+			}
+		})
 	}
 }

@@ -18,6 +18,143 @@ import (
 	"github.com/crb2nu/loom/pkg/mills/workflow/killtest"
 )
 
+func TestRunQueuedAdmissionKilltestDryRunSkipsWorkerLifecycle(t *testing.T) {
+	var out strings.Builder
+	stateDir := filepath.Join(t.TempDir(), "must-not-be-created")
+	err := runQueuedAdmissionKilltest(context.Background(), &out, queuedAdmissionOptions{
+		WorkerCommand: "exit 99",
+		StateDir:      stateDir,
+		DryRun:        true,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	var verdict queuedAdmissionVerdict
+	if err := json.Unmarshal([]byte(out.String()), &verdict); err != nil {
+		t.Fatalf("decode dry-run verdict: %v\n%s", err, out.String())
+	}
+	if verdict.Verdict != "PLANNED" || verdict.TargetID == "" || !verdict.Proof.DryRun || !verdict.Proof.Planned {
+		t.Fatalf("dry-run verdict = %+v", verdict)
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry run touched state directory: %v", err)
+	}
+}
+
+func TestRunQueuedAdmissionKilltestFailureEmitsJSON(t *testing.T) {
+	var out strings.Builder
+	err := runQueuedAdmissionKilltest(context.Background(), &out, queuedAdmissionOptions{})
+	if err == nil {
+		t.Fatal("invalid configuration unexpectedly passed")
+	}
+	var verdict queuedAdmissionVerdict
+	if decodeErr := json.Unmarshal([]byte(out.String()), &verdict); decodeErr != nil {
+		t.Fatalf("decode failure verdict: %v\n%s", decodeErr, out.String())
+	}
+	if verdict.Verdict != "FAIL" || verdict.Passed || verdict.ReasonCode != "invalid_configuration" {
+		t.Fatalf("failure verdict = %+v", verdict)
+	}
+	if verdict.Proof.ItemID != "" || verdict.Proof.Passed || len(verdict.Proof.Events) != 0 {
+		t.Fatalf("unexpected proof on configuration failure: %+v", verdict.Proof)
+	}
+}
+
+func TestQueuedProofEmbedPreconditionBlocksStart(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"non-zero count", fmt.Sprintf(`{"status":"healthy","observed_at":%q,"fail_closed_counts":{"pattern":1}}`, now.Format(time.RFC3339Nano))},
+		{"unhealthy", fmt.Sprintf(`{"status":"unhealthy","observed_at":%q,"fail_closed_counts":{}}`, now.Format(time.RFC3339Nano))},
+		{"malformed", `{"status":`},
+		{"stale", fmt.Sprintf(`{"status":"healthy","observed_at":%q,"fail_closed_counts":{}}`, now.Add(-time.Minute-time.Nanosecond).Format(time.RFC3339Nano))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprint(w, tt.body) }))
+			defer health.Close()
+			startHits := 0
+			err := runQueuedProofWithEmbedPrecondition(context.Background(), health.Client(), health.URL, time.Minute, now, func() error { startHits++; return nil })
+			if err == nil || !strings.Contains(err.Error(), "embedder_unhealthy") {
+				t.Fatalf("error = %v, want embedder_unhealthy", err)
+			}
+			if startHits != 0 {
+				t.Fatalf("queued-proof start hits = %d, want 0", startHits)
+			}
+		})
+	}
+}
+
+func TestQueuedProofEmbedPreconditionAllowsHealthyStart(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"status":"healthy","observed_at":%q,"fail_closed_counts":{"pattern":0}}`, now.Format(time.RFC3339Nano))
+	}))
+	defer health.Close()
+	startHits := 0
+	if err := runQueuedProofWithEmbedPrecondition(context.Background(), health.Client(), health.URL, time.Minute, now, func() error { startHits++; return nil }); err != nil {
+		t.Fatalf("healthy precondition: %v", err)
+	}
+	if startHits != 1 {
+		t.Fatalf("queued-proof start hits = %d, want 1", startHits)
+	}
+}
+
+func TestQueuedProofEmbedPreconditionUnavailableBlocksStart(t *testing.T) {
+	health := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	endpoint, client := health.URL, health.Client()
+	health.Close()
+	startHits := 0
+	err := runQueuedProofWithEmbedPrecondition(context.Background(), client, endpoint, time.Minute, time.Now(), func() error {
+		startHits++
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "embedder_unhealthy") {
+		t.Fatalf("error = %v, want embedder_unhealthy", err)
+	}
+	if startHits != 0 {
+		t.Fatalf("queued-proof start hits = %d, want 0", startHits)
+	}
+}
+
+func TestQueuedAdmissionDryRunIsDeterministicAndOffline(t *testing.T) {
+	evidence := filepath.Join(t.TempDir(), "queued-proof.json")
+	var out strings.Builder
+	err := runQueuedAdmissionKilltest(context.Background(), &out, queuedAdmissionOptions{
+		OperatorURL: "http://127.0.0.1:1", TargetProject: "services/widgets",
+		EvidencePath: evidence, DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	want, err := os.ReadFile(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != string(want) || !strings.Contains(out.String(), `"stamp_id": "queued-proof-dry-run"`) ||
+		!strings.Contains(out.String(), `"landed_target_project": "services/widgets"`) ||
+		!strings.Contains(out.String(), `"collision_detected": true`) {
+		t.Fatalf("unexpected dry-run evidence: %s", out.String())
+	}
+	var second strings.Builder
+	if err := runQueuedAdmissionKilltest(context.Background(), &second, queuedAdmissionOptions{TargetProject: "services/widgets", DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if second.String() != out.String() {
+		t.Fatalf("dry-run output is not deterministic:\n%s\n%s", out.String(), second.String())
+	}
+}
+
+func TestChangedCollateralIncludesTargetProjectRewrite(t *testing.T) {
+	before := []queuedAdmissionSnapshot{{ID: "target", State: "queued", TargetProject: "services/widgets"}, {ID: "control", State: "queued", TargetProject: "services/widgets"}}
+	after := []queuedAdmissionSnapshot{{ID: "target", State: "running", TargetProject: "services/widgets"}, {ID: "control", State: "queued", TargetProject: "services/other"}}
+	got := changedCollateral(before, after, "target")
+	if len(got) != 1 || got[0] != "control" {
+		t.Fatalf("changed collateral = %v, want [control]", got)
+	}
+}
+
 func TestRunScenarioDispatch(t *testing.T) {
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
 	evidence := pipeline.KilltestEvidence{
@@ -47,6 +184,77 @@ func TestRunScenarioDispatch(t *testing.T) {
 	}
 	if err := runScenario(pipeline.KilltestMRAwareness, path, time.Minute, now); err == nil {
 		t.Fatal("trailing evidence unexpectedly passed")
+	}
+}
+
+func TestStageAtOrBeyondMR(t *testing.T) {
+	for _, tt := range []struct {
+		stage string
+		want  bool
+	}{
+		{"implement", false}, {"post_review_gate", false}, {"mr", true},
+		{"post_mr_gate", true}, {"ci_watch", true}, {"cleanup", true},
+		{"", true}, {"invented", false},
+	} {
+		if got := stageAtOrBeyondMR(tt.stage); got != tt.want {
+			t.Errorf("stageAtOrBeyondMR(%q) = %v, want %v", tt.stage, got, tt.want)
+		}
+	}
+}
+
+func TestListBranchMRsPreservesIdentityAndCount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("source_branch") != "feat/mr awareness" || r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("unexpected request: %s auth=%q", r.URL.String(), r.Header.Get("Authorization"))
+		}
+		_, _ = fmt.Fprint(w, `[{"iid":17,"web_url":"https://gitlab.example/mr/17","source_branch":"feat/mr awareness"}]`)
+	}))
+	defer server.Close()
+	o := mrAwarenessOptions{GitLabURL: server.URL, GitLabToken: "token", GitLabProject: "services/loom-core"}
+	mrs, err := listBranchMRs(context.Background(), server.Client(), o, "feat/mr awareness")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mrs) != 1 || mrs[0].IID != 17 || mrs[0].SourceBranch != "feat/mr awareness" {
+		t.Fatalf("MR evidence = %+v", mrs)
+	}
+}
+
+func TestValidateMRAwarenessRecoveryFailsClosed(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	o := mrAwarenessOptions{BacklogID: "item-1", SourceBranch: "feat/x", GitLabProject: "services/x", RecoveryMaxAge: time.Hour}
+	valid := fmt.Sprintf(`{"mode":"mr-awareness","verdict":"FAIL","passed":false,"backlog_id":"item-1","run_id":"run-1","mr_project":"services/x","mr_iid":7,"source_branch":"feat/x","mr_count":0,"worker_restarts":0,"recovered":false,"captured_at":%q}`, now.Format(time.RFC3339Nano))
+	for _, tt := range []struct{ name, input, code string }{
+		{"malformed", `{`, "malformed_evidence"},
+		{"stale", strings.Replace(valid, now.Format(time.RFC3339Nano), now.Add(-2*time.Hour).Format(time.RFC3339Nano), 1), "stale_evidence"},
+		{"mismatch", strings.Replace(valid, `"mr_iid":7`, `"mr_iid":8`, 1), ""},
+		{"branch mismatch", strings.Replace(valid, "feat/x", "feat/y", 1), "mismatched_identity"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, code, err := validateMRAwarenessRecovery([]byte(tt.input), o, now)
+			if tt.code == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || code != tt.code {
+				t.Fatalf("code=%q err=%v, want %q", code, err, tt.code)
+			}
+		})
+	}
+}
+
+func TestRecoveredMRAwarenessIdentityMustMatchPersistedRun(t *testing.T) {
+	report := mrAwarenessSummary{Recovered: true, MRIID: 8}
+	if err := recoveredMRIdentityError(report, 7); err == nil {
+		t.Fatal("expected mismatched recovered MR identity to fail")
+	}
+	if err := recoveredMRIdentityError(report, 8); err != nil {
+		t.Fatalf("matching recovered MR identity failed: %v", err)
+	}
+	if err := recoveredMRIdentityError(mrAwarenessSummary{Recovered: true}, 7); err != nil {
+		t.Fatalf("partial recovery token should adopt durable MR identity: %v", err)
 	}
 }
 

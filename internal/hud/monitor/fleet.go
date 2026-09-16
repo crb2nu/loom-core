@@ -449,6 +449,14 @@ func (m *FleetMonitor) refresh(force bool) error {
 		m.Unlock()
 	}()
 
+	if force && m.agent != nil {
+		// A forced refresh is an explicit "read the store now" — startup,
+		// reload, a presence change that just landed. Bypass the light
+		// session projections' reuse window so the snapshot reflects the
+		// write that triggered it rather than a list fetched a moment ago.
+		m.agent.InvalidateSessionLists()
+	}
+
 	snap := FleetSnapshot{
 		UpdatedAt: time.Now(),
 	}

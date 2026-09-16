@@ -245,5 +245,13 @@
     "BenchmarkFleetMuxRoundTrip",
     "BenchmarkFleetMillsEventAppend",
     "BenchmarkFleetCustomServerWrite"
+  ],
+  "waivers": [
+    {
+      "benchmark": "BenchmarkFleetMillsEventAppend",
+      "max_time_percent": 60,
+      "until": "2026-09-15",
+      "reason": "Operator-approved 2026-08-16: migration 029 event read indexes cost +52% per append (measured, ~+13us absolute) to unpin a full core of read congestion (bl-mills-event-read-index-congestion-20260816). Expires with the materialized-rollups fix (bl-mills-report-rollups-20260816), which may drop the indexes again."
+    }
   ]
 }

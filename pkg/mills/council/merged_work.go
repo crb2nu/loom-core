@@ -75,9 +75,20 @@ type MergedWorkSkipped struct {
 // mergedWorkHit pairs a matched merged MR with the score and band that produced
 // it, mirroring dedupHit/planDedupHit.
 type mergedWorkHit struct {
-	work  MergedWork
-	score float64
-	basis string
+	work              MergedWork
+	score             float64
+	lexicalScore      float64
+	semanticScore     float64
+	semanticAvailable bool
+	basis             string
+}
+
+type mergedWorkScore struct {
+	work              MergedWork
+	lexicalScore      float64
+	semanticScore     float64
+	configuredScore   float64
+	semanticAvailable bool
 }
 
 // findMergedWork returns the merged MR that best explains title as a
@@ -102,6 +113,16 @@ type mergedWorkHit struct {
 // A hard hit always wins over a gray-band one; ties within a band go to the
 // higher score, so the recorded collision is the most explanatory one.
 func findMergedWork(title string, candidates []MergedWork, threshold float64, now time.Time) *mergedWorkHit {
+	return findMergedWorkGrounded(context.Background(), nil, title, candidates, threshold, now)
+}
+
+// findMergedWorkGrounded uses the configured scorer when semantic similarity
+// is available and otherwise preserves the lexical decision exactly.
+func findMergedWorkGrounded(ctx context.Context, scorer textsim.Scorer, title string, candidates []MergedWork, threshold float64, now time.Time) *mergedWorkHit {
+	return findMergedWorkGroundedObserved(ctx, scorer, title, candidates, threshold, now, nil)
+}
+
+func findMergedWorkGroundedObserved(ctx context.Context, scorer textsim.Scorer, title string, candidates []MergedWork, threshold float64, now time.Time, observe func(mergedWorkScore)) *mergedWorkHit {
 	// threshold > 1 is the documented "dedup disabled" escape hatch (see
 	// MutationOptions.DedupSimilarityThreshold); grounding respects it.
 	if title == "" || threshold <= 0 || threshold > 1 {
@@ -113,18 +134,39 @@ func findMergedWork(title string, candidates []MergedWork, threshold float64, no
 	}
 	var hard, gray *mergedWorkHit
 	for _, c := range candidates {
-		score := textsim.Jaccard(tokens, textsim.NormalizeWorkTitleTokens(c.Title))
+		lexicalScore := textsim.Jaccard(tokens, textsim.NormalizeWorkTitleTokens(c.Title))
+		score := lexicalScore
+		semanticScore := float64(0)
+		semanticAvailable := false
+		if scorer != nil {
+			semantic := scorer.Score(ctx, title, c.Title)
+			semanticScore = semantic.Semantic
+			semanticAvailable = semantic.SemanticAvailable
+			if !semantic.SemanticAvailable {
+				// Backend unavailability is generally corpus-wide. Disable the
+				// scorer for the rest of this pass so a timed-out service cannot
+				// add one timeout per merged-work candidate to admission.
+				scorer = nil
+			} else if semantic.Combined >= 0 && semantic.Combined <= 1 {
+				// When available, the configured scorer owns the decision. The
+				// lexical score remains observation data and the exact fallback.
+				score = semantic.Combined
+			}
+		}
+		if observe != nil {
+			observe(mergedWorkScore{work: c, lexicalScore: lexicalScore, semanticScore: semanticScore, configuredScore: score, semanticAvailable: semanticAvailable})
+		}
 		switch {
 		case score >= threshold:
 			if hard == nil || score > hard.score {
-				hard = &mergedWorkHit{work: c, score: score, basis: mergedWorkBasisHard}
+				hard = &mergedWorkHit{work: c, score: score, lexicalScore: lexicalScore, semanticScore: semanticScore, semanticAvailable: semanticAvailable, basis: mergedWorkBasisHard}
 			}
 		case score >= textsim.GrayBandFloor && threshold > textsim.GrayBandFloor:
 			if c.MergedAt.IsZero() || now.Sub(c.MergedAt) > grayBandRecentWindow {
 				continue
 			}
 			if gray == nil || score > gray.score {
-				gray = &mergedWorkHit{work: c, score: score, basis: mergedWorkBasisGray}
+				gray = &mergedWorkHit{work: c, score: score, lexicalScore: lexicalScore, semanticScore: semanticScore, semanticAvailable: semanticAvailable, basis: mergedWorkBasisGray}
 			}
 		}
 	}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/gates"
+	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
 // handleStatusFull replaces the slice-1.2 stub with a fully populated
@@ -18,16 +19,30 @@ func (o *operator) handleStatusFull(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	policy := o.policy.Current()
 
-	queueDepth := 0
+	// queue_held_human is the subset of the queue the reconciler will never
+	// start on its own: items whose effective policy (item flag or per-repo
+	// override) requires human review. Surfaced beside queue_depth so a
+	// queue_depth=1 that sits for hours reads as "waiting on a hand-off"
+	// rather than as a dispatch outage.
+	queueDepth, queueHeldHuman := 0, 0
 	if items, err := o.store.Backlog.ListByState(ctx, "queued"); err == nil {
 		queueDepth = len(items)
+		queueHeldHuman = countHeldForHuman(policy, items, o.homeProject())
 	}
 	active, _ := o.store.Pipeline.CountActive(ctx)
 
+	// One newest-first council read serves both last_council_at and the
+	// council_yield block (how many finished runs since one produced a
+	// backlog delta, and what they cost).
 	var lastCouncil *time.Time
-	if runs, err := o.store.Council.List(ctx, 1); err == nil && len(runs) > 0 {
-		t := runs[0].StartedAt
-		lastCouncil = &t
+	var yield *councilYield
+	if runs, err := o.store.Council.List(ctx, councilYieldSample); err == nil {
+		if len(runs) > 0 {
+			t := runs[0].StartedAt
+			lastCouncil = &t
+		}
+		y := computeCouncilYield(runs)
+		yield = &y
 	}
 	// last_merge_at is the all-time most-recent autonomous merge. The HUD
 	// health banner cannot derive this from its active-only pipeline-run
@@ -50,6 +65,7 @@ func (o *operator) handleStatusFull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := map[string]any{
+		"build_sha":            version,
 		"budget":               budget,
 		"db_ok":                o.dbOK(ctx),
 		"policy_enabled":       policy.IsEnabled(),
@@ -58,9 +74,13 @@ func (o *operator) handleStatusFull(w http.ResponseWriter, r *http.Request) {
 		"autonomy_blockers":    capabilities.AutonomyBlockers,
 		"capabilities":         capabilities.Capabilities,
 		"queue_depth":          queueDepth,
+		"queue_held_human":     queueHeldHuman,
 		"active_pipeline_runs": active,
 		"last_council_at":      lastCouncil,
 		"last_merge_at":        lastMerge,
+		// council_yield is nil only when the council table could not be read;
+		// a healthy operator with zero runs reports an all-zero block.
+		"council_yield": yield,
 		// GitLab instance web base (mill-floor B1). Lets the HUD build a
 		// clickable MR link from a run's MR iid + the item's TargetProject
 		// without a per-run schema change. Empty string when no GitLab API URL
@@ -89,6 +109,21 @@ func (o *operator) handleStatusFull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// countHeldForHuman counts queued items the reconciler's tryStart would hold
+// for a human hand-off, using the same effective-policy predicate the gate
+// itself uses (mills.Policy.RequiresHumanReview) so the two never drift.
+// homeProject is o.homeProject() — the per-repo override key an empty
+// TargetProject resolves to.
+func countHeldForHuman(policy *mills.Policy, items []*store.BacklogItem, homeProject string) int {
+	held := 0
+	for _, item := range items {
+		if ok, _ := policy.RequiresHumanReview(item, homeProject); ok {
+			held++
+		}
+	}
+	return held
 }
 
 func (o *operator) handleCapabilities(w http.ResponseWriter, r *http.Request) {

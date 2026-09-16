@@ -27,11 +27,26 @@ func TestHandleMergeQueueList(t *testing.T) {
 	if err := op.store.Pipeline.PutRun(ctx, run); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
-	if _, _, err := op.store.MergeQueue.Enqueue(ctx, &store.MergeQueueEntry{
+	active, _, err := op.store.MergeQueue.Enqueue(ctx, &store.MergeQueueEntry{
 		PipelineRunID: run.ID, BacklogID: item.ID, Project: "services/loom-core",
 		MRIID: 5, SourceBranch: "feat/mql", TargetBranch: "main", EnqueuedSHA: "sha-mql",
-	}, 10); err != nil {
+	}, 10)
+	if err != nil {
 		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := op.store.MergeQueue.MarkEvicted(ctx, active.ID, store.MergeQueueEvictRebaseConflict, nil); err != nil {
+		t.Fatalf("evict: %v", err)
+	}
+	run2 := &store.PipelineRun{ID: "PIPE-MQL-ACTIVE", BacklogID: item.ID, Template: "mills-default-pipeline",
+		State: store.PipelineMerging, Attempts: 2, StartedAt: time.Now().UTC()}
+	if err := op.store.Pipeline.PutRun(ctx, run2); err != nil {
+		t.Fatalf("seed active run: %v", err)
+	}
+	if _, _, err := op.store.MergeQueue.Enqueue(ctx, &store.MergeQueueEntry{
+		PipelineRunID: run2.ID, BacklogID: item.ID, Project: "services/loom-core",
+		MRIID: 6, SourceBranch: "feat/active", TargetBranch: "main", EnqueuedSHA: "sha-active",
+	}, 10); err != nil {
+		t.Fatalf("enqueue active: %v", err)
 	}
 
 	rec := httptest.NewRecorder()
@@ -40,7 +55,14 @@ func TestHandleMergeQueueList(t *testing.T) {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 	var got struct {
-		Active  []map[string]any `json:"active"`
+		Active        []map[string]any `json:"active"`
+		RecentSettled []struct {
+			State          string `json:"state"`
+			EvictionReason string `json:"eviction_reason"`
+			MRIID          int64  `json:"mr_iid"`
+			Project        string `json:"project"`
+			SettledAt      string `json:"settled_at"`
+		} `json:"recent_settled"`
 		Summary struct {
 			Depth int            `json:"depth"`
 			Lanes map[string]int `json:"lanes"`
@@ -54,5 +76,13 @@ func TestHandleMergeQueueList(t *testing.T) {
 	}
 	if got.Summary.Lanes["services/loom-core→main"] != 1 {
 		t.Fatalf("lane summary missing: %+v", got.Summary.Lanes)
+	}
+	if len(got.RecentSettled) != 1 {
+		t.Fatalf("recent_settled = %+v, want one entry", got.RecentSettled)
+	}
+	settled := got.RecentSettled[0]
+	if settled.State != "evicted" || settled.EvictionReason != store.MergeQueueEvictRebaseConflict ||
+		settled.MRIID != 5 || settled.Project != "services/loom-core" || settled.SettledAt == "" {
+		t.Fatalf("settled entry lost API fields: %+v", settled)
 	}
 }

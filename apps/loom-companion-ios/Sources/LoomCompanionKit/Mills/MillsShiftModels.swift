@@ -16,15 +16,21 @@ import Foundation
 public struct MillsBacklogItem: Codable, Sendable, Identifiable, Hashable {
     public let id: String
     public let planID: String?
+    /// Current taste grade ("keep" | "meh" | "regret", empty/absent when
+    /// ungraded). Lets the shift report render already-graded bolts as
+    /// graded instead of offering the one-tap again.
+    public let grade: String?
 
     enum CodingKeys: String, CodingKey {
         case id = "ID"
         case planID = "PlanID"
+        case grade = "Grade"
     }
 
-    public init(id: String, planID: String? = nil) {
+    public init(id: String, planID: String? = nil, grade: String? = nil) {
         self.id = id
         self.planID = planID
+        self.grade = grade
     }
 }
 

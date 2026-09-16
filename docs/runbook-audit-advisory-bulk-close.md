@@ -5,10 +5,17 @@ The script is dry-run by default, reads its selection identity from the Go
 producer contract, discovers all pages before mutation, and excludes current,
 nonmatching, and already-closed issues.
 
+`scripts/close-stale-audit-advisories.sh` is the canonical audit-advisory
+closer; the earlier `audit-advisory-sweep.sh`, `bulk_close_audit_advisories.sh`,
+and `close_stale_audit_advisories.sh` variants were removed in its favor. The
+separate Go `loom audit-advisory-sweep` subcommand has its own procedure in
+`runbook-audit-advisory-sweep.md`.
+
 ## Prerequisites
 
 - Authenticate `glab` to the target GitLab project with issue update access.
-- Install `jq` and use GNU `date`.
+- Install `jq`. The script derives its cutoff with `jq` clock math rather than
+  `date`, so it runs on both macOS and Linux without GNU coreutils.
 - Reserve an operator window and retain command output as the audit record.
 - Confirm the expected author (`mills-bot` by default), project, and 30-day
   staleness window. Override the window only with an explicit positive

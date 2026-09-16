@@ -69,6 +69,31 @@ func TestStatus_ExposesGitLabBaseURL(t *testing.T) {
 	}
 }
 
+func TestStatus_ExposesBuildSHA(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	previous := version
+	version = "deployed-build-sha"
+	defer func() { version = previous }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/mills/status", nil)
+	op.httpMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		BuildSHA string `json:"build_sha"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.BuildSHA != "deployed-build-sha" {
+		t.Fatalf("build_sha: got %q want deployed-build-sha", resp.BuildSHA)
+	}
+}
+
 // TestStatus_GitLabBaseURL_EmptyWhenUnset confirms the field is present but
 // empty when no API URL is configured, so the HUD degrades to an iid chip
 // rather than a broken link.

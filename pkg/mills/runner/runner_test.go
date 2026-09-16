@@ -51,15 +51,20 @@ human_handoff:
   on_escalation_create_issue: true
 `
 
-// Regression: the production 35B reviewer backend can queue parallel lens
-// calls beyond the old 30-second deadline. The deadline must cover at least
-// two such slots so a three-lens dispatch can still reach majority quorum.
-func TestCouncilReviewerTimeoutCoversQueuedLocalInference(t *testing.T) {
-	if councilReviewerTimeout < 90*time.Second {
-		t.Fatalf("councilReviewerTimeout = %s, want at least 90s", councilReviewerTimeout)
+// Regression: the production reviewer backend is parked between councils and
+// cold-loads on the first lens call (~66s observed on COUNCIL-2026-09-02-000053
+// before "model ready, draining queue"), then needs ~40s to generate a
+// 384-token review. The deadline must cover a cold load plus generation, and
+// the Reviewers stage envelope must still enclose it.
+func TestCouncilReviewerTimeoutCoversColdLoadPlusGeneration(t *testing.T) {
+	if councilReviewerTimeout < 150*time.Second {
+		t.Fatalf("councilReviewerTimeout = %s, want at least 150s (66s cold load + generation)", councilReviewerTimeout)
 	}
-	if councilReviewerTimeout > 2*time.Minute {
+	if councilReviewerTimeout > 4*time.Minute {
 		t.Fatalf("councilReviewerTimeout = %s, want a bounded deadline", councilReviewerTimeout)
+	}
+	if env := DefaultStageBudgets().Reviewers; env <= councilReviewerTimeout {
+		t.Fatalf("Reviewers stage budget %s must exceed the per-lens deadline %s", env, councilReviewerTimeout)
 	}
 }
 
@@ -231,7 +236,9 @@ func TestRun_HappyPathPersistsEverything(t *testing.T) {
 	if len(got.BacklogDeltas.Created) != 2 {
 		t.Errorf("persisted backlog deltas: %+v", got.BacklogDeltas)
 	}
-	if got.Notes != "test; fake" {
+	// The mutator's accounting rides the run row since 2026-09-02 so a
+	// zero-yield run explains itself without the (best-effort) audit rows.
+	if got.Notes != "test; fake; mutator: created=2 proposed=2" {
 		t.Errorf("notes: %q", got.Notes)
 	}
 	if total := got.CostFrontierUSD + got.CostLocalUSD; abs(total-(0.42+0.10+0.05)) > 1e-6 {

@@ -1,0 +1,1 @@
+- Fixed cross-repository Mills merge requests in `pkg/mills/clients/gitlab.go` and `pkg/mills/clients/git_merger.go` to target each GitLab project's cached default branch instead of assuming `main`.

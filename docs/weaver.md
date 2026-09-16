@@ -30,7 +30,7 @@ work that would otherwise require multiple turns.
 │ pkg/aimodels — role resolver                                        │
 │   weaver-router      → qwen3-1p7b-tools-radeonvii (with fallbacks)  │
 │   weaver-subagent    → qwen3-8b                                     │
-│   mills-judge        → qwen3-8b                                     │
+│   mills-judge        → LiteLLM: oa/gpt-5.6-luna                     │
 │   coordinator-default→ qwen3-8b                                     │
 │   autofix            → qwen3-8b                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -67,10 +67,19 @@ canonical cluster, **no configuration is required**.
 |---------------------------|-----------------------------|---------------------------------------------|
 | `weaver-router`           | `qwen3-1p7b-tools-radeonvii`| `qwen3-8b`, `fast-text`                     |
 | `weaver-subagent`         | `qwen3-8b`                  | `qwen3-8b-fast-7900xtx`, `fast-text`        |
-| `mills-judge`             | `qwen3-8b`                  | `fast-text`, `gpt-3.5-turbo`                |
+| `mills-judge`             | LiteLLM `oa/gpt-5.6-luna`   | `FLEXINFER_JUDGE_MODEL_FALLBACKS`; FlexInfer if LiteLLM cannot initialize |
 | `mills-research`          | `qwen3-8b`                  | `fast-text`                                 |
 | `coordinator-default`     | `qwen3-8b`                  | `fast-text`                                 |
 | `autofix`                 | `qwen3-8b`                  | `fast-text`                                 |
+
+`mills-judge` is configured separately from the `pkg/aimodels` role
+resolver. The cluster deployment at `platform/gitops/k3s/mills/deployment.yaml`
+selects the LiteLLM backend with `MILLS_JUDGE_BACKEND` and pins the model with
+`FLEXINFER_JUDGE_MODEL`. Its ordered model degrade chain is configured by
+`FLEXINFER_JUDGE_MODEL_FALLBACKS`; LiteLLM initialization failures fall back to
+the FlexInfer judge. For a failing primary verdict that disagrees with passing
+deterministic tests, the gate can request a second-family Anthropic tiebreaker.
+This applies to the Mills `spec_conformance` and `pr_self_review` gates.
 
 ### Override file (optional)
 

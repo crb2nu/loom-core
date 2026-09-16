@@ -637,3 +637,24 @@ func TestSpin_OuterCancelNotMisreportedAsPhaseTimeout(t *testing.T) {
 		t.Fatal("want an error on a cancelled outer context")
 	}
 }
+
+func TestSpinFramePersistsFallbackNotes(t *testing.T) {
+	out := slicedOutput()
+	out.Backend = "openai"
+	out.Model = "gpt-5.5"
+	out.CostUSD = 3
+	out.Sidecar.Notes = "existing note"
+	out.FallbackHops = []council.EditorFallbackHop{{Primary: "anthropic:opus", Destination: "openai:gpt-5.5", Kind: "billing"}}
+	author := &fakeAuthor{planID: "draft"}
+	s := newSpinner(Frame{Name: "jacquard", Backend: "anthropic", Model: "opus"}, &fakeEditor{out: out}, nil, author)
+	got, err := s.Spin(context.Background(), Request{Frame: "jacquard", Brief: "Build retries"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "gpt-5.5" || got.Backend != "openai" || got.CostUSD != 3 {
+		t.Fatalf("%+v", got)
+	}
+	if len(author.got.Notes) != 2 || author.got.Notes[0] != "existing note" || author.got.Notes[1] != "frame=jacquard primary=anthropic:opus fell back to openai:gpt-5.5: billing" {
+		t.Fatalf("%+v", author.got.Notes)
+	}
+}

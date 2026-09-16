@@ -28,8 +28,8 @@ func (g *Generator) generateClaudeSkillByType(skill *Skill) ([]string, error) {
 // generateClaudeAgentSkill writes an Agent Skills bundle to
 // <baseDir>/skills/<name>/SKILL.md with copied scripts/references/assets.
 // This is the modern Claude Code surface replacing legacy commands/<name>.md;
-// after a successful write it prunes the skill's stale command file so the
-// two layouts never present the same skill twice.
+// Stale commands are pruned by generateForTarget using manifest ownership
+// after all bundles have been delivered successfully.
 func (g *Generator) generateClaudeAgentSkill(skill *Skill) ([]string, error) {
 	baseDir := g.resolveTargetDir("claude")
 	if baseDir == "" {
@@ -45,6 +45,9 @@ func (g *Generator) generateClaudeAgentSkill(skill *Skill) ([]string, error) {
 		fmt.Printf("[dry-run] Would create Claude agent skill: %s\n", skillDir)
 		return g.codexManifestFiles(skill), nil
 	}
+	if err := validateBundleDestination(baseDir, skillDir, skill); err != nil {
+		return nil, err
+	}
 
 	if err := os.MkdirAll(skillDir, 0755); err != nil {
 		return nil, fmt.Errorf("create skill dir: %w", err)
@@ -59,15 +62,6 @@ func (g *Generator) generateClaudeAgentSkill(skill *Skill) ([]string, error) {
 
 	if err := g.copyBundleResources(skill, skillDir); err != nil {
 		return nil, err
-	}
-
-	// Prune the legacy command file this bundle supersedes. Claude Code would
-	// otherwise keep resolving /name against both layouts.
-	staleCommand := filepath.Join(baseDir, "commands", skill.Name+".md")
-	if _, err := os.Stat(staleCommand); err == nil {
-		if err := os.Remove(staleCommand); err != nil && g.Verbose {
-			fmt.Printf("Warning: could not remove stale command %s: %v\n", staleCommand, err)
-		}
 	}
 
 	return g.codexManifestFiles(skill), nil

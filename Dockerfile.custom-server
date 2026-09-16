@@ -85,9 +85,16 @@ FROM ${PUBLIC_BASE_REGISTRY}/library/alpine:3.24
 #              and mcp-loki exec it directly with no API fallback.
 #   helm    -- mcp-helm execs `helm`; without it every tool returns
 #              `exec: "helm": executable file not found in $PATH`.
+#   nodejs  -- context7 runs the pinned @upstash/context7-mcp package as a
+#              stdio child behind custom-server's HTTP transports.
 #              (mcp-flux is deliberately NOT in this list: it probes for a
 #              `flux` binary but falls back to the Kubernetes API, and
 #              flux_probe reports mode=kubernetes-api in the hub.)
+#   openssh-client -- mcp-asus-router execs `ssh` for every tool; without it
+#              the hub's asus_router server answered every call with
+#              `exec: "ssh": executable file not found in $PATH`
+#              (2026-09-02 alert triage). The key/host come from the
+#              deployment (ASUS_ROUTER_SSH_KEY + an optional Secret mount).
 #
 # helm is pinned to the 3.19 line. The major.minor pin is the part that
 # matters: Flux's helm-controller writes Helm 3 `sh.helm.release.v1` storage
@@ -98,7 +105,9 @@ FROM ${PUBLIC_BASE_REGISTRY}/library/alpine:3.24
 # resolves this to helm 3.19.0-r7. apk resolves the correct arch for the build
 # platform; this image is built single-arch amd64, matching the loom-hub
 # deployments' `nodeSelector: kubernetes.io/arch: amd64`.
-RUN apk add --no-cache ca-certificates kubectl "helm=~3.19"
+RUN apk add --no-cache ca-certificates kubectl "helm=~3.19" nodejs npm openssh-client && \
+    npm install --global --omit=dev --ignore-scripts @upstash/context7-mcp@1.0.26 && \
+    test -x "$(command -v context7-mcp)"
 
 RUN adduser -D -u 1000 mcp
 USER mcp

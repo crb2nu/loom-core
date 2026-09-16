@@ -124,6 +124,16 @@ func (g *Generator) Generate() error {
 }
 
 func (g *Generator) generateForTarget(target string) error {
+	manifestDir := g.resolveTargetDir(target)
+	var prev *Manifest
+	if !g.DryRun && manifestDir != "" {
+		var err error
+		prev, err = ReadManifest(manifestDir)
+		if err != nil {
+			return fmt.Errorf("read previous %s manifest: %w", target, err)
+		}
+	}
+
 	var generatedFiles []string
 	var instructionSkills []*Skill
 	var bundleSkills []*Skill
@@ -157,10 +167,12 @@ func (g *Generator) generateForTarget(target string) error {
 
 		switch target {
 		case "codex":
-			err = g.generateCodexSkill(skill)
-			if err == nil {
-				files = append(files, g.codexManifestFiles(skill)...)
+			prefix, pathErr := filepath.Rel(manifestDir, g.codexSkillsOutputDir())
+			if pathErr != nil || !filepath.IsLocal(prefix) {
+				return fmt.Errorf("codex skills output %s must be within manifest root %s", g.codexSkillsOutputDir(), manifestDir)
 			}
+			files = bundleManifestFiles(skill, prefix)
+			err = g.generateCodexSkill(skill)
 		case "claude":
 			files, err = g.generateClaudeSkillByType(skill)
 		case "kilocode":
@@ -205,30 +217,21 @@ func (g *Generator) generateForTarget(target string) error {
 		generatedFiles = append(generatedFiles, files...)
 	}
 
-	// Prune files a previous run generated that this run no longer produces
-	// (skills deleted from the registry), then write the new manifest.
-	if !g.DryRun {
-		manifestDir := g.resolveTargetDir(target)
-		if manifestDir != "" {
-			prev, err := ReadManifest(manifestDir)
-			if err != nil && g.Verbose {
-				fmt.Printf("Warning: could not read previous manifest for %s: %v\n", target, err)
+	// Publish only after delivery and ownership-aware stale pruning succeed.
+	if !g.DryRun && manifestDir != "" {
+		removed, err := PruneManifest(manifestDir, prev, generatedFiles)
+		if err != nil {
+			return fmt.Errorf("prune stale %s skill files: %w", target, err)
+		}
+		if g.Verbose {
+			for _, rel := range removed {
+				fmt.Printf("Pruned stale %s skill file: %s\n", target, rel)
 			}
-			if prev != nil {
-				removed := PruneStaleGenerated(manifestDir, prev.Generated, generatedFiles)
-				if g.Verbose {
-					for _, rel := range removed {
-						fmt.Printf("Pruned stale %s skill file: %s\n", target, rel)
-					}
-				}
-			}
-			if len(generatedFiles) > 0 || prev != nil {
-				if err := WriteManifest(manifestDir, target, generatedFiles); err != nil {
-					if g.Verbose {
-						fmt.Printf("Warning: could not write manifest for %s: %v\n", target, err)
-					}
-				}
-			}
+		}
+		// An empty desired set still needs a manifest so a fresh repo mirror
+		// can retire files from an older home installation.
+		if err := WriteManifest(manifestDir, target, generatedFiles); err != nil {
+			return fmt.Errorf("write %s manifest: %w", target, err)
 		}
 	}
 
@@ -241,8 +244,8 @@ func (g *Generator) resolveTargetDir(target string) string {
 		if g.CodexRootDir != "" {
 			return g.CodexRootDir
 		}
-		if g.RepoRoot != "" {
-			return filepath.Join(g.RepoRoot, ".codex")
+		if g.OutputDir != "" || g.CodexSkillsDir != "" {
+			return filepath.Dir(g.codexSkillsOutputDir())
 		}
 		if g.CodexHome != "" {
 			return g.CodexHome
@@ -267,7 +270,11 @@ func (g *Generator) resolveTargetDir(target string) string {
 }
 
 func (g *Generator) codexManifestFiles(skill *Skill) []string {
-	files := []string{filepath.Join("skills", skill.Name, "SKILL.md")}
+	return bundleManifestFiles(skill, "skills")
+}
+
+func bundleManifestFiles(skill *Skill, prefix string) []string {
+	files := []string{filepath.Join(prefix, skill.Name, "SKILL.md")}
 	seen := map[string]struct{}{files[0]: {}}
 
 	add := func(path string) {
@@ -286,13 +293,13 @@ func (g *Generator) codexManifestFiles(skill *Skill) []string {
 			if script == nil || script.Path == "" {
 				continue
 			}
-			add(filepath.Join("skills", skill.Name, script.Path))
+			add(filepath.Join(prefix, skill.Name, script.Path))
 		}
 		for _, ref := range skill.Common.References {
-			add(filepath.Join("skills", skill.Name, "references", ref))
+			add(filepath.Join(prefix, skill.Name, "references", ref))
 		}
 		for _, asset := range skill.Common.Assets {
-			add(filepath.Join("skills", skill.Name, "assets", asset))
+			add(filepath.Join(prefix, skill.Name, "assets", asset))
 		}
 	}
 

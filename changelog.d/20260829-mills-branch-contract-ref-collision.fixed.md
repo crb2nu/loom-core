@@ -1,0 +1,1 @@
+- Prevent Mills implement spawns from producing husk branches when a legacy item ref conflicts with the nested slice contract branch by preflighting origin refs, safely retiring unused same-item refs, and failing foreign collisions before spawn (`pkg/mills/pipeline`, `cmd/loom-mills-operator`, and `docs/MILLS_RUNBOOK.md`).

@@ -1,0 +1,1 @@
+- Fixed `pkg/mills/pipeline`, `pkg/mills/clients`, and `cmd/mcp-devbox` so Mills tests resolve and check out the pushed GitLab branch head or fail closed, while Go test commands bypass cached results.

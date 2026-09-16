@@ -1,0 +1,1 @@
+- Tag merge-queue-minted pipelines with queue and MR variables, give their critical CI jobs a 3/4-CPU lane, and expose GitLab wall and queued duration histograms (`pkg/mills/mergequeue`, `pkg/mills/clients`, `.gitlab-ci.yml`, `pkg/mills/metrics.go`, and `docs/MILLS_RUNBOOK.md`).

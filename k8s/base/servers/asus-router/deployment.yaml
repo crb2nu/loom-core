@@ -26,12 +26,21 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - env:
+            # In-cluster there is no ~/.ssh/config, so the workstation alias
+            # `asus-router` does not resolve; address the router directly.
             - name: ASUS_ROUTER_HOST
-              value: asus-router
+              value: 192.168.50.1
             - name: ASUS_ROUTER_PORT
               value: "2222"
             - name: ASUS_ROUTER_USER
               value: admin
+            # Identity for the router's admin user, mounted from the optional
+            # `asus-router-ssh` Secret (key `id_ed25519`, SOPS-managed in
+            # platform/gitops). Until that Secret exists the mount is empty
+            # and every tool fails with a clear "No such identity" instead of
+            # the pre-2026-09-02 `exec: "ssh": executable file not found`.
+            - name: ASUS_ROUTER_SSH_KEY
+              value: /etc/asus-router/id_ed25519
             - name: MCP_TRANSPORT
               value: websocket
             - name: MCP_WS_PORT
@@ -73,6 +82,17 @@ spec:
               drop:
                 - ALL
             readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: ssh-key
+              mountPath: /etc/asus-router
+              readOnly: true
+      volumes:
+        - name: ssh-key
+          secret:
+            secretName: asus-router-ssh
+            # ssh refuses group/world-readable identities; 0400 for uid 1000.
+            defaultMode: 0400
+            optional: true
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true

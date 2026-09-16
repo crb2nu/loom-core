@@ -3,14 +3,10 @@
   import { fleetStore } from '../stores/fleet.svelte.ts';
   import { presenceStore } from '../stores/presence.svelte.ts';
   import { presenceActionsStore } from '../stores/presenceActions.svelte.ts';
-  import { summarizeUnifiedAgents } from '../utils/agents.ts';
-  import PresenceAgentsTab from './presence/PresenceAgentsTab.svelte';
   import PresenceClaimsTab from './presence/PresenceClaimsTab.svelte';
   import PresenceWorktreesTab from './presence/PresenceWorktreesTab.svelte';
   import PresenceHandoffsTab from './presence/PresenceHandoffsTab.svelte';
   import PresenceDiagnosticsTab from './presence/PresenceDiagnosticsTab.svelte';
-  import DispatchTaskModal from './presence/DispatchTaskModal.svelte';
-  import NudgeAgentModal from './presence/NudgeAgentModal.svelte';
   import CreateHandoffModal from './presence/CreateHandoffModal.svelte';
   import PanelHeader from './shared/PanelHeader.svelte';
   import ErrorBanner from './shared/ErrorBanner.svelte';
@@ -59,8 +55,10 @@
     );
   }
 
+  // The roster itself lives on Fleet (the Agents tab was retired 2026-08-30;
+  // its Task/Nudge actions moved to Fleet's rows). `agents` stays for the
+  // Diagnostics tab and the header count.
   let agents = $derived(suppressLegacyCodexBootstrapAgents(fleetStore.unifiedAgents ?? []));
-  let agentSummary = $derived(summarizeUnifiedAgents(agents));
   let claims = $derived(fleetStore.fileClaims ?? []);
   let worktrees = $derived(presenceStore.worktrees ?? []);
   let fileConflicts = $derived.by(() => {
@@ -73,13 +71,8 @@
       .filter(([, owners]) => owners.length > 1)
       .map(([path, owners]) => ({ path, agents: [...new Set(owners)] }));
   });
-  let showOfflineAgents = $state(false);
-  let visibleAgents = $derived(
-    showOfflineAgents ? agents : agents.filter((agent) => agent.status !== 'offline')
-  );
-
   // --- Tab management ---
-  let activeTab = $state('agents');
+  let activeTab = $state('claims');
 
   function setActiveTab(nextTab: string) {
     activeTab = nextTab;
@@ -90,9 +83,6 @@
       presenceActionsStore.refreshHandoffs();
     }
   });
-
-  // --- Agents view toggle: table vs cards ---
-  let agentView = $state('cards');
 </script>
 
 <div class="panel presence-panel">
@@ -100,14 +90,6 @@
 
   <!-- Tab bar -->
   <div class="tab-bar">
-    <button class="tab-btn" class:active={activeTab === 'agents'} onclick={() => setActiveTab('agents')}>
-      Agents
-      <span class="status-chips">
-        <span class="status-chip chip-active" title="Active">{agentSummary.active_agents}</span>
-        <span class="status-chip chip-idle" title="Idle">{agentSummary.idle_agents}</span>
-        <span class="status-chip chip-offline" title="Offline">{agentSummary.offline_agents}</span>
-      </span>
-    </button>
     <button class="tab-btn" class:active={activeTab === 'claims'} onclick={() => setActiveTab('claims')}>
       Claims <span class="tab-count">{claims.length}</span>
     </button>
@@ -125,34 +107,6 @@
       <span class="conflict-badge" title="{fileConflicts.length} file(s) claimed by multiple agents">
         ⚠ {fileConflicts.length} conflicts
       </span>
-    {/if}
-    {#if activeTab === 'agents'}
-      <div class="agent-filter-toggle" role="group" aria-label="Agent visibility filter">
-        <button
-          class="filter-chip"
-          class:active={!showOfflineAgents}
-          aria-pressed={!showOfflineAgents}
-          onclick={() => { showOfflineAgents = false; }}
-          title="Show active and idle agents"
-        >
-          Live
-          <span class="filter-chip-count">{agentSummary.live_agents}</span>
-        </button>
-        <button
-          class="filter-chip"
-          class:active={showOfflineAgents}
-          aria-pressed={showOfflineAgents}
-          onclick={() => { showOfflineAgents = true; }}
-          title="Include offline agents"
-        >
-          All
-          <span class="filter-chip-count">{agents.length}</span>
-        </button>
-      </div>
-      <div class="view-toggle" role="group" aria-label="Agent list layout">
-        <button class="toggle-btn" class:active={agentView === 'cards'} aria-pressed={agentView === 'cards'} aria-label="Card view" onclick={() => { agentView = 'cards'; }} title="Card view">{'\u25A3'}</button>
-        <button class="toggle-btn" class:active={agentView === 'table'} aria-pressed={agentView === 'table'} aria-label="Table view" onclick={() => { agentView = 'table'; }} title="Table view">{'\u2261'}</button>
-      </div>
     {/if}
   </div>
 
@@ -172,23 +126,7 @@
   {/if}
 
   <div class="tab-content">
-    {#if activeTab === 'agents'}
-      <PresenceAgentsTab
-        agents={visibleAgents}
-        {claims}
-        {worktrees}
-        activeCount={agentSummary.active_agents}
-        idleCount={agentSummary.idle_agents}
-        offlineCount={agentSummary.offline_agents}
-        claimedFilesCount={new Set(claims.map((claim) => claim.file_path)).size}
-        showOfflineAgents={showOfflineAgents}
-        hiddenOfflineCount={showOfflineAgents ? 0 : agentSummary.offline_agents}
-        {agentView}
-        onOpenDispatch={(agentId) => presenceActionsStore.onOpenDispatch(agentId)}
-        onOpenNudge={(agentId) => presenceActionsStore.onOpenNudge(agentId)}
-      />
-
-    {:else if activeTab === 'claims'}
+    {#if activeTab === 'claims'}
       <PresenceClaimsTab
         {claims}
         {fileConflicts}
@@ -213,8 +151,6 @@
   </div>
 </div>
 
-<DispatchTaskModal />
-<NudgeAgentModal />
 <CreateHandoffModal />
 
 <style>
@@ -282,117 +218,22 @@
     color: var(--fg-dim);
   }
 
-  .status-chips {
-    display: inline-flex;
-    gap: 3px;
-    margin-left: 2px;
-  }
 
-  .status-chip {
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    padding: 1px 5px;
-    border-radius: var(--radius-full);
-    line-height: 1.3;
-  }
 
-  .chip-active {
-    background: var(--success-dim);
-    color: var(--success);
-  }
 
-  .chip-idle {
-    background: var(--warning-dim);
-    color: var(--warning);
-  }
 
-  .chip-offline {
-    background: var(--bg-primary);
-    color: var(--fg-dim);
-  }
 
   .tab-spacer { flex: 1; }
 
-  /* Bare flex row, matching TracesPanel's `.chip-row`: the chips carry their
-     own pill background and border, so a segmented-control tray behind them
-     read as a second, competing container. */
-  .agent-filter-toggle {
-    display: flex;
-    gap: var(--space-1);
-    margin-right: 6px;
-  }
 
-  /* Shape borrowed verbatim from TracesPanel's `.filter-chip` so the HUD has
-     one filter-pill language. */
-  .filter-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
-    font-family: var(--font-sans);
-    font-size: var(--text-xs);
-    color: var(--fg-muted);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-full);
-    cursor: pointer;
-    line-height: 1;
-    transition: all var(--transition-fast);
-  }
 
-  .filter-chip:hover {
-    color: var(--fg-primary);
-    background: var(--bg-tertiary);
-  }
 
-  .filter-chip.active {
-    color: var(--fg-primary);
-    border-color: color-mix(in srgb, var(--info) 30%, var(--border));
-    background: color-mix(in srgb, var(--info) 10%, var(--bg-tertiary));
-  }
 
-  .filter-chip:focus-visible {
-    outline: 2px solid var(--info);
-    outline-offset: 2px;
-    border-radius: var(--radius-sm);
-  }
 
-  .filter-chip-count {
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    color: inherit;
-    opacity: 0.85;
-  }
 
-  .view-toggle {
-    display: flex;
-    gap: 2px;
-    background: var(--bg-primary);
-    border-radius: var(--radius-sm);
-    padding: 2px;
-  }
 
-  .toggle-btn {
-    padding: 3px var(--space-2);
-    font-size: var(--text-sm);
-    color: var(--fg-muted);
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    line-height: 1;
-    transition: all var(--transition-fast);
-  }
 
-  .toggle-btn:hover {
-    color: var(--fg-primary);
-    background: var(--bg-tertiary);
-  }
 
-  .toggle-btn.active {
-    color: var(--fg-primary);
-    background: var(--bg-elevated);
-  }
 
   .conflict-badge {
     font-size: var(--text-xs);

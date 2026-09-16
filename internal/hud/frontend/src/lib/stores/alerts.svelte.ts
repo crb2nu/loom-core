@@ -168,6 +168,34 @@ export function isZeroTime(ts: string | null | undefined): boolean {
   return !ts || ts.startsWith('0001-01-01');
 }
 
+/**
+ * Condition types the engine's Evaluate switch actually implements
+ * (internal/hud/alerting/engine.go). PUT accepts ANY string and an unknown
+ * type is then silently never evaluated, so the editor restricts input to
+ * this set instead of trusting the backend to complain.
+ */
+export const KNOWN_RULE_CONDITION_TYPES = [
+  'pipeline_failed',
+  'consecutive_failures',
+  'pipeline_stuck',
+] as const;
+
+/** Parse "30s" / "5m" / "2h" / "1d" (or a bare number of minutes) into Go
+ * time.Duration NANOSECONDS — the inverse of formatGoDuration. Returns null
+ * on garbage so callers can hold the dialog open instead of writing 5ns
+ * cooldowns. */
+export function parseGoDuration(input: string): number | null {
+  const s = input.trim().toLowerCase();
+  if (s === '' || s === '—' || s === '0') return 0;
+  const m = /^(\d+(?:\.\d+)?)\s*(s|m|h|d)?$/.exec(s);
+  if (!m) return null;
+  const value = Number(m[1]);
+  if (!Number.isFinite(value) || value < 0) return null;
+  const unit = m[2] ?? 'm';
+  const perUnitSecs = unit === 's' ? 1 : unit === 'm' ? 60 : unit === 'h' ? 3600 : 86400;
+  return Math.round(value * perUnitSecs) * 1e9;
+}
+
 /** Message the alerting handlers use when an engine is nil. */
 const NOT_CONFIGURED = 'not configured';
 
@@ -179,10 +207,10 @@ const NOT_CONFIGURED = 'not configured';
  */
 async function postAlerting<T>(
   url: string,
-  opts: { requireToken?: boolean; action?: string; body?: unknown } = {},
+  opts: { requireToken?: boolean; action?: string; body?: unknown; method?: 'POST' | 'PUT' } = {},
 ): Promise<{ data: T | null; notConfigured: boolean }> {
   const res = await adminFetch(url, {
-    method: 'POST',
+    method: opts.method ?? 'POST',
     requireToken: opts.requireToken ?? false,
     action: opts.action ?? 'This action',
     headers: opts.body === undefined ? undefined : { 'content-type': 'application/json' },
@@ -283,6 +311,46 @@ class AlertsStore {
 
   get enabledRuleCount(): number {
     return this.rules.filter((r) => r.enabled).length;
+  }
+
+  /** True while a rules PUT is in flight, for row/dialog button state. */
+  savingRules = $state(false);
+
+  /**
+   * Mutate the alert-rule set through the operator's whole-set-replace PUT.
+   * The contract has no CAS and no server-side validation, so the safety
+   * lives here:
+   *  - the mutator runs against a FRESH GET, not the possibly-20s-stale
+   *    poll cache — re-read-then-write is the only clobber protection the
+   *    endpoint offers;
+   *  - `last_fired` rides along verbatim (it carries live cooldown state —
+   *    zeroing it would re-arm every rule on the next evaluate cycle);
+   *  - an empty result is refused unless `allowEmpty` — `{"rules": []}`
+   *    (or null) silently wipes the whole set.
+   * Throws on failure so callers ride the runAdminAction toast path.
+   * NOTE: rules are engine-memory only — a PUT survives until the HUD
+   * process restarts, then the built-in defaults return. The panel says so.
+   */
+  async updateRules(
+    mutate: (fresh: AlertRule[]) => AlertRule[],
+    opts: { allowEmpty?: boolean } = {},
+  ): Promise<number> {
+    this.savingRules = true;
+    try {
+      const current = await fetchJSON<RulesResponse>('/api/alerts/rules', { absentStatuses: [] });
+      const next = mutate([...(current?.rules ?? [])]);
+      if (!Array.isArray(next) || (next.length === 0 && !opts.allowEmpty)) {
+        throw new Error('refusing to write an empty rule set');
+      }
+      const { data } = await postAlerting<{ updated: boolean; count: number }>(
+        '/api/alerts/rules',
+        { method: 'PUT', requireToken: false, action: 'Update alert rules', body: { rules: next } },
+      );
+      await this.fetch();
+      return data?.count ?? next.length;
+    } finally {
+      this.savingRules = false;
+    }
   }
 
   async fetch(): Promise<void> {

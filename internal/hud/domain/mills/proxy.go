@@ -10,16 +10,24 @@ import (
 	"time"
 )
 
+// OperatorTokenHeader carries a caller's own operator admin token through
+// the HUD to the operator. The proxy consumes it and forwards it as the
+// upstream Bearer on mutations, in preference to the HUD's configured
+// copy. CLI callers filing backlog items through the HUD use it; the
+// browser and mobile clients never do.
+const OperatorTokenHeader = "X-Loom-Operator-Token"
+
 // operatorProxy is a thin reverse proxy that forwards /api/mills/* from
 // the HUD to the in-cluster loom-mills-operator. It:
 //
 //   - rewrites Host so the upstream sees its own service name
-//   - injects Authorization: Bearer <admin-token> when the request is a
-//     mutation (POST/PUT/PATCH/DELETE) AND the caller didn't already
-//     supply one (HUD admin token is the source of truth here; the
-//     operator token never reaches the browser)
-//   - drops hop-by-hop headers + the HUD's own bearer (so we never leak
-//     it to the operator)
+//   - on mutations (POST/PUT/PATCH/DELETE) sets Authorization: Bearer to
+//     the caller's OperatorTokenHeader when present, else to the HUD's
+//     configured operator token; a caller-sent Authorization header is
+//     replaced either way, because browser and mobile sessions
+//     authenticate to the HUD with tokens the operator must never see
+//   - drops hop-by-hop headers + the HUD's own admin header (so we never
+//     leak it to the operator)
 //
 // The upstream URL is fixed for the lifetime of the HUD process. Config
 // hot-reload would require recreating the proxy; not needed for v1.
@@ -102,9 +110,27 @@ func (p *operatorProxy) director(req *http.Request) {
 	// Strip the HUD's own admin-token header — the operator has its own
 	// admin gate and shouldn't trust anything the browser sent. Then
 	// inject the operator's admin token for mutations.
+	//
+	// A caller that holds the operator admin token itself (a CLI or script
+	// filing backlog items) sends it as X-Loom-Operator-Token and it wins
+	// over the HUD's copy. The header is consumed here so the operator only
+	// ever sees Authorization. The Authorization header the caller sent is
+	// still replaced on mutations: browser and mobile sessions authenticate
+	// to the HUD with their own tokens, which the operator must never
+	// receive. Before this seam the HUD's possibly stale copy silently
+	// overwrote a valid caller token (2026-09-12: 401 "invalid admin token"
+	// from the operator although the caller's token matched the cluster
+	// secret).
 	req.Header.Del("X-Loom-Admin-Token")
-	if p.token != "" && isMutation(req.Method) {
-		req.Header.Set("Authorization", "Bearer "+p.token)
+	callerToken := strings.TrimSpace(req.Header.Get(OperatorTokenHeader))
+	req.Header.Del(OperatorTokenHeader)
+	if isMutation(req.Method) {
+		switch {
+		case callerToken != "":
+			req.Header.Set("Authorization", "Bearer "+callerToken)
+		case p.token != "":
+			req.Header.Set("Authorization", "Bearer "+p.token)
+		}
 	}
 	// Identify ourselves so operator audit logs show the call origin.
 	if ua := req.Header.Get("User-Agent"); ua == "" {

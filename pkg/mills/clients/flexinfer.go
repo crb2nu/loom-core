@@ -81,6 +81,18 @@ type FlexInferConfig struct {
 	// gateway-routable ids) — a backend-local degrade chain. Left false
 	// (the default) the FlexInfer-proxy behavior is byte-identical.
 	DisableRegistryFallbacks bool
+	// IgnoreJudgeFallbackEnv / IgnoreWeaverFallbackEnv stop the constructor
+	// consulting FLEXINFER_JUDGE_MODEL_FALLBACKS / FLEXINFER_WEAVER_MODEL_
+	// FALLBACKS for that role. The env lists are role-scoped and belong to
+	// whichever backend MILLS_JUDGE_BACKEND / MILLS_WEAVER_BACKEND selects; when
+	// that is the LiteLLM gateway the ids are gateway-routable (or/kimi-k2.7-
+	// code) and a FlexInfer-proxy client that inherited them would walk a
+	// degrade chain the proxy cannot serve. The operator sets these on the
+	// proxy client for exactly the roles it has moved to the gateway, so the
+	// proxy client's chain for that role comes from the aimodels registry
+	// alone (blank primary + registry fallbacks: FlexInfer GPU ids only).
+	IgnoreJudgeFallbackEnv  bool
+	IgnoreWeaverFallbackEnv bool
 	// Token, when set, is sent as a Bearer auth header (the proxy
 	// supports OAuth bearer in front of vLLM).
 	Token string
@@ -154,7 +166,7 @@ func NewFlexInferClient(cfg FlexInferConfig) (*FlexInferClient, error) {
 	// instead of re-dialing the same unservable model. Env override first,
 	// then (registry clients only) the role chain.
 	if len(cfg.JudgeModelFallbacks) == 0 {
-		cfg.JudgeModelFallbacks = degradeChain(cfg.JudgeModel, "FLEXINFER_JUDGE_MODEL_FALLBACKS", aimodels.RoleMillsJudge, allowRegistry)
+		cfg.JudgeModelFallbacks = degradeChain(cfg.JudgeModel, "FLEXINFER_JUDGE_MODEL_FALLBACKS", aimodels.RoleMillsJudge, allowRegistry, !cfg.IgnoreJudgeFallbackEnv)
 	}
 	if cfg.WeaverModel == "" && allowRegistry {
 		chain := aimodels.DefaultResolver().ResolveWithFallbacks(aimodels.RoleMillsResearch)
@@ -167,7 +179,7 @@ func NewFlexInferClient(cfg FlexInferConfig) (*FlexInferClient, error) {
 		}
 	}
 	if len(cfg.WeaverModelFallbacks) == 0 {
-		cfg.WeaverModelFallbacks = degradeChain(cfg.WeaverModel, "FLEXINFER_WEAVER_MODEL_FALLBACKS", aimodels.RoleMillsResearch, allowRegistry)
+		cfg.WeaverModelFallbacks = degradeChain(cfg.WeaverModel, "FLEXINFER_WEAVER_MODEL_FALLBACKS", aimodels.RoleMillsResearch, allowRegistry, !cfg.IgnoreWeaverFallbackEnv)
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 5 * time.Minute
@@ -237,13 +249,18 @@ func (c *FlexInferClient) RegistryFallbacksDisabled() bool {
 // degradeChain resolves the ordered fallback models a PINNED primary (one the
 // registry didn't resolve, so it has no automatic role chain) walks to when it
 // 404s or 503-parks. Precedence: the FLEXINFER_*_MODEL_FALLBACKS env override
-// (comma-separated), then — only when allowRegistry is true — the aimodels role
-// chain. The primary itself is filtered out so it is never re-dialed as its own
-// fallback. A LiteLLM-gateway client passes allowRegistry=false so it never
-// inherits FlexInfer-proxy model ids the gateway can't route (backend-local
-// degrade: env-listed litellm ids or nothing).
-func degradeChain(primary, envKey string, role aimodels.Role, allowRegistry bool) []string {
-	src := splitModelList(os.Getenv(envKey))
+// (comma-separated, consulted only when allowEnv is true), then — only when
+// allowRegistry is true — the aimodels role chain. The primary itself is
+// filtered out so it is never re-dialed as its own fallback. A LiteLLM-gateway
+// client passes allowRegistry=false so it never inherits FlexInfer-proxy model
+// ids the gateway can't route (backend-local degrade: env-listed litellm ids or
+// nothing); the proxy client passes allowEnv=false for a role the operator has
+// moved to the gateway so the mirror-image leak cannot happen either.
+func degradeChain(primary, envKey string, role aimodels.Role, allowRegistry, allowEnv bool) []string {
+	var src []string
+	if allowEnv {
+		src = splitModelList(os.Getenv(envKey))
+	}
 	if len(src) == 0 && allowRegistry {
 		src = aimodels.DefaultResolver().ResolveWithFallbacks(role)
 	}

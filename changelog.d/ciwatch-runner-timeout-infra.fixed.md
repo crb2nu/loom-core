@@ -1,0 +1,1 @@
+- Classify typed all-runner-timeout CI failures in `pkg/mills/pipeline/error_class.go` and `pkg/mills/pipeline/failure_classifier.go` as free-retry GitLab CI infrastructure incidents.

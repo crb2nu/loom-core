@@ -75,16 +75,26 @@ type Backend interface {
 
 // BuildOpts configures an image build.
 type BuildOpts struct {
-	Tag            string // image tag (e.g., "mcp/devbox/loom-core:a3b9c1d")
-	Dockerfile     []byte // generated Dockerfile content
-	ContextDir     string // build context directory (project dir)
-	PreferExisting bool   // when true, return/reuse Tag if it already exists
+	Tag             string // image tag (e.g., "mcp/devbox/loom-core:a3b9c1d")
+	Dockerfile      []byte // generated Dockerfile content
+	ContextDir      string // build context directory (project dir)
+	PreferExisting  bool   // when true, return/reuse Tag if it already exists
+	DetectBaseImage bool   // inspect the hydrated build context and select a registered base image
 }
 
 // BuildResult describes the outcome of an image build.
 type BuildResult struct {
-	ImageTag string `json:"image_tag"`
-	Cached   bool   `json:"cached"`
+	ImageTag          string             `json:"image_tag"`
+	Cached            bool               `json:"cached"`
+	BaseImageFallback *BaseImageFallback `json:"base_image_fallback,omitempty"`
+}
+
+// BaseImageFallback describes a build whose detected runtime did not have a
+// registered pre-built base image.
+type BaseImageFallback struct {
+	Language string `json:"language"`
+	Version  string `json:"version"`
+	Reason   string `json:"reason"`
 }
 
 // SecretEnvVar describes an environment variable sourced from a K8s Secret.
@@ -135,17 +145,18 @@ type SecretMountItem struct {
 
 // StartOpts configures a sandbox container start.
 type StartOpts struct {
-	Name         string            // container name (e.g., "devbox-loom-core")
-	ImageTag     string            // image to use
-	WorkDir      string            // working directory inside container (default: "/workspace")
-	Mounts       []Mount           // bind mounts
-	Env          map[string]string // environment variables
-	SecretEnv    []SecretEnvVar    // env vars sourced from K8s secrets (K8s backend only)
-	SecretMounts []SecretMount     // files from K8s secrets mounted into the container
-	MemoryMB     int               // memory limit in MB (0 = no limit)
-	CPUs         float64           // CPU limit (0 = no limit)
-	Network      bool              // enable networking
-	AgentID      string            // owning agent ID (used as pod label in K8s backend)
+	Name           string            // container name (e.g., "devbox-loom-core")
+	ImageTag       string            // image to use
+	WorkDir        string            // working directory inside container (default: "/workspace")
+	GitProjectPath string            // repo path relative to GitBaseURL; defaults to WorkDir basename
+	Mounts         []Mount           // bind mounts
+	Env            map[string]string // environment variables
+	SecretEnv      []SecretEnvVar    // env vars sourced from K8s secrets (K8s backend only)
+	SecretMounts   []SecretMount     // files from K8s secrets mounted into the container
+	MemoryMB       int               // memory limit in MB (0 = no limit)
+	CPUs           float64           // CPU limit (0 = no limit)
+	Network        bool              // enable networking
+	AgentID        string            // owning agent ID (used as pod label in K8s backend)
 
 	// ManagedByOverride, if non-empty, replaces the default "mcp-devbox"
 	// value for the app.kubernetes.io/managed-by label. Spawn pods set this

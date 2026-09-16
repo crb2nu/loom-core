@@ -1,0 +1,1 @@
+- Make the queued-proof workflow kill-test fail closed on inconclusive live verdicts and contradictory MR proof in `cmd/mills-workflow-killtest/main.go` and `pkg/mills/workflow/workflow.go`.

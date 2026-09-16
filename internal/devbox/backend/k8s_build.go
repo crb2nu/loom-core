@@ -2,11 +2,21 @@ package backend
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/crb2nu/loom/internal/devbox/baseimage"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,14 +42,22 @@ const (
 	// well under the outer buildMaxRetries backoff so a stubborn pod
 	// gets a second eviction attempt without blowing the build budget.
 	podEvictTimeout = 30 * time.Second
+
+	// DefaultBuildTimeout is the per-pod build budget, excluding queue and setup.
+	DefaultBuildTimeout = 30 * time.Minute
+
+	// Setup and diagnostics have their own bounds so they cannot consume a pod's budget.
+	buildSetupTimeout = 5 * time.Minute
 )
 
 func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, error) {
+	queuedAt := time.Now()
 	release, err := k.acquireBuildSlot(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+	slog.Info("build slot acquired", "tag", opts.Tag, "queue_wait", time.Since(queuedAt), "build_timeout", k.effectiveBuildTimeout())
 
 	registryTag := k.registryTag(opts.Tag)
 
@@ -50,9 +68,10 @@ func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, e
 	}
 
 	// Detach from the request context: builds are long-running and must
-	// survive MCP proxy timeouts / client disconnects. Use a generous
-	// build-scoped timeout instead.
-	buildCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	// survive MCP proxy timeouts / client disconnects. Bound setup separately
+	// from each pod wait so neither setup nor retries truncate the pod budget.
+	buildCtx := context.Background()
+	setupCtx, cancel := context.WithTimeout(buildCtx, buildSetupTimeout)
 	defer cancel()
 
 	buildName := sanitizeBuildName(opts.Tag)
@@ -65,12 +84,12 @@ func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, e
 	buildContextDir := "/workspace/" + contextRel
 	if k.syncMode == "tar-pipe" {
 		depFiles := readDepFiles(opts.ContextDir)
-		if err := k.createBuildConfigMap(buildCtx, cmName, opts.Dockerfile, depFiles); err != nil {
+		if err := k.createBuildConfigMap(setupCtx, cmName, opts.Dockerfile, depFiles); err != nil {
 			return nil, fmt.Errorf("create build configmap: %w", err)
 		}
 		buildContextDir = "/buildah-dockerfile"
 	} else {
-		if err := k.createDockerfileConfigMap(buildCtx, cmName, opts.Dockerfile); err != nil {
+		if err := k.createDockerfileConfigMap(setupCtx, cmName, opts.Dockerfile); err != nil {
 			return nil, fmt.Errorf("create dockerfile configmap: %w", err)
 		}
 	}
@@ -82,16 +101,11 @@ func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, e
 
 	var lastErr error
 	for attempt := range buildMaxRetries {
-		result, err := k.runBuildPod(buildCtx, podName, registryTag, cmName, buildContextDir, opts.PreferExisting)
+		result, err := k.runBuildPod(buildCtx, podName, registryTag, cmName, buildContextDir, opts.PreferExisting, opts.DetectBaseImage)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
-
-		// Don't retry on context cancellation
-		if buildCtx.Err() != nil {
-			break
-		}
 
 		if attempt < buildMaxRetries-1 {
 			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
@@ -103,8 +117,27 @@ func (k *K8sBackend) Build(ctx context.Context, opts BuildOpts) (*BuildResult, e
 // runBuildPod creates a Buildah build pod, waits for completion, and returns the result.
 // buildContext is the absolute path inside the pod (e.g., "/workspace/services/loom-core"
 // or "/buildah-dockerfile" for tar-pipe mode).
-func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmName, buildContext string, preferExisting bool) (*BuildResult, error) {
-	pod := k.buildBuildahPodSpec(podName, registryTag, cmName, buildContext, preferExisting)
+func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmName, buildContext string, preferExisting, detectBaseImage bool) (*BuildResult, error) {
+	setupCtx, cancel := context.WithTimeout(ctx, buildSetupTimeout)
+	defer cancel()
+	// A clone-time selection build must inspect the hydrated repository. An
+	// existing empty-fingerprint image may have been built by the legacy static
+	// Go 1.25 path, so it is not a safe cache hit.
+	if preferExisting && !detectBaseImage && k.registryImageExists(setupCtx, registryTag) {
+		return &BuildResult{ImageTag: registryTag, Cached: true}, nil
+	}
+
+	terminalLeftover := false
+	if existing, err := k.clientset.CoreV1().Pods(k.namespace).Get(setupCtx, podName, metav1.GetOptions{}); err == nil {
+		if existing.Status.Phase == corev1.PodPending || existing.Status.Phase == corev1.PodRunning {
+			return k.joinBuildPod(ctx, podName, registryTag)
+		}
+		terminalLeftover = true
+	} else if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("get existing buildah pod: %w", err)
+	}
+
+	pod := k.buildBuildahPodSpec(podName, registryTag, cmName, buildContext, preferExisting, detectBaseImage)
 
 	// Evict any leftover build pod with the same name AND wait for the
 	// terminating pod to actually disappear. The previous code called
@@ -115,19 +148,19 @@ func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmNa
 	// Don't fail outright on eviction timeout — the Create call below
 	// will surface a 409 with the actual error context if the pod is
 	// genuinely still there, and the next retry loop handles that.
-	_ = k.evictPod(ctx, podName, podEvictTimeout)
+	if terminalLeftover {
+		_ = k.evictPod(setupCtx, podName, podEvictTimeout)
+	}
 
-	if _, err := k.clientset.CoreV1().Pods(k.namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-		// Belt-and-suspenders: if the eviction wait was too short
-		// and Create still hit AlreadyExists, evict harder and try
-		// once more before giving up. Combined with the outer
-		// buildMaxRetries this gives the cluster up to ~1 minute to
-		// finish a stubborn termination.
+	if _, err := k.clientset.CoreV1().Pods(k.namespace).Create(setupCtx, pod, metav1.CreateOptions{}); err != nil {
+		// A concurrent caller may have created the deterministic pod after
+		// our initial Get. Join it when active; never evict an in-flight build.
 		if apierrors.IsAlreadyExists(err) {
-			_ = k.evictPod(ctx, podName, podEvictTimeout)
-			if _, retryErr := k.clientset.CoreV1().Pods(k.namespace).Create(ctx, pod, metav1.CreateOptions{}); retryErr != nil {
-				return nil, fmt.Errorf("create buildah pod (after evict retry): %w", retryErr)
+			existing, getErr := k.clientset.CoreV1().Pods(k.namespace).Get(setupCtx, podName, metav1.GetOptions{})
+			if getErr == nil && (existing.Status.Phase == corev1.PodPending || existing.Status.Phase == corev1.PodRunning) {
+				return k.joinBuildPod(ctx, podName, registryTag)
 			}
+			return nil, fmt.Errorf("create buildah pod: %w", err)
 		} else {
 			return nil, fmt.Errorf("create buildah pod: %w", err)
 		}
@@ -136,9 +169,11 @@ func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmNa
 		_ = k.deletePod(context.Background(), podName)
 	}()
 
-	// Wait for the build to complete. First builds can be slow (base image pull
-	// + apt install + npm install + push to registry), so allow 30 minutes.
-	if err := k.waitForPodDone(ctx, podName, 30*time.Minute); err != nil {
+	// Start the full pod budget only after creation.
+	waitErr := k.waitForPodDone(ctx, podName, k.effectiveBuildTimeout())
+	ctx, cancelLogs := context.WithTimeout(ctx, time.Minute)
+	defer cancelLogs()
+	if err := waitErr; err != nil {
 		// A failed git-clone INIT container (repo not found / bad ref / auth)
 		// terminates before buildah runs, so getPodLogs (the buildah container)
 		// is empty and the error is the opaque "container git-clone terminated
@@ -158,25 +193,173 @@ func (k *K8sBackend) runBuildPod(ctx context.Context, podName, registryTag, cmNa
 		strings.Contains(logs, "--> Using cache") ||
 		strings.Contains(logs, "Using existing image")
 
-	return &BuildResult{ImageTag: registryTag, Cached: cached}, nil
+	return &BuildResult{ImageTag: registryTag, Cached: cached, BaseImageFallback: parseBaseImageFallback(logs)}, nil
+}
+
+func (k *K8sBackend) joinBuildPod(ctx context.Context, podName, registryTag string) (*BuildResult, error) {
+	if err := k.waitForPodDone(ctx, podName, k.effectiveBuildTimeout()); err != nil {
+		return nil, fmt.Errorf("buildah build failed: %w", err)
+	}
+	return &BuildResult{ImageTag: registryTag}, nil
+}
+
+var bearerChallengeRE = regexp.MustCompile(`(?i)^Bearer\s+realm="([^"]+)"(?:,service="([^"]*)")?(?:,scope="([^"]*)")?`)
+
+// registryImageExists probes the destination registry with the same pull
+// credentials mounted into Buildah. Probe failures are conservative misses.
+func (k *K8sBackend) registryImageExists(ctx context.Context, image string) bool {
+	host, repo, tag, ok := splitRegistryImage(image)
+	if !ok {
+		return false
+	}
+	scheme := "https"
+	if strings.HasPrefix(host, "localhost:") || strings.HasPrefix(host, "127.0.0.1:") {
+		scheme = "http"
+	}
+	manifestURL := scheme + "://" + host + "/v2/" + repo + "/manifests/" + url.PathEscape(tag)
+	username, password := k.RegistryCredentials(ctx, host)
+	client, err := RegistryClient(10 * time.Second)
+	if err != nil {
+		return false
+	}
+	request := func(token string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, manifestURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		} else if username != "" {
+			req.SetBasicAuth(username, password)
+		}
+		return client.Do(req)
+	}
+	resp, err := request("")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return true
+	}
+	match := bearerChallengeRE.FindStringSubmatch(resp.Header.Get("WWW-Authenticate"))
+	if resp.StatusCode != http.StatusUnauthorized || len(match) == 0 {
+		return false
+	}
+	tokenURL, err := url.Parse(match[1])
+	if err != nil {
+		return false
+	}
+	q := tokenURL.Query()
+	if match[2] != "" {
+		q.Set("service", match[2])
+	}
+	if match[3] != "" {
+		q.Set("scope", match[3])
+	}
+	tokenURL.RawQuery = q.Encode()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL.String(), nil)
+	if username != "" {
+		req.SetBasicAuth(username, password)
+	}
+	tokenResp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer tokenResp.Body.Close()
+	var payload struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+	}
+	if tokenResp.StatusCode/100 != 2 || json.NewDecoder(tokenResp.Body).Decode(&payload) != nil {
+		return false
+	}
+	if payload.Token == "" {
+		payload.Token = payload.AccessToken
+	}
+	resp, err = request(payload.Token)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+func splitRegistryImage(image string) (host, repo, tag string, ok bool) {
+	image = strings.TrimPrefix(strings.TrimPrefix(image, "https://"), "http://")
+	slash := strings.IndexByte(image, '/')
+	colon := strings.LastIndex(image, ":")
+	if slash <= 0 || colon <= slash+1 {
+		return "", "", "", false
+	}
+	return image[:slash], image[slash+1 : colon], image[colon+1:], true
+}
+
+// RegistryCredentials reads credentials for host from the Buildah image pull secret.
+func (k *K8sBackend) RegistryCredentials(ctx context.Context, host string) (string, string) {
+	secret, err := k.clientset.CoreV1().Secrets(k.namespace).Get(ctx, k.imagePullSecret, metav1.GetOptions{})
+	if err != nil {
+		return "", ""
+	}
+	var cfg struct {
+		Auths map[string]struct{ Auth, Username, Password string } `json:"auths"`
+	}
+	if json.Unmarshal(secret.Data[corev1.DockerConfigJsonKey], &cfg) != nil {
+		return "", ""
+	}
+	for registry, auth := range cfg.Auths {
+		if strings.TrimPrefix(strings.TrimPrefix(registry, "https://"), "http://") != host {
+			continue
+		}
+		if auth.Username != "" {
+			return auth.Username, auth.Password
+		}
+		decoded, err := base64.StdEncoding.DecodeString(auth.Auth)
+		if err == nil {
+			if i := strings.IndexByte(string(decoded), ':'); i >= 0 {
+				return string(decoded[:i]), string(decoded[i+1:])
+			}
+		}
+	}
+	return "", ""
+}
+
+// RegistryClient returns the HTTP client shared by build cache and startup probes.
+// Without an explicit CA it mirrors Buildah's tls-verify=false posture.
+func RegistryClient(timeout time.Duration) (*http.Client, error) {
+	tlsConfig := &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- parity with Buildah's explicit tls-verify=false.
+	if caFile := strings.TrimSpace(os.Getenv("DEVBOX_REGISTRY_CA_FILE")); caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read registry CA file: %w", err)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("registry CA file contains no certificates")
+		}
+		tlsConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}, Timeout: timeout}, nil
 }
 
 // buildBuildahPodSpec creates a Pod spec for a Buildah in-cluster build.
 // buildContext is the absolute path inside the pod to use as the Docker build context
 // (e.g., "/workspace/services/loom-core" for NFS/git, "/buildah-dockerfile" for tar-pipe).
-func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, buildContext string, preferExisting bool) *corev1.Pod {
+func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, buildContext string, preferExisting, detectBaseImage bool) *corev1.Pod {
 	gracePeriod := int64(0)
 	runAsUser := int64(0)
 	runAsGroup := int64(0)
 
-	// Cache repo: repository path without tag for --cache-from (buildah v1.29+
+	// Cache repo: repository path without tag for --cache-from and --cache-to (buildah v1.29+
 	// requires a bare repository reference, no tag or digest).
-	// Cache tag: full image:cache reference for tagging and pushing cache layers.
 	cacheRepo := destination
 	if idx := strings.LastIndex(cacheRepo, ":"); idx > 0 {
 		cacheRepo = cacheRepo[:idx]
 	}
-	cacheTag := cacheRepo + ":cache"
 
 	buildSteps := []string{
 		// Configure registries for short-name resolution (non-interactive builds)
@@ -185,7 +368,7 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, bui
 		`printf 'unqualified-search-registries = ["docker.io"]\nshort-name-mode = "permissive"\n' > /etc/containers/registries.conf`,
 		"&&",
 	}
-	if preferExisting {
+	if preferExisting && !detectBaseImage {
 		buildSteps = append(buildSteps,
 			"if command -v skopeo >/dev/null 2>&1 && skopeo inspect --raw --tls-verify=false docker://"+destination+" >/dev/null 2>&1; then",
 			"echo Using existing image "+destination+";",
@@ -205,23 +388,26 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, bui
 			"&&",
 		)
 	}
+	if detectBaseImage {
+		buildSteps = append(buildSteps, clonedRepoBaseSelectionScript(buildContext), "&&")
+	}
+	buildArgs := ""
+	if detectBaseImage {
+		buildArgs = "--build-arg DEVBOX_BASE_IMAGE=\"$DEVBOX_BASE_IMAGE\" "
+	}
 	buildSteps = append(buildSteps,
 		"buildah build-using-dockerfile",
 		"--storage-driver=vfs",
 		"--isolation=chroot",
 		"--tls-verify=false",
-		"--layers",
+		"--layers", buildArgs,
 		"--cache-from="+cacheRepo,
+		"--cache-to="+cacheRepo,
 		"-f /buildah-dockerfile/Dockerfile",
 		"-t "+destination,
 		buildContext,
 		"&&",
 		"buildah push --storage-driver=vfs --tls-verify=false "+destination,
-		"&&",
-		// Push a cache tag so future builds can use --cache-from
-		"buildah tag --storage-driver=vfs "+destination+" "+cacheTag,
-		"&&",
-		"buildah push --storage-driver=vfs --tls-verify=false "+cacheTag,
 	)
 	buildAndPush := strings.Join(buildSteps, " ")
 
@@ -322,6 +508,34 @@ func (k *K8sBackend) buildBuildahPodSpec(podName, destination, dockerfileCM, bui
 	}
 }
 
+func clonedRepoBaseSelectionScript(buildContext string) string {
+	var cases strings.Builder
+	for _, item := range baseimage.Languages() {
+		fmt.Fprintf(&cases, "%s:%s) DEVBOX_BASE_IMAGE=%q ;; ", item.Language, item.Version, baseimage.Lookup(item.Language, item.Version))
+	}
+	goMod := shellQuote(filepath.Join(buildContext, "go.mod"))
+	return fmt.Sprintf(`language=unknown; version=unknown; reason=no_language_detected; DEVBOX_BASE_IMAGE=registry.harbor.lan/mcp/devbox-base/go:1.25; if [ -f %s ]; then language=go; version=$(awk '$1=="go" {split($2,v,"."); print v[1] "." v[2]; exit}' %s); reason=unmapped_version; fi; case "$language:$version" in %s*) ;; esac; if [ "$DEVBOX_BASE_IMAGE" = registry.harbor.lan/mcp/devbox-base/go:1.25 ] && [ "$language:$version" = "go:1.25" ]; then reason=; elif [ "$DEVBOX_BASE_IMAGE" != registry.harbor.lan/mcp/devbox-base/go:1.25 ]; then reason=; fi; export DEVBOX_BASE_IMAGE; printf 'DEVBOX_BASE_SELECTION language=%%s version=%%s image=%%s reason=%%s\n' "$language" "$version" "$DEVBOX_BASE_IMAGE" "$reason"`, goMod, goMod, cases.String())
+}
+
+func parseBaseImageFallback(logs string) *BaseImageFallback {
+	for _, line := range strings.Split(logs, "\n") {
+		if !strings.HasPrefix(line, "DEVBOX_BASE_SELECTION ") {
+			continue
+		}
+		fields := map[string]string{}
+		for _, field := range strings.Fields(strings.TrimPrefix(line, "DEVBOX_BASE_SELECTION ")) {
+			parts := strings.SplitN(field, "=", 2)
+			if len(parts) == 2 {
+				fields[parts[0]] = parts[1]
+			}
+		}
+		if fields["reason"] != "" {
+			return &BaseImageFallback{Language: fields["language"], Version: fields["version"], Reason: fields["reason"]}
+		}
+	}
+	return nil
+}
+
 func avoidNodesAffinity(nodes []string) *corev1.Affinity {
 	if len(nodes) == 0 {
 		return nil
@@ -374,8 +588,13 @@ func (k *K8sBackend) createBuildConfigMap(ctx context.Context, name string, dock
 		},
 		Data: data,
 	}
-	_ = k.deleteConfigMap(ctx, name)
 	_, err := k.clientset.CoreV1().ConfigMaps(k.namespace).Create(ctx, cm, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		// ConfigMap names include the immutable image fingerprint. Another
+		// caller may already be using this one from a same-tag build, so never
+		// delete it merely to recreate identical build input.
+		return nil
+	}
 	return err
 }
 
@@ -408,8 +627,13 @@ func (k *K8sBackend) createDockerfileConfigMap(ctx context.Context, name string,
 			"Dockerfile": string(dockerfile),
 		},
 	}
-	_ = k.deleteConfigMap(ctx, name)
 	_, err := k.clientset.CoreV1().ConfigMaps(k.namespace).Create(ctx, cm, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		// ConfigMap names include the immutable image fingerprint. Another
+		// caller may already be using this one from a same-tag build, so never
+		// delete it merely to recreate identical build input.
+		return nil
+	}
 	return err
 }
 
@@ -486,4 +710,11 @@ func sanitizeBuildName(tag string) string {
 		name = name[:63]
 	}
 	return name
+}
+
+func (k *K8sBackend) effectiveBuildTimeout() time.Duration {
+	if k.buildTimeout <= 0 {
+		return DefaultBuildTimeout
+	}
+	return k.buildTimeout
 }

@@ -1,0 +1,1 @@
+- Add the curated OpenRouter HTTP 402 insufficient-credit signature in `pkg/mills/sigfp` and expose its non-retryable external dependency metadata through `pkg/mills/health`.

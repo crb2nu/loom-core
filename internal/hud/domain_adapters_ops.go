@@ -159,6 +159,26 @@ func (h *millsDepsAdapter) MillsConfig() domainmills.Config {
 	}
 }
 
+// --- Forge domain Deps adapter ---
+
+type forgeDepsAdapter struct {
+	app *App
+}
+
+func (f *forgeDepsAdapter) WriteJSON(w http.ResponseWriter, status int, v any) {
+	f.app.WriteJSON(w, status, v)
+}
+
+func (f *forgeDepsAdapter) WriteError(w http.ResponseWriter, status int, msg string, err error) {
+	f.app.WriteError(w, status, msg, err)
+}
+
+func (f *forgeDepsAdapter) RequireAdminToken(w http.ResponseWriter, r *http.Request) bool {
+	return f.app.RequireAdminToken(w, r)
+}
+
+func (f *forgeDepsAdapter) Logger() *slog.Logger { return f.app.Logger() }
+
 // --- Merge domain Deps adapter ---
 
 type mergeDepsAdapter struct {

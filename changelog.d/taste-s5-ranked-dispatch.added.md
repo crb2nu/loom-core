@@ -1,0 +1,1 @@
+- Add policy-gated, taste-aware ranked dispatch with bounded scoring and strict FIFO fallback in `pkg/mills/ranker.go`, `pkg/mills/policy.go`, and `pkg/mills/reconciler.go`.

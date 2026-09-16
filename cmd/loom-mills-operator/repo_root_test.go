@@ -141,7 +141,7 @@ func TestRefreshRepoRoot_AlignsStaleShallowClone(t *testing.T) {
 	gitT(t, origin, "commit", "-m", "third")
 	writeT(t, filepath.Join(clone, "a.txt"), "local drift\n")
 
-	if err := refreshRepoRoot(ctx, t.TempDir(), clone); err != nil {
+	if err := refreshRepoRoot(ctx, t.TempDir(), clone, nil); err != nil {
 		t.Fatalf("refreshRepoRoot: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(clone, "b.txt")); err != nil {
@@ -153,6 +153,53 @@ func TestRefreshRepoRoot_AlignsStaleShallowClone(t *testing.T) {
 	}
 	if cloneHead, originHead := gitOutT(t, clone, "rev-parse", "HEAD"), gitOutT(t, origin, "rev-parse", "main"); cloneHead != originHead {
 		t.Errorf("HEAD = %s, want origin main %s", cloneHead, originHead)
+	}
+}
+
+func TestRefreshRepoRoot_RemovesStaleIndexLockAndRetriesCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	origin := t.TempDir()
+	gitT(t, origin, "init", "-b", "main", ".")
+	writeT(t, filepath.Join(origin, "a.txt"), "one\n")
+	gitT(t, origin, "add", ".")
+	gitT(t, origin, "commit", "-m", "first")
+	clone := filepath.Join(t.TempDir(), "repo")
+	gitT(t, t.TempDir(), "clone", "file://"+origin, clone)
+
+	lock := filepath.Join(clone, ".git", "index.lock")
+	writeT(t, lock, "stale")
+	if err := refreshRepoRoot(context.Background(), t.TempDir(), clone, nil); err != nil {
+		t.Fatalf("refreshRepoRoot with stale lock: %v", err)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("stale lock remains after refresh: %v", err)
+	}
+}
+
+func TestCloneRepoRoot_UsesFullHistory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	origin := t.TempDir()
+	gitT(t, origin, "init", "-b", "main", ".")
+	writeT(t, filepath.Join(origin, "history.txt"), "old\n")
+	gitT(t, origin, "add", ".")
+	gitT(t, origin, "commit", "-m", "old")
+	old := gitOutT(t, origin, "rev-parse", "HEAD")
+	writeT(t, filepath.Join(origin, "history.txt"), "new\n")
+	gitT(t, origin, "commit", "-am", "new")
+
+	clone := filepath.Join(t.TempDir(), "repo")
+	if err := cloneRepoRoot(context.Background(), t.TempDir(), "file://"+origin, clone); err != nil {
+		t.Fatalf("cloneRepoRoot: %v", err)
+	}
+	if got := gitOutT(t, clone, "rev-parse", "--is-shallow-repository"); got != "false" {
+		t.Fatalf("is-shallow-repository = %q", got)
+	}
+	if got := gitOutT(t, clone, "merge-base", "origin/main", old); got != old {
+		t.Fatalf("merge-base = %q, want old commit %q", got, old)
 	}
 }
 

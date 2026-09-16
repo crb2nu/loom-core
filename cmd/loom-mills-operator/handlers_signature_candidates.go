@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -52,43 +51,7 @@ func (o *operator) handleSignatureCandidatesList(w http.ResponseWriter, r *http.
 		}
 		window = d
 	}
-	if o.store == nil || o.store.Events == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "events store unavailable"})
-		return
-	}
-
-	since := time.Now().UTC().Add(-window)
-	// The sweep is the sole writer of this actor, so selecting on it uses the
-	// indexed window scan and the kind filter below is a cheap belt-and-braces
-	// guard against a future actor reuse.
-	events, err := o.store.Events.ListByActorSince(r.Context(), mills.SignatureMinerActor, since, signatureCandidatesScanLimit)
-	if err != nil {
-		o.logger.Warn("signature candidate list failed", "window", window.String(), "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	resp := signatureCandidatesResponse{
-		Window:     window.String(),
-		Since:      since,
-		Candidates: make([]signatureCandidateView, 0, len(events)),
-	}
-	for _, ev := range events {
-		if ev == nil || ev.Kind != mills.SignatureCandidateEventKind {
-			continue
-		}
-		resp.Candidates = append(resp.Candidates, signatureCandidateView{
-			Fingerprint:      ev.SubjectID,
-			Phrase:           eventPayloadString(ev, "phrase"),
-			MemberCount:      eventPayloadInt64(ev, "member_count"),
-			WindowMatchCount: eventPayloadInt64(ev, "window_match_count"),
-			SampleEvidence:   eventPayloadStrings(ev, "sample_evidence"),
-			FirstSeen:        eventPayloadString(ev, "first_seen"),
-			LastSeen:         eventPayloadString(ev, "last_seen"),
-			ProposedAt:       ev.OccurredAt,
-		})
-	}
-	resp.Count = len(resp.Candidates)
-	writeJSON(w, http.StatusOK, resp)
+	o.writeReportRollup(w, r, "signature_candidates", window, "")
 }
 
 // eventPayloadStrings reads a string-list payload field. Payloads round-trip

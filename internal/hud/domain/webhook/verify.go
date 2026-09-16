@@ -10,19 +10,23 @@ import (
 )
 
 // verifyGitLabToken checks the X-Gitlab-Token header against the configured secret
-// using constant-time comparison.
+// using constant-time comparison. An empty secret fails closed — there is
+// nothing to verify against, so every request is rejected. Anything else
+// would leave the endpoint unauthenticated when the secret is unset
+// (docs/harvest-gitlab-hookify-notify-contract.md §4.1).
 func verifyGitLabToken(headerToken, secret string) bool {
 	if secret == "" {
-		return true // no secret configured, skip verification
+		return false // fail closed: no secret configured, reject all requests
 	}
 	return subtle.ConstantTimeCompare([]byte(headerToken), []byte(secret)) == 1
 }
 
 // verifyGitHubSignature checks the X-Hub-Signature-256 header against an HMAC-SHA256
-// of the request body using the configured secret.
+// of the request body using the configured secret. An empty secret fails
+// closed, same as verifyGitLabToken.
 func verifyGitHubSignature(signature, secret string, body []byte) bool {
 	if secret == "" {
-		return true // no secret configured, skip verification
+		return false // fail closed: no secret configured, reject all requests
 	}
 	if !strings.HasPrefix(signature, "sha256=") {
 		return false

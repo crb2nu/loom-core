@@ -1,0 +1,1 @@
+- Allow concurrent Mills devbox quality gates using dedicated hub streams with isolated transport retries and shutdown cleanup, while preserving ordinary-call serialization and metrics (`pkg/mills/clients/mcphub.go`, `pkg/mills/clients/devbox.go`, and `pkg/mills/clients/mcphub_test.go`).

@@ -60,6 +60,46 @@ type MergeRequestListItem struct {
 	Pipeline                  *MergeRequestPipeline `json:"pipeline"`
 }
 
+// MergeRequestDiffStats is the bounded diff projection used by Bolt Cards.
+type MergeRequestDiffStats struct {
+	Files    int
+	Added    int
+	Removed  int
+	URL      string
+	MergedAt time.Time
+}
+
+// GetMergeRequestDiffStats counts the paginated-diff payload for one MR.
+func (c *GitLabClient) GetMergeRequestDiffStats(ctx context.Context, iid int64) (MergeRequestDiffStats, error) {
+	if iid <= 0 {
+		return MergeRequestDiffStats{}, errors.New("gitlab: merge request IID must be positive")
+	}
+	mr, err := c.GetMergeRequest(ctx, iid)
+	if err != nil {
+		return MergeRequestDiffStats{}, err
+	}
+	var diffs []struct {
+		Diff string `json:"diff"`
+	}
+	path := fmt.Sprintf("/projects/%s/merge_requests/%d/diffs?per_page=100", c.projectPath(), iid)
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &diffs); err != nil {
+		return MergeRequestDiffStats{}, err
+	}
+	out := MergeRequestDiffStats{Files: len(diffs), URL: mr.WebURL, MergedAt: mr.MergedAt}
+	for _, d := range diffs {
+		for _, line := range strings.Split(d.Diff, "\n") {
+			switch {
+			case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			case strings.HasPrefix(line, "+"):
+				out.Added++
+			case strings.HasPrefix(line, "-"):
+				out.Removed++
+			}
+		}
+	}
+	return out, nil
+}
+
 // IsDraft reports whether the MR is a draft, tolerating either the modern
 // `draft` field or the legacy `work_in_progress` alias.
 func (m MergeRequestListItem) IsDraft() bool { return m.Draft || m.WorkInProgress }

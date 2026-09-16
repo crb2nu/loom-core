@@ -150,6 +150,9 @@ func classifyInterruptedSpawn(state *spawn.State) interruptedSpawnAction {
 	if state.PodName == "" && isPreRuntimeSpawnStatus(state.Status) {
 		return interruptedSkip // resumePreRuntimeSpawns owns this shape
 	}
+	if state.AuthRetryPending {
+		return interruptedRedrive
+	}
 	req := state.Request
 	keyed := req.IdempotencyKey != "" && req.TaskDescription != "" && req.Project != ""
 	if !keyed {

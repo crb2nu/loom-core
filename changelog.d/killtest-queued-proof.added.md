@@ -1,0 +1,1 @@
+- Add deterministic `--dry-run` support and fail-closed target-project stamp, landing, and collision evidence to `cmd/mills-workflow-killtest/main.go` and `pkg/mills/workflow/workflow.go`.

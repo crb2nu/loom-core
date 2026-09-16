@@ -84,6 +84,13 @@ its sampled log line with the rule table in
 authorize Mills to repair the outside service. If only the service or only the
 log signature matches, the rule does not apply.
 
+The recurring-infrastructure allowlist also recognizes three storage/database
+clusters: Langfuse failures that explicitly name S3, MinIO drive or disk
+failures, and PostgreSQL connection refusals (including port `5432`). These
+classify with external dependencies `s3`, `minio`, and `postgres`,
+respectively. A generic repository-local connection refusal does not match;
+PostgreSQL identity or its standard port must also be present.
+
 <!-- BEGIN INFRASTRUCTURE WORKSPACE SIGNAL RULES -->
 | Stable rule ID | Matched infrastructure namespace or service | External dependency | Why remediation is outside loom-core | Required evidence | Escalation owner and path |
 | --- | --- | --- | --- | --- | --- |
@@ -327,6 +334,46 @@ the policy procedure in `docs/MILLS_RUNBOOK.md` before investigating individual
 runs. Do not delete pipeline, event, reservation, or outbox records to force
 progress.
 
+## Autonomy-soak pause and resumption policy
+
+For ClickHouse, Postgres, and GitLab agent incidents, apply the following
+operator policy in addition to parking the affected pipeline run. It is
+intentionally fail-closed: it constrains human operation until automated
+enforcement is extended, and it does not replace the machine-checkable S2 gate
+in `pkg/mills/overseer/overseer.go`.
+
+| Threshold | Required autonomy action |
+| --- | --- |
+| One classified incident with dependency attribution and its recognized failure shape | Immediately pause promotion of the affected overseer action class and retain dry-run. |
+| One ambiguous, contradictory, or unreadable dependency signal | Pause the affected action class until a Mills operator records a human classification; do not retry or promote on partial evidence. |
+| Missing owner acknowledgement, recovery evidence, append-only escalation, or complete soak telemetry | Keep the action class paused in dry-run. |
+| Any S2 divergence, unexpected committed action during a dry-run soak, or failed/unreadable S2 gate | Keep the action class paused and discard that window as promotion evidence. |
+
+The Mills operator/on-call owns classification, pausing, the evidence-bearing
+escalation, and the request to resume. The ClickHouse, Postgres, or GitLab
+agent owner owns dependency recovery. Escalate immediately to that owner; if
+there is no acknowledgement within **15 minutes**, page the Mills incident
+lead. Pause all autonomy promotions, rather than only one action class, when
+the blast radius cannot be determined or more than one action class is
+affected.
+
+After owner acknowledgement, recovery verification is bounded to **two**
+non-mutating probes of the affected dependency path, separated by at least
+**five minutes**. ClickHouse probes must be read-only; Postgres probes must use
+the normal least-privilege path; GitLab agent probes must exercise the affected
+agent RPC or CI integration rather than only general GitLab availability. Stop
+at the first failed probe, preserve its evidence, and continue the pause. Mills
+must not restart a dependency, change credentials, create roles/grants, or
+re-register an agent as a recovery action.
+
+Before the affected action class can resume dry-run observation, the
+escalation must link the original classification evidence, owner recovery
+acknowledgement with UTC time, both successful probes and timestamps, and a
+fresh append-only Mills event. Promotion additionally requires a new closed
+**168-hour** S2 window with the required dry-run and would-have-acted evidence,
+zero divergences, no committed action, and no missing or inconsistent
+telemetry. A healthy endpoint or owner claim alone is insufficient.
+
 ## Resume only after recovery
 
 Before requeueing, all of the following must be true:
@@ -418,6 +465,89 @@ of these dependencies. They supplement, rather than replace, the detect, park,
 and resume procedure above. Do not turn a storage, database, gateway, or
 credential repair into a loom-core backlog item unless the follow-up changes a
 repository-owned guardrail, configuration, telemetry, test, or this runbook.
+
+### ClickHouse MergeTree merge-task failures
+
+- **Detection:** Treat a ClickHouse-scoped `merge task failed`, `failed to
+  execute merge task`, or MergeTree `Code: 432` failure as a candidate. Confirm
+  that it is the first meaningful failure and distinguish shared merge pressure
+  from branch-owned query, schema, partition, or data changes.
+- **Evidence collection:** Preserve the sanitized first error, UTC window,
+  affected table/partition, query or job ID, and database-owner evidence for
+  merge queues, replica state, disk/inode headroom, and detached parts.
+- **Fail-closed rationale:** Merge and part repair can damage data or conceal
+  the original condition. Park the affected run without a paid or automatic
+  retry until the database owner has supplied fresh recovery evidence.
+- **Prohibited actions:** Do not kill or force merges, detach/drop/mutate
+  parts, alter table settings, restart ClickHouse, or run filesystem repair.
+- **Escalation ownership:** The ClickHouse/database owner owns server-side
+  diagnosis and repair; the calling workload owner owns any confirmed
+  query/schema correction.
+- **Recovery verification:** Require healthy replica and merge-path evidence,
+  adequate capacity, and a successful safe read or write for the blocked
+  workflow without a new merge error.
+- **Resume criteria:** A human may submit one bounded requeue only after that
+  verification and the shared **Resume only after recovery** checklist pass.
+
+### GitLab-agent unauthenticated tunnel errors
+
+- **Detection:** Treat a GitLab-agent tunnel or client `Unauthenticated`, HTTP
+  401, invalid-token, or authentication-failed error as a candidate. Check
+  whether unrelated agents or work fail with the same GitLab host and identity
+  path; a 403 may instead be an authorization/scope issue.
+- **Evidence collection:** Preserve the sanitized first error and correlation
+  ID, UTC window, agent and project identity, GitLab host, and referenced
+  Secret name/key or version—never a token value. Use only a least-privileged,
+  read-only probe from the affected runtime identity.
+- **Fail-closed rationale:** Repeating rejected authentication can extend
+  lockout or throttling and does not prove access has recovered. Park the run
+  with `retry_allowed=false` pending owner evidence.
+- **Prohibited actions:** Do not paste tokens into logs, Git, or workload
+  configuration; rotate credentials directly; alter agent trust/RBAC; or
+  bypass the GitLab-agent tunnel.
+- **Escalation ownership:** The GitLab/identity platform owner owns token
+  issuance, rotation, trust, and tunnel authorization. The workload owner owns
+  only its approved credential reference.
+- **Recovery verification:** The owner must restore the approved identity;
+  then the affected runtime's read-only probe must succeed and fresh agent logs
+  must show a healthy connection with no unauthenticated event.
+- **Resume criteria:** Run one affected stage after verification. Resume normal
+  automation only if it succeeds and the error does not recur in the agreed
+  observation window.
+
+### LiteLLM proxy authentication exceptions
+
+- **Detection:** Treat a LiteLLM-scoped 401/403 or `missing API key`, `API key
+  is missing`, or `no API key` response as a candidate. First distinguish a
+  local client preflight/configuration error from a request that reached the
+  intended proxy route and provider.
+- **Evidence collection:** Preserve the sanitized response, UTC window, Mills
+  run/stage, route or model alias, upstream provider, workload identity, and
+  secret reference/version. Inspect only metadata: never print headers,
+  environment dumps, Secret manifests, key values, or key lengths.
+- **Fail-closed rationale:** Retrying can incur provider cost and amplify a
+  credential failure; a fallback or personal key would hide the failed approved
+  route. Stop requests on that route and keep the item parked.
+- **Prohibited actions:** Do not bypass LiteLLM, substitute a personal or
+  unapproved key/provider, expose credentials, or edit gateway secrets outside
+  the approved secret-management and reconciliation process.
+- **Escalation ownership:** The LiteLLM and secret-management owner restores
+  provider credentials and reconciles the gateway; the caller owner corrects a
+  confirmed branch-owned route or credential-reference defect.
+- **Recovery verification:** Confirm the expected reference is injected, then
+  send one minimal authenticated request through the same proxy route and model
+  alias. Require a valid response and no new auth event in sanitized proxy logs
+  or metrics.
+- **Resume criteria:** Run one affected Mills stage and validate its expected
+  provider usage/accounting. Resume only if it succeeds without an auth
+  recurrence and the shared recovery checklist passes.
+
+The three procedures above are the canonical steps for these exact detection
+signatures. **ClickHouse merge failures** and **LiteLLM or GitLab-agent
+authentication drift** below apply the same fail-closed and ownership rules to
+related surfacing paths — a Langfuse-surfaced Code 432 error, and combined
+LiteLLM/GitLab-agent identity-drift triage — without relaxing or superseding
+the steps above.
 
 ### Mills behavior for every incident in this section
 

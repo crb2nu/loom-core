@@ -1,0 +1,1 @@
+- Hold merge-queue lanes during persisted external default-branch CI incidents, with policy-bounded one-shot escalation and shift-report visibility (`pkg/mills/mergequeue`, `pkg/mills/pipeline`, `pkg/mills/store`, `pkg/mills/shiftreport`, `pkg/policy`).

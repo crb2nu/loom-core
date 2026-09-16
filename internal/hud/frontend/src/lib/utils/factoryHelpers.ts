@@ -2,7 +2,7 @@
 // Rune-free so vitest can exercise the data→weave mapping without a
 // Svelte runtime, mirroring the plansHelpers/spinRunsHelpers pattern.
 
-import type { PipelineRun } from '../stores/mills.svelte.ts';
+import type { BudgetWindowUsage, PipelineRun } from '../stores/mills.svelte.ts';
 
 /** A row the loom should weave in response to a real pipeline event. */
 export interface WeaveEvent {
@@ -186,6 +186,38 @@ export function fuelReading(
     label: `${fmtUSD(spent)} / ${fmtUSD(cap)}`,
     tone: frac > 0.5 ? 'ok' : frac > 0.25 ? 'wr' : 'er',
   };
+}
+
+export interface FuelTank extends FuelReading {
+  kind: 'api' | 'sub';
+  /** Unbounded is a full bar, not a measured remaining fraction. */
+  unbounded: boolean;
+  title: string;
+}
+
+/** Split either budget tier for Factory; keep fuelReading metered-only for Andon. */
+export function fuelReadings(usage: Partial<BudgetWindowUsage> | null | undefined): FuelTank[] {
+  const total = usage?.total_spent_usd;
+  const totalLabel = typeof total === 'number' && Number.isFinite(total)
+    ? `$${total.toFixed(2)}` : '—';
+  const tank = (kind: FuelTank['kind'], spent?: number, cap?: number): FuelTank => {
+    const reading = fuelReading({ spent_usd: spent, cap_usd: cap });
+    const known = typeof spent === 'number' && Number.isFinite(spent);
+    const capped = typeof cap === 'number' && cap > 0;
+    const unbounded = kind === 'sub' && known && !capped;
+    const exact = known
+      ? `$${spent.toFixed(2)} / ${capped ? `$${cap.toFixed(2)}` : 'no cap'}`
+      : '—';
+    const description = kind === 'api' ? 'API metered spend' : 'Subscription list-price equivalent';
+    return { ...reading, kind, unbounded, title: `${description}: ${exact}; total spend: ${totalLabel} (rolling 24h)` };
+  };
+  const tanks = [tank('api', usage?.spent_usd, usage?.cap_usd)];
+  // Older operators omit every attribution field. A partial new payload
+  // still gets a subscription tank with an honest em dash for missing spend.
+  if (usage?.subscription_spent_usd !== undefined || usage?.subscription_cap_usd !== undefined || total !== undefined) {
+    tanks.push(tank('sub', usage?.subscription_spent_usd, usage?.subscription_cap_usd));
+  }
+  return tanks;
 }
 
 /**

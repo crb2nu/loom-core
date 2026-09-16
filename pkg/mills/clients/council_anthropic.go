@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -28,6 +29,12 @@ type anthropicTokenPrice struct {
 // $3/$15 sticker price rather than the $2/$10 introductory price through
 // 2026-08-31, so accounting remains conservative after that promotion expires.
 var anthropicCouncilTokenPrices = map[string]anthropicTokenPrice{
+	// claude-fable-5-1 (GA 2026-09): PROVISIONAL row at the Fable 5 rates so
+	// the model is never unpriced (an unpriced model loses the attempt
+	// ceiling and charges the whole run reservation). Confirm against the
+	// published list price and correct here, or override from policy
+	// `budgets.model_prices` without a deploy.
+	"claude-fable-5-1":  {InputPerMillion: 10, CacheWritePerMillion: 12.50, CacheReadPerMillion: 1, OutputPerMillion: 50},
 	"claude-fable-5":    {InputPerMillion: 10, CacheWritePerMillion: 12.50, CacheReadPerMillion: 1, OutputPerMillion: 50},
 	"claude-mythos-5":   {InputPerMillion: 10, CacheWritePerMillion: 12.50, CacheReadPerMillion: 1, OutputPerMillion: 50},
 	"claude-opus-4-8":   {InputPerMillion: 5, CacheWritePerMillion: 6.25, CacheReadPerMillion: 0.50, OutputPerMillion: 25},
@@ -105,10 +112,26 @@ func (e *AnthropicCouncilEditor) Edit(ctx context.Context, brief *council.Brief,
 		cost, priced := anthropicCouncilResponseCostUSD(e.Model, res)
 		hasUsage := res.InputTokens > 0 || res.OutputTokens > 0 ||
 			res.CacheCreationInputTokens > 0 || res.CacheReadInputTokens > 0
+		unpriced := !priced || !hasUsage
+		// A failed call on a KNOWN model with no usage is charged its bounded
+		// worst case (system + prompt at cache-write rate, max_tokens at
+		// output rate) rather than the whole run reservation — the same rule
+		// as the gateway reviewers (see unpricedAttemptCeilingUSD).
+		notes := ""
+		if !hasUsage && vendorKnownZero(err) {
+			cost, unpriced = 0, false
+			notes = "no charge: " + err.Error()
+		}
+		if unpriced {
+			if ceiling, ok := anthropicAttemptCeilingUSD(e.Model, len(systemPrefix)+len(userPrompt), int(maxTokens)); ok {
+				cost = math.Max(cost, ceiling)
+				unpriced = false
+			}
+		}
 		return &council.EditorOutput{
 			Backend: e.backend(), Model: e.Model, CostUSD: cost,
-			CostUnpriced: !priced || !hasUsage,
-			Sidecar:      council.Sidecar{StartedAt: started, CostUSD: council.SidecarCost{Frontier: cost}},
+			CostUnpriced: unpriced,
+			Sidecar:      council.Sidecar{StartedAt: started, Notes: notes, CostUSD: council.SidecarCost{Frontier: cost}},
 		}, fmt.Errorf("anthropic council editor: %w", err)
 	}
 
@@ -175,8 +198,26 @@ func (e *AnthropicCouncilEditor) Edit(ctx context.Context, brief *council.Brief,
 	return out, nil
 }
 
+// anthropicAttemptCeilingUSD prices a failed editor attempt on a KNOWN
+// Anthropic model from the prompt size it sent and the completion cap it
+// requested: every prompt token at the cache-WRITE rate (the dearest input
+// rate) and every allowed output token at the output rate. Unknown models
+// return false so they keep the whole-reservation fallback.
+func anthropicAttemptCeilingUSD(model string, promptChars, maxTokens int) (float64, bool) {
+	price, ok := lookupAnthropicPrice(model)
+	if !ok {
+		return 0, false
+	}
+	promptTokens := (promptChars + councilCeilingCharsPerToken - 1) / councilCeilingCharsPerToken
+	if maxTokens < 0 {
+		maxTokens = 0
+	}
+	return (float64(promptTokens)*price.CacheWritePerMillion +
+		float64(maxTokens)*price.OutputPerMillion) / 1_000_000, true
+}
+
 func anthropicCouncilResponseCostUSD(model string, res anthropicMessageResult) (float64, bool) {
-	price, ok := anthropicCouncilTokenPrices[strings.TrimSpace(model)]
+	price, ok := lookupAnthropicPrice(model)
 	if !ok {
 		return 0, false
 	}

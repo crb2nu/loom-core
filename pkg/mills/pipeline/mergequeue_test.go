@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -167,5 +168,75 @@ func TestRunMerge_QueueResumeSkipsStaleFenceRevalidation(t *testing.T) {
 	}
 	if len(fq.enqueued) != 0 {
 		t.Fatalf("resume must not re-enqueue")
+	}
+}
+
+// A1: evictions surface as typed errors — head_moved reconstructs the
+// runner-rewindable *MergeSourceSHAMismatchError, everything else the
+// classifiable *MergeQueueEvictedError.
+func TestRunMerge_QueueEvictionTypedErrors(t *testing.T) {
+	fq := &fakeMergeQueue{statuses: []mergeQueueStatusStep{
+		{err: ErrMergeQueueUnknownRun},
+		{st: MergeQueueStatus{
+			State: "evicted", Terminal: true, EvictionReason: "head_moved",
+			Detail:       "head moved externally while queued: authorized aaa, observed bbb",
+			Project:      "services/loom-core",
+			SourceBranch: "feat/x", TargetBranch: "main",
+			AuthorizedSHA: "aaa-full", ObservedSHA: "bbb-full",
+		}},
+	}}
+	w := queueWorker(fq, &fakeGitLab{}, true)
+	jc := mergeJobContext(t, testCIArtifacts("tested-head"), 0)
+
+	_, err := w.Run(context.Background(), jc)
+	var moved *MergeSourceSHAMismatchError
+	if !errors.As(err, &moved) {
+		t.Fatalf("head_moved eviction must be a MergeSourceSHAMismatchError, got %T: %v", err, err)
+	}
+	if moved.ReviewedSHA != "aaa-full" || moved.ObservedSHA != "bbb-full" || moved.Project != "services/loom-core" {
+		t.Fatalf("mismatch fields = %+v", moved)
+	}
+	if !strings.Contains(moved.Error(), "head moved externally") {
+		t.Fatalf("historical text lost: %v", moved.Error())
+	}
+
+	// head_moved WITHOUT a recorded successor (pre-031 rows) stays a typed
+	// eviction — classified, never a phantom rewind on empty SHAs.
+	fq2 := &fakeMergeQueue{statuses: []mergeQueueStatusStep{
+		{err: ErrMergeQueueUnknownRun},
+		{st: MergeQueueStatus{State: "evicted", Terminal: true, EvictionReason: "head_moved", Detail: "legacy row"}},
+	}}
+	w2 := queueWorker(fq2, &fakeGitLab{}, true)
+	_, err2 := w2.Run(context.Background(), mergeJobContext(t, testCIArtifacts("tested-head"), 0))
+	var evicted *MergeQueueEvictedError
+	if !errors.As(err2, &evicted) || evicted.Reason != "head_moved" {
+		t.Fatalf("legacy head_moved must be MergeQueueEvictedError, got %T: %v", err2, err2)
+	}
+}
+
+// A1: per-reason classification stops evictions burning code-class budgets
+// on no-op retries.
+func TestClassify_MergeQueueEvictions(t *testing.T) {
+	cases := []struct {
+		reason string
+		want   ErrorClass
+	}{
+		{"ci_timeout", ClassInfra},
+		{"queue_full", ClassInfra},
+		{"mr_closed", ClassConfig},
+		{"ci_red", ClassCode},
+		{"rebase_conflict", ClassCode},
+		{"rebase_ambiguous", ClassCode},
+	}
+	for _, tc := range cases {
+		err := fmt.Errorf("merge stage: %w", &MergeQueueEvictedError{MRIID: 7, Reason: tc.reason, Detail: "x"})
+		if got := Classify(err); got != tc.want {
+			t.Errorf("Classify(%s) = %s, want %s", tc.reason, got, tc.want)
+		}
+	}
+	// merge_failed defers to the needle classifiers via Detail text.
+	err405 := &MergeQueueEvictedError{MRIID: 7, Reason: "merge_failed", Detail: "merge mr 7: status 405"}
+	if got := Classify(err405); got != ClassConfig {
+		t.Errorf("Classify(merge_failed/405) = %s, want %s", got, ClassConfig)
 	}
 }

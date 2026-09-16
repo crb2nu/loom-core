@@ -51,8 +51,8 @@ Example mcp.json:
 	// The proxy itself doesn't need a registry path (the daemon loads it), but accepting the
 	// flag prevents immediate exit with "unknown flag" which breaks MCP initialization.
 	cmd.Flags().String("registry", "", "Path to registry.yaml (accepted for compatibility; ignored)")
-	cmd.Flags().String("agent-hint", "", "Agent type hint for proxy-level heartbeats (e.g., kilocode, antigravity)")
-	cmd.Flags().String("tool-profile", "", "Tool filter profile for proxy tools/list responses (e.g., antigravity-core)")
+	cmd.Flags().String("agent-hint", "", "Agent type hint for proxy-level heartbeats and default tool shaping (codex, claude, claude-desktop, gemini, zed, kilocode → llm-core; antigravity → antigravity-core)")
+	cmd.Flags().String("tool-profile", "", "Tool filter profile for proxy tools/list responses: antigravity-core, llm-core, icc-core, or full (no shaping); overrides the agent-hint default")
 	cmd.Flags().Int("max-tools", 0, "Maximum number of tools exposed by proxy (0 = unlimited)")
 	cmd.Flags().String("remote", "", "Remote daemon URL for Streamable HTTP (e.g., https://host:8088/mcp)")
 	cmd.Flags().String("remote-token", "", "Bearer token for remote daemon (or set LOOM_REMOTE_TOKEN env var)")

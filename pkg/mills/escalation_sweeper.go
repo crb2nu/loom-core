@@ -75,23 +75,29 @@ func (s *EscalationSweeper) runPass(parent context.Context) {
 	// Deliberately unconditional and independently budgeted: ordering is ghost
 	// then auto-requeue, but a ghost failure or sub-deadline must not starve
 	// retry admission. The outer pass deadline still caps total wall time.
-	autoCtx, autoCancel := context.WithTimeout(passCtx, budget/3)
-	auto, autoErr := s.Reconciler.SweepAutoRequeue(autoCtx)
-	autoCancel()
+	// SweepAutoRequeue sizes its deadline from the shelf and uses all remaining pass time.
+	auto, autoErr := s.Reconciler.SweepAutoRequeue(passCtx)
+	// The attention scan is local SQLite work and deliberately follows both
+	// existing network phases, so a historical rescue backlog cannot starve
+	// ghost reconciliation or retry admission.
+	rescued, vaccineErr := s.Reconciler.SweepVaccineAttention(passCtx)
+	if vaccineErr == nil {
+		RescuedWithoutVaccine.Set(float64(rescued))
+	}
 	duration := time.Since(started)
 	passErr := passCtx.Err()
 	EscalationSweepDurationSeconds.Observe(duration.Seconds())
 	// Inspected already includes both IID and branch calls; BranchInspected is
 	// the diagnostic subset and must not be added a second time.
 	EscalationSweepLookups.Observe(float64(ghost.Inspected))
-	timedOut := errors.Is(ghostErr, context.DeadlineExceeded) || errors.Is(autoErr, context.DeadlineExceeded) || errors.Is(passErr, context.DeadlineExceeded)
+	timedOut := errors.Is(ghostErr, context.DeadlineExceeded) || errors.Is(autoErr, context.DeadlineExceeded) || errors.Is(vaccineErr, context.DeadlineExceeded) || errors.Is(passErr, context.DeadlineExceeded)
 	if timedOut {
 		EscalationSweepTimeoutsTotal.Inc()
 	}
 	outcome := "ok"
 	if timedOut {
 		outcome = "timeout"
-	} else if ghostErr != nil || autoErr != nil {
+	} else if ghostErr != nil || autoErr != nil || vaccineErr != nil {
 		outcome = "error"
 	}
 	payload := map[string]any{
@@ -100,12 +106,19 @@ func (s *EscalationSweeper) runPass(parent context.Context) {
 		"ghost_mr_closed": ghost.MRClosed, "ghost_errored": ghost.Errored,
 		"auto_requeue_inspected": auto.Inspected, "auto_requeued": auto.Requeued,
 		"auto_requeue_skipped": auto.Skipped, "auto_requeue_errored": auto.Errored,
+		// unreached > 0 with auto_requeue_error set is a starved pass: those
+		// candidates were never judged and re-enter the next pass untouched.
+		"auto_requeue_unreached":  auto.Unreached,
+		"rescued_without_vaccine": rescued,
 	}
 	if ghostErr != nil {
 		payload["ghost_error"] = ghostErr.Error()
 	}
 	if autoErr != nil {
 		payload["auto_requeue_error"] = autoErr.Error()
+	}
+	if vaccineErr != nil {
+		payload["vaccine_attention_error"] = vaccineErr.Error()
 	}
 	s.Reconciler.append(parent, "reconciler.escalation_sweep", outcome, payload)
 }

@@ -8,8 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crb2nu/loom/internal/router"
 	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/internal/router"
 )
 
 // These tests cover the HUD agent_id-correlation keystone: an interactive

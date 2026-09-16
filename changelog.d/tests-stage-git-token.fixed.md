@@ -1,0 +1,1 @@
+- Propagate only `GIT_TOKEN` and `GOPRIVATE` from the Mills tests stage into devbox test executions, with private-module credentials redacted from gate output and telemetry.

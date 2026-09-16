@@ -433,6 +433,193 @@ func TestWaitForPodDoneFailsOnInitContainerError(t *testing.T) {
 	}
 }
 
+// closedFakeWatcher returns a watch.FakeWatcher whose result channel is
+// already closed — exactly what the caller sees when the API server ends a
+// long watch (k3s does this routinely, well inside the 30m build budget).
+func closedFakeWatcher() *watch.FakeWatcher {
+	w := watch.NewFake()
+	w.Stop()
+	return w
+}
+
+// TestWaitForPodDoneSurvivesWatchExpiry_ResyncGet pins the 2026-08-30 outage:
+// the API server closed the watch ~15m into a cold buildah build and the old
+// single-cycle wait returned "watch closed for pod …" — runBuildPod's
+// deferred deletePod then killed the still-running build, so no build longer
+// than one watch window could ever finish. The wait must instead re-sync via
+// Get and keep waiting; here the pod completes while the watch is down, and
+// the re-sync Get alone must resolve the wait successfully.
+func TestWaitForPodDoneSurvivesWatchExpiry_ResyncGet(t *testing.T) {
+	k := testK8sBackend()
+	running := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "buildah-build-x", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	clientset := k8sfake.NewSimpleClientset(running)
+	firstWatch := make(chan struct{})
+	clientset.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		select {
+		case <-firstWatch:
+		default:
+			close(firstWatch)
+		}
+		return true, closedFakeWatcher(), nil
+	})
+	k.clientset = clientset
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- k.waitForPodDone(context.Background(), "buildah-build-x", time.Minute)
+	}()
+
+	// The pod reaches Succeeded while no watch is up; only the re-sync Get
+	// after the closed watch can observe it.
+	<-firstWatch
+	succeeded := running.DeepCopy()
+	succeeded.Status.Phase = corev1.PodSucceeded
+	if _, err := clientset.CoreV1().Pods(k.namespace).UpdateStatus(context.Background(), succeeded, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update pod status: %v", err)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("waitForPodDone should survive a closed watch via re-sync, got: %v", err)
+	}
+}
+
+// TestWaitForPodDoneSurvivesWatchExpiry_SecondWatch covers the other half of
+// the reconnect: the pod is still running at re-sync, so the wait must open a
+// SECOND watch and resolve from its events.
+func TestWaitForPodDoneSurvivesWatchExpiry_SecondWatch(t *testing.T) {
+	k := testK8sBackend()
+	clientset := k8sfake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "buildah-build-x", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	})
+	second := watch.NewFake()
+	watches := 0
+	secondUp := make(chan struct{})
+	clientset.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		watches++
+		if watches == 1 {
+			return true, closedFakeWatcher(), nil
+		}
+		close(secondUp)
+		return true, second, nil
+	})
+	k.clientset = clientset
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- k.waitForPodDone(context.Background(), "buildah-build-x", time.Minute)
+	}()
+
+	<-secondUp
+	second.Modify(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "buildah-build-x", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("waitForPodDone should resolve from the re-established watch, got: %v", err)
+	}
+}
+
+// TestWaitForPodDoneDeletedBetweenWatches: once the pod has been seen, a
+// NotFound on the re-sync Get means it was deleted while the watch was down —
+// that must surface as the deleted error, not hang until the deadline.
+func TestWaitForPodDoneDeletedBetweenWatches(t *testing.T) {
+	k := testK8sBackend()
+	clientset := k8sfake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "buildah-build-x", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	})
+	firstWatch := make(chan struct{})
+	clientset.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		select {
+		case <-firstWatch:
+		default:
+			close(firstWatch)
+		}
+		return true, closedFakeWatcher(), nil
+	})
+	k.clientset = clientset
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- k.waitForPodDone(context.Background(), "buildah-build-x", time.Minute)
+	}()
+
+	<-firstWatch
+	if err := clientset.CoreV1().Pods(k.namespace).Delete(context.Background(), "buildah-build-x", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete pod: %v", err)
+	}
+
+	err := <-errCh
+	if err == nil || !strings.Contains(err.Error(), "deleted before completion") {
+		t.Fatalf("waitForPodDone error = %v, want deleted pod error", err)
+	}
+}
+
+// TestWaitForPodDoneTimesOutAcrossReconnects: only the caller's deadline may
+// end the wait, and it must say so — the old "watch closed for pod" text
+// misattributed genuine timeouts to the transport.
+func TestWaitForPodDoneTimesOutAcrossReconnects(t *testing.T) {
+	k := testK8sBackend()
+	clientset := k8sfake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "buildah-build-x", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	})
+	clientset.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		return true, closedFakeWatcher(), nil
+	})
+	k.clientset = clientset
+
+	err := k.waitForPodDone(context.Background(), "buildah-build-x", 200*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out after") {
+		t.Fatalf("waitForPodDone error = %v, want timeout error", err)
+	}
+	if strings.Contains(err.Error(), "watch closed") {
+		t.Fatalf("timeout must not be reported as a closed watch: %v", err)
+	}
+}
+
+// TestWaitForPodRunningSurvivesWatchExpiry mirrors the reconnect pin for the
+// Running wait used by spawn runtime pods.
+func TestWaitForPodRunningSurvivesWatchExpiry(t *testing.T) {
+	k := testK8sBackend()
+	pending := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "spawn-pod", Namespace: k.namespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	clientset := k8sfake.NewSimpleClientset(pending)
+	firstWatch := make(chan struct{})
+	clientset.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		select {
+		case <-firstWatch:
+		default:
+			close(firstWatch)
+		}
+		return true, closedFakeWatcher(), nil
+	})
+	k.clientset = clientset
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- k.waitForPodRunning(context.Background(), "spawn-pod", time.Minute)
+	}()
+
+	<-firstWatch
+	running := pending.DeepCopy()
+	running.Status.Phase = corev1.PodRunning
+	if _, err := clientset.CoreV1().Pods(k.namespace).UpdateStatus(context.Background(), running, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update pod status: %v", err)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("waitForPodRunning should survive a closed watch via re-sync, got: %v", err)
+	}
+}
+
 // ----- Slice 2e: pod-already-exists eviction race -----
 
 // TestWaitForPodGone_NotFoundResolvesImmediately pins the fast path:

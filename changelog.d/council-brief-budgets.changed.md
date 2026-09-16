@@ -1,0 +1,1 @@
+- Budget council brief sections in `pkg/mills/council/brief.go` so incident-classification headings and context survive oversized earlier sections, with deterministic item trimming and explicit empty reviewer notes.

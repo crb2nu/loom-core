@@ -1,0 +1,1 @@
+Bumped golang.org/x/crypto v0.54.0 -> v0.55.0 (GO-2026-6303: ssh source-address critical option not enforced for non-public-key auth callbacks); x/text follows to v0.41.0. Clears the security:govulncheck gate that failed every main pipeline on 2026-08-29.

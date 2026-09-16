@@ -1,0 +1,1 @@
+- Fixed pipeline concurrency policy field resolution so the canonical `max_concurrent_pipelines` value and compatibility spellings are validated fail-closed before `pkg/mills/pipeline` updates its scheduler limiter.

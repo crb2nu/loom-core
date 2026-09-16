@@ -1,0 +1,1 @@
+- Add Prometheus failure counts and current bulk-reviewer availability for audit dispatches in `pkg/mills/metrics.go` and `pkg/mills/audit/dispatcher.go`.

@@ -11,9 +11,12 @@ This skill is backed by the local-only MCP server `browserkit` (binary: `mcp-bro
 ## Prereqs (Host Machine)
 
 ```bash
-pip install flexinfer-browser-kit playwright
-python3 -m playwright install chromium
+bash scripts/browserkit/install_deps.sh
 ```
+
+Use the installer rather than a bare `pip install`: `flexinfer-browser-kit` is
+an internal library and the installer carries its SHA pin (plus the pinned
+playwright and the chromium download).
 
 Verify your setup:
 

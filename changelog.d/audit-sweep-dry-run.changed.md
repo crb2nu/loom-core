@@ -1,0 +1,1 @@
+- Report every open audit digest with age and recent-modification status, and suppress unchanged previous-day digests (`cmd/loom/main.go`, `pkg/mills/audit/{audit,sweep,followup}.go`, `pkg/mills/clients/gitlab.go`; documented in `docs/MILLS.md`).

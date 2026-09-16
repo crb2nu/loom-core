@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/crb2nu/loom/internal/hud/bridge"
 	"github.com/crb2nu/loom/internal/hud/monitor"
@@ -319,6 +320,83 @@ func TestHandleMobileDashboard_UsesUnifiedLiveAgentCounts(t *testing.T) {
 	}
 	if got := data["offline_agents"]; got != float64(1) {
 		t.Fatalf("expected dashboard offline_agents=1 from presence snapshot, got %v", got)
+	}
+}
+
+func TestHandleMobileAgents_HeartbeatlessSpawnAgreesWithDashboard(t *testing.T) {
+	deps := newTestMockDeps()
+	deps.monitors = Monitors{
+		Fleet:  &monitor.FleetMonitor{},
+		Health: &monitor.HealthMonitor{},
+	}
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	deps.monitors.Fleet.Update(monitor.FleetSnapshot{
+		UpdatedAt: now,
+		Agents: []presence.PresenceInfo{
+			{
+				AgentID:       "live-agent",
+				Status:        "active",
+				HasPresence:   true,
+				LastHeartbeat: now.Add(-30 * time.Second).Format(time.RFC3339),
+			},
+			{
+				AgentID:     "spawn-husk",
+				AgentType:   "claude",
+				Status:      "active",
+				HasPresence: true,
+			},
+		},
+		Spawns: []monitor.SpawnInfo{
+			{SpawnID: "spawn-1", AgentID: "spawn-husk", Status: "running"},
+		},
+	})
+	d := New(deps)
+
+	agentsRec := httptest.NewRecorder()
+	d.handleMobileAgents(agentsRec, newAuthRequest("GET", "/api/mobile/v1/agents"))
+	if agentsRec.Code != http.StatusOK {
+		t.Fatalf("agents: expected 200, got %d; body: %s", agentsRec.Code, agentsRec.Body.String())
+	}
+	var agentsEnv Envelope
+	if err := json.NewDecoder(agentsRec.Body).Decode(&agentsEnv); err != nil {
+		t.Fatalf("decode agents envelope: %v", err)
+	}
+	agentsData := agentsEnv.Data.(map[string]any)
+	agentsSummary := agentsData["summary"].(map[string]any)
+	if got := agentsSummary["active_agents"]; got != float64(1) {
+		t.Fatalf("expected agents active_agents=1, got %v", got)
+	}
+
+	var husk map[string]any
+	for _, item := range agentsData["agents"].([]any) {
+		agent := item.(map[string]any)
+		if agent["agent_id"] == "spawn-husk" {
+			husk = agent
+			break
+		}
+	}
+	if husk == nil {
+		t.Fatal("expected spawn-husk row")
+	}
+	if got := husk["status"]; got != "offline" {
+		t.Fatalf("expected heartbeat-less spawn status=offline, got %v", got)
+	}
+	if got := husk["is_orphan"]; got != true {
+		t.Fatalf("expected heartbeat-less spawn is_orphan=true, got %v", got)
+	}
+
+	dashboardRec := httptest.NewRecorder()
+	d.handleMobileDashboard(dashboardRec, newAuthRequest("GET", "/api/mobile/v1/dashboard"))
+	if dashboardRec.Code != http.StatusOK {
+		t.Fatalf("dashboard: expected 200, got %d; body: %s", dashboardRec.Code, dashboardRec.Body.String())
+	}
+	var dashboardEnv Envelope
+	if err := json.NewDecoder(dashboardRec.Body).Decode(&dashboardEnv); err != nil {
+		t.Fatalf("decode dashboard envelope: %v", err)
+	}
+	dashboardData := dashboardEnv.Data.(map[string]any)
+	if got, want := dashboardData["active_agents"], agentsSummary["active_agents"]; got != want {
+		t.Fatalf("active count mismatch: dashboard=%v agents=%v", got, want)
 	}
 }
 

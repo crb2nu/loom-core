@@ -63,9 +63,16 @@ func (g *StageGateway) Status(ctx context.Context, runID string) (pipeline.Merge
 		State:          string(e.State),
 		EvictionReason: e.EvictionReason,
 		MergedSHA:      e.MergedSHA,
+		Project:        e.Project,
+		SourceBranch:   e.SourceBranch,
+		TargetBranch:   e.TargetBranch,
+		AuthorizedSHA:  e.CurrentSHA,
 	}
 	if detail, ok := e.Detail["detail"].(string); ok {
 		st.Detail = detail
+	}
+	if observed, ok := e.Detail["observed_sha"].(string); ok {
+		st.ObservedSHA = observed
 	}
 	switch e.State {
 	case store.MergeQueueMerged:

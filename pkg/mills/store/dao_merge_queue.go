@@ -125,12 +125,17 @@ func (d *MergeQueueDAO) Enqueue(ctx context.Context, e *MergeQueueEntry, maxDept
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// One ACTIVE row per run (031): resumes re-find their in-flight
+	// candidate, a merged verdict stays authoritative forever, and only an
+	// evicted run — which re-passed the enqueue-time authorization to get
+	// here — may insert a fresh candidate. Newest row wins the re-find so
+	// a prior settled attempt never shadows the live one.
 	existing, err := scanMergeQueueEntry(tx.QueryRowContext(ctx, mergeQueueSelect+`
-		WHERE pipeline_run_id = ?`, e.PipelineRunID))
-	if err == nil {
+		WHERE pipeline_run_id = ? ORDER BY id DESC LIMIT 1`, e.PipelineRunID))
+	if err == nil && (existing.SettledAt == nil || existing.State == MergeQueueMerged) {
 		return existing, false, nil
 	}
-	if !errors.Is(err, ErrNotFound) {
+	if err != nil && !errors.Is(err, ErrNotFound) {
 		return nil, false, err
 	}
 
@@ -182,13 +187,15 @@ func (d *MergeQueueDAO) Enqueue(ctx context.Context, e *MergeQueueEntry, maxDept
 	return &row, true, nil
 }
 
-// Get returns the entry for a pipeline run. ErrNotFound when absent.
+// Get returns the newest entry for a pipeline run (031 allows one settled
+// history row per prior attempt beside the single active one). ErrNotFound
+// when absent.
 func (d *MergeQueueDAO) Get(ctx context.Context, runID string) (*MergeQueueEntry, error) {
 	if d == nil || d.db == nil {
 		return nil, errors.New("merge queue: dao not configured")
 	}
 	return scanMergeQueueEntry(d.db.QueryRowContext(ctx, mergeQueueSelect+`
-		WHERE pipeline_run_id = ?`, runID))
+		WHERE pipeline_run_id = ? ORDER BY id DESC LIMIT 1`, runID))
 }
 
 // Heads returns the head (lowest id active) entry of every lane that has at
@@ -224,6 +231,57 @@ func (d *MergeQueueDAO) ListActive(ctx context.Context) ([]*MergeQueueEntry, err
 	}
 	defer rows.Close()
 	return collectMergeQueueEntries(rows)
+}
+
+// ListSettled returns terminal merge-queue entries newest-first. since is an
+// optional lower bound on settled_at; non-positive limits default to 20 and
+// limits above 100 are capped so history reads remain bounded.
+func (d *MergeQueueDAO) ListSettled(ctx context.Context, since time.Time, limit int) ([]*MergeQueueEntry, error) {
+	if d == nil || d.db == nil {
+		return nil, errors.New("merge queue: dao not configured")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	query := mergeQueueSelect + `
+		WHERE settled_at IS NOT NULL
+		  AND state IN (?, ?)`
+	args := []any{string(MergeQueueMerged), string(MergeQueueEvicted)}
+	if !since.IsZero() {
+		query += ` AND settled_at >= ?`
+		args = append(args, timeRFC3339(since))
+	}
+	query += ` ORDER BY settled_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("merge queue: list settled: %w", err)
+	}
+	defer rows.Close()
+	return collectMergeQueueEntries(rows)
+}
+
+// LatestSettledByMR returns the most recently settled (merged or evicted)
+// queue row for one merge request in one project, or ErrNotFound when the MR
+// has never settled. ExternalEnqueuer reads it as the admission fence for a
+// head the queue has already proven cannot land (rebase_conflict at the same
+// SHA): the verdict is deterministic for that head, so re-driving it only
+// burns a rebase request and a second eviction row.
+func (d *MergeQueueDAO) LatestSettledByMR(ctx context.Context, project string, mrIID int64) (*MergeQueueEntry, error) {
+	if d == nil || d.db == nil {
+		return nil, errors.New("merge queue: dao not configured")
+	}
+	if project == "" || mrIID <= 0 {
+		return nil, errors.New("merge queue: project and positive mr_iid required")
+	}
+	return scanMergeQueueEntry(d.db.QueryRowContext(ctx, mergeQueueSelect+`
+		WHERE project = ? AND mr_iid = ? AND settled_at IS NOT NULL
+		ORDER BY settled_at DESC, id DESC LIMIT 1`, project, mrIID))
 }
 
 // Position returns the 1-based position of a run's entry among its lane's

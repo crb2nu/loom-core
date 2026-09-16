@@ -1,0 +1,1 @@
+- Add the `textsim.Scorer` lexical and embedding-backed result contract in `pkg/mills/textsim`, with explicit, unchanged Jaccard fallback for unavailable or invalid embeddings from `pkg/codebase/embed`.

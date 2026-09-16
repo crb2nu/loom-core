@@ -1,0 +1,1 @@
+- Reuse stable quality-gate checkout paths in pod-local devbox workspaces while retaining per-run isolation on shared storage, and derive gate GOMEMLIMIT from sandbox memory with reserved headroom (cmd/mcp-devbox/quality_gate.go, cmd/mcp-devbox/manager.go, cmd/mcp-devbox/quality_gate_test.go).

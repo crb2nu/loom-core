@@ -1,0 +1,1 @@
+- Add `loom mills audit sweep`, a dry-run-first bulk closer for stale audit-advisory items, with a seven-day minimum cutoff and aggregate confirmed-sweep auditing (`pkg/mills/audit`, `cmd/loom`).

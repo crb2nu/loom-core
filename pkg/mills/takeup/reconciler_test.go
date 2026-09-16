@@ -30,6 +30,8 @@ type fakePlanStore struct {
 	detailErr     bool
 	sliceDetails  map[string]clients.PlanSliceSummary
 	detailFetches int
+	cachedStamps  map[string]string
+	cachedSlices  map[string][]clients.PlanSliceSummary
 }
 
 func newFakePlanStore() *fakePlanStore {
@@ -58,6 +60,18 @@ func (f *fakePlanStore) ListPlans(_ context.Context, _, _, phase string) ([]clie
 func (f *fakePlanStore) ListSlices(_ context.Context, planID string) ([]clients.PlanSliceSummary, error) {
 	f.listSlicePlanIDs = append(f.listSlicePlanIDs, planID)
 	return f.slices[planID], nil
+}
+func (f *fakePlanStore) ListSlicesIfChanged(ctx context.Context, plan clients.PlanSummary) ([]clients.PlanSliceSummary, error) {
+	if plan.UpdatedAt != "" && f.cachedStamps[plan.ID] == plan.UpdatedAt {
+		return f.cachedSlices[plan.ID], nil
+	}
+	if f.cachedStamps == nil {
+		f.cachedStamps = map[string]string{}
+		f.cachedSlices = map[string][]clients.PlanSliceSummary{}
+	}
+	f.cachedStamps[plan.ID] = plan.UpdatedAt
+	f.cachedSlices[plan.ID] = append([]clients.PlanSliceSummary(nil), f.slices[plan.ID]...)
+	return f.ListSlices(ctx, plan.ID)
 }
 func (f *fakePlanStore) GetSlice(_ context.Context, sliceID string) (clients.PlanSliceSummary, error) {
 	f.detailFetches++
@@ -748,5 +762,30 @@ func TestMergedMRRefs_JoinsAndCaps(t *testing.T) {
 	}
 	if got := mergedMRRefs(nil); got != "" {
 		t.Errorf("mergedMRRefs(nil) = %q, want empty", got)
+	}
+}
+
+func TestTakeupUnchangedPlanReusesSlicesAndMovedStampRefetches(t *testing.T) {
+	ps := newFakePlanStore()
+	plan := clients.PlanSummary{ID: "p", Phase: "planned", UpdatedAt: "2026-09-12T11:00:00Z"}
+	ps.plansByPhase["planned"] = []clients.PlanSummary{plan}
+	ps.slices["p"] = []clients.PlanSliceSummary{{ID: "p#1", PlanID: "p", Phase: "pending"}}
+	r := testReconciler(ps, &fakeMRs{}, newFakeBacklog())
+	if _, err := r.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(ps.listSlicePlanIDs); got != 1 {
+		t.Fatalf("unchanged live list calls=%d, want 1", got)
+	}
+	plan.UpdatedAt = "2026-09-12T11:01:00Z"
+	ps.plansByPhase["planned"] = []clients.PlanSummary{plan}
+	if _, err := r.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(ps.listSlicePlanIDs); got != 2 {
+		t.Fatalf("moved-stamp live list calls=%d, want 2", got)
 	}
 }

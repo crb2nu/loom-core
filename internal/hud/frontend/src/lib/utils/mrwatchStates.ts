@@ -46,3 +46,23 @@ export function isLiveMRWatchState(state: string): boolean {
 export function isHealthyMRWatchState(state: string): boolean {
   return state === 'ok' || state === 'merged';
 }
+
+/**
+ * States where a human (or the shepherd) has something to do. Mirrors the
+ * warn/error buckets of operatorHelpers.mrSeverity: in-flight states
+ * (awaiting_pipeline, ci_running) and drafts are progress, not problems.
+ */
+export const MR_ATTENTION_STATES: ReadonlySet<string> = new Set([
+  'ci_failed_flaky',
+  'ci_failed_deterministic',
+  'conflict',
+  'automerge_unarmed',
+  'pipeline_skipped',
+  'stale_branch',
+]);
+
+/** A red head pipeline needs attention whatever the registry classified. */
+export function mrNeedsAttention(state: string, pipelineStatus?: string | null): boolean {
+  if ((pipelineStatus || '').toLowerCase() === 'failed') return true;
+  return MR_ATTENTION_STATES.has((state || '').toLowerCase());
+}

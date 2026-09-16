@@ -26,9 +26,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
+	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/crb2nu/loom/internal/hud/monitor"
+	"github.com/crb2nu/loom/pkg/codebase/embed"
+	"github.com/crb2nu/loom/pkg/httpclient"
 	"github.com/crb2nu/loom/pkg/journalengine"
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/audit"
@@ -36,8 +39,10 @@ import (
 	"github.com/crb2nu/loom/pkg/mills/clients"
 	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/mills/eval"
+	"github.com/crb2nu/loom/pkg/mills/finishing"
 	"github.com/crb2nu/loom/pkg/mills/gates"
 	"github.com/crb2nu/loom/pkg/mills/guard"
+	millshealth "github.com/crb2nu/loom/pkg/mills/health"
 	"github.com/crb2nu/loom/pkg/mills/intake"
 	"github.com/crb2nu/loom/pkg/mills/mergequeue"
 	"github.com/crb2nu/loom/pkg/mills/notify"
@@ -48,6 +53,8 @@ import (
 	"github.com/crb2nu/loom/pkg/mills/squads"
 	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/crb2nu/loom/pkg/mills/takeup"
+	"github.com/crb2nu/loom/pkg/mills/textsim"
+	"github.com/crb2nu/loom/pkg/mills/webhookbus"
 	"github.com/crb2nu/loom/pkg/mills/worker"
 	"github.com/crb2nu/loom/pkg/mills/workflow"
 	"github.com/crb2nu/loom/pkg/openairesponses"
@@ -62,6 +69,68 @@ var version = "dev"
 // in Followup.OnRecorded fails at runtime, not build time) — this catches that
 // at build. See pkg/mills/audit.DigestIssuer.
 var _ audit.DigestIssuer = (*clients.GitLabClient)(nil)
+
+// Same guard for the supersession capability: if it drifts, the follow-up
+// writer would silently stop retiring the previous day's digest and the open
+// `audit-digest` pile would start growing again. See
+// pkg/mills/audit.DigestSupersessionIssuer.
+var _ audit.DigestSupersessionIssuer = (*clients.GitLabClient)(nil)
+
+type sandboxDrillHubClient struct{ hub *clients.MCPHubClient }
+
+type sandboxDrillWireVerdict struct {
+	Passed *bool `json:"passed"`
+	Checks []struct {
+		Name       string `json:"name"`
+		Passed     bool   `json:"passed"`
+		ExitCode   *int   `json:"exit_code"`
+		OutputTail string `json:"output_tail"`
+		StderrTail string `json:"stderr_tail"`
+	} `json:"checks"`
+}
+
+func (c *sandboxDrillHubClient) QualityGate(ctx context.Context, req overseer.SandboxDrillRequest) (overseer.SandboxDrillVerdict, error) {
+	if c == nil || c.hub == nil {
+		return overseer.SandboxDrillVerdict{}, errors.New("sandbox drill hub unavailable")
+	}
+	args := map[string]any{
+		"project": req.Project, "agent_id": req.AgentID, "checks": req.Checks,
+		"extra_test_commands": req.ExtraTestCommands, "fail_fast": req.FailFast,
+	}
+	body, callErr := c.hub.CallTool(ctx, clients.DevboxServerName, "devbox_quality_gate", args)
+	if body == "" {
+		return overseer.SandboxDrillVerdict{}, callErr
+	}
+	raw := []byte(body)
+	if !json.Valid(raw) {
+		decoded, err := mcp.DecodeTOONToJSON(body)
+		if err != nil {
+			return overseer.SandboxDrillVerdict{}, fmt.Errorf("decode drill verdict: %w", err)
+		}
+		raw = decoded
+	}
+	var wire sandboxDrillWireVerdict
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return overseer.SandboxDrillVerdict{}, fmt.Errorf("decode drill verdict: %w", err)
+	}
+	verdict := overseer.SandboxDrillVerdict{Passed: wire.Passed, Checks: make([]overseer.SandboxDrillCheck, 0, len(wire.Checks))}
+	for _, check := range wire.Checks {
+		output := check.OutputTail
+		if output == "" {
+			output = check.StderrTail
+		}
+		verdict.Checks = append(verdict.Checks, overseer.SandboxDrillCheck{Name: check.Name, Passed: check.Passed, ExitCode: check.ExitCode, OutputTail: output})
+	}
+	return verdict, callErr
+}
+
+func (c *sandboxDrillHubClient) Stop(ctx context.Context, project, agentID string) error {
+	if c == nil || c.hub == nil {
+		return errors.New("sandbox drill hub unavailable")
+	}
+	_, err := c.hub.CallTool(ctx, clients.DevboxServerName, "devbox_stop", map[string]any{"project": project, "agent_id": agentID})
+	return err
+}
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
@@ -152,6 +221,10 @@ func run(cfg Config) error {
 			logger.Warn("policy manager close", "error", cerr)
 		}
 	}()
+	// Policy-priced models (budgets.model_prices) overlay the compiled price
+	// tables at boot and follow every hot reload, so a new tier is priced the
+	// day policy names it.
+	applyPolicyModelPrices(pm.Current(), logger)
 	pm.Subscribe(func(_, n *mills.Policy) {
 		logger.Info("policy reloaded",
 			"version", n.Version,
@@ -159,6 +232,7 @@ func run(cfg Config) error {
 			"council_max_usd_per_day", n.Budgets.Council.MaxUSDPerDay,
 			"pipeline_max_concurrent_runs", n.Budgets.Pipeline.MaxConcurrentRuns,
 		)
+		applyPolicyModelPrices(n, logger)
 	})
 
 	budget := mills.NewBudget(pm, mills.NewStoreBudgetReader(st))
@@ -191,10 +265,13 @@ func run(cfg Config) error {
 	// backend fails loud here and degrades to FlexInfer.
 	judgeClient, councilJudgeModel := resolveMillsJudgeClient(cfg, flexClient, logger)
 	weaverClient := resolveMillsWeaverClient(cfg, flexClient, logger)
+	// Overseer triage (groomer verdicts, foreman issue bodies) inherits the
+	// judge wiring unless MILLS_TRIAGE_BACKEND pins it to a cheaper lane.
+	triageClient, triageModel := resolveMillsTriageClient(cfg, flexClient, judgeClient, logger)
 	capabilities := newCapabilityWiring(cfg)
 	capabilities.FlexInferConfigured = strings.TrimSpace(cfg.FlexInferProxyURL) != ""
 	capabilities.FlexInferReady = flexClient != nil
-	// gateTiebreaker feeds the /wiring snapshot: "anthropic" when the dissent
+	// gateTiebreaker feeds the /wiring snapshot: the ordered chain when the dissent
 	// tiebreaker is wired, else "none". Captured here (not re-derived) so it
 	// tracks exactly what RegisterLLMGates* bound.
 	gateTiebreaker := "none"
@@ -203,14 +280,22 @@ func run(cfg Config) error {
 		if judgeClient != flexClient {
 			judgeBackend = "litellm"
 		}
-		tiebreaker := buildGateTiebreaker(logger)
+		tiebreaker := buildGateTiebreaker(pm.Current().Gates.Tiebreaker, cfg, flexClient, logger)
+		tiebreakerName := ""
+		wiring := gates.LLMGateWiring{Judge: clients.NewRubricJudge(judgeClient)}
 		if tiebreaker != nil {
-			gateTiebreaker = "anthropic"
-			gates.RegisterLLMGatesWithTiebreaker(gateRegistry, clients.NewRubricJudge(judgeClient), tiebreaker, "anthropic")
-		} else {
-			gates.RegisterLLMGates(gateRegistry, clients.NewRubricJudge(judgeClient))
+			// A typed-nil *ChainRubricJudge must not reach the RubricJudge
+			// interface field, so the chain is only wired when it exists.
+			gateTiebreaker = tiebreaker.String()
+			tiebreakerName = gateTiebreaker
+			wiring.Tiebreaker = tiebreaker
+			wiring.TiebreakerName = tiebreakerName
 		}
-		logger.Info("LLM-judged gates enabled", "judge_backend", judgeBackend, "judge_model", judgeClient.JudgeModel(), "tiebreaker", tiebreaker != nil)
+		shadow := buildShadowJudge(cfg, logger)
+		wiring.Shadow = shadow
+		wiring.ShadowTimeout = cfg.FlexInferShadowJudgeTimeout
+		gates.RegisterLLMGatesWired(gateRegistry, wiring)
+		logger.Info("LLM-judged gates enabled", "judge_backend", judgeBackend, "judge_model", judgeClient.JudgeModel(), "tiebreaker", tiebreaker != nil, "shadow_judge", shadow != nil)
 	} else {
 		logger.Warn("LLM-judged gates disabled; spec_conformance + pr_self_review skipped (set FLEXINFER_PROXY_URL, or MILLS_JUDGE_BACKEND=litellm with LITELLM_PROXY_URL + FLEXINFER_JUDGE_MODEL)")
 	}
@@ -219,7 +304,17 @@ func run(cfg Config) error {
 	// editor, and artifact judge. Local/degraded runs keep the deterministic
 	// fakes so handlers can still be exercised, but autonomy readiness reports
 	// the fake fallback as a blocker.
-	councilRunner, councilUsesFakeAgents := buildCouncilRunner(st, pm, budget, cfg.RepoRoot, flexClient, litellmClient, judgeClient, councilJudgeModel, cfg.CouncilStages, logger)
+	semanticScorer, semanticEmbedModel := buildMergedWorkSemanticScorer(cfg)
+	if semanticScorer != nil {
+		// Name the embed model at startup: a model the proxy cannot resolve
+		// degrades scoring to lexical-only through the scorer's silent
+		// fallback, and this line is the only boot-time trace of which
+		// model the semantic band depends on.
+		logger.Info("merged-work semantic grounding enabled", "embed_model", semanticEmbedModel)
+	} else {
+		logger.Info("merged-work semantic grounding disabled (no FLEXINFER_PROXY_URL); grounding is lexical-only")
+	}
+	councilRunner, councilUsesFakeAgents := buildCouncilRunner(st, pm, budget, cfg.RepoRoot, flexClient, litellmClient, judgeClient, councilJudgeModel, semanticScorer, cfg.CouncilStages, logger)
 	capabilities.CouncilConfigured = councilRunner != nil
 	capabilities.CouncilUsesFakeAgents = councilUsesFakeAgents
 
@@ -255,7 +350,14 @@ func run(cfg Config) error {
 		withRunner(councilRunner).
 		withSquadsLoader(squadsLoader).
 		withGitLabBaseURL(cfg.GitLabAPIURL).
+		withRepoRoot(cfg.RepoRoot).
 		withKillSwitch(gitopsKillSwitch, cfg.GitOpsPolicyPath, cfg.GitOpsDefaultBranch)
+	op.gitopsDeploymentPath = cfg.GitOpsDeploymentPath
+	op.digestAt = cfg.DigestAt
+	// Runtime-registered repos (minted or onboarded from the HUD) are known
+	// to the protected-paths resolver under the same two-key gate that lets
+	// them source demand; cached so the resolver never hits SQLite per call.
+	mills.SetRuntimeKnownProjects(newCachedRuntimeProjects(st.Bootstrap.List, 30*time.Second).Projects)
 	op.beginActivitySourceWiring()
 	// Audit subsystem is attached below after the pipeline runner +
 	// FlexInfer client are ready; handlers read the fields at request
@@ -344,8 +446,14 @@ func run(cfg Config) error {
 				return spin.Frame{Name: a.Name, Model: a.Model, Backend: a.Backend}, true
 			},
 			NewEditor: func(f spin.Frame) (council.Editor, error) {
-				ed := buildEditorForAgent(
-					mills.CouncilAgent{Name: f.Name, Model: f.Model, Backend: f.Backend},
+				policy := pm.Current()
+				frame, ok := policy.SpinningRoomFrame(f.Name)
+				if !ok {
+					return nil, fmt.Errorf("frame %q is no longer configured", f.Name)
+				}
+				fallback, _ := policy.SpinningRoomFallback(frame)
+				ed := buildEditorChain(
+					frame, fallback,
 					"", flexClient, cfg.RepoRoot, nil, logger)
 				if ed == nil {
 					return nil, fmt.Errorf("no inference backend for frame %q (set FLEXINFER_PROXY_URL, an OpenAI key, or an Anthropic key)", f.Name)
@@ -396,7 +504,7 @@ func run(cfg Config) error {
 			MaxDepth: func() int { return pm.Current().MergeQueueMaxDepth() },
 		}
 	}
-	dispatcher, realStages := buildDispatcher(cfg, weaverClient, hubClient, st, logger, autoMergeFor(pm), flakyCIJobsFor(pm), substrateForStage(pm), spawnRouteFor(pm, st, logger), hudSpawn, mergeQueueGateway, mergeQueueEnabled)
+	dispatcher, realStages := buildDispatcher(cfg, weaverClient, hubClient, st, logger, autoMergeFor(pm, cfg.GitLabProject), flakyCIJobsFor(pm), func() int { return pm.Current().Pipeline.CIWatch.MaxWallClockMinutes }, substrateForStage(pm), spawnRouteFor(pm, st, logger), hudSpawn, mergeQueueGateway, mergeQueueEnabled, func() bool { return pm.Current().TestsBaselineOracleEnabled() })
 	capabilities.DispatcherRealStages = realStages
 	capabilities.BranchContractReady = true
 	capabilities.BranchContractSource = "pkg/mills/pipeline/branch_contract.go"
@@ -438,7 +546,35 @@ func run(cfg Config) error {
 	op.withHealthGates(healthGates)
 
 	pipelineRunner := pipeline.New(st, gateRegistry, dispatcher, pm)
+	pipelineRunner.HomeProject = cfg.GitLabProject
 	pipelineRunner.Logger = logger
+	if hudSpawn != nil {
+		pipelineRunner.SpawnStopper = hudSpawn
+	}
+	var flightdeckClient *millshealth.FlightdeckClient
+	if fp := pm.Current().Health.Flightdeck; fp.Enabled {
+		flightdeckErrors := prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "loom_mills_flightdeck_delivery_errors_total",
+			Help: "Mills lifecycle events dropped after queue overflow or delivery failure.",
+		})
+		prometheus.MustRegister(flightdeckErrors)
+		flightdeckClient = millshealth.NewFlightdeckClient(millshealth.FlightdeckClientConfig{
+			Endpoint: fp.Endpoint, Token: fp.Token, Timeout: fp.Timeout(), QueueSize: fp.QueueSize, Errors: flightdeckErrors,
+		})
+		defer flightdeckClient.Close()
+		lifecycleDispatcher, ok := dispatcher.(*pipeline.Dispatcher)
+		if !ok {
+			return fmt.Errorf("flightdeck lifecycle export requires pipeline dispatcher, got %T", dispatcher)
+		}
+		lifecycleDispatcher.SetLifecycleObserver(func(run *store.PipelineRun, item *store.BacklogItem, stage pipeline.Stage, attempt int) {
+			typ := "factory.stage.transition"
+			if stage.ID == "plan_slice" {
+				typ = "factory.run.started"
+			}
+			flightdeckClient.Emit(millshealth.FactoryEvent{Type: typ, RunID: run.ID, BacklogID: item.ID, Stage: stage.ID, Attempt: attempt})
+		})
+		logger.Info("flightdeck lifecycle export enabled", "endpoint", fp.Endpoint)
+	}
 	pipelineRunner.HealthGates = healthGates.runnerPreflight()
 	if councilRunner != nil {
 		councilRunner.HealthGates = healthGates.runnerPreflight()
@@ -538,10 +674,23 @@ func run(cfg Config) error {
 	} else {
 		logger.Info("audit triggers disabled (FLEXINFER_PROXY_URL or council runner missing)")
 	}
+	if flightdeckClient != nil {
+		mergedHooks = append(mergedHooks, func(_ context.Context, run *store.PipelineRun, item *store.BacklogItem) error {
+			flightdeckClient.Emit(millshealth.FactoryEvent{Type: "factory.run.terminal", RunID: run.ID, BacklogID: item.ID, Stage: run.CurrentStage, Class: "success", CostUSD: run.CostUSD})
+			return nil
+		})
+	}
 	pipelineRunner.OnMerged = chainPipelineMerged(mergedHooks...)
 	// Record `failed` squad outcomes on real escalations so the router's
 	// confidence signal reflects failures, not just merges.
 	pipelineRunner.OnEscalated = squadRecorder.OnEscalated
+	if flightdeckClient != nil {
+		previous := pipelineRunner.OnEscalated
+		pipelineRunner.OnEscalated = func(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem) error {
+			flightdeckClient.Emit(millshealth.FactoryEvent{Type: "factory.run.terminal", RunID: run.ID, BacklogID: item.ID, Stage: run.CurrentStage, Class: run.FailureClass, CostUSD: run.CostUSD})
+			return previous(ctx, run, item)
+		}
+	}
 	// Slice 3d: when maybeAutoRetry converts a transient-cap
 	// escalation into a re-queue, kick the scheduler so the new run
 	// starts within ~1s instead of waiting for the next tick.
@@ -556,9 +705,18 @@ func run(cfg Config) error {
 	// Escalator: GitLab for issues, MCP hub for handoff. Either may be
 	// disabled independently; the escalator runs whichever it has.
 	gitlabClient := buildGitLabClient(cfg, logger)
+	if gitlabClient != nil {
+		op.docsMirror.check = func(ctx context.Context, now time.Time) finishing.DocsMirrorDrift {
+			return finishing.CheckDocsMirror(ctx, finishing.GitSourceLister(cfg.RepoRoot, version), gitlabClient, gitlabClient, cfg.DocsMirrorProject, cfg.DocsMirrorRef, cfg.DocsMirrorPath, now)
+		}
+	}
 	capabilities.GitLabConfigured = strings.TrimSpace(cfg.GitLabAPIURL) != "" && strings.TrimSpace(cfg.GitLabToken) != "" && strings.TrimSpace(cfg.GitLabProject) != ""
 	capabilities.GitLabReady = gitlabClient != nil
 	if gitlabClient != nil {
+		op.withBoltMRStats(func(ctx context.Context, project string, iid int64) (boltGitLabStats, error) {
+			stats, err := gitlabClient.ForProject(project).GetMergeRequestDiffStats(ctx, iid)
+			return boltGitLabStats{Files: stats.Files, Added: stats.Added, Removed: stats.Removed, URL: stats.URL, MergedAt: stats.MergedAt}, err
+		})
 		op.withVerdictMRVerification(func(project string) mills.MRStateClient {
 			return gitlabClient.ForProject(project)
 		}, st.Pipeline, cfg.GitLabProject)
@@ -768,6 +926,8 @@ func run(cfg Config) error {
 		case *clients.FlexInferCouncilEditor:
 			ed.Patterns = patternLister
 			logger.Info("council editor wired to approved-pattern catalog", "editor", "flexinfer")
+		case *clients.OpenRouterCouncilEditor:
+			ed.Patterns = patternLister
 		case *clients.OpenAIResponsesCouncilEditor:
 			ed.Patterns = patternLister
 			logger.Info("council editor wired to approved-pattern catalog", "editor", "openai-responses")
@@ -802,6 +962,7 @@ func run(cfg Config) error {
 		alloc.SourceSessionIDFunc = operatorSession.SessionID
 		merger := clients.NewGitBranchMerger(cfg.RepoRoot)
 		integrator = pipeline.NewIntegrator(st, pipelineRunner, alloc, merger)
+		integrator.HomeProject = cfg.GitLabProject
 		integrator.Logger = logger
 		// Inherit the pipeline runner's MaxConcurrentRuns budget for the
 		// integrator's parallel fan-out cap so a single backlog item
@@ -819,6 +980,7 @@ func run(cfg Config) error {
 	starter := pipeline.NewRunnerStarter(pipelineRunner, integrator)
 	starter.Logger = logger
 	kpiWriter := mills.NewKPIWriter(st, pm)
+	kpiWriter.HomeProject = cfg.GitLabProject
 	kpiWriter.Logger = logger
 	capabilities.KPIWriterReady = true
 	capabilities.KPIWriterSource = "pkg/mills/kpi_writer.go"
@@ -833,7 +995,13 @@ func run(cfg Config) error {
 	// pipeline starter (which spawns goroutines that drive the DAG and
 	// fire OnMerged → eval Loop B per merge).
 	reconciler := mills.NewReconciler(st, pm, budget, starter)
+	reconciler.SweepSilentRuns = pipelineRunner.SweepSilentRuns
 	reconciler.Logger = logger
+	reconciler.OperatorRepoRoot = cfg.RepoRoot
+	reconciler.OperatorBuildSHA = version
+	if hubClient != nil {
+		reconciler.VaccineMinter = clients.NewPatternClient(hubClient)
+	}
 	escalationSweeper := mills.NewEscalationSweeper(reconciler, pm)
 	escalationSweeper.Logger = logger
 	escalationSweeper.Enabled = op.workAdmissionOpen
@@ -856,8 +1024,37 @@ func run(cfg Config) error {
 	// through the getter (not a frozen copy) — the session maintainer replaces
 	// the id after a hub outage.
 	reconciler.OperatorSessionID = operatorSession.SessionID
+	var substrateHealthMu sync.Mutex
+	substrateRedAt := make(map[string]time.Time)
 	reconciler.AutonomyGate = func(ctx context.Context) (bool, []string) {
 		report := op.capabilityReport(ctx)
+		checkedAt, err := time.Parse(time.RFC3339, report.CheckedAt)
+		if err != nil {
+			checkedAt = time.Now().UTC()
+		}
+		substrateHealthMu.Lock()
+		for _, row := range report.Capabilities {
+			capability := strings.TrimSpace(row.ID)
+			if capability == "" {
+				continue
+			}
+			redAt, wasRed := substrateRedAt[capability]
+			switch {
+			case row.Status == string(capabilityRed) && !wasRed:
+				if err := reconciler.RecordSubstrateRed(ctx, capability, checkedAt); err != nil {
+					logger.Warn("record substrate red edge", "capability", capability, "error", err)
+					continue
+				}
+				substrateRedAt[capability] = checkedAt
+			case row.Status == string(capabilityGreen) && wasRed:
+				if err := reconciler.RecordSubstrateRecovered(ctx, mills.SubstrateRecoveryWindow{Capability: capability, RedAt: redAt, GreenAt: checkedAt}); err != nil {
+					logger.Warn("record substrate recovery edge", "capability", capability, "error", err)
+					continue
+				}
+				delete(substrateRedAt, capability)
+			}
+		}
+		substrateHealthMu.Unlock()
 		return report.AutonomyReady, report.AutonomyBlockers
 	}
 	// Run provenance: stamp the configuration each run starts under so a merged
@@ -952,9 +1149,23 @@ func run(cfg Config) error {
 		reconciler.GhostSparkMergedBranchForProject = func(project string) mills.MergedBranchMRClient {
 			return gitlabClient.ForProject(project)
 		}
+		// Deployment-aware dependency gate: when a merged dependency's run left
+		// no merged_sha artifact (a hand-finished MR reaped by the ghost-spark
+		// sweep, an external merge-queue candidate) and the merge-queue ledger
+		// has no row for its MR either, ask GitLab once for the landed commit.
+		// The reconciler caches the answer as an event, so this never runs per
+		// tick. Same per-project client contract as the ghost-spark passes.
+		reconciler.DependencyMergeSHA = func(ctx context.Context, project string, mrIID int64) (string, error) {
+			client := gitlabClient
+			if project != "" {
+				client = gitlabClient.ForProject(project)
+			}
+			return client.MergedSHAForMR(ctx, mrIID)
+		}
 		logger.Info("ghost-spark reap sweep enabled",
 			"issue_autoclose", reconciler.GhostSparkResolver != nil,
-			"merged_branch_pass", true)
+			"merged_branch_pass", true,
+			"dependency_merge_sha_lookup", true)
 		// Post-merge regression attribution: join merged MRs to later revert
 		// commits on the default branch, revert-trailer only. Both halves come
 		// from the same read-only client, so they arm together or not at all.
@@ -1045,6 +1256,7 @@ func run(cfg Config) error {
 	scheduler.Logger = logger
 	scheduler.Enabled = workAdmissionEnabled
 	scheduler.KPIRecorder = kpiWriter
+	scheduler.KPIRecordInterval = mills.DefaultKPIRecordInterval
 	// Bind the tick-on-merge closure now that the scheduler exists.
 	schedulerRef = scheduler
 
@@ -1074,6 +1286,13 @@ func run(cfg Config) error {
 		}
 	}
 	councilSched := mills.NewCouncilScheduler(councilRunFn, pm)
+	// A rollout that lands within a minute of a cron slot skips it (no
+	// catch-up existed before 2026-09-02); consult the store so a slot the
+	// previous process did fire is not run twice.
+	councilSched.RanSince = func(ctx context.Context, since time.Time) (bool, error) {
+		n, err := st.Council.CountSince(ctx, since)
+		return n > 0, err
+	}
 	councilSched.Logger = logger
 	councilSched.Enabled = workAdmissionEnabled
 
@@ -1131,6 +1350,18 @@ func run(cfg Config) error {
 		Store:   st,
 		Enabled: mergeQueueEnabled,
 		Logger:  logger,
+		// Shepherd A2: green evictions (head_moved successor, ci_timeout
+		// same-head) re-enter ONCE as external candidates when the policy
+		// flag is on. External candidates only merge on a terminal
+		// successful pipeline for the head, so the hop never bypasses proof.
+		External: &mergequeue.ExternalEnqueuer{
+			Store:    st,
+			Enabled:  mergeQueueEnabled,
+			MaxDepth: func() int { return pm.Current().MergeQueueMaxDepth() },
+		},
+		RequeueEvictions: func() bool { return pm.Current().MergeQueueRequeueEvictions() },
+		AwaitPipelineFn:  func() time.Duration { return pm.Current().MergeQueueAwaitPipeline() },
+		SpeculationDepth: func() int { return pm.Current().MergeQueueSpeculationDepth() },
 	}
 	if gitlabClient != nil {
 		mergeQueueProc.ForProject = func(project string) mergequeue.Forge {
@@ -1154,15 +1385,17 @@ func run(cfg Config) error {
 	// selection (and litellm exclusions) stay single-sourced; a nil judge
 	// degrades the groomer to deterministic-only, never blocks it.
 	var groomerTriage *overseer.Triage
-	if judgeClient != nil {
-		groomerTriage = &overseer.Triage{Client: judgeClient, Logger: logger}
+	if triageClient != nil {
+		groomerTriage = &overseer.Triage{Client: triageClient, Model: triageModel, Logger: logger}
 	}
 	groomer := &overseer.Groomer{
-		Store:  st,
-		Policy: pm.Current,
-		Triage: groomerTriage,
+		Store:       st,
+		Policy:      pm.Current,
+		Triage:      groomerTriage,
+		HomeProject: cfg.GitLabProject,
 		Recorder: &overseer.ActionRecorder{
 			Events: st.Events,
+			Soak:   st,
 			Actor:  "overseer.groomer",
 			DryRun: func() bool {
 				pol := pm.Current()
@@ -1173,6 +1406,10 @@ func run(cfg Config) error {
 	}
 	groomerHarness := &overseer.Harness{
 		Agent: groomer,
+		// S2 soak evidence: dry-run ticks that would act nothing still count
+		// as reviewed decisions (see guard.Harness.Soak).
+		Soak:   st,
+		DryRun: groomer.Recorder.DryRun,
 		Enabled: func() bool {
 			pol := pm.Current()
 			return workAdmissionEnabled() && pol != nil && pol.GroomerEnabled()
@@ -1229,6 +1466,7 @@ func run(cfg Config) error {
 		Policy: pm.Current,
 		Recorder: &overseer.ActionRecorder{
 			Events: st.Events,
+			Soak:   st,
 			Actor:  "overseer.sentinel",
 			DryRun: func() bool {
 				pol := pm.Current()
@@ -1243,6 +1481,10 @@ func run(cfg Config) error {
 	op.addAdmissionSuppressor(sentinel.SuppressAdmission)
 	sentinelHarness := &overseer.Harness{
 		Agent: sentinel,
+		// S2 soak evidence: dry-run ticks that would act nothing still count
+		// as reviewed decisions (see guard.Harness.Soak).
+		Soak:   st,
+		DryRun: sentinel.Recorder.DryRun,
 		// Gated on workAdmissionOpen (kill-switch/crash-lease) but NOT on the
 		// composed workAdmissionEnabled: the sentinel must keep ticking while
 		// its own suppression lease is live, or it could never clear it.
@@ -1285,6 +1527,44 @@ func run(cfg Config) error {
 		"dry_run", mills.DryRunOn(pm.Current().Overseers.Sentinel.DryRun),
 		"probes", len(sentinelProbes))
 
+	// Sandbox drill: an isolated, scheduled proof that concurrent devbox gates
+	// can both return complete verdicts within budget. It is intentionally not
+	// gated on work admission because it observes substrate health and never
+	// touches backlog items or pipeline runs.
+	drill := &overseer.SandboxDrill{Policy: pm.Current, Logger: logger}
+	if hubClient != nil {
+		drill.Client = &sandboxDrillHubClient{hub: hubClient}
+	}
+	if gitlabClient != nil {
+		drill.Issues = gitlabClient
+	}
+	drillHarness := &overseer.Harness{
+		Agent: drill,
+		// The drill enforces the hot-reloaded per-gate budget internally. Keep
+		// the outer harness above the policy's hard 1h ceiling so its generic
+		// 5m default cannot preempt the default 15m drill.
+		TickTimeout: 61 * time.Minute,
+		Enabled: func() bool {
+			pol := pm.Current()
+			return hubClient != nil && pol != nil && pol.SandboxDrillEnabled()
+		},
+		Interval: func() time.Duration {
+			pol := pm.Current()
+			if pol == nil {
+				return 6 * time.Hour
+			}
+			return pol.Overseers.SandboxDrill.Interval()
+		},
+		BootTick: 2 * time.Minute,
+		Logger:   logger,
+	}
+	op.addActivitySource("overseer_sandbox_drill", drillHarness)
+	op.overseers["sandbox_drill"] = overseerEntry{
+		Harness: drillHarness,
+		Enabled: func() bool { pol := pm.Current(); return pol != nil && pol.SandboxDrillEnabled() },
+		DryRun:  func() bool { return false },
+	}
+
 	// Mill foreman (overseers slice 3). Deterministic KPI-anomaly rules over the
 	// store (stuck runs, throughput collapse, escalation storm, budget burn);
 	// optional LLM-composed issue bodies; guarded actions (file dedup-marked
@@ -1294,8 +1574,8 @@ func run(cfg Config) error {
 	// template and a nil/disabled webhook skips alerts — neither blocks the
 	// deterministic rules.
 	var foremanTriage *overseer.Triage
-	if judgeClient != nil {
-		foremanTriage = &overseer.Triage{Client: judgeClient, Logger: logger}
+	if triageClient != nil {
+		foremanTriage = &overseer.Triage{Client: triageClient, Model: triageModel, Logger: logger}
 	}
 	foreman := &overseer.Foreman{
 		Store:  st,
@@ -1303,6 +1583,7 @@ func run(cfg Config) error {
 		Triage: foremanTriage,
 		Recorder: &overseer.ActionRecorder{
 			Events: st.Events,
+			Soak:   st,
 			Actor:  "overseer.foreman",
 			DryRun: func() bool {
 				pol := pm.Current()
@@ -1323,6 +1604,10 @@ func run(cfg Config) error {
 	op.addAdmissionSuppressor(foreman.SuppressAdmission)
 	foremanHarness := &overseer.Harness{
 		Agent: foreman,
+		// S2 soak evidence: dry-run ticks that would act nothing still count
+		// as reviewed decisions (see guard.Harness.Soak).
+		Soak:   st,
+		DryRun: foreman.Recorder.DryRun,
 		// Gated on workAdmissionOpen (kill-switch/crash-lease) but NOT on the
 		// composed workAdmissionEnabled: like the sentinel, the foreman must keep
 		// ticking while its own pause lease is live, or it could never clear it.
@@ -1355,6 +1640,64 @@ func run(cfg Config) error {
 		"dry_run", mills.DryRunOn(pm.Current().Overseers.Foreman.DryRun),
 		"llm_triage", foremanTriage.Available(),
 		"webhook", foreman.Webhook != nil)
+
+	// Escalated-shelf shepherd (shepherd program B1). Owns the items every
+	// other automatic path structurally excludes: bounded, audited
+	// escalated→queued relaunches for aged retryable escalations the
+	// auto-requeue sweep refuses (MR-bearing, cross-repo, code-class), and
+	// event-only attention flags for closed-MR orphans. Fail-safe posture:
+	// default-OFF policy section, dry-run default ON (proposal evidence for
+	// the promotion soak), allow.relaunch opt-in, per-tick/day caps, one
+	// shepherd relaunch per item ever.
+	shepherd := &overseer.Shepherd{
+		Store:  st,
+		Policy: pm.Current,
+		Recorder: &overseer.ActionRecorder{
+			Events: st.Events,
+			Soak:   st,
+			Actor:  "overseer.shepherd",
+			DryRun: func() bool {
+				pol := pm.Current()
+				return pol == nil || mills.DryRunOn(pol.Overseers.Shepherd.DryRun)
+			},
+		},
+		Logger:      logger,
+		HomeProject: cfg.GitLabProject,
+	}
+	shepherdHarness := &overseer.Harness{
+		Agent: shepherd,
+		// S2 soak evidence: dry-run ticks that would act nothing still count
+		// as reviewed decisions (see guard.Harness.Soak).
+		Soak:   st,
+		DryRun: shepherd.Recorder.DryRun,
+		// Composed workAdmissionEnabled like the groomer: the shepherd feeds
+		// the queue, so a kill-switch or suppression lease must idle it.
+		Enabled: func() bool {
+			pol := pm.Current()
+			return workAdmissionEnabled() && pol != nil && pol.ShepherdEnabled()
+		},
+		Interval: func() time.Duration {
+			pol := pm.Current()
+			if pol == nil {
+				return time.Hour
+			}
+			return pol.Overseers.Shepherd.Interval()
+		},
+		BootTick: 2 * time.Minute,
+		Logger:   logger,
+	}
+	op.addActivitySource("overseer_shepherd", shepherdHarness)
+	op.overseers["shepherd"] = overseerEntry{
+		Harness: shepherdHarness,
+		Enabled: func() bool { pol := pm.Current(); return pol != nil && pol.ShepherdEnabled() },
+		DryRun: func() bool {
+			pol := pm.Current()
+			return pol == nil || mills.DryRunOn(pol.Overseers.Shepherd.DryRun)
+		},
+	}
+	logger.Info("overseer shepherd wired",
+		"enabled", pm.Current().ShepherdEnabled(),
+		"dry_run", mills.DryRunOn(pm.Current().Overseers.Shepherd.DryRun))
 
 	// S6-min imperative workflow runtime (plan .loom/134 §S6-min). Always
 	// wired into the errgroup but DEFAULT-OFF: the scheduler self-gates on
@@ -1395,12 +1738,61 @@ func run(cfg Config) error {
 			"quarantined_runs", snap.QuarantinedCount,
 			"recent_steps", len(snap.RecentSteps))
 	})
+	reportWriter := newReportRollupWriter(op)
+	// Boot phases (see boot_order.go): the rollup warm-up releases the first,
+	// the reconciler's boot tick the second. Gated loops wait on them below.
+	rollupsWarm := mills.NewBootPhase("report_rollup_warmup", logger)
+	reconcilerBooted := mills.NewBootPhase("reconciler_boot_tick", logger)
+	reportWriter.OnFirstRefresh = rollupsWarm.Release
+	scheduler.OnBootTick = reconcilerBooted.Release
+	var healthPoller *millshealth.Poller
+	// Wire the observation reader before the scheduler goroutine starts. The
+	// snapshot itself is protected below; publishing the callback afterward
+	// would race with tryStart reading the function field during a boot tick.
+	if hp := pm.Current().Health; hp.Enabled {
+		var healthMu sync.RWMutex
+		var latestHealth millshealth.Observation
+		reconciler.HealthObservation = func() millshealth.Observation {
+			healthMu.RLock()
+			defer healthMu.RUnlock()
+			return latestHealth
+		}
+		builtAt, parseErr := time.Parse(time.RFC3339, hp.OperatorBuiltAt)
+		if parseErr != nil && strings.TrimSpace(hp.OperatorBuiltAt) != "" {
+			logger.Warn("health operator_built_at is invalid; image lag disabled", "error", parseErr)
+		}
+		healthPoller = &millshealth.Poller{
+			Client: &millshealth.GitLabClient{BaseURL: cfg.GitLabAPIURL, Token: cfg.GitLabToken, Project: hp.Project},
+			Ref:    hp.RefName(), Interval: hp.PollInterval(), OperatorBuiltAt: builtAt,
+			Observe: func(o millshealth.Observation) {
+				healthMu.Lock()
+				wasRed := latestHealth.Known && !latestHealth.Green
+				latestHealth = o
+				healthMu.Unlock()
+				if o.Green {
+					mills.MainPipelineGreen.Set(1)
+				} else {
+					mills.MainPipelineGreen.Set(0)
+				}
+				mills.MainRedDurationSeconds.Set(o.RedDuration.Seconds())
+				mills.OperatorImageLagSeconds.Set(o.OperatorImageLag.Seconds())
+				if wasRed && o.Known && o.Green && schedulerRef != nil {
+					schedulerRef.KickNow()
+				}
+			},
+		}
+	}
 
 	g, gctx := errgroup.WithContext(rootCtx)
 	g.Go(func() error { return runListener(gctx, "http", httpSrv, logger) })
 	g.Go(func() error { return runListener(gctx, "metrics", metricsSrv, logger) })
-	g.Go(func() error { return scheduler.Run(gctx) })
-	g.Go(func() error { return escalationSweeper.Run(gctx) })
+	// Ordered boot (boot_order.go): rollup warm-up → reconciler boot tick →
+	// escalation sweep. The report writer's Run performs the warm-up itself
+	// and releases rollupsWarm from OnFirstRefresh.
+	g.Go(func() error { return reportWriter.Run(gctx) })
+	g.Go(func() error { return rollupsWarm.Gate(gctx, bootRollupWarmupWait, scheduler.Run) })
+	g.Go(func() error { return reconcilerBooted.Gate(gctx, bootReconcilerTickWait, escalationSweeper.Run) })
+	g.Go(func() error { return reconcilerBooted.Gate(gctx, bootReconcilerTickWait, op.runDigestScheduler) })
 	g.Go(func() error { return crossRunSched.Run(gctx) })
 	g.Go(func() error { return councilSched.Run(gctx) })
 	g.Go(func() error { return canarySched.Run(gctx) })
@@ -1408,7 +1800,25 @@ func run(cfg Config) error {
 	g.Go(func() error { return workflowSched.Run(gctx) })
 	g.Go(func() error { return groomerHarness.Run(gctx) })
 	g.Go(func() error { return sentinelHarness.Run(gctx) })
+	g.Go(func() error { return drillHarness.Run(gctx) })
 	g.Go(func() error { return foremanHarness.Run(gctx) })
+	g.Go(func() error { return shepherdHarness.Run(gctx) })
+	// First check happens on the housekeeping tick, never on the boot path.
+	if op.docsMirror.check != nil {
+		g.Go(func() error { return reconcilerBooted.Gate(gctx, bootReconcilerTickWait, op.docsMirror.Run) })
+	}
+	// The health plane is deliberately absent when disabled: no client, first
+	// request, ticker, goroutine, or metric mutation is created on that path.
+	if healthPoller != nil {
+		g.Go(func() error { return healthPoller.Run(gctx) })
+		// S5 advisory auto-remediation rides the same GitLab poller source:
+		// a main-red on security:govulncheck either arms the Renovate MR that
+		// bumps the flagged module or mints exactly one remediation item.
+		if src, ok := healthPoller.Client.(*millshealth.GitLabClient); ok {
+			remediator := &millshealth.Remediator{Source: src, Sink: remediationSink{backlog: st.Backlog, gitlab: gitlabClient}, Interval: healthPoller.Interval, Log: logger}
+			g.Go(func() error { return remediator.Run(gctx) })
+		}
+	}
 
 	// Drive the workflow monitor's poll loop and stop it on shutdown. Start
 	// kicks off an immediate refresh + a ticker; the g.Go blocks until ctx
@@ -1423,7 +1833,7 @@ func run(cfg Config) error {
 	// GitLab issue importer (Slice 1a of plan 43). Opt-in via
 	// policy.intake.gitlab.enabled: true. No-op without a configured
 	// GitLab client.
-	if gitlabImporter := buildGitLabImporter(pm, gitlabClient, st, logger); gitlabImporter != nil {
+	if gitlabImporter := buildGitLabImporter(pm, gitlabClient, st, cfg.GitLabProject, logger); gitlabImporter != nil {
 		gitlabImporter.Enabled = workAdmissionEnabled
 		op.addActivitySource("gitlab_importer", gitlabImporter)
 		// Inline plan authoring (plan store S7b-β): when enabled and the
@@ -1435,7 +1845,9 @@ func run(cfg Config) error {
 			gitlabImporter.Project = cfg.GitLabProject
 			logger.Info("gitlab importer inline plan authoring enabled")
 		}
-		g.Go(func() error { return gitlabImporter.Run(gctx) })
+		// Intake loops tick immediately on Run; start them behind the rollup
+		// warm-up (boot_order.go) so their first pass reads a warm store.
+		g.Go(func() error { return rollupsWarm.Gate(gctx, bootRollupWarmupWait, gitlabImporter.Run) })
 	}
 
 	// Plan-slice emitter (.loom/163 S2): the Plan Store → backlog bridge.
@@ -1497,9 +1909,12 @@ func run(cfg Config) error {
 		// the post-implement path_policy gate treats a plan-declared touch (e.g.
 		// **/*auth*.go) as intended instead of escalating the item; an
 		// undeclared touch the implement stage introduces still fails the gate.
+		// The project is the slice's demand repo (empty = home repo), so
+		// cross-repo items are judged against the target repo's
+		// protected_paths_per_repo overlay in addition to the global globs.
 		// pm.Current() is read per call so a hot policy reload is honored.
-		emitter.SetProtectedPathHitter(func(paths []string) []string {
-			return pm.Current().ProtectedPathsHit(paths)
+		emitter.SetProtectedPathHitter(func(project string, paths []string) []string {
+			return pm.Current().ProtectedPathsHitFor(project, paths)
 		})
 		// Ground each emitted slice's declared files against a revision-pinned
 		// origin/main tree read from the operator-local clone. A slice whose
@@ -1518,7 +1933,7 @@ func run(cfg Config) error {
 			}
 			emitter.SetSliceGrounder(grounder.Ground)
 		}
-		g.Go(func() error { return emitter.Run(gctx) })
+		g.Go(func() error { return rollupsWarm.Gate(gctx, bootRollupWarmupWait, emitter.Run) })
 		logger.Info("plan-slice emitter enabled",
 			"project", project,
 			"namespace", pm.Current().PlanSliceEmitterNamespace(),
@@ -1556,7 +1971,7 @@ func run(cfg Config) error {
 		// the pattern taste gate. Same hub the plan writes ride; nil-safe off.
 		takeupRec.Patterns = clients.NewPatternClient(hubClient)
 		op.addActivitySource("takeup", takeupRec)
-		g.Go(func() error { return takeupRec.Run(gctx) })
+		g.Go(func() error { return rollupsWarm.Gate(gctx, bootRollupWarmupWait, takeupRec.Run) })
 		logger.Info("take-up reconciler enabled",
 			"project", project,
 			"namespace", pm.Current().TakeupNamespace(),
@@ -1570,7 +1985,7 @@ func run(cfg Config) error {
 	if canaryGC := buildCanaryGC(pm, st, logger); canaryGC != nil {
 		canaryGC.Enabled = workAdmissionEnabled
 		op.addActivitySource("canary_gc", canaryGC)
-		g.Go(func() error { return canaryGC.Run(gctx) })
+		g.Go(func() error { return rollupsWarm.Gate(gctx, bootRollupWarmupWait, canaryGC.Run) })
 	}
 	if hubClient != nil {
 		g.Go(func() error {
@@ -1668,22 +2083,37 @@ func newLogger(debug bool) *slog.Logger {
 const openAICouncilEditorTimeout = 5 * time.Minute
 
 func buildCouncilEditor(policy *mills.Policy, flexClient *clients.FlexInferClient, repoRoot string, mem council.MemoryLoader, logger *slog.Logger) council.Editor {
-	return buildEditorForAgent(policy.Council.Ensemble.Editor, policy.Council.Ensemble.EditorFallbackModel, flexClient, repoRoot, mem, logger)
+	crossVendor, _ := policy.Council.Ensemble.EditorCrossVendorFallback()
+	return buildEditorChain(policy.Council.Ensemble.Editor, crossVendor, policy.Council.Ensemble.EditorFallbackModel, flexClient, repoRoot, mem, logger)
 }
 
 // buildEditorForAgent builds a council.Editor for an arbitrary {name, model,
-// backend} agent — the council ensemble editor (buildCouncilEditor) OR a
-// Spinning Room frame (Live Beam slice 3). An OpenAI/Responses backend with a
-// key configured drives the frontier model with a flexinfer fallback; any other
-// backend (or a missing key) uses the local flexinfer editor. Returns nil only
-// when no backend is available at all (flexClient nil AND no usable OpenAI
-// client) so a caller can fail loudly rather than spin on a dead editor.
+// backend} agent — a Spinning Room frame (Live Beam slice 3), or the council
+// ensemble editor when no cross-vendor hop applies. An OpenAI/Responses or
+// Anthropic backend with a key configured drives the frontier model with a
+// flexinfer fallback; any other backend (or a missing key) uses the local
+// flexinfer editor. Returns nil only when no backend is available at all
+// (flexClient nil AND no usable remote client) so a caller can fail loudly
+// rather than spin on a dead editor.
 //
 // mem is the council lane's durable cross-run memory (nil = none). Only the
 // council ensemble editor passes it: a Spinning Room frame is a different lane
 // that never records into that journal, so rendering it there would put another
 // lane's history above the frame's own boundary for no gain.
 func buildEditorForAgent(agent mills.CouncilAgent, localFallbackModel string, flexClient *clients.FlexInferClient, repoRoot string, mem council.MemoryLoader, logger *slog.Logger) council.Editor {
+	return buildEditorChain(agent, mills.CouncilAgent{}, localFallbackModel, flexClient, repoRoot, mem, logger)
+}
+
+// buildEditorChain is buildEditorForAgent plus an optional cross-vendor hop:
+// primary → crossVendor (a remote editor on the OTHER frontier provider) →
+// local flexinfer. The hop exists because the primary's dominant failures are
+// vendor-scoped — 2026-09-07 three consecutive council runs died at the editor
+// on an Anthropic billing hold ("credit balance is too low") after $1.7 of
+// reviewer spend each, while the OpenAI key beside it sat idle and the local
+// fallback was mis-routed. crossVendor with an empty Model means no hop; a hop
+// whose key is absent is skipped at build time (logged once) so a policy that
+// names it never hard-fails a deployment without that credential.
+func buildEditorChain(agent, crossVendor mills.CouncilAgent, localFallbackModel string, flexClient *clients.FlexInferClient, repoRoot string, mem council.MemoryLoader, logger *slog.Logger) council.Editor {
 	model := agent.Model
 	backend := strings.ToLower(strings.TrimSpace(agent.Backend))
 	// A remote frontier model id is never deployable on the local flexinfer
@@ -1693,82 +2123,131 @@ func buildEditorForAgent(agent mills.CouncilAgent, localFallbackModel string, fl
 	// explicit policy pin wins; empty resolves to the client's weaver chain.
 	flexModel := model
 	switch backend {
-	case "openai", "openai-responses", "anthropic", "claude":
+	case "openai", "openai-responses", "anthropic", "claude", "openrouter":
 		flexModel = strings.TrimSpace(localFallbackModel)
 	}
 	var flex *clients.FlexInferCouncilEditor
 	if flexClient != nil {
 		flex = &clients.FlexInferCouncilEditor{Client: flexClient, Backend: "flexinfer", Model: flexModel, RepoRoot: repoRoot, Memory: mem}
 	}
-	if backend == "openai" || backend == "openai-responses" {
-		if apiKey := openairesponses.APIKeyFromEnv(); apiKey != "" {
-			apiClient, err := openairesponses.NewAPIClient(openairesponses.APIClientConfig{
-				APIKey:  apiKey,
-				BaseURL: openairesponses.BaseURLFromEnv(),
-				Timeout: openAICouncilEditorTimeout,
-				// Opt this client into per-completion usage logging. The
-				// Responses API is the one backend that has always reported
-				// cached_tokens, so it is the cleanest read on whether the
-				// council's stable-first prompt is actually earning a warm
-				// prefix.
-				Logger:    logger,
-				Component: clients.ComponentCouncilEditor,
-			})
-			if err == nil {
-				logger.Info("council editor wired to OpenAI Responses",
-					"model", model, "timeout", openAICouncilEditorTimeout)
-				primary := &clients.OpenAIResponsesCouncilEditor{Client: apiClient, Model: model, RepoRoot: repoRoot, Memory: mem}
-				if flex == nil {
-					// No local fallback available; drive OpenAI directly.
-					return primary
+	primary := newRemoteCouncilEditor(agent, "council editor", repoRoot, mem, logger)
+	// Fallback chain beneath the primary: the cross-vendor remote hop first
+	// (when configured and its key is present), then the local flexinfer
+	// editor. Run-time resilience is per Edit: a transient primary error,
+	// timeout, refusal or billing hold falls through this chain for THAT run
+	// rather than hard-failing a scheduled council run.
+	var fallback council.Editor
+	fallbackLabel := ""
+	if flex != nil {
+		fallback, fallbackLabel = flex, "flexinfer"
+	}
+	if strings.TrimSpace(crossVendor.Model) != "" {
+		if cross := newRemoteCouncilEditor(crossVendor, "council editor cross-vendor fallback", repoRoot, mem, logger); cross != nil {
+			crossLabel := councilEditorLabel(crossVendor)
+			if fallback == nil {
+				fallback, fallbackLabel = cross, crossLabel
+			} else {
+				fallback = &clients.FallbackCouncilEditor{
+					Primary:       cross,
+					Fallback:      fallback,
+					Logger:        logger,
+					PrimaryLabel:  crossLabel,
+					FallbackLabel: fallbackLabel,
 				}
-				// Run-time resilience: if the OpenAI call errors/times out, fall
-				// back to the local flexinfer editor for THAT run so a transient
-				// API hiccup never hard-fails a scheduled council run.
-				return &clients.FallbackCouncilEditor{
-					Primary:  primary,
-					Fallback: flex,
-					Logger:   logger,
-				}
+				fallbackLabel = crossLabel + "→" + fallbackLabel
 			}
-			logger.Warn("openai council editor requested but client init failed; falling back to flexinfer", "err", err)
-		} else {
-			logger.Warn("openai council editor requested but no OPENAI_API_KEY/LOOM_RESPONSES_API_KEY; falling back to flexinfer")
 		}
+	}
+	if primary == nil {
+		return fallback
+	}
+	if fallback == nil {
+		// No fallback available at all; drive the remote primary directly.
+		return primary
+	}
+	return &clients.FallbackCouncilEditor{
+		Primary:       primary,
+		Fallback:      fallback,
+		Logger:        logger,
+		PrimaryLabel:  councilEditorLabel(agent),
+		FallbackLabel: fallbackLabel,
+	}
+}
+
+// councilEditorLabel renders a {backend, model} pair for fallback log lines.
+func councilEditorLabel(agent mills.CouncilAgent) string {
+	backend := strings.ToLower(strings.TrimSpace(agent.Backend))
+	switch backend {
+	case "claude":
+		backend = "anthropic"
+	case "openai-responses":
+		backend = "openai"
+	}
+	return backend + ":" + strings.TrimSpace(agent.Model)
+}
+
+// newRemoteCouncilEditor builds the frontier editor for an openai/anthropic
+// agent, or returns nil when the backend is local/unknown, the vendor key is
+// absent, or the client fails to init (each logged so the degrade is visible at
+// boot). role names the slot in log lines ("council editor", "council editor
+// cross-vendor fallback").
+func newRemoteCouncilEditor(agent mills.CouncilAgent, role, repoRoot string, mem council.MemoryLoader, logger *slog.Logger) council.Editor {
+	model := agent.Model
+	backend := strings.ToLower(strings.TrimSpace(agent.Backend))
+	if backend == "openrouter" {
+		config := clients.OpenRouterConfigFromEnv()
+		config.Timeout, config.Logger, config.Component = openAICouncilEditorTimeout, logger, clients.ComponentCouncilEditor
+		client, err := clients.NewOpenRouterClient(config)
+		if err != nil {
+			logger.Warn("openrouter "+role+" unavailable; falling back", "error", err)
+			return nil
+		}
+		return &clients.OpenRouterCouncilEditor{Client: client, Model: model, RepoRoot: repoRoot, Memory: mem}
+	}
+	if backend == "openai" || backend == "openai-responses" {
+		apiKey := openairesponses.APIKeyFromEnv()
+		if apiKey == "" {
+			logger.Warn("openai "+role+" requested but no OPENAI_API_KEY/LOOM_RESPONSES_API_KEY; falling back to flexinfer", "model", model)
+			return nil
+		}
+		apiClient, err := openairesponses.NewAPIClient(openairesponses.APIClientConfig{
+			APIKey:  apiKey,
+			BaseURL: openairesponses.BaseURLFromEnv(),
+			Timeout: openAICouncilEditorTimeout,
+			// Opt this client into per-completion usage logging. The
+			// Responses API is the one backend that has always reported
+			// cached_tokens, so it is the cleanest read on whether the
+			// council's stable-first prompt is actually earning a warm
+			// prefix.
+			Logger:    logger,
+			Component: clients.ComponentCouncilEditor,
+		})
+		if err != nil {
+			logger.Warn("openai "+role+" requested but client init failed; falling back to flexinfer", "model", model, "err", err)
+			return nil
+		}
+		logger.Info(role+" wired to OpenAI Responses", "model", model, "timeout", openAICouncilEditorTimeout)
+		return &clients.OpenAIResponsesCouncilEditor{Client: apiClient, Model: model, RepoRoot: repoRoot, Memory: mem}
 	}
 	if backend == "anthropic" || backend == "claude" {
-		if apiKey := clients.AnthropicAPIKeyFromEnv(); apiKey != "" {
-			anthropicClient, err := clients.NewAnthropicClient(clients.AnthropicClientConfig{
-				APIKey:  apiKey,
-				BaseURL: clients.AnthropicBaseURLFromEnv(),
-				Timeout: openAICouncilEditorTimeout,
-			})
-			if err == nil {
-				logger.Info("council editor wired to Anthropic Messages API",
-					"model", model, "timeout", openAICouncilEditorTimeout)
-				primary := &clients.AnthropicCouncilEditor{Client: anthropicClient, Model: model, RepoRoot: repoRoot, Memory: mem}
-				if flex == nil {
-					// No local fallback available; drive Anthropic directly.
-					return primary
-				}
-				// Same run-time resilience as the OpenAI path: a transient
-				// Anthropic error/timeout/refusal falls back to flexinfer for
-				// THAT run rather than hard-failing.
-				return &clients.FallbackCouncilEditor{
-					Primary:  primary,
-					Fallback: flex,
-					Logger:   logger,
-				}
-			}
-			logger.Warn("anthropic council editor requested but client init failed; falling back to flexinfer", "err", err)
-		} else {
-			logger.Warn("anthropic council editor requested but no ANTHROPIC_API_KEY/LOOM_ANTHROPIC_API_KEY; falling back to flexinfer")
+		apiKey := clients.AnthropicAPIKeyFromEnv()
+		if apiKey == "" {
+			logger.Warn("anthropic "+role+" requested but no ANTHROPIC_API_KEY/LOOM_ANTHROPIC_API_KEY; falling back to flexinfer", "model", model)
+			return nil
 		}
+		anthropicClient, err := clients.NewAnthropicClient(clients.AnthropicClientConfig{
+			APIKey:  apiKey,
+			BaseURL: clients.AnthropicBaseURLFromEnv(),
+			Timeout: openAICouncilEditorTimeout,
+		})
+		if err != nil {
+			logger.Warn("anthropic "+role+" requested but client init failed; falling back to flexinfer", "model", model, "err", err)
+			return nil
+		}
+		logger.Info(role+" wired to Anthropic Messages API", "model", model, "timeout", openAICouncilEditorTimeout)
+		return &clients.AnthropicCouncilEditor{Client: anthropicClient, Model: model, RepoRoot: repoRoot, Memory: mem}
 	}
-	if flex == nil {
-		return nil
-	}
-	return flex
+	return nil
 }
 
 // buildCouncilRunner wires the configured council ensemble into a runner. When
@@ -1789,6 +2268,7 @@ func buildCouncilRunner(
 	litellmClient *clients.FlexInferClient,
 	judgeClient *clients.FlexInferClient,
 	councilJudgeModel string,
+	semanticScorer textsim.Scorer,
 	stages runner.StageBudgets,
 	logger *slog.Logger,
 ) (*runner.Runner, bool) {
@@ -1875,7 +2355,7 @@ func buildCouncilRunner(
 	}
 	dispatcher := &council.Dispatcher{Reviewers: reviewers}
 	writer := &council.ArtifactWriter{RepoRoot: repoRoot}
-	mutator := &council.BacklogMutator{Store: st}
+	mutator := &council.BacklogMutator{Store: st, MergedWorkSemantic: semanticScorer}
 	// Mill Staff audit: mutator actions land under actor "council.mutator"
 	// alongside the overseer.* trail. DryRun=false is deliberate — the
 	// council's artifact-dryrun path never reaches Apply, so any mutation
@@ -1901,6 +2381,23 @@ func buildCouncilRunner(
 		// scheduler's uncapped root context inherits the overall cap too.
 		StageBudgets: stages,
 	}, usesFakeAgents
+}
+
+// buildMergedWorkSemanticScorer shares the operator's configured FlexInfer
+// proxy with the shadow-only merged-work observer. The proxy exposes the
+// OpenAI-compatible embeddings endpoint under /v1; an absent proxy leaves the
+// observer disabled, matching the rest of the council's local fallback mode.
+func buildMergedWorkSemanticScorer(cfg Config) (textsim.Scorer, string) {
+	if strings.TrimSpace(cfg.FlexInferProxyURL) == "" {
+		return nil, ""
+	}
+	backend := embed.NewFlexInferClient(
+		httpclient.NewDefault(),
+		strings.TrimRight(cfg.FlexInferProxyURL, "/")+"/v1",
+		cfg.FlexInferToken,
+		cfg.FlexInferEmbedModel,
+	)
+	return textsim.NewSemanticScorer(backend), backend.Model()
 }
 
 // buildSquadsLoader instantiates the squads manifest loader pointing at
@@ -1940,12 +2437,36 @@ func buildFlexInferClient(cfg Config, logger *slog.Logger) *clients.FlexInferCli
 	if cfg.FlexInferProxyURL == "" {
 		return nil
 	}
+	// Backend-local model ids. FLEXINFER_JUDGE_MODEL / FLEXINFER_WEAVER_MODEL
+	// (and their *_FALLBACKS env) belong to whichever backend MILLS_JUDGE_BACKEND
+	// / MILLS_WEAVER_BACKEND selects. When that is the LiteLLM gateway the ids
+	// are gateway-routable (or/kimi-k3) and the FlexInfer proxy cannot serve
+	// them, so this client must not inherit them as ITS defaults: every caller
+	// that dials flexClient with an empty model (the council editor's local
+	// fallback, a Spinning Room frame without a pin) would send a gateway id to
+	// the proxy. 2026-09-07 that is exactly what happened — the editor fallback
+	// tried [or/kimi-k3 or/kimi-k2.7-code] against flexinfer-proxy and got
+	// "Internal error fetching model" on three consecutive council runs. A
+	// blanked id resolves through the aimodels registry (FlexInfer GPU models
+	// only) and the same role's env fallback list is ignored so a gateway
+	// chain never leaks in. Roles left on the proxy are byte-identical.
+	judgeModel, weaverModel := cfg.FlexInferJudgeModel, cfg.FlexInferWeaverModel
+	judgeOnGateway := backendIsLiteLLM(cfg.JudgeBackend)
+	weaverOnGateway := backendIsLiteLLM(cfg.WeaverBackend)
+	if judgeOnGateway {
+		judgeModel = ""
+	}
+	if weaverOnGateway {
+		weaverModel = ""
+	}
 	c, err := clients.NewFlexInferClient(clients.FlexInferConfig{
-		ProxyURL:    cfg.FlexInferProxyURL,
-		Token:       cfg.FlexInferToken,
-		JudgeModel:  cfg.FlexInferJudgeModel,
-		WeaverModel: cfg.FlexInferWeaverModel,
-		Timeout:     cfg.FlexInferTimeout,
+		ProxyURL:                cfg.FlexInferProxyURL,
+		Token:                   cfg.FlexInferToken,
+		JudgeModel:              judgeModel,
+		WeaverModel:             weaverModel,
+		IgnoreJudgeFallbackEnv:  judgeOnGateway,
+		IgnoreWeaverFallbackEnv: weaverOnGateway,
+		Timeout:                 cfg.FlexInferTimeout,
 	})
 	if err != nil {
 		logger.Error("flexinfer client init failed; LLM gates + research stage will skip", "error", err)
@@ -2018,8 +2539,15 @@ func buildLiteLLMModelClient(cfg Config, judgeModel, weaverModel string, logger 
 // The second return is the explicit model id the council contradiction judge
 // must dial (empty for the flexinfer default so its legacy weaver-model
 // resolution is preserved; the gateway model when on litellm).
+// backendIsLiteLLM reports whether a MILLS_*_BACKEND selection names the
+// LiteLLM gateway (case/space-insensitive), the one test every role-routing
+// site in this file shares.
+func backendIsLiteLLM(backend string) bool {
+	return strings.EqualFold(strings.TrimSpace(backend), "litellm")
+}
+
 func resolveMillsJudgeClient(cfg Config, flexClient *clients.FlexInferClient, logger *slog.Logger) (*clients.FlexInferClient, string) {
-	if !strings.EqualFold(strings.TrimSpace(cfg.JudgeBackend), "litellm") {
+	if !backendIsLiteLLM(cfg.JudgeBackend) {
 		return flexClient, ""
 	}
 	if strings.TrimSpace(cfg.LiteLLMProxyURL) == "" {
@@ -2047,7 +2575,7 @@ func resolveMillsJudgeClient(cfg Config, flexClient *clients.FlexInferClient, lo
 // "litellm" binds the gateway on FLEXINFER_WEAVER_MODEL and degrades loud to
 // FlexInfer on any misconfiguration.
 func resolveMillsWeaverClient(cfg Config, flexClient *clients.FlexInferClient, logger *slog.Logger) *clients.FlexInferClient {
-	if !strings.EqualFold(strings.TrimSpace(cfg.WeaverBackend), "litellm") {
+	if !backendIsLiteLLM(cfg.WeaverBackend) {
 		return flexClient
 	}
 	if strings.TrimSpace(cfg.LiteLLMProxyURL) == "" {
@@ -2067,6 +2595,60 @@ func resolveMillsWeaverClient(cfg Config, flexClient *clients.FlexInferClient, l
 		"model", cfg.FlexInferWeaverModel, "proxy", cfg.LiteLLMProxyURL,
 		"fallbacks", "FLEXINFER_WEAVER_MODEL_FALLBACKS (backend-local: litellm-routable ids only)")
 	return c
+}
+
+// resolveMillsTriageClient selects the LLM client + model behind the overseer
+// triage (backlog groomer dedup/zombie verdicts, foreman issue bodies), per
+// MILLS_TRIAGE_BACKEND. Default (unset / "" ) returns the already-resolved
+// judge client with an empty model, so overseer.Triage dials JudgeModel() —
+// byte-identical to the historical wiring.
+//
+// "flexinfer" pins the FlexInfer proxy client on FLEXINFER_TRIAGE_MODEL (a
+// serving name, e.g. qwen38-27b-xtx-warm-canary) so the 512-token JSON
+// verdicts run on a warm local lane while the gates keep their frontier
+// judge. "litellm" binds the gateway on that model, like the judge resolver.
+// Either selection without an explicit model, or without its client, fails
+// loud at startup and degrades to the judge wiring rather than 404ing every
+// tick. An explicit triage model has no fallback chain
+// (clients.FlexInferClient.fallbacksFor): a lane outage degrades the
+// overseers to deterministic-only, which is their designed fail-safe.
+func resolveMillsTriageClient(cfg Config, flexClient, judgeClient *clients.FlexInferClient, logger *slog.Logger) (*clients.FlexInferClient, string) {
+	backend := strings.ToLower(strings.TrimSpace(cfg.TriageBackend))
+	model := strings.TrimSpace(cfg.FlexInferTriageModel)
+	switch backend {
+	case "":
+		return judgeClient, ""
+	case "flexinfer":
+		if model == "" {
+			logger.Error("MILLS_TRIAGE_BACKEND=flexinfer but FLEXINFER_TRIAGE_MODEL unset; the triage lane needs an explicit serving name; falling back to the judge wiring")
+			return judgeClient, ""
+		}
+		if flexClient == nil {
+			logger.Error("MILLS_TRIAGE_BACKEND=flexinfer but the FlexInfer client is not configured (FLEXINFER_PROXY_URL); falling back to the judge wiring")
+			return judgeClient, ""
+		}
+		logger.Info("mills triage backend: flexinfer", "model", model, "fallbacks", "none (explicit triage model; outage degrades overseers to deterministic-only)")
+		return flexClient, model
+	case "litellm":
+		if model == "" {
+			logger.Error("MILLS_TRIAGE_BACKEND=litellm but FLEXINFER_TRIAGE_MODEL unset; a litellm triage needs an explicit gateway-routable model; falling back to the judge wiring")
+			return judgeClient, ""
+		}
+		if strings.TrimSpace(cfg.LiteLLMProxyURL) == "" {
+			logger.Error("MILLS_TRIAGE_BACKEND=litellm but LITELLM_PROXY_URL unset; falling back to the judge wiring")
+			return judgeClient, ""
+		}
+		c := buildLiteLLMModelClient(cfg, model, "", logger)
+		if c == nil {
+			logger.Error("litellm triage client init failed; falling back to the judge wiring")
+			return judgeClient, ""
+		}
+		logger.Info("mills triage backend: litellm", "model", model, "proxy", cfg.LiteLLMProxyURL)
+		return c, model
+	default:
+		logger.Error("MILLS_TRIAGE_BACKEND unrecognised; expected \"\", flexinfer or litellm; falling back to the judge wiring", "value", cfg.TriageBackend)
+		return judgeClient, ""
+	}
 }
 
 // weaverBackendLabel reports the effective research/weaver backend for logging.
@@ -2172,22 +2754,16 @@ func buildNotifyHook(pm *mills.PolicyManager, st *store.Store, logger *slog.Logg
 // council) OR policy.LabelOverrideFor(item.Labels).AutoMerge (per-label
 // override from the policy YAML). Live policy is read on every call so
 // the hot-reloadable YAML takes effect without an operator restart.
-func autoMergeFor(pm *mills.PolicyManager) func(pipeline.JobContext) bool {
+func autoMergeFor(pm *mills.PolicyManager, homeProject string) func(pipeline.JobContext) bool {
 	return func(jc pipeline.JobContext) bool {
 		if jc.Item == nil {
 			return false
-		}
-		if jc.Item.Policy.AutoMerge {
-			return true
 		}
 		pol := pm.Current()
 		if pol == nil {
 			return false
 		}
-		if ov, ok := pol.LabelOverrideFor(jc.Item.Labels); ok && ov.AutoMerge {
-			return true
-		}
-		return false
+		return pol.AutoMergeFor(jc.Item.TargetProject, homeProject, jc.Item.Policy.AutoMerge, jc.Item.Labels)
 	}
 }
 
@@ -2232,16 +2808,8 @@ func substrateForStage(pm *mills.PolicyManager) func(stage string) string {
 // Never returns empty (it always resolves to at least AgentDefault), so the
 // reported baseline is always a concrete harness.
 func agentForStage(pm *mills.PolicyManager) func(stage string) string {
-	envOverride := strings.TrimSpace(os.Getenv("LOOM_MILLS_SPAWN_AGENT"))
-	return func(stage string) string {
-		if envOverride != "" {
-			return envOverride
-		}
-		if a := pm.Current().AgentForStage(stage); a != "" {
-			return a
-		}
-		return mills.AgentDefault
-	}
+	resolve := resolveSpawnRoute(pm)
+	return func(stage string) string { return resolve(stage, nil).Agent }
 }
 
 // modelForStage returns a closure that resolves the ITEM-LESS effective
@@ -2255,7 +2823,8 @@ func agentForStage(pm *mills.PolicyManager) func(stage string) string {
 //     at startup (pod env vars don't hot-reload) and, when set, wins for EVERY
 //     stage regardless of policy — the model failover knob that mirrors
 //     LOOM_MILLS_SPAWN_AGENT.
-//  2. policy `pipeline.stage_models[stage]` — the per-stage override.
+//  2. guarded policy `pipeline.stage_models[stage]` — requires an explicit,
+//     compatible stage agent and is dropped when the env changes vendors.
 //  3. empty string — "no per-spawn override". The SpawnWorker leaves
 //     SpawnRequest.AgentModel empty and the HUD spawn server applies its own
 //     vendor default (SPAWN_CODEX_MODEL env / resolveCodexModel for codex).
@@ -2264,13 +2833,8 @@ func agentForStage(pm *mills.PolicyManager) func(stage string) string {
 // there is no operator-side default model to fall back to (each vendor's CLI
 // owns its default). The empty return is the "keep vendor default" signal.
 func modelForStage(pm *mills.PolicyManager) func(stage string) string {
-	envOverride := strings.TrimSpace(os.Getenv("LOOM_MILLS_SPAWN_MODEL"))
-	return func(stage string) string {
-		if envOverride != "" {
-			return envOverride
-		}
-		return pm.Current().ModelForStage(stage)
-	}
+	resolve := resolveSpawnRoute(pm)
+	return func(stage string) string { return resolve(stage, nil).Model }
 }
 
 // agentRoutedEventKind is the dispatch-context event recording WHY a stage ran
@@ -2326,6 +2890,11 @@ func spawnRouteFor(pm *mills.PolicyManager, st *store.Store, logger *slog.Logger
 				"item", itemID, "stage", stage, "labels", d.IgnoredLabels,
 				"allowed", "claude-code, codex, gemini")
 		}
+		if itemID != "" && d.DroppedModel != "" && logger != nil {
+			logger.Warn("agent routing: dropped stage model",
+				"item", itemID, "stage", stage, "agent", d.Agent,
+				"model", d.Model, "dropped_model", d.DroppedModel, "drop_reason", d.DropReason)
+		}
 		recordAgentRoute(ctx, st, logger, itemID, stage, d)
 		return d
 	}
@@ -2359,14 +2928,12 @@ func resolveSpawnRoute(pm *mills.PolicyManager) func(string, *store.BacklogItem)
 // recordAgentRoute appends the dispatch-context routing event so an operator can
 // answer "why did this item go to codex?" straight off the event stream.
 //
-// Only ROUTED dispatches are recorded — those an agent/* label or an
-// agent_routing rule claimed. The stage_agents / default rungs are the
-// pre-routing behavior and writing an event for them would put a per-dispatch
-// row into the (unpruned) events table of every deployment that never opted in.
+// Record per-item routing and rejected stage pins. Valid stage_agents/default
+// baselines remain silent to avoid unneeded rows in the unpruned events table.
 // An empty itemID means the caller asked for the item-less baseline (the startup
 // wiring log), not a real dispatch, so there is nothing to attribute.
 func recordAgentRoute(ctx context.Context, st *store.Store, logger *slog.Logger, itemID, stage string, d mills.AgentDecision) {
-	if st == nil || st.Events == nil || itemID == "" || !mills.AgentRouted(d) {
+	if st == nil || st.Events == nil || itemID == "" || (!mills.AgentRouted(d) && d.DroppedModel == "") {
 		return
 	}
 	err := st.Events.Append(ctx, &store.Event{
@@ -2379,9 +2946,10 @@ func recordAgentRoute(ctx context.Context, st *store.Store, logger *slog.Logger,
 			"stage": stage,
 			"agent": d.Agent,
 			"model": d.Model,
-			// decided_by ∈ {label, rule:<idx>} here; the env / stage_agents /
-			// default rungs do not reach this append.
-			"decided_by": d.DecidedBy,
+			// Baseline and env decisions are included when a stage pin was rejected.
+			"decided_by":    d.DecidedBy,
+			"dropped_model": d.DroppedModel,
+			"drop_reason":   d.DropReason,
 			// outcome matches the convention Runner.event stamps on every
 			// other pipeline.* event, so consumers can filter uniformly.
 			"outcome": "ok",
@@ -2420,7 +2988,7 @@ func buildCanaryGC(pm *mills.PolicyManager, st *store.Store, logger *slog.Logger
 // (no error) when either is missing so the operator boots without it.
 // Logs at info on enable + warn on the disabled-but-could-be-on case so
 // the gating decision is visible in the pod logs.
-func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, st *store.Store, logger *slog.Logger) *intake.GitLabImporter {
+func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, st *store.Store, homeProject string, logger *slog.Logger) *intake.GitLabImporter {
 	pol := pm.Current()
 	if !pol.Intake.GitLab.Enabled {
 		return nil
@@ -2431,6 +2999,11 @@ func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, 
 	}
 	cfg := intake.GitLabImporterConfig{
 		EligibleLabel: pol.Intake.GitLab.EligibleLabel,
+		HomeProject:   homeProject,
+		Projects:      append([]string(nil), pol.Intake.GitLab.Projects...),
+		IssuesClientForProject: func(project string) intake.GitLabIssuesClient {
+			return gitlab.ForProject(project)
+		},
 	}
 	if secs := pol.Intake.GitLab.PollIntervalSeconds; secs > 0 {
 		cfg.PollInterval = time.Duration(secs) * time.Second
@@ -2442,8 +3015,30 @@ func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, 
 		"eligible_label", cfg.EligibleLabel,
 		"poll_interval_seconds", pol.Intake.GitLab.PollIntervalSeconds,
 		"default_priority", pol.Intake.GitLab.DefaultPriority,
+		"projects", cfg.Projects,
 	)
 	return intake.NewGitLabImporter(gitlab, st.Backlog, cfg, logger)
+}
+
+type webhookRegistrar interface {
+	EnsureMillsWebhook(context.Context, string, string) error
+}
+
+func configuredWebhookBus(gitlab webhookRegistrar, logger *slog.Logger) *webhookbus.Bus {
+	secret := strings.TrimSpace(os.Getenv("LOOM_MILLS_GITLAB_WEBHOOK_SECRET"))
+	publicURL := strings.TrimSpace(os.Getenv("LOOM_MILLS_OPERATOR_URL"))
+	if gitlab == nil || secret == "" || publicURL == "" {
+		logger.Warn("GitLab webhook registration disabled; ci_watch remains polling-only", "secret_configured", secret != "", "public_url_configured", publicURL != "")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := gitlab.EnsureMillsWebhook(ctx, publicURL, secret); err != nil {
+		logger.Warn("GitLab webhook registration failed; ci_watch remains polling-only", "error", err)
+		return nil
+	}
+	logger.Info("GitLab webhook registration ready")
+	return webhookbus.Default
 }
 
 // buildDispatcher wires the per-stage worker dispatcher. Real clients
@@ -2461,8 +3056,9 @@ func buildGitLabImporter(pm *mills.PolicyManager, gitlab *clients.GitLabClient, 
 //   - GitLabWorker (mr/ci_watch/merge/cleanup): GitLab REST API
 //   - DevboxWorker (tests): mcp-devbox via MCP hub
 //   - SpawnWorker (plan_slice/implement/pr_self_review): HUD mobile API
-func buildDispatcher(cfg Config, weaver *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger, autoMerge func(pipeline.JobContext) bool, flakyJobs func() []string, substrateFor func(stage string) string, routeFor func(context.Context, string, *store.BacklogItem) mills.AgentDecision, spawn *clients.HUDSpawnClient, mergeQueue pipeline.MergeQueue, mergeQueueEnabled func() bool) (pipeline.WorkerDispatcher, map[string]bool) {
+func buildDispatcher(cfg Config, weaver *clients.FlexInferClient, hub *clients.MCPHubClient, st *store.Store, logger *slog.Logger, autoMerge func(pipeline.JobContext) bool, flakyJobs func() []string, ciWatchMaxWallClockMinutes func() int, substrateFor func(stage string) string, routeFor func(context.Context, string, *store.BacklogItem) mills.AgentDecision, spawn *clients.HUDSpawnClient, mergeQueue pipeline.MergeQueue, mergeQueueEnabled func() bool, baselineOracle func() bool) (pipeline.WorkerDispatcher, map[string]bool) {
 	gitlab := buildGitLabClient(cfg, logger)
+	webhooks := configuredWebhookBus(gitlab, logger)
 
 	// Per-item cross-stage memory. Nil (store-less test wiring) or a disabled
 	// LOOM_MILLS_ITEM_JOURNAL both yield the stateless prompts.
@@ -2505,11 +3101,13 @@ func buildDispatcher(cfg Config, weaver *clients.FlexInferClient, hub *clients.M
 	}
 	if gitlab != nil {
 		gw := &pipeline.GitLabWorker{
-			Client:       gitlab,
-			AutoMergeFor: autoMerge,
-			BranchPusher: clients.NewGitBranchPusher(),
-			Logger:       logger,
-			FlakyJobs:    flakyJobs,
+			Client:                     gitlab,
+			Webhooks:                   webhooks,
+			AutoMergeFor:               autoMerge,
+			BranchPusher:               clients.NewGitBranchPusher(),
+			Logger:                     logger,
+			FlakyJobs:                  flakyJobs,
+			CIWatchMaxWallClockMinutes: ciWatchMaxWallClockMinutes,
 			// Per-item cross-repo routing: scope mr/ci_watch/merge/cleanup to
 			// an item's TargetProject. ForProject shares the home client's token
 			// (which, for cross-repo, must be the services group token — a
@@ -2555,9 +3153,13 @@ func buildDispatcher(cfg Config, weaver *clients.FlexInferClient, hub *clients.M
 	}
 	if hub != nil {
 		routes["tests"] = &pipeline.DevboxWorker{
-			Client:  clients.NewDevboxClient(hub),
-			Project: project,
-			AgentID: "loom-mills-operator",
+			Client:         clients.NewDevboxClient(hub),
+			GitLab:         gitlab,
+			Project:        project,
+			AgentID:        "loom-mills-operator",
+			GitToken:       cfg.GitLabToken,
+			GoPrivate:      os.Getenv("GOPRIVATE"),
+			BaselineOracle: baselineOracle,
 		}
 		realStages["tests"] = true
 		logger.Info("tests stage wired to devbox via MCP hub")
@@ -2618,6 +3220,35 @@ func buildDispatcher(cfg Config, weaver *clients.FlexInferClient, hub *clients.M
 			NeedsWorktree: true,
 			SubstrateFor:  substrateFor,
 			RouteFor:      routeFor,
+			CompareForProject: func(target string) pipeline.BranchCompareClient {
+				if gitlab == nil {
+					return nil
+				}
+				return gitlab.ForProject(target)
+			},
+			OpenMRForBranch: func(ctx context.Context, target, branch string) (bool, error) {
+				if gitlab == nil {
+					return false, errors.New("GitLab client is not configured")
+				}
+				mrs, err := gitlab.ForProject(target).ListOpenMergeRequests(ctx, 100)
+				if err != nil {
+					return false, err
+				}
+				for _, mr := range mrs {
+					if mr.SourceBranch == branch {
+						return true, nil
+					}
+				}
+				return false, nil
+			},
+			RecordBranchRefRetired: func(ctx context.Context, runID, contractBranch, retiredRef string) error {
+				if st == nil || st.Events == nil {
+					return errors.New("event store is not configured")
+				}
+				return st.Events.Append(ctx, &store.Event{Actor: "pipeline", Kind: "branch_contract.ref_retired", Payload: map[string]any{
+					"run_id": runID, "contract_branch": contractBranch, "retired_ref": retiredRef,
+				}})
+			},
 		}
 		routes["pr_self_review"] = &pipeline.SpawnWorker{
 			Client:       spawn,
@@ -2629,6 +3260,12 @@ func buildDispatcher(cfg Config, weaver *clients.FlexInferClient, hub *clients.M
 			PromptFor:    prSelfReviewPromptFor(itemMemory),
 			SubstrateFor: substrateFor,
 			RouteFor:     routeFor,
+			ResolveBranchHead: func(ctx context.Context, target, branch string) (string, error) {
+				if gitlab == nil {
+					return "", errors.New("GitLab client is not configured")
+				}
+				return gitlab.ForProject(target).BranchHeadSHA(ctx, target, branch)
+			},
 		}
 		realStages["plan_slice"] = true
 		realStages["implement"] = true
@@ -2766,7 +3403,8 @@ const planSliceSpecDiscipline = "PERSIST YOUR DECOMPOSITION (pipeline-enforced):
 	"The pipeline reads these slices right after this stage to enforce the implementation's file scope; a decomposition that exists only in your chat output is discarded. " +
 	"Do NOT invent paths — ground every path in the real repository tree. " +
 	"A slice whose `files` are ALL new paths is invalid: new code that nothing existing imports merges dead, and the fabricated_slice gate escalates it. " +
-	"Every slice that creates a file must also list the EXISTING file that will import/call it (the wiring edit), in the same slice."
+	"Every slice that creates a file must also list the EXISTING file that will import/call it (the wiring edit), in the same slice. " +
+	"DIFF CAP OVERRIDES: only cleanup diffs expected to be at least 90% deletions may set policy.max_diff_lines, and the SpecDoc must justify the requested ceiling; additions-heavy items must not request an override."
 
 // planSlicePromptFor wraps the default plan_slice prompt with the persist
 // discipline above. Mirrors researchPromptFor/implementPromptFor: the base
@@ -3004,6 +3642,13 @@ func implementRetryDiscipline(rc *pipeline.StageRetryContext) string {
 	b.WriteString("If the backlog context references a Plan, the plan store may still show the slice as claimed/in_progress/completed by the FAILED attempt; that status is STALE. ")
 	b.WriteString("Do NOT conclude the work is already done and do NOT finish without changes: re-do the full implementation in THIS worktree, fix the gate failure named above, update the slice via agent_plan_slice_update once your redo is committed, and finish with a non-empty committed diff pushed via `git push -u origin HEAD`. ")
 	b.WriteString("Finishing with an empty diff will fail the nonempty_diff gate and escalate the run.")
+	if len(rc.Findings) > 0 {
+		b.WriteString("\n\nFindings to fix (from the previous attempt's tests stage):")
+		for _, finding := range rc.Findings {
+			b.WriteString("\n- ")
+			b.WriteString(finding)
+		}
+	}
 	return b.String()
 }
 
@@ -3596,38 +4241,133 @@ const auditDiffMaxBytes = 64 * 1024
 // grounded on what the run intended; the diff body is what it scores.
 // Returns "" (trigger skips the enqueue with a warn) when the run has no
 // MR iid or GitLab returns an empty diff — no audit beats a junk audit.
-// buildGateTiebreaker constructs the dissent-tiebreaker judge for the
-// LLM-judged gates when an Anthropic key is configured (same env resolution
-// as the council editor). Nil when the key is absent or the client fails to
-// init — the gates then run primary-only, exactly as before. Model comes
-// from LOOM_MILLS_GATE_TIEBREAKER_MODEL (default claude-sonnet-5: the gate
-// envelope is a ~200-token verdict, so the mid-tier model is plenty and the
-// call fires only on primary-vs-tests dissent). Disable outright by setting
-// the env var to "off".
-func buildGateTiebreaker(logger *slog.Logger) gates.RubricJudge {
-	model := strings.TrimSpace(os.Getenv("LOOM_MILLS_GATE_TIEBREAKER_MODEL"))
-	if strings.EqualFold(model, "off") {
-		logger.Info("gate tiebreaker disabled via LOOM_MILLS_GATE_TIEBREAKER_MODEL=off")
+// buildGateTiebreaker resolves the policy chain at startup. The model env
+// override applies to the first hop only; "off" disables the entire chain.
+func buildGateTiebreaker(policy mills.GateTiebreakerPolicy, cfg Config, flex *clients.FlexInferClient, logger *slog.Logger) *gates.ChainRubricJudge {
+	override := strings.TrimSpace(os.Getenv("LOOM_MILLS_GATE_TIEBREAKER_MODEL"))
+	if strings.EqualFold(override, "off") {
 		return nil
 	}
+	if override != "" {
+		policy.Model = override
+	}
+	if err := policy.Validate(); err != nil {
+		logger.Error("invalid gate tiebreaker policy", "error", err)
+		return nil
+	}
+	flexModel := cfg.FlexInferJudgeModel
+	if flex != nil {
+		flexModel = flex.JudgeModel()
+	}
+	chain := &gates.ChainRubricJudge{
+		Classify: func(err error) string {
+			if e, ok := clients.AsVendorError(err); ok {
+				return string(e.Kind)
+			}
+			return "unknown"
+		},
+		BreakerReason: func(vendor string) string {
+			s := clients.DefaultVendorBreaker.State(vendor)
+			if s.Breaker == "open" {
+				return "breaker_open:" + string(s.Kind)
+			}
+			return ""
+		},
+	}
+	for _, pin := range policy.Hops(flexModel) {
+		hop := gates.RubricJudgeHop{Vendor: pin.Backend, Model: pin.Model}
+		var err error
+		switch pin.Backend {
+		case "anthropic":
+			if key := clients.AnthropicAPIKeyFromEnv(); key != "" {
+				var c *clients.AnthropicClient
+				c, err = clients.NewAnthropicClient(clients.AnthropicClientConfig{APIKey: key, BaseURL: clients.AnthropicBaseURLFromEnv(), Timeout: 2 * time.Minute})
+				if err == nil {
+					hop.Judge = &clients.AnthropicRubricJudge{Client: c, Model: pin.Model}
+				}
+			}
+		case "openrouter":
+			config := clients.OpenRouterConfigFromEnv()
+			if config.APIKey != "" {
+				config.Timeout, config.Logger, config.Component = 2*time.Minute, logger, clients.ComponentJudge
+				var c *clients.OpenRouterClient
+				c, err = clients.NewOpenRouterClient(config)
+				if err == nil {
+					hop.Judge = &clients.OpenRouterRubricJudge{Client: c, Model: pin.Model}
+				}
+			}
+		case "openai":
+			if key := openairesponses.APIKeyFromEnv(); key != "" {
+				var c *openairesponses.APIClient
+				c, err = openairesponses.NewAPIClient(openairesponses.APIClientConfig{APIKey: key, BaseURL: openairesponses.BaseURLFromEnv(), Timeout: 2 * time.Minute, Logger: logger, Component: clients.ComponentJudge})
+				if err == nil {
+					hop.Judge = &clients.OpenAIRubricJudge{Client: c, Model: pin.Model}
+				}
+			}
+		case "flexinfer":
+			if flex != nil && pin.Model == flex.JudgeModel() {
+				hop.Judge = clients.NewRubricJudge(flex)
+			} else if cfg.FlexInferProxyURL != "" {
+				var c *clients.FlexInferClient
+				c, err = clients.NewFlexInferClient(clients.FlexInferConfig{ProxyURL: cfg.FlexInferProxyURL, Token: cfg.FlexInferToken, JudgeModel: pin.Model, IgnoreJudgeFallbackEnv: true, Timeout: cfg.FlexInferTimeout})
+				if err == nil {
+					hop.Judge = clients.NewRubricJudge(c)
+					hop.Model = c.JudgeModel()
+				}
+			}
+		}
+		if err != nil {
+			hop.Unavailable = "init_failed"
+			logger.Warn("gate tiebreaker hop init failed", "vendor", pin.Backend, "error", err)
+		}
+		if hop.Judge == nil && hop.Unavailable == "" {
+			hop.Unavailable = "not_configured"
+		}
+		chain.Hops = append(chain.Hops, hop)
+	}
+	logger.Info("gate dissent tiebreaker enabled", "chain", chain.String())
+	return chain
+}
+
+// buildShadowJudge constructs the calibration shadow judge for the LLM-judged
+// gates (issue #755) when FLEXINFER_SHADOW_JUDGE_MODEL names a FlexInfer-proxy
+// serving model. The client dials exactly that one model: registry fallbacks
+// and the judge fallback env are both disabled so a shadow row can never be
+// quietly served by another model (the 2026-07 route-incompatibility incident,
+// where every "judge" verdict was really the fallback's). Gateway ids (oa/,
+// or/) are refused loudly — the shadow grades a LOCAL candidate against the
+// frontier primary. Nil (shadow off) when unset, refused, or when the proxy is
+// not configured; the gates then run exactly as before.
+func buildShadowJudge(cfg Config, logger *slog.Logger) gates.RubricJudge {
+	model := strings.TrimSpace(cfg.FlexInferShadowJudgeModel)
 	if model == "" {
-		model = "claude-sonnet-5"
-	}
-	key := clients.AnthropicAPIKeyFromEnv()
-	if key == "" {
 		return nil
 	}
-	ac, err := clients.NewAnthropicClient(clients.AnthropicClientConfig{
-		APIKey:  key,
-		BaseURL: clients.AnthropicBaseURLFromEnv(),
-		Timeout: 2 * time.Minute,
+	lower := strings.ToLower(model)
+	if strings.HasPrefix(lower, "oa/") || strings.HasPrefix(lower, "or/") {
+		logger.Error("FLEXINFER_SHADOW_JUDGE_MODEL names a gateway model; the shadow judge grades a local FlexInfer lane and stays off", "model", model)
+		return nil
+	}
+	if strings.TrimSpace(cfg.FlexInferProxyURL) == "" {
+		logger.Error("FLEXINFER_SHADOW_JUDGE_MODEL set but FLEXINFER_PROXY_URL unset; shadow judge off", "model", model)
+		return nil
+	}
+	c, err := clients.NewFlexInferClient(clients.FlexInferConfig{
+		ProxyURL:                 cfg.FlexInferProxyURL,
+		Token:                    cfg.FlexInferToken,
+		JudgeModel:               model,
+		DisableRegistryFallbacks: true,
+		IgnoreJudgeFallbackEnv:   true,
+		IgnoreWeaverFallbackEnv:  true,
+		Timeout:                  cfg.FlexInferTimeout,
 	})
 	if err != nil {
-		logger.Warn("gate tiebreaker requested but anthropic client init failed; gates run primary-only", "err", err)
+		logger.Error("shadow judge client init failed; shadow judge off", "model", model, "error", err)
 		return nil
 	}
-	logger.Info("gate dissent tiebreaker enabled", "backend", "anthropic", "model", model)
-	return &clients.AnthropicRubricJudge{Client: ac, Model: model}
+	logger.Info("gate shadow judge enabled (calibration only; never affects a verdict)",
+		"model", model, "timeout", cfg.FlexInferShadowJudgeTimeout)
+	return clients.NewRubricJudge(c)
 }
 
 type pipelineProjectResolver interface {

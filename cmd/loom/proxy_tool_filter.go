@@ -10,7 +10,14 @@ const (
 	proxyToolProfileAntigravityCore = "antigravity-core"
 	proxyToolProfileLLMCore         = "llm-core"
 	proxyToolProfileICCCore         = "icc-core"
-	proxyToolLimitAntigravity       = 100
+	// proxyToolProfileFull is the explicit opt-out from shaping: every tool
+	// the daemon exposes, subject only to --max-tools and the daemon's own
+	// ceiling. It exists so the default can be a shaped profile without
+	// taking the unshaped surface away from callers that genuinely want it
+	// (catalog inspection, the HUD's own proxy, ad-hoc probes):
+	// `loom proxy --tool-profile full`.
+	proxyToolProfileFull      = "full"
+	proxyToolLimitAntigravity = 100
 	// Raised 140 → 160 (2026-07-14) to fit the ICC/PM block at the tail of
 	// the core priority list without displacing existing selections. The
 	// LLM-core vendors (codex/claude/kilocode) have no hard tool ceiling;
@@ -32,7 +39,10 @@ const (
 	// evicts the last entry of the ICC/PM tail instead.
 	// Raised 166 → 167 (2026-07-27) for browserkit__screenshot so the
 	// BrowserKit screenshot skill is usable from profile-limited clients.
-	proxyToolLimitLLM = 167
+	// Raised 167 → 175 (2026-09-13) for the eight mills__* factory tools;
+	// pkg/generator/platform_profiles.yaml pins the same number into every
+	// generated vendor config (regen with `loom sync all --regen`).
+	proxyToolLimitLLM = 175
 	// icc-core shares Antigravity's 100-tool platform ceiling so the
 	// profile is usable on every profile-limited client.
 	proxyToolLimitICC = 100
@@ -42,8 +52,20 @@ const (
 // This keeps global daemon tool caches unchanged while allowing platform-
 // specific caps (like Antigravity's 100-tool ceiling).
 func filterProxyTools(tools []mcp.Tool, agentHint, profile string, maxTools int) []mcp.Tool {
+	kept, _ := filterProxyToolsReport(tools, agentHint, profile, maxTools)
+	return kept
+}
+
+// filterProxyToolsReport is filterProxyTools plus the list of REQUIRED
+// tools the profile wanted but the cap displaced. The priority lists are
+// ordered so displacement hits the tail (ICC/PM, patterns, session bridge)
+// first, and until now it happened silently: a pattern added without
+// bumping the cap evicted the last tail entry and nothing said so
+// (see the proxyToolLimitLLM history). Callers log the report once per
+// tools/list so the eviction is visible where the operator looks.
+func filterProxyToolsReport(tools []mcp.Tool, agentHint, profile string, maxTools int) ([]mcp.Tool, []string) {
 	if len(tools) == 0 {
-		return tools
+		return tools, nil
 	}
 
 	resolvedProfile, resolvedLimit := resolveProxyToolFilter(agentHint, profile, maxTools)
@@ -55,18 +77,46 @@ func filterProxyTools(tools []mcp.Tool, agentHint, profile string, maxTools int)
 	}
 
 	if resolvedLimit > 0 && len(tools) > resolvedLimit {
-		return append([]mcp.Tool(nil), tools[:resolvedLimit]...)
+		return append([]mcp.Tool(nil), tools[:resolvedLimit]...), nil
 	}
-	return tools
+	return tools, nil
+}
+
+// llmCoreAgentHints are the agent hints that resolve to the llm-core
+// profile when no explicit --tool-profile is given. Every vendor that runs
+// an LLM against the tool list belongs here: a hint that is NOT listed
+// falls through unshaped and receives the daemon's whole surface (≈590
+// tools — ≈260KB of schema, ≈64k tokens per turn; the daemon no longer
+// caps this at 500, see ContextConfig.MaxTools), which is what
+// claude-desktop, zed and gemini sessions were getting in the
+// 2026-09-09..12 daemon log while codex sessions got the 167-tool
+// llm-core set. Opt out with `--tool-profile full`.
+var llmCoreAgentHints = map[string]struct{}{
+	"codex":          {},
+	"claude":         {},
+	"claude-code":    {},
+	"claude-desktop": {},
+	"gemini":         {},
+	"gemini-cli":     {},
+	"zed":            {},
+	"kilocode":       {},
+	"kilo":           {},
+	"cursor":         {},
+	"windsurf":       {},
+	"opencode":       {},
 }
 
 func resolveProxyToolFilter(agentHint, profile string, maxTools int) (string, int) {
 	resolvedProfile := strings.ToLower(strings.TrimSpace(profile))
+	if resolvedProfile == proxyToolProfileFull {
+		// Explicit passthrough: no shaping, only the caller's --max-tools.
+		return "", maxTools
+	}
 	if resolvedProfile == "" {
-		switch normalized := strings.ToLower(strings.TrimSpace(agentHint)); normalized {
-		case "antigravity":
+		normalized := strings.ToLower(strings.TrimSpace(agentHint))
+		if normalized == "antigravity" {
 			resolvedProfile = proxyToolProfileAntigravityCore
-		case "codex", "claude", "claude-code":
+		} else if _, ok := llmCoreAgentHints[normalized]; ok {
 			resolvedProfile = proxyToolProfileLLMCore
 		}
 	}
@@ -85,7 +135,7 @@ func resolveProxyToolFilter(agentHint, profile string, maxTools int) (string, in
 
 // selectCoreDeveloperTools shapes the shared developer core used by the
 // antigravity-core and llm-core profiles.
-func selectCoreDeveloperTools(tools []mcp.Tool, limit int) []mcp.Tool {
+func selectCoreDeveloperTools(tools []mcp.Tool, limit int) ([]mcp.Tool, []string) {
 	if limit <= 0 {
 		limit = proxyToolLimitLLM
 	}
@@ -96,16 +146,21 @@ func selectCoreDeveloperTools(tools []mcp.Tool, limit int) []mcp.Tool {
 // plus the full ICC workbench surface (icc, icc-capture, pm). Sized to fit
 // Antigravity's 100-tool ceiling so ICC-focused sessions work on every
 // profile-limited client. Opt in with `loom proxy --tool-profile icc-core`.
-func selectICCWorkbenchTools(tools []mcp.Tool, limit int) []mcp.Tool {
+func selectICCWorkbenchTools(tools []mcp.Tool, limit int) ([]mcp.Tool, []string) {
 	if limit <= 0 {
 		limit = proxyToolLimitICC
 	}
 	return selectProfileTools(tools, limit, iccCoreRequiredPatterns, iccCoreServerOrder, iccCoreServerQuota)
 }
 
-func selectProfileTools(tools []mcp.Tool, limit int, requiredPatterns, serverOrder []string, serverQuota map[string]int) []mcp.Tool {
+// selectProfileTools returns the shaped tool list and the names of required
+// tools that were present but displaced by the cap. Required patterns that
+// match nothing (a server that is not enabled) cost no slot and are not
+// reported; only a tool the profile explicitly wanted and could not fit is.
+func selectProfileTools(tools []mcp.Tool, limit int, requiredPatterns, serverOrder []string, serverQuota map[string]int) ([]mcp.Tool, []string) {
 	selected := make([]mcp.Tool, 0, min(limit, len(tools)))
 	seen := make(map[string]struct{}, len(tools))
+	var displaced []string
 
 	addTool := func(tool mcp.Tool) bool {
 		if len(selected) >= limit {
@@ -119,29 +174,42 @@ func selectProfileTools(tools []mcp.Tool, limit int, requiredPatterns, serverOrd
 		return true
 	}
 
-	addByPattern := func(pattern string) bool {
+	// matchPattern returns the first tool a required pattern names, or nil
+	// when the pattern matches nothing in this tool list.
+	matchPattern := func(pattern string) *mcp.Tool {
 		if strings.Contains(pattern, "__") {
-			for _, tool := range tools {
-				if tool.Name == pattern {
-					return addTool(tool)
+			for i := range tools {
+				if tools[i].Name == pattern {
+					return &tools[i]
 				}
 			}
-			return true
+			return nil
 		}
-
 		suffix := "__" + pattern
-		for _, tool := range tools {
-			if tool.Name == pattern || strings.HasSuffix(tool.Name, suffix) {
-				return addTool(tool)
+		for i := range tools {
+			if tools[i].Name == pattern || strings.HasSuffix(tools[i].Name, suffix) {
+				return &tools[i]
 			}
 		}
-		return true
+		return nil
 	}
 
 	for _, pattern := range requiredPatterns {
-		if !addByPattern(pattern) {
-			return selected
+		tool := matchPattern(pattern)
+		if tool == nil {
+			continue
 		}
+		if _, ok := seen[tool.Name]; ok {
+			continue
+		}
+		if !addTool(*tool) {
+			displaced = append(displaced, tool.Name)
+		}
+	}
+	if len(displaced) > 0 {
+		// The cap is exhausted by required patterns alone; nothing below
+		// (server quotas, tail fill) can add a tool, so return now.
+		return selected, displaced
 	}
 
 	toolsByServer := make(map[string][]mcp.Tool)
@@ -158,13 +226,13 @@ func selectProfileTools(tools []mcp.Tool, limit int, requiredPatterns, serverOrd
 		added := 0
 		for _, tool := range toolsByServer[server] {
 			if len(selected) >= limit {
-				return selected
+				return selected, nil
 			}
 			if _, ok := seen[tool.Name]; ok {
 				continue
 			}
 			if !addTool(tool) {
-				return selected
+				return selected, nil
 			}
 			added++
 			if added >= quota {
@@ -185,7 +253,7 @@ func selectProfileTools(tools []mcp.Tool, limit int, requiredPatterns, serverOrd
 		}
 	}
 
-	return selected
+	return selected, nil
 }
 
 var coreRequiredPatterns = []string{
@@ -368,6 +436,20 @@ var coreRequiredPatterns = []string{
 	// catalog-state.yaml; unmatched patterns cost no slots.
 	"icc__icc_project_list",
 	"icc__icc_project_brief",
+	// Mills factory surface (2026-09-13, factory-from-CC S0). The server was
+	// registered and built but never in this list, so profile-limited
+	// sessions (codex/claude-code at the 167 cap) could not see a single
+	// mills_* tool and every factory interaction fell back to curl against
+	// the operator REST API. Eight entries; sits after position 100 so the
+	// antigravity-core set is unchanged.
+	"mills__mills_status",
+	"mills__mills_backlog_list",
+	"mills__mills_backlog_get",
+	"mills__mills_backlog_post",
+	"mills__mills_backlog_update_state",
+	"mills__mills_runs",
+	"mills__mills_kpis",
+	"mills__mills_escalation_diagnose",
 	"icc__icc_project_status",
 	"icc__icc_project_changes",
 	"icc__icc_project_blocked",

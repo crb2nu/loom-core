@@ -1,0 +1,1 @@
+- Use the stronger of lexical Jaccard and embedding cosine similarity to ground paraphrase-equivalent merged work while preserving lexical fallback (`pkg/codebase/embed`, `pkg/mills/textsim`, `pkg/mills/council`).

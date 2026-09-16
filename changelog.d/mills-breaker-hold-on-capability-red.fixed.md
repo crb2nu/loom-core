@@ -1,0 +1,1 @@
+- Hold Mills pipeline stages during transient capability transport failures with bounded backoff and recovery, preserving completed work; expire as retryable infrastructure failures while configuration blockers still escalate immediately. Adds shared classification in `pkg/transport`, council and hub integration, and policy and hold metrics in `pkg/mills`.

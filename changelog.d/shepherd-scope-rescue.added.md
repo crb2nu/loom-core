@@ -1,0 +1,1 @@
+- Shepherd scope-rescue pass (C1): scope escalations are re-evaluated against CURRENT policy and slices each tick — all-admissible items get a CAS scope widen + requeue (allow.scope_widen opt-in; branch adoption and merge-stage recovery finish the rescue), still-inadmissible items get a once-only widen-vs-close attention flag carrying the per-file verdict table.

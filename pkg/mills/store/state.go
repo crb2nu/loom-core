@@ -6,7 +6,7 @@ package store
 // another or back to active work.
 func IsPipelineTerminalState(state PipelineState) bool {
 	switch state {
-	case PipelineDone, PipelineEscalated, PipelinePaused:
+	case PipelineDone, PipelineEscalated, PipelinePreflightFailed, PipelinePaused:
 		return true
 	default:
 		return false

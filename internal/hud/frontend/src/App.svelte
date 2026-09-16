@@ -14,7 +14,6 @@
   import { millsStore } from './lib/stores/mills.svelte.ts';
   import { millsSquadsStore } from './lib/stores/mills_squads.svelte.ts';
   import { millsAuditStore } from './lib/stores/mills_audit.svelte.ts';
-  import { millsCrossRepoStore } from './lib/stores/mills_crossrepo.svelte.ts';
   import { formatTime as fmtTime } from './lib/utils/format.ts';
   import { focusTrap } from './lib/actions/focusTrap';
   import { dialogStore } from './lib/stores/dialogs.svelte.ts';
@@ -87,16 +86,22 @@
     scrollActiveTabIntoView();
   });
 
-  // Prime the three Mills sub-stores when the operator enters the Mills
-  // view so the sub-tab nav can render counts without waiting for each
-  // panel to be visited. Each panel still runs its own 15s polling on
-  // mount; this is a one-shot refresh per Mills-view entry, not a
-  // perpetual poll loop.
+  // Prime the Mills stores when the operator enters the Mills view so the
+  // sub-tab nav can render counts without waiting for each panel to be
+  // visited. Each panel still runs its own 15s polling on mount; this is a
+  // one-shot refresh per Mills-view entry, not a perpetual poll loop.
+  //
+  // millsStore feeds seven of the nine badges (warps, shuttles, sparks,
+  // bolts, council, eval, policy) but is only polled by the mill-floor,
+  // council, eval, telemetry, and workflows panels — land on Audit, Policy,
+  // Patterns, Drawing-in, or The Alley and those seven read 0 until a
+  // polling tab is visited. primeOnce fills it once per session and is a
+  // no-op if a polling panel already fetched.
   $effect(() => {
     if (router.view === 'mills') {
+      millsStore.primeOnce();
       void millsSquadsStore.refresh();
       void millsAuditStore.refresh();
-      void millsCrossRepoStore.refresh();
     }
   });
 
@@ -369,14 +374,13 @@
                   switch (sv.id) {
                     case 'warps':      return { ...sv, count: millsStore.strungCount };
                     case 'shuttles':   return { ...sv, count: millsStore.activeShuttleCount };
-                    case 'sparks':     return { ...sv, count: millsStore.escalatedRuns.length };
+                    case 'sparks':     return { ...sv, count: millsStore.openSparks.length };
                     case 'bolts':      return { ...sv, count: millsStore.boltRuns.length };
                     case 'council':    return { ...sv, count: millsStore.councilRuns.length };
                     case 'eval':       return { ...sv, count: millsStore.evalScores.length };
                     case 'policy':     return { ...sv, count: millsStore.policyProposals.length };
                     case 'squads':     return { ...sv, count: millsSquadsStore.state.length };
                     case 'audit':      return { ...sv, count: millsAuditStore.state.length };
-                    case 'cross-repo': return { ...sv, count: millsCrossRepoStore.inFlightCount };
                     default:           return sv;
                   }
                 })

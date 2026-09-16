@@ -1,0 +1,1 @@
+- mcpo canary: the `youtube` upstream now uses Streamable HTTP (`/mcp`) instead of legacy SSE (`/sse`) — first of 22 entries per the `.loom/197` migration plan; the mcpo Deployment gains a config-checksum annotation so ConfigMap edits roll the pod via GitOps.

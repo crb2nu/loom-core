@@ -1,0 +1,1 @@
+- Bound Mills council incident reads and add append-friendly event-window, escalation, and gate-outcome indexes in `pkg/mills/store` so council briefs and KPI snapshots do not degrade into full scans as history grows.

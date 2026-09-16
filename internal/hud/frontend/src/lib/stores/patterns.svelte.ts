@@ -108,15 +108,13 @@ class PatternsStore {
     this.loading = true;
     this.error = null;
     try {
-      // Snapshot the filter OUTSIDE the caller's tracking context — fetch()
-      // runs synchronously inside panel $effects (FactoryPanel, startPolling);
-      // a tracked read re-runs those effects on every filter write
-      // (the mills_staff pre-await-read class, MR !1474).
-      const statusFilter = untrack(() => this.statusFilter);
-      const params = new URLSearchParams();
-      if (statusFilter !== 'all') params.set('status', statusFilter);
-      const url = params.toString() ? `/api/patterns?${params}` : '/api/patterns';
-      const res = await globalThis.fetch(url);
+      // Always fetch the FULL set. statusFilter used to ride the request,
+      // which made this module singleton leak one panel's filter into every
+      // other consumer: flipping the Patterns page to "candidate" reloaded
+      // candidates-only globally and the Factory pattern shelf (which
+      // hard-filters approved) silently rendered nothing. The filter is now
+      // pure view state applied by `filtered` below.
+      const res = await globalThis.fetch('/api/patterns');
       if (!res.ok) throw new Error(`Patterns API: ${res.status}`);
       const data = await res.json();
       this.patterns = data.patterns ?? [];
@@ -129,8 +127,17 @@ class PatternsStore {
   }
 
   setStatusFilter(s: PatternStatusFilter): void {
+    // View state only — the fetch is unfiltered, so no refetch is needed and
+    // other consumers of `patterns` are unaffected.
     this.statusFilter = s;
-    void this.fetch();
+  }
+
+  /** The catalog through the panel's status filter. Consumers that need a
+   * specific status regardless of the panel (patternBooks, SpinPlanDialog)
+   * read `patterns` and filter themselves. */
+  get filtered(): PatternInfo[] {
+    if (this.statusFilter === 'all') return this.patterns;
+    return this.patterns.filter((p) => p.status === this.statusFilter);
   }
 
   // stamp posts materials for a pattern and returns the result (or null on

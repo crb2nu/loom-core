@@ -23,6 +23,7 @@ import (
 
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/telemetry"
 )
 
 // TickResult summarises one agent tick for the status API and the tick event.
@@ -39,6 +40,39 @@ type TickResult struct {
 	Errored int `json:"errored"`
 	// Note carries a short free-form annotation ("llm_unavailable", …).
 	Note string `json:"note,omitempty"`
+}
+
+// CredentialPresence is safe to report: it retains credential names only,
+// never the values returned by the lookup function.
+type CredentialPresence struct {
+	Required []string
+	Missing  []string
+}
+
+// CheckCredentialPresence performs a presence-only check. Blank values count
+// as absent and duplicate names are collapsed in first-seen order.
+func CheckCredentialPresence(required []string, lookup func(string) (string, bool)) CredentialPresence {
+	result := CredentialPresence{}
+	seen := make(map[string]struct{}, len(required))
+	for _, raw := range required {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		result.Required = append(result.Required, name)
+		value, ok := "", false
+		if lookup != nil {
+			value, ok = lookup(name)
+		}
+		if !ok || strings.TrimSpace(value) == "" {
+			result.Missing = append(result.Missing, name)
+		}
+	}
+	return result
 }
 
 // Agent is one supervisory loop body. Tick must be safe to call repeatedly
@@ -86,6 +120,14 @@ type Harness struct {
 	Logger   *slog.Logger
 	// Clock is used by tests; defaults to time.Now.
 	Clock func() time.Time
+	// Soak + DryRun, when both wired, record an S2 soak decision with
+	// would-have-acted = false for every successful DRY-RUN tick that planned
+	// no action, so each UTC day bucket carries at least one reviewed decision
+	// even when the floor is quiet (the runbook fails closed on an empty
+	// day). Ticks that did plan actions are covered by the ActionRecorder's
+	// per-action decisions.
+	Soak   SoakDecisionRecorder
+	DryRun func() bool
 
 	active atomic.Int64
 	paused atomic.Bool
@@ -159,6 +201,9 @@ func (h *Harness) TickOnce(ctx context.Context) (TickResult, error) {
 	}
 	mills.OverseerTicksTotal.WithLabelValues(h.Agent.Name(), outcome).Inc()
 	mills.OverseerTickDurationSeconds.WithLabelValues(h.Agent.Name()).Observe(h.now().Sub(start).Seconds())
+	if err == nil && h.Soak != nil && h.DryRun != nil && h.DryRun() && res.Planned == 0 && res.Acted == 0 {
+		recordSoakDecision(ctx, h.Soak, h.now(), false)
+	}
 
 	h.mu.Lock()
 	h.lastTickAt = h.now()
@@ -243,10 +288,58 @@ type ActionRecorder struct {
 	// DryRun is read per record so a policy hot-reload flips behavior
 	// mid-loop. Nil means dry-run (fail-safe).
 	DryRun func() bool
+	// Soak, when wired, receives one S2 soak decision per DRY-RUN action
+	// record (would-have-acted = true): the evidence the promotion runbook
+	// (docs/mill-staff-s2-soak-runbook.md) reads through
+	// overseer.EvaluatePersistedS2Soak. Nil skips the write. Best-effort:
+	// a telemetry failure never fails the audit record. Before this was
+	// wired (2026-09-02) no decision was ever persisted, so the verdict
+	// could only fail closed and no dry-run overseer had a path to
+	// promotion.
+	Soak SoakDecisionRecorder
+	// Clock is used by tests; defaults to time.Now.
+	Clock func() time.Time
+}
+
+// SoakDecisionRecorder persists one S2 dry-run decision (*store.Store
+// satisfies it via RecordOverseerSoakDecision).
+type SoakDecisionRecorder interface {
+	RecordOverseerSoakDecision(ctx context.Context, at time.Time, wouldHaveActed, policyDisagreement bool) error
 }
 
 // dryRun resolves the fail-safe default: no wiring means dry-run.
 func (r *ActionRecorder) dryRun() bool { return r == nil || r.DryRun == nil || r.DryRun() }
+
+func (r *ActionRecorder) now() time.Time {
+	if r != nil && r.Clock != nil {
+		return r.Clock()
+	}
+	return time.Now().UTC()
+}
+
+// recordSoakDecision writes the S2 soak evidence for a dry-run action that
+// just recorded: the agent evaluated an action approved execution would have
+// taken. Committed actions are not soak decisions.
+func (r *ActionRecorder) recordSoakDecision(ctx context.Context) {
+	if r == nil || r.Soak == nil || !r.dryRun() {
+		return
+	}
+	recordSoakDecision(ctx, r.Soak, r.now(), true)
+}
+
+// recordSoakDecision persists one decision and mirrors it into the Prometheus
+// counter (pkg/telemetry) so the runbook's corroborating `increase` query
+// agrees with the persisted evaluation. Policy disagreements are reviewed by
+// an operator, never inferred here, so diverged is always false.
+func recordSoakDecision(ctx context.Context, soak SoakDecisionRecorder, at time.Time, wouldHaveActed bool) {
+	if soak == nil {
+		return
+	}
+	if err := soak.RecordOverseerSoakDecision(ctx, at, wouldHaveActed, false); err != nil {
+		return
+	}
+	telemetry.RecordOverseerDryRunDecision(ctx, wouldHaveActed, false)
+}
 
 // agentLabel derives the metrics agent label from the actor: overseer
 // actors keep their short name ("overseer.groomer" → "groomer", the
@@ -300,6 +393,7 @@ func (r *ActionRecorder) Record(ctx context.Context, action, subjectKind, subjec
 	})
 	if err == nil {
 		r.countAction(action, r.recordMode())
+		r.recordSoakDecision(ctx)
 	}
 	return err
 }
@@ -320,6 +414,7 @@ func (r *ActionRecorder) RecordOnce(ctx context.Context, action, subjectKind, su
 	})
 	if err == nil && ok {
 		r.countAction(action, r.recordMode())
+		r.recordSoakDecision(ctx)
 	}
 	return ok, err
 }

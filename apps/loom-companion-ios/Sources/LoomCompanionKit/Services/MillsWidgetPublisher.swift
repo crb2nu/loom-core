@@ -68,3 +68,31 @@ public enum MillsWidgetPublisher {
         #endif
     }
 }
+
+// MARK: - Full home-screen sync
+
+extension MillsWidgetPublisher {
+    /// Publish EVERY App-Group snapshot (fleet/tasks/sessions + Mills) from
+    /// one fetch pass. Surfaces that are not the classic dashboard call this:
+    /// the Operator deck replaced `DashboardView` as the home tab
+    /// (2026-07-14), and until the deck published, home-screen widgets froze
+    /// at whatever the last classic-dashboard visit wrote — the live
+    /// "widgets busted" report of 2026-08-22 was a month-old snapshot.
+    ///
+    /// Degradation mirrors `publish(using:)`: each fetch fails independently
+    /// and a failed dashboard read keeps the previous fleet snapshot rather
+    /// than zeroing it.
+    public static func publishAll(using client: LoomAPIClientProtocol) async {
+        if let dashboard: DashboardData = try? await client.request(.dashboard) {
+            var counts: MobileTaskCounts?
+            if let response: MobileTasksResponse = try? await client.request(.tasks(limit: 1)) {
+                counts = response.counts
+            }
+            SharedDataStore.save(WidgetSnapshotBuilder.snapshot(dashboard: dashboard, counts: counts))
+            #if os(iOS)
+            WidgetCenter.shared.reloadAllTimelines()
+            #endif
+        }
+        await publish(using: client)
+    }
+}

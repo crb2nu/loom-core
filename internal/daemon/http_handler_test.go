@@ -12,8 +12,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/crb2nu/loom/internal/hud"
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/internal/hud"
 )
 
 // TestHTTPHandler_InitializeRoundTrip verifies the Streamable HTTP handler

@@ -1,0 +1,1 @@
+- Add the MR-awareness crash/restart kill-test mode, idempotent live driver, documented recovery token, and fail-closed JSON verdicts in `cmd/mills-workflow-killtest/main.go`, `scripts/mills-mr-awareness-killtest.sh`, and `docs/MILLS.md`.

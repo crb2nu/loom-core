@@ -1,6 +1,10 @@
 package backend
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestTruncateOutput_EmptyString(t *testing.T) {
 	out, lines, truncated := TruncateOutput("", 10)
@@ -112,5 +116,36 @@ func TestTruncateOutput_TruncateToOne(t *testing.T) {
 	}
 	if !truncated {
 		t.Fatal("expected truncated=true")
+	}
+}
+
+func TestResultStderrHeadJSON(t *testing.T) {
+	var result ExecResult
+	if err := json.Unmarshal([]byte(`{"exit_code":1,"stderr_tail":"old","truncated":false}`), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.StderrHead != "" || result.StderrTail != "old" {
+		t.Fatal("legacy JSON changed")
+	}
+	data, err := json.Marshal(result)
+	if err != nil || strings.Contains(string(data), "stderr_head") {
+		t.Fatalf("empty head: %s, %v", data, err)
+	}
+	result.StderrHead = "first"
+	data, err = json.Marshal(result)
+	if err != nil || !strings.Contains(string(data), `"stderr_head":"first"`) {
+		t.Fatalf("head JSON: %s, %v", data, err)
+	}
+}
+
+func TestResultStderrHead(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{"", ""}, {"\n", ""}, {"a\n\n", "a\n"}, {"a\nb", "a\nb"},
+		{strings.Repeat("x\n", 100), strings.TrimSuffix(strings.Repeat("x\n", 20), "\n")},
+		{strings.Repeat("a", 9000), strings.Repeat("a", 8192)},
+	} {
+		if got := stderrHead(tt.input); got != tt.want {
+			t.Fatalf("head length %d, want %d", len(got), len(tt.want))
+		}
 	}
 }

@@ -1,0 +1,1 @@
+- Settle owning Mills backlog items when their merge requests land through external merge-queue candidates, with restart-safe replay and an auditable `backlog.settled` event (`pkg/mills/mergequeue/processor.go`, `pkg/mills/mergequeue/processor_test.go`).

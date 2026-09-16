@@ -255,10 +255,15 @@ func (d *Daemon) refreshToolCacheForSnapshot(ctx context.Context, snapshot cache
 
 	filterResult := d.profiles.Filter(allTools, activeProfile)
 	if filterResult.Truncated {
+		// Name what fell off the end. Truncation keeps the head of the
+		// aggregate in source order (registry order, then hub hosts), so the
+		// victims are whole servers at the tail; "before=589 after=500" on
+		// its own never said which ones (2026-09-12: 89 tools, silently).
 		d.logger.Warn("tools truncated by profile",
 			"profile", activeProfile,
 			"before", filterResult.TotalBefore,
-			"after", filterResult.TotalAfter)
+			"after", filterResult.TotalAfter,
+			"displaced", formatDisplacedServers(displacedToolServers(allTools, filterResult.Tools)))
 	}
 	allTools = filterResult.Tools
 

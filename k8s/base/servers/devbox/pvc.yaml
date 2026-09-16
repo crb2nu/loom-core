@@ -1,0 +1,31 @@
+# Persistent home for mcp-devbox's state store (DEVBOX_CACHE_DIR/state.json).
+#
+# The manager decides whether a sandbox image needs (re)building from this
+# store: an entry whose fingerprint hash matches skips the build and just
+# (re)starts the sandbox pod from the registry image. Without a volume the
+# store lived on the container filesystem, so every hub rollout — one per
+# loom-core merge, 11 in the 41h to 2026-09-02 — booted an empty store and
+# rebuilt the same `mcp/devbox/<project>:e3b0c44` git-clone image (13 cold
+# builds in 38h across loom-core / fi-fhir / edilint, 6–20 min each). The
+# git-clone path deliberately skips the registry cache probe (a clone-time
+# base-image selection must inspect the hydrated repo), so the persisted
+# entry is the only thing that makes "image already built" survive a roll.
+#
+# 1Gi is generous: state.json is a few KB. RWO Longhorn; the deployment's
+# required same-node self-affinity lets the fleet-wide RollingUpdate surge
+# pod share the attachment (the gitops overlay forces RollingUpdate on every
+# mcp-server Deployment, so Recreate is not available here).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devbox-state
+  labels:
+    app: devbox
+    component: mcp-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi

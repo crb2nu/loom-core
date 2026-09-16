@@ -68,8 +68,9 @@ func (k *K8sBackend) buildPodSpec(opts StartOpts, imageTag string) *corev1.Pod {
 	}
 
 	workspace := k.workspacePlan(opts.WorkDir, gitCloneOpts{
-		branch:     opts.Branch,
-		baseBranch: opts.BaseBranch,
+		branch:      opts.Branch,
+		baseBranch:  opts.BaseBranch,
+		projectPath: opts.GitProjectPath,
 	}, nil)
 	volumes := []corev1.Volume{workspace.volume}
 	volumeMounts := append([]corev1.VolumeMount{}, workspace.volumeMounts...)
@@ -284,10 +285,15 @@ func (k *K8sBackend) gitCloneInitContainer(workDirPath string, opts gitCloneOpts
 		cloneDest = "/workspace/project"
 	}
 
-	// Extract project name from the last path component for the git URL.
+	// Prefer caller-supplied workspace metadata for the remote path. The
+	// basename fallback preserves legacy devbox callers.
 	parts := strings.Split(strings.TrimSuffix(cloneDest, "/"), "/")
 	projectName := parts[len(parts)-1]
-	repoURL := strings.TrimSuffix(k.gitBaseURL, "/") + "/" + projectName + ".git"
+	gitProjectPath := strings.Trim(strings.TrimSpace(opts.projectPath), "/")
+	if gitProjectPath == "" {
+		gitProjectPath = projectName
+	}
+	repoURL := joinRepoURL(k.gitBaseURL, gitProjectPath)
 
 	// Preserve the original URL scheme (http vs https) so internal
 	// HTTP-only registries work.

@@ -1,0 +1,1 @@
+- Classify `ci_watch` failures shared with the latest failed target-branch pipeline as held, free-retry GitLab CI baseline incidents, using normalized failed-job traces from `pkg/mills/pipeline`, `pkg/mills/sigfp`, and `pkg/mills/clients`.

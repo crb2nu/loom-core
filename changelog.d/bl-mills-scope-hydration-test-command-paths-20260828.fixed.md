@@ -1,0 +1,1 @@
+- Fix Mills scope hydration and amendment evidence so test commands cannot declare path scope or admit unrelated reaches (`pkg/mills/pipeline/slice_hydration.go`, `pkg/mills/pipeline/scope_amendment.go`).

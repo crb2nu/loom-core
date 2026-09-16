@@ -16,14 +16,25 @@ base_sha=""
 current_stage="initialize"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# The CI wrapper allows 1080s for this script. Bound benchmark evidence to the
-# first 930s, reserving 90s for the mandatory mixed-load test, 30s for an
-# in-flight benchmark sample, and 30s for comparison and final evidence.
+# The CI wrapper allows 1380s for this script (25-minute job). Bound benchmark
+# evidence to the first 1230s, reserving 150s for the mandatory mixed-load
+# test (60s), the comparison, and final evidence. 1080s -> 1380s on
+# 2026-09-11: on a saturated runner (60 queued jobs) a run completed 84 of 88
+# paired samples by 853s and failed "need at least 11 paired samples, got 10"
+# on two benchmarks — a genuine pass short by four samples, not a regression.
 # Keep this value in sync with test:reliability in .gitlab-ci.yml.
-reliability_shell_budget_seconds=1080
+reliability_shell_budget_seconds=1380
 mixed_load_reserve_seconds=150
 benchmark_deadline_seconds=$((reliability_shell_budget_seconds - mixed_load_reserve_seconds))
-benchmark_sample_timeout_seconds=30
+# The deadline check must not refuse to start a 2-second sample because the
+# worst-case 90-second cap would not fit: it reserves twice the slowest sample
+# observed so far (floor 20s, ceiling the cap). Updated by the sampler.
+benchmark_max_sample_wall_seconds=0
+# Per-sample cap lives with the paired-round driver in
+# scripts/ci/fleet_reliability_benchmarks.sh (sourced below); a timed-out
+# sample skips its pair and is made up in a later round instead of aborting
+# the whole phase.
+benchmark_sample_timeout_seconds="${fleet_benchmark_sample_timeout_seconds:-90}"
 
 benchmark_files=(
   internal/daemon/fleet_reliability_benchmark_test.go
@@ -299,13 +310,27 @@ run_bounded_fleet_benchmark_sample() {
   local package="$4"
   local output="$5"
   local binary
+  local sample_started
+  local sample_status
+  local sample_wall_seconds
 
-  if ((SECONDS + benchmark_sample_timeout_seconds > benchmark_deadline_seconds)); then
-    echo "Benchmark deadline reached after ${SECONDS}s; reserving time for mixed-load gate" >&2
-    return 124
+  # 125 tells run_paired_fleet_benchmark_rounds the DEADLINE was hit (stop
+  # the phase); 124 below is a single slow sample (skip the pair, carry on).
+  local reserve_seconds=$((benchmark_max_sample_wall_seconds * 2))
+  if ((reserve_seconds < 20)); then
+    reserve_seconds=20
+  fi
+  if ((reserve_seconds > benchmark_sample_timeout_seconds)); then
+    reserve_seconds="$benchmark_sample_timeout_seconds"
+  fi
+  if ((SECONDS + reserve_seconds > benchmark_deadline_seconds)); then
+    echo "Benchmark deadline reached after ${SECONDS}s (reserve ${reserve_seconds}s, slowest sample ${benchmark_max_sample_wall_seconds}s); reserving time for mixed-load gate" >&2
+    return 125
   fi
 
   binary="$(fleet_benchmark_binary_path "$binary_dir" "$side" "$package")"
+  sample_started="$SECONDS"
+  set +e
   (
     cd "$directory/${package#./}"
     GOWORK=off CGO_ENABLED=0 GOMAXPROCS=2 timeout --foreground "${benchmark_sample_timeout_seconds}s" "$binary" \
@@ -315,6 +340,33 @@ run_bounded_fleet_benchmark_sample() {
       -test.benchtime="$fleet_benchmark_benchtime" \
       -test.count=1
   ) | tee -a "$output"
+  sample_status="${PIPESTATUS[0]}"
+  set -e
+  sample_wall_seconds=$((SECONDS - sample_started))
+  if ((sample_wall_seconds > benchmark_max_sample_wall_seconds)); then
+    benchmark_max_sample_wall_seconds="$sample_wall_seconds"
+  fi
+  if [[ "$sample_status" -eq 0 ]]; then
+    printf 'LOOM_BENCHMARK_SAMPLE wall_seconds=%d\n' "$sample_wall_seconds" >>"$output"
+  fi
+  # 124 (timeout) and any other failure are reported to the paired-round
+  # driver, which writes the STOP / skipped-pair markers on BOTH outputs so
+  # the two sides never disagree about what happened.
+  return "$sample_status"
+}
+
+# Adapter the paired-round driver calls: picks the checkout for the side and
+# keeps the failure-stage label current for the evidence writer.
+gate_benchmark_sampler() {
+  local side="$1"
+  local package="$2"
+  local output="$3"
+  local directory="$repo_root"
+  if [[ "$side" == base ]]; then
+    directory="$base_worktree"
+  fi
+  current_stage="benchmark-${side}-${package#./}"
+  run_bounded_fleet_benchmark_sample "$directory" "$benchmark_bin_dir" "$side" "$package" "$output"
 }
 
 current_stage="package-selection"
@@ -380,45 +432,13 @@ benchmark_candidate_output="$artifact_dir/benchmark-candidate.txt"
 : >"$benchmark_base_output"
 : >"$benchmark_candidate_output"
 
-echo "Running ${fleet_benchmark_rounds} package-adjacent, paired same-runner benchmark rounds (deadline=${benchmark_deadline_seconds}s, sample-timeout=${benchmark_sample_timeout_seconds}s)"
+echo "Running ${fleet_benchmark_rounds} package-adjacent, paired same-runner benchmark rounds (deadline=${benchmark_deadline_seconds}s, sample-timeout=${benchmark_sample_timeout_seconds}s, make-up rounds=${fleet_benchmark_makeup_rounds})"
 benchmark_status=0
-for ((round = 1; round <= fleet_benchmark_rounds; round++)); do
-  start_fleet_benchmark_round "$benchmark_base_output" "$round"
-  start_fleet_benchmark_round "$benchmark_candidate_output" "$round"
-  for package in "${fleet_benchmark_packages[@]}"; do
-    if ((round % 2 == 1)); then
-      current_stage="benchmark-round-${round}-base-${package#./}"
-      if run_bounded_fleet_benchmark_sample "$base_worktree" "$benchmark_bin_dir" base "$package" "$benchmark_base_output"; then
-        :
-      else
-        benchmark_status="$?"
-        break 2
-      fi
-      current_stage="benchmark-round-${round}-candidate-${package#./}"
-      if run_bounded_fleet_benchmark_sample "$repo_root" "$benchmark_bin_dir" candidate "$package" "$benchmark_candidate_output"; then
-        :
-      else
-        benchmark_status="$?"
-        break 2
-      fi
-    else
-      current_stage="benchmark-round-${round}-candidate-${package#./}"
-      if run_bounded_fleet_benchmark_sample "$repo_root" "$benchmark_bin_dir" candidate "$package" "$benchmark_candidate_output"; then
-        :
-      else
-        benchmark_status="$?"
-        break 2
-      fi
-      current_stage="benchmark-round-${round}-base-${package#./}"
-      if run_bounded_fleet_benchmark_sample "$base_worktree" "$benchmark_bin_dir" base "$package" "$benchmark_base_output"; then
-        :
-      else
-        benchmark_status="$?"
-        break 2
-      fi
-    fi
-  done
-done
+if run_paired_fleet_benchmark_rounds gate_benchmark_sampler "$benchmark_base_output" "$benchmark_candidate_output"; then
+  :
+else
+  benchmark_status="$?"
+fi
 
 current_stage="test-load"
 run_manifest_test_group load "$artifact_dir/tests-load.jsonl" \

@@ -16,9 +16,37 @@ import (
 // operator restart without a dedicated counter column; the per-day cap reads the
 // same kind fleet-wide (CountByKindSince).
 const (
-	eventKindAutoRequeued  = "reconciler.auto_requeued"
-	autoRequeueSubjectKind = "backlog_item"
+	eventKindAutoRequeued       = "reconciler.auto_requeued"
+	eventKindSubstrateRed       = "substrate_red"
+	eventKindSubstrateRecovered = "substrate_recovered"
+	eventKindSubstrateReleased  = "reconciler.substrate_released"
+	autoRequeueSubjectKind      = "backlog_item"
 )
+
+// SubstrateRecoveryWindow is the durable red→green capability interval.
+type SubstrateRecoveryWindow struct {
+	Capability string
+	RedAt      time.Time
+	GreenAt    time.Time
+}
+
+// RecordSubstrateRed records the opening edge used to suppress doomed retries.
+func (r *Reconciler) RecordSubstrateRed(ctx context.Context, capability string, at time.Time) error {
+	capability = strings.TrimSpace(capability)
+	if r == nil || r.Store == nil || r.Store.Events == nil || capability == "" {
+		return errors.New("substrate red: reconciler and capability required")
+	}
+	return r.Store.Events.Append(ctx, &store.Event{Actor: "health", Kind: eventKindSubstrateRed, SubjectKind: "capability", SubjectID: capability, OccurredAt: at, Payload: map[string]any{"capability": capability, "red_at": at.UTC().Format(time.RFC3339Nano)}})
+}
+
+// RecordSubstrateRecovered emits the closed incident window consumed by ticks.
+func (r *Reconciler) RecordSubstrateRecovered(ctx context.Context, w SubstrateRecoveryWindow) error {
+	w.Capability = strings.TrimSpace(w.Capability)
+	if r == nil || r.Store == nil || r.Store.Events == nil || w.Capability == "" || w.RedAt.IsZero() || w.GreenAt.Before(w.RedAt) {
+		return errors.New("substrate recovered: valid reconciler, capability, and window required")
+	}
+	return r.Store.Events.Append(ctx, &store.Event{Actor: "health", Kind: eventKindSubstrateRecovered, SubjectKind: "capability", SubjectID: w.Capability, OccurredAt: w.GreenAt, Payload: map[string]any{"capability": w.Capability, "red_at": w.RedAt.UTC().Format(time.RFC3339Nano), "green_at": w.GreenAt.UTC().Format(time.RFC3339Nano)}})
+}
 
 // Eligible-class labels for the metric + event payload. "external_dependency"
 // is not a base ErrorClass — it is the incident category that takes precedence
@@ -81,6 +109,14 @@ type AutoRequeueSweepResult struct {
 	// Errored is the number of candidates whose store lookup or transition
 	// failed; each is retried on a later tick.
 	Errored int
+	// Unreached is the number of candidates the sweep never judged because its
+	// context expired first. Those items were neither requeued nor parked on
+	// the recheck cooldown; the next pass re-inspects them from scratch. It is
+	// what tells a starved pass apart from one that judged its candidates: the
+	// 2026-09-08 boot pass recorded 16 auto_requeue_failed rows for items it
+	// had never looked at, because the loop kept going on a dead context and
+	// every first query per item failed instantly.
+	Unreached int
 }
 
 // autoRequeueEval is the outcome of the per-item eligibility decision.
@@ -123,8 +159,51 @@ func (r *Reconciler) deferAutoRequeueRecheck(itemID string, now time.Time) {
 // budget (MaxRunsPerDay via CountBudgetedSince) is exhausted. Disabled when the
 // policy is off or pipeline.auto_requeue.enabled is false; a nil error with a
 // zero result then means "sweep did nothing".
-func (r *Reconciler) SweepAutoRequeue(ctx context.Context) (AutoRequeueSweepResult, error) {
-	res := AutoRequeueSweepResult{}
+func (r *Reconciler) SweepAutoRequeue(ctx context.Context) (res AutoRequeueSweepResult, retErr error) {
+	started := time.Now()
+	var cursorBefore, cursorAfter string
+	deadline, _ := ctx.Deadline()
+	var requested time.Duration
+	var capped, budgetBlocked bool
+	var total, beyond, dayUsed, dayCap, ordinaryRequeued int
+	defer func() {
+		outcome := "ok"
+		switch {
+		case errors.Is(retErr, context.DeadlineExceeded):
+			outcome = "timeout"
+		case retErr != nil:
+			outcome = "error"
+			if errors.Is(retErr, context.Canceled) {
+				outcome = "canceled"
+			}
+		case budgetBlocked:
+			outcome = "budget_blocked"
+		case res.Errored > 0:
+			outcome = "error"
+		}
+		AutoRequeueUnreached.Set(float64(res.Unreached))
+		if outcome == "ok" || outcome == "timeout" || outcome == "budget_blocked" {
+			AutoRequeueSweepsTotal.WithLabelValues(outcome).Inc()
+		}
+		if r == nil {
+			return
+		}
+		elapsed := time.Since(started)
+		payload := map[string]any{"inspected": res.Inspected, "requeued": res.Requeued, "skipped": res.Skipped, "errored": res.Errored, "unreached": res.Unreached, "candidates": total, "day_used": dayUsed + ordinaryRequeued, "day_cap": dayCap, "elapsed": elapsed.String(), "deadline": deadline, "cursor_before": cursorBefore, "cursor_after": cursorAfter, "deadline_capped": capped, "requested_budget": requested.String()}
+		if retErr != nil {
+			payload["error"] = retErr.Error()
+		}
+		r.append(ctx, "reconciler.auto_requeue_sweep", outcome, payload)
+		if r.Logger != nil {
+			fields := []any{"inspected", res.Inspected, "requeued", res.Requeued, "skipped", res.Skipped, "errored", res.Errored, "unreached", res.Unreached, "candidates", total, "elapsed", elapsed, "deadline", deadline, "cursor_before", cursorBefore, "cursor_after", cursorAfter, "deadline_capped", capped, "requested_budget", requested, "outcome", outcome}
+			if retErr != nil || res.Errored > 0 {
+				fields = append(fields, "error", retErr)
+				r.Logger.Warn("auto-requeue sweep stopped before every candidate was judged", fields...)
+			} else {
+				r.Logger.Info("auto-requeue sweep completed", fields...)
+			}
+		}
+	}()
 	if r == nil || r.Store == nil || r.Store.Backlog == nil ||
 		r.Store.Pipeline == nil || r.Store.Events == nil {
 		return res, errors.New("reconciler: not configured")
@@ -136,24 +215,62 @@ func (r *Reconciler) SweepAutoRequeue(ctx context.Context) (AutoRequeueSweepResu
 	arp := policy.Pipeline.AutoRequeue
 	now := r.now()
 
-	// Nothing escalated ⇒ the common path — skip the cap/budget queries entirely.
-	candidates, err := r.Store.Backlog.ListByStateLimit(ctx, store.BacklogEscalated, autoRequeueCandidateBatchSize)
+	cursor, err := r.Store.Backlog.AutoRequeueCursor(ctx)
 	if err != nil {
+		return res, fmt.Errorf("auto-requeue: load cursor: %w", err)
+	}
+	if cursor != nil {
+		cursorBefore = cursor.ID
+		cursorAfter = cursor.ID
+	}
+	save := func(item *store.BacklogItem) error {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		if err := r.Store.Backlog.SaveAutoRequeueCursor(writeCtx, item); err != nil {
+			return fmt.Errorf("auto-requeue: save cursor: %w", err)
+		}
+		cursorAfter = ""
+		if item != nil {
+			cursorAfter = item.ID
+		}
+		return nil
+	}
+	total, err = r.Store.Backlog.CountAutoRequeueRemaining(ctx, cursor)
+	if err != nil {
+		return res, err
+	}
+	if total == 0 {
+		return res, save(nil) // completed lap; wrap on the next tick
+	}
+	allowance := r.AutoRequeuePerCandidateAllowance
+	if allowance <= 0 {
+		allowance = 4 * time.Second
+	}
+	requested = time.Duration(total) * allowance
+	deadline = time.Now().Add(requested)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+		capped = true
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	candidates, err := r.Store.Backlog.ListByStatePage(ctx, store.BacklogEscalated, cursor, autoRequeueCandidateBatchSize)
+	if err != nil {
+		res.Unreached = total
 		return res, fmt.Errorf("auto-requeue: list escalated: %w", err)
 	}
-	if len(candidates) == 0 {
-		return res, nil
-	}
-
+	beyond = max(0, total-len(candidates))
+	res.Unreached = total
 	// Fleet-wide rolling-24h cap: read the base count once, then track requeues
 	// committed within this tick against it (dayUsed + res.Requeued).
-	dayCap := arp.DayCap()
-	dayUsed, err := r.Store.Events.CountByKindSince(ctx, eventKindAutoRequeued, now.Add(-24*time.Hour))
+	dayCap = arp.DayCap()
+	dayUsed, err = r.Store.Events.CountByKindSince(ctx, eventKindAutoRequeued, now.Add(-24*time.Hour))
 	if err != nil {
+		res.Unreached = beyond + r.countAutoRequeueCandidates(candidates, now)
 		return res, fmt.Errorf("auto-requeue: count day window: %w", err)
 	}
 	if dayUsed >= dayCap {
-		return res, nil // fleet already at its daily unattended-retry budget
+		budgetBlocked = true // recovery releases remain outside this budget
 	}
 
 	// Run budget: never requeue into an exhausted MaxRunsPerDay. Estimate 0 —
@@ -163,49 +280,150 @@ func (r *Reconciler) SweepAutoRequeue(ctx context.Context) (AutoRequeueSweepResu
 	if r.Budget != nil {
 		decision, berr := r.Budget.Allow(ctx, TierPipeline, 0)
 		if berr != nil {
+			res.Unreached = beyond + r.countAutoRequeueCandidates(candidates, now)
 			return res, fmt.Errorf("auto-requeue: budget check: %w", berr)
 		}
 		if !decision.Allowed {
 			r.append(ctx, "reconciler.auto_requeue_budget_blocked", "skipped", map[string]any{
 				"reasons": decision.Reasons,
 			})
-			return res, nil
+			budgetBlocked = true
 		}
 	}
 
+	recovery, err := r.loadSubstrateRecovery(ctx, arp.Release, now)
+	if err != nil {
+		return res, err
+	}
 	cooldown := arp.CooldownDuration()
 	itemCap := arp.ItemCap()
-	for _, item := range candidates {
-		if res.Requeued >= autoRequeueMaxPerTick || dayUsed+res.Requeued >= dayCap {
+	// sweepErr is the context error that ended the pass early, if any. A
+	// starved pass stops at the first dead-context read instead of walking
+	// the rest of the batch: every further query would fail instantly, each
+	// would record a phantom auto_requeue_failed row for an item that was
+	// never judged, and the pass would still report "ok".
+	var sweepErr error
+	// A pending key represents a completed local judgment. Checkpoint it
+	// before another lookup; interrupted lookups clear it and are retried.
+	var pending *store.BacklogItem
+	processed := 0
+	releasedCount := 0
+	checkpoint := func() bool {
+		if pending == nil {
+			return true
+		}
+		if err := save(pending); err != nil {
+			sweepErr = err
+			return false
+		}
+		pending = nil
+		return true
+	}
+	// starved reports whether the sweep context expired under candidate i.
+	// That item and everything after it is then unreached — not judged, not
+	// errored, and not parked on the recheck cooldown.
+	starved := func(i int) bool {
+		ctxErr := ctx.Err()
+		if ctxErr == nil {
+			return false
+		}
+		pending = nil
+		sweepErr = ctxErr
+		res.Unreached = beyond + r.countAutoRequeueCandidates(candidates[i:], now)
+		return true
+	}
+	for i, item := range candidates {
+		if !checkpoint() {
+			return res, sweepErr
+		}
+		if starved(i) {
 			break
 		}
 		if item == nil {
 			continue
 		}
+		res.Unreached = beyond + r.countAutoRequeueCandidates(candidates[i:], now)
+		copyItem := *item
+		pending = &copyItem
+		processed = i + 1
+		if item.TargetProject != "" {
+			continue
+		}
+		released, redCapabilities, recoveryHeld, releaseErr := r.sweepSubstrateReleases(ctx, []*store.BacklogItem{item}, arp.Release, recovery, releasedCount)
+		releasedCount += released.Requeued
+		res.Requeued += released.Requeued
+		if releaseErr != nil {
+			pending = nil
+			sweepErr = releaseErr
+			break
+		}
+		if released.Requeued == 0 && starved(i) {
+			break
+		}
+		if released.Requeued > 0 {
+			pending = &copyItem
+			res.Inspected++
+			continue
+		}
+		if released.Errored > 0 {
+			res.Inspected++
+			res.Errored++
+			continue
+		}
 		if until, ok := r.autoRequeueRecheck[item.ID]; ok && now.Before(until) {
 			continue
 		}
-		// Cross-repo items are excluded here as they are in the ghost-spark
-		// sweep: their MR IIDs live in another project's sequence and cross-repo
-		// dispatch is separately gated (CrossRepoPolicy), so requeuing one could
-		// only churn it back to a state tryStart skips. Leave them for a human
-		// (cross-repo auto-requeue is a follow-up).
-		if item.TargetProject != "" {
-			r.deferAutoRequeueRecheck(item.ID, now)
+		if budgetBlocked || ordinaryRequeued >= autoRequeueMaxPerTick || dayUsed+ordinaryRequeued >= dayCap {
+			// Admission denial is itself a judgment. Keep walking for substrate
+			// releases, whose independent per-sweep cap must still apply.
+			budgetBlocked = true
+			res.Inspected++
+			res.Skipped++
 			continue
 		}
-		res.Inspected++
 		runs, lerr := r.Store.Pipeline.ListByBacklog(ctx, item.ID)
 		if lerr != nil {
+			if starved(i) {
+				break // the budget ran out under this lookup: not an item fault
+			}
+			res.Inspected++
 			r.append(ctx, "reconciler.auto_requeue_failed", "error", map[string]any{
-				"backlog": item.ID, "error": lerr.Error(),
+				"backlog": item.ID, "stage": "lookup", "error": lerr.Error(),
 			})
 			res.Errored++
 			continue
 		}
+		res.Inspected++
 		run := mostRecentRun(runs)
+		if recoveryHeld[item.ID] {
+			res.Skipped++
+			continue
+		}
+		if capability := arp.Release.capabilityForRun(run); capability != "" && redCapabilities[capability] {
+			res.Skipped++
+			r.deferAutoRequeueRecheck(item.ID, now)
+			continue // do not spend retry budget while its substrate is red
+		}
+		// Preserve rescue work from any attempt, not only the newest one. A
+		// newer MR-less retry must not obscure an earlier MR that can still merge
+		// and be settled by the ghost-spark IID fallback.
+		if mostRecentRunWithMR(runs) != nil {
+			res.Skipped++
+			r.deferAutoRequeueRecheck(item.ID, now)
+			if r.Logger != nil {
+				r.Logger.Debug("auto-requeue: skip", "backlog", item.ID, "reason", "an attempt has an MR; ghost-spark/human path")
+			}
+			continue
+		}
 		eval := r.autoRequeueEligible(ctx, item, run, now, cooldown, itemCap, arp.IncludeCodeConfig)
 		if !eval.eligible {
+			if starved(i) {
+				// The budget ran out inside the eligibility reads: the item
+				// was not judged, so it must not be counted or parked for
+				// the 15-minute recheck cooldown.
+				res.Inspected--
+				break
+			}
 			res.Skipped++
 			r.deferAutoRequeueRecheck(item.ID, now)
 			if r.Logger != nil {
@@ -213,12 +431,17 @@ func (r *Reconciler) SweepAutoRequeue(ctx context.Context) (AutoRequeueSweepResu
 			}
 			continue
 		}
-		committed, cerr := r.commitAutoRequeue(ctx, item, run, eval, itemCap, dayUsed+res.Requeued, dayCap)
+		committed, cerr := r.commitAutoRequeue(ctx, item, run, eval, itemCap, dayUsed+ordinaryRequeued, dayCap)
 		switch {
 		case cerr != nil:
+			// A failed transition IS a failed requeue attempt (the item was
+			// eligible), whatever the cause — commitAutoRequeue recorded it
+			// with stage=transition. The loop head then decides whether the
+			// rest of the batch is still reachable.
 			res.Errored++
 		case committed:
 			res.Requeued++
+			ordinaryRequeued++
 		default:
 			// Stale claim: a concurrent writer already moved the item off
 			// escalated. Clean skip, no error storm.
@@ -226,14 +449,37 @@ func (r *Reconciler) SweepAutoRequeue(ctx context.Context) (AutoRequeueSweepResu
 			r.deferAutoRequeueRecheck(item.ID, now)
 		}
 	}
-	if res.Inspected > 0 || res.Errored > 0 {
-		r.append(ctx, "reconciler.auto_requeue_sweep", "ok", map[string]any{
-			"inspected": res.Inspected, "requeued": res.Requeued,
-			"skipped": res.Skipped, "errored": res.Errored,
-			"day_used": dayUsed + res.Requeued, "day_cap": dayCap,
-		})
+	if !checkpoint() {
+		return res, sweepErr
 	}
+	if sweepErr != nil {
+		return res, fmt.Errorf("auto-requeue: %d of %d candidates unreached: %w", res.Unreached, total, sweepErr)
+	}
+	res.Unreached = beyond + r.countAutoRequeueCandidates(candidates[processed:], now)
+	if processed == len(candidates) && beyond == 0 {
+		if err := save(nil); err != nil {
+			return res, err
+		}
+	}
+
 	return res, nil
+}
+
+// countAutoRequeueCandidates counts the candidates a pass would still have
+// judged: non-nil, not cross-repo, and not parked on the recheck cooldown.
+// Pure process-local filtering — it is called on a dead context.
+func (r *Reconciler) countAutoRequeueCandidates(candidates []*store.BacklogItem, now time.Time) int {
+	n := 0
+	for _, item := range candidates {
+		if item == nil || item.TargetProject != "" {
+			continue
+		}
+		if until, ok := r.autoRequeueRecheck[item.ID]; ok && now.Before(until) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // autoRequeueEligible decides whether an escalated item may be auto-requeued now.
@@ -415,7 +661,7 @@ func (r *Reconciler) finishEligibility(
 // (code/config/unclassified fail closed to a human).
 func autoRequeueBaseClass(run *store.PipelineRun) string {
 	switch strings.ToLower(strings.TrimSpace(run.EscalationClass)) {
-	case autoRequeueClassInfra:
+	case autoRequeueClassInfra, "substrate":
 		return autoRequeueClassInfra
 	case autoRequeueClassTransient:
 		return autoRequeueClassTransient
@@ -424,6 +670,162 @@ func autoRequeueBaseClass(run *store.PipelineRun) string {
 	default:
 		return ""
 	}
+}
+
+func (p SubstrateReleasePolicy) capabilityForRun(run *store.PipelineRun) string {
+	if run == nil {
+		return ""
+	}
+	sig := strings.ToLower(strings.TrimSpace(run.FailureSignature))
+	for token, capability := range p.SignatureMap() {
+		if strings.Contains(sig, strings.ToLower(strings.TrimSpace(token))) {
+			return strings.TrimSpace(capability)
+		}
+	}
+	return ""
+}
+
+func (p SubstrateReleasePolicy) eligibleClass(class string) bool {
+	class = strings.ToLower(strings.TrimSpace(class))
+	for _, eligible := range p.Classes() {
+		if class == strings.ToLower(strings.TrimSpace(eligible)) {
+			return true
+		}
+	}
+	return false
+}
+
+func payloadTime(payload map[string]any, key string) (time.Time, bool) {
+	raw, ok := payload[key].(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	return t, err == nil
+}
+
+// substrateRecoveryState is the incident snapshot shared by this pass.
+type substrateRecoveryState struct {
+	red     map[string]bool
+	windows []SubstrateRecoveryWindow
+}
+
+// Load the incident edges once per pass, before walking the durable cursor.
+func (r *Reconciler) loadSubstrateRecovery(ctx context.Context, policy SubstrateReleasePolicy, now time.Time) (substrateRecoveryState, error) {
+	state := substrateRecoveryState{red: map[string]bool{}}
+	red := state.red
+	if !policy.IsEnabled() {
+		return state, nil
+	}
+	events, err := r.Store.Events.ListSinceByKinds(ctx, []string{eventKindSubstrateRed, eventKindSubstrateRecovered}, now.Add(-7*24*time.Hour), 500)
+	if err != nil {
+		return state, fmt.Errorf("substrate release: list health events: %w", err)
+	}
+	windows := make([]SubstrateRecoveryWindow, 0)
+	seen := map[string]bool{}
+	for _, event := range events { // newest first: first edge determines current state
+		capability := strings.TrimSpace(event.SubjectID)
+		if capability == "" {
+			continue
+		}
+		if !seen[capability] {
+			red[capability] = event.Kind == eventKindSubstrateRed
+			seen[capability] = true
+		}
+		if event.Kind == eventKindSubstrateRecovered {
+			redAt, rok := payloadTime(event.Payload, "red_at")
+			greenAt, gok := payloadTime(event.Payload, "green_at")
+			if rok && gok && !greenAt.Before(redAt) {
+				windows = append(windows, SubstrateRecoveryWindow{Capability: capability, RedAt: redAt, GreenAt: greenAt})
+			}
+		}
+	}
+	state.windows = windows
+	return state, nil
+}
+
+// Each candidate's release and ordinary eligibility share one checkpoint;
+// an interrupted release lookup therefore cannot starve the same shelf head.
+func (r *Reconciler) sweepSubstrateReleases(ctx context.Context, candidates []*store.BacklogItem, policy SubstrateReleasePolicy, recovery substrateRecoveryState, releasedSoFar int) (AutoRequeueSweepResult, map[string]bool, map[string]bool, error) {
+	res := AutoRequeueSweepResult{}
+	red, windows := recovery.red, recovery.windows
+	held := map[string]bool{}
+	if len(windows) == 0 {
+		return res, red, held, nil
+	}
+	if r.Budget != nil {
+		decision, berr := r.Budget.Allow(ctx, TierPipeline, 0)
+		if berr != nil {
+			return res, red, held, fmt.Errorf("substrate release: admission check: %w", berr)
+		}
+		if !decision.Allowed {
+			return res, red, held, nil
+		}
+	}
+	for _, item := range candidates {
+		if item == nil || item.TargetProject != "" {
+			continue
+		}
+		runs, lerr := r.Store.Pipeline.ListByBacklog(ctx, item.ID)
+		if lerr != nil {
+			res.Errored++
+			continue
+		}
+		run := mostRecentRun(runs)
+		res.Inspected++
+		if run == nil || mostRecentRunWithMR(runs) != nil || !policy.eligibleClass(run.EscalationClass) {
+			res.Skipped++
+			continue
+		}
+		capability := policy.capabilityForRun(run)
+		if capability == "" || red[capability] {
+			res.Skipped++
+			continue
+		}
+		escalatedAt := run.StartedAt
+		if run.EndedAt != nil {
+			escalatedAt = *run.EndedAt
+		}
+		matched := false
+		for _, window := range windows {
+			if window.Capability == capability && !escalatedAt.Before(window.RedAt) && !escalatedAt.After(window.GreenAt) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			res.Skipped++
+			continue
+		}
+		if releasedSoFar+res.Requeued >= policy.SweepCap() {
+			held[item.ID] = true
+			continue
+		}
+		if _, lookupErr := r.Store.Events.FirstBySubjectKind(ctx, "pipeline_run", run.ID, eventKindSubstrateReleased); lookupErr == nil {
+			res.Skipped++
+			continue
+		} else if !errors.Is(lookupErr, store.ErrNotFound) {
+			res.Errored++
+			continue
+		}
+		releasedBy := "substrate_recovered:" + capability
+		event := &store.Event{Actor: "reconciler", Kind: eventKindSubstrateReleased, SubjectKind: "pipeline_run", SubjectID: run.ID, Payload: map[string]any{"backlog_id": item.ID, "run_id": run.ID, "escalation_class": run.EscalationClass, "failure_signature": run.FailureSignature, "released_by": releasedBy}}
+		updated, commitErr := r.Store.Backlog.TransitionStateWithEvent(ctx, item.ID, item.ClaimVersion, store.BacklogEscalated, store.BacklogQueued, event)
+		if commitErr != nil {
+			if errors.Is(commitErr, store.ErrStaleWrite) {
+				res.Skipped++
+				continue
+			}
+			res.Errored++
+			continue
+		}
+		if updated != nil {
+			*item = *updated
+		}
+		delete(r.autoRequeueRecheck, item.ID)
+		res.Requeued++
+	}
+	return res, red, held, nil
 }
 
 // externalIncidentActive reports whether the dependency the run escalated
@@ -472,7 +874,7 @@ func (r *Reconciler) commitAutoRequeue(
 			return false, nil // lost the race; clean skip
 		}
 		r.append(ctx, "reconciler.auto_requeue_failed", "error", map[string]any{
-			"backlog": item.ID, "run": run.ID, "class": eval.class, "error": err.Error(),
+			"backlog": item.ID, "run": run.ID, "class": eval.class, "stage": "transition", "error": err.Error(),
 		})
 		return false, err
 	}

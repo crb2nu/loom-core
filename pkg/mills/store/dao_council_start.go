@@ -286,17 +286,21 @@ func appendCouncilStoreNote(existing, note string) string {
 	return existing + "; " + note
 }
 
+// readCouncilStartBudgetSnapshot counts METERED council spend only
+// (cost_frontier_usd); cost_local_usd is flexinfer/local inference the daily USD
+// cap does not govern (store.BillingLocal). Keep in lockstep with
+// Budget.spentSince for TierCouncil.
 func readCouncilStartBudgetSnapshot(ctx context.Context, tx *sql.Tx, since time.Time, currentRunID string) (councilStartBudgetSnapshot, error) {
 	var out councilStartBudgetSnapshot
 	if err := tx.QueryRowContext(ctx, `
 		SELECT
 			COALESCE((
-				SELECT SUM(cost_frontier_usd + cost_local_usd)
+				SELECT SUM(cost_frontier_usd)
 				FROM council_runs
 				WHERE started_at >= ? AND id <> ?
 			), 0),
 			COALESCE((
-				SELECT SUM(MAX(r.reserved_usd - (cr.cost_frontier_usd + cr.cost_local_usd), 0))
+				SELECT SUM(MAX(r.reserved_usd - cr.cost_frontier_usd, 0))
 				FROM council_budget_reservations r
 				JOIN council_runs cr ON cr.id = r.run_id
 				WHERE r.state = 'active' AND r.created_at >= ? AND r.run_id <> ?

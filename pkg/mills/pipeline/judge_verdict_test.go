@@ -111,3 +111,37 @@ func TestRunGate_PureGoGateWritesNoJudgeVerdict(t *testing.T) {
 		t.Fatalf("judge.verdict events = %d, want none", len(events))
 	}
 }
+
+// A shadow judgement is persisted like any other, under its own role, so the
+// calibration report can compare the candidate judge with the primary.
+func TestRunGate_PersistsShadowJudgeVerdict(t *testing.T) {
+	st, r, run, stage := judgeVerdictFixture(t, 0.93)
+	r.Gates = gates.NewRegistry()
+	r.Gates.Register(&gates.LLMGate{
+		GateName: "spec_conformance", RubricName: gates.SpecConformanceRubricName, Threshold: 0.8,
+		Judge:  &gates.FakeRubricJudge{Default: gates.RubricVerdict{Score: 0.93, Model: "gemma"}},
+		Shadow: &gates.FakeRubricJudge{Default: gates.RubricVerdict{Score: 0.61, Model: "qwen38"}},
+	})
+
+	verdict, err := r.runGate(context.Background(), run, &store.BacklogItem{ID: run.BacklogID}, stage, nil, mills.Default())
+	if err != nil {
+		t.Fatalf("runGate: %v", err)
+	}
+	if !verdict.Pass {
+		t.Fatalf("gate verdict = %+v, want pass (the shadow never decides)", verdict)
+	}
+	events := judgeVerdictEvents(t, st)
+	if len(events) != 2 {
+		t.Fatalf("judge.verdict events = %d, want primary + shadow", len(events))
+	}
+	byRole := map[string]map[string]any{}
+	for _, e := range events {
+		byRole[e.Payload["role"].(string)] = e.Payload
+	}
+	if p := byRole[gates.JudgeRolePrimary]; p == nil || p["judge_model"] != "gemma" || p["score"] != 0.93 {
+		t.Errorf("primary payload = %v", p)
+	}
+	if s := byRole[gates.JudgeRoleShadow]; s == nil || s["judge_model"] != "qwen38" || s["score"] != 0.61 || s["pass"] != false {
+		t.Errorf("shadow payload = %v", s)
+	}
+}

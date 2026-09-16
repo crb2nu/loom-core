@@ -1,0 +1,1 @@
+- Cache plan-slice list reads by each plan's `updated_at` stamp in `pkg/mills`, invalidating successful writes and exposing fetched-versus-cached metrics to reduce polling load.

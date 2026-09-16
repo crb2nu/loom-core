@@ -108,22 +108,29 @@ func TestEnsureRegisteredIndexes_NonSessionsNoDatetime(t *testing.T) {
 	}
 }
 
-// TestDatetimeIndexesByKind_OnlySessions pins the registry contents so a future
-// edit that drops or widens datetime indexing fails loudly.
-func TestDatetimeIndexesByKind_OnlySessions(t *testing.T) {
+// TestDatetimeIndexesByKind_Registry pins the registry contents so a future
+// edit that drops or widens datetime indexing fails loudly. Sessions carry the
+// reaper's started_at/ended_at range; context carries timestamp for the HUD
+// live stream's newest-first listing (agent_context_search sort=recent).
+func TestDatetimeIndexesByKind_Registry(t *testing.T) {
 	t.Parallel()
-	if len(datetimeIndexesByKind) != 1 {
-		t.Fatalf("datetimeIndexesByKind has %d kinds, want 1 (sessions only)", len(datetimeIndexesByKind))
+	want := map[string][]string{
+		CollSessions: {"ended_at", "started_at"},
+		CollContext:  {"timestamp"},
 	}
-	got := append([]string(nil), datetimeIndexesByKind[CollSessions]...)
-	sort.Strings(got)
-	want := []string{"ended_at", "started_at"}
-	if len(got) != len(want) {
-		t.Fatalf("sessions datetime fields = %v, want %v", got, want)
+	if len(datetimeIndexesByKind) != len(want) {
+		t.Fatalf("datetimeIndexesByKind has %d kinds, want %d (%v)", len(datetimeIndexesByKind), len(want), want)
 	}
-	for i := range got {
-		if got[i] != want[i] {
-			t.Errorf("sessions datetime fields[%d] = %q, want %q", i, got[i], want[i])
+	for kind, fields := range want {
+		got := append([]string(nil), datetimeIndexesByKind[kind]...)
+		sort.Strings(got)
+		if len(got) != len(fields) {
+			t.Fatalf("%s datetime fields = %v, want %v", kind, got, fields)
+		}
+		for i := range got {
+			if got[i] != fields[i] {
+				t.Fatalf("%s datetime fields = %v, want %v", kind, got, fields)
+			}
 		}
 	}
 }

@@ -2,9 +2,46 @@ package workflow
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// QueuedTargetStampProof is the fail-closed contract used by the queued-proof
+// kill-test. A proof is valid only when one target-bound stamp is admitted,
+// retains its destination through landing, and a replay is rejected as a
+// collision instead of overwriting the original delivery intent.
+type QueuedTargetStampProof struct {
+	StampID             string   `json:"stamp_id"`
+	TargetProject       string   `json:"target_project"`
+	LandedTargetProject string   `json:"landed_target_project"`
+	QueueStates         []string `json:"queue_states"`
+	Admissions          int      `json:"admissions"`
+	CollisionDetected   bool     `json:"collision_detected"`
+}
+
+// AssertQueuedTargetStampProof rejects missing or contradictory stamp proof.
+func AssertQueuedTargetStampProof(p QueuedTargetStampProof) error {
+	p.StampID = strings.TrimSpace(p.StampID)
+	p.TargetProject = strings.TrimSpace(p.TargetProject)
+	p.LandedTargetProject = strings.TrimSpace(p.LandedTargetProject)
+	if p.StampID == "" || p.TargetProject == "" {
+		return fmt.Errorf("queued target stamp identity is missing")
+	}
+	if p.LandedTargetProject != p.TargetProject {
+		return fmt.Errorf("queued target stamp %q landed on %q, want %q", p.StampID, p.LandedTargetProject, p.TargetProject)
+	}
+	if len(p.QueueStates) != 2 || p.QueueStates[0] != "queued" || p.QueueStates[1] != "admitted" {
+		return fmt.Errorf("queued target stamp %q has incomplete queue evidence: %v", p.StampID, p.QueueStates)
+	}
+	if p.Admissions != 1 {
+		return fmt.Errorf("queued target stamp %q admissions=%d, want 1", p.StampID, p.Admissions)
+	}
+	if !p.CollisionDetected {
+		return fmt.Errorf("queued target stamp %q has no duplicate collision evidence", p.StampID)
+	}
+	return nil
+}
 
 // QueuedProofEvidence is the durable report produced by the live queued-proof
 // kill-test. It binds one queued backlog item to one terminal pipeline run and
@@ -49,8 +86,11 @@ func AssertQueuedProof(e QueuedProofEvidence) error {
 	}
 	queuedObservations := 0
 	for i, state := range e.States {
-		if strings.TrimSpace(state.State) == "" || state.ObservedAt.IsZero() || (i > 0 && state.ObservedAt.Before(e.States[i-1].ObservedAt)) {
+		if strings.TrimSpace(state.State) == "" || state.ObservedAt.IsZero() || state.ObservedAt.After(e.CapturedAt) || (i > 0 && !state.ObservedAt.After(e.States[i-1].ObservedAt)) {
 			return fmt.Errorf("queued-proof state %d is missing or unordered", i)
+		}
+		if i > 0 && state.State == e.States[i-1].State {
+			return fmt.Errorf("queued-proof state %d does not progress from %q", i, state.State)
 		}
 		if state.State == "quarantined" {
 			return fmt.Errorf("queued-proof run %s was quarantined", e.RunID)
@@ -73,6 +113,12 @@ func AssertQueuedProof(e QueuedProofEvidence) error {
 	}
 	if e.MR.IID <= 0 || strings.TrimSpace(e.MR.Project) == "" || strings.TrimSpace(e.MR.URL) == "" {
 		return fmt.Errorf("queued-proof terminal MR identity is missing")
+	}
+	wantMRSuffix := "/-/merge_requests/" + strconv.FormatInt(e.MR.IID, 10)
+	legacyMRSuffix := "/mr/" + strconv.FormatInt(e.MR.IID, 10)
+	trimmedMRURL := strings.TrimRight(e.MR.URL, "/")
+	if !strings.HasSuffix(trimmedMRURL, wantMRSuffix) && !strings.HasSuffix(trimmedMRURL, legacyMRSuffix) {
+		return fmt.Errorf("queued-proof MR URL %q contradicts IID %d", e.MR.URL, e.MR.IID)
 	}
 	if e.MR.State != "merged" {
 		return fmt.Errorf("queued-proof MR state %q is not auto-merged proof", e.MR.State)

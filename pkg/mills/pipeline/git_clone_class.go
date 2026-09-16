@@ -19,14 +19,16 @@ import (
 // the RIGHT class and the RIGHT instruction. A missing target repo, a bad ref,
 // and a bad token are all TERMINAL config errors (a human must create the repo,
 // fix the branch, or fix the credential — an identical retry can only fail
-// identically), while a DNS/connectivity blip is TRANSIENT and must retry.
+// identically), while a DNS/connectivity blip or a GitLab HTTP 5xx /
+// pack-stream transport failure is TRANSIENT and must retry.
 // Before this, all four escalated as ClassInfra via the generic
 // "buildah build failed"/"image build failed" needles in Classify, which both
 // mis-attributed the fault (cluster vs. config) AND burned the retry budget on
 // the terminal cases.
 type GitCloneFailure struct {
 	// Class is the taxonomy bucket. Terminal cases (repo-not-found, bad-ref,
-	// auth) map to ClassConfig; a network/DNS blip maps to ClassTransient.
+	// auth) map to ClassConfig; a network/DNS blip or an HTTP/stream transport
+	// failure maps to ClassTransient.
 	Class ErrorClass
 	// Message is the actionable escalation reason (no trailing period; the
 	// runner wraps it in a "stage X terminal git-clone error …" envelope).
@@ -74,6 +76,14 @@ func looksLikeGitClone(lower string) bool {
 		"fatal: repository",
 		"fatal: could not read",
 		"fatal: unable to access",
+		// git's own HTTP/stream transport failure lines. Anchored on git's
+		// "error:"/"fatal:" prefixes so an unrelated stream's "early EOF" or
+		// a gRPC "rpc error" can never be claimed as a clone failure.
+		"error: rpc failed",
+		"fatal: expected flush after ref listing",
+		"fatal: early eof",
+		"fatal: the remote end hung up unexpectedly",
+		"fatal: unexpected disconnect",
 		"couldn't find remote ref",
 		"couldnt find remote ref",
 		"remote branch",
@@ -127,8 +137,8 @@ var gitCloneNotFoundNeedles = []string{
 	"not found", // git's `fatal: repository '…' not found` (guarded)
 }
 
-// networkNeedles: DNS/connectivity blips. These are the only TRANSIENT class —
-// a fresh spawn after the blip clears typically clones fine.
+// networkNeedles: DNS/connectivity blips. TRANSIENT — a fresh spawn after the
+// blip clears typically clones fine.
 var gitCloneNetworkNeedles = []string{
 	"could not resolve host",
 	"couldn't resolve host",
@@ -141,6 +151,27 @@ var gitCloneNetworkNeedles = []string{
 	"no route to host",
 	"failed to connect",
 	"timed out",
+}
+
+// transportNeedles: the remote answered but the HTTP/TLS/pack stream failed
+// mid-clone — a GitLab 5xx blip (`error: RPC failed; HTTP 502 curl 22 The
+// requested URL returned error: 502 | fatal: expected flush after ref
+// listing`, PIPE-psl-plan-council-split-internal-hud-spawn-… 2026-09-13), an
+// early EOF, or a hung-up remote. TRANSIENT like the network needles, kept
+// separate so the diagnostic names the captured transport failure. Before
+// this family existed that exact tail fell through to the exit-128 default
+// and escalated terminal config claiming "no git message was captured".
+var gitCloneTransportNeedles = []string{
+	"rpc failed",
+	"http 502",
+	"http 503",
+	"http 504",
+	"returned error: 5",
+	"expected flush after ref listing",
+	"early eof",
+	"the remote end hung up unexpectedly",
+	"gnutls recv error",
+	"unexpected disconnect",
 }
 
 // ClassifyGitCloneError inspects a spawn/build error string and, when it
@@ -197,6 +228,13 @@ func ClassifyGitCloneError(errText string) (GitCloneFailure, bool) {
 			Class:   ClassTransient,
 			Project: project,
 			Message: fmt.Sprintf("transient git-clone network error cloning %s (DNS/connectivity) — retrying", project),
+		}, true
+
+	case containsAny(lower, gitCloneTransportNeedles):
+		return GitCloneFailure{
+			Class:   ClassTransient,
+			Project: project,
+			Message: fmt.Sprintf("transient git-clone transport error cloning %s — retrying", project),
 		}, true
 
 	// Our git-clone init container exited 128 but the captured tail held no

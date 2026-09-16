@@ -20,12 +20,14 @@ type testMetrics struct {
 	dispatches     atomic.Int64
 	dropsFullChan  atomic.Int64
 	dropsNoPending atomic.Int64
+	lateResponses  atomic.Int64
 	notifications  atomic.Int64
 }
 
 func (m *testMetrics) IncMuxDispatches()     { m.dispatches.Add(1) }
 func (m *testMetrics) IncMuxDropsFullChan()  { m.dropsFullChan.Add(1) }
 func (m *testMetrics) IncMuxDropsNoPending() { m.dropsNoPending.Add(1) }
+func (m *testMetrics) IncMuxLateResponses()  { m.lateResponses.Add(1) }
 func (m *testMetrics) IncMuxNotifications()  { m.notifications.Add(1) }
 
 // newPair returns a wrapped client transport plus the raw server-side pipe.

@@ -15,10 +15,24 @@
 #   scripts/mobile/cleanup-signing.sh
 
 include:
+  - local: /ci/mills.gitlab-ci.yml
   - project: platform/gitops
     ref: main
     file:
       - /k3s/ci/caches/gitlab-ci-cache.yml
+      # Fleet security baseline: GitLab SAST + Secret Detection, plus the
+      # shared SAST_EXCLUDED_PATHS / SECRET_DETECTION_EXCLUDED_PATHS defaults.
+      # Additive to the hand-rolled security:* jobs below, not a replacement:
+      #   - secret_detection is coverage this repo had none of.
+      #   - semgrep-sast is first-party static analysis with a rule set gosec
+      #     has no equivalent for. The template's own gosec-sast analyzer is
+      #     retired upstream (`rules: - when: never`), so security:gosec is not
+      #     duplicated by adding this include.
+      #   - govulncheck's module vulnerability database has no template
+      #     counterpart at all, so security:govulncheck stays as-is.
+      # See the .sast-analyzer / .secret-analyzer overrides below for the two
+      # adaptations these jobs need to work in this pipeline.
+      - /ci/templates/security.yml
   - project: "services/tech-radar"
     file: "/ci/radar.yml"
 
@@ -33,6 +47,10 @@ workflow:
     on_new_commit: interruptible
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    # Queue-owned speculative commits are explicitly pipelined through the API;
+    # never let their ref updates mint duplicate push pipelines.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^mills-mq\/spec-/'
       when: never
     # Default-branch pipelines are the deploy path and must never be
     # auto-canceled. On 2026-08-07 five consecutive main pipelines
@@ -54,6 +72,23 @@ workflow:
     - if: '$CI_COMMIT_BRANCH'
     - if: '$CI_COMMIT_TAG'
 
+# `lint -> test -> build -> publish` is the fleet-canonical stage set
+# (platform/gitops/ci/README.md). The departures here are deliberate, and
+# recorded so a conformance sweep does not "fix" them into a broken pipeline:
+#
+# - `prepare` seeds the shared Go module/build cache once (prepare:go-cache) so
+#   the ~20 downstream Go jobs do not each repeat a network-heavy dependency
+#   download. Nearly every Go job `needs:` it.
+# - `deploy` is this repo's publish stage under an older name: the buildkit
+#   image jobs, the `release` job and the cluster rollouts all live there.
+# - build sits before test because the dependency graph points that way, not by
+#   accident. test:integration and test:benchmark `needs: build:binaries`
+#   (stage `build`) because they exercise the compiled binaries, while the
+#   release cross-compiles (build:linux-*, build:darwin-*) sit in the `test`
+#   stage precisely so they can `needs: test:unit`. Swapping the two stage
+#   names inverts both edges at once -- a job cannot `needs:` a job in a later
+#   stage -- so canonicalising the order is not a rename, it is a re-plumbing
+#   of the needs graph, and belongs in its own change.
 stages:
   - prepare
   - lint
@@ -152,20 +187,52 @@ variables:
   # This repo doesn't use DinD for its Go jobs; disable that wait globally to prevent jobs hanging.
   DOCKER_HOST: ""
 
-# Cache Go modules and build cache
+# Cache Go modules and tooling.
+#
+# 2026-09-09: every Go job had been building cold for months. Two independent
+# faults, both visible in any job trace:
+#   1. The per-branch archive (.go/pkg/mod/cache/download + .go-build) was
+#      ~970MB against the runner's 512MB MaxUploadedArchiveSize, so
+#      prepare:go-cache printed "Cache archive size ... is too big ... stored
+#      only locally" and never uploaded anything. The bucket held zero Go keys.
+#   2. main is a protected branch, so its key is written as `main-protected`,
+#      while branch pipelines resolve `fallback_keys: [main]` to
+#      `main-non_protected` — a key nobody writes. The fallback could never hit.
+# Result: 212 `go: downloading` lines and a full rebuild in every job, ~8 min of
+# pre-test time in test:reliability under load, which is what starved its
+# benchmark deadline once CI capacity dropped.
+#
+# Fix: shared, constant keys written only by main's prepare:go-cache and read
+# by every ref (`unprotect: true` lets protected and unprotected pipelines
+# share them). Two entries, deliberately: the runner judges each archive
+# against MaxUploadedArchiveSize on its own, so a build cache that outgrows
+# the cap is "stored only locally" by itself and can never take the module
+# cache down with it again. Modules are content-addressed, so a shared key is
+# safe across branches; a branch with a new dependency downloads just that
+# one module. The build cache is keyed the same way — Go's build cache is
+# content-addressed too, so a branch reuses whatever main compiled and
+# recompiles only what it changed. The 1-day bucket prune keeps both keys
+# alive because main pipelines refresh them several times a day. The
+# `go-build-shared` upload needs the 2GiB cap + persistent MinIO from
+# platform/gitops !667; before that rolls, the runner logs it as stored
+# locally and the job carries on.
 cache:
-  key: ${CI_COMMIT_REF_SLUG}
-  paths:
-    # Cache Go-installed tooling (golangci-lint, etc.) to avoid reinstalling
-    # large toolchains on every job.
-    - .go/bin/
-    # Cache the module download ZIP/index cache (not extracted modules).
-    # This stays well under the runner's 512MB cache upload limit.
-    - .go/pkg/mod/cache/download/
-    - .go-build/
-  # Pull cache everywhere, but only push from selected jobs to avoid repeatedly
-  # archiving tens of thousands of small Go cache files on every job.
-  policy: pull
+  - key: go-mod-shared
+    unprotect: true
+    paths:
+      # Go-installed tooling (golangci-lint, gotestsum) so jobs skip the
+      # network install.
+      - .go/bin/
+      # Module download ZIP/index cache (not extracted modules).
+      - .go/pkg/mod/cache/download/
+    # Pull everywhere; only main's prepare:go-cache pushes (see its rules).
+    policy: pull
+  - key: go-build-shared
+    unprotect: true
+    paths:
+      # GOCACHE (see .go-template: GOCACHE=$CI_PROJECT_DIR/.go-build).
+      - .go-build/
+    policy: pull
 
 # Shared source-fetch anchor. Idempotent: skips when already inside a git work
 # tree, otherwise initialises one and fetches `${CI_COMMIT_SHA}`. Mirrors the
@@ -317,6 +384,45 @@ cache:
       fi
 
 # =============================================================================
+# SECURITY TEMPLATE ADAPTATIONS
+# Two changes the jobs from the included platform/gitops security.yml need in
+# order to work here. Both are applied to the GitLab templates' hidden base
+# jobs (.sast-analyzer, .secret-analyzer) rather than to concrete analyzer job
+# names, so they keep applying when GitLab adds, renames or retires an
+# analyzer -- and an override of a hidden job that no longer exists upstream is
+# inert rather than a config error.
+#
+# 1. Source fetch. GIT_STRATEGY is "none" repo-wide (see variables: above)
+#    because this GitLab instance does not reliably serve refs/pipelines/<id>
+#    to the runner; every job here fetches its own sources through .clone_repo,
+#    which carries the retry ladder and the CI-INFRA-FAILURE sentinel. The
+#    analyzers have no such hook, so without this they would scan an empty
+#    working directory and report a clean result having read nothing --
+#    strictly worse than no scanning, because it looks like a pass.
+# 2. needs: []. Security scanning is downstream of nothing. Gating it behind
+#    prepare/lint/build only delays the finding.
+#
+# Both stay at the template's allow_failure: true. Their images resolve through
+# $CI_TEMPLATE_REGISTRY_HOST (registry.gitlab.com) -- the one endpoint in this
+# pipeline with no in-cluster mirror (see docs/ci-external-endpoints.md) -- so a
+# WAN disturbance must not be able to gate a merge.
+# =============================================================================
+
+.sast-analyzer:
+  variables:
+    GIT_STRATEGY: "none"
+  needs: []
+  before_script:
+    - *clone_repo
+
+.secret-analyzer:
+  variables:
+    GIT_STRATEGY: "none"
+  needs: []
+  before_script:
+    - *clone_repo
+
+# =============================================================================
 # PREPARE STAGE
 # Seed shared Go module/build cache once so lint/test jobs avoid repeating
 # network-heavy dependency downloads.
@@ -329,15 +435,31 @@ prepare:go-cache:
     GO_WARM_MOD_CACHE: "true"
     KUBERNETES_CPU_REQUEST: "1"
     KUBERNETES_CPU_LIMIT: "2"
+    GO_CACHE_POLICY: pull
+  # Only default-branch pipelines write the shared key; branch pipelines read
+  # it. Keeps one ~300MB object in the cache bucket instead of one per branch
+  # (Mills opens ~15 branches a day against a 5Gi emptyDir-backed MinIO), and
+  # keeps peak-hour MinIO I/O to reads. The trailing rule keeps the job in
+  # every pipeline the workflow rules admit — ~20 Go jobs `needs:` it.
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      variables:
+        GO_CACHE_POLICY: pull-push
+    - when: on_success
   cache:
-    key: ${CI_COMMIT_REF_SLUG}
-    paths:
-      - .go/bin/
-      - .go/pkg/mod/cache/download/
-      - .go-build/
-    policy: pull-push
+    - key: go-mod-shared
+      unprotect: true
+      paths:
+        - .go/bin/
+        - .go/pkg/mod/cache/download/
+      policy: $GO_CACHE_POLICY
+    - key: go-build-shared
+      unprotect: true
+      paths:
+        - .go-build/
+      policy: $GO_CACHE_POLICY
   script:
-    - echo "Seeding shared Go cache/tooling"
+    - echo "Seeding shared Go cache/tooling (policy=${GO_CACHE_POLICY})"
     - |
       LINT_BIN="$(go env GOPATH)/bin/golangci-lint"
       if [ -x "$LINT_BIN" ] && "$LINT_BIN" version 2>/dev/null | grep -q 'version v2.8.0'; then
@@ -356,6 +478,10 @@ prepare:go-cache:
         go install gotest.tools/gotestsum@v1.13.0
       fi
     - go env GOPATH GOCACHE
+    # Record what the archive will hold. The runner silently downgrades an
+    # archive over MaxUploadedArchiveSize (512MB) to "stored only locally", so
+    # this line is the evidence when a future dependency bump tips it over.
+    - du -sh .go/bin .go/pkg/mod/cache/download .go-build 2>/dev/null || true
   artifacts:
     paths:
       - .go/bin/golangci-lint
@@ -402,7 +528,16 @@ lint:
     KUBERNETES_CPU_LIMIT: "2"
     KUBERNETES_MEMORY_REQUEST: "4Gi"
     KUBERNETES_MEMORY_LIMIT: "8Gi"
+  rules:
+    - if: '$MILLS_MERGE_QUEUE == "1"'
+      variables:
+        KUBERNETES_CPU_REQUEST: "3"
+        KUBERNETES_CPU_LIMIT: "4"
+    - when: on_success
   script:
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
     - |
       if [ ! -x "$(go env GOPATH)/bin/golangci-lint" ]; then
         echo "ERROR: expected golangci-lint artifact from prepare:go-cache"
@@ -411,7 +546,26 @@ lint:
       fi
     # Fail fast on config schema drift (issue #240): a v1-keyed config under a
     # v2 binary is silently ignored by `run`, so verify the schema explicitly.
-    - $(go env GOPATH)/bin/golangci-lint config verify
+    #
+    # Without --schema, `config verify` fetches its schema from
+    # golangci-lint.run at runtime — a public-internet dependency inside a
+    # blocking job (pipeline 23729 job 235686 went red on that fetch timing
+    # out, with no Go or config change in the MR). The schema is vendored in
+    # ci/ instead. The filename is derived from the binary version so a
+    # golangci-lint bump without re-vendoring fails here with an explicit
+    # message rather than validating against a stale schema. Re-vendor with:
+    #   curl -sSfo ci/golangci.v<MAJ>.<MIN>.jsonschema.json \
+    #     https://golangci-lint.run/jsonschema/golangci.v<MAJ>.<MIN>.jsonschema.json
+    - |
+      LINT_MINOR="$($(go env GOPATH)/bin/golangci-lint version --short | cut -d. -f1-2)"
+      SCHEMA="ci/golangci.v${LINT_MINOR}.jsonschema.json"
+      if [ ! -f "$SCHEMA" ]; then
+        echo "ERROR: ${SCHEMA} not vendored for golangci-lint v${LINT_MINOR}."
+        echo "Re-vendor it (command in the comment above this block) so config"
+        echo "verify does not fall back to a mid-job public-internet schema fetch."
+        exit 1
+      fi
+      $(go env GOPATH)/bin/golangci-lint config verify --schema "$SCHEMA"
     # 45m, not 30m: golangci-lint completed in 29m47s on pipeline 7923's
     # retry of job 86562 (right at the wire, after slice 5.1 added ~1.3k
     # LOC). Earlier the same pipeline failed with `Timeout exceeded` at
@@ -439,8 +593,20 @@ vet:
     # memory profile since vet has comparable working-set requirements.
     KUBERNETES_MEMORY_REQUEST: "4Gi"
     KUBERNETES_MEMORY_LIMIT: "8Gi"
+  rules:
+    - if: '$MILLS_MERGE_QUEUE == "1"'
+      variables:
+        KUBERNETES_CPU_REQUEST: "3"
+        KUBERNETES_CPU_LIMIT: "4"
+    - when: on_success
   script:
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
     - go vet ./...
+    # Keep build:image:loom-mills-operator's `changes:` list in step with the
+    # operator's real import footprint.
+    - bash scripts/ci/check_operator_image_changes.sh
 
 fmt:
   <<: *go-template
@@ -484,6 +650,7 @@ lint:ci-guards:
     - bash scripts/ci/check_ci_external_endpoints.sh
     - bash scripts/ci/check_ci_external_endpoints_test.sh
     - bash scripts/ci/clone_repo_retry_test.sh
+    - bash scripts/ci/validated_tree_skip_test.sh
 
 lint:rbac-policy:
   <<: *go-template
@@ -491,6 +658,9 @@ lint:rbac-policy:
   variables:
     GO_WARM_MOD_CACHE: "false"
   script:
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
     - go run ./cmd/loom validate rbac --source repo
 
 guardrails:docs-cli:
@@ -499,6 +669,9 @@ guardrails:docs-cli:
   variables:
     GO_WARM_MOD_CACHE: "false"
   script:
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
     - |
       # .go-template's before_script ran *clone_repo, so .git metadata is
       # available here. Fetch the base branch so docs-drift diffs work.
@@ -555,10 +728,10 @@ security:gosec:
     #   G118: intentional context.Background  G120: local-only OAuth handler
     #   G122: CLI filepath.Walk  G204/G304: core CLI/MCP functionality
     #   G301/G302/G306: intentional permissions  G401/G501/G505: crypto tool functionality
-    #   G402: internal LAN TLS  G702/G703/G704: core server-launch/file-read functionality
+    #   G402: internal LAN TLS  G702/G703/G704/G705: core server-launch/file-read/JSON-write functionality
     - >-
       $(go env GOPATH)/bin/gosec -concurrency=2
-      -exclude=G101,G104,G106,G115,G117,G118,G120,G122,G204,G301,G302,G304,G306,G401,G402,G501,G505,G702,G703,G704
+      -exclude=G101,G104,G106,G115,G117,G118,G120,G122,G204,G301,G302,G304,G306,G401,G402,G501,G505,G702,G703,G704,G705
       -exclude-dir=.go -exclude-dir=vendor
       -fmt json -out gosec-report.json ${GO_APP_PKGS}
   artifacts:
@@ -705,21 +878,38 @@ build:binaries:
     KUBERNETES_CPU_LIMIT: "4"
     KUBERNETES_MEMORY_REQUEST: "3Gi"
     KUBERNETES_MEMORY_LIMIT: "8Gi"
+  rules:
+    - if: '$MILLS_MERGE_QUEUE == "1"'
+      variables:
+        KUBERNETES_CPU_REQUEST: "3"
+        KUBERNETES_CPU_LIMIT: "4"
+    - when: on_success
   cache:
-    # Keep Go module/build caches shared per-branch, but keep compiled binaries
-    # scoped per-commit to avoid stale/incorrect reuse.
-    - key: ${CI_COMMIT_REF_SLUG}
+    # Read the shared Go module/tooling cache (written only by main's
+    # prepare:go-cache; see the top-level cache: comment), but keep compiled
+    # binaries scoped per-commit to avoid stale/incorrect reuse. The old
+    # per-branch key with .go/pkg/mod + .go-build was never written by anyone.
+    - key: go-mod-shared
+      unprotect: true
       paths:
-        - .go/pkg/mod/
+        - .go/bin/
+        - .go/pkg/mod/cache/download/
+      policy: pull
+    - key: go-build-shared
+      unprotect: true
+      paths:
         - .go-build/
-      # Uploading this cache adds several minutes of archive time in practice
-      # (40k+ files). Keep pull-only to avoid CI wall-clock bottlenecks.
       policy: pull
     - key: ${CI_COMMIT_SHA}-bin
       paths:
         - bin/
       policy: push
   script:
+    # Main-only dedup: the MR pipeline built this exact tree. Nothing on main
+    # consumes the per-SHA bin cache when the tree is validated (test:integration
+    # skips too, test:benchmark only needs the ordering), and without this the
+    # image jobs' DAG still waited ~14 min on binaries via test:integration.
+    - . scripts/ci/validated_tree_skip.sh
     - |
       VERSION="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
       LDFLAGS="-s -w -X main.version=${VERSION}"
@@ -812,7 +1002,16 @@ test:unit:
     KUBERNETES_CPU_LIMIT: "4"
     KUBERNETES_MEMORY_REQUEST: "3Gi"
     KUBERNETES_MEMORY_LIMIT: "8Gi"
+  rules:
+    - if: '$MILLS_MERGE_QUEUE == "1"'
+      variables:
+        KUBERNETES_CPU_REQUEST: "3"
+        KUBERNETES_CPU_LIMIT: "4"
+    - when: on_success
   script:
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
     # Verify gotestsum's rerun/coverage contract against a hermetic fixture
     # BEFORE trusting it with the real suite. Cheap (~5s) and it is the only
     # thing standing between a GOTESTSUM_VERSION bump and a silent regression
@@ -891,6 +1090,9 @@ test:integration:
         - bin/
       policy: pull
   script:
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
     - |
       echo "Setting up integration test environment..."
       export LOOM_REPO_ROOT="$CI_PROJECT_DIR"
@@ -943,9 +1145,13 @@ test:reliability:
       - script_failure
   # Eleven paired benchmark rounds plus the mandatory 60s mixed-load test can
   # exceed the old 810s shell budget on the shared Xeon runner even when every
-  # scenario passes. The 1080s shell deadline leaves 120s of the 20-minute job
-  # timeout for artifact upload and teardown.
-  timeout: 20 minutes
+  # scenario passes. 1080s -> 1380s on 2026-09-11: on a saturated runner a run
+  # completed 84 of 88 paired samples by its 930s benchmark deadline and failed
+  # two benchmarks at 10 of 11 pairs — a pass short by four samples. The 1380s
+  # shell deadline leaves 120s of the 25-minute job timeout for artifact
+  # upload and teardown. Keep in sync with reliability_shell_budget_seconds in
+  # scripts/ci/fleet_reliability_gate.sh.
+  timeout: 25 minutes
   variables:
     GO_WARM_MOD_CACHE: "false"
     KUBERNETES_CPU_REQUEST: "2"
@@ -953,13 +1159,20 @@ test:reliability:
     KUBERNETES_MEMORY_REQUEST: "4Gi"
     KUBERNETES_MEMORY_LIMIT: "8Gi"
   script:
-    - timeout 1080s make ci-reliability
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
+    - timeout 1380s make ci-reliability
   artifacts:
     when: always
     paths:
       - .loom/local/evidence/fleet-reliability/
     expire_in: 30 days
   rules:
+    - if: '$MILLS_MERGE_QUEUE == "1"'
+      variables:
+        KUBERNETES_CPU_REQUEST: "3"
+        KUBERNETES_CPU_LIMIT: "4"
     - if: '$CI_COMMIT_BRANCH'
     - when: never
 
@@ -972,6 +1185,9 @@ test:enterprise-smoke:
   variables:
     GO_WARM_MOD_CACHE: "false"
   script:
+    # Main-only dedup: a merge whose tree equals the MR head's already passed
+    # this job on the MR pipeline (scripts/ci/validated_tree_skip.sh).
+    - . scripts/ci/validated_tree_skip.sh
     - bash scripts/ci/enterprise_smoke_suite.sh
 
 test:race:
@@ -1002,7 +1218,8 @@ test:race:
       # reconciler same-tick double-count fix; the package now carries race
       # coverage like the rest of pkg/.
 
-      go test -race -short "${PKGS[@]}"
+      # Pipeline 24793 had two contention reds; a quiet-window retry was green.
+      go test -race -short -timeout=30m "${PKGS[@]}"
   rules:
     # NB: do NOT add `if: $CI_PIPELINE_SOURCE == "merge_request_event"` here.
     # The top-level `workflow.rules` blocks all merge_request_event pipelines
@@ -1189,6 +1406,30 @@ ios:archive-export:
 
 build:image:loom-core:
   stage: deploy
+  # DAG: start as soon as the image's real gates are done instead of waiting
+  # for the whole test stage. Deliberately NOT listed: test:race, test:benchmark
+  # (main-only monitors that keep running in parallel and still fail the
+  # pipeline) and build:binaries (its per-SHA bin cache feeds test:integration,
+  # not the image). On a validated-tree merge the listed jobs skip in seconds,
+  # so the image lands ~10 min after the merge instead of ~40 (2026-09-11:
+  # 12:18 merge → 12:56 image start on pipeline 26296). `optional` because
+  # several of these are main-only or rule-gated on branch pipelines.
+  needs:
+    - {job: 'build:frontend', optional: true, artifacts: false}
+    - {job: 'fmt', optional: true, artifacts: false}
+    - {job: 'guardrails:docs-cli', optional: true, artifacts: false}
+    - {job: 'lint', optional: true, artifacts: false}
+    - {job: 'lint:ci-guards', optional: true, artifacts: false}
+    - {job: 'lint:mcp-godot', optional: true, artifacts: false}
+    - {job: 'lint:rbac-policy', optional: true, artifacts: false}
+    - {job: 'security:gosec', optional: true, artifacts: false}
+    - {job: 'security:govulncheck', optional: true, artifacts: false}
+    - {job: 'vet', optional: true, artifacts: false}
+    - {job: 'test:enterprise-smoke', optional: true, artifacts: false}
+    - {job: 'test:hooks', optional: true, artifacts: false}
+    - {job: 'test:integration', optional: true, artifacts: false}
+    - {job: 'test:reliability', optional: true, artifacts: false}
+    - {job: 'test:unit', optional: true, artifacts: false}
   interruptible: true
   timeout: 90 minutes
   # Image jobs do not use language caches; skip restore/upload overhead.
@@ -1255,6 +1496,30 @@ build:image:loom-core:
 
 build:image:custom-server:
   stage: deploy
+  # DAG: start as soon as the image's real gates are done instead of waiting
+  # for the whole test stage. Deliberately NOT listed: test:race, test:benchmark
+  # (main-only monitors that keep running in parallel and still fail the
+  # pipeline) and build:binaries (its per-SHA bin cache feeds test:integration,
+  # not the image). On a validated-tree merge the listed jobs skip in seconds,
+  # so the image lands ~10 min after the merge instead of ~40 (2026-09-11:
+  # 12:18 merge → 12:56 image start on pipeline 26296). `optional` because
+  # several of these are main-only or rule-gated on branch pipelines.
+  needs:
+    - {job: 'build:frontend', optional: true, artifacts: false}
+    - {job: 'fmt', optional: true, artifacts: false}
+    - {job: 'guardrails:docs-cli', optional: true, artifacts: false}
+    - {job: 'lint', optional: true, artifacts: false}
+    - {job: 'lint:ci-guards', optional: true, artifacts: false}
+    - {job: 'lint:mcp-godot', optional: true, artifacts: false}
+    - {job: 'lint:rbac-policy', optional: true, artifacts: false}
+    - {job: 'security:gosec', optional: true, artifacts: false}
+    - {job: 'security:govulncheck', optional: true, artifacts: false}
+    - {job: 'vet', optional: true, artifacts: false}
+    - {job: 'test:enterprise-smoke', optional: true, artifacts: false}
+    - {job: 'test:hooks', optional: true, artifacts: false}
+    - {job: 'test:integration', optional: true, artifacts: false}
+    - {job: 'test:reliability', optional: true, artifacts: false}
+    - {job: 'test:unit', optional: true, artifacts: false}
   interruptible: true
   timeout: 90 minutes
   cache: []
@@ -1314,6 +1579,30 @@ build:image:custom-server:
 # also tag :latest for flux force-reconcile in dev environments.
 build:image:loom-mills-operator:
   stage: deploy
+  # DAG: start as soon as the image's real gates are done instead of waiting
+  # for the whole test stage. Deliberately NOT listed: test:race, test:benchmark
+  # (main-only monitors that keep running in parallel and still fail the
+  # pipeline) and build:binaries (its per-SHA bin cache feeds test:integration,
+  # not the image). On a validated-tree merge the listed jobs skip in seconds,
+  # so the image lands ~10 min after the merge instead of ~40 (2026-09-11:
+  # 12:18 merge → 12:56 image start on pipeline 26296). `optional` because
+  # several of these are main-only or rule-gated on branch pipelines.
+  needs:
+    - {job: 'build:frontend', optional: true, artifacts: false}
+    - {job: 'fmt', optional: true, artifacts: false}
+    - {job: 'guardrails:docs-cli', optional: true, artifacts: false}
+    - {job: 'lint', optional: true, artifacts: false}
+    - {job: 'lint:ci-guards', optional: true, artifacts: false}
+    - {job: 'lint:mcp-godot', optional: true, artifacts: false}
+    - {job: 'lint:rbac-policy', optional: true, artifacts: false}
+    - {job: 'security:gosec', optional: true, artifacts: false}
+    - {job: 'security:govulncheck', optional: true, artifacts: false}
+    - {job: 'vet', optional: true, artifacts: false}
+    - {job: 'test:enterprise-smoke', optional: true, artifacts: false}
+    - {job: 'test:hooks', optional: true, artifacts: false}
+    - {job: 'test:integration', optional: true, artifacts: false}
+    - {job: 'test:reliability', optional: true, artifacts: false}
+    - {job: 'test:unit', optional: true, artifacts: false}
   interruptible: true
   timeout: 90 minutes
   cache: []
@@ -1333,7 +1622,41 @@ build:image:loom-mills-operator:
     - scripts/ci/buildkit-build.sh mcp/loom-mills-operator Dockerfile.loom-mills-operator loom-mills-operator
   rules:
     - if: '$CI_COMMIT_TAG'
+    # Default branch: gate on the image's real inputs, like the two image jobs
+    # above. This was the last image job that rebuilt and re-tagged on EVERY
+    # main merge — a 4-CPU BuildKit slot per merge, plus a Flux Image
+    # Automation roll of the operator deployment on unrelated changes
+    # (2026-09-04 CI-demand audit).
+    #
+    # The list is the operator binary's import footprint (`go list -deps
+    # ./cmd/loom-mills-operator`): only cmd/loom-mills-operator, the internal/
+    # packages it actually links, and pkg/**. The runtime image is a single
+    # static binary, so files outside that footprint cannot change it even
+    # though the builder stage does `COPY . .`. The broad cmd/internal/pkg list
+    # used until 2026-09-11 rolled the operator (Recreate strategy, ~90s of
+    # downtime) on every mcp-* server, HUD spawn, or killtest change. The list
+    # cannot go stale silently: scripts/ci/check_operator_image_changes.sh
+    # (run in `vet`) fails when a new dependency directory is not covered.
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - .gitlab-ci.yml
+        - .dockerignore
+        - Dockerfile.loom-mills-operator
+        - scripts/ci/buildkit-build.sh
+        - go.mod
+        - go.sum
+        - cmd/loom-mills-operator/**/*
+        - internal/cache/**/*
+        - internal/contracts/**/*
+        - internal/fleetgate/**/*
+        - internal/hud/bridge/**/*
+        - internal/hud/coordination/**/*
+        - internal/hud/fleetview/**/*
+        - internal/hud/monitor/**/*
+        - internal/hud/notify/**/*
+        - internal/loomconcurrency/**/*
+        - internal/visibility/**/*
+        - pkg/**/*
     - if: '$CI_COMMIT_BRANCH'
       changes:
         - .gitlab-ci.yml
@@ -1343,7 +1666,17 @@ build:image:loom-mills-operator:
         - go.mod
         - go.sum
         - cmd/loom-mills-operator/**/*
-        - pkg/mills/**/*
+        - internal/cache/**/*
+        - internal/contracts/**/*
+        - internal/fleetgate/**/*
+        - internal/hud/bridge/**/*
+        - internal/hud/coordination/**/*
+        - internal/hud/fleetview/**/*
+        - internal/hud/monitor/**/*
+        - internal/hud/notify/**/*
+        - internal/loomconcurrency/**/*
+        - internal/visibility/**/*
+        - pkg/**/*
       allow_failure: true
     - when: never
 

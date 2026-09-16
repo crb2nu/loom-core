@@ -379,14 +379,23 @@ func (a *AgentBridge) KnowledgeRecall(query string, category string, tokenBudget
 	return &result, nil
 }
 
-// ContextStream returns context entries since a given time, up to limit.
+// ContextStream returns context entries newest-first, only those at or after
+// since (zero = no lower bound), up to limit.
+//
+// It asks agent_context_search for sort=recent — a timestamp-ordered listing
+// — rather than a similarity search. The previous "since:<ts>" query text was
+// ranked by similarity to the literal word "since", which is why the HUD's
+// live context stream showed months-old entries and never a new one
+// (2026-09-02). The query field is still sent so an agent-context server that
+// predates sort=recent keeps answering during a rollout instead of rejecting
+// the call as missing its required argument.
 func (a *AgentBridge) ContextStream(since time.Time, limit int) ([]ContextEntryInfo, error) {
 	args := map[string]any{
-		// agent_context_search requires a non-empty query string.
-		// Keep the existing since: marker used by HUD stream callers.
+		"sort":  "recent",
 		"query": "since:1970-01-01T00:00:00Z",
 	}
 	if !since.IsZero() {
+		args["since"] = since.UTC().Format(time.RFC3339Nano)
 		args["query"] = fmt.Sprintf("since:%s", since.UTC().Format(time.RFC3339))
 	}
 	if limit > 0 {

@@ -1,0 +1,1 @@
+- `projectConfigured` now admits bucket-qualified forms of bare allow-list entries (`services/loom-core` vs `loom-core`) — the exact-match-only gate from the libs/mcp-go enablement rejected every home-lane Mills spawn.

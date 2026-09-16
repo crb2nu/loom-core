@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +61,13 @@ func judgeEvent(at time.Time, runID, gate string, score float64, pass bool) *sto
 
 func getJudgeCalibration(t *testing.T, op *operator, query string) (*httptest.ResponseRecorder, guard.JudgeCalibrationReport) {
 	t.Helper()
+	window := judgeCalibrationDefaultWindow
+	if req := httptest.NewRequest(http.MethodGet, "/?"+strings.TrimPrefix(query, "?"), nil); req.URL.Query().Get("window") != "" {
+		if d, err := time.ParseDuration(req.URL.Query().Get("window")); err == nil && d > 0 {
+			window = d
+		}
+	}
+	materializeTestReport(t, op, "judge_calibration", window, "")
 	rec := httptest.NewRecorder()
 	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/judge-calibration"+query, nil))
 	var report guard.JudgeCalibrationReport

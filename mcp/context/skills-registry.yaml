@@ -651,8 +651,7 @@ skills:
 
         ## Prereqs (Host)
 
-        - `pip install flexinfer-browser-kit playwright`
-        - `python3 -m playwright install chromium`
+        - `bash scripts/browserkit/install_deps.sh` (pinned flexinfer-browser-kit + playwright + chromium)
 
         Verify:
         - `bash ${SKILL_PATH}/scripts/check_browserkit_ready.sh`
@@ -3419,7 +3418,7 @@ skills:
         - Finds `skills-registry.yaml` (workspace-first)
         - Normalizes the skill name to kebab-case
         - Appends (or replaces with `--force`) a skill entry with sane cross-platform defaults:
-          - codex=`skill`, claude=`command`, kilocode=`rule`, gemini=`skill`
+          - codex=`skill`, claude=`skill`, kilocode=`rule`, gemini=`skill`
         - Creates source directories:
           - `mcp/skills/<name>/scripts`
           - `mcp/skills/<name>/references`
@@ -3445,8 +3444,9 @@ skills:
         5. Add vendor-specific deltas only when required:
            - `targets.<platform>.instructions_append` for platform primitives/workarounds
            - keep `common.instructions` as the canonical workflow
-        6. Validate registry:
-           - `bin/loom generate skills --registry mcp/context/skills-registry.yaml --validate`
+        6. Validate the current source from the loom-core repository root:
+           - `go run ./cmd/loom generate skills --registry mcp/context/skills-registry.yaml --target all --validate`
+           - This checks the checkout's code. An installed `loom` or prebuilt `bin/loom` may be older; a successful installed-CLI check does not verify a source change.
         7. Regenerate all platform outputs:
            - `bin/loom generate skills --target all --registry mcp/context/skills-registry.yaml --workspace . --codex-home ./.codex`
         8. Sync skills into home profiles:
@@ -3459,7 +3459,9 @@ skills:
 
         ## Design Guidelines
 
-        - Keep descriptions trigger-oriented: clearly state when to use the skill.
+        - Use a unique name of 1-64 lowercase ASCII letters, digits, and single hyphens; no leading or trailing hyphen.
+        - Keep descriptions trigger-oriented, non-empty, and at most 1024 characters: clearly state when to use the skill.
+        - Registry fields are strict: unknown keys and target names fail validation. Supported target keys are codex, claude, kilocode, gemini, antigravity, zed, and opencode; `all` generates the five primary targets.
         - Keep instruction body concise; move deep details to `references/`.
         - Design for repeatable outcomes, not advisory checklists only.
         - Use scripts for deterministic, repeatable steps.

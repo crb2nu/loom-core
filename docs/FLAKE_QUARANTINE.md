@@ -52,6 +52,60 @@ filed, and the job is red. If more than five distinct tests fail, gotestsum
 skips reruns entirely and the job is red — that many failures is a real break,
 not a flake.
 
+## Package timeouts are starvation, not flakes
+
+A `test:unit` failure that reads
+
+```
+panic: test timed out after 10m0s
+running tests:
+	TestGhostSparkDisabledWithoutClient (0s)
+```
+
+is almost never the named test hanging. Read the goroutine dump under it. On
+2026-09-15 four such jobs (pipelines 27071, 27086, 27121, 27123) each timed
+out in the packages that open the most SQLite stores per test — `pkg/mills`,
+`pkg/mills/store`, `pkg/mills/pipeline`, `cmd/loom-mills-operator` — and
+every in-flight goroutine was parked in `modernc.org/libc.Xfsync` under
+`_unixSync`, reached from `store.Open` (the `journal_mode=WAL` commit on a
+fresh file) or `store.Close` (the WAL checkpoint). Nothing had hung: every
+store-touching test was taking 1–50 s instead of milliseconds, because the
+runner node's NVMe was 91–95 % busy with an average queue depth of 43–132
+from 22–26 concurrent runner pods, and each fsync waited behind that queue.
+The packages were 38–64 % through their test lists when the 10-minute budget
+ran out. The green pipelines that overlapped the red ones had landed on the
+other overflow host.
+
+Two things keep that from redding the job:
+
+- **Test stores skip fsync.** `pkg/mills/store` builds its DSN with
+  `synchronous=OFF` inside `go test` binaries (`buildDSNFor`, gated on
+  `testing.Testing()`), and `Open` switches a file to WAL only after those
+  per-connection pragmas are in force — the driver applies DSN pragmas in
+  sorted order, which had put `journal_mode` before `synchronous`, so the WAL
+  switch on a brand-new file used to commit under SQLite's default
+  `synchronous=FULL` and fsync regardless. Production binaries keep
+  `synchronous=NORMAL`. Unit tests never need crash durability — the process,
+  not the kernel, is what ends them.
+- **A 30-minute per-package timeout.** `scripts/ci/run_unit_tests.sh` passes
+  `-timeout ${UNIT_TEST_TIMEOUT:-30m}`. Go's 10m default assumes a quiet
+  machine; the starved runs above extrapolate to 17–26 min per package. A
+  timeout *panic* is worse than a slow package, because gotestsum treats it as
+  a suspected panic and aborts every rerun — which is how the documented
+  `TestStopSpawnLateStartCleanupFailureRetainsRetryablePod` flake turned into
+  a hard red on those pipelines instead of being absorbed.
+
+How to tell starvation from a real hang next time: the `running tests:` list
+names a different test on every failing job; the `PASS … (Ns)` lines above the
+panic show seconds where a green run shows milliseconds; the job runs 28–33
+minutes instead of 6–12; and the blocked frame is a syscall (`Xfsync`,
+`Xwrite`) rather than a channel receive or mutex. Confirm on the node the pod
+ran on (`kube_pod_info{namespace="ci-jobs", pod="runner-…"}`) with
+`rate(node_disk_io_time_seconds_total[5m])` and
+`rate(node_disk_io_time_weighted_seconds_total[5m])`; CPU throttling of the
+pod (`container_cpu_cfs_throttled_periods_total`) will be near zero during the
+test phase, which is the tell that it is I/O, not CPU.
+
 ## Coverage: why `-test.gocoverdir`, not `-coverprofile`
 
 This is the trap, and it is load-bearing.
@@ -119,6 +173,7 @@ than dropping the signal — mirroring the mills escalator
 | `FLAKE_RERUN_ATTEMPTS` | `2` | `--rerun-fails` |
 | `FLAKE_RERUN_MAX_FAILURES` | `5` | `--rerun-fails-max-failures`; above this, no reruns at all |
 | `FLAKE_RERUN_REPORT` | `rerun-report.txt` | Rerun report path (also the artifact name) |
+| `UNIT_TEST_TIMEOUT` | `30m` | Per-package `go test -timeout`. Sized for an I/O-starved runner, not a hang — see [Package timeouts are starvation, not flakes](#package-timeouts-are-starvation-not-flakes) |
 | `FLAKE_DIGEST` | unset | Set to `true` on a weekly pipeline schedule to run `flake:digest` |
 | `FLAKE_ISSUE_TOKEN` / `GITLAB_TOKEN` | — | Project access token with `api` scope. **Required for issue filing.** |
 

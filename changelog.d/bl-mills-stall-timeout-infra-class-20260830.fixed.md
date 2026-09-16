@@ -1,0 +1,1 @@
+- Classify liveness-watchdog spawn stalls as capped transient failures with a stable spawn reason in `pkg/mills/pipeline/error_class.go` and `pkg/mills/pipeline/spawn_class.go`.

@@ -26,6 +26,13 @@ func gradeTestStore(t *testing.T, state store.BacklogState) *store.Store {
 	return st
 }
 
+func writeGradeOutcome(t *testing.T, st *store.Store) {
+	t.Helper()
+	if _, err := st.Outcomes.WriteTerminal(context.Background(), "BL-GRADE", 0.8); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGradeRun_AppendsSupersedeChain(t *testing.T) {
 	st := gradeTestStore(t, store.BacklogMerged)
 	ctx := context.Background()
@@ -63,6 +70,63 @@ func TestGradeRun_AcceptsEscalatedTerminalWork(t *testing.T) {
 	}
 	if item.Grade != "meh" || item.GradeNote != "useful failure" {
 		t.Fatalf("grade head = %+v", item)
+	}
+}
+
+func TestGradeRunAndItem_PropagateOutcomeWritebackGrade(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		grade func(context.Context, *store.Store) error
+	}{
+		{"run", func(ctx context.Context, st *store.Store) error {
+			_, err := GradeRun(ctx, st, "RUN-GRADE", "keep", "", "operator.manual")
+			return err
+		}},
+		{"item", func(ctx context.Context, st *store.Store) error {
+			_, err := GradeItem(ctx, st, "BL-GRADE", "meh", "", "operator.manual")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := gradeTestStore(t, store.BacklogMerged)
+			writeGradeOutcome(t, st)
+			if err := tc.grade(context.Background(), st); err != nil {
+				t.Fatal(err)
+			}
+			got, err := st.Outcomes.Get(context.Background(), "BL-GRADE")
+			if err != nil || got.Grade == nil {
+				t.Fatalf("writeback grade: row=%+v err=%v", got, err)
+			}
+			want := map[string]string{"run": "keep", "item": "meh"}[tc.name]
+			if *got.Grade != want {
+				t.Fatalf("writeback grade=%q want %q", *got.Grade, want)
+			}
+		})
+	}
+}
+
+func TestGradeItem_RollsBackHeadAndWritebackWhenEventFails(t *testing.T) {
+	st := gradeTestStore(t, store.BacklogMerged)
+	writeGradeOutcome(t, st)
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx, `CREATE TRIGGER reject_bolt_graded BEFORE INSERT ON events
+		WHEN NEW.kind = 'bolt.graded' BEGIN SELECT RAISE(ABORT, 'reject grade event'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GradeItem(ctx, st, "BL-GRADE", "regret", "", "operator.manual"); err == nil {
+		t.Fatal("grade unexpectedly succeeded")
+	}
+	item, err := st.Backlog.Get(ctx, "BL-GRADE")
+	if err != nil || item.Grade != "" {
+		t.Fatalf("backlog head changed after rollback: item=%+v err=%v", item, err)
+	}
+	writeback, err := st.Outcomes.Get(ctx, "BL-GRADE")
+	if err != nil || writeback.Grade != nil {
+		t.Fatalf("writeback changed after rollback: row=%+v err=%v", writeback, err)
+	}
+	events, err := st.Events.ListBySubject(ctx, "backlog_item", "BL-GRADE", 10)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("grade event persisted after rollback: events=%+v err=%v", events, err)
 	}
 }
 

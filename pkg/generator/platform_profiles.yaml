@@ -39,7 +39,7 @@ platforms:
     loom_proxy:
       agent_hint: "claude-code"
       tool_profile: "llm-core"
-      max_tools: 167
+      max_tools: 175
     capabilities:
       mcp_servers: true
       permissions: true
@@ -67,7 +67,7 @@ platforms:
     loom_proxy:
       agent_hint: "claude-desktop"
       tool_profile: "llm-core"
-      max_tools: 167
+      max_tools: 175
       env:
         LOOM_PROXY_IDLE_EXIT_SECONDS: "0"
     capabilities:
@@ -173,7 +173,7 @@ platforms:
     loom_proxy:
       agent_hint: "codex"
       tool_profile: "llm-core"
-      max_tools: 167
+      max_tools: 175
     capabilities:
       mcp_servers: true
       permissions: true
@@ -302,7 +302,7 @@ platforms:
     loom_proxy:
       agent_hint: "kilocode"
       tool_profile: "llm-core"
-      max_tools: 167
+      max_tools: 175
     capabilities:
       mcp_servers: true
       permissions: true

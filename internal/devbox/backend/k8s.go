@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -14,11 +15,27 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/crb2nu/loom/pkg/env"
 )
 
 const (
 	defaultBuilderImage  = "quay.io/buildah/stable:v1.38.0"
 	defaultGitCloneImage = "alpine/git:2.47.2"
+)
+
+const (
+	// Client-go's built-in defaults (5 QPS, burst 10) are sized for a human
+	// running kubectl. This backend is a controller: one clientset serves
+	// every concurrent sandbox's readiness waits, pod-gone polls, execs and
+	// log streams, and under Mills' four concurrent tests stages the shared
+	// limiter queued requests for longer than the callers' deadlines — the
+	// sandbox replacement wait died with "client rate limiter Wait returned
+	// an error: context deadline exceeded" in 44 of 46 failures on
+	// 2026-09-04..10 without observing the pod once. Override with
+	// DEVBOX_K8S_CLIENT_QPS / DEVBOX_K8S_CLIENT_BURST.
+	defaultClientQPS   float32 = 50
+	defaultClientBurst int     = 100
 )
 
 const (
@@ -68,6 +85,7 @@ type K8sBackend struct {
 	buildEphemeralStorageLimit   resource.Quantity
 	buildAvoidNodes              []string
 	buildSlots                   chan struct{}
+	buildTimeout                 time.Duration
 
 	gitCloneMemoryRequest resource.Quantity
 	gitCloneMemoryLimit   resource.Quantity
@@ -80,6 +98,8 @@ type K8sBackend struct {
 
 // K8sBackendConfig holds configuration for the K8s backend.
 type K8sBackendConfig struct {
+	BuildTimeout time.Duration // Per-pod build budget, excluding queue and setup (default: 30m).
+
 	Kubeconfig                   string // path to kubeconfig file
 	Namespace                    string // namespace for sandbox pods (default: "devbox")
 	Registry                     string // image registry (e.g., "registry.harbor.lan")
@@ -201,6 +221,7 @@ func NewK8sBackend(cfg K8sBackendConfig) (*K8sBackend, error) {
 		buildEphemeralStorageLimit:   buildEphemeralStorageLimit,
 		buildAvoidNodes:              splitCSV(cfg.BuildAvoidNodes),
 		buildSlots:                   make(chan struct{}, cfg.MaxConcurrentBuilds),
+		buildTimeout:                 cfg.BuildTimeout,
 		gitCloneMemoryRequest:        gitCloneMemoryRequest,
 		gitCloneMemoryLimit:          gitCloneMemoryLimit,
 		syncMode:                     cfg.SyncMode,
@@ -236,6 +257,15 @@ func parseBuildQuantity(name, value, fallback string) (resource.Quantity, error)
 }
 
 func buildRestConfig(kubeconfig string) (*rest.Config, error) {
+	cfg, err := loadRestConfig(kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	applyClientRateLimits(cfg)
+	return cfg, nil
+}
+
+func loadRestConfig(kubeconfig string) (*rest.Config, error) {
 	if kubeconfig != "" {
 		return clientcmd.BuildConfigFromFlags("", kubeconfig)
 	}
@@ -245,6 +275,21 @@ func buildRestConfig(kubeconfig string) (*rest.Config, error) {
 	}
 	home, _ := os.UserHomeDir()
 	return clientcmd.BuildConfigFromFlags("", home+"/.kube/config")
+}
+
+// applyClientRateLimits raises the clientset's request rate limits to
+// controller-grade values (see defaultClientQPS). Values already present on
+// the config are kept, so a caller that tuned them explicitly wins.
+func applyClientRateLimits(cfg *rest.Config) {
+	if cfg == nil {
+		return
+	}
+	if cfg.QPS <= 0 {
+		cfg.QPS = float32(env.Float("DEVBOX_K8S_CLIENT_QPS", float64(defaultClientQPS)))
+	}
+	if cfg.Burst <= 0 {
+		cfg.Burst = env.Int("DEVBOX_K8S_CLIENT_BURST", defaultClientBurst)
+	}
 }
 
 // Clientset returns the underlying Kubernetes clientset. This allows callers

@@ -1,0 +1,1 @@
+- Migrate the mcpo `agent-context` entry in `k8s/base/servers/mcpo/configmap.yaml` to Streamable HTTP and update its deployment checksum.

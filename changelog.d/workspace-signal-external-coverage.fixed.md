@@ -1,0 +1,1 @@
+- Classify Langfuse S3, MinIO drive, and PostgreSQL connection-refused workspace signals as external dependency incidents (`pkg/mills/council/council.go`, `pkg/mills/council/council_test.go`).

@@ -99,6 +99,37 @@ Embedding for `agent_plan_search` is **best-effort**: a failed embedder never
 blocks a write (a deterministic fallback vector keeps the point valid), avoiding
 the embed-coupling outage class that previously blanked the task lane.
 
+### Create with a planning contract
+
+`agent_plan_create` exposes the handler's optional planning fields, including
+`riskiest_assumption`, `kill_test`, `kill_test_status`, and `success`.
+`success.tests` and `success.metrics` are string arrays; `success.manual_check`
+is a string. Existing calls need only `title`.
+
+Example arguments for `agent_plan_create`:
+
+<!-- agent-plan-create-example -->
+```json
+{
+  "title": "Validate skill delivery",
+  "project": "services/loom-core",
+  "namespace": "loom-core/skills-enhancement",
+  "riskiest_assumption": "The host can load an isolated skill bundle.",
+  "kill_test": "Within 30 minutes, load a temporary bundle and verify its required artifact.",
+  "kill_test_status": "not run",
+  "budget": "One engineer-day",
+  "success": {
+    "tests": ["go test ./pkg/skills"],
+    "metrics": ["Zero missing required bundle resources"],
+    "manual_check": "Verify the delivered revision in the host trace."
+  }
+}
+```
+
+Schema tests exercise the server built from the current checkout. A running
+daemon or installed CLI may expose an older schema until rebuilt and reloaded;
+inspect its discovered tool schema separately before relying on these fields.
+
 ## Parallel slice shipping (claim enforcement)
 
 `parallel-slice-ship` persists its slice decomposition to the store, then spawns

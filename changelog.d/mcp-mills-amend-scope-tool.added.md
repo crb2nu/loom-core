@@ -1,0 +1,1 @@
+- Add `mills_backlog_amend_scope` to widen slice files and success tests with revision-safe retries and optional scope-rescue-aware requeue, reporting saved amendments even when starting fails (`cmd/mcp-mills/main.go`, `tools.go`, `client.go`, `main_test.go`; usage hint in `mcp/context/registry.yaml`).

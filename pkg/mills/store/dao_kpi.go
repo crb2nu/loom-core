@@ -10,7 +10,8 @@ import (
 
 // KPIDAO records and reads rolled-up metric snapshots.
 type KPIDAO struct {
-	db *sql.DB
+	db      *sql.DB
+	hotRead hotReadConfig
 }
 
 // RecordSnapshot appends a snapshot row.
@@ -41,6 +42,38 @@ func (d *KPIDAO) RecordSnapshot(ctx context.Context, snap *KPISnapshot) error {
 }
 
 // Latest returns the most recent snapshot for the given window, or ErrNotFound.
+// PruneBefore deletes snapshots older than before in bounded batches. The
+// writer records one row per window every scheduler minute (~4.2k rows/day);
+// by 2026-09-02 the table held 214k rows / 196MB — the largest object in the
+// store — with no reader looking further back than the shift report's
+// 2×window. Returns the number of rows deleted.
+func (d *KPIDAO) PruneBefore(ctx context.Context, before time.Time, batch int) (int64, error) {
+	if before.IsZero() {
+		return 0, errors.New("kpi prune-before: cutoff required")
+	}
+	if batch <= 0 {
+		batch = 5000
+	}
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		res, err := d.db.ExecContext(ctx,
+			`DELETE FROM kpi_snapshots WHERE id IN (
+			   SELECT id FROM kpi_snapshots WHERE snapshot_at < ? LIMIT ?)`,
+			timeRFC3339(before), batch)
+		if err != nil {
+			return total, fmt.Errorf("kpi prune-before: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n < int64(batch) {
+			return total, nil
+		}
+	}
+}
+
 func (d *KPIDAO) Latest(ctx context.Context, windowSeconds int) (*KPISnapshot, error) {
 	row := d.db.QueryRowContext(ctx, `
 		SELECT id, snapshot_at, window_seconds, metrics_json
@@ -54,12 +87,15 @@ func (d *KPIDAO) Latest(ctx context.Context, windowSeconds int) (*KPISnapshot, e
 
 // Range returns snapshots for the window between [from, to], oldest-first.
 func (d *KPIDAO) Range(ctx context.Context, windowSeconds int, from, to time.Time) ([]*KPISnapshot, error) {
-	rows, err := d.db.QueryContext(ctx, `
+	queryCtx, cancel := d.hotRead.context(ctx)
+	defer cancel()
+	rows, err := d.db.QueryContext(queryCtx, `
 		SELECT id, snapshot_at, window_seconds, metrics_json
 		FROM kpi_snapshots
 		WHERE window_seconds = ? AND snapshot_at BETWEEN ? AND ?
 		ORDER BY snapshot_at ASC
-	`, windowSeconds, timeRFC3339(from), timeRFC3339(to))
+		LIMIT ?
+	`, windowSeconds, timeRFC3339(from), timeRFC3339(to), d.hotRead.limit)
 	if err != nil {
 		return nil, fmt.Errorf("kpi range: %w", err)
 	}
@@ -68,11 +104,14 @@ func (d *KPIDAO) Range(ctx context.Context, windowSeconds int, from, to time.Tim
 	for rows.Next() {
 		s, err := scanKPI(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("kpi range: %w", err)
 		}
 		out = append(out, s)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("kpi range: %w", err)
+	}
+	return out, nil
 }
 
 func scanKPI(s scanner) (*KPISnapshot, error) {

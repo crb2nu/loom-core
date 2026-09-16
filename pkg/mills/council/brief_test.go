@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
@@ -151,6 +152,63 @@ func TestCompile_DeterministicForFixedInputs(t *testing.T) {
 	}
 }
 
+func TestCompile_AnnotatesKPIWhenTelemetryThresholdExceeded(t *testing.T) {
+	tests := []struct {
+		name       string
+		verdict    *PolicyVerdict
+		wantMarker bool
+	}{
+		{
+			name: "threshold exceeded",
+			verdict: &PolicyVerdict{
+				Pass: false,
+				Code: "external_incident_threshold_exceeded",
+			},
+			wantMarker: true,
+		},
+		{
+			name:       "threshold passing",
+			verdict:    &PolicyVerdict{Pass: true, Code: "ok"},
+			wantMarker: false,
+		},
+		{
+			name:       "verdict absent",
+			verdict:    nil,
+			wantMarker: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, repo := seedBriefStore(t)
+			brief, err := Compile(context.Background(), BriefSources{
+				Store: st, RepoRoot: repo, Now: fixedTime,
+				ExternalIncidentVerdict: tt.verdict,
+			})
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+
+			var kpi *BriefSection
+			for i := range brief.Sections {
+				if brief.Sections[i].Heading == "Mills KPIs (last 24h snapshot)" {
+					kpi = &brief.Sections[i]
+					break
+				}
+			}
+			if kpi == nil {
+				t.Fatal("structured brief is missing KPI section")
+			}
+			if got := strings.Contains(kpi.Body, KPIDegradedMarker); got != tt.wantMarker {
+				t.Errorf("structured KPI marker present = %t, want %t:\n%s", got, tt.wantMarker, kpi.Body)
+			}
+			if got := strings.Contains(brief.Markdown, KPIDegradedMarker); got != tt.wantMarker {
+				t.Errorf("Markdown KPI marker present = %t, want %t:\n%s", got, tt.wantMarker, brief.Markdown)
+			}
+		})
+	}
+}
+
 func TestCompile_TruncatesAtMaxBytes(t *testing.T) {
 	st, repo := seedBriefStore(t)
 	b, err := Compile(context.Background(), BriefSources{
@@ -159,13 +217,64 @@ func TestCompile_TruncatesAtMaxBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	if !strings.Contains(b.Markdown, "brief truncated at 200 bytes") {
+	if !strings.Contains(b.Markdown, briefSectionTruncatedMarker) {
 		t.Errorf("expected truncation marker; got:\n%s", b.Markdown)
 	}
-	if len(b.Markdown) > 600 {
-		// We allow the trailing _truncated_ note to push past MaxBytes.
-		// 200 + ~150-byte note + safety margin → 600 is generous.
-		t.Errorf("truncated brief is unexpectedly large: %d bytes", len(b.Markdown))
+	if len(b.Markdown) > 200 {
+		t.Errorf("truncated brief exceeds cap: %d bytes", len(b.Markdown))
+	}
+}
+
+func TestRenderMarkdown_ReservesIncidentSectionsAndTrimsItems(t *testing.T) {
+	largeItems := strings.Repeat("- optional item with enough text to consume budget\n", 600)
+	sections := []BriefSection{
+		{Heading: "Oversized optional evidence", Body: largeItems},
+		{Heading: "Persisted incidents", Body: "- incident one\n- incident two\n"},
+		{Heading: "Classified CI failures (last 24h)", Body: "- classified failure\n"},
+		{Heading: "Incident classification planning context", Body: "- preserve this classification rule\n"},
+	}
+
+	got := renderMarkdown(fixedTime(), sections, briefDefaultMaxBytes)
+	if len(got) > briefDefaultMaxBytes {
+		t.Fatalf("rendered %d bytes, cap %d", len(got), briefDefaultMaxBytes)
+	}
+	for _, want := range []string{
+		"## Oversized optional evidence",
+		"## Persisted incidents",
+		"## Classified CI failures (last 24h)",
+		"## Incident classification planning context",
+		"preserve this classification rule",
+		briefSectionTruncatedMarker,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "- optional item with enough text to consume budg\n") {
+		t.Errorf("renderer emitted a partial list item:\n%s", got)
+	}
+	if got != renderMarkdown(fixedTime(), sections, briefDefaultMaxBytes) {
+		t.Error("budgeted rendering is not deterministic")
+	}
+}
+
+func TestRenderMarkdown_EmptyReviewerNotesAreExplicit(t *testing.T) {
+	got := renderMarkdown(fixedTime(), []BriefSection{{Heading: "Reviewer notes"}}, 1024)
+	if !strings.Contains(got, briefEmptyReviewerNotes) {
+		t.Fatalf("empty reviewer notes missing placeholder:\n%s", got)
+	}
+}
+
+func TestRenderMarkdown_SmallBudgetIsBoundedValidUTF8(t *testing.T) {
+	sections := []BriefSection{{Heading: "Unicode", Body: strings.Repeat("⚠️", 100)}}
+	for _, capBytes := range []int{0, 1, 20, 64, 128} {
+		got := renderMarkdown(fixedTime(), sections, capBytes)
+		if len(got) > capBytes {
+			t.Errorf("cap %d produced %d bytes", capBytes, len(got))
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("cap %d produced invalid UTF-8", capBytes)
+		}
 	}
 }
 

@@ -1,0 +1,1 @@
+- **Council workspace storage signal classification** (`pkg/mills/council/classifier.go`, `pkg/mills/council/classifier_test.go`): classify Langfuse S3 event-upload failures and Longhorn replica disk-availability failures as external dependency incidents owned by `s3` and `storage`, respectively.

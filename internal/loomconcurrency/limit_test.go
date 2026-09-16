@@ -22,6 +22,32 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestResolvePolicyLimit(t *testing.T) {
+	valid, zero, negative, tooLarge := 3, 0, -1, MaxLimit+1
+	for _, tc := range []struct {
+		name       string
+		configured *int
+		want       int
+		wantErr    bool
+	}{
+		{name: "unset", want: DefaultLimit},
+		{name: "explicit", configured: &valid, want: valid},
+		{name: "zero", configured: &zero, wantErr: true},
+		{name: "negative", configured: &negative, wantErr: true},
+		{name: "too large", configured: &tooLarge, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolvePolicyLimit(tc.configured)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ResolvePolicyLimit() error = %v, want error %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Fatalf("ResolvePolicyLimit() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDefault_UnsetReturnsDefault(t *testing.T) {
 	t.Setenv(EnvVar, "")
 	if got := Default(); got != DefaultLimit {

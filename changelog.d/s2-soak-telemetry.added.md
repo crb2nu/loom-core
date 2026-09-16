@@ -1,0 +1,1 @@
+- Add persisted S2 soak-start progress telemetry in `pkg/mills/overseer/overseer.go` and a fail-closed `soak_complete` projection in `pkg/mills/shiftreport/compose.go`.

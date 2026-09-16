@@ -844,6 +844,14 @@ func (r *spawnTelGitRunner) Run(_ context.Context, dir, name string, args ...str
 			return out, r.stderrs[key], r.exits[key], nil
 		}
 	}
+	// Integrity preflight is shared by every cumulative-capture test. Tests
+	// concerned with a specific shallow-history outcome override these keys.
+	if strings.HasPrefix(key, "merge-base ") {
+		return "test-merge-base\n", "", 0, nil
+	}
+	if key == "rev-parse --is-shallow-repository" {
+		return "false\n", "", 0, nil
+	}
 	return r.fallback.Stdout, r.fallback.Stderr, r.fallback.ExitCode, r.fallback.Err
 }
 
@@ -1727,7 +1735,7 @@ func TestRun_CumulativeCaptureExcludesRevertedTelemetryPath(t *testing.T) {
 
 func TestHUDSpawnClientStop_UsesAuthenticatedEscapedEndpoint(t *testing.T) {
 	ft := &hudFakeTransport{post: func(_ *http.Request) (int, any) {
-		return http.StatusOK, map[string]bool{"stopped": true}
+		return http.StatusOK, map[string]any{"ok": true, "data": map[string]any{"stopped": true, "spawn_id": "spawn/a b"}}
 	}}
 	c := newHUDStub(t, ft)
 	if err := c.Stop(context.Background(), "spawn/a b"); err != nil {
@@ -1759,5 +1767,73 @@ func TestHUDSpawnClientStop_ReturnsStatusError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "status 500") || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("stop error = %v, want status and body", err)
+	}
+}
+
+func TestHUDSpawnClientStop_RequiresSynchronousAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   any
+	}{
+		{"accepted", http.StatusAccepted, map[string]bool{"stopped": true}},
+		{"missing", http.StatusNotFound, map[string]string{"error": "not found"}},
+		{"unconfirmed", http.StatusOK, map[string]bool{"stopped": false}},
+		{"unrelated response", http.StatusOK, map[string]string{"status": "ok"}},
+		{"enveloped failure", http.StatusOK, map[string]any{"ok": false, "error": map[string]string{"code": "cleanup", "message": "cleanup failed"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newHUDStub(t, &hudFakeTransport{post: func(*http.Request) (int, any) {
+				return tc.status, tc.body
+			}})
+			if err := c.Stop(t.Context(), "spawn-live"); err == nil {
+				t.Fatal("unconfirmed stop must not permit a replacement")
+			}
+		})
+	}
+}
+
+func TestSpawnFinalAuthArtifactsAndBilling(t *testing.T) {
+	for _, telemetry := range []*hudSpawnTelemetry{nil, {TotalCostUSD: 0.25}} {
+		for _, tc := range []struct {
+			mode    string
+			billing string
+		}{
+			{"cluster_api_key", "api"}, {"cluster_oauth", "subscription"}, {"cluster_service_account", "api"}, {"unknown", ""}, {"", ""},
+		} {
+			t.Run(fmt.Sprintf("%s/telemetry=%t", tc.mode, telemetry != nil), func(t *testing.T) {
+				polls := 0
+				ft := &hudFakeTransport{
+					post: func(*http.Request) (int, any) {
+						return 200, &hudSpawnState{SpawnID: "auth", Status: "running", AuthMode: "cluster_oauth", AuthAccount: "oauth-token"}
+					},
+					get: func(*http.Request) (int, any) {
+						polls++
+						if polls == 1 {
+							return 200, &hudSpawnState{SpawnID: "auth", Status: "running", AuthMode: "cluster_oauth", AuthAccount: "oauth-token"}
+						}
+						return 200, &hudSpawnState{SpawnID: "auth", Status: "completed", AuthMode: tc.mode, AuthAccount: "final-key", AuthOutcome: "oauth_quota", AuthFallbackFrom: "cluster_oauth", Telemetry: telemetry}
+					},
+				}
+				resp, err := newHUDStub(t, ft).Run(t.Context(), sampleSpawnReq())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(resp.Billing) != tc.billing {
+					t.Fatalf("billing = %q, want %q", resp.Billing, tc.billing)
+				}
+				for key, want := range map[string]string{"auth_mode": tc.mode, "auth_account": "final-key", "auth_outcome": "oauth_quota", "auth_fallback_from": "cluster_oauth"} {
+					if want == "" {
+						if _, ok := resp.Artifacts[key]; ok {
+							t.Errorf("unexpected %s", key)
+						}
+						continue
+					}
+					if resp.Artifacts[key] != want {
+						t.Errorf("%s = %v, want %s", key, resp.Artifacts[key], want)
+					}
+				}
+			})
+		}
 	}
 }

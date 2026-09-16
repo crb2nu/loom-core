@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/mills/textsim"
 )
 
 // fakeChat scripts triage verdicts. Each Verdict call pops the next reply;
@@ -19,12 +21,14 @@ type fakeChat struct {
 	replies []string
 	err     error
 	calls   int
+	models  []string
 	OnCall  func(call int)
 }
 
-func (f *fakeChat) ChatStructured(_ context.Context, _, _ string, _ int) (string, float64, error) {
+func (f *fakeChat) ChatStructured(_ context.Context, model, _ string, _ int) (string, float64, error) {
 	call := f.calls
 	f.calls++
+	f.models = append(f.models, model)
 	if f.OnCall != nil {
 		f.OnCall(call)
 	}
@@ -463,5 +467,130 @@ func backdate(t *testing.T, st *store.Store, id string, to time.Time) {
 		to.UTC().Format(time.RFC3339Nano), id,
 	); err != nil {
 		t.Fatalf("backdate %s: %v", id, err)
+	}
+}
+
+// Founding promotion-review pairs must survive with both current and legacy metadata.
+func TestGroomerPlanSiblings(t *testing.T) {
+	fixtures := []struct{ plan, title, a, b string }{
+		{"plan-queued-proof", "Add queued proof kill test mode and MR awareness scripted killtest", "queued-proof-killtest-mode", "mr-awareness-scripted-killtest"},
+		{"plan-hud-spawn", "Split internal hud spawn go by concern then add the unified Mill Staff HUD group", "hud-spawn-split", "mill-staff-hud-group"},
+		{"plan-ciwatch", "Classify branch CI failures as baseline red infra when the target branch is red", "ciwatch-baseline-red-classification", "ciwatch-baseline-red-requeue-on-green"},
+		{"plan-soak", "Publish the overseer S2 soak criteria schema and surface its verdict", "overseer-soak-criteria-schema", "shiftreport-soak-verdict"},
+	}
+	for _, f := range fixtures {
+		for _, legacy := range []bool{false, true} {
+			for _, dryRun := range []bool{false, true} {
+				for _, merged := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/legacy=%t/dry=%t/merged=%t", f.plan, legacy, dryRun, merged), func(t *testing.T) {
+						plan := f.plan
+						reason := "same_plan_id"
+						if legacy {
+							plan = ""
+							reason = "different_slice_names"
+						}
+						testGroomerSiblingPair(t, f.title+" — "+f.a, f.title+" — "+f.b, plan, reason, dryRun, merged)
+					})
+				}
+			}
+		}
+	}
+}
+
+func testGroomerSiblingPair(t *testing.T, titleA, titleB, plan, reason string, dryRun, merged bool) {
+	t.Helper()
+	chat := &fakeChat{replies: []string{verdictJSON(t, "duplicate", 0.99)}}
+	env := newGroomerEnv(t, mills.GroomerPolicy{Enabled: true, DryRun: boolPtr(dryRun), Allow: mills.GroomerAllowPolicy{DedupClose: true}}, chat)
+	stateA, stateB := store.BacklogQueued, store.BacklogQueued
+	if merged {
+		stateA, stateB = store.BacklogMerged, store.BacklogEscalated
+	}
+	for i, item := range []*store.BacklogItem{
+		env.seedInState(t, "A", titleA, stateA, 2*time.Hour),
+		env.seedInState(t, "B", titleB, stateB, time.Hour),
+	} {
+		item.PlanID = plan
+		item.Slices = []store.Slice{{Name: fmt.Sprintf("slice-%d", i), Files: []string{"shared.go"}}}
+		if err := env.store.Backlog.Put(context.Background(), item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := env.groomer.Tick(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Acted != 0 || res.Planned != 0 || res.Skipped != 1 || res.Errored != 0 || chat.calls != 0 {
+		t.Fatalf("sibling pair: result=%+v llm calls=%d", res, chat.calls)
+	}
+	if env.itemState(t, "A") != stateA || env.itemState(t, "B") != stateB {
+		t.Fatal("sibling state changed")
+	}
+	events, err := env.store.Events.ListBySubject(context.Background(), groomerSubjectKind, "B", 10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events=%v err=%v", events, err)
+	}
+	ev := events[0]
+	if ev.Kind != "overseer.groomer.dedup_skipped.plan_sibling" || ev.Payload["canonical_id"] != "A" || ev.Payload["reason"] != reason || ev.Payload["would_have_acted"] != false {
+		t.Fatalf("skip evidence: %+v", ev)
+	}
+	days, err := env.store.OverseerSoakTelemetry(context.Background(), env.now.AddDate(0, 0, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisions := 0
+	for _, day := range days {
+		decisions += day.Decisions
+		if day.WouldHaveActed != 0 || day.Disagreements != 0 {
+			t.Fatalf("skip counted as intervention: %+v", day)
+		}
+	}
+	want := 0
+	if dryRun {
+		want = 1
+	}
+	if decisions != want {
+		t.Fatalf("soak decisions=%d want=%d", decisions, want)
+	}
+}
+
+func TestGroomerPlanSiblingGrayBand(t *testing.T) {
+	for _, merged := range []bool{false, true} {
+		for _, legacy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("merged=%t/legacy=%t", merged, legacy), func(t *testing.T) {
+				a, b := "Mills telemetry stage rollup endpoint", "Mills telemetry stage rollup panel for HUD"
+				plan, reason := "shared-plan", "same_plan_id"
+				if legacy {
+					a += " — endpoint"
+					b += " — panel"
+					plan = ""
+					reason = "different_slice_names"
+				}
+				score := textsim.TitleJaccard(a, b)
+				if score < textsim.GrayBandFloor || score >= (mills.GroomerPolicy{}).DedupThreshold() {
+					t.Fatalf("fixture outside gray band: %f", score)
+				}
+				testGroomerSiblingPair(t, a, b, plan, reason, true, merged)
+			})
+		}
+	}
+	testGroomerSiblingPair(t, "Identical title", "Identical title", "shared-plan", "same_plan_id", false, false)
+}
+
+func TestGroomerGenuineDuplicatesAcrossPlans(t *testing.T) {
+	for _, title := range []string{"Wire spawn health probe", "Wire spawn health probe — implementation"} {
+		t.Run(title, func(t *testing.T) {
+			env := newGroomerEnv(t, mills.GroomerPolicy{Enabled: true}, nil)
+			for _, id := range []string{"A", "B"} {
+				item := env.seedQueued(t, id, title, store.P2, time.Hour)
+				item.PlanID = "plan-" + id
+				if err := env.store.Backlog.Put(context.Background(), item); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res, err := env.groomer.Tick(context.Background())
+			if err != nil || res.Planned != 1 {
+				t.Fatalf("result=%+v err=%v", res, err)
+			}
+		})
 	}
 }

@@ -1,0 +1,1 @@
+- Teach the Mills merge stage (`pkg/mills/pipeline/dispatcher.go`, `pkg/mills/clients/gitlab.go`) to un-draft owned rescue merge requests and audit bounded retries for GitLab checking, HTTP 405, and HTTP 409 merge blocks.

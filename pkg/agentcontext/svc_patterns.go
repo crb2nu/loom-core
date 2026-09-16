@@ -36,6 +36,7 @@ type PatternSvc struct {
 	embedr     embed.Embedder
 	vectorSize *int
 	logger     *slog.Logger
+	metrics    *Metrics
 }
 
 // NewPatternSvc constructs a PatternSvc. embedr/vectorSize may be nil in tests.
@@ -50,6 +51,7 @@ func NewPatternSvc(patternsQ *QdrantClient, embedr embed.Embedder, vectorSize *i
 		embedr:     embedr,
 		vectorSize: vectorSize,
 		logger:     logger,
+		metrics:    GetMetrics(),
 	}
 }
 
@@ -297,12 +299,19 @@ func (ps *PatternSvc) SeedBuiltins(ctx context.Context) {
 // ---- persistence -----------------------------------------------------------
 
 // persist writes a pattern to Qdrant, embedding name+makes+description best-
-// effort (a failed embedder must NEVER block the write).
+// effort. Circuit-breaker-open errors fail closed; other embedding failures
+// retain the deterministic fallback-vector behavior.
 func (ps *PatternSvc) persist(ctx context.Context, p *Pattern) error {
 	if ps.patternsQ == nil {
 		return nil
 	}
-	vec := ps.embedText(ctx, p.Name+" "+p.Makes+" "+p.Description)
+	vec, err := ps.embedText(ctx, p.Name+" "+p.Makes+" "+p.Description)
+	if err != nil {
+		if errors.Is(err, embed.ErrEmbedderUnavailable) {
+			ps.metrics.PatternEmbedFailclosed.Add(1)
+		}
+		return err
+	}
 	degraded := len(vec) == 0
 	size := ps.resolveVectorSize(ctx, vec, ps.patternsQ)
 	if err := ps.patternsQ.EnsureCollection(ctx, size); err != nil {
@@ -329,17 +338,21 @@ func (ps *PatternSvc) BackfillFallbackVectors(ctx context.Context, limit int, cu
 	})
 }
 
-// embedText returns an embedding for text, or nil on any failure / no embedder.
-func (ps *PatternSvc) embedText(ctx context.Context, text string) []float64 {
+// embedText returns an embedding for text. Generic failures return a nil vector
+// for fallback persistence; breaker-open failures are propagated fail-closed.
+func (ps *PatternSvc) embedText(ctx context.Context, text string) ([]float64, error) {
 	if ps.embedr == nil {
-		return nil
+		return nil, nil
 	}
 	vecs, err := ps.embedr.EmbedDocuments(ctx, []string{text})
+	if errors.Is(err, embed.ErrEmbedderUnavailable) {
+		return nil, fmt.Errorf("pattern embed: %w", err)
+	}
 	if err != nil || len(vecs) != 1 || len(vecs[0]) == 0 {
 		ps.logger.Warn("pattern embed failed; using fallback vector", "error", err)
-		return nil
+		return nil, nil
 	}
-	return vecs[0]
+	return vecs[0], nil
 }
 
 // resolveVectorSize picks the embedding dimension (mirrors PlanSvc).

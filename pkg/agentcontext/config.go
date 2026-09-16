@@ -322,6 +322,7 @@ func LoadConfigFromEnv() (Config, error) {
 		cfg.EmbedBaseURL = flexinfer.DefaultEmbedBaseURL
 		cfg.EmbedModel = flexinfer.DefaultEmbedModel
 	}
+	normalizeRetiredEmbedConfig(&cfg)
 	return cfg, nil
 }
 
@@ -424,4 +425,23 @@ func LoadAutoHandoffConfigFromEnv() AutoHandoffConfig {
 	}
 	cfg.Enabled = env.Bool("AGENTCONTEXT_HANDOFF_ENABLED", false)
 	return cfg
+}
+
+// normalizeRetiredEmbedConfig routes embeds that still name the retired Morph
+// endpoint or model back to the FlexInfer defaults. The env chains above keep
+// MORPH_* as fallbacks for older deployments, which means a stale
+// MORPH_EMBED_MODEL=morph-embedding-v3 sits AHEAD of the defaults: on
+// 2026-09-05 the hub's agent-context asked flexinfer-proxy for that model on
+// every embed (404, ~5,000 failures in six hours) and served keyword-only
+// search. pkg/pm and pkg/codebase already normalize the same way; this closes
+// the last copy so no manifest or shell env can resurrect the retired route.
+func normalizeRetiredEmbedConfig(cfg *Config) {
+	model := strings.ToLower(strings.TrimSpace(cfg.EmbedModel))
+	retiredModel := strings.HasPrefix(model, flexinfer.RetiredMorphModelPrefix)
+	retiredURL := strings.Contains(strings.ToLower(cfg.EmbedBaseURL), flexinfer.RetiredMorphHost)
+	if cfg.EmbedProvider == "morph" || retiredModel || retiredURL {
+		cfg.EmbedProvider = flexinfer.DefaultEmbedProvider
+		cfg.EmbedBaseURL = flexinfer.DefaultEmbedBaseURL
+		cfg.EmbedModel = flexinfer.DefaultEmbedModel
+	}
 }

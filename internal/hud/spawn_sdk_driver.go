@@ -160,7 +160,14 @@ func (o *SpawnOrchestrator) injectControlMessage(ctx context.Context, be backend
 // so a follow-up slice can wire SDK-side enforcement. When controlFilePath is
 // non-empty the driver enters multi-turn mode and tails the file for
 // follow-up commands (slice 8a).
-func buildSDKDriverCommand(agentType, task, agentID, spawnID, workingDir, controlFilePath string, maxTurns int, maxCostUSD float64) string {
+//
+// model is the routed LLM id (Mills stage_models / agent_routing, or the
+// spawn request's own model). It is forwarded as --model so the SDK path
+// honours the same pin the legacy CLI path applies via `--model` /
+// `codex exec --model`; before this the driver had no model knob and every
+// SDK-driven spawn silently ran the harness default. Empty means "vendor
+// default", exactly as on the CLI path.
+func buildSDKDriverCommand(agentType, task, agentID, spawnID, workingDir, controlFilePath, model string, maxTurns int, maxCostUSD float64) string {
 	var b strings.Builder
 	b.WriteString("node ")
 	b.WriteString(spawnDriverPodPath)
@@ -170,6 +177,9 @@ func buildSDKDriverCommand(agentType, task, agentID, spawnID, workingDir, contro
 	fmt.Fprintf(&b, " --spawn-id %s", shellQuote(spawnID))
 	if workingDir != "" {
 		fmt.Fprintf(&b, " --working-dir %s", shellQuote(workingDir))
+	}
+	if m := strings.TrimSpace(model); m != "" {
+		fmt.Fprintf(&b, " --model %s", shellQuote(m))
 	}
 	if maxTurns > 0 {
 		fmt.Fprintf(&b, " --max-turns %d", maxTurns)

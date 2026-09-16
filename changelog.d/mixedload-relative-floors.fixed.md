@@ -1,0 +1,1 @@
+- Replace wall-clock operation floors in `internal/reliability/mixed_load_test.go` with calibrated mixed/baseline throughput ratios and expose their diagnostics through `cmd/fleet-reliability-gate/main.go`.

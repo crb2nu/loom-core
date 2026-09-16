@@ -70,7 +70,12 @@ describe('millsStore drilldown entry points inside a tracking effect', () => {
     expect(fetchMock.mock.calls.length).toBe(1);
   });
 
-  it('openBacklogDetail fetches the detail exactly once', async () => {
+  it('openBacklogDetail fetches the detail, its ledger, and its runs exactly once each', async () => {
+    // Three fetches by design: the item detail, its recorded-event ledger
+    // (the drawer's journey strip), and its per-item run list (the "why is
+    // this escalated?" cross-link). The number is the point — every write is
+    // untracked, so opening from inside a tracking effect must not re-arm it.
+    // Before the ledger write was wrapped in untrack() this ran away to 12.
     const fetchMock = countingFetch();
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
 
@@ -80,7 +85,13 @@ describe('millsStore drilldown entry points inside a tracking effect', () => {
     await settle();
     stop();
 
-    expect(fetchMock.mock.calls.length).toBe(1);
+    expect(fetchMock.mock.calls.length).toBe(3);
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.filter((u) => u.endsWith('/events'))).toHaveLength(1);
+    expect(urls.filter((u) => u.includes('/pipeline/runs?backlog_id='))).toHaveLength(1);
+    expect(
+      urls.filter((u) => !u.endsWith('/events') && !u.includes('/pipeline/runs?backlog_id=')),
+    ).toHaveLength(1);
   });
 
   it('ensureWorkflowRunsLoaded with zero runs fetches exactly once', async () => {

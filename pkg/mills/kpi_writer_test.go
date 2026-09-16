@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +84,65 @@ func TestKPIWriter_RecordWritesRollingSnapshot(t *testing.T) {
 	assertMetric(t, snap.Metrics, "eval_average_score", 0.8)
 	if got, ok := snap.Metrics["policy_enabled"].(bool); !ok || !got {
 		t.Fatalf("policy_enabled = %#v, want true", snap.Metrics["policy_enabled"])
+	}
+}
+
+func TestKPIWriterMergedRunsByTargetRepo(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	for _, item := range []*store.BacklogItem{
+		{ID: "KPI-HOME", Title: "home", State: store.BacklogMerged, Priority: store.P2, CreatedBy: "test"},
+		{ID: "KPI-REMOTE", Title: "remote", State: store.BacklogMerged, Priority: store.P2, CreatedBy: "test", TargetProject: "services/flexdeck"},
+	} {
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, backlog := range []string{"KPI-HOME", "KPI-REMOTE", "KPI-REMOTE"} {
+		if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{ID: fmt.Sprintf("KPI-REPO-%d", i), BacklogID: backlog, Template: "mills-default", State: store.PipelineDone, Attempts: i + 1, StartedAt: env.now.Add(-time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := NewKPIWriter(env.store, env.policy)
+	w.HomeProject = "services/loom-core"
+	snap, err := w.snapshot(ctx, env.now, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := snap.Metrics["pipeline_merged_by_repo"].(map[string]int)
+	if !ok || got["services/loom-core"] != 1 || got["services/flexdeck"] != 2 {
+		t.Fatalf("pipeline_merged_by_repo = %#v", snap.Metrics["pipeline_merged_by_repo"])
+	}
+}
+
+func TestKPIWriter_GateOutcomeWindowUsesHotReadIndex(t *testing.T) {
+	env := newRecEnv(t, nil)
+	rows, err := env.store.DB().QueryContext(context.Background(), `
+		EXPLAIN QUERY PLAN
+		SELECT
+			COALESCE(SUM(CASE WHEN outcome = 'pass' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN outcome != 'skip' THEN 1 ELSE 0 END), 0)
+		FROM gate_outcomes
+		WHERE evaluated_at >= ?`, kpiTime(env.now.Add(-kpiWindow1d)))
+	if err != nil {
+		t.Fatalf("explain gate outcomes: %v", err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("query plan rows: %v", err)
+	}
+	plan := strings.Join(details, "\n")
+	if !strings.Contains(plan, "idx_gate_outcomes_evaluated") || strings.Contains(plan, "SCAN gate_outcomes") {
+		t.Fatalf("gate outcome query must use its window index without a table scan:\n%s", plan)
 	}
 }
 
@@ -515,6 +575,27 @@ func TestKPIWriter_P50_OddCountReturnsExactMiddle(t *testing.T) {
 		}
 	}
 
+	// Two external merge-queue candidates: `done` rows whose duration is only
+	// the queue wait. They must not enter the slice-to-merge median (they
+	// would otherwise pull it to 1s).
+	for i := 0; i < 2; i++ {
+		id := fmt.Sprintf("external-mq-%d", i)
+		if err := env.store.Backlog.Put(ctx, &store.BacklogItem{
+			ID: id, Title: id, State: store.BacklogRetired,
+			Priority: store.P2, CreatedBy: "mrwatch",
+		}); err != nil {
+			t.Fatalf("seed external backlog %d: %v", i, err)
+		}
+		end := now.Add(-time.Hour).Add(time.Second)
+		if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: id,
+			Template: store.PipelineTemplateExternalMerge, State: store.PipelineDone,
+			CurrentStage: "merge_queue", StartedAt: now.Add(-time.Hour), EndedAt: &end,
+		}); err != nil {
+			t.Fatalf("seed external run %d: %v", i, err)
+		}
+	}
+
 	writer := NewKPIWriter(env.store, env.policy)
 	writer.Clock = func() time.Time { return now }
 	writer.Windows = []time.Duration{kpiWindow1d}
@@ -525,7 +606,8 @@ func TestKPIWriter_P50_OddCountReturnsExactMiddle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("latest: %v", err)
 	}
-	// Median of [30, 90, 240] = 90 (exact middle, no interpolation)
+	// Median of [30, 90, 240] = 90 (exact middle, no interpolation); the two
+	// 1s external_merge rows are excluded.
 	assertMetric(t, snap.Metrics, "slice_to_merge_p50_seconds", 90.0)
 }
 
@@ -662,6 +744,106 @@ func TestKPIWriter_RealMergedRuns_ExcludesCanary(t *testing.T) {
 	}
 	if v, _ := snap.Metrics["pipeline_merged_runs"].(int); v != 5 {
 		t.Errorf("snapshot pipeline_merged_runs = %v, want 5", snap.Metrics["pipeline_merged_runs"])
+	}
+}
+
+// TestKPIWriter_ExcludesExternalMergeQueuePlaceholders pins that the serial
+// merge queue's external-candidate compatibility rows (template
+// external_merge, state done from ENQUEUE time, even when later evicted) never
+// count as pipeline runs or merges, and that candidates the queue actually
+// landed surface under mergequeue_external_merged instead.
+func TestKPIWriter_ExcludesExternalMergeQueuePlaceholders(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := env.now
+
+	seed := func(id, template string, state store.PipelineState, backlogState store.BacklogState, target string, cost float64) {
+		t.Helper()
+		if err := env.store.Backlog.Put(ctx, &store.BacklogItem{
+			ID: id, Title: id, State: backlogState, Priority: store.P2,
+			CreatedBy: "test", TargetProject: target,
+		}); err != nil {
+			t.Fatalf("seed backlog %s: %v", id, err)
+		}
+		if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: id, Template: template, State: state,
+			StartedAt: now.Add(-2 * time.Hour), CostUSD: cost,
+		}); err != nil {
+			t.Fatalf("seed run %s: %v", id, err)
+		}
+	}
+	// Two real pipeline outcomes: one merge, one escalation.
+	seed("PIPE-REAL-DONE", "mills-default", store.PipelineDone, store.BacklogMerged, "", 4)
+	seed("PIPE-REAL-ESC", "mills-default", store.PipelineEscalated, store.BacklogEscalated, "", 2)
+	// Two external candidates, both `done` placeholder rows: one the queue
+	// merged, one it evicted for a rebase conflict.
+	seed("external-mq-landed", store.PipelineTemplateExternalMerge, store.PipelineDone, store.BacklogRetired, "services/other", 0)
+	seed("external-mq-evicted", store.PipelineTemplateExternalMerge, store.PipelineDone, store.BacklogRetired, "services/other", 0)
+
+	enqueue := func(runID string, mr int64) *store.MergeQueueEntry {
+		t.Helper()
+		entry, _, err := env.store.MergeQueue.Enqueue(ctx, &store.MergeQueueEntry{
+			PipelineRunID: runID, BacklogID: runID, Project: "services/other", MRIID: mr,
+			SourceBranch: "feat/" + runID, TargetBranch: "main", EnqueuedSHA: "sha-" + runID,
+			Detail: map[string]any{"producer": "mrwatch_shepherd", "idempotency_key": runID},
+		}, 0)
+		if err != nil {
+			t.Fatalf("enqueue %s: %v", runID, err)
+		}
+		return entry
+	}
+	landed := enqueue("external-mq-landed", 11)
+	if _, err := env.store.MergeQueue.MarkMerged(ctx, landed.ID, store.MergeQueueQueued, "merged-sha"); err != nil {
+		t.Fatalf("mark merged: %v", err)
+	}
+	evicted := enqueue("external-mq-evicted", 12)
+	if _, err := env.store.MergeQueue.MarkEvicted(ctx, evicted.ID, store.MergeQueueEvictRebaseConflict, nil); err != nil {
+		t.Fatalf("mark evicted: %v", err)
+	}
+
+	writer := NewKPIWriter(env.store, env.policy)
+	writer.Clock = func() time.Time { return now }
+	snap, err := writer.snapshot(ctx, now, kpiWindow1d)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	wantInts := map[string]int{
+		"pipeline_runs":              2,
+		"pipeline_merged_runs":       1,
+		"pipeline_merged_real":       1,
+		"pipeline_escalated_runs":    1,
+		"mergequeue_external_merged": 1,
+	}
+	for key, want := range wantInts {
+		if got, _ := snap.Metrics[key].(int); got != want {
+			t.Errorf("%s = %v, want %d", key, snap.Metrics[key], want)
+		}
+	}
+	if got, _ := snap.Metrics["auto_merge_rate"].(float64); got != 0.5 {
+		t.Errorf("auto_merge_rate = %v, want 0.5 (1 merge / 2 real terminal runs)", snap.Metrics["auto_merge_rate"])
+	}
+	// $4 + $2 of real pipeline spend over the single merged change; the two
+	// $0 placeholders must not dilute the denominator.
+	if got, _ := snap.Metrics["cost_per_merged_change_usd"].(float64); got != 4 {
+		t.Errorf("cost_per_merged_change_usd = %v, want 4 (only PIPE-REAL-DONE's backlog merged)", snap.Metrics["cost_per_merged_change_usd"])
+	}
+	byRepo, _ := snap.Metrics["pipeline_merged_by_repo"].(map[string]int)
+	if _, leaked := byRepo["services/other"]; leaked {
+		t.Errorf("pipeline_merged_by_repo leaked the external placeholder project: %v", byRepo)
+	}
+
+	// The durable gauges take the same path.
+	AutonomousMerges.Reset()
+	AutonomousMergesReal.Reset()
+	writer.Windows = []time.Duration{kpiWindow1d}
+	if err := writer.SeedDurableGauges(ctx); err != nil {
+		t.Fatalf("seed durable gauges: %v", err)
+	}
+	if got := testutil.ToFloat64(AutonomousMerges.WithLabelValues("1d")); got != 1 {
+		t.Errorf("mills_autonomous_merges{1d} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(AutonomousMergesReal.WithLabelValues("1d")); got != 1 {
+		t.Errorf("mills_autonomous_merges_real{1d} = %v, want 1", got)
 	}
 }
 

@@ -790,3 +790,33 @@ func TestAssertQueuedProofRequiresAutoMergedNonEmptyMR(t *testing.T) {
 		})
 	}
 }
+
+func TestAssertQueuedTargetStampProofFailsClosed(t *testing.T) {
+	valid := QueuedTargetStampProof{
+		StampID: "stamp-1", TargetProject: "services/widgets",
+		LandedTargetProject: "services/widgets", QueueStates: []string{"queued", "admitted"},
+		Admissions: 1, CollisionDetected: true,
+	}
+	if err := AssertQueuedTargetStampProof(valid); err != nil {
+		t.Fatalf("valid target stamp proof rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*QueuedTargetStampProof){
+		"missing stamp":      func(p *QueuedTargetStampProof) { p.StampID = " " },
+		"missing target":     func(p *QueuedTargetStampProof) { p.TargetProject = " " },
+		"wrong target":       func(p *QueuedTargetStampProof) { p.LandedTargetProject = "services/other" },
+		"missing transition": func(p *QueuedTargetStampProof) { p.QueueStates = []string{"queued"} },
+		"duplicate admission": func(p *QueuedTargetStampProof) {
+			p.Admissions = 2
+		},
+		"collision accepted": func(p *QueuedTargetStampProof) { p.CollisionDetected = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			candidate.QueueStates = append([]string(nil), valid.QueueStates...)
+			mutate(&candidate)
+			if err := AssertQueuedTargetStampProof(candidate); err == nil {
+				t.Fatal("unsafe target stamp proof unexpectedly passed")
+			}
+		})
+	}
+}

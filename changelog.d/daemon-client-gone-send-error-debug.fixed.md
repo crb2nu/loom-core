@@ -1,0 +1,1 @@
+- Stop logging `send response error … write: broken pipe` at ERROR when the client hung up before its response was written (EPIPE, ECONNRESET, closed socket). These are the client's doing, not a daemon fault, and appeared ~150 times a day; they are now a DEBUG line naming the method plus a span event (`internal/daemon/daemon_transport.go`).

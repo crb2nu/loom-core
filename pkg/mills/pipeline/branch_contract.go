@@ -20,6 +20,46 @@ type RunBranchContract struct {
 	IntegrationBranch string
 }
 
+// BranchRefCollision describes an origin head whose ref path cannot coexist
+// with the contract branch. Git stores refs as paths, so either side being a
+// strict, segment-wise prefix of the other is a collision.
+type BranchRefCollision struct {
+	Ref                string
+	SameItemLegacyForm bool
+}
+
+// BranchRefCollisions returns path-prefix collisions in origin order. Exact
+// equality is deliberately excluded because it belongs to branch adoption.
+func BranchRefCollisions(contractBranch string, originRefs []string, item *store.BacklogItem) []BranchRefCollision {
+	legacy := sourceBranchName(item)
+	var collisions []BranchRefCollision
+	for _, ref := range originRefs {
+		ref = strings.TrimSpace(strings.TrimPrefix(ref, "refs/heads/"))
+		if ref == "" || ref == contractBranch || !strictBranchPathPrefix(ref, contractBranch) {
+			continue
+		}
+		collisions = append(collisions, BranchRefCollision{Ref: ref, SameItemLegacyForm: ref == legacy})
+	}
+	return collisions
+}
+
+func strictBranchPathPrefix(left, right string) bool {
+	leftParts, rightParts := strings.Split(left, "/"), strings.Split(right, "/")
+	short, long := leftParts, rightParts
+	if len(short) > len(long) {
+		short, long = long, short
+	}
+	if len(short) == len(long) {
+		return false
+	}
+	for i := range short {
+		if short[i] != long[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // BranchContractFor returns the canonical branch names for a run/item/slice.
 //
 // A source or slice ref is a pure function of the item-owned ID, labels,

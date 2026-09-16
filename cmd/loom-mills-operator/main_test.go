@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +19,40 @@ import (
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/clients"
 	"github.com/crb2nu/loom/pkg/mills/council"
+	"github.com/crb2nu/loom/pkg/mills/eval"
+	"github.com/crb2nu/loom/pkg/mills/guard"
+	"github.com/crb2nu/loom/pkg/mills/overseer"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 	"github.com/crb2nu/loom/pkg/mills/runner"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
+
+var _ overseer.SandboxDrillClient = (*sandboxDrillHubClient)(nil)
+
+func TestSandboxDrillPolicyDisabledKeepsHarnessIdle(t *testing.T) {
+	var calls int
+	h := &overseer.Harness{
+		Agent:    &countingOverseerAgent{calls: &calls},
+		Enabled:  func() bool { return (&mills.Policy{}).SandboxDrillEnabled() },
+		Interval: func() time.Duration { return time.Millisecond },
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := h.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("disabled sandbox drill ran %d times", calls)
+	}
+}
+
+type countingOverseerAgent struct{ calls *int }
+
+func (a *countingOverseerAgent) Name() string { return "sandbox_drill" }
+func (a *countingOverseerAgent) Tick(context.Context) (overseer.TickResult, error) {
+	*a.calls++
+	return overseer.TickResult{}, nil
+}
 
 const validPolicy = `
 version: 1
@@ -74,6 +105,44 @@ func newTestOperator(t *testing.T) (*operator, func()) {
 		_ = st.Close()
 	}
 	return op, cleanup
+}
+
+func TestImplementRetryDisciplineRendersFindings(t *testing.T) {
+	findings := []string{"lint[exit=1]: first finding", "test[exit=1]: second finding"}
+	got := implementRetryDiscipline(&pipeline.StageRetryContext{Attempt: 2, GateStage: "post_tests_gate", Findings: findings})
+	for _, finding := range findings {
+		if !strings.Contains(got, "- "+finding) {
+			t.Fatalf("prompt missing finding %q:\n%s", finding, got)
+		}
+	}
+}
+
+// materializeTestReport mirrors the production background writer while
+// keeping handler tests deterministic: requests themselves remain snapshot-only.
+func materializeTestReport(t *testing.T, op *operator, name string, window time.Duration, key string) {
+	t.Helper()
+	var spec *eval.ReportRollupSpec
+	for _, candidate := range newReportRollupWriter(op).Specs {
+		if candidate.Name == name {
+			copy := candidate
+			copy.Window, copy.Key = window, key
+			if name == "promotion" {
+				copy.Build = func(ctx context.Context, since, now time.Time) (any, error) {
+					return guard.BuildPromotionReport(ctx, op.store.Events, key, since, now)
+				}
+			}
+			spec = &copy
+			break
+		}
+	}
+	if spec == nil {
+		t.Fatalf("unknown report %q", name)
+	}
+	w := newReportRollupWriter(op)
+	w.Specs = []eval.ReportRollupSpec{*spec}
+	if err := w.Refresh(context.Background()); err != nil {
+		t.Fatalf("materialize %s: %v", name, err)
+	}
 }
 
 func TestHealthz_OK(t *testing.T) {
@@ -342,7 +411,7 @@ func TestStatus_FullResponds(t *testing.T) {
 	for _, want := range []string{
 		`"db_ok":true`, `"policy_enabled":true`,
 		`"autonomy_ready":false`,
-		`"queue_depth":0`, `"active_pipeline_runs":0`,
+		`"queue_depth":0`, `"queue_held_human":0`, `"active_pipeline_runs":0`,
 		`"slice":"2.4-rest-surface"`,
 	} {
 		if !strings.Contains(rec.Body.String(), want) {
@@ -420,7 +489,7 @@ func TestBuildCouncilRunner_UsesRealParticipantsWhenFlexInferReady(t *testing.T)
 	if err != nil {
 		t.Fatalf("flex client: %v", err)
 	}
-	r, usesFake := buildCouncilRunner(op.store, op.policy, op.budget, t.TempDir(), flex, nil, flex, "", runner.DefaultStageBudgets(), discardLogger())
+	r, usesFake := buildCouncilRunner(op.store, op.policy, op.budget, t.TempDir(), flex, nil, flex, "", nil, runner.DefaultStageBudgets(), discardLogger())
 	if r == nil {
 		t.Fatal("runner nil")
 	}
@@ -433,7 +502,7 @@ func TestBuildCouncilRunner_FakeFallbackWhenFlexInferMissing(t *testing.T) {
 	op, cleanup := newTestOperator(t)
 	defer cleanup()
 
-	r, usesFake := buildCouncilRunner(op.store, op.policy, op.budget, t.TempDir(), nil, nil, nil, "", runner.DefaultStageBudgets(), discardLogger())
+	r, usesFake := buildCouncilRunner(op.store, op.policy, op.budget, t.TempDir(), nil, nil, nil, "", nil, runner.DefaultStageBudgets(), discardLogger())
 	if r == nil {
 		t.Fatal("runner nil")
 	}
@@ -558,6 +627,63 @@ func TestCapabilities_MCPHubLiveFailureBlocksAutonomy(t *testing.T) {
 	}
 	if report.AutonomyReady {
 		t.Fatal("autonomy stayed ready while the live MCP hub dependency was failing")
+	}
+}
+
+// TestCapabilities_MCPHubCallSlotTimeoutIsTransientCapability pins the
+// 2026-09-13 evidence (PIPE-bl-devbox-tests-checkout-shared-clone-…): four
+// runs plus the reconciler sharing the hub made the operator's agent_context
+// probe time out waiting for the hub call slot, and the live-health text
+// tripped a terminal capability_red one stage from the MR. The probe's blocker
+// for a busy or unreachable hub must reach the pipeline gate as a transient
+// capability (held with backoff, then retryable infra), while an auth failure
+// inside the same probe envelope still fails closed.
+func TestCapabilities_MCPHubCallSlotTimeoutIsTransientCapability(t *testing.T) {
+	tests := []struct {
+		name, lastError string
+		transient       bool
+	}{
+		{name: "call slot timeout", lastError: "wait for call slot: context deadline exceeded", transient: true},
+		{name: "hub dns outage", lastError: "dial tcp: lookup loom-gateway.loom-hub.svc.cluster.local: i/o timeout", transient: true},
+		{name: "auth", lastError: "401 unauthorized", transient: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op, cleanup := newTestOperator(t)
+			defer cleanup()
+			w := newCapabilityWiring(Config{})
+			w.MCPHubConfigured = true
+			w.MCPHubSessionReady = true
+			w.MCPHubLiveHealth = func() (bool, string) {
+				// Same envelope the operator's live-health closure renders.
+				return false, "MCP hub agent_context unavailable after 1 consecutive failure(s): " + tt.lastError
+			}
+			op.setCapabilities(w)
+
+			report := op.capabilityReport(context.Background())
+			if report.AutonomyReady {
+				t.Fatal("autonomy stayed ready while the live MCP hub dependency was failing")
+			}
+			var hub []string
+			for _, blocker := range report.AutonomyBlockers {
+				if strings.HasPrefix(blocker, "mcp_hub_session:") {
+					hub = append(hub, blocker)
+				}
+			}
+			if len(hub) != 1 || !strings.Contains(hub[0], tt.lastError) {
+				t.Fatalf("mcp_hub_session blockers = %v, want the probe text", hub)
+			}
+			// Mirror the production gate wiring (AutonomyGateFromCouncil over
+			// the capability report's blockers) for the hub row alone.
+			decision := council.NormalizeAutonomyDecision(council.AutonomyGateDecision{Blockers: hub})
+			if decision.Code != council.AutonomyReasonCapabilityRed {
+				t.Fatalf("reason code = %q, want capability_red", decision.Code)
+			}
+			got := decision.TransientCapabilities()
+			if tt.transient != (len(got) == 1 && got[0] == "mcp_hub_session") {
+				t.Fatalf("transient capabilities = %v, want transient=%t", got, tt.transient)
+			}
+		})
 	}
 }
 
@@ -709,6 +835,31 @@ func TestConfig_ApplyEnv(t *testing.T) {
 	}
 }
 
+func TestBuildMergedWorkSemanticScorer_EmbedModel(t *testing.T) {
+	t.Setenv("FLEXINFER_EMBED_MODEL", "bge-large-radeonvii")
+	c := DefaultConfig()
+	c.FlexInferProxyURL = "http://proxy.example"
+	c.ApplyEnv()
+	if c.FlexInferEmbedModel != "bge-large-radeonvii" {
+		t.Fatalf("env not applied: %q", c.FlexInferEmbedModel)
+	}
+	scorer, model := buildMergedWorkSemanticScorer(c)
+	if scorer == nil || model != "bge-large-radeonvii" {
+		t.Errorf("configured model not honored: scorer=%v model=%q", scorer, model)
+	}
+
+	c.FlexInferEmbedModel = ""
+	scorer, model = buildMergedWorkSemanticScorer(c)
+	if scorer == nil || model != "BAAI/bge-large-en-v1.5" {
+		t.Errorf("empty model must fall through to client default, got %q", model)
+	}
+
+	c.FlexInferProxyURL = ""
+	if scorer, model = buildMergedWorkSemanticScorer(c); scorer != nil || model != "" {
+		t.Errorf("no proxy must disable the scorer, got %v %q", scorer, model)
+	}
+}
+
 func TestConfig_ApplyEnv_CouncilStageBudgets(t *testing.T) {
 	t.Setenv("LOOM_MILLS_COUNCIL_OVERALL_TIMEOUT", "30m")
 	t.Setenv("LOOM_MILLS_COUNCIL_EDITOR_TIMEOUT", "4m")
@@ -850,6 +1001,21 @@ func TestImplementPromptForAddsRetryDiscipline(t *testing.T) {
 	} {
 		if !strings.Contains(retry, want) {
 			t.Errorf("attempt-3 retry prompt missing %q:\n%s", want, retry)
+		}
+	}
+}
+
+func TestPlanSlicePromptRestrictsDiffCapOverrides(t *testing.T) {
+	prompt := planSlicePromptFor(nil)(pipeline.JobContext{Item: &store.BacklogItem{
+		ID: "BL-CLEANUP-1", Title: "remove dead package",
+	}})
+	for _, want := range []string{
+		"at least 90% deletions",
+		"SpecDoc must justify",
+		"additions-heavy items must not",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("plan_slice prompt missing %q:\n%s", want, prompt)
 		}
 	}
 }
@@ -1082,7 +1248,7 @@ func TestBuildCouncilRunner_LiteLLMLensBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("litellm client: %v", err)
 	}
-	r, usesFake := buildCouncilRunner(op.store, pm, op.budget, t.TempDir(), flex, lite, flex, "", runner.DefaultStageBudgets(), discardLogger())
+	r, usesFake := buildCouncilRunner(op.store, pm, op.budget, t.TempDir(), flex, lite, flex, "", nil, runner.DefaultStageBudgets(), discardLogger())
 	if r == nil || usesFake {
 		t.Fatalf("runner nil=%v usesFake=%v; want real participants", r == nil, usesFake)
 	}
@@ -1116,7 +1282,7 @@ func TestBuildCouncilRunner_LiteLLMLensWithoutGatewayFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("flex client: %v", err)
 	}
-	r, _ := buildCouncilRunner(op.store, pm, op.budget, t.TempDir(), flex, nil, flex, "", runner.DefaultStageBudgets(), discardLogger())
+	r, _ := buildCouncilRunner(op.store, pm, op.budget, t.TempDir(), flex, nil, flex, "", nil, runner.DefaultStageBudgets(), discardLogger())
 	if r == nil {
 		t.Fatal("runner nil")
 	}
@@ -1241,6 +1407,79 @@ func TestResolveMillsWeaverClient_LiteLLMMisconfiguredFallsBackLoud(t *testing.T
 	}
 }
 
+// TestResolveMillsTriageClient_DefaultInheritsJudge pins the zero-config path:
+// no MILLS_TRIAGE_BACKEND ⇒ the overseers keep dialing the resolved judge
+// client on its own JudgeModel() (empty override), whatever the judge backend.
+func TestResolveMillsTriageClient_DefaultInheritsJudge(t *testing.T) {
+	flex := newBackendTestFlexClient(t)
+	judge := newBackendTestFlexClient(t)
+	cfg := Config{FlexInferTriageModel: "qwen38-27b-xtx-warm-canary"}
+	got, model := resolveMillsTriageClient(cfg, flex, judge, discardLogger())
+	if got != judge {
+		t.Errorf("triage client = %p, want judge %p", got, judge)
+	}
+	if model != "" {
+		t.Errorf("triage model = %q, want empty (inherit JudgeModel)", model)
+	}
+}
+
+// TestResolveMillsTriageClient_FlexInferPinsModel: backend flexinfer + an
+// explicit model binds the FlexInfer proxy client with that model even when
+// the judge runs elsewhere.
+func TestResolveMillsTriageClient_FlexInferPinsModel(t *testing.T) {
+	flex := newBackendTestFlexClient(t)
+	judge := newBackendTestFlexClient(t)
+	cfg := Config{TriageBackend: "FlexInfer", FlexInferTriageModel: "qwen38-27b-xtx-warm-canary"}
+	got, model := resolveMillsTriageClient(cfg, flex, judge, discardLogger())
+	if got != flex {
+		t.Errorf("triage client = %p, want flex %p", got, flex)
+	}
+	if model != "qwen38-27b-xtx-warm-canary" {
+		t.Errorf("triage model = %q, want the pinned lane", model)
+	}
+}
+
+// TestResolveMillsTriageClient_MisconfiguredFallsBackLoud: a non-default
+// backend without its model or client degrades to the judge wiring.
+func TestResolveMillsTriageClient_MisconfiguredFallsBackLoud(t *testing.T) {
+	flex := newBackendTestFlexClient(t)
+	judge := newBackendTestFlexClient(t)
+	cases := map[string]struct {
+		cfg  Config
+		flex *clients.FlexInferClient
+	}{
+		"flexinfer no model":  {cfg: Config{TriageBackend: "flexinfer"}, flex: flex},
+		"flexinfer no client": {cfg: Config{TriageBackend: "flexinfer", FlexInferTriageModel: "m"}, flex: nil},
+		"litellm no model":    {cfg: Config{TriageBackend: "litellm", LiteLLMProxyURL: "http://litellm.test"}, flex: flex},
+		"litellm no gateway":  {cfg: Config{TriageBackend: "litellm", FlexInferTriageModel: "or/kimi-k3"}, flex: flex},
+		"unknown backend":     {cfg: Config{TriageBackend: "ollama", FlexInferTriageModel: "m"}, flex: flex},
+	}
+	for name, tc := range cases {
+		got, model := resolveMillsTriageClient(tc.cfg, tc.flex, judge, discardLogger())
+		if got != judge {
+			t.Errorf("%s: triage client = %p, want judge fallback %p", name, got, judge)
+		}
+		if model != "" {
+			t.Errorf("%s: triage model = %q, want empty on fallback", name, model)
+		}
+	}
+}
+
+// TestResolveMillsTriageClient_LiteLLMBindsGateway mirrors the judge resolver:
+// backend litellm + gateway + model binds a distinct gateway client carrying
+// the triage model as its JudgeModel().
+func TestResolveMillsTriageClient_LiteLLMBindsGateway(t *testing.T) {
+	flex := newBackendTestFlexClient(t)
+	cfg := Config{TriageBackend: "litellm", LiteLLMProxyURL: "http://litellm.test", LiteLLMToken: "k", FlexInferTriageModel: "or/kimi-k2.7-code"}
+	got, model := resolveMillsTriageClient(cfg, flex, flex, discardLogger())
+	if got == nil || got == flex {
+		t.Fatalf("triage client = %p, want a distinct litellm client (flex %p)", got, flex)
+	}
+	if got.JudgeModel() != "or/kimi-k2.7-code" || model != "or/kimi-k2.7-code" {
+		t.Errorf("litellm triage model = %q / %q, want or/kimi-k2.7-code", got.JudgeModel(), model)
+	}
+}
+
 // TestResolveMillsJudgeClient_LiteLLMWorksWithoutFlexInfer confirms the litellm
 // judge binds even when the FlexInfer proxy is absent (flexClient nil), so a
 // gateway-only deployment still gets LLM-judged gates.
@@ -1256,5 +1495,207 @@ func TestResolveMillsJudgeClient_LiteLLMWorksWithoutFlexInfer(t *testing.T) {
 	}
 	if model != "or/kimi-k3" {
 		t.Errorf("council judge model = %q, want or/kimi-k3", model)
+	}
+}
+
+type webhookRegistrarFunc func(context.Context, string, string) error
+
+func (f webhookRegistrarFunc) EnsureMillsWebhook(ctx context.Context, url, secret string) error {
+	return f(ctx, url, secret)
+}
+
+func TestConfiguredWebhookBusRequiresSuccessfulRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name, secret, publicURL string
+		registrationErr         error
+		want                    bool
+	}{
+		{name: "both configured", secret: "secret", publicURL: "https://mills.example", want: true},
+		{name: "registration fails", secret: "secret", publicURL: "https://mills.example", registrationErr: errors.New("no hook")},
+		{name: "missing secret", publicURL: "https://mills.example"},
+		{name: "missing URL", secret: "secret"},
+		{name: "whitespace is missing", secret: "  ", publicURL: "\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LOOM_MILLS_GITLAB_WEBHOOK_SECRET", tc.secret)
+			t.Setenv("LOOM_MILLS_OPERATOR_URL", tc.publicURL)
+			registrar := webhookRegistrarFunc(func(context.Context, string, string) error { return tc.registrationErr })
+			if got := configuredWebhookBus(registrar, slog.Default()) != nil; got != tc.want {
+				t.Fatalf("configuredWebhookBus present=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildFlexInferClient_GatewayRolesStayBackendLocal pins the 2026-09-07
+// fix: FLEXINFER_JUDGE_MODEL / FLEXINFER_WEAVER_MODEL (+ *_FALLBACKS env) name
+// gateway ids when MILLS_*_BACKEND=litellm, and the FlexInfer-proxy client must
+// not inherit them as its own defaults — the council editor's local fallback
+// dialed [or/kimi-k3 or/kimi-k2.7-code] against flexinfer-proxy and got
+// "Internal error fetching model" on three consecutive council runs.
+func TestBuildFlexInferClient_GatewayRolesStayBackendLocal(t *testing.T) {
+	t.Setenv("FLEXINFER_JUDGE_MODEL_FALLBACKS", "oa/gpt-5.6-terra")
+	t.Setenv("FLEXINFER_WEAVER_MODEL_FALLBACKS", "or/kimi-k2.7-code")
+	gatewayID := func(id string) bool {
+		return strings.HasPrefix(id, "oa/") || strings.HasPrefix(id, "or/")
+	}
+
+	t.Run("both roles on the gateway: proxy client resolves registry ids only", func(t *testing.T) {
+		c := buildFlexInferClient(Config{
+			FlexInferProxyURL:    "http://flexinfer.test",
+			FlexInferJudgeModel:  "oa/gpt-5.6-luna",
+			FlexInferWeaverModel: "or/kimi-k3",
+			JudgeBackend:         "litellm",
+			WeaverBackend:        "litellm",
+		}, discardLogger())
+		if c == nil {
+			t.Fatal("buildFlexInferClient returned nil")
+		}
+		for role, id := range map[string]string{"judge": c.JudgeModel(), "weaver": c.WeaverModel()} {
+			if id == "" || gatewayID(id) {
+				t.Errorf("%s model = %q, want a registry-resolved FlexInfer id", role, id)
+			}
+		}
+		for role, chain := range map[string][]string{"judge": c.JudgeModelFallbacks(), "weaver": c.WeaverModelFallbacks()} {
+			for _, id := range chain {
+				if gatewayID(id) {
+					t.Errorf("%s fallbacks = %v leak a gateway id", role, chain)
+				}
+			}
+		}
+	})
+
+	t.Run("mixed: only the gateway role is blanked, the proxy role keeps its pin and env chain", func(t *testing.T) {
+		c := buildFlexInferClient(Config{
+			FlexInferProxyURL:    "http://flexinfer.test",
+			FlexInferJudgeModel:  "oa/gpt-5.6-luna",
+			FlexInferWeaverModel: "qwen38-27b-autoround-workhorse",
+			JudgeBackend:         "litellm",
+		}, discardLogger())
+		if c == nil {
+			t.Fatal("buildFlexInferClient returned nil")
+		}
+		if id := c.JudgeModel(); id == "" || gatewayID(id) {
+			t.Errorf("judge model = %q, want a registry-resolved FlexInfer id", id)
+		}
+		if got := c.WeaverModel(); got != "qwen38-27b-autoround-workhorse" {
+			t.Errorf("weaver model = %q, want the proxy pin preserved", got)
+		}
+		if got := c.WeaverModelFallbacks(); !slices.Contains(got, "or/kimi-k2.7-code") {
+			t.Errorf("weaver fallbacks = %v, want the role's env list honoured (role still on the proxy)", got)
+		}
+	})
+
+	t.Run("default backends are byte-identical", func(t *testing.T) {
+		c := buildFlexInferClient(Config{
+			FlexInferProxyURL:    "http://flexinfer.test",
+			FlexInferJudgeModel:  "gemma4-26b-a4b-gptq",
+			FlexInferWeaverModel: "qwen38-27b-autoround-workhorse",
+		}, discardLogger())
+		if c == nil {
+			t.Fatal("buildFlexInferClient returned nil")
+		}
+		if c.JudgeModel() != "gemma4-26b-a4b-gptq" || c.WeaverModel() != "qwen38-27b-autoround-workhorse" {
+			t.Errorf("pins changed: judge=%q weaver=%q", c.JudgeModel(), c.WeaverModel())
+		}
+	})
+}
+
+// TestBuildShadowJudge_OffByDefault: no FLEXINFER_SHADOW_JUDGE_MODEL ⇒ no
+// shadow, so the gates run exactly as before.
+func TestBuildShadowJudge_OffByDefault(t *testing.T) {
+	if got := buildShadowJudge(Config{FlexInferProxyURL: "http://flexinfer.test"}, discardLogger()); got != nil {
+		t.Fatalf("shadow judge = %T, want nil", got)
+	}
+}
+
+// TestBuildShadowJudge_PinsModelWithoutFallbacks: the shadow client dials the
+// named lane and nothing else — no registry chain, no judge fallback env.
+func TestBuildShadowJudge_PinsModelWithoutFallbacks(t *testing.T) {
+	t.Setenv("FLEXINFER_JUDGE_MODEL_FALLBACKS", "qwen38-27b-xtx-warm-canary,gemma4-e4b")
+	got := buildShadowJudge(Config{
+		FlexInferProxyURL:         "http://flexinfer.test",
+		FlexInferShadowJudgeModel: "qwen38-27b-autoround-workhorse",
+	}, discardLogger())
+	rj, ok := got.(*clients.RubricJudge)
+	if !ok || rj == nil || rj.Client == nil {
+		t.Fatalf("shadow judge = %T, want *clients.RubricJudge with a client", got)
+	}
+	if rj.Client.JudgeModel() != "qwen38-27b-autoround-workhorse" {
+		t.Errorf("shadow model = %q", rj.Client.JudgeModel())
+	}
+	if fb := rj.Client.JudgeModelFallbacks(); len(fb) != 0 {
+		t.Errorf("shadow fallbacks = %v, want none", fb)
+	}
+}
+
+// TestBuildShadowJudge_RefusesGatewayPrefixAndMissingProxy: a gateway id or a
+// missing proxy leaves the shadow off rather than binding an unroutable client.
+func TestBuildShadowJudge_RefusesGatewayPrefixAndMissingProxy(t *testing.T) {
+	cases := map[string]Config{
+		"or/ prefix":   {FlexInferProxyURL: "http://flexinfer.test", FlexInferShadowJudgeModel: "or/kimi-k3"},
+		"oa/ prefix":   {FlexInferProxyURL: "http://flexinfer.test", FlexInferShadowJudgeModel: "OA/gpt-5.6-terra"},
+		"no proxy url": {FlexInferShadowJudgeModel: "qwen38-27b-autoround-workhorse"},
+	}
+	for name, cfg := range cases {
+		if got := buildShadowJudge(cfg, discardLogger()); got != nil {
+			t.Errorf("%s: shadow judge = %T, want nil", name, got)
+		}
+	}
+}
+
+func TestBuildGateTiebreakerChain(t *testing.T) {
+	for _, key := range []string{"ANTHROPIC_API_KEY", "LOOM_ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LOOM_RESPONSES_API_KEY", "LOOM_MILLS_GATE_TIEBREAKER_MODEL"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	cfg := Config{FlexInferProxyURL: "http://localhost:9999", FlexInferJudgeModel: "local"}
+	chain := buildGateTiebreaker(mills.GateTiebreakerPolicy{}, cfg, nil, slog.Default())
+	if chain == nil || len(chain.Hops) != 3 || chain.Hops[0].Judge != nil || chain.Hops[1].Judge == nil || chain.Hops[2].Judge == nil {
+		t.Fatalf("bad chain: %#v", chain)
+	}
+	if chain.String() != "anthropic/claude-sonnet-5 → openai/gpt-5.5 → flexinfer/local" {
+		t.Fatal(chain.String())
+	}
+	t.Setenv("LOOM_MILLS_GATE_TIEBREAKER_MODEL", "override")
+	chain = buildGateTiebreaker(mills.GateTiebreakerPolicy{Model: "policy", Fallbacks: []mills.GateJudgeHop{}}, cfg, nil, slog.Default())
+	if len(chain.Hops) != 1 || chain.Hops[0].Model != "override" {
+		t.Fatal(chain)
+	}
+	t.Setenv("LOOM_MILLS_GATE_TIEBREAKER_MODEL", "off")
+	if buildGateTiebreaker(mills.GateTiebreakerPolicy{}, cfg, nil, slog.Default()) != nil {
+		t.Fatal("off ignored")
+	}
+}
+
+func TestBuildEditorChainFrameAvailability(t *testing.T) {
+	for _, key := range []string{"ANTHROPIC_API_KEY", "LOOM_ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LOOM_RESPONSES_API_KEY"} {
+		t.Setenv(key, "")
+	}
+	primary := mills.CouncilAgent{Backend: "anthropic", Model: "claude-opus"}
+	remote := mills.CouncilAgent{Backend: "openai", Model: "gpt-5.5"}
+	build := func(flex *clients.FlexInferClient) council.Editor {
+		return buildEditorChain(primary, remote, "local-model", flex, "", nil, slog.Default())
+	}
+	if ed := build(nil); ed != nil {
+		t.Fatalf("no credentials: %T", ed)
+	}
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	if ed := build(nil); ed == nil {
+		t.Fatal("missing primary and flex must retain remote fallback")
+	} else if _, ok := ed.(*clients.OpenAIResponsesCouncilEditor); !ok {
+		t.Fatalf("got %T", ed)
+	}
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	ed := build(&clients.FlexInferClient{}).(*clients.FallbackCouncilEditor)
+	if _, ok := ed.Primary.(*clients.AnthropicCouncilEditor); !ok {
+		t.Fatalf("primary %T", ed.Primary)
+	}
+	next := ed.Fallback.(*clients.FallbackCouncilEditor)
+	if _, ok := next.Primary.(*clients.OpenAIResponsesCouncilEditor); !ok {
+		t.Fatalf("remote %T", next.Primary)
+	}
+	if local := next.Fallback.(*clients.FlexInferCouncilEditor); local.Model != "local-model" {
+		t.Fatalf("local model %s", local.Model)
 	}
 }

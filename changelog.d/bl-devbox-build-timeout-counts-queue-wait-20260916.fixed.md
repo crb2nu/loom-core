@@ -1,0 +1,1 @@
+- Give created and joined devbox build pods their full budget after queue wait and setup; add positive-duration `DEVBOX_K8S_BUILD_TIMEOUT` (default `30m`) with startup and queue-wait logging in `internal/devbox/backend/k8s{,_build}.go` and `cmd/mcp-devbox/{main,manager}.go`, with regression tests.

@@ -69,6 +69,7 @@ func (c *PlanClient) AuthorSlicedPlan(ctx context.Context, in council.SlicedPlan
 	if !parsed.OK && parsed.PlanID == "" {
 		return "", fmt.Errorf("plan: author sliced reported failure: %q", truncateBody(body, 240))
 	}
+	c.invalidatePlan(parsed.PlanID)
 	return parsed.PlanID, nil
 }
 

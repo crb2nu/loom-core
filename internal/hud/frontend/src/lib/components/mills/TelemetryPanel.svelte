@@ -60,6 +60,31 @@
     return () => poller.stop();
   });
 
+  // Fleet-gate benchmark waivers. Independent of the telemetry window: a
+  // waiver is a standing property of the committed manifest, not a windowed
+  // measurement, so it has its own slow poll and renders even when a window
+  // has no runs. Refreshed lazily (10m) because the source is a git-tracked
+  // file the operator re-syncs at boot.
+  $effect(() => {
+    void millsStore.fetchWaivers();
+    const poller = createPoller(() => millsStore.fetchWaivers(), 600_000);
+    poller.start();
+    return () => poller.stop();
+  });
+
+  // Nearest expiry first — the whole reason to show these is the countdown,
+  // so the one about to lapse must be the one at the top.
+  let waivers = $derived(
+    [...(millsStore.waivers?.waivers ?? [])].sort((a, b) => a.days_remaining - b.days_remaining),
+  );
+  let waiverGlobalCap = $derived(millsStore.waivers?.global_time_percent ?? null);
+  // 30 days is the "start planning the fix" horizon; past `until` the gate has
+  // already snapped back to the global threshold.
+  function waiverTone(w: { expired: boolean; days_remaining: number }): string {
+    if (w.expired) return 'bad';
+    return w.days_remaining <= 30 ? 'warn' : 'ok';
+  }
+
   let disabled = $derived(millsStore.disabled);
   let error = $derived(millsStore.telemetryError);
   // The route 404'd and no live report is cached — an operator/HUD version
@@ -154,6 +179,43 @@
 
   {#if error}
     <ErrorBanner prefix="Telemetry feed failed" message={error} />
+  {/if}
+
+  <!-- Benchmark waivers: operator-approved, self-expiring exceptions that
+       raise one benchmark's regression cap. Until now these lived only in CI,
+       which makes the expiry a silent cliff — past `until` the gate snaps back
+       to the global threshold on its own and the next run fails with no
+       warning anyone saw. Rendered only when waivers exist; an empty card
+       would be noise on every other day. -->
+  {#if waivers.length > 0}
+    <section class="waivers" aria-label="Active benchmark waivers">
+      <div class="waivers-head">
+        <span class="waivers-tag">benchmark waivers</span>
+        {#if waiverGlobalCap != null}
+          <span class="waivers-meta">global cap {waiverGlobalCap}%</span>
+        {/if}
+      </div>
+      <ul class="waivers-list">
+        {#each waivers as w (w.benchmark)}
+          <li class="waiver tone-{waiverTone(w)}">
+            <span class="waiver-top">
+              <span class="waiver-name mono">{w.benchmark}</span>
+              <span class="waiver-cap mono">cap {w.max_time_percent}%</span>
+              <span class="waiver-when">
+                {#if w.expired}
+                  expired {Math.abs(w.days_remaining)}d ago
+                {:else if w.days_remaining === 0}
+                  expires today
+                {:else}
+                  {w.days_remaining}d left · {w.until}
+                {/if}
+              </span>
+            </span>
+            <span class="waiver-reason">{w.reason}</span>
+          </li>
+        {/each}
+      </ul>
+    </section>
   {/if}
 
   {#if disabled}
@@ -405,6 +467,55 @@
   }
   @keyframes tele-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .tele-spinner { animation-duration: 1.6s; } }
+
+  /* Benchmark waivers — same card anatomy as the press lane on Bolts. */
+  .waivers {
+    margin: var(--space-2) 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    overflow: hidden;
+  }
+  .waivers-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--bg-primary);
+  }
+  .waivers-tag {
+    font-size: var(--text-2xs); letter-spacing: var(--tracking-wide);
+    text-transform: uppercase; color: var(--accent); white-space: nowrap;
+  }
+  .waivers-meta {
+    font-size: var(--text-2xs); font-family: var(--font-mono);
+    color: var(--fg-muted); white-space: nowrap;
+  }
+  .waivers-list { margin: 0; padding: 0; list-style: none; }
+  .waiver {
+    display: flex; flex-direction: column; gap: 2px;
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+    border-left: 3px solid var(--tone);
+    --tone: var(--fg-tertiary);
+  }
+  .waiver:last-child { border-bottom: 0; }
+  .waiver.tone-ok { --tone: var(--success); }
+  .waiver.tone-warn { --tone: var(--warning); }
+  .waiver.tone-bad { --tone: var(--error); }
+  .waiver-top {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2);
+    font-size: var(--text-xs);
+  }
+  .waiver-name { color: var(--fg-primary); font-weight: 600; }
+  .waiver-cap { color: var(--fg-muted); font-size: var(--text-2xs); }
+  .waiver-when {
+    margin-left: auto; color: var(--tone);
+    font-size: var(--text-2xs); font-family: var(--font-mono); white-space: nowrap;
+  }
+  .waiver-reason {
+    font-size: var(--text-2xs); color: var(--text-muted); line-height: 1.45;
+  }
 
   .tele-body {
     display: flex;

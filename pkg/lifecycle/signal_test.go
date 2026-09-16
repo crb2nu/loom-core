@@ -134,3 +134,33 @@ func BenchmarkSetupSignalHandler(b *testing.B) {
 		_ = ctx
 	}
 }
+
+func TestDrainAdmissionAndRetainedWork(t *testing.T) {
+	var d Drain
+	if !d.Admit() || !d.Retain() {
+		t.Fatal("initial admission failed")
+	}
+	n, done := d.Begin()
+	if n != 2 || d.Admit() {
+		t.Fatal("drain must close admission atomically")
+	}
+	d.Release()
+	select {
+	case <-done:
+		t.Fatal("retained work lost")
+	default:
+	}
+	d.Release()
+	select {
+	case <-done:
+	default:
+		t.Fatal("drain did not complete")
+	}
+	if d.Retain() {
+		t.Fatal("completed drain reopened")
+	}
+	_, again := d.Begin()
+	if done != again {
+		t.Fatal("Begin is not idempotent")
+	}
+}

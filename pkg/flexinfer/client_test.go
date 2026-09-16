@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -98,6 +99,80 @@ func TestClient_CompleteSimple_ServerError(t *testing.T) {
 	}
 	if statusErr.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("expected status 500, got %d", statusErr.StatusCode)
+	}
+}
+
+func TestModelNotReadyClassifier(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "runtime pod starting", status: http.StatusServiceUnavailable, body: "Runtime pod is starting", want: true},
+		{name: "case and whitespace", status: http.StatusBadGateway, body: "RUNTIME  pod\n is\t STARTING; retry later", want: true},
+		{name: "JSON endpoint missing", status: http.StatusNotFound, body: `{"error":"no runtime endpoint found for model"}`, want: true},
+		{name: "endpoint not ready", status: http.StatusGatewayTimeout, body: `{"detail": "runtime endpoint is not ready"}`, want: true},
+		{name: "known message on client error", status: http.StatusBadRequest, body: "runtime pod is starting", want: false},
+		{name: "unrelated unavailable", status: http.StatusServiceUnavailable, body: "database is unavailable", want: false},
+		{name: "user text merely mentions runtime", status: http.StatusInternalServerError, body: "prompt contains runtime pod", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			statusErr := &HTTPStatusError{StatusCode: tt.status, Body: tt.body}
+			var err error = statusErr
+			if isModelNotReadyResponse(tt.status, tt.body) {
+				err = &ModelNotReadyError{HTTPError: statusErr}
+			}
+			wrapped := fmt.Errorf("caller: %w", err)
+			if got := errors.Is(wrapped, ErrModelNotReady); got != tt.want {
+				t.Fatalf("errors.Is(..., ErrModelNotReady) = %v, want %v", got, tt.want)
+			}
+			if got := IsModelNotReady(wrapped); got != tt.want {
+				t.Fatalf("IsModelNotReady(...) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClient_Complete_ModelNotReadyError(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       int
+		body         string
+		wantNotReady bool
+	}{
+		{name: "cold start", status: http.StatusServiceUnavailable, body: `{"error":"Runtime pod is starting"}`, wantNotReady: true},
+		{name: "ordinary HTTP error", status: http.StatusServiceUnavailable, body: `{"error":"maintenance"}`, wantNotReady: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "", 0, NewCircuitBreaker(5, time.Second), slog.Default())
+			_, err := client.Complete(context.Background(), ChatCompletionRequest{Model: "embedding-model"})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if got := errors.Is(err, ErrModelNotReady); got != tt.wantNotReady {
+				t.Fatalf("errors.Is(..., ErrModelNotReady) = %v, want %v: %v", got, tt.wantNotReady, err)
+			}
+
+			var statusErr *HTTPStatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != tt.status || statusErr.Body != tt.body {
+				t.Fatalf("HTTPStatusError not preserved: %#v", statusErr)
+			}
+			var notReadyErr *ModelNotReadyError
+			if got := errors.As(err, &notReadyErr); got != tt.wantNotReady {
+				t.Fatalf("errors.As(..., *ModelNotReadyError) = %v, want %v", got, tt.wantNotReady)
+			}
+		})
 	}
 }
 

@@ -831,6 +831,89 @@ func TestHandlePipelineRuns_TerminalHistory(t *testing.T) {
 	}
 }
 
+// TestHandlePipelineRuns_ByBacklogID covers the per-item read mode:
+// GET /api/mills/pipeline/runs?backlog_id=X returns every run spawned for
+// that item (terminal or not), newest-first, and never leaks other items'
+// runs. This is the drawer's "why is this item escalated?" cross-link, so
+// it must keep working after the runs age out of the 7d terminal window.
+func TestHandlePipelineRuns_ByBacklogID(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for _, id := range []string{"MILLS-BID", "MILLS-OTHER"} {
+		if err := op.store.Backlog.Put(ctx, &store.BacklogItem{
+			ID: id, Title: "b", State: store.BacklogRunning,
+			Priority: store.P2, CreatedBy: "test",
+		}); err != nil {
+			t.Fatalf("seed item %s: %v", id, err)
+		}
+	}
+	now := time.Now().UTC()
+	seed := func(id, backlogID string, st store.PipelineState, attempt int, started time.Time) {
+		t.Helper()
+		if err := op.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+			ID: id, BacklogID: backlogID, Template: "t", State: st,
+			Attempts: attempt, StartedAt: started,
+		}); err != nil {
+			t.Fatalf("seed run %s: %v", id, err)
+		}
+	}
+	// Two escalated runs older than the 7d terminal window plus one active —
+	// the exact mix the client-side intersection lost.
+	seed("BID-OLD", "MILLS-BID", store.PipelineEscalated, 1, now.Add(-30*24*time.Hour))
+	seed("BID-MID", "MILLS-BID", store.PipelineEscalated, 2, now.Add(-10*24*time.Hour))
+	seed("BID-ACTIVE", "MILLS-BID", store.PipelineImplementing, 3, now.Add(-5*time.Minute))
+	seed("OTHER-RUN", "MILLS-OTHER", store.PipelineDone, 1, now.Add(-1*time.Hour))
+
+	rec := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?backlog_id=MILLS-BID", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var runs []store.PipelineRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(runs) != 3 {
+		t.Fatalf("expected 3 runs for MILLS-BID, got %d (%+v)", len(runs), runs)
+	}
+	if runs[0].ID != "BID-ACTIVE" || runs[1].ID != "BID-MID" || runs[2].ID != "BID-OLD" {
+		t.Fatalf("order = [%s %s %s], want [BID-ACTIVE BID-MID BID-OLD]", runs[0].ID, runs[1].ID, runs[2].ID)
+	}
+
+	// limit= bounds the response, newest-first.
+	recLim := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(recLim, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?backlog_id=MILLS-BID&limit=1", nil))
+	if recLim.Code != http.StatusOK {
+		t.Fatalf("limit status: %d body=%s", recLim.Code, recLim.Body.String())
+	}
+	var limited []store.PipelineRun
+	if err := json.Unmarshal(recLim.Body.Bytes(), &limited); err != nil {
+		t.Fatalf("decode limited: %v", err)
+	}
+	if len(limited) != 1 || limited[0].ID != "BID-ACTIVE" {
+		t.Fatalf("limited = %+v, want just BID-ACTIVE", limited)
+	}
+
+	// Unknown item → empty JSON array, not null and not an error.
+	recNone := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(recNone, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?backlog_id=MILLS-NOPE", nil))
+	if recNone.Code != http.StatusOK {
+		t.Fatalf("unknown item status: %d body=%s", recNone.Code, recNone.Body.String())
+	}
+	if body := strings.TrimSpace(recNone.Body.String()); body != "[]" {
+		t.Fatalf("unknown item body = %q, want []", body)
+	}
+
+	// Bad limit → 400, same contract as the terminal branch.
+	recBad := httptest.NewRecorder()
+	op.httpMux().ServeHTTP(recBad, httptest.NewRequest(http.MethodGet, "/api/mills/pipeline/runs?backlog_id=MILLS-BID&limit=-3", nil))
+	if recBad.Code != http.StatusBadRequest {
+		t.Errorf("bad limit: got %d want 400", recBad.Code)
+	}
+}
+
 type recordingPipelineStarter struct {
 	calls int
 	runID string

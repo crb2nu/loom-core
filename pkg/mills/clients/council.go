@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -51,6 +52,9 @@ Brief:
 %s`, lens.Name, brief.Markdown)
 	out, resp, cost, providerReported, err := r.Client.chatCompletionResponseCostStatus(ctx, lens.Model, prompt, maxTokens, true)
 	cost, providerReported = knownRemoteCouncilCost(lens.Model, lens.Backend, resp, cost, providerReported)
+	// A timeout or transport error leaves no usage to price; charge the
+	// bounded worst case for this lens instead of the whole run reservation.
+	cost, providerReported = ceilingPricedAttempt(lens.Model, lens.Backend, prompt, maxTokens, cost, providerReported)
 	if err != nil {
 		return council.ReviewerOutput{
 			Lens: lens, CostUSD: cost,
@@ -121,6 +125,9 @@ func (e *FlexInferCouncilEditor) Edit(ctx context.Context, brief *council.Brief,
 	// runs that actually took multiple seconds.
 	started := time.Now().UTC()
 	raw, cost, providerReported, err := e.Client.chatCompletionCostStatus(ctx, e.Model, prompt, maxTokens, false)
+	// Same bounded-ceiling rule as the reviewer: a gateway-routed editor that
+	// times out is charged prompt + max_tokens at list price, not the run.
+	cost, providerReported = ceilingPricedAttempt(e.Model, e.backend(), prompt, maxTokens, cost, providerReported)
 	if err != nil {
 		backend := e.backend()
 		return &council.EditorOutput{
@@ -601,6 +608,7 @@ func (j *FlexInferEvalJudge) JudgeContradiction(ctx context.Context, in eval.Inp
 	prompt := buildContradictionPrompt(in)
 	raw, resp, cost, providerReported, err := j.Client.chatCompletionResponseCostStatus(ctx, j.Model, prompt, maxTokens, true)
 	cost, providerReported = j.knownRemoteJudgeCost(resp, cost, providerReported)
+	cost, providerReported = ceilingPricedAttempt(j.Model, j.backend(), prompt, maxTokens, cost, providerReported)
 	addEvalJudgeAttemptCost(&result, cost, providerReported)
 	if err != nil {
 		return result, err
@@ -627,6 +635,7 @@ func (j *FlexInferEvalJudge) JudgeContradiction(ctx context.Context, in eval.Inp
 	// A retry is independently billed; price its returned usage when LiteLLM
 	// omitted usage.cost just as for the initial attempt.
 	cost, providerReported = j.knownRemoteJudgeCost(retryResp, cost, providerReported)
+	cost, providerReported = ceilingPricedAttempt(j.Model, j.backend(), retryPrompt, retryTokens, cost, providerReported)
 	addEvalJudgeAttemptCost(&result, cost, providerReported)
 	if retryErr != nil {
 		return result, fmt.Errorf("flexinfer eval judge boosted retry: %w", retryErr)
@@ -677,6 +686,60 @@ func knownRemoteCouncilCost(model, backend string, resp *chatResponse, cost floa
 	return cost, false
 }
 
+// councilCeilingCharsPerToken is the conservative prompt-size→token ratio used
+// to price an attempt whose usage never came back. English + markdown runs
+// ~4 chars/token; 3 overestimates by design.
+const councilCeilingCharsPerToken = 3
+
+// unpricedAttemptCeilingUSD prices a paid council attempt that returned no
+// trustworthy usage — a client-side timeout, a transport error, or a body
+// without a usage block — from what the caller DID know before sending it:
+// the prompt and the completion cap, at the pinned ceiling rates. Only KNOWN
+// oa/ and or/ gateway models qualify; an unknown model returns false so the
+// runner keeps its whole-reservation fallback (aliases never inherit a rate).
+//
+// Why: an unpriced attempt used to consume the ENTIRE run reservation. A
+// single or/kimi-k3 reviewer timing out at the 90s lens deadline — a ~2K-token
+// prompt with a 384-token cap, worst case ≈ $0.02 — turned a $0.72 council run
+// into a $15.00 charge three times in four days (COUNCIL-2026-08-30-180032,
+// -08-31-000037, -09-02-000053), burning a third of the council's daily cap
+// per incident. The worst a timed-out call can bill is prompt + max_tokens at
+// list price, so that is what it is charged.
+func unpricedAttemptCeilingUSD(model, backend, prompt string, maxTokens int) (float64, bool) {
+	if isLocalCouncilBackend(backend) {
+		return 0, false
+	}
+	promptTokens := (len(prompt) + councilCeilingCharsPerToken - 1) / councilCeilingCharsPerToken
+	if maxTokens < 0 {
+		maxTokens = 0
+	}
+	if priced, ok := openAICouncilTokenCostUSD(model, promptTokens, 0, maxTokens); ok {
+		return priced, true
+	}
+	price, ok := lookupOpenRouterPrice(model)
+	if !ok {
+		return 0, false
+	}
+	return (float64(promptTokens)*price.InputPerMillion +
+		float64(maxTokens)*price.OutputPerMillion) / 1_000_000, true
+}
+
+// ceilingPricedAttempt resolves the (cost, providerReported) pair for a paid
+// attempt AFTER the usage-based fill (knownRemoteCouncilCost): when the
+// attempt is still unpriced on a known remote model, substitute the ceiling
+// — never less than any partial cost already known — and report it priced so
+// the run is not charged its full admission reservation.
+func ceilingPricedAttempt(model, backend, prompt string, maxTokens int, cost float64, providerReported bool) (float64, bool) {
+	if providerReported || isLocalCouncilBackend(backend) {
+		return cost, providerReported
+	}
+	ceiling, ok := unpricedAttemptCeilingUSD(model, backend, prompt, maxTokens)
+	if !ok {
+		return cost, providerReported
+	}
+	return math.Max(cost, ceiling), true
+}
+
 // openRouterCouncilTokenPrices pins deliberate price CEILINGS (well above the
 // providers' sticker rates) for the or/ OpenRouter council models, consumed
 // only when the gateway omits usage.cost. Overestimating keeps the accounting
@@ -694,7 +757,7 @@ func openRouterCouncilChatResponseCostUSD(model string, resp *chatResponse) (flo
 	if resp == nil {
 		return 0, false
 	}
-	price, ok := openRouterCouncilTokenPrices[strings.TrimSpace(model)]
+	price, ok := lookupOpenRouterPrice(model)
 	if !ok {
 		return 0, false
 	}

@@ -17,6 +17,7 @@ import (
 	domainctx "github.com/crb2nu/loom/internal/hud/domain/context"
 	coorddomain "github.com/crb2nu/loom/internal/hud/domain/coordinator"
 	"github.com/crb2nu/loom/internal/hud/domain/fleet"
+	domainforge "github.com/crb2nu/loom/internal/hud/domain/forge"
 	"github.com/crb2nu/loom/internal/hud/domain/graph"
 	"github.com/crb2nu/loom/internal/hud/domain/handoff"
 	"github.com/crb2nu/loom/internal/hud/domain/memory"
@@ -64,6 +65,10 @@ func (a *App) initDomainRegistry() {
 	register("handoff", handoff.New(&handoffDepsAdapter{app: a}))
 	register("plans", plans.New(&plansDepsAdapter{app: a}))
 	register("mills", domainmills.New(&millsDepsAdapter{app: a}))
+	// Forge: GitLab/GitHub identity, repo + group listing, project creation
+	// with a GitHub mirror, and GitHub→GitLab import — the intake side of
+	// Mills. Credentials resolve from env or the local glab/gh logins.
+	register("forge", domainforge.New(&forgeDepsAdapter{app: a}))
 	register("merge", domainmerge.New(&mergeDepsAdapter{app: a}))
 	register("mrwatch", domainmrwatch.New(&mrwatchDepsAdapter{app: a}))
 	register("shuttle", domainshuttle.New(&shuttleDepsAdapter{app: a}))

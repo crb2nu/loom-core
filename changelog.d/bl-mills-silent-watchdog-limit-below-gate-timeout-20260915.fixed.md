@@ -1,0 +1,1 @@
+- Derive the Mills stage silence limit from the larger of the policy timeout and the registered synchronous gate timeout, plus five minutes; refresh activity between completed gates and expose the effective limit in watchdog metrics (`pkg/mills/pipeline/{runner,dispatcher}.go`, `pkg/mills/clients/devbox.go`, `pkg/mills/metrics.go`, and their tests).

@@ -13,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -39,22 +40,26 @@ import (
 //   - CrossRepo off — operator opts in after 4 weeks of dogfooding.
 //   - Debate off (incident-only opt-in); Recursion off; AdaptivePolicy off.
 type Policy struct {
-	Version        int                `yaml:"version,omitempty"`
-	Enabled        *bool              `yaml:"enabled,omitempty"` // nil treated as enabled
-	Budgets        Budgets            `yaml:"budgets"`
-	Council        CouncilPolicy      `yaml:"council"`
-	Pipeline       PipelinePolicy     `yaml:"pipeline"`
-	HumanHandoff   HumanHandoffPolicy `yaml:"human_handoff"`
-	Squads         SquadsPolicy       `yaml:"squads,omitempty"`
-	Audit          AuditPolicy        `yaml:"audit,omitempty"`
-	CrossRepo      CrossRepoPolicy    `yaml:"cross_repo,omitempty"`
-	Debate         DebatePolicy       `yaml:"debate,omitempty"`
-	Recursion      RecursionPolicy    `yaml:"recursion,omitempty"`
-	AdaptivePolicy AdaptivePolicy     `yaml:"adaptive_policy,omitempty"`
-	Intake         IntakePolicy       `yaml:"intake,omitempty"`
-	Notify         NotifyPolicy       `yaml:"notify,omitempty"`
-	Workflows      WorkflowsPolicy    `yaml:"workflows,omitempty"`
-	SpinningRoom   SpinningRoomPolicy `yaml:"spinning_room,omitempty"`
+	Gates   GatesPolicy `yaml:"gates,omitempty"`
+	Version int         `yaml:"version,omitempty"`
+	Enabled *bool       `yaml:"enabled,omitempty"` // nil treated as enabled
+	// MaxConcurrentPipelines bounds simultaneous pipeline work admitted by
+	// the runner. Nil preserves the compiled default for older documents.
+	MaxConcurrentPipelines *int               `yaml:"max_concurrent_pipelines,omitempty"`
+	Budgets                Budgets            `yaml:"budgets"`
+	Council                CouncilPolicy      `yaml:"council"`
+	Pipeline               PipelinePolicy     `yaml:"pipeline"`
+	HumanHandoff           HumanHandoffPolicy `yaml:"human_handoff"`
+	Squads                 SquadsPolicy       `yaml:"squads,omitempty"`
+	Audit                  AuditPolicy        `yaml:"audit,omitempty"`
+	CrossRepo              CrossRepoPolicy    `yaml:"cross_repo,omitempty"`
+	Debate                 DebatePolicy       `yaml:"debate,omitempty"`
+	Recursion              RecursionPolicy    `yaml:"recursion,omitempty"`
+	AdaptivePolicy         AdaptivePolicy     `yaml:"adaptive_policy,omitempty"`
+	Intake                 IntakePolicy       `yaml:"intake,omitempty"`
+	Notify                 NotifyPolicy       `yaml:"notify,omitempty"`
+	Workflows              WorkflowsPolicy    `yaml:"workflows,omitempty"`
+	SpinningRoom           SpinningRoomPolicy `yaml:"spinning_room,omitempty"`
 	// Overseers gates the supervisory agents (groomer/sentinel/foreman);
 	// contract + accessors live in policy_overseers.go. Zero value = off.
 	Overseers OverseersPolicy `yaml:"overseers,omitempty"`
@@ -64,6 +69,82 @@ type Policy struct {
 	// rebasing stale heads onto the exact target tip and re-proving them
 	// before the merge PUT. Zero value = off, so rollout is a policy flip.
 	MergeQueue MergeQueuePolicy `yaml:"merge_queue,omitempty"`
+	// Health gates the factory health-plane poller. Omitted is deliberately
+	// disabled so upgrading the operator creates no timer or GitLab traffic.
+	Health HealthPolicy `yaml:"health,omitempty"`
+}
+
+// HealthPolicy configures the read-only GitLab main-pipeline detector.
+type HealthPolicy struct {
+	Enabled             bool             `yaml:"enabled,omitempty"`
+	PollIntervalSeconds int              `yaml:"poll_interval_seconds,omitempty"`
+	Project             string           `yaml:"project,omitempty"`
+	Ref                 string           `yaml:"ref,omitempty"`
+	OperatorBuiltAt     string           `yaml:"operator_built_at,omitempty"`
+	Flightdeck          FlightdeckPolicy `yaml:"flightdeck,omitempty"`
+	BaseRed             BaseRedPolicy    `yaml:"base_red,omitempty"`
+}
+
+const DefaultBaseRedThreshold = 90 * time.Minute
+
+// BaseRedPolicy holds code-producing backlog work while the default branch is
+// continuously red. The zero value is off so older policy documents retain
+// their exact admission behaviour.
+type BaseRedPolicy struct {
+	Enabled          bool   `yaml:"enabled,omitempty"`
+	Mode             string `yaml:"mode,omitempty"`
+	ThresholdMinutes int    `yaml:"threshold_minutes,omitempty"`
+}
+
+func (p BaseRedPolicy) Threshold() time.Duration {
+	if p.ThresholdMinutes > 0 {
+		return time.Duration(p.ThresholdMinutes) * time.Minute
+	}
+	return DefaultBaseRedThreshold
+}
+
+func (p BaseRedPolicy) Enforced() bool { return p.Enabled && p.Mode != "dry-log" }
+
+func (p BaseRedPolicy) Exempt(labels []string) bool {
+	for _, label := range labels {
+		switch strings.ToLower(strings.TrimSpace(label)) {
+		case "ci-fix", "remediation":
+			return true
+		}
+	}
+	return false
+}
+
+// FlightdeckPolicy gates best-effort Mills lifecycle export. Omitted is off.
+type FlightdeckPolicy struct {
+	Enabled        bool   `yaml:"enabled,omitempty"`
+	Endpoint       string `yaml:"endpoint,omitempty"`
+	Token          string `yaml:"token,omitempty"`
+	TimeoutSeconds int    `yaml:"timeout_seconds,omitempty"`
+	QueueSize      int    `yaml:"queue_size,omitempty"`
+}
+
+func (p FlightdeckPolicy) Timeout() time.Duration {
+	if p.TimeoutSeconds > 0 {
+		return time.Duration(p.TimeoutSeconds) * time.Second
+	}
+	return 2 * time.Second
+}
+
+// PollInterval returns the configured interval, or the conservative default.
+func (p HealthPolicy) PollInterval() time.Duration {
+	if p.PollIntervalSeconds > 0 {
+		return time.Duration(p.PollIntervalSeconds) * time.Second
+	}
+	return time.Minute
+}
+
+// RefName returns the configured health branch.
+func (p HealthPolicy) RefName() string {
+	if strings.TrimSpace(p.Ref) != "" {
+		return strings.TrimSpace(p.Ref)
+	}
+	return "main"
 }
 
 // MergeQueuePolicy configures the serial merge queue. Mirrors the
@@ -72,11 +153,32 @@ type Policy struct {
 // hot-reloaded onto a queue-capable binary keeps merges on the direct path.
 type MergeQueuePolicy struct {
 	Enabled bool `yaml:"enabled,omitempty"`
+	// MainRedExternalHoldMinutes bounds a classified external default-branch
+	// incident hold. Resolution and clamping live in pkg/policy.
+	MainRedExternalHoldMinutes int `yaml:"main_red_external_hold_minutes,omitempty"`
 	// MaxDepth bounds a lane's active entries. An enqueue past the bound is
 	// refused and the run escalates immediately with reason queue_full —
 	// backpressure surfaces instead of silently deepening the queue. Zero
 	// selects DefaultMergeQueueMaxDepth.
 	MaxDepth int `yaml:"max_depth,omitempty"`
+	// RequeueEvictions (shepherd A2, default OFF) re-enqueues a head_moved
+	// or ci_timeout eviction ONCE as an external candidate under the
+	// observed head, so a green MR whose waiting run is gone still lands
+	// through the queue's own proof path (external candidates merge only on
+	// a terminal successful pipeline for the head). One hop: a candidate the
+	// evictor itself produced is never re-requeued.
+	RequeueEvictions bool `yaml:"requeue_evictions,omitempty"`
+	// AwaitPipelineMinutes bounds how long a rebased head may wait for a
+	// terminal branch pipeline before the candidate is evicted ci_timeout.
+	// Zero selects the processor default (45 minutes). Raise it above the
+	// observed runner-queue latency: on 2026-09-10 CI queues sat 60–90
+	// minutes deep, every candidate timed out, and with requeue_evictions on
+	// each re-adoption rebased and launched another full pipeline — a loop
+	// that deepened the very queue that caused the timeout.
+	AwaitPipelineMinutes int `yaml:"await_pipeline_minutes,omitempty"`
+	// SpeculationDepth bounds successors pre-tested behind a running lane
+	// head. Zero disables speculation; values are clamped to MaxDepth.
+	SpeculationDepth int `yaml:"speculation_depth,omitempty"`
 }
 
 // DefaultMergeQueueMaxDepth bounds a merge-queue lane when the policy does
@@ -106,6 +208,8 @@ type SpinningRoomPolicy struct {
 	// and the audit label recorded on the plan; Model/Backend drive which
 	// council editor client the operator instantiates for the spin.
 	Frames []CouncilAgent `yaml:"frames,omitempty"`
+	// DefaultFallback is the remote hop inherited by frames without an override.
+	DefaultFallback *CouncilAgent `yaml:"default_fallback,omitempty" json:"default_fallback,omitempty"`
 	// DefaultPriority stamps the draft plan's warp-beam bucket when the
 	// operator doesn't pick one. Default "P2" (see SpinningRoomDefaultPriority).
 	DefaultPriority string `yaml:"default_priority,omitempty"`
@@ -257,29 +361,132 @@ type CanaryGCPolicy struct {
 }
 
 // GitLabIntake configures the GitLab issue importer (Slice 1a). The
-// importer polls the configured GitLab project on PollIntervalSeconds
+// importer polls the configured GitLab projects on PollIntervalSeconds
 // and creates a backlog item for each open issue carrying the
 // EligibleLabel that the operator hasn't already imported. Disabled by
 // default — opt in via configmap policy.intake.gitlab.enabled: true.
+// Projects is fail-closed: only listed repositories are polled; an empty
+// list preserves legacy behavior by polling only the operator home project.
 type GitLabIntake struct {
-	Enabled             bool   `yaml:"enabled,omitempty"`
-	EligibleLabel       string `yaml:"eligible_label,omitempty"`        // default "mills-eligible"
-	PollIntervalSeconds int    `yaml:"poll_interval_seconds,omitempty"` // default 300 (5min)
-	DefaultPriority     string `yaml:"default_priority,omitempty"`      // default "P2"
+	Enabled             bool     `yaml:"enabled,omitempty"`
+	EligibleLabel       string   `yaml:"eligible_label,omitempty"`        // default "mills-eligible"
+	PollIntervalSeconds int      `yaml:"poll_interval_seconds,omitempty"` // default 300 (5min)
+	DefaultPriority     string   `yaml:"default_priority,omitempty"`      // default "P2"
+	Projects            []string `yaml:"projects,omitempty"`
 }
 
 // Budgets holds per-tier spend limits.
 type Budgets struct {
 	Council  BudgetLimits `yaml:"council"`
 	Pipeline BudgetLimits `yaml:"pipeline"`
+	// ThroughputGuardrail bounds fleet-level shift KPIs. Zero values select
+	// the conservative compiled defaults through Effective().
+	ThroughputGuardrail ThroughputGuardrailThresholds `yaml:"throughput_guardrail,omitempty"`
+	// ModelPrices lets policy price a model the compiled tables do not know
+	// (a new frontier tier the day it ships, a gateway alias) or correct a
+	// list price without an image deploy. Keyed by the exact model id the
+	// policy routes ("claude-fable-5-1", "gpt-6-astra", "or/kimi-k3"). A row
+	// here wins over the compiled table for the same id. Pricing a model is
+	// not cosmetic: an unpriced council/spin model loses the per-attempt
+	// ceiling and charges its whole run reservation on a timeout.
+	ModelPrices map[string]ModelPriceOverride `yaml:"model_prices,omitempty"`
+}
+
+// ThroughputGuardrailThresholds are advisory shift-report limits. They do not
+// stop admission; they make degraded throughput explicit to operators.
+type ThroughputGuardrailThresholds struct {
+	MaxEscalationRate           float64 `yaml:"max_escalation_rate,omitempty"`
+	MaxCostPerMergedPipelineUSD float64 `yaml:"max_cost_per_merged_pipeline_usd,omitempty"`
+	MaxScopeQueueAgeSeconds     float64 `yaml:"max_scope_queue_age_seconds,omitempty"`
+	MaxStarvedQueues            int     `yaml:"max_starved_queues,omitempty"`
+}
+
+var DefaultThroughputGuardrailThresholds = ThroughputGuardrailThresholds{
+	MaxEscalationRate: .25, MaxCostPerMergedPipelineUSD: 5,
+	MaxScopeQueueAgeSeconds: 6 * 60 * 60, MaxStarvedQueues: 0,
+}
+
+// Effective fills omitted thresholds with defaults. MaxStarvedQueues is
+// intentionally allowed to be zero: any starvation reservation is unhealthy.
+func (t ThroughputGuardrailThresholds) Effective() ThroughputGuardrailThresholds {
+	d := DefaultThroughputGuardrailThresholds
+	if t.MaxEscalationRate > 0 {
+		d.MaxEscalationRate = t.MaxEscalationRate
+	}
+	if t.MaxCostPerMergedPipelineUSD > 0 {
+		d.MaxCostPerMergedPipelineUSD = t.MaxCostPerMergedPipelineUSD
+	}
+	if t.MaxScopeQueueAgeSeconds > 0 {
+		d.MaxScopeQueueAgeSeconds = t.MaxScopeQueueAgeSeconds
+	}
+	if t.MaxStarvedQueues > 0 {
+		d.MaxStarvedQueues = t.MaxStarvedQueues
+	}
+	return d
+}
+
+// ModelPriceOverride is one policy-supplied price row. USD per million
+// tokens. Provider selects the price table it overlays: "anthropic"
+// (Messages API: cached_input = cache read, cache_write optional and
+// defaulting to 1.25× input), "openai" (Responses / LiteLLM oa/ rates), or
+// "openrouter" (or/ ceilings). A missing cached_input charges cache reads at
+// the full input rate — conservative by construction.
+type ModelPriceOverride struct {
+	Provider              string  `yaml:"provider"`
+	InputPerMillion       float64 `yaml:"input_per_million"`
+	CachedInputPerMillion float64 `yaml:"cached_input_per_million,omitempty"`
+	CacheWritePerMillion  float64 `yaml:"cache_write_per_million,omitempty"`
+	OutputPerMillion      float64 `yaml:"output_per_million"`
+}
+
+// modelPriceProviders mirrors clients.ModelPriceProviders; kept as a literal
+// here so the policy package stays free of a clients import.
+var modelPriceProviders = map[string]bool{"anthropic": true, "openai": true, "openrouter": true}
+
+// ModelPriceOverrides returns a copy of budgets.model_prices (nil when none).
+func (p *Policy) ModelPriceOverrides() map[string]ModelPriceOverride {
+	if p == nil || len(p.Budgets.ModelPrices) == 0 {
+		return nil
+	}
+	out := make(map[string]ModelPriceOverride, len(p.Budgets.ModelPrices))
+	for k, v := range p.Budgets.ModelPrices {
+		out[k] = v
+	}
+	return out
+}
+
+func validateModelPrices(rows map[string]ModelPriceOverride) error {
+	for id, row := range rows {
+		if !validModelToken(id) {
+			return fmt.Errorf("budgets.model_prices: %q is not a valid model id", id)
+		}
+		provider := strings.ToLower(strings.TrimSpace(row.Provider))
+		if !modelPriceProviders[provider] {
+			return fmt.Errorf("budgets.model_prices[%s].provider must be one of anthropic, openai, openrouter; got %q", id, row.Provider)
+		}
+		if row.InputPerMillion <= 0 || row.OutputPerMillion <= 0 {
+			return fmt.Errorf("budgets.model_prices[%s]: input_per_million and output_per_million must be > 0", id)
+		}
+		if row.CachedInputPerMillion < 0 || row.CacheWritePerMillion < 0 {
+			return fmt.Errorf("budgets.model_prices[%s]: cache rates must be >= 0", id)
+		}
+	}
+	return nil
 }
 
 // BudgetLimits captures one tier's caps. Zero values disable that specific cap.
 type BudgetLimits struct {
-	MaxUSDPerRun      float64 `yaml:"max_usd_per_run"`
-	MaxUSDPerDay      float64 `yaml:"max_usd_per_day"`
-	MaxConcurrentRuns int     `yaml:"max_concurrent_runs,omitempty"`
-	MaxRunsPerDay     int     `yaml:"max_runs_per_day,omitempty"`
+	MaxUSDPerRun float64 `yaml:"max_usd_per_run"`
+	// MaxUSDPerDay caps METERED spend only: dollars an API account is billed.
+	// Subscription turns (Claude Code / Codex under the cluster OAuth
+	// accounts) and local inference are excluded — see store.BillingClass.
+	MaxUSDPerDay float64 `yaml:"max_usd_per_day"`
+	// MaxSubscriptionUSDPerDay optionally caps the list-price equivalent of
+	// subscription turns per rolling day, so a runaway harness stops before
+	// the vendor's rate limits do. Zero (the default) leaves it uncapped.
+	MaxSubscriptionUSDPerDay float64 `yaml:"max_subscription_usd_per_day,omitempty"`
+	MaxConcurrentRuns        int     `yaml:"max_concurrent_runs,omitempty"`
+	MaxRunsPerDay            int     `yaml:"max_runs_per_day,omitempty"`
 }
 
 // CouncilPolicy bounds the planning tier.
@@ -383,26 +590,148 @@ type CouncilEnsemble struct {
 	// Editor.Backend is a remote provider. A remote frontier model id is
 	// never deployable on the flexinfer tier, so the fallback must not
 	// inherit it. Empty resolves to the flexinfer client's weaver chain.
-	EditorFallbackModel string         `yaml:"editor_fallback_model,omitempty"`
-	Reviewers           []CouncilAgent `yaml:"reviewers"`
-	Judge               CouncilAgent   `yaml:"judge,omitempty"`
+	EditorFallbackModel string `yaml:"editor_fallback_model,omitempty"`
+	// EditorFallback optionally names a REMOTE cross-vendor editor tried
+	// between the primary and the local flexinfer fallback when Editor.Backend
+	// is a frontier provider: anthropic → openai (or the reverse). It exists
+	// because the two failure modes a primary hits most — a billing hold
+	// ("credit balance is too low", 2026-09-07 ×3 runs) or a provider outage
+	// — are vendor-scoped, so the other vendor is the fallback most likely to
+	// still produce a frontier-quality plan. Omitted resolves through
+	// EditorCrossVendorFallback (an anthropic primary defaults to
+	// DefaultEditorCrossVendorFallback; any other primary has no default).
+	// `backend: none` disables the cross-vendor hop explicitly. The hop is
+	// skipped at build time when the vendor's API key is absent, so a policy
+	// naming it never hard-fails a deployment without that key.
+	EditorFallback CouncilAgent   `yaml:"editor_fallback,omitempty"`
+	Reviewers      []CouncilAgent `yaml:"reviewers"`
+	Judge          CouncilAgent   `yaml:"judge,omitempty"`
+}
+
+// DefaultEditorCrossVendorFallback is the remote editor an anthropic-backed
+// council editor falls back to when policy leaves editor_fallback unset. gpt-5.5
+// is priced in pkg/llmpricing (an unpriced model loses the per-attempt ceiling)
+// and is already the Spinning Room "mule" frame, so it carries no new pricing
+// or credential surface.
+var DefaultEditorCrossVendorFallback = CouncilAgent{Model: "gpt-5.5", Backend: "openai"}
+
+// editorBackendVendor collapses the accepted remote editor backend spellings
+// into a vendor label ("anthropic", "openai") so the cross-vendor rule can
+// compare like with like. Local/unknown backends return "".
+func editorBackendVendor(backend string) string {
+	switch strings.ToLower(strings.TrimSpace(backend)) {
+	case "anthropic", "claude":
+		return "anthropic"
+	case "openai", "openai-responses":
+		return "openai"
+	case "openrouter":
+		return "openrouter"
+	default:
+		return ""
+	}
+}
+
+// EditorCrossVendorFallback returns the remote editor the council editor
+// chain tries between the primary and the local flexinfer fallback, and
+// whether one applies. The explicit policy pin wins; `backend: none` opts out;
+// an omitted pin defaults an anthropic primary to
+// DefaultEditorCrossVendorFallback and leaves every other primary without a
+// cross-vendor hop. A pin whose vendor matches the primary's is rejected here
+// (same billing account, same outage — it would only double the failure) so
+// callers never build an anthropic→anthropic chain.
+func (e CouncilEnsemble) EditorCrossVendorFallback() (CouncilAgent, bool) {
+	primaryVendor := editorBackendVendor(e.Editor.Backend)
+	if primaryVendor == "" {
+		return CouncilAgent{}, false
+	}
+	pin := e.EditorFallback
+	if strings.EqualFold(strings.TrimSpace(pin.Backend), "none") {
+		return CouncilAgent{}, false
+	}
+	if strings.TrimSpace(pin.Model) == "" {
+		if primaryVendor != "anthropic" {
+			return CouncilAgent{}, false
+		}
+		pin = DefaultEditorCrossVendorFallback
+	}
+	if v := editorBackendVendor(pin.Backend); v == "" || v == primaryVendor {
+		return CouncilAgent{}, false
+	}
+	return pin, true
+}
+
+// SpinningRoomFallback resolves frame override, room default, then council policy.
+// Council defaults are evaluated against the frame's vendor so mixed rooms work.
+func (p *Policy) SpinningRoomFallback(frame CouncilAgent) (CouncilAgent, bool) {
+	if p == nil {
+		return CouncilAgent{}, false
+	}
+	pin := p.Council.Ensemble.EditorFallback
+	if p.SpinningRoom.DefaultFallback != nil {
+		pin = *p.SpinningRoom.DefaultFallback
+	}
+	if frame.Fallback != nil {
+		pin = *frame.Fallback
+	}
+	return (CouncilEnsemble{Editor: frame, EditorFallback: pin}).EditorCrossVendorFallback()
+}
+
+func validateEditorFallback(fb CouncilAgent, primary, path string) error {
+	backend, model := strings.ToLower(strings.TrimSpace(fb.Backend)), strings.TrimSpace(fb.Model)
+	switch {
+	case backend == "" && model == "":
+		return nil
+	case backend == "none":
+		if model != "" {
+			return fmt.Errorf("%s: backend none takes no model", path)
+		}
+	case editorBackendVendor(backend) == "":
+		return fmt.Errorf("%s.backend %q must be anthropic, claude, openai, openai-responses, openrouter, or none", path, fb.Backend)
+	case model == "":
+		return fmt.Errorf("%s.model is required when editor_fallback.backend is set", path)
+	case editorBackendVendor(backend) == editorBackendVendor(primary):
+		return fmt.Errorf("%s.backend %q is the same vendor as editor.backend %q; a cross-vendor fallback must name the other provider", path, fb.Backend, primary)
+	}
+	return nil
 }
 
 // CouncilAgent identifies one council participant.
 type CouncilAgent struct {
-	Name    string `yaml:"name,omitempty"`
-	Model   string `yaml:"model"`
-	Backend string `yaml:"backend"`
+	// Fallback overrides the spinning-room remote hop; nil inherits policy.
+	Fallback *CouncilAgent `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+	Name     string        `yaml:"name,omitempty"`
+	Model    string        `yaml:"model"`
+	Backend  string        `yaml:"backend"`
 }
 
 // PipelinePolicy bounds the execution tier.
 type PipelinePolicy struct {
-	DefaultTemplate        string          `yaml:"default_template"`
-	PerLabelOverrides      []LabelOverride `yaml:"per_label_overrides,omitempty"`
-	ProtectedPaths         []string        `yaml:"protected_paths,omitempty"`
-	Retry                  RetryPolicy     `yaml:"retry"`
-	AutoRevertOnRegression bool            `yaml:"auto_revert_on_regression,omitempty"`
-	CIWatch                CIWatchPolicy   `yaml:"ci_watch,omitempty"`
+	DefaultTemplate   string          `yaml:"default_template"`
+	PerLabelOverrides []LabelOverride `yaml:"per_label_overrides,omitempty"`
+	ProtectedPaths    []string        `yaml:"protected_paths,omitempty"`
+
+	// ProtectedPathsPerRepo replaces ProtectedPaths for pipeline runs targeting
+	// a specific repo
+	// (BacklogItem.TargetProject — the cross-repo lane). Keys are project
+	// identifiers, bucket-qualified ("services/flexdeck") or bare
+	// ("flexdeck"), matched case-insensitively via store.SameRepo; values are
+	// doublestar globs evaluated against repo-relative paths in the TARGET
+	// repo's layout. An explicitly empty list therefore means that the target
+	// has no protected paths. Known targets without an entry inherit the global
+	// list; unknown foreign targets fail closed.
+	// An item with an empty TargetProject (home-repo item) never consults the
+	// overlay. Hot-reloads via PolicyManager like the rest of this section;
+	// older operator images lenient-decode past the unknown key.
+	ProtectedPathsPerRepo map[string][]string `yaml:"protected_paths_per_repo,omitempty"`
+
+	// PerRepoOverrides narrows execution policy for a target repository. An
+	// absent entry preserves the global/item/label behaviour. Boolean pointers
+	// distinguish an omitted setting from an explicit false value.
+	PerRepoOverrides map[string]RepoExecutionOverride `yaml:"per_repo_overrides,omitempty"`
+
+	Retry                  RetryPolicy   `yaml:"retry"`
+	AutoRevertOnRegression bool          `yaml:"auto_revert_on_regression,omitempty"`
+	CIWatch                CIWatchPolicy `yaml:"ci_watch,omitempty"`
 
 	// RankerEnabled flips the dispatch order from the store's
 	// FIFO-within-priority to the heuristic DispatchRanker (W3.2): queued
@@ -411,7 +740,10 @@ type PipelinePolicy struct {
 	// work most likely to merge. Default-off (unset = FIFO-within-priority);
 	// the ranker is a strict refinement, so flipping it on never reorders
 	// across priority bands. Hot-reloads via PolicyManager.
-	RankerEnabled bool `yaml:"ranker_enabled,omitempty"`
+	RankerEnabled             bool    `yaml:"ranker_enabled,omitempty"`
+	RankerTimeoutMilliseconds int     `yaml:"ranker_timeout_milliseconds,omitempty"`
+	RankerMaxCandidates       int     `yaml:"ranker_max_candidates,omitempty"`
+	RankerMaxCost             float64 `yaml:"ranker_max_cost,omitempty"`
 
 	// SerializeOverlappingScopes gates the reconciler's scope-overlap
 	// dispatch guard (pkg/mills/scope_overlap.go): a queued item defers
@@ -496,10 +828,20 @@ type PipelinePolicy struct {
 	// time (issue #382, the 2026-07-25 codex websocket 503s).
 	SpawnBreaker SpawnBreakerPolicy `yaml:"spawn_breaker,omitempty"`
 
+	// AutonomyHoldMinutes bounds transient capability holds (0 uses 30m; max 24h).
+	AutonomyHoldMinutes int `yaml:"autonomy_hold_minutes,omitempty"`
+
 	// ScopeAmendment configures the runtime scope auto-amendment the runner
 	// applies when the ONLY failing gate at post_implement_gate is `scope`
 	// (see ScopeAmendmentPolicy). Default-ON.
 	ScopeAmendment ScopeAmendmentPolicy `yaml:"scope_amendment,omitempty"`
+
+	// TestsBaselineOracle (shepherd B3, default OFF) re-runs the FAILED
+	// subset of a tests-stage gate against the bare main checkout: a check
+	// that also fails without the change is an environment/baseline problem
+	// and classifies as infrastructure instead of burning code-class
+	// attempts. Costs one extra devbox call, only on failure.
+	TestsBaselineOracle bool `yaml:"tests_baseline_oracle,omitempty"`
 
 	// StageModels selects the vendor-native LLM model id each spawn-driven
 	// stage's agent CLI runs — e.g. "gpt-5.6-terra" for the codex implementer
@@ -537,7 +879,18 @@ type PipelinePolicy struct {
 }
 
 type CIWatchPolicy struct {
-	FlakyJobs []string `yaml:"flaky_jobs,omitempty"`
+	FlakyJobs           []string `yaml:"flaky_jobs,omitempty"`
+	MaxWallClockMinutes int      `yaml:"max_wall_clock_minutes,omitempty"`
+}
+
+// MaxWallClock resolves the independent ceiling for watching one CI pipeline.
+// Zero keeps the backwards-compatible three-session (90 minute) default.
+func (p CIWatchPolicy) MaxWallClock() time.Duration {
+	minutes := p.MaxWallClockMinutes
+	if minutes <= 0 {
+		minutes = 90
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 // SerializeOverlappingScopesEnabled resolves the *bool with its default-on
@@ -550,6 +903,9 @@ func (p PipelinePolicy) SerializeOverlappingScopesEnabled() bool {
 // ScopeFairnessPolicy bounds writer-preference for repeatedly scope-blocked
 // backlog items. It is default-on because it is the liveness half of scope
 // serialization; an explicit enabled:false restores the legacy admission path.
+// Reservations only delay equal or lower priority work while their owner is
+// otherwise eligible and clear of active scopes. Inactivity preserves aging;
+// the existing maximum hold duration still releases and resets a reservation.
 type ScopeFairnessPolicy struct {
 	Enabled              *bool `yaml:"enabled,omitempty"`
 	DeferralThreshold    int   `yaml:"deferral_threshold,omitempty"`
@@ -644,6 +1000,55 @@ type AutoRequeuePolicy struct {
 	// must have NO prior auto-requeue of any class (code/config retries are
 	// one-shot). Default off.
 	IncludeCodeConfig bool `yaml:"include_code_config,omitempty"`
+	// Release governs recovery-triggered requeues. These bypass unattended
+	// retry counters because the failed substrate, rather than the item, healed.
+	Release SubstrateReleasePolicy `yaml:"release,omitempty"`
+}
+
+const substrateReleaseDefaultMaxPerSweep = 10
+
+// substrateReleaseDefaultSignatures maps a failure-signature token to the
+// operator capability whose red→green edge should release the escalation.
+// Each token names a distinct capability: the devbox quality gate is reached
+// through the hub session (its 2026-09-05 outages — the sandbox rebuild
+// loop, the shared-child websocket close — showed up as mcp_hub_session red,
+// not as spawn-pool trouble), spawn pod readiness is the HUD spawn pool, and
+// ci_watch poll timeouts are GitLab.
+var substrateReleaseDefaultSignatures = map[string]string{
+	"sandbox_build":   "mcp_hub_session",
+	"spawn_infra":     "hud_spawn",
+	"ci_poll_timeout": "gitlab",
+	"mcp_hub_session": "mcp_hub_session",
+}
+
+// SubstrateReleasePolicy controls release of escalations after a capability's
+// red window closes. Enabled is default-on; maps are signature prefix/token to
+// capability name, permitting operators to extend the built-in vocabulary.
+type SubstrateReleasePolicy struct {
+	Enabled               *bool             `yaml:"enabled,omitempty"`
+	MaxPerSweep           int               `yaml:"max_per_sweep,omitempty"`
+	EligibleClasses       []string          `yaml:"eligible_classes,omitempty"`
+	SignatureCapabilities map[string]string `yaml:"signature_capabilities,omitempty"`
+}
+
+func (p SubstrateReleasePolicy) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+func (p SubstrateReleasePolicy) SweepCap() int {
+	if p.MaxPerSweep > 0 {
+		return p.MaxPerSweep
+	}
+	return substrateReleaseDefaultMaxPerSweep
+}
+func (p SubstrateReleasePolicy) Classes() []string {
+	if len(p.EligibleClasses) > 0 {
+		return p.EligibleClasses
+	}
+	return []string{autoRequeueClassTransient, autoRequeueClassInfra, autoRequeueClassTransientQuota}
+}
+func (p SubstrateReleasePolicy) SignatureMap() map[string]string {
+	if len(p.SignatureCapabilities) > 0 {
+		return p.SignatureCapabilities
+	}
+	return substrateReleaseDefaultSignatures
 }
 
 // AutoRequeueEnabled resolves the *bool with default-ON semantics (nil ==
@@ -1060,6 +1465,15 @@ type LabelOverride struct {
 	HumanReview bool   `yaml:"human_review"`
 }
 
+// RepoExecutionOverride is a fail-safe, narrowing overlay for one repository.
+// Zero budget values leave the corresponding global cap unchanged.
+type RepoExecutionOverride struct {
+	AutoMerge          *bool   `yaml:"auto_merge,omitempty"`
+	RequireHumanReview *bool   `yaml:"require_human_review,omitempty"`
+	MaxUSDPerRun       float64 `yaml:"max_usd_per_run,omitempty"`
+	MaxRunsPerDay      int     `yaml:"max_runs_per_day,omitempty"`
+}
+
 // RetryPolicy controls how the pipeline retries failed stages.
 //
 // MaxAttempts caps "real" failures (Code + Infra error classes per
@@ -1249,8 +1663,9 @@ func Default() *Policy {
 		Version: 2,
 		Enabled: &enabled,
 		Budgets: Budgets{
-			Council:  BudgetLimits{MaxUSDPerRun: 15, MaxUSDPerDay: 50},
-			Pipeline: BudgetLimits{MaxUSDPerRun: 5, MaxUSDPerDay: 75, MaxConcurrentRuns: 4, MaxRunsPerDay: 20},
+			Council:             BudgetLimits{MaxUSDPerRun: 15, MaxUSDPerDay: 50},
+			Pipeline:            BudgetLimits{MaxUSDPerRun: 5, MaxUSDPerDay: 75, MaxConcurrentRuns: 4, MaxRunsPerDay: 20},
+			ThroughputGuardrail: DefaultThroughputGuardrailThresholds,
 		},
 		Council: CouncilPolicy{
 			ScheduleCron:           "0 */6 * * *",
@@ -1271,7 +1686,7 @@ func Default() *Policy {
 			// Default-ON with the conservative built-in caps (10m cooldown,
 			// 2/item, 6/day). Explicit here so `Default()` and an omitted
 			// `auto_requeue:` block resolve to the same enabled sweep.
-			AutoRequeue: AutoRequeuePolicy{Enabled: boolPtr(true)},
+			AutoRequeue: AutoRequeuePolicy{Enabled: boolPtr(true), Release: SubstrateReleasePolicy{Enabled: boolPtr(true)}},
 			// Default-ON with the built-in depth/file caps, so `Default()` and
 			// an omitted `scope_amendment:` block resolve identically (see
 			// ScopeAmendmentPolicy.Enabled for why this section inverts the
@@ -1358,6 +1773,73 @@ func ParsePolicy(data []byte) (*Policy, error) {
 	return &p, nil
 }
 
+// GatesPolicy configures the dissent second opinion independently of the primary judge.
+type GatesPolicy struct {
+	Tiebreaker GateTiebreakerPolicy `yaml:"tiebreaker,omitempty"`
+}
+
+type GateJudgeHop struct {
+	Backend string `yaml:"backend"`
+	Model   string `yaml:"model"`
+}
+
+type GateTiebreakerPolicy struct {
+	Backend string `yaml:"backend,omitempty"`
+	Model   string `yaml:"model,omitempty"`
+	// Nil selects defaults; an explicitly empty list disables fallback.
+	Fallbacks []GateJudgeHop `yaml:"fallbacks"`
+}
+
+// Hops resolves defaults without mutating policy. flexModel is the local
+// client's resolved model, so gateway-only model aliases cannot leak to it.
+func (p GateTiebreakerPolicy) Hops(flexModel string) []GateJudgeHop {
+	backend := strings.ToLower(strings.TrimSpace(p.Backend))
+	if backend == "" {
+		backend = "anthropic"
+	}
+	hops := []GateJudgeHop{{Backend: backend, Model: p.Model}}
+	if p.Fallbacks == nil {
+		hops = append(hops, GateJudgeHop{Backend: "openai", Model: "gpt-5.5"}, GateJudgeHop{Backend: "flexinfer", Model: flexModel})
+	} else {
+		hops = append(hops, p.Fallbacks...)
+	}
+	for i := range hops {
+		h := &hops[i]
+		h.Backend = strings.ToLower(strings.TrimSpace(h.Backend))
+		h.Model = strings.TrimSpace(h.Model)
+		if h.Model == "" {
+			switch h.Backend {
+			case "anthropic":
+				h.Model = "claude-sonnet-5"
+			case "openai":
+				h.Model = "gpt-5.5"
+			case "flexinfer":
+				h.Model = flexModel
+			}
+		}
+	}
+	return hops
+}
+
+func (p GateTiebreakerPolicy) Validate() error {
+	previous := ""
+	for i, h := range p.Hops("local-judge") {
+		switch h.Backend {
+		case "anthropic", "openai", "openrouter", "flexinfer":
+		default:
+			return fmt.Errorf("gates.tiebreaker hop %d: unsupported backend %q", i, h.Backend)
+		}
+		if h.Backend == "openrouter" && h.Model == "" {
+			return fmt.Errorf("gates.tiebreaker hop %d: openrouter requires a model", i)
+		}
+		if h.Backend == previous {
+			return fmt.Errorf("gates.tiebreaker hop %d: consecutive vendor %q", i, h.Backend)
+		}
+		previous = h.Backend
+	}
+	return nil
+}
+
 // Validate enforces the rules a malformed policy must trip on.
 //
 // Version handling: 0 (omitted) is treated as legacy v1 — pre-Phase-7
@@ -1368,17 +1850,56 @@ func (p *Policy) Validate() error {
 	if p == nil {
 		return errors.New("policy is nil")
 	}
+	if err := p.Gates.Tiebreaker.Validate(); err != nil {
+		return err
+	}
 	switch p.Version {
 	case 0, 1, 2:
 		// 0 = omitted; treat as legacy v1.
 	default:
 		return fmt.Errorf("unsupported policy version %d (supported: 1, 2)", p.Version)
 	}
+	if _, err := basepolicy.ResolvePipelineConcurrencyLimit(p.MaxConcurrentPipelines); err != nil {
+		return err
+	}
+	if p.Health.PollIntervalSeconds < 0 {
+		return errors.New("health.poll_interval_seconds must be >= 0")
+	}
+	if p.Health.Enabled && strings.TrimSpace(p.Health.Project) == "" {
+		return errors.New("health.project is required when health is enabled")
+	}
+	if p.Health.BaseRed.ThresholdMinutes < 0 {
+		return errors.New("health.base_red.threshold_minutes must be >= 0")
+	}
+	if p.Health.BaseRed.Enabled {
+		switch p.Health.BaseRed.Mode {
+		case "", "enforce", "dry-log":
+		default:
+			return errors.New("health.base_red.mode must be enforce or dry-log")
+		}
+	}
+	if p.Health.Flightdeck.TimeoutSeconds < 0 {
+		return errors.New("health.flightdeck.timeout_seconds must be >= 0")
+	}
+	if p.Health.Flightdeck.QueueSize < 0 {
+		return errors.New("health.flightdeck.queue_size must be >= 0")
+	}
+	if p.Health.Flightdeck.Enabled && (strings.TrimSpace(p.Health.Flightdeck.Endpoint) == "" || strings.TrimSpace(p.Health.Flightdeck.Token) == "") {
+		return errors.New("health.flightdeck.endpoint and health.flightdeck.token are required when flightdeck is enabled")
+	}
 	if err := validateBudget("council", p.Budgets.Council); err != nil {
 		return err
 	}
 	if err := validateBudget("pipeline", p.Budgets.Pipeline); err != nil {
 		return err
+	}
+	if err := validateModelPrices(p.Budgets.ModelPrices); err != nil {
+		return err
+	}
+	if t := p.Budgets.ThroughputGuardrail; t.MaxEscalationRate < 0 || t.MaxEscalationRate > 1 {
+		return errors.New("budgets.throughput_guardrail.max_escalation_rate must be in [0,1]")
+	} else if t.MaxCostPerMergedPipelineUSD < 0 || t.MaxScopeQueueAgeSeconds < 0 || t.MaxStarvedQueues < 0 {
+		return errors.New("budgets.throughput_guardrail thresholds must be >= 0")
 	}
 	if p.Council.ArtifactsMergeStrategy != "" {
 		switch p.Council.ArtifactsMergeStrategy {
@@ -1402,6 +1923,12 @@ func (p *Policy) Validate() error {
 	if p.Pipeline.Retry.CooldownSeconds < 0 {
 		return errors.New("pipeline.retry.cooldown_seconds must be >= 0")
 	}
+	if p.Pipeline.CIWatch.MaxWallClockMinutes < 0 {
+		return errors.New("pipeline.ci_watch.max_wall_clock_minutes must be >= 0")
+	}
+	if p.Pipeline.RankerTimeoutMilliseconds < 0 || p.Pipeline.RankerMaxCandidates < 0 || p.Pipeline.RankerMaxCost < 0 {
+		return errors.New("pipeline ranker bounds must be >= 0")
+	}
 	if p.Pipeline.ScopeFairness.DeferralThreshold < 0 || p.Pipeline.ScopeFairness.AgeThresholdHours < 0 || p.Pipeline.ScopeFairness.ReservationHoldHours < 0 {
 		return errors.New("pipeline.scope_fairness thresholds must be >= 0")
 	}
@@ -1414,6 +1941,63 @@ func (p *Policy) Validate() error {
 		if !doublestar.ValidatePattern(gp) {
 			return fmt.Errorf("pipeline.protected_paths[%d] %q is not a valid glob", i, gp)
 		}
+	}
+	seenOverlayRepos := make(map[string]string, len(p.Pipeline.ProtectedPathsPerRepo))
+	for key, globs := range p.Pipeline.ProtectedPathsPerRepo {
+		base, ok := normalizedRepoKey(key)
+		if !ok {
+			return fmt.Errorf("pipeline.protected_paths_per_repo: key %q does not name a repo", key)
+		}
+		// Two keys naming the same repo ("flexdeck" and "services/flexdeck")
+		// would make the effective overlay depend on map iteration order.
+		if prev, dup := seenOverlayRepos[base]; dup {
+			return fmt.Errorf("pipeline.protected_paths_per_repo: keys %q and %q name the same repo", prev, key)
+		}
+		seenOverlayRepos[base] = key
+		for i, gp := range globs {
+			if !doublestar.ValidatePattern(gp) {
+				return fmt.Errorf("pipeline.protected_paths_per_repo[%s][%d] %q is not a valid glob", key, i, gp)
+			}
+		}
+	}
+	seenExecutionRepos := make(map[string]string, len(p.Pipeline.PerRepoOverrides))
+	for key, override := range p.Pipeline.PerRepoOverrides {
+		base, ok := normalizedRepoKey(key)
+		if !ok {
+			return fmt.Errorf("pipeline.per_repo_overrides: key %q does not name a repo", key)
+		}
+		if prev, dup := seenExecutionRepos[base]; dup {
+			return fmt.Errorf("pipeline.per_repo_overrides: keys %q and %q name the same repo", prev, key)
+		}
+		seenExecutionRepos[base] = key
+		if override.MaxUSDPerRun < 0 {
+			return fmt.Errorf("pipeline.per_repo_overrides[%s].max_usd_per_run must be >= 0", key)
+		}
+		if override.MaxRunsPerDay < 0 {
+			return fmt.Errorf("pipeline.per_repo_overrides[%s].max_runs_per_day must be >= 0", key)
+		}
+	}
+	seenKnownRepos := make(map[string]string, len(p.CrossRepo.DemandProjects))
+	for _, key := range p.CrossRepo.DemandProjects {
+		base, ok := normalizedRepoKey(key)
+		if !ok {
+			return fmt.Errorf("cross_repo.demand_projects: entry %q does not name a repo", key)
+		}
+		if prev, dup := seenKnownRepos[base]; dup {
+			return fmt.Errorf("cross_repo.demand_projects: entries %q and %q name the same repo", prev, key)
+		}
+		seenKnownRepos[base] = key
+	}
+	seenIntakeRepos := make(map[string]string, len(p.Intake.GitLab.Projects))
+	for _, key := range p.Intake.GitLab.Projects {
+		base, ok := normalizedRepoKey(key)
+		if !ok {
+			return fmt.Errorf("intake.gitlab.projects: entry %q does not name a repo", key)
+		}
+		if prev, dup := seenIntakeRepos[base]; dup {
+			return fmt.Errorf("intake.gitlab.projects: entries %q and %q name the same repo", prev, key)
+		}
+		seenIntakeRepos[base] = key
 	}
 	for stage, sub := range p.Pipeline.StageSubstrate {
 		if _, ok := StageSubstrateKeysValid[stage]; !ok {
@@ -1445,6 +2029,9 @@ func (p *Policy) Validate() error {
 	if err := validateAutoRequeue(p.Pipeline.AutoRequeue); err != nil {
 		return err
 	}
+	if p.Pipeline.AutonomyHoldMinutes < 0 || p.Pipeline.AutonomyHoldMinutes > 1440 {
+		return errors.New("pipeline.autonomy_hold_minutes must be between 0 and 1440")
+	}
 	if err := validateSpawnBreaker(p.Pipeline.SpawnBreaker); err != nil {
 		return err
 	}
@@ -1454,9 +2041,32 @@ func (p *Policy) Validate() error {
 	if err := validateOverseers(p.Overseers); err != nil {
 		return err
 	}
+	if strings.EqualFold(strings.TrimSpace(p.Council.Ensemble.Editor.Backend), "openrouter") && strings.TrimSpace(p.Council.Ensemble.Editor.Model) == "" {
+		return errors.New("council.ensemble.editor.model is required for openrouter")
+	}
 	if p.Council.Ensemble.Editor.Model != "" && p.Council.Ensemble.Editor.Backend == "" {
 		return errors.New("council.ensemble.editor.backend is required when editor.model is set")
 	}
+	if err := validateEditorFallback(p.Council.Ensemble.EditorFallback, p.Council.Ensemble.Editor.Backend, "council.ensemble.editor_fallback"); err != nil {
+		return err
+	}
+	if fb := p.SpinningRoom.DefaultFallback; fb != nil {
+		if err := validateEditorFallback(*fb, "", "spinning_room.default_fallback"); err != nil {
+			return err
+		}
+	}
+	for i, frame := range p.SpinningRoom.Frames {
+		fb := frame.Fallback
+		if fb == nil {
+			fb = p.SpinningRoom.DefaultFallback
+		}
+		if fb != nil {
+			if err := validateEditorFallback(*fb, frame.Backend, fmt.Sprintf("spinning_room.frames[%d].fallback", i)); err != nil {
+				return err
+			}
+		}
+	}
+
 	for i, r := range p.Council.Ensemble.Reviewers {
 		if r.Model == "" || r.Backend == "" {
 			return fmt.Errorf("council.ensemble.reviewers[%d] requires both model and backend", i)
@@ -1492,6 +2102,19 @@ func (p *Policy) Validate() error {
 	return nil
 }
 
+func normalizedRepoKey(project string) (string, bool) {
+	if project == "" || project != strings.TrimSpace(project) || strings.ContainsAny(project, " \t\r\n") {
+		return "", false
+	}
+	parts := strings.Split(project, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", false
+		}
+	}
+	return strings.ToLower(parts[len(parts)-1]), true
+}
+
 // validateAutoRequeue bounds the auto-requeue caps. Values must be
 // non-negative (0 means "use the default", resolved by the accessors) and
 // within sane ceilings so a fat-fingered policy cannot disable the sweep by
@@ -1521,6 +2144,20 @@ func validateAutoRequeue(a AutoRequeuePolicy) error {
 	}
 	if a.PerDayMax > autoRequeueMaxPerDay {
 		return fmt.Errorf("pipeline.auto_requeue.per_day_max (%d) exceeds the max of %d", a.PerDayMax, autoRequeueMaxPerDay)
+	}
+	if a.Release.MaxPerSweep < 0 || a.Release.MaxPerSweep > 100 {
+		return errors.New("pipeline.auto_requeue.release.max_per_sweep must be between 0 and 100")
+	}
+	knownClasses := map[string]bool{"transient": true, "infra": true, "transient_quota": true}
+	for _, class := range a.Release.Classes() {
+		if !knownClasses[strings.ToLower(strings.TrimSpace(class))] {
+			return fmt.Errorf("pipeline.auto_requeue.release.eligible_classes contains unknown class %q", class)
+		}
+	}
+	for signature, capability := range a.Release.SignatureMap() {
+		if strings.TrimSpace(signature) == "" || strings.TrimSpace(capability) == "" {
+			return errors.New("pipeline.auto_requeue.release.signature_capabilities requires non-empty signatures and capabilities")
+		}
 	}
 	return nil
 }
@@ -1561,6 +2198,9 @@ func validateBudget(tier string, b BudgetLimits) error {
 	if b.MaxUSDPerRun > 0 && b.MaxUSDPerDay > 0 && b.MaxUSDPerRun > b.MaxUSDPerDay {
 		return fmt.Errorf("budgets.%s.max_usd_per_run (%v) exceeds max_usd_per_day (%v)", tier, b.MaxUSDPerRun, b.MaxUSDPerDay)
 	}
+	if b.MaxSubscriptionUSDPerDay < 0 {
+		return fmt.Errorf("budgets.%s.max_subscription_usd_per_day must be >= 0", tier)
+	}
 	if b.MaxConcurrentRuns < 0 {
 		return fmt.Errorf("budgets.%s.max_concurrent_runs must be >= 0", tier)
 	}
@@ -1582,6 +2222,13 @@ func (p *Policy) IsEnabled() bool {
 	return *p.Enabled
 }
 
+// TestsBaselineOracleEnabled reports whether the tests-stage baseline oracle
+// (rerun-without-patch, shepherd B3) should run. Nil-safe; folds the kill
+// switch.
+func (p *Policy) TestsBaselineOracleEnabled() bool {
+	return p != nil && p.IsEnabled() && p.Pipeline.TestsBaselineOracle
+}
+
 // MergeQueueEnabled reports whether the serial merge queue should act.
 // Nil-safe, defaults to false, and folds in the global kill switch: a frozen
 // mills must also freeze the queue processor (entries stay durably queued).
@@ -1592,12 +2239,40 @@ func (p *Policy) MergeQueueEnabled() bool {
 	return p.IsEnabled() && p.MergeQueue.Enabled
 }
 
+// MergeQueueRequeueEvictions reports whether the queue's eviction re-enqueue
+// hop (shepherd A2) is enabled: master enable AND queue enable AND the flag.
+func (p *Policy) MergeQueueRequeueEvictions() bool {
+	return p.MergeQueueEnabled() && p.MergeQueue.RequeueEvictions
+}
+
 // MergeQueueMaxDepth returns the effective lane depth bound.
 func (p *Policy) MergeQueueMaxDepth() int {
 	if p == nil || p.MergeQueue.MaxDepth <= 0 {
 		return DefaultMergeQueueMaxDepth
 	}
 	return p.MergeQueue.MaxDepth
+}
+
+// MergeQueueAwaitPipeline returns the policy's pipeline wait bound for a
+// rebased head, or zero when the policy does not set one — the processor
+// then applies its own default.
+func (p *Policy) MergeQueueAwaitPipeline() time.Duration {
+	if p == nil || p.MergeQueue.AwaitPipelineMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(p.MergeQueue.AwaitPipelineMinutes) * time.Minute
+}
+
+// MergeQueueSpeculationDepth returns the bounded, opt-in speculative depth.
+func (p *Policy) MergeQueueSpeculationDepth() int {
+	if p == nil || p.MergeQueue.SpeculationDepth <= 0 {
+		return 0
+	}
+	d := p.MergeQueue.SpeculationDepth
+	if max := p.MergeQueueMaxDepth(); d > max {
+		return max
+	}
+	return d
 }
 
 // SquadsEnabled reports whether v2 squad routing is on. Nil-safe and
@@ -2033,6 +2708,10 @@ func (p *Policy) SpinningRoomFrames() []CouncilAgent {
 		if strings.TrimSpace(f.Name) == "" {
 			continue
 		}
+		if f.Fallback != nil {
+			fallback := *f.Fallback
+			f.Fallback = &fallback
+		}
 		out = append(out, f)
 	}
 	if len(out) == 0 {
@@ -2095,11 +2774,197 @@ func (p *Policy) LabelOverrideFor(labels []string) (LabelOverride, bool) {
 // ProtectedPathsHit returns the subset of input paths that match any pattern
 // in pipeline.protected_paths. Used by the path-policy gate to decide whether
 // an item must require human review regardless of its label policy.
+// Target-repo-agnostic: equivalent to ProtectedPathsHitFor with an empty
+// target project (home-repo semantics — global globs only, no per-repo
+// overlay). Callers that hold a backlog item should prefer
+// ProtectedPathsHitFor with the item's TargetProject so cross-repo runs are
+// judged against the target repo's own protected surface.
 func (p *Policy) ProtectedPathsHit(paths []string) []string {
+	return p.ProtectedPathsHitFor("", paths)
+}
+
+// ProtectedPathsFor returns the effective protected-path glob list for a run.
+// A matching per-repo entry replaces the global list. Unknown foreign targets
+// return a match-all rule so legacy, errorless callers fail closed; new callers
+// should use ResolveProtectedPaths and surface its error.
+func (p *Policy) ProtectedPathsFor(targetProject string) []string {
+	paths, err := p.ResolveProtectedPaths(targetProject)
+	if err != nil {
+		// Legacy callers cannot return an error. Matching every path preserves
+		// the resolver's fail-closed contract until they can surface one.
+		return []string{"**"}
+	}
+	return paths
+}
+
+// ResolveProtectedPaths resolves the replacement overlay for targetProject.
+// Empty identifies the home repository. A foreign repository is known when it
+// appears in cross_repo.demand_projects or has an explicit overlay.
+func (p *Policy) ResolveProtectedPaths(targetProject string) ([]string, error) {
+	if p == nil {
+		return nil, errors.New("protected paths: nil policy")
+	}
+	global := p.Pipeline.ProtectedPaths
+	target := strings.TrimSpace(targetProject)
+	if target == "" {
+		return global, nil
+	}
+	for key, overlay := range p.Pipeline.ProtectedPathsPerRepo {
+		if !store.SameRepo(key, target) {
+			continue
+		}
+		return overlay, nil
+	}
+	for _, known := range p.CrossRepo.DemandProjects {
+		if store.SameRepo(known, target) {
+			return global, nil
+		}
+	}
+	// Runtime-registered repos (the bootstrapped_projects registry: minted by
+	// the operator or onboarded from the HUD) are known too — but only under
+	// the same two-key gate that lets them source demand. Without this a
+	// registered repo could be woven yet every path it touched matched the
+	// fail-closed "**" overlay, sending every run to human review.
+	if p.CrossRepo.Enabled && p.CrossRepo.AllowBootstrapped {
+		if fn := runtimeKnownProjects.Load(); fn != nil {
+			for _, known := range (*fn)() {
+				if store.SameRepo(known, target) {
+					return global, nil
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("protected paths: unknown target repository %q", target)
+}
+
+// runtimeKnownProjects is the operator-supplied source of runtime-registered
+// foreign projects consulted by ResolveProtectedPaths. A Policy is an
+// immutable snapshot with no store access, so the registry reaches it through
+// this process-wide hook rather than a field. Nil until the operator wires it.
+var runtimeKnownProjects atomic.Pointer[func() []string]
+
+// SetRuntimeKnownProjects installs (or clears, with nil) the runtime source of
+// registered foreign projects. The operator wires it to a cached read of the
+// bootstrapped_projects registry at boot. Cheap to call on every resolve is
+// the caller's contract — cache accordingly.
+func SetRuntimeKnownProjects(fn func() []string) {
+	if fn == nil {
+		runtimeKnownProjects.Store(nil)
+		return
+	}
+	runtimeKnownProjects.Store(&fn)
+}
+
+// ProtectedPathsHitFor returns the subset of input paths matching the
+// effective protected-path globs for a run targeting targetProject (see
+// ProtectedPathsFor). This is the item-aware form every consumer that holds a
+// BacklogItem should use — the global-only ProtectedPathsHit misses the
+// target repo's own protected surface on cross-repo runs.
+func (p *Policy) ProtectedPathsHitFor(targetProject string, paths []string) []string {
 	if p == nil {
 		return nil
 	}
-	return ProtectedPathsMatch(p.Pipeline.ProtectedPaths, paths)
+	return ProtectedPathsMatch(p.ProtectedPathsFor(targetProject), paths)
+}
+
+// PerRepoOverrideFor returns the execution overlay for targetProject. Empty
+// targetProject identifies homeProject, matching BacklogItem routing.
+func (p *Policy) PerRepoOverrideFor(targetProject, homeProject string) (RepoExecutionOverride, bool) {
+	if p == nil {
+		return RepoExecutionOverride{}, false
+	}
+	target := strings.TrimSpace(targetProject)
+	if target == "" {
+		target = strings.TrimSpace(homeProject)
+	}
+	if target == "" {
+		return RepoExecutionOverride{}, false
+	}
+	for key, override := range p.Pipeline.PerRepoOverrides {
+		if store.SameRepo(key, target) {
+			return override, true
+		}
+	}
+	return RepoExecutionOverride{}, false
+}
+
+// RequiresHumanReview reports whether item's effective policy withholds it
+// from autonomous admission — either the item's own require_human_review flag
+// or the per-repo override for its target. The reason names which rail fired,
+// in the wording the reconciler records on its reconciler.skipped event, so
+// the tryStart gate and the /api/mills/status queue_held_human count cannot
+// disagree about what "held for a human" means.
+func (p *Policy) RequiresHumanReview(item *store.BacklogItem, homeProject string) (bool, string) {
+	if item == nil {
+		return false, ""
+	}
+	if item.Policy.RequireHumanReview {
+		return true, "require_human_review=true"
+	}
+	if override, ok := p.PerRepoOverrideFor(item.TargetProject, homeProject); ok &&
+		override.RequireHumanReview != nil && *override.RequireHumanReview {
+		return true, "per-repo override require_human_review=true"
+	}
+	return false, ""
+}
+
+// PipelineBudgetLimitsFor applies the target repo's narrowing caps to the
+// global pipeline limits. A zero overlay cap means no additional restriction.
+func (p *Policy) PipelineBudgetLimitsFor(targetProject, homeProject string) BudgetLimits {
+	if p == nil {
+		return BudgetLimits{}
+	}
+	limits := p.Budgets.Pipeline
+	if override, ok := p.PerRepoOverrideFor(targetProject, homeProject); ok {
+		limits.MaxUSDPerRun = narrowerFloatCap(limits.MaxUSDPerRun, override.MaxUSDPerRun)
+		limits.MaxRunsPerDay = narrowerIntCap(limits.MaxRunsPerDay, override.MaxRunsPerDay)
+	}
+	return limits
+}
+
+// PerRepoRunCapFor returns the additional repository-scoped daily cap. The
+// boolean is false when the repository does not configure one, so callers do
+// not accidentally reinterpret the global cap as a per-repository cap.
+func (p *Policy) PerRepoRunCapFor(targetProject, homeProject string) (int, bool) {
+	if p == nil {
+		return 0, false
+	}
+	override, ok := p.PerRepoOverrideFor(targetProject, homeProject)
+	if !ok || override.MaxRunsPerDay <= 0 {
+		return 0, false
+	}
+	return narrowerIntCap(p.Budgets.Pipeline.MaxRunsPerDay, override.MaxRunsPerDay), true
+}
+
+// AutoMergeFor resolves item and label intent, then applies the per-repo
+// narrowing rail. A repo true value is deliberately non-authorizing.
+func (p *Policy) AutoMergeFor(targetProject, homeProject string, itemIntent bool, labels []string) bool {
+	if p == nil {
+		return false
+	}
+	if override, ok := p.PerRepoOverrideFor(targetProject, homeProject); ok &&
+		override.AutoMerge != nil && !*override.AutoMerge {
+		return false
+	}
+	if itemIntent {
+		return true
+	}
+	override, ok := p.LabelOverrideFor(labels)
+	return ok && override.AutoMerge
+}
+
+func narrowerFloatCap(global, repo float64) float64 {
+	if repo > 0 && (global <= 0 || repo < global) {
+		return repo
+	}
+	return global
+}
+
+func narrowerIntCap(global, repo int) int {
+	if repo > 0 && (global <= 0 || repo < global) {
+		return repo
+	}
+	return global
 }
 
 // CooldownDuration is a typed accessor around RetryPolicy.CooldownSeconds.
@@ -2108,4 +2973,24 @@ func (r RetryPolicy) CooldownDuration() time.Duration {
 		return 0
 	}
 	return time.Duration(r.CooldownSeconds) * time.Second
+}
+
+// MergeQueueMainRedExternalHold returns the bounded external-CI hold policy.
+func (p *Policy) MergeQueueMainRedExternalHold() basepolicy.MainRedExternalHoldPolicy {
+	if p == nil {
+		return basepolicy.MainRedExternalHoldPolicy{}
+	}
+	return basepolicy.MainRedExternalHoldPolicy{HoldMinutes: p.MergeQueue.MainRedExternalHoldMinutes}
+}
+
+// AutonomyHoldDuration resolves the bounded hold window even for unvalidated policies.
+func (p PipelinePolicy) AutonomyHoldDuration() time.Duration {
+	minutes := p.AutonomyHoldMinutes
+	if minutes <= 0 {
+		minutes = 30
+	}
+	if minutes > 1440 {
+		minutes = 1440
+	}
+	return time.Duration(minutes) * time.Minute
 }

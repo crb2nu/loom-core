@@ -1,0 +1,1 @@
+- Guard Mills backlog scope declarations against changelog fragment overlap, reject directory paths, and report broad directory envelopes in post and amendment results (cmd/mcp-mills/tools.go, cmd/mcp-mills/main.go, cmd/mcp-mills/main_test.go, and mcp/context/registry.yaml).

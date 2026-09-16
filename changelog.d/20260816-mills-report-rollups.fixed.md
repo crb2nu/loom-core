@@ -1,0 +1,1 @@
+- Materialize Mills evaluation and overseer reports in durable keyed snapshots, moving event-window aggregation to a bounded periodic writer and making HTTP report reads snapshot-only (`pkg/mills/eval`, `pkg/mills/store`, `cmd/loom-mills-operator`).

@@ -1,0 +1,1 @@
+- Fix Mills parity-lint baseline oracle scoping and classify exit-7 zero-finding loader/typechecker errors as degraded infrastructure in `pkg/mills/pipeline/dispatcher.go` and `pkg/mills/gates/lint_parity.go`.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 VOYAGER_BASE_URL = "https://www.linkedin.com/voyager/api"
 VOYAGER_HEALTH_PATH = "/me"
 MAX_WARNING_LEN = 240
+MAX_STORAGE_STATE_BACKUPS = 5
 
 
 def _err(msg: str, state: str = "error", warnings: list[str] | None = None) -> None:
@@ -81,7 +83,10 @@ def _sanitize_error_message(raw: str) -> str:
     if not raw:
         return ""
     lower = raw.lower()
-    if _contains_any(lower, ["max redirect count exceeded", "err_too_many_redirects", "too many redirects"]):
+    if _contains_any(
+        lower,
+        ["max redirect count exceeded", "err_too_many_redirects", "too many redirects"],
+    ):
         return "voyager request redirect loop (max redirect count exceeded)"
     if "execution context was destroyed" in lower:
         return "voyager request failed: execution context was destroyed"
@@ -125,9 +130,14 @@ def _classify_state(page, has_li_at: bool) -> str:
 
 def _classify_exception_state(err: Exception) -> str:
     msg = str(err).lower()
-    if _contains_any(msg, ["err_too_many_redirects", "max redirect count exceeded", "too many redirects"]):
+    if _contains_any(
+        msg,
+        ["err_too_many_redirects", "max redirect count exceeded", "too many redirects"],
+    ):
         return "logged_out"
-    if _contains_any(msg, ["checkpoint", "challenge", "captcha", "security verification"]):
+    if _contains_any(
+        msg, ["checkpoint", "challenge", "captcha", "security verification"]
+    ):
         return "challenge"
     if _contains_any(msg, ["login", "authwall", "session expired"]):
         return "logged_out"
@@ -158,7 +168,9 @@ def _parse_json_maybe(text: str):
         return None
 
 
-def _voyager_probe(context, method: str, path: str, body, jsessionid: str, timeout_ms: int) -> dict:
+def _voyager_probe(
+    context, method: str, path: str, body, jsessionid: str, timeout_ms: int
+) -> dict:
     method = (method or "GET").upper()
     if not path.startswith("/"):
         path = "/" + path
@@ -222,7 +234,16 @@ def _classify_voyager_state(probe: dict) -> str:
     if 300 <= status < 400:
         return "logged_out"
     if status == 0:
-        if _contains_any(error, ["err_too_many_redirects", "max redirect count exceeded", "too many redirects", "login", "authwall"]):
+        if _contains_any(
+            error,
+            [
+                "err_too_many_redirects",
+                "max redirect count exceeded",
+                "too many redirects",
+                "login",
+                "authwall",
+            ],
+        ):
             return "logged_out"
         return _classify_exception_state(Exception(error or "voyager request failed"))
     if 200 <= status < 300:
@@ -239,6 +260,137 @@ def _classify_voyager_state(probe: dict) -> str:
     return "unknown"
 
 
+def _build_payload(
+    state: str,
+    final_url: str,
+    li_at: str,
+    jsid: str,
+    warnings: list[str],
+    probe: dict | None,
+) -> dict:
+    payload = {
+        "ok": True,
+        "state": state,
+        "final_url": final_url,
+        "has_li_at": bool(li_at),
+        "has_jsessionid": bool(jsid),
+        "li_at": li_at,
+        "jsessionid": jsid,
+        "warnings": warnings,
+    }
+    if probe is not None:
+        payload["http_status"] = int(probe.get("status") or 0)
+        payload["response_url"] = str(probe.get("url") or "")
+        payload["response_headers"] = probe.get("headers") or {}
+
+        response_text = str(probe.get("text") or "")
+        response_json = _parse_json_maybe(response_text)
+        if response_json is not None:
+            payload["response_json"] = response_json
+        elif response_text:
+            payload["response_text"] = response_text
+    return payload
+
+
+def _prune_storage_state_backups(
+    storage_state_path: Path, keep: int = MAX_STORAGE_STATE_BACKUPS
+) -> None:
+    # Timestamped names sort chronologically; pruning is best-effort.
+    try:
+        backups = sorted(
+            storage_state_path.parent.glob(storage_state_path.name + ".*.bak")
+        )
+        for stale in backups[: max(len(backups) - keep, 0)]:
+            stale.unlink()
+    except Exception:
+        pass
+
+
+def _backup_storage_state(storage_state_path: Path, warnings: list[str]) -> Path | None:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    backup_path = storage_state_path.with_name(f"{storage_state_path.name}.{stamp}.bak")
+    try:
+        shutil.copy2(storage_state_path, backup_path)
+    except Exception as backup_err:
+        warnings.append(
+            _sanitize_error_message(
+                f"storage state backup failed; keeping persisted state in place: {backup_err}"
+            )
+        )
+        return None
+    warnings.append(f"backed up persisted browser session state to {backup_path}")
+    _prune_storage_state_backups(storage_state_path)
+    return backup_path
+
+
+def _clear_storage_state(
+    storage_state_path: Path, backup_path: Path | None, warnings: list[str]
+) -> None:
+    if backup_path is None:
+        # Never destroy session state that could not be backed up.
+        warnings.append(
+            "persisted browser session state left in place: no backup available"
+        )
+        return
+    try:
+        storage_state_path.unlink(missing_ok=True)
+        warnings.append(
+            f"cleared persisted browser session state before recovery (backup: {backup_path.name})"
+        )
+    except Exception as storage_err:
+        warnings.append(
+            _sanitize_error_message(f"storage state cleanup warning: {storage_err}")
+        )
+
+
+def _attempt_persisted_session(
+    mgr,
+    session_id: str,
+    session_token: str,
+    jsessionid: str,
+    timeout_ms: int,
+    warnings: list[str],
+) -> dict | None:
+    """Probe the persisted browser session before silent recovery may destroy it.
+
+    Returns a completed response payload when the persisted state still passes the
+    voyager probe, or None when recovery should continue with a fresh login.
+    """
+    try:
+        with mgr.new_context(session_id=session_id) as context:
+            _seed_missing_cookies(context, session_token, jsessionid)
+            li_at = _extract_cookie_value(context, "li_at")
+            jsid = _extract_cookie_value(context, "JSESSIONID").strip('"')
+            probe = _voyager_probe(
+                context,
+                method="GET",
+                path=VOYAGER_HEALTH_PATH,
+                body=None,
+                jsessionid=jsid,
+                timeout_ms=timeout_ms,
+            )
+            state = _classify_voyager_state(probe)
+            if state == "healthy":
+                warnings.append(
+                    "silent recovery reused persisted browser session state (voyager probe healthy)"
+                )
+                return _build_payload(
+                    state=state,
+                    final_url=str(probe.get("url") or ""),
+                    li_at=li_at,
+                    jsid=jsid,
+                    warnings=warnings,
+                    probe=probe,
+                )
+            warnings.append(
+                f"persisted browser session state failed voyager probe (state={state})"
+            )
+            return None
+    except Exception as reuse_err:
+        _append_warning(warnings, f"persisted session probe warning: {reuse_err}")
+        return None
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         _err("expected a single JSON argument")
@@ -251,12 +403,6 @@ def main(argv: list[str]) -> int:
     except Exception as e:
         _err(f"invalid JSON request: {e}")
         return 2
-
-    try:
-        from browser_kit.browser import BrowserConfig, BrowserManager
-    except Exception as e:
-        _err(str(e))
-        return 3
 
     action = str(req.get("action") or "health").strip().lower()
     mode = str(req.get("mode") or "silent").strip().lower()
@@ -281,12 +427,31 @@ def main(argv: list[str]) -> int:
         Path(storage_dir).mkdir(parents=True, exist_ok=True)
 
     pre_warnings: list[str] = []
+
+    storage_state_path: Path | None = None
+    storage_backup_path: Path | None = None
+    if action == "recover" and storage_dir:
+        candidate = Path(storage_dir) / f"{session_id}.json"
+        if candidate.exists():
+            # Snapshot up front: recovery must never destroy the only copy of a
+            # possibly-still-valid session (context exit rewrites this file too).
+            storage_state_path = candidate
+            storage_backup_path = _backup_storage_state(candidate, pre_warnings)
+
+    try:
+        from browser_kit.browser import BrowserConfig, BrowserManager
+    except Exception as e:
+        _err(str(e), warnings=pre_warnings)
+        return 3
+
     if stealth:
         try:
             import playwright_stealth  # noqa: F401
         except Exception:
             stealth = False
-            pre_warnings.append("playwright-stealth not installed; proceeding with stealth disabled")
+            pre_warnings.append(
+                "playwright-stealth not installed; proceeding with stealth disabled"
+            )
 
     cfg = BrowserConfig(
         headless=headless,
@@ -299,16 +464,25 @@ def main(argv: list[str]) -> int:
     )
 
     mgr = BrowserManager(cfg)
-    if action == "recover" and storage_dir:
-        storage_state_path = Path(storage_dir) / f"{session_id}.json"
-        try:
-            if storage_state_path.exists():
-                storage_state_path.unlink()
-                pre_warnings.append("cleared persisted browser session state before recovery")
-        except Exception as storage_err:
-            pre_warnings.append(_sanitize_error_message(f"storage state cleanup warning: {storage_err}"))
 
     try:
+        if action == "recover" and storage_state_path is not None:
+            if mode != "interactive":
+                # Silent recovery: the persisted state may still be valid even when
+                # a health check misfired, so probe it before clearing anything.
+                reuse_payload = _attempt_persisted_session(
+                    mgr,
+                    session_id=session_id,
+                    session_token=session_token,
+                    jsessionid=jsessionid,
+                    timeout_ms=timeout_ms,
+                    warnings=pre_warnings,
+                )
+                if reuse_payload is not None:
+                    sys.stdout.write(json.dumps(reuse_payload) + "\n")
+                    return 0
+            _clear_storage_state(storage_state_path, storage_backup_path, pre_warnings)
+
         with mgr.new_context(session_id=session_id) as context:
             warnings: list[str] = list(pre_warnings)
             page = context.new_page()
@@ -323,10 +497,14 @@ def main(argv: list[str]) -> int:
                 login_nav_warning = ""
                 state = "logged_out"
                 try:
-                    page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    page.goto(
+                        login_url, wait_until="domcontentloaded", timeout=timeout_ms
+                    )
                 except Exception as login_nav_err:
                     login_nav_warning = str(login_nav_err)
-                    _append_warning(warnings, f"login navigation warning: {login_nav_warning}")
+                    _append_warning(
+                        warnings, f"login navigation warning: {login_nav_warning}"
+                    )
 
                 if not login_nav_warning:
                     if mode == "interactive":
@@ -334,16 +512,22 @@ def main(argv: list[str]) -> int:
                         if username:
                             try:
                                 if page.locator("#username").count() > 0:
-                                    page.locator("#username").fill(username, timeout=5000)
+                                    page.locator("#username").fill(
+                                        username, timeout=5000
+                                    )
                             except Exception:
                                 warnings.append("username field not found")
                         if password:
                             try:
                                 if page.locator("#password").count() > 0:
-                                    page.locator("#password").fill(password, timeout=5000)
+                                    page.locator("#password").fill(
+                                        password, timeout=5000
+                                    )
                             except Exception:
                                 warnings.append("password field not found")
-                        warnings.append("interactive recovery: complete login/checkpoint in browser window")
+                        warnings.append(
+                            "interactive recovery: complete login/checkpoint in browser window"
+                        )
                         state = _wait_for_post_login_state(page, timeout_ms)
                     else:
                         # Silent mode attempts best-effort credentialed login.
@@ -359,12 +543,16 @@ def main(argv: list[str]) -> int:
                                 warnings.append("password field not found")
                         if username and password:
                             try:
-                                page.locator("button[type='submit']").first.click(timeout=5000)
+                                page.locator("button[type='submit']").first.click(
+                                    timeout=5000
+                                )
                                 page.wait_for_timeout(1800)
                             except Exception:
                                 warnings.append("login submit button not found")
                         page.wait_for_timeout(1200)
-                        state = _classify_state(page, bool(_extract_cookie_value(context, "li_at")))
+                        state = _classify_state(
+                            page, bool(_extract_cookie_value(context, "li_at"))
+                        )
                 else:
                     state = _classify_exception_state(Exception(login_nav_warning))
                 li_at = _extract_cookie_value(context, "li_at")
@@ -388,11 +576,15 @@ def main(argv: list[str]) -> int:
                     state = _classify_state(page, bool(li_at))
 
                 if initial_nav_warning:
-                    _append_warning(warnings, f"initial navigation warning: {initial_nav_warning}")
+                    _append_warning(
+                        warnings, f"initial navigation warning: {initial_nav_warning}"
+                    )
 
             probe = None
             if action in ("health", "recover", "voyager_request"):
-                probe_path = request_path if action == "voyager_request" else VOYAGER_HEALTH_PATH
+                probe_path = (
+                    request_path if action == "voyager_request" else VOYAGER_HEALTH_PATH
+                )
                 probe_method = request_method if action == "voyager_request" else "GET"
                 probe_body = request_body if action == "voyager_request" else None
 
@@ -416,29 +608,14 @@ def main(argv: list[str]) -> int:
                         f"voyager probe non-success status: {probe.get('status')} ({_truncate_text(str(probe.get('url') or ''), 120)})",
                     )
 
-            payload = {
-                "ok": True,
-                "state": state,
-                "final_url": page.url,
-                "has_li_at": bool(li_at),
-                "has_jsessionid": bool(jsid),
-                "li_at": li_at,
-                "jsessionid": jsid,
-                "warnings": warnings,
-            }
-
-            if probe is not None:
-                payload["http_status"] = int(probe.get("status") or 0)
-                payload["response_url"] = str(probe.get("url") or "")
-                payload["response_headers"] = probe.get("headers") or {}
-
-                response_text = str(probe.get("text") or "")
-                response_json = _parse_json_maybe(response_text)
-                if response_json is not None:
-                    payload["response_json"] = response_json
-                elif response_text:
-                    payload["response_text"] = response_text
-
+            payload = _build_payload(
+                state=state,
+                final_url=page.url,
+                li_at=li_at,
+                jsid=jsid,
+                warnings=warnings,
+                probe=probe,
+            )
             sys.stdout.write(json.dumps(payload) + "\n")
             return 0
     except Exception as e:

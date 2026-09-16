@@ -14,7 +14,32 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/crb2nu/loom/pkg/mills/finishing"
+	"github.com/crb2nu/loom/pkg/mills/pipeline"
 )
+
+// ListTree returns every entry below path. GitLab caps a page at 100 entries.
+func (c *GitLabClient) ListTree(ctx context.Context, project, ref, treePath string, recursive bool) ([]finishing.TreeEntry, error) {
+	var all []finishing.TreeEntry
+	for page := 1; ; page++ {
+		endpoint := fmt.Sprintf("/projects/%s/repository/tree?path=%s&recursive=%t&ref=%s&per_page=100&page=%d",
+			url.PathEscape(project), url.QueryEscape(treePath), recursive, url.QueryEscape(ref), page)
+		var raw []struct {
+			Path, Type string
+			ID         string `json:"id"`
+		}
+		if err := c.requestJSON(ctx, http.MethodGet, endpoint, nil, &raw); err != nil {
+			return nil, err
+		}
+		for _, e := range raw {
+			all = append(all, finishing.TreeEntry{Path: e.Path, Type: e.Type, BlobSHA: e.ID})
+		}
+		if len(raw) < 100 {
+			return all, nil
+		}
+	}
+}
 
 type branchResponse struct {
 	Name   string `json:"name"`
@@ -35,6 +60,64 @@ func (c *GitLabClient) GetBranch(ctx context.Context, branch string) (string, bo
 		return "", false, err
 	}
 	return got.Commit.ID, true, nil
+}
+
+type repositoryCompareResponse struct {
+	Commits []struct {
+		Title string `json:"title"`
+	} `json:"commits"`
+	Diffs []struct {
+		OldPath string `json:"old_path"`
+		NewPath string `json:"new_path"`
+		Diff    string `json:"diff"`
+	} `json:"diffs"`
+}
+
+// CompareBranch returns GitLab's authoritative branch-vs-base diff. The
+// source branch lookup is explicit so a missing branch remains distinguishable
+// from a valid comparison whose diff is empty.
+func (c *GitLabClient) CompareBranch(ctx context.Context, baseBranch, branch string) (pipeline.StageOutput, bool, error) {
+	if _, ok, err := c.GetBranch(ctx, branch); err != nil || !ok {
+		return pipeline.StageOutput{}, ok, err
+	}
+	path := fmt.Sprintf("/projects/%s/repository/compare?from=%s&to=%s",
+		c.projectPath(), url.QueryEscape(baseBranch), url.QueryEscape(branch))
+	var got repositoryCompareResponse
+	if err := c.requestJSON(ctx, http.MethodGet, path, nil, &got); err != nil {
+		return pipeline.StageOutput{}, true, err
+	}
+	out := pipeline.StageOutput{}
+	seen := map[string]struct{}{}
+	for _, d := range got.Diffs {
+		name := d.NewPath
+		if name == "" {
+			name = d.OldPath
+		}
+		if _, exists := seen[name]; name != "" && !exists {
+			seen[name] = struct{}{}
+			out.FilesChanged = append(out.FilesChanged, name)
+		}
+		if d.Diff != "" {
+			out.DiffPatch = append(out.DiffPatch, d.Diff...)
+			if d.Diff[len(d.Diff)-1] != '\n' {
+				out.DiffPatch = append(out.DiffPatch, '\n')
+			}
+			for _, line := range strings.Split(d.Diff, "\n") {
+				if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+					out.LinesAdded++
+				}
+				if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+					out.LinesRemoved++
+				}
+			}
+		}
+	}
+	for _, commit := range got.Commits {
+		if commit.Title != "" {
+			out.CommitMessages = append(out.CommitMessages, commit.Title)
+		}
+	}
+	return out, true, nil
 }
 
 // EnsureBranch creates branch from ref if it does not exist and returns the

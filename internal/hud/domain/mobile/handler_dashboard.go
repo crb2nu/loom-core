@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/crb2nu/loom/internal/hud/monitor"
+	"github.com/crb2nu/loom/internal/visibility/contracts/presence"
 )
 
 func (d *MobileDomain) handleMobilePing(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +112,7 @@ func mobileDashboardAgentCounts(snap monitor.FleetSnapshot) (active, idle, offli
 			continue
 		}
 		seen[agent.AgentID] = struct{}{}
-		switch normalizeMobilePresenceStatus(agent.Status) {
+		switch mobileFleetAgentStatus(agent) {
 		case "active":
 			active++
 		case "idle":
@@ -133,6 +134,20 @@ func mobileDashboardAgentCounts(snap monitor.FleetSnapshot) (active, idle, offli
 	}
 
 	return active, idle, offline
+}
+
+// mobileFleetAgentStatus is the shared mobile activity verdict for rows from a
+// FleetSnapshot. Presence-backed rows require a heartbeat to be live; synthetic
+// session-only rows remain active because their session is their liveness
+// signal. FleetSnapshot already applies the time-based stale-heartbeat window,
+// so this only closes the heartbeat-less case without duplicating its constant.
+func mobileFleetAgentStatus(agent presence.PresenceInfo) string {
+	status := normalizeMobilePresenceStatus(agent.Status)
+	if agent.HasPresence && strings.TrimSpace(agent.LastHeartbeat) == "" &&
+		(status == "active" || status == "idle") {
+		return "offline"
+	}
+	return status
 }
 
 func (d *MobileDomain) handleMobileControlPlane(w http.ResponseWriter, r *http.Request) {

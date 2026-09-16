@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestConcurrencyClampsZeroToOne(t *testing.T) {
@@ -41,4 +42,25 @@ func TestConcurrencyBoundsAdmissions(t *testing.T) {
 	}
 	close(release)
 	wg.Wait()
+}
+
+func TestConcurrencySetLimitPreservesInflightAdmissions(t *testing.T) {
+	gate := NewConcurrency(2)
+	if err := gate.Acquire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Acquire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.SetLimit(1); err != nil {
+		t.Fatal(err)
+	}
+	gate.Release()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := gate.Acquire(ctx); err == nil {
+		t.Fatal("lower limit admitted work while one holder remained")
+	}
+	gate.Release()
 }

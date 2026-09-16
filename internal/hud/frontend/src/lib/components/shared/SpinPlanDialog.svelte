@@ -26,14 +26,9 @@
   import { toastStore } from '../../stores/toasts.svelte.ts';
   import { submitAsyncSpin } from './spinActions.ts';
   import { patternsStore, type PatternInfo } from '../../stores/patterns.svelte.ts';
-  import {
-    buildMaterials,
-    greenCount,
-    materialInputKind,
-    materialPlaceholder,
-    patternPickerGroups,
-    type RawMaterialValues,
-  } from '../../utils/spinningRoomHelpers.ts';
+  import { buildMaterials, type RawMaterialValues } from '../../utils/spinningRoomHelpers.ts';
+  import PatternCardPicker from './PatternCardPicker.svelte';
+  import PatternMaterialsFields from './PatternMaterialsFields.svelte';
 
   interface Frame {
     name: string;
@@ -103,54 +98,24 @@
   // door). A respin seed always means free mode — it redoes a free-form plan.
   let mode = $state<'free' | 'pattern'>('free');
 
-  // Pattern mode state. The catalog is fetched locally on open (like frames)
-  // so this dialog never disturbs the Patterns panel's shared status filter;
-  // the stamp ACTION goes through patternsStore so its stamping/stampError
-  // state stays the single source of truth.
-  let catalog = $state<PatternInfo[]>([]);
-  let catalogError = $state('');
-  let loadingCatalog = $state(false);
+  // Pattern mode state. The catalog rides the shared patternsStore — its
+  // fetch is unfiltered since the filter-leak fix, so the old private fetch
+  // (kept to avoid disturbing the Patterns panel's filter) lost its reason.
+  // The picker + materials form are the shared components; only the stamp
+  // CTA and its copy stay dialog-specific.
   let selectedPatternId = $state('');
   let materialValues = $state<RawMaterialValues>({});
   let materialErrors = $state<string[]>([]);
 
-  let picker = $derived(patternPickerGroups(catalog));
+  let catalog = $derived(patternsStore.patterns);
   let selectedPattern = $derived(catalog.find((p) => p.id === selectedPatternId) ?? null);
-
-  async function loadCatalog() {
-    loadingCatalog = true;
-    catalogError = '';
-    try {
-      // All statuses: candidates render (disabled) so the operator sees what
-      // exists and what still needs a kill-test/promote before it stamps.
-      const res = await fetch('/api/patterns?status=all', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      catalog = data.patterns ?? [];
-    } catch (e) {
-      catalogError = e instanceof Error ? e.message : String(e);
-    } finally {
-      loadingCatalog = false;
-    }
-  }
-
-  // matText narrows the string|boolean union for template value= bindings
-  // (an indexed access doesn't narrow across two reads in markup).
-  function matText(name: string): string {
-    const v = materialValues[name];
-    return typeof v === 'string' ? v : '';
-  }
+  let approvedCount = $derived(catalog.filter((p) => p.status === 'approved').length);
 
   function pickPattern(p: PatternInfo) {
-    if (p.status !== 'approved') return;
     selectedPatternId = p.id;
-    // Fresh form per card: checkbox fields start explicit-false, the rest
-    // empty (empty optionals are omitted so the stamp applies defaults).
-    const next: RawMaterialValues = {};
-    for (const f of p.materials_schema ?? []) {
-      if (f.type === 'bool') next[f.name] = false;
-    }
-    materialValues = next;
+    // Fresh, EMPTY form per card: empty fields (bools included — tri-state)
+    // are omitted so the stamp applies the pattern's declared defaults.
+    materialValues = {};
     materialErrors = [];
   }
 
@@ -227,7 +192,7 @@
     if (open && !openedOnce) {
       openedOnce = true;
       void loadFrames();
-      void loadCatalog();
+      void patternsStore.fetch();
       mode = 'free'; // a respin seed is always a free spin; fresh opens reset too
       selectedPatternId = '';
       materialErrors = [];
@@ -341,14 +306,14 @@
             aria-selected={mode === 'pattern'}
             onclick={() => (mode = 'pattern')}
             disabled={busy}
-          >From pattern{#if picker.approved.length > 0}&nbsp;· {picker.approved.length}{/if}</button>
+          >From pattern{#if approvedCount > 0}&nbsp;· {approvedCount}{/if}</button>
         </div>
       {/if}
 
       {#if mode === 'pattern' && !seed}
-        {#if catalogError}
-          <div class="spin-note err">Couldn't load the pattern catalog: {catalogError}</div>
-        {:else if loadingCatalog && catalog.length === 0}
+        {#if patternsStore.error && catalog.length === 0}
+          <div class="spin-note err">Couldn't load the pattern catalog: {patternsStore.error}</div>
+        {:else if patternsStore.loading && catalog.length === 0}
           <div class="spin-note">Loading the catalog…</div>
         {:else if catalog.length === 0}
           <div class="spin-note">No patterns in the catalog yet.</div>
@@ -357,82 +322,25 @@
         {#if catalog.length > 0}
           <div class="fld">
             <span class="fld-label">Pattern cards</span>
-            <div class="card-picks" role="group" aria-label="Pattern cards">
-              {#each picker.approved as p (p.id)}
-                <button
-                  class="card-pick"
-                  class:picked={selectedPatternId === p.id}
-                  title="{p.makes} · v{p.version}{greenCount(p) > 0 ? ` · ${greenCount(p)} shipped green` : ''}"
-                  onclick={() => pickPattern(p)}
-                  disabled={busy}
-                >
-                  <span class="card-name">{p.name}</span>
-                  <span class="card-makes">{p.makes}</span>
-                  {#if greenCount(p) > 0}<span class="card-green">✓{greenCount(p)}</span>{/if}
-                </button>
-              {/each}
-              {#each picker.candidates as p (p.id)}
-                <button
-                  class="card-pick candidate"
-                  title="candidate — needs a kill-test or a promote before it can stamp"
-                  disabled
-                >
-                  <span class="card-name">{p.name}</span>
-                  <span class="card-badge">candidate</span>
-                </button>
-              {/each}
-            </div>
+            <PatternCardPicker
+              patterns={catalog}
+              selectedId={selectedPatternId}
+              onPick={pickPattern}
+              approvedOnly
+              compact
+              disabled={busy}
+            />
           </div>
         {/if}
 
         {#if selectedPattern}
           <div class="pattern-desc">{selectedPattern.description ?? selectedPattern.makes}</div>
-          {#each selectedPattern.materials_schema ?? [] as f (f.name)}
-            <label class="fld">
-              <span class="fld-label">
-                {f.name}
-                {#if !f.required}<span class="opt">optional</span>{/if}
-                {#if f.description}<span class="opt"> — {f.description}</span>{/if}
-              </span>
-              {#if materialInputKind(f) === 'checkbox'}
-                <input
-                  type="checkbox"
-                  class="mat-check"
-                  checked={materialValues[f.name] === true}
-                  onchange={(e) => (materialValues[f.name] = (e.currentTarget as HTMLInputElement).checked)}
-                  disabled={busy}
-                />
-              {:else if materialInputKind(f) === 'select'}
-                <select
-                  class="inp"
-                  value={matText(f.name)}
-                  onchange={(e) => (materialValues[f.name] = (e.currentTarget as HTMLSelectElement).value)}
-                  disabled={busy}
-                >
-                  <option value="">{f.default ? `default (${f.default})` : '— pick —'}</option>
-                  {#each f.enum ?? [] as opt}<option value={opt}>{opt}</option>{/each}
-                </select>
-              {:else if materialInputKind(f) === 'json'}
-                <textarea
-                  class="inp ta"
-                  rows="3"
-                  placeholder={materialPlaceholder(f) || (f.type === 'list' ? '[…]' : '{…}')}
-                  value={matText(f.name)}
-                  oninput={(e) => (materialValues[f.name] = (e.currentTarget as HTMLTextAreaElement).value)}
-                  disabled={busy}
-                ></textarea>
-              {:else}
-                <input
-                  class="inp"
-                  type={materialInputKind(f) === 'number' ? 'number' : 'text'}
-                  placeholder={materialPlaceholder(f)}
-                  value={matText(f.name)}
-                  oninput={(e) => (materialValues[f.name] = (e.currentTarget as HTMLInputElement).value)}
-                  disabled={busy}
-                />
-              {/if}
-            </label>
-          {/each}
+          <PatternMaterialsFields
+            schema={selectedPattern.materials_schema ?? []}
+            bind:values={materialValues}
+            disabled={busy}
+            idPrefix="spin-mat"
+          />
 
           {#if materialErrors.length > 0}
             <div class="spin-note err">{materialErrors.join(' · ')}</div>
@@ -753,59 +661,6 @@
     color: var(--fg-primary);
   }
 
-  .card-picks {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-    max-height: 200px;
-    overflow-y: auto;
-  }
-  .card-pick {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-2);
-    padding: 5px 8px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    font-size: var(--text-xs);
-    color: var(--fg-secondary);
-    cursor: pointer;
-    text-align: left;
-    transition: border-color var(--transition-fast), color var(--transition-fast);
-  }
-  .card-pick.picked {
-    border-color: var(--border-focus);
-    color: var(--fg-primary);
-  }
-  .card-pick.candidate,
-  .card-pick:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-  .card-name {
-    font-weight: 600;
-    font-family: var(--font-mono);
-    white-space: nowrap;
-  }
-  .card-makes {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .card-green {
-    color: var(--success);
-    font-family: var(--font-mono);
-  }
-  .card-badge {
-    font-family: var(--font-mono);
-    color: var(--warning);
-    border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
-    border-radius: var(--radius-xs);
-    padding: 0 5px;
-  }
 
   .pattern-desc {
     font-size: var(--text-xs);
@@ -817,11 +672,6 @@
     padding: var(--space-1) var(--space-2);
   }
 
-  .mat-check {
-    align-self: flex-start;
-    accent-color: var(--accent);
-    margin: 2px 0;
-  }
 
   .spin-actions {
     display: flex;

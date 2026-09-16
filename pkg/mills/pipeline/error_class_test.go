@@ -9,6 +9,31 @@ import (
 	"time"
 )
 
+const realLivenessWatchdogStall = "liveness watchdog: agent produced no output within stall timeout: spawn 0198f6e7-7987-787e-bed5-d4f943d24205 stalled: no agent output for 15m0s"
+
+func TestClassify_LivenessWatchdogStallIsTransient(t *testing.T) {
+	err := errors.New(realLivenessWatchdogStall)
+	if got := Classify(err); got != ClassTransient {
+		t.Fatalf("Classify(%q) = %q, want %q", err, got, ClassTransient)
+	}
+
+	record := ClassifyFailureRecord(err)
+	if record.Class != FailureTransient || !record.Retryable || !record.FreeRetry || record.Terminal {
+		t.Fatalf("ClassifyFailureRecord(%q) = %+v, want retryable capped transient", err, record)
+	}
+
+	for _, msg := range []string{
+		"liveness watchdog: health probe failed: spawn abc stalled: no agent output for 15m0s",
+		"spawn abc stalled: no agent output for 15m0s",
+		"liveness watchdog: agent produced no output within stall timeout: worker stalled",
+		"some bizarre unrecognized failure",
+	} {
+		if got := Classify(errors.New(msg)); got != ClassCode {
+			t.Errorf("Classify(%q) = %q, want conservative %q", msg, got, ClassCode)
+		}
+	}
+}
+
 // realClaudeInvalidAuthResult is the final Claude Code JSON-stream output
 // recorded for spawn-b23f63aa88b4 during the 2026-07-25 dual-fleet canary.
 // It has no HTTP status, so it must be classified from the producer payload.
@@ -17,8 +42,8 @@ const realClaudeInvalidAuthResult = `{"type":"assistant","message":{"id":"b4faa3
 
 func TestErrorClass_ValidAndAll(t *testing.T) {
 	all := AllErrorClasses()
-	if len(all) != 5 {
-		t.Fatalf("AllErrorClasses len = %d, want 5", len(all))
+	if len(all) != 6 {
+		t.Fatalf("AllErrorClasses len = %d, want 6", len(all))
 	}
 	for _, c := range all {
 		if !c.Valid() {
@@ -89,6 +114,38 @@ func TestClassify_KillTestFixtures(t *testing.T) {
 			name: "sandbox dockerfile generation",
 			msg:  "devbox: decode body: invalid character 'e' looking for beginning of value; raw=\"ensure sandbox: generate dockerfile: no language detected",
 			want: ClassInfra,
+		},
+		// Kill-test 2026-09-12: the sandbox families below were escalating as
+		// ClassCode although no check ever ran against the diff.
+		{
+			name: "lint parity refused by golangci-lint parallel-runner lock (shared sandbox)",
+			msg:  "devbox quality gate failed (1/3 checks failed: lint:parity[exit=3]: Command: CGO_ENABLED=0 GOWORK=off golangci-lint run --config .golangci.yml './internal/hud' 2>&1 | Error: parallel golangci-lint is running | The command is terminated due to an error: parallel golangci-lint is running)",
+			want: ClassTransient,
+		},
+		{
+			name: "devbox replacing a non-running sandbox pod timed out",
+			msg:  "stage=tests attempt=2: devbox quality_gate: mcphub: devbox/devbox_quality_gate reported error: ensure sandbox: start container: wait to replace non-running pod: wait pod gone: devbox-loom-core-loom-mills-operator still present after 2m0s",
+			want: ClassTransient,
+		},
+		{
+			name: "devbox wait pod gone get error",
+			msg:  "ensure sandbox: start container: wait to replace non-running pod: wait pod gone: get devbox-loom-core-loom-mills-operator: etcdserver: request timed out",
+			want: ClassTransient,
+		},
+		{
+			name: "sandbox could not start the exec process at the memory limit",
+			msg:  "stage=tests attempt=2: FAIL test:1 (162ms): $ GOWORK=off go test -count=1 './pkg/mills/crossrepo' './pkg/mills/store' | exec error: Internal error occurred: error executing command in container: failed to exec in container: failed to create exec \"75abf5ed\": task ab63bb23: OCI runtime exec failed: exec failed: unable to start container process: error executing setns process: exit status 1 | devbox: the sandbox could not start the exec process (container memory limit 4Gi).",
+			want: ClassInfra,
+		},
+		{
+			name: "containerd exec create failure without the devbox hint",
+			msg:  "exec error: Internal error occurred: error executing command in container: failed to exec in container: failed to create exec \"c0ffee\": task deadbeef not found",
+			want: ClassInfra,
+		},
+		{
+			name: "lint parity with a genuine finding stays code",
+			msg:  "devbox quality gate failed (1/3 checks failed: lint:parity[exit=1]: Command: CGO_ENABLED=0 GOWORK=off golangci-lint run --config .golangci.yml --allow-parallel-runners './pkg/mills' 2>&1 | pkg/mills/reconciler.go:41:2: db.QueryRow must be QueryRowContext (noctx) | 1 issues)",
+			want: ClassCode,
 		},
 		{
 			name: "gate fail (real code issue)",
@@ -296,6 +353,17 @@ func TestClassify_FlexInferRawUpstream5xx(t *testing.T) {
 	}
 }
 
+func TestClassify_ResearchModelEndpoint404IsInfra(t *testing.T) {
+	for _, msg := range []string{
+		"stage=research attempt=1: flexinfer chat: status 404: model not found",
+		"model endpoint returned status 404",
+	} {
+		if got := Classify(errors.New(msg)); got != ClassInfra {
+			t.Errorf("Classify(%q) = %s, want infra", msg, got)
+		}
+	}
+}
+
 func TestClassify_NilAndEOF(t *testing.T) {
 	if got := Classify(nil); got != "" {
 		t.Errorf("Classify(nil) = %q, want empty", got)
@@ -454,16 +522,75 @@ func TestClassify_QualityGateNoChecksSelectorIsConfig(t *testing.T) {
 	}
 }
 
-// TestClassify_SandboxStillBuildingIsInfra guards escalation #322
-// (2026-07-16): a cold sandbox image build that outlived the quality
-// gate's build wait surfaced as "ensure sandbox: sandbox image still
-// building after 8m0s". The client-side strict parse now propagates
-// that text instead of fabricating a 0-checks verdict; it must land in
-// the infra class, not code.
-func TestClassify_SandboxStillBuildingIsInfra(t *testing.T) {
-	msg := `devbox quality_gate: mcphub: devbox/devbox_quality_gate reported error: ensure sandbox: sandbox image still building after 8m0s: build in progress; raw="ensure sandbox: sandbox image still building after 8m0s"`
-	if got := Classify(errors.New(msg)); got != ClassInfra {
-		t.Errorf("Classify(%q) = %s, want %s", msg, got, ClassInfra)
+// TestClassify_CreatePodInvalidIsConfig pins synchronous Kubernetes API
+// validation rejections as terminal configuration failures. Retrying an
+// identical pod spec cannot change the API server's validation verdict.
+func TestClassify_CreatePodInvalidIsConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want ErrorClass
+	}{
+		{
+			name: "2026-08-20 production label rejection",
+			msg:  `ensure sandbox: start container: create pod: Pod "devbox-loom-core-loom-mills-o" is invalid: metadata.labels: Invalid value: "loom-mills-operator-PIPE-…": must be no more than 63 characters`,
+			want: ClassConfig,
+		},
+		{
+			name: "case insensitive",
+			msg:  `ensure sandbox: start container: Create Pod: Pod "devbox" IS INVALID: spec.containers: Required value`,
+			want: ClassConfig,
+		},
+		{
+			name: "create pod transient near miss",
+			msg:  "ensure sandbox: start container: create pod: dial tcp 10.0.0.1:443: i/o timeout",
+			want: ClassTransient,
+		},
+		{
+			name: "invalid phrase alone near miss",
+			msg:  `admission response is invalid: metadata.labels: Invalid value: "bad"`,
+			want: ClassCode,
+		},
+		{
+			name: "git clone classification retains precedence",
+			msg:  "image build failed: container git-clone terminated exit_code=128 — git-clone log: fatal: unable to access 'https://gitlab.example/services/loom-core.git/': Could not resolve host: gitlab.example; create pod: captured context is invalid: captured context",
+			want: ClassTransient,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Classify(errors.New(tc.msg)); got != tc.want {
+				t.Errorf("Classify(%q) = %s, want %s", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassify_SandboxStillBuildingIsTransient guards escalation #322
+// (2026-07-16) and the 2026-09-01 attempt burn: a cold sandbox image build
+// that outlives the quality gate's build wait surfaces as "ensure sandbox:
+// sandbox image still building after 8m0s". The client-side strict parse
+// propagates that text instead of fabricating a 0-checks verdict; it must
+// never land in the code class, and — because the build is still
+// progressing and the next gate call re-attaches to it — it is a FREE
+// transient retry bounded by the transient cap, not an infra failure that
+// burns MaxAttempts (tests#1 and #2 both burned on the same healthy build).
+func TestClassify_SandboxStillBuildingIsTransient(t *testing.T) {
+	for _, msg := range []string{
+		`devbox quality_gate: mcphub: devbox/devbox_quality_gate reported error: ensure sandbox: sandbox image still building after 8m0s: build in progress; raw="ensure sandbox: sandbox image still building after 8m0s"`,
+		`stage=tests attempt=1: devbox quality_gate: mcphub: devbox/devbox_quality_gate reported error: ensure sandbox: sandbox image still building after 8m0s: sandbox image build in progress for loom-core (elapsed 8m0s)`,
+	} {
+		if got := Classify(errors.New(msg)); got != ClassTransient {
+			t.Errorf("Classify(%q) = %s, want %s", msg, got, ClassTransient)
+		}
+		if !IsFreeRetry(Classify(errors.New(msg))) {
+			t.Errorf("still-building must be a free retry: %q", msg)
+		}
+	}
+	// A build that actually failed is still a persistent infra failure.
+	failed := `devbox quality_gate: ensure sandbox: image build failed: buildah build failed: container git-clone terminated exit_code=1`
+	if got := Classify(errors.New(failed)); got != ClassInfra {
+		t.Errorf("Classify(%q) = %s, want %s", failed, got, ClassInfra)
 	}
 }
 
@@ -511,27 +638,22 @@ func TestClassify_ContainerNotFoundIsTransient(t *testing.T) {
 	}
 }
 
-// TestClassify_PipelinePollTimeoutIsInfra guards DEBT-073 (#167) class a: a
-// ci_watch pipeline-poll timeout must classify ClassInfra, not the default
-// ClassCode, so the escalation-class metric attributes it to the CI/cluster
-// layer (escalations #149/#153) instead of conflating a stuck pipeline with a
-// real code bug. Detection is via errors.Is on the wrapped sentinel so the
-// embedded pipeline web_url in the message can't shift the result.
-func TestClassify_PipelinePollTimeoutIsInfra(t *testing.T) {
-	// The exact shape the GitLab client emits (fmt.Errorf("...: %w", ...)): a
+// TestClassify_CIWatchPollTimeoutIsFreeTransient guards the reattach contract:
+// A ci_watch poll-session cap is free/transient; only its independent
+// wall-clock ceiling is infrastructure escalation.
+func TestClassify_CIWatchPollTimeoutIsFreeTransient(t *testing.T) {
+	// The CI-watch worker wraps its free-reattach sentinel with a
 	// human-readable prefix, an embedded pipeline URL, and the wrapped sentinel.
-	err := fmt.Errorf("gitlab: pipeline poll timed out after 30m0s (pipeline: https://gitlab.example/services/loom-core/-/pipelines/12345): %w", ErrPipelinePollTimeout)
-	if got := Classify(err); got != ClassInfra {
-		t.Fatalf("Classify(pipeline poll timeout) = %s, want %s", got, ClassInfra)
+	err := fmt.Errorf("gitlab: pipeline poll timed out after 30m0s (pipeline: https://gitlab.example/services/loom-core/-/pipelines/12345): %w", ErrCIWatchPollTimeout)
+	if got := Classify(err); got != ClassTransient {
+		t.Fatalf("Classify(pipeline poll timeout) = %s, want %s", got, ClassTransient)
 	}
-	// Infra shares Code's retry accounting: it is not a free transient retry
-	// (so it counts against MaxAttempts, bounding total wall-clock) and it is
-	// not terminal (a genuinely slow pipeline can still go green on a re-poll).
-	if IsFreeRetry(ClassInfra) {
-		t.Error("ClassInfra must not be a free retry")
+	if !IsFreeRetry(ClassTransient) || IsTerminal(ClassTransient) {
+		t.Error("poll expiry must reattach for free and remain non-terminal")
 	}
-	if IsTerminal(ClassInfra) {
-		t.Error("ClassInfra must not be terminal")
+	ceiling := &CIWatchStalledError{PipelineID: "123", Runtime: 90 * time.Minute, MaxMinutes: 90}
+	if got := Classify(ceiling); got != ClassInfra || IsFreeRetry(got) {
+		t.Fatalf("Classify(ceiling) = %s, want budgeted infra", got)
 	}
 }
 
@@ -541,9 +663,17 @@ func TestClassify_CIPipelineTerminalJobReasons(t *testing.T) {
 		reasons []string
 		want    ErrorClass
 	}{
-		{name: "all runner system failures", reasons: []string{"runner_system_failure", "runner_system_failure"}, want: ClassTransient},
+		{name: "all runner system failures", reasons: []string{"runner_system_failure", "runner_system_failure"}, want: ClassInfra},
+		{name: "all job execution timeouts", reasons: []string{"job_execution_timeout", "job_execution_timeout"}, want: ClassInfra},
+		{name: "all stuck or timeout failures", reasons: []string{"stuck_or_timeout_failure", "stuck_or_timeout_failure"}, want: ClassInfra},
+		{name: "mixed accepted reasons", reasons: []string{"runner_system_failure", "job_execution_timeout", "stuck_or_timeout_failure"}, want: ClassInfra},
+		{name: "normalized accepted reason", reasons: []string{"  RUNNER_SYSTEM_FAILURE  "}, want: ClassInfra},
+		{name: "runner unsupported", reasons: []string{"runner_unsupported"}, want: ClassCode},
+		{name: "stale schedule", reasons: []string{"stale_schedule"}, want: ClassCode},
+		{name: "scheduler failure", reasons: []string{"scheduler_failure"}, want: ClassCode},
 		{name: "script failure", reasons: []string{"script_failure"}, want: ClassCode},
 		{name: "mixed", reasons: []string{"runner_system_failure", "script_failure"}, want: ClassCode},
+		{name: "timeout plus script failure", reasons: []string{"job_execution_timeout", "script_failure"}, want: ClassCode},
 		{name: "unknown", reasons: []string{""}, want: ClassCode},
 		{name: "missing inspection", reasons: nil, want: ClassCode},
 	}
@@ -557,6 +687,15 @@ func TestClassify_CIPipelineTerminalJobReasons(t *testing.T) {
 				t.Fatal("typed terminal CI error must wrap ErrCIPipelineTerminal")
 			}
 		})
+	}
+}
+
+func TestClassify_CIPipelineTerminalJobReasonsWrapped(t *testing.T) {
+	err := fmt.Errorf("ci_watch failed: %w", &CIPipelineTerminalError{
+		Status: "failed", MRIID: 42, FailedJobReasons: []string{"job_execution_timeout"},
+	})
+	if got := Classify(err); got != ClassInfra {
+		t.Fatalf("Classify(wrapped terminal CI error) = %s, want %s", got, ClassInfra)
 	}
 }
 
@@ -817,5 +956,87 @@ func TestIsSpawnSaturation(t *testing.T) {
 	}
 	if isSpawnSaturation(nil) {
 		t.Error("nil misdetected as saturation")
+	}
+}
+
+func TestClassifySubstrateAndBackoff(t *testing.T) {
+	for _, message := range []string{"mcp_hub_session unavailable", "MCP hub unavailable after operator rollout"} {
+		if got := Classify(errors.New(message)); got != ClassSubstrate {
+			t.Fatalf("%s: %s", message, got)
+		}
+	}
+	if !ClassSubstrate.Valid() || IsTerminal(ClassSubstrate) || IsFreeRetry(ClassSubstrate) || !FailureClassFromErrorClass(ClassSubstrate).Retryable() {
+		t.Fatal("substrate must be valid, budgeted and retryable")
+	}
+	if a, b := retryBackoff(ClassSubstrate, nil, 1), retryBackoff(ClassSubstrate, nil, 2); a <= 0 || b <= a {
+		t.Fatalf("backoff %v %v", a, b)
+	}
+}
+
+func TestClassify_OrdinaryPipelineTimeoutKeepsMergeRetryBudget(t *testing.T) {
+	err := fmt.Errorf("poll superseding pipeline 4902: %w", ErrPipelinePollTimeout)
+	if got := Classify(err); got != ClassInfra {
+		t.Fatalf("ordinary pipeline timeout = %s, want infra", got)
+	}
+	if IsFreeRetry(Classify(err)) {
+		t.Fatal("ordinary pipeline timeout must consume retry budget")
+	}
+}
+
+func TestClassifyLintParityNoOutputIsRetryableInfra(t *testing.T) {
+	err := errors.New("lint_parity_no_output: golangci-lint did not produce a lint verdict")
+	if Classify(err) != ClassInfra {
+		t.Fatalf("class=%s", Classify(err))
+	}
+	record := ClassifyFailureRecord(err)
+	if record.Class != FailureInfrastructure || !record.Retryable || record.Terminal {
+		t.Fatalf("record=%+v", record)
+	}
+}
+
+// TestClassify_DevboxQuotaRefusalIsInfraWithBackoff pins
+// bl-devbox-sandbox-quota-headroom-20260913: a devbox ResourceQuota refusal is
+// budgeted infra attributed to devbox_quota with retries a minute or more apart.
+// The pod name's hashed run token contains "429" on purpose: the rate-limit
+// needle used to launder it into a seconds-scale transient_quota retry.
+func TestClassify_DevboxQuotaRefusalIsInfraWithBackoff(t *testing.T) {
+	live := errors.New(liveDevboxQuotaRefusal)
+	truncated := errors.New("stage=tests attempt=2: exceeded quota: devbox-quota, requested: limits.memory=6Gi")
+	for _, err := range []error{live, truncated} {
+		if cls := Classify(err); cls != ClassInfra || IsFreeRetry(cls) || IsTerminal(cls) || !isDevboxQuotaRefusal(err) {
+			t.Fatalf("Classify(%q) = %s, want budgeted infra", err, cls)
+		}
+		fc := ClassifyFailureRecord(err)
+		if fc.Class != FailureInfrastructure || !fc.Retryable || fc.FreeRetry || fc.Terminal ||
+			fc.ExternalDependencyID != DevboxQuotaDependency || fc.ExternalDependency != DevboxQuotaDependency ||
+			!KnownFailureSignature(err.Error()) {
+			t.Fatalf("ClassifyFailureRecord(%q) = %+v", err, fc)
+		}
+	}
+	// 1m, 2m, 4m, then the 5m cap: never inside the minute the live run burned
+	// three attempts in.
+	for i, want := range []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+		if got := retryBackoff(ClassInfra, live, i+1); got != want {
+			t.Errorf("retryBackoff(quota, attempt %d) = %s, want %s", i+1, got, want)
+		}
+	}
+	// Near misses keep their existing classes, immediate retry and no attribution.
+	for _, tc := range []struct {
+		msg  string
+		want ErrorClass
+	}{
+		{`create pod: pods is forbidden: User "system:serviceaccount:devbox:default" cannot create resource "pods"`, ClassInfra},
+		{`create pod: pods "devbox-x" is forbidden: maximum memory usage per Container is 4Gi, but limit is 6Gi`, ClassInfra},
+		{"anthropic: quota exceeded for this billing period", ClassTransientQuota},
+		{"anthropic: HTTP 429: exceeded quota for this billing period", ClassTransientQuota},
+		{`resourcequotas "devbox-quota" is forbidden: user cannot get resourcequotas`, ClassInfra},
+		{`create pod: pods "other-service" is forbidden: exceeded quota: other-quota, requested: limits.memory=6Gi`, ClassInfra},
+		{"flexinfer chat: status 429: too many requests", ClassTransientQuota},
+	} {
+		err := errors.New(tc.msg)
+		if got := Classify(err); got != tc.want || isDevboxQuotaRefusal(err) || retryBackoff(ClassInfra, err, 1) != 0 ||
+			ClassifyFailureRecord(err).ExternalDependency == DevboxQuotaDependency {
+			t.Errorf("near miss %q: class %s, want %s untouched by the quota path", tc.msg, got, tc.want)
+		}
 	}
 }

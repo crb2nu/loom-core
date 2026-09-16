@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func (c *QdrantClient) Upsert(ctx context.Context, points []Point, wait bool) error {
@@ -284,6 +285,67 @@ func (c *QdrantClient) ScrollPoints(ctx context.Context, filter map[string]any, 
 	}
 
 	return out, nil
+}
+
+// ScrollOrdered returns up to limit entries ordered by the named payload
+// field, newest (largest) first. Qdrant's scroll `order_by` needs a range-
+// capable payload index on the key (datetime for RFC3339 strings, see
+// datetimeIndexesByKind) and does not page, so this is a single request
+// capped at Qdrant's 256-point scroll page. Callers that need the listing
+// to work before the index exists must catch the error and fall back to
+// Scroll + an in-process sort (see ContextSvc.recentEntries).
+func (c *QdrantClient) ScrollOrdered(ctx context.Context, filter map[string]any, limit int, orderKey string) ([]ContextEntry, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 256 {
+		limit = 256
+	}
+	body := map[string]any{
+		"limit":        limit,
+		"with_payload": true,
+		"with_vector":  false,
+		"order_by":     map[string]any{"key": orderKey, "direction": "desc"},
+	}
+	if filter != nil {
+		body["filter"] = filter
+	}
+	path := fmt.Sprintf("/collections/%s/points/scroll", c.collection)
+	var resp struct {
+		Result struct {
+			Points []struct {
+				ID      string         `json:"id"`
+				Payload map[string]any `json:"payload"`
+			} `json:"points"`
+		} `json:"result"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, path, body, &resp); err != nil {
+		if errors.Is(err, ErrCollectionNotFound) {
+			return []ContextEntry{}, nil
+		}
+		return nil, err
+	}
+	out := make([]ContextEntry, 0, len(resp.Result.Points))
+	for _, p := range resp.Result.Points {
+		entry, err := PayloadToEntry(p.Payload)
+		if err == nil && entry != nil {
+			out = append(out, *entry)
+		}
+	}
+	return out, nil
+}
+
+// DatetimeRange builds a Qdrant range condition on an RFC3339 payload field.
+// gte/lt are ignored when zero. Requires a datetime payload index on key.
+func DatetimeRange(key string, gte, lt time.Time) map[string]any {
+	rng := map[string]any{}
+	if !gte.IsZero() {
+		rng["gte"] = gte.UTC().Format(time.RFC3339Nano)
+	}
+	if !lt.IsZero() {
+		rng["lt"] = lt.UTC().Format(time.RFC3339Nano)
+	}
+	return map[string]any{"key": key, "range": rng}
 }
 
 // ScrollPointsPage returns exactly one bounded page and its opaque Qdrant

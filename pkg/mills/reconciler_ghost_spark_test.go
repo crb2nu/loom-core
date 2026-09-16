@@ -27,6 +27,102 @@ type fakeMRStateClient struct {
 	calls  int
 }
 
+// externallyRebasedMR models the live recurrence: the run remembers the head
+// it escalated on, while another actor moves the same MR IID before it merges.
+// MRState deliberately exposes only the terminal state because the settle
+// contract is the durable (project, IID), not either head SHA.
+type externallyRebasedMR struct {
+	mu      sync.Mutex
+	headSHA string
+	state   string
+}
+
+func (f *externallyRebasedMR) rebase(headSHA string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.headSHA = headSHA
+}
+
+func (f *externallyRebasedMR) merge() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.state = "merged"
+}
+
+func (f *externallyRebasedMR) MRState(context.Context, int64) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state, nil
+}
+
+func assertGhostSparkSkip(t *testing.T, env *recTestEnv, subjectKind, subjectID, precondition string) {
+	t.Helper()
+	ev, err := env.store.Events.FirstBySubjectKind(context.Background(), subjectKind, subjectID, "reconciler.ghost_spark_skipped")
+	if err != nil {
+		t.Fatalf("ghost-spark skip event: %v", err)
+	}
+	if got := ev.Payload["precondition"]; got != precondition {
+		t.Fatalf("precondition = %v, want %q (payload=%+v)", got, precondition, ev.Payload)
+	}
+	if detail, _ := ev.Payload["detail"].(string); strings.TrimSpace(detail) == "" {
+		t.Fatalf("skip detail is empty: %+v", ev.Payload)
+	}
+}
+
+func TestGhostSparkSkipEventsNameFailedPrecondition(t *testing.T) {
+	t.Run("cooldown", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		seedEscalatedGhostSpark(t, env, "MILLS-SKIP-COOLDOWN", 5101, time.Now().Add(-time.Hour))
+		env.rec.GhostSparkMRState = &fakeMRStateClient{states: map[int64]string{5101: "opened"}}
+		if err := env.rec.deferGhostSparkRecheck(context.Background(), "MILLS-SKIP-COOLDOWN", time.Now(), 5101); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.rec.SweepGhostSparks(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertGhostSparkSkip(t, env, "pipeline_run", "PIPE-MILLS-SKIP-COOLDOWN", "cooldown")
+	})
+
+	t.Run("candidate exclusion", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		seedGateEscalatedItem(t, env, "MILLS-SKIP-CANDIDATE", time.Now().Add(-time.Hour), "")
+		env.rec.GhostSparkMRState = &fakeMRStateClient{states: map[int64]string{}}
+		if _, err := env.rec.SweepGhostSparks(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertGhostSparkSkip(t, env, "pipeline_run", "PIPE-MILLS-SKIP-CANDIDATE", "candidate_exclusion")
+	})
+
+	t.Run("project provenance", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		seedGateEscalatedItem(t, env, "MILLS-SKIP-PROVENANCE", time.Now().Add(-time.Hour), "")
+		run, err := env.store.Pipeline.GetRun(context.Background(), "PIPE-MILLS-SKIP-PROVENANCE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		iid := int64(5102)
+		run.MRIID = &iid
+		if err := env.store.Pipeline.PutRun(context.Background(), run); err != nil {
+			t.Fatal(err)
+		}
+		env.rec.GhostSparkMRState = &fakeMRStateClient{states: map[int64]string{5102: "merged"}}
+		if _, err := env.rec.SweepGhostSparks(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertGhostSparkSkip(t, env, "pipeline_run", run.ID, "project_provenance")
+	})
+
+	t.Run("client selection", func(t *testing.T) {
+		env := newRecEnv(t, nil)
+		seedEscalatedGhostSparkProject(t, env, "MILLS-SKIP-CLIENT", 5103, time.Now().Add(-time.Hour), "services/foreign")
+		env.rec.GhostSparkMRStateForProject = func(string) MRStateClient { return nil }
+		if _, err := env.rec.SweepGhostSparks(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertGhostSparkSkip(t, env, "pipeline_run", "PIPE-MILLS-SKIP-CLIENT", "client_selection")
+	})
+}
+
 func (f *fakeMRStateClient) MRState(_ context.Context, mrIID int64) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -284,6 +380,162 @@ func TestGhostSparkClosesMergedItem(t *testing.T) {
 	}
 	if delta := testutil.ToFloat64(GhostSparksClosedTotal.WithLabelValues("merged")) - before; delta != 1 {
 		t.Fatalf("merged counter must not double-count: got %v want 1", delta)
+	}
+}
+
+func TestGhostSparkSettlesStampedMRInFirstSweepAfterExternalRebase(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	const itemID = "MILLS-EXTERNAL-REBASE-1758"
+	seedEscalatedGhostSpark(t, env, itemID, 1758, env.now.Add(-9*time.Hour))
+
+	// Stamp the run-era head on ci_watch. The external actor then rebases the
+	// same project/IID twice; neither the changed head nor actor is an identity
+	// precondition once GitLab reports the MR merged.
+	success := store.StageOutcomeSuccess
+	ended := env.now.Add(-8 * time.Hour)
+	if err := env.store.Pipeline.PutStage(ctx, &store.StageResult{
+		PipelineRunID: "PIPE-" + itemID,
+		Stage:         "ci_watch",
+		Attempt:       1,
+		StartedAt:     ended.Add(-time.Minute),
+		EndedAt:       &ended,
+		Outcome:       &success,
+		Artifacts: map[string]any{
+			// Model the stale successor provenance that made the former
+			// all-stage authorization reject this otherwise durable MR stamp.
+			// The MR-stage project below remains the namespace of IID 1758.
+			"ci_project": "services/loom-core-rebased",
+			"ci_sha":     "run-era-head",
+			"ci_actor":   "pipeline-runner",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	boundItem, err := env.store.Backlog.Get(ctx, itemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := escalationAuthorizedProject(ctx, env.store.Pipeline, env.store.Events, boundItem, env.rec.HomeProject, "PIPE-"+itemID); !errors.Is(err, store.ErrPipelineProjectUnavailable) {
+		t.Fatalf("former all-stage provenance check = %v, want project conflict", err)
+	}
+	mr := &externallyRebasedMR{headSHA: "run-era-head", state: "opened"}
+	mr.rebase("external-rebase-1")
+	mr.rebase("49ab5ef9")
+	mr.merge()
+	env.rec.GhostSparkMRState = mr
+
+	res, err := env.rec.SweepGhostSparks(ctx)
+	if err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	if res.Merged != 1 || res.Inspected != 1 {
+		t.Fatalf("first sweep = %+v, want one merged stamped MR", res)
+	}
+	item, err := env.store.Backlog.Get(ctx, itemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.State != store.BacklogMerged {
+		t.Fatalf("item state = %s, want merged", item.State)
+	}
+
+	// CAS/idempotency: a repeat cannot transition or annotate the item twice.
+	second, err := env.rec.SweepGhostSparks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Merged != 0 || second.Inspected != 0 {
+		t.Fatalf("second sweep = %+v, want no-op", second)
+	}
+	count, err := env.store.Events.CountBySubjectKind(ctx, "pipeline_run", "PIPE-"+itemID, "reconciler.ghost_spark_closed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("close event count = %d, want 1", count)
+	}
+}
+
+func TestGhostSparkLegacyEmptyBindingSettlesHomeRescueMRWithoutThrottle(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	const itemID = "MILLS-HOME-RESCUE"
+	item := seedGateEscalatedItem(t, env, itemID, env.now.Add(-time.Hour), "")
+	run, err := env.store.Pipeline.GetRun(ctx, "PIPE-"+itemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iid := int64(1807)
+	run.MRIID = &iid
+	if err := env.store.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Events.Append(ctx, &store.Event{
+		Actor: "pipeline", Kind: EscalationTargetBindingKind,
+		SubjectKind: "pipeline_run", SubjectID: run.ID,
+		Payload: map[string]any{"backlog_id": item.ID, "target_project": ""},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mrs := &fakeMRStateClient{states: map[int64]string{iid: "merged"}}
+	resolver := &fakeGhostResolver{}
+	env.rec.GhostSparkMRState = mrs
+	env.rec.GhostSparkResolver = resolver
+
+	res, err := env.rec.SweepGhostSparks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Merged != 1 || mrs.callCount() != 1 || resolver.count() != 1 {
+		t.Fatalf("sweep=%+v lookups=%d closes=%d, want one of each", res, mrs.callCount(), resolver.count())
+	}
+	got, err := env.store.Backlog.Get(ctx, itemID)
+	if err != nil || got.State != store.BacklogMerged {
+		t.Fatalf("item=(%+v, %v), want merged", got, err)
+	}
+	if _, err := env.store.Backlog.EscalationRecheck(ctx, itemID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("escalation recheck state err=%v, want not found", err)
+	}
+}
+
+func TestGhostSparkLegacyEmptyBindingForeignItemFailsClosedWithoutThrottle(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	const itemID = "MILLS-FOREIGN-EMPTY-BINDING"
+	item := seedGateEscalatedItem(t, env, itemID, env.now.Add(-time.Hour), "services/foreign")
+	run, err := env.store.Pipeline.GetRun(ctx, "PIPE-"+itemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iid := int64(1808)
+	run.MRIID = &iid
+	if err := env.store.Pipeline.PutRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Events.Append(ctx, &store.Event{
+		Actor: "pipeline", Kind: EscalationTargetBindingKind,
+		SubjectKind: "pipeline_run", SubjectID: run.ID,
+		Payload: map[string]any{"backlog_id": item.ID, "target_project": ""},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mrs := &fakeMRStateClient{states: map[int64]string{iid: "merged"}}
+	env.rec.GhostSparkMRStateForProject = func(string) MRStateClient { return mrs }
+
+	res, err := env.rec.SweepGhostSparks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Errored != 1 || mrs.callCount() != 0 {
+		t.Fatalf("sweep=%+v lookups=%d, want provenance error without lookup", res, mrs.callCount())
+	}
+	assertGhostSparkSkip(t, env, "pipeline_run", run.ID, "project_provenance")
+	if _, err := env.store.Backlog.EscalationRecheck(ctx, itemID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("escalation recheck state err=%v, want not found", err)
+	}
+	if _, err := env.store.Events.FirstBySubjectKind(ctx, "pipeline_run", run.ID, "reconciler.ghost_spark_failed"); err != nil {
+		t.Fatalf("deduplicated failure event: %v", err)
 	}
 }
 
@@ -883,5 +1135,133 @@ func TestGhostSparkReapPrunesRecheckEntry(t *testing.T) {
 	}
 	if _, ok := env.rec.ghostSparkRecheck["MILLS-GHOST-PRUNE"]; ok {
 		t.Fatalf("recheck entry must be pruned after the item is reaped as merged")
+	}
+}
+
+// TestGhostSparkClosesViaEarlierRunMR proves the 2026-08-19 blind-spot fix:
+// an item whose LATEST run died before the mr stage (a failed requeue) but
+// whose EARLIER run's MR merged out-of-band is still reachable — the sweep
+// falls back to the newest MR-bearing run, asks GitLab about THAT MR, and
+// closes on merged. A latest run with no MR must never make merged work
+// invisible again.
+func TestGhostSparkClosesViaEarlierRunMR(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+
+	seedEscalatedGhostSpark(t, env, "MILLS-GHOST-RETRY", 2044, env.now.Add(-2*time.Hour))
+	// A newer requeue attempt that escalated before the mr stage: no MR IID.
+	if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+		ID:        "PIPE-MILLS-GHOST-RETRY-2",
+		BacklogID: "MILLS-GHOST-RETRY",
+		Template:  "mills-default-pipeline",
+		State:     store.PipelineEscalated,
+		Attempts:  2,
+		StartedAt: env.now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("seed retry run: %v", err)
+	}
+
+	mrs := &fakeMRStateClient{states: map[int64]string{2044: "merged"}}
+	env.rec.GhostSparkMRState = mrs
+	env.rec.GhostSparkResolver = &fakeGhostResolver{}
+
+	res, err := env.rec.SweepGhostSparks(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if res.Merged != 1 || res.Inspected != 1 {
+		t.Fatalf("sweep result: %+v", res)
+	}
+	got, _ := env.store.Backlog.Get(ctx, "MILLS-GHOST-RETRY")
+	if got.State != store.BacklogMerged {
+		t.Fatalf("item state: got %s want merged", got.State)
+	}
+	// Provenance: the close event rides the MR-BEARING run, not the retry.
+	if _, err := env.store.Events.FirstBySubjectKind(ctx, "pipeline_run", "PIPE-MILLS-GHOST-RETRY", "reconciler.ghost_spark_closed"); err != nil {
+		t.Fatalf("expected ghost_spark_closed on the MR-bearing run: %v", err)
+	}
+}
+
+func TestGhostSparkBranchLedgerBypassesCooldown(t *testing.T) {
+	for _, mode := range []string{"merged", "absent", "evicted", "foreign", "other_branch", "stale", "unknown_project"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			env := newRecEnv(t, nil)
+			env.rec.HomeProject = "services/loom-core"
+			started := time.Now().Add(-time.Hour)
+			if mode == "stale" {
+				started = time.Now().Add(time.Hour)
+			}
+			item := seedGateEscalatedItem(t, env, "ledger-owner", started, "")
+			client := &fakeMergedBranchClient{}
+			enableMergedBranchPass(env, client)
+			if _, err := env.store.Backlog.DeferEscalationRecheck(ctx, item.ID, 0, time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "absent" {
+				project, branch := env.rec.HomeProject, "feat/ledger-owner/the-slice"
+				if mode == "foreign" {
+					project = "services/other"
+				}
+				if mode == "other_branch" {
+					branch += "-extra"
+				}
+				entry, _, err := env.store.MergeQueue.Enqueue(ctx, &store.MergeQueueEntry{PipelineRunID: "PIPE-" + item.ID, BacklogID: item.ID, Project: project, MRIID: 1947, SourceBranch: branch, TargetBranch: "main", EnqueuedSHA: "head"}, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "evicted" {
+					_, err = env.store.MergeQueue.MarkEvicted(ctx, entry.ID, store.MergeQueueEvictRebaseConflict, nil)
+				} else {
+					_, err = env.store.MergeQueue.MarkMerged(ctx, entry.ID, store.MergeQueueQueued, "ledger-sha")
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "unknown_project" {
+				env.rec.HomeProject = ""
+			}
+			res, err := env.rec.SweepGhostSparks(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := env.store.Backlog.Get(ctx, item.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := mode == "merged"
+			if (got.State == store.BacklogMerged) != want {
+				t.Fatalf("state=%s result=%+v", got.State, res)
+			}
+			if res.BranchInspected != 0 {
+				t.Fatalf("ledger/cooldown spent network budget: %+v", res)
+			}
+			if want {
+				event, err := env.store.Events.FirstBySubjectKind(ctx, "pipeline_run", "PIPE-"+item.ID, GhostSparkClosedEventKind)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if event.Payload["merged_sha"] != "ledger-sha" {
+					t.Fatalf("evidence=%v", event.Payload)
+				}
+				if _, err := env.store.Backlog.EscalationRecheck(ctx, item.ID); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("cooldown=%v", err)
+				}
+			} else if _, err := env.store.Backlog.EscalationRecheck(ctx, item.ID); err != nil {
+				t.Fatalf("cooldown lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestReconcilerExternalAdoptionClosureSHA(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	if err := env.store.Events.Append(ctx, &store.Event{Actor: "mergequeue", Kind: "backlog.settled", SubjectKind: "backlog", SubjectID: "adopted", Payload: map[string]any{"merged_sha": "closure-sha", "mr_iid": 1947, "project": "services/loom-core"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.rec.cachedDependencyMergeSHA(ctx, "adopted"); got != "closure-sha" {
+		t.Fatalf("SHA=%q", got)
 	}
 }

@@ -8,7 +8,7 @@
 //   - synthetic mirror fallback `agents/<agent-id>` (no real repo)
 //   - degenerate `////main` from a pre-fix Codex git inference
 //
-// Rune-free so it is unit-testable via the tsx fixture (namespace.fixture.ts).
+// Rune-free so it is unit-testable via vitest (namespace.test.ts).
 
 export interface ParsedNamespace {
   /** 2-level repo path (e.g. "services/loom-core"), or "" when unknown. */

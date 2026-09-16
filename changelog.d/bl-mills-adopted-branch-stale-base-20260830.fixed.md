@@ -1,0 +1,1 @@
+- Prevent Mills adopted-branch and cumulative Git capture in `pkg/mills/pipeline/dispatcher.go` and `pkg/mills/clients/spawn.go` from sending shallow-graft-polluted diffs to scope and diff-size gates.

@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	mcp "gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/mills/store"
-	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 )
 
 // PlanSummary is the projection of a Plan returned by agent_plan_list. The
@@ -19,11 +22,20 @@ import (
 // propagates it onto emitted backlog items so the dispatcher's
 // priority-ordered pickup reflects the operator's plan ordering.
 type PlanSummary struct {
-	ID       string `json:"id"`
-	Project  string `json:"project"`
-	Phase    string `json:"phase"`
-	Title    string `json:"title"`
-	Priority string `json:"priority"`
+	ID        string `json:"id"`
+	Project   string `json:"project"`
+	Phase     string `json:"phase"`
+	Title     string `json:"title"`
+	Priority  string `json:"priority"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+const planSliceCacheTTL = time.Hour
+
+type planSliceCacheEntry struct {
+	stamp     string
+	fetchedAt time.Time
+	slices    []PlanSliceSummary
 }
 
 // PlanSliceSummary is the projection of a PlanSlice returned by
@@ -142,6 +154,107 @@ func (c *PlanClient) ListSlices(ctx context.Context, planID string) ([]PlanSlice
 		return nil, fmt.Errorf("plan: slice list rejected: %s", truncateBody(body, 240))
 	}
 	return env.Slices, nil
+}
+
+// ListSlicesIfChanged returns a defensive copy of cached slices while the
+// plan summary stamp is unchanged. Missing or malformed stamps fail safe to a
+// live read, and every entry expires after one hour.
+func (c *PlanClient) ListSlicesIfChanged(ctx context.Context, plan PlanSummary) ([]PlanSliceSummary, error) {
+	stamp := strings.TrimSpace(plan.UpdatedAt)
+	if strings.TrimSpace(plan.ID) == "" || stamp == "" {
+		return c.fetchSlices(ctx, plan.ID)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, stamp); err != nil {
+		return c.fetchSlices(ctx, plan.ID)
+	}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	c.cacheMu.Lock()
+	entry, ok := c.sliceCache[plan.ID]
+	if ok && entry.stamp == stamp && now().Sub(entry.fetchedAt) >= 0 && now().Sub(entry.fetchedAt) < planSliceCacheTTL {
+		out := append([]PlanSliceSummary(nil), entry.slices...)
+		c.cacheMu.Unlock()
+		mills.PlanSliceListCallsTotal.WithLabelValues("cached").Inc()
+		return out, nil
+	}
+	generation := c.cacheGeneration[plan.ID]
+	c.cacheMu.Unlock()
+
+	slices, err := c.ListSlices(ctx, plan.ID)
+	if err != nil {
+		return nil, err
+	}
+	c.cacheMu.Lock()
+	if c.cacheGeneration[plan.ID] != generation {
+		c.cacheMu.Unlock()
+		mills.PlanSliceListCallsTotal.WithLabelValues("fetched").Inc()
+		return append([]PlanSliceSummary(nil), slices...), nil
+	}
+	if c.sliceCache == nil {
+		c.sliceCache = make(map[string]planSliceCacheEntry)
+	}
+	if c.slicePlan == nil {
+		c.slicePlan = make(map[string]string)
+	}
+	fetchedAt := now()
+	for cachedPlanID, cached := range c.sliceCache {
+		if fetchedAt.Sub(cached.fetchedAt) >= planSliceCacheTTL || fetchedAt.Before(cached.fetchedAt) {
+			c.deleteCachedPlanLocked(cachedPlanID)
+		}
+	}
+	copySlices := append([]PlanSliceSummary(nil), slices...)
+	c.sliceCache[plan.ID] = planSliceCacheEntry{stamp: stamp, fetchedAt: fetchedAt, slices: copySlices}
+	for _, sl := range slices {
+		c.slicePlan[sl.ID] = plan.ID
+	}
+	c.cacheMu.Unlock()
+	mills.PlanSliceListCallsTotal.WithLabelValues("fetched").Inc()
+	return append([]PlanSliceSummary(nil), slices...), nil
+}
+
+func (c *PlanClient) fetchSlices(ctx context.Context, planID string) ([]PlanSliceSummary, error) {
+	slices, err := c.ListSlices(ctx, planID)
+	if err == nil {
+		mills.PlanSliceListCallsTotal.WithLabelValues("fetched").Inc()
+	}
+	return slices, err
+}
+
+func (c *PlanClient) invalidatePlan(planID string) {
+	if c == nil || strings.TrimSpace(planID) == "" {
+		return
+	}
+	c.cacheMu.Lock()
+	if c.cacheGeneration == nil {
+		c.cacheGeneration = make(map[string]uint64)
+	}
+	c.cacheGeneration[planID]++
+	c.deleteCachedPlanLocked(planID)
+	c.cacheMu.Unlock()
+}
+
+func (c *PlanClient) deleteCachedPlanLocked(planID string) {
+	delete(c.sliceCache, planID)
+	for sliceID, owner := range c.slicePlan {
+		if owner == planID {
+			delete(c.slicePlan, sliceID)
+		}
+	}
+}
+
+func (c *PlanClient) invalidateSlice(sliceID string) {
+	c.cacheMu.Lock()
+	planID := c.slicePlan[sliceID]
+	if c.cacheGeneration == nil {
+		c.cacheGeneration = make(map[string]uint64)
+	}
+	if planID != "" {
+		c.cacheGeneration[planID]++
+	}
+	c.deleteCachedPlanLocked(planID)
+	c.cacheMu.Unlock()
 }
 
 // GetSlice fetches one slice's full detail via agent_plan_slice_get. Unlike the

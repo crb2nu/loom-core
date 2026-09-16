@@ -77,5 +77,9 @@ func (c *PlanClient) RescopePlan(ctx context.Context, planID, project, namespace
 	if s := strings.TrimSpace(namespace); s != "" {
 		args["namespace"] = s
 	}
-	return c.planWrite(ctx, "agent_plan_update", args)
+	err := c.planWrite(ctx, "agent_plan_update", args)
+	if err == nil {
+		c.invalidatePlan(planID)
+	}
+	return err
 }

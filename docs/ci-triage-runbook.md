@@ -43,6 +43,29 @@ whose only remediation is "restart GitLab", "increase quota", "contact vendor",
 or "fix the registry". See `docs/mills-escalation-and-dependency-failures.md`
 for the council output contract.
 
+## Main-Branch Validated-Tree Skip
+
+A validation job on `main` that finishes in under a minute with the line
+
+```text
+validated-tree skip: <job> — merge <sha> has tree <tree>, identical to MR head <sha> (…); nothing new to validate on main
+```
+
+did not run its checks: the commit is a merge whose tree is byte-identical to
+its MR head, and that head already passed the same job on the MR pipeline
+(`scripts/ci/validated_tree_skip.sh`). Every merge-queue and rebased
+auto-merge produces this shape. A three-way merge of an un-rebased branch has
+a tree neither pipeline saw and always runs in full, as do the main-only jobs
+(`test:race`, `test:benchmark`, `security:*`) and the image builds.
+
+- To force full validation on one pipeline, run it with the variable
+  `CI_VALIDATED_TREE_SKIP=false`.
+- `VALIDATED_TREE_TOKEN` (a `read_api` token in CI variables) makes the skip
+  additionally confirm a successful pipeline for the head SHA; without it the
+  skip relies on the project's "pipeline must succeed" merge rule.
+- A skipped `test:unit` publishes no coverage or JUnit artifact for that main
+  commit; the MR pipeline's artifacts are the record.
+
 ## Preflight Checks
 
 Run these before changing pipeline state:

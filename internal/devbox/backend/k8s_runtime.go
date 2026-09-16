@@ -61,16 +61,19 @@ func (k *K8sBackend) Start(ctx context.Context, opts StartOpts) (*StartResult, e
 		if err := k.StopIfIdentity(ctx, opts.Name, expectedIdentity); err != nil {
 			return nil, fmt.Errorf("replace existing pod: %w", err)
 		}
-		if err := k.waitForPodGone(ctx, opts.Name, 30*time.Second); err != nil {
+		if err := k.waitForPodGone(ctx, opts.Name, podGoneTimeout()); err != nil {
 			return nil, fmt.Errorf("wait to replace existing pod: %w", err)
 		}
 	} else if err == nil {
 		// Pod exists but is not reusable (including Terminating) — delete it
-		// and wait for the API name to become free before Create.
+		// and wait for the API name to become free before Create. The wait
+		// is generous (defaultPodGoneTimeout) because the previous run's pod
+		// may still be releasing its volumes; it returns the moment the name
+		// is free.
 		if err := k.StopIfIdentity(ctx, opts.Name, expectedIdentity); err != nil {
 			return nil, fmt.Errorf("replace non-running pod: %w", err)
 		}
-		if err := k.waitForPodGone(ctx, opts.Name, 30*time.Second); err != nil {
+		if err := k.waitForPodGone(ctx, opts.Name, podGoneTimeout()); err != nil {
 			return nil, fmt.Errorf("wait to replace non-running pod: %w", err)
 		}
 	} else if !isNotFound(err) {
@@ -94,7 +97,7 @@ func (k *K8sBackend) Start(ctx context.Context, opts StartOpts) (*StartResult, e
 	}
 
 	// Wait for pod to be Running; cleanup dangling pod on failure
-	if err := k.waitForPodRunning(ctx, opts.Name, 120*time.Second); err != nil {
+	if err := k.waitForSpawnPodRunning(ctx, opts.Name); err != nil {
 		// Capture the git-clone init container's real `fatal: …` line BEFORE
 		// StopIfIdentity deletes the pod — otherwise a repo-not-found / bad-ref
 		// / auth clone failure surfaces only as the opaque "container git-clone
@@ -187,17 +190,28 @@ func (k *K8sBackend) ensurePodStartIdentity(ctx context.Context, opts StartOpts)
 
 // StopIfIdentity deletes a pod only after validating its current identity.
 // The UID precondition prevents a same-name replacement from winning the
-// check/delete race.
+// check/delete race. Like Stop, it waits for that exact pod to disappear;
+// accepting deletion alone does not confirm that its worker has stopped.
 func (k *K8sBackend) StopIfIdentity(ctx context.Context, id string, expectedLabels map[string]string) error {
+	uid, err := k.deleteIfIdentity(ctx, id, expectedLabels)
+	if err != nil || uid == "" {
+		return err
+	}
+	return k.waitForPodUIDGone(ctx, id, uid, podGoneTimeout())
+}
+
+// deleteIfIdentity is StopIfIdentity's body. It returns the UID of the pod
+// whose deletion was accepted, or "" when no pod was found.
+func (k *K8sBackend) deleteIfIdentity(ctx context.Context, id string, expectedLabels map[string]string) (string, error) {
 	pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, id, metav1.GetOptions{})
 	if err != nil {
 		if isNotFound(err) {
-			return nil
+			return "", nil
 		}
-		return fmt.Errorf("get pod before conditional delete: %w", err)
+		return "", fmt.Errorf("get pod before conditional delete: %w", err)
 	}
 	if _, err := validateIdentityLabels("pod "+pod.Name, pod.Labels, expectedLabels, false); err != nil {
-		return err
+		return "", err
 	}
 	gracePeriod := int64(5)
 	deleteOpts := metav1.DeleteOptions{GracePeriodSeconds: &gracePeriod}
@@ -206,9 +220,9 @@ func (k *K8sBackend) StopIfIdentity(ctx context.Context, id string, expectedLabe
 		deleteOpts.Preconditions = &metav1.Preconditions{UID: &uid}
 	}
 	if err := k.clientset.CoreV1().Pods(k.namespace).Delete(ctx, id, deleteOpts); err != nil && !isNotFound(err) {
-		return fmt.Errorf("delete pod with identity precondition: %w", err)
+		return "", fmt.Errorf("delete pod with identity precondition: %w", err)
 	}
-	return nil
+	return string(pod.UID), nil
 }
 
 func (k *K8sBackend) Exec(_ context.Context, opts ExecOpts) (*ExecResult, error) {
@@ -228,12 +242,12 @@ func (k *K8sBackend) Exec(_ context.Context, opts ExecOpts) (*ExecResult, error)
 	if len(opts.Env) > 0 {
 		var envPrefix strings.Builder
 		for k, v := range opts.Env {
-			envPrefix.WriteString(fmt.Sprintf("export %s=%q; ", k, v))
+			envPrefix.WriteString(fmt.Sprintf("export %s=%s; ", k, shellQuote(v)))
 		}
 		shellCmd = envPrefix.String() + shellCmd
 	}
 	if opts.WorkDir != "" {
-		shellCmd = fmt.Sprintf("cd %q && %s", opts.WorkDir, shellCmd)
+		shellCmd = fmt.Sprintf("cd %s && %s", shellQuote(opts.WorkDir), shellCmd)
 	}
 
 	// NFS cache flush: force the kernel to re-validate file attributes so
@@ -325,21 +339,59 @@ func (k *K8sBackend) Exec(_ context.Context, opts ExecOpts) (*ExecResult, error)
 		StderrLines: stderrTotal,
 		StdoutTail:  stdoutTail,
 		StderrTail:  stderrTail,
+		StderrHead:  stderrHead(stderrBuf.String()),
 		DurationMs:  durationMs,
 		Truncated:   stdoutTrunc || stderrTrunc,
 		OOMKilled:   oomKilled || exitCode == 137,
 	}, nil
 }
 
+// Stop deletes the sandbox pod and waits for that exact pod (by UID) to
+// leave the API, so a confirmed stop means its gate process is gone. A
+// same-name replacement created meanwhile is neither deleted nor awaited.
+// The wait is bounded by the caller's context and podGoneTimeout.
 func (k *K8sBackend) Stop(ctx context.Context, id string) error {
-	gracePeriod := int64(5)
-	err := k.clientset.CoreV1().Pods(k.namespace).Delete(ctx, id, metav1.DeleteOptions{
-		GracePeriodSeconds: &gracePeriod,
-	})
-	if err != nil && !isNotFound(err) {
-		return fmt.Errorf("delete pod: %w", err)
+	uid, err := k.deleteIfIdentity(ctx, id, nil)
+	if err != nil || uid == "" {
+		return err
 	}
-	return nil
+	return k.waitForPodUIDGone(ctx, id, uid, podGoneTimeout())
+}
+
+// waitForPodUIDGone polls until no pod named id exists or the name belongs
+// to a different pod, using waitForPodGone's cadence. Transient API errors
+// keep polling and surface only if the deadline passes.
+func (k *K8sBackend) waitForPodUIDGone(ctx context.Context, id, uid string, timeout time.Duration) error {
+	const (
+		fastInterval = 200 * time.Millisecond
+		slowInterval = time.Second
+		fastWindow   = 2 * time.Second
+	)
+	deadline, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	var lastErr error
+	for {
+		current, err := k.clientset.CoreV1().Pods(k.namespace).Get(deadline, id, metav1.GetOptions{})
+		if isNotFound(err) || (err == nil && string(current.UID) != uid) {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+		interval := fastInterval
+		if time.Since(start) > fastWindow {
+			interval = slowInterval
+		}
+		select {
+		case <-deadline.Done():
+			if lastErr != nil {
+				return fmt.Errorf("wait for sandbox %s termination: %w (last get error: %v)", id, deadline.Err(), lastErr)
+			}
+			return fmt.Errorf("wait for sandbox %s termination: %w", id, deadline.Err())
+		case <-time.After(interval):
+		}
+	}
 }
 
 func (k *K8sBackend) Status(ctx context.Context, id string) (*StatusResult, error) {

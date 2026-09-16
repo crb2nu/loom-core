@@ -1,0 +1,1 @@
+- Recognize bare `402` and `Payment Required` OpenRouter insufficient-credit failures in the curated non-retryable `external_dependency_incident` matcher (`pkg/mills/sigfp/sigfp.go`, `pkg/mills/sigfp/sigfp_test.go`).

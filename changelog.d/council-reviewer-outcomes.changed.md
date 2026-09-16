@@ -1,0 +1,1 @@
+- Record bounded per-reviewer Council outcomes in `pkg/mills/council/council.go`, classify provider auth and quota incidents, emit outcome telemetry from `pkg/telemetry/telemetry.go`, and fail closed when no reviewer returns usable content.

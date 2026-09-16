@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/crb2nu/loom/pkg/llmusage"
 	"github.com/crb2nu/loom/pkg/mills/clients"
 )
 
@@ -29,13 +30,39 @@ const defaultTriageMaxTokens = 512
 // degrades the overseers to flag-only, it never blocks their deterministic
 // work and never causes a judgment-free action.
 type Triage struct {
-	Client    ChatClient
+	Client ChatClient
+	// Model overrides the model the verdicts dial. Empty keeps the client's
+	// JudgeModel() (the historical wiring); the operator sets it from
+	// MILLS_TRIAGE_BACKEND / FLEXINFER_TRIAGE_MODEL so the overseers can run
+	// on a warm local lane while the gates keep the frontier judge.
+	Model     string
 	MaxTokens int
 	Logger    *slog.Logger
 }
 
 // Available reports whether LLM verdicts can be requested.
 func (t *Triage) Available() bool { return t != nil && t.Client != nil }
+
+// model is the id every triage call dials: the override when set, else the
+// client's judge model.
+func (t *Triage) model() string {
+	if t.Model != "" {
+		return t.Model
+	}
+	return t.Client.JudgeModel()
+}
+
+// chat is the single dial-out for triage traffic: it tags the context with
+// clients.ComponentTriage so usage lands on
+// mills_llm_prompt_tokens_total{component="mills-triage"} rather than being
+// folded into the judge's counters, and dials model().
+func (t *Triage) chat(ctx context.Context, prompt string, maxTokens int) (string, float64, error) {
+	if !t.Available() {
+		return "", 0, errors.New("overseer triage: no client")
+	}
+	ctx = llmusage.WithComponent(ctx, clients.ComponentTriage)
+	return t.Client.ChatStructured(ctx, t.model(), prompt, maxTokens)
+}
 
 // Verdict asks the judge model one structured question and decodes the JSON
 // object in its reply into out. Returns the call's cost in USD. Any error —
@@ -49,7 +76,7 @@ func (t *Triage) Verdict(ctx context.Context, prompt string, out any) (float64, 
 	if maxTokens <= 0 {
 		maxTokens = defaultTriageMaxTokens
 	}
-	content, cost, err := t.Client.ChatStructured(ctx, t.Client.JudgeModel(), prompt, maxTokens)
+	content, cost, err := t.chat(ctx, prompt, maxTokens)
 	if err != nil {
 		return cost, fmt.Errorf("overseer triage: %w", err)
 	}

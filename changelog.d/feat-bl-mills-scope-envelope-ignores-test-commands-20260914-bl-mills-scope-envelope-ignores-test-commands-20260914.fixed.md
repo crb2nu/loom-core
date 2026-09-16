@@ -1,0 +1,1 @@
+- Ignore test commands when building Mills scope envelopes and gate inputs, preserving declared file paths and globs (`pkg/mills/scope_overlap.go`, `pkg/mills/store/scope_overlap.go`, and `pkg/mills/gates/scope.go`).

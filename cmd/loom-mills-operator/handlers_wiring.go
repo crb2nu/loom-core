@@ -17,8 +17,8 @@ import (
 // post policy) routing the operator logs at startup but the HUD Mills Overview
 // otherwise hides. The values are captured ONCE at wiring time into a
 // WiringSnapshot (buildWiringSnapshot, called from main.go adjacent to the
-// wiring log lines) and served verbatim: the routing only changes on restart,
-// so a static snapshot can never disagree with the reconciler's live behavior.
+// wiring log lines): routing only changes on restart. Vendor circuit state is
+// overlaid on each read so breaker trips, resets, and expiry are visible live.
 //
 // Contract invariants the HUD Overview builds against (buildWiringSnapshot must
 // preserve them): every array field is non-nil ([] never null) and no secret,
@@ -111,15 +111,16 @@ type policyWiring struct {
 // WiringSnapshot is the full resolved model-wiring config the /wiring endpoint
 // serves. Built once at startup by buildWiringSnapshot.
 type WiringSnapshot struct {
-	GeneratedAt time.Time     `json:"generated_at"`
-	Judge       judgeWiring   `json:"judge"`
-	Weaver      weaverWiring  `json:"weaver"`
-	Council     councilWiring `json:"council"`
-	Stages      []stageWiring `json:"stages"`
-	Spawn       spawnWiring   `json:"spawn"`
-	Gates       gatesWiring   `json:"gates"`
-	LiteLLM     litellmWiring `json:"litellm"`
-	Policy      policyWiring  `json:"policy"`
+	Vendors     map[string]clients.VendorBreakerState `json:"vendors"`
+	GeneratedAt time.Time                             `json:"generated_at"`
+	Judge       judgeWiring                           `json:"judge"`
+	Weaver      weaverWiring                          `json:"weaver"`
+	Council     councilWiring                         `json:"council"`
+	Stages      []stageWiring                         `json:"stages"`
+	Spawn       spawnWiring                           `json:"spawn"`
+	Gates       gatesWiring                           `json:"gates"`
+	LiteLLM     litellmWiring                         `json:"litellm"`
+	Policy      policyWiring                          `json:"policy"`
 }
 
 // spawnStages is the ordered set of spawn-driven pipeline stages the wiring log
@@ -150,8 +151,8 @@ type wiringInputs struct {
 	// judge dials on the litellm backend ("" on the flexinfer default).
 	councilJudgeModel string
 
-	// agentFor/modelFor are the effective per-stage resolvers (env > policy >
-	// default). Never nil in production; buildWiringSnapshot guards nil.
+	// agentFor/modelFor use the shared guarded spawn route (env > policy >
+	// default), dropping unpaired or vendor-mismatched stage pins. Never nil in production; buildWiringSnapshot guards nil.
 	agentFor func(stage string) string
 	modelFor func(stage string) string
 
@@ -162,7 +163,7 @@ type wiringInputs struct {
 	spawnEnvAgent     bool
 	spawnEnvModel     bool
 
-	// gateTiebreaker is "anthropic" (dissent tiebreaker wired) or "none".
+	// gateTiebreaker is the ordered vendor/model chain, or "none".
 	gateTiebreaker string
 
 	now time.Time
@@ -345,7 +346,7 @@ func orString(v, def string) string {
 	return v
 }
 
-// handleWiring serves the static resolved model-wiring snapshot captured at
+// handleWiring overlays live vendor circuits on the model-wiring snapshot captured at
 // startup. Read-only, non-secret config — no auth, GET only. Returns 503 only
 // in the (production-impossible) case that the snapshot was never populated,
 // which surfaces a wiring bug rather than serving a misleading zero value.
@@ -357,5 +358,10 @@ func (o *operator) handleWiring(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "wiring snapshot not populated", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, http.StatusOK, snap)
+	live := *snap
+	live.Vendors = map[string]clients.VendorBreakerState{}
+	for _, vendor := range []string{"anthropic", "openai"} {
+		live.Vendors[vendor] = clients.DefaultVendorBreaker.State(vendor)
+	}
+	writeJSON(w, http.StatusOK, live)
 }

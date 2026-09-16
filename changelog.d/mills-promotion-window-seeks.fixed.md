@@ -1,0 +1,1 @@
+- Promotion reports seek each actor's exact time window through the existing event index, avoiding scans of historical actor entries on busy stores without requiring a schema migration.

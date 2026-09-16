@@ -1,0 +1,1 @@
+- Extract the HUD spawn launcher implementations from `internal/hud/spawn.go` into `internal/hud/spawn_launch.go`, preserving the characterized seam behavior in `internal/hud/spawn_test.go`.

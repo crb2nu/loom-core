@@ -299,6 +299,46 @@ func TestRunner_ScopeEscalationOpensDraftRescueMR(t *testing.T) {
 	if reason := escalationReasonFromEvents(t, st); !strings.Contains(reason, "rescue draft MR !1249") {
 		t.Errorf("escalation reason %q must name the rescue MR", reason)
 	}
+	persisted, err := st.Pipeline.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get escalated rescue run: %v", err)
+	}
+	if persisted.MRIID == nil || *persisted.MRIID != 1249 {
+		t.Fatalf("rescue mr_iid = %v, want 1249", persisted.MRIID)
+	}
+}
+
+func TestScopeAmendment_TestCommandPathDoesNotDeclareScope(t *testing.T) {
+	item := &store.BacklogItem{Slices: []store.Slice{{
+		Name:  "scope-hydration-fix",
+		Files: []string{"pkg/mills/pipeline/slice_hydration.go"},
+		Tests: []string{"GOWORK=off go build ./cmd/custom-server"},
+	}}}
+	decision := gates.EvaluateScopeAmendment(
+		fileScopedItem(item),
+		[]string{"cmd/another-server/main.go"},
+		mills.ScopeAmendmentPolicy{},
+		nil,
+	)
+
+	if decision.Admitted {
+		t.Fatal("cmd reach admitted via a test-command path; want refusal")
+	}
+	if len(decision.Verdicts) != 1 || decision.Verdicts[0].Rule != gates.AmendRuleNoSharedAncestor {
+		t.Fatalf("verdicts = %+v, want no-shared-ancestor refusal", decision.Verdicts)
+	}
+	for _, dir := range decision.DeclaredDirs {
+		if strings.Contains(dir, "GOWORK=off") || dir == "cmd" || strings.HasPrefix(dir, "cmd/") {
+			t.Fatalf("test command leaked into declared directories: %v", decision.DeclaredDirs)
+		}
+	}
+	body := scopeRescueMRBody(&store.PipelineRun{ID: "run-1"}, item, &decision)
+	if strings.Contains(body, "GOWORK=off") || strings.Contains(body, "`cmd`") {
+		t.Fatalf("rescue MR rendered test-derived scope:\n%s", body)
+	}
+	if !strings.Contains(body, "`pkg/mills/pipeline`") {
+		t.Fatalf("rescue MR omitted file-derived directory:\n%s", body)
+	}
 }
 
 // A NON-scope gate cap must not gain a blanket class MARKER — the original

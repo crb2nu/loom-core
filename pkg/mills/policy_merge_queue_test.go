@@ -1,6 +1,24 @@
 package mills
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestMergeQueueSpeculationDepthDefaultsOffAndBoundsToQueue(t *testing.T) {
+	var nilPolicy *Policy
+	if got := nilPolicy.MergeQueueSpeculationDepth(); got != 0 {
+		t.Fatalf("nil depth = %d", got)
+	}
+	p := &Policy{MergeQueue: MergeQueuePolicy{MaxDepth: 3, SpeculationDepth: 7}}
+	if got := p.MergeQueueSpeculationDepth(); got != 3 {
+		t.Fatalf("bounded depth = %d, want 3", got)
+	}
+	p.MergeQueue.SpeculationDepth = 2
+	if got := p.MergeQueueSpeculationDepth(); got != 2 {
+		t.Fatalf("configured depth = %d, want 2", got)
+	}
+}
 
 // The queue must be OFF for a nil policy, an omitted section, and a frozen
 // mills (global kill switch), and ON only with an explicit enable.
@@ -25,6 +43,27 @@ func TestMergeQueueEnabled(t *testing.T) {
 	p.Enabled = &off
 	if p.MergeQueueEnabled() {
 		t.Fatalf("a frozen mills must freeze the merge queue")
+	}
+}
+
+// The await bound is opt-in: nil/omitted/zero/negative yield 0 so the
+// processor keeps its compiled default; an explicit value is minutes.
+func TestMergeQueueAwaitPipeline(t *testing.T) {
+	var nilPolicy *Policy
+	if got := nilPolicy.MergeQueueAwaitPipeline(); got != 0 {
+		t.Fatalf("nil policy await = %v, want 0", got)
+	}
+	p := &Policy{}
+	if got := p.MergeQueueAwaitPipeline(); got != 0 {
+		t.Fatalf("omitted await = %v, want 0", got)
+	}
+	p.MergeQueue.AwaitPipelineMinutes = -5
+	if got := p.MergeQueueAwaitPipeline(); got != 0 {
+		t.Fatalf("negative await = %v, want 0", got)
+	}
+	p.MergeQueue.AwaitPipelineMinutes = 120
+	if got := p.MergeQueueAwaitPipeline(); got != 120*time.Minute {
+		t.Fatalf("explicit await = %v, want 120m", got)
 	}
 }
 

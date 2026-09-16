@@ -1,0 +1,1 @@
+- Add exactly-once queued-item requeue proof, JSON verdicts, and a side-effect-free dry run to `mills-workflow-killtest` (`cmd/mills-workflow-killtest/main.go`, `pkg/mills/workflow/requeue.go`).

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/crb2nu/loom/pkg/mills/audit"
 	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/crb2nu/loom/pkg/telemetry"
 )
@@ -21,7 +22,7 @@ var (
 // StampAuthorizer decides whether the caller may deliver to the exact project
 // named by a stamp. Implementations must not substitute a home/default project.
 type StampAuthorizer interface {
-	AuthorizeStamp(context.Context, string) error
+	AuthorizeStamp(context.Context, string, string) error
 }
 
 func validRouteProject(project string) bool {
@@ -44,9 +45,11 @@ type StampDeliveryMetricSink interface {
 
 // Deliverer is the authorization boundary around cross-repository stamp writes.
 type Deliverer struct {
-	Authorizer StampAuthorizer
-	Writer     StampWriter
-	Metrics    StampDeliveryMetricSink
+	SourceProject string
+	Authorizer    StampAuthorizer
+	Writer        StampWriter
+	Audit         audit.StampWriteEmitter
+	Metrics       StampDeliveryMetricSink
 }
 
 // Deliver authorizes and persists a target-bound stamp. Validation and
@@ -57,34 +60,64 @@ func (d *Deliverer) Deliver(ctx context.Context, stamp *store.Stamp) (err error)
 	outcome := telemetry.CrossRepoStampDeliveryFailure
 	metrics := d.metricSink()
 	defer func() { metrics.RecordCrossRepoStampDelivery(outcome) }()
+	event := audit.StampWriteEvent{Decision: audit.StampWriteRejected}
+	defer func() {
+		if d != nil && d.Audit != nil {
+			d.Audit.EmitStampWrite(ctx, event)
+		}
+	}()
 
 	if d == nil {
 		outcome = telemetry.CrossRepoStampDeliveryDenial
+		event.Reason = "deliverer_missing"
 		return fmt.Errorf("%w: deliverer is nil", ErrStampDeliveryDenied)
 	}
+	event.SourceProject = strings.TrimSpace(d.SourceProject)
 	if stamp == nil {
 		outcome = telemetry.CrossRepoStampDeliveryDenial
+		event.Reason = "stamp_missing"
 		return fmt.Errorf("%w: stamp is required", ErrStampDeliveryDenied)
+	}
+	stamp.ID = strings.TrimSpace(stamp.ID)
+	stamp.TargetProject = strings.TrimSpace(stamp.TargetProject)
+	event.StampID = stamp.ID
+	event.TargetProject = stamp.TargetProject
+	if stamp.ID == "" {
+		outcome = telemetry.CrossRepoStampDeliveryDenial
+		event.Reason = "stamp_id_missing"
+		return fmt.Errorf("%w: stamp ID is required", ErrStampDeliveryDenied)
+	}
+	if !validRouteProject(event.SourceProject) {
+		outcome = telemetry.CrossRepoStampDeliveryDenial
+		event.Reason = "source_project_missing_or_malformed"
+		return fmt.Errorf("%w: source project %q is missing or malformed", ErrStampDeliveryDenied, event.SourceProject)
 	}
 	if !validRouteProject(stamp.TargetProject) {
 		outcome = telemetry.CrossRepoStampDeliveryDenial
+		event.Reason = "target_project_missing_or_malformed"
 		return fmt.Errorf("%w: target project %q is missing or malformed", ErrStampDeliveryDenied, stamp.TargetProject)
 	}
 	if d.Authorizer == nil {
 		outcome = telemetry.CrossRepoStampDeliveryDenial
+		event.Reason = "authorizer_missing"
 		return fmt.Errorf("%w: authorizer is required", ErrStampDeliveryDenied)
 	}
-	if err := d.Authorizer.AuthorizeStamp(ctx, stamp.TargetProject); err != nil {
+	if err := d.Authorizer.AuthorizeStamp(ctx, event.SourceProject, stamp.TargetProject); err != nil {
 		outcome = telemetry.CrossRepoStampDeliveryDenial
+		event.Reason = "policy_denied"
 		return fmt.Errorf("%w for target project %q: %w", ErrStampDeliveryDenied, stamp.TargetProject, err)
 	}
 	if d.Writer == nil {
+		event.Reason = "writer_missing"
 		return fmt.Errorf("%w: stamp writer is required", ErrStampDeliveryFailed)
 	}
 	if err := d.Writer.Put(ctx, stamp); err != nil {
+		event.Reason = "write_failed"
 		return fmt.Errorf("%w for target project %q: %w", ErrStampDeliveryFailed, stamp.TargetProject, err)
 	}
 	outcome = telemetry.CrossRepoStampDeliverySuccess
+	event.Decision = audit.StampWriteAllowed
+	event.Reason = "written"
 	return nil
 }
 

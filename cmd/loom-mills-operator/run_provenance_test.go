@@ -16,6 +16,9 @@ budgets:
   pipeline: { max_usd_per_run: 5, max_usd_per_day: 75 }
 pipeline:
   retry: { max_attempts: 3, cooldown_seconds: 300 }
+  stage_agents:
+    implement: codex
+    plan_slice: codex
   stage_models:
     implement: gpt-5.6-terra
     plan_slice: gpt-5.6-sol

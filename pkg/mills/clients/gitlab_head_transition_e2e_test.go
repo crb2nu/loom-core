@@ -208,6 +208,30 @@ type implementWorker struct {
 	calls map[string]int
 }
 
+// e2eSpawnClient gives the implement stage the same invocation inputs as a
+// production SpawnWorker while keeping this test independent of HUD.
+type e2eSpawnClient struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *e2eSpawnClient) Run(_ context.Context, _ pipeline.SpawnRequest) (pipeline.SpawnResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return pipeline.SpawnResponse{
+		FilesChanged:   []string{"pkg/mills/store/dao_mr_transitions.go"},
+		DiffPatch:      []byte("diff --git a/x b/x\n+durable\n"),
+		CommitMessages: []string{"feat(mills): durable head transitions"},
+	}, nil
+}
+
+func (s *e2eSpawnClient) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
 func (s *implementWorker) Run(_ context.Context, jc pipeline.JobContext) (pipeline.StageOutput, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -264,20 +288,27 @@ func TestE2E_HeadMovesAfterGreenCI_RegatesAndMergesTheSuccessor(t *testing.T) {
 		t.Fatalf("seed backlog: %v", err)
 	}
 	run := &store.PipelineRun{
-		ID:        "PIPE-BL-E2E-374-0",
-		BacklogID: item.ID,
-		Template:  "mills-default-pipeline",
-		State:     store.PipelineQueued,
-		Attempts:  1,
-		StartedAt: time.Date(2026, 7, 25, 16, 0, 0, 0, time.UTC),
+		ID:           "PIPE-BL-E2E-374-0",
+		BacklogID:    item.ID,
+		Template:     "mills-default-pipeline",
+		State:        store.PipelineQueued,
+		Attempts:     1,
+		WorktreePath: t.TempDir(),
+		StartedAt:    time.Date(2026, 7, 25, 16, 0, 0, 0, time.UTC),
 	}
 	if err := st.Pipeline.PutRun(ctx, run); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 
 	stub := &implementWorker{}
+	spawn := &e2eSpawnClient{}
 	gw := &pipeline.GitLabWorker{Client: cli}
 	disp := pipeline.NewDispatcher(map[string]pipeline.Worker{
+		"implement": &pipeline.SpawnWorker{
+			Client:        spawn,
+			PromptFor:     func(pipeline.JobContext) string { return "implement durable head transitions" },
+			NeedsWorktree: true,
+		},
 		"mr":       gw,
 		"ci_watch": gw,
 		"merge":    gw,
@@ -345,7 +376,7 @@ func TestE2E_HeadMovesAfterGreenCI_RegatesAndMergesTheSuccessor(t *testing.T) {
 
 	// Exactly one rewind: one extra pass over the source-sensitive tail, and
 	// no re-run of the expensive planning/implementation stages.
-	if got := stub.count("implement"); got != 1 {
+	if got := spawn.count(); got != 1 {
 		t.Errorf("implement ran %d times, want 1 — a rewind replays the same work onto a new base", got)
 	}
 	if got := stub.count("plan_slice"); got != 1 {

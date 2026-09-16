@@ -55,8 +55,9 @@ type IncidentSummary struct {
 // IncidentDAO persists classified incidents in the Mills event log. One row is
 // maintained for each fingerprint across runner restarts.
 type IncidentDAO struct {
-	db     *sql.DB
-	events *EventDAO
+	db      *sql.DB
+	events  *EventDAO
+	hotRead hotReadConfig
 }
 
 // Put persists an incident. It returns true when a fingerprint is first seen;
@@ -157,9 +158,23 @@ func (d *IncidentDAO) ListSince(ctx context.Context, since time.Time, limit int)
 		return nil, errors.New("incident store not configured")
 	}
 	if limit <= 0 {
-		limit = 200
+		return nil, errors.New("incident list: positive limit required")
 	}
-	rows, err := d.db.QueryContext(ctx, `
+	limit = d.hotRead.bound(limit, 200)
+	queryCtx, cancel := d.hotRead.context(ctx)
+	defer cancel()
+	// NOT pinned to idx_events_occurred. The pin predated migration 029's
+	// (kind, occurred_at) index and outlived it here after ListSinceByKinds was
+	// unpinned on 2026-09-02: forced onto the time index the planner walked
+	// the whole 24h event window newest-first, filtering for the rare incident
+	// kind row by row — on the loaded operator node that blew the 5s hot-read
+	// budget on 8 of the 16 council runs between 2026-09-03 and 2026-09-07
+	// ("council: list persisted incidents: incident list: context deadline
+	// exceeded" — a brief-stage abort before any model spend). Unpinned, the
+	// planner takes idx_events_kind_occurred: one range over the incident
+	// kind, sub-millisecond. TestIncidentDAO_ListSinceUsesKindIndex pins the
+	// plan.
+	rows, err := d.db.QueryContext(queryCtx, `
 		SELECT `+eventColumns+`
 		FROM events
 		WHERE kind = ? AND occurred_at >= ?
@@ -185,10 +200,18 @@ func (d *IncidentDAO) ListSince(ctx context.Context, since time.Time, limit int)
 	return out, nil
 }
 
-// ListAggregated returns all persisted incidents grouped by their stable
-// classification identity and sorted independently of insertion order.
-func (d *IncidentDAO) ListAggregated(ctx context.Context) ([]IncidentSummary, error) {
-	records, err := d.ListSince(ctx, time.Time{}, int(^uint(0)>>1))
+// ListAggregated returns a bounded window of persisted incidents grouped by
+// their stable classification identity and sorted independently of insertion
+// order. Callers must choose both the evidence window and maximum row count;
+// an accidental all-history council read must never grow with the event log.
+func (d *IncidentDAO) ListAggregated(ctx context.Context, since time.Time, limit int) ([]IncidentSummary, error) {
+	if since.IsZero() {
+		return nil, errors.New("incident list-aggregated: since required")
+	}
+	if limit <= 0 {
+		return nil, errors.New("incident list-aggregated: positive limit required")
+	}
+	records, err := d.ListSince(ctx, since, limit)
 	if err != nil {
 		return nil, err
 	}

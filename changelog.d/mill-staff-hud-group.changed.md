@@ -1,0 +1,1 @@
+- Add `MillStaffGroup.svelte` and opt-in grouped rendering in `PanelShell.svelte` so the four Mill Staff HUD surfaces share one accessible, ordered presentation without changing standalone panels.

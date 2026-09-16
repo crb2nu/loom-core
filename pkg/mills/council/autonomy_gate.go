@@ -2,7 +2,10 @@ package council
 
 import (
 	"context"
+	"errors"
 	"strings"
+
+	"github.com/crb2nu/loom/pkg/transport"
 )
 
 const (
@@ -83,4 +86,34 @@ func normalizeReasonCode(code string) string {
 		return AutonomyReasonBlocked
 	}
 	return code
+}
+
+// TransientCapabilities returns bounded metric identities only when every blocker
+// is a substrate failure: a transport error (the dependency is down) or a
+// deadline / call-slot expiry (the dependency is busy — the 2026-09-13 hub
+// probe `wait for call slot: context deadline exceeded` under load). Unknown or
+// mixed configuration blockers fail closed.
+func (d AutonomyGateDecision) TransientCapabilities() []string {
+	d = NormalizeAutonomyDecision(d)
+	if d.Allowed || d.Code != AutonomyReasonCapabilityRed || len(d.Blockers) == 0 {
+		return nil
+	}
+	var capabilities []string
+	seen := map[string]bool{}
+	for _, blocker := range d.Blockers {
+		if err := errors.New(blocker); !transport.IsError(err) && !transport.IsTimeout(err) {
+			return nil
+		}
+		name, _, _ := strings.Cut(blocker, ":")
+		switch name {
+		case "sqlite_store", "policy_loaded", "admin_auth", "repo_root", "flexinfer", "gitlab", "hud_spawn", "mcp_hub_session", "dispatcher_write_stages", "council_participants", "branch_contract", "kpi_writer":
+		default:
+			name = "unknown"
+		}
+		if !seen[name] {
+			capabilities = append(capabilities, name)
+			seen[name] = true
+		}
+	}
+	return capabilities
 }

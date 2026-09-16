@@ -1,0 +1,1 @@
+- Give the `test:race` CI job a 30-minute Go test timeout so runner contention degrades to a slow run instead of a false failure.

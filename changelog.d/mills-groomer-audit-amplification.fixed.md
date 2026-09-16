@@ -1,0 +1,1 @@
+Bound groomer sibling-skip auditing to relevant duplicate candidates and retain one durable witness per item. Protected slices are still checked every pass; unchanged comparisons no longer repeatedly grow the event ledger or dry-run soak counts.

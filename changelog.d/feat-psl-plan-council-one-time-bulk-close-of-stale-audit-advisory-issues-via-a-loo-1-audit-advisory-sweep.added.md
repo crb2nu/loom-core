@@ -1,0 +1,1 @@
+- Add the dry-run-by-default `loom audit-advisory-sweep` command and its narrowly scoped stale digest selection in `cmd/loom/main.go`, `pkg/mills/audit/sweep.go`, and `pkg/mills/audit/advisory.go`.

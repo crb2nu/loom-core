@@ -1746,13 +1746,15 @@ func TestCleanRepoSkills_RemovesStaleFiles(t *testing.T) {
 	os.MkdirAll(skillsDir, 0755)
 	os.WriteFile(filepath.Join(skillsDir, "SKILL.md"), []byte("stale"), 0644)
 
-	// Create stale manifest
-	os.WriteFile(filepath.Join(repoGemini, skills.ManifestFilename), []byte("{}"), 0644)
-
 	// Create stale instructions.md
 	os.WriteFile(filepath.Join(repoGemini, "instructions.md"), []byte("stale"), 0644)
 
-	m.cleanRepoSkills(p, []string{"test-skill"})
+	if err := skills.WriteManifest(repoGemini, "gemini", []string{"skills/test-skill/SKILL.md", "instructions.md"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.cleanRepoSkills(p); err != nil {
+		t.Fatal(err)
+	}
 
 	if Exists(filepath.Join(repoGemini, "skills")) {
 		t.Error("expected skills directory to be removed")
@@ -1779,7 +1781,9 @@ func TestCleanRepoSkills_NoopWhenNothingExists(t *testing.T) {
 	}
 
 	// Should not panic or error when nothing exists
-	m.cleanRepoSkills(p, nil)
+	if err := m.cleanRepoSkills(p); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSyncToHome_SkillsDirectToHome_SkipsRepoCopy(t *testing.T) {
@@ -2424,7 +2428,7 @@ func TestCompareHomeGeneratedFiles_ReportsMissingExtras(t *testing.T) {
 	}
 }
 
-func TestCleanSkillsAt_PrunesRegistryCommandsOnly(t *testing.T) {
+func TestCleanSkillsAt_PrunesManagedCommandsOnly(t *testing.T) {
 	repoDir := t.TempDir()
 	m, _ := NewManager(repoDir)
 
@@ -2438,7 +2442,12 @@ func TestCleanSkillsAt_PrunesRegistryCommandsOnly(t *testing.T) {
 	os.WriteFile(stale, []byte("stale"), 0644)
 	os.WriteFile(handAuthored, []byte("mine"), 0644)
 
-	m.cleanSkillsAt(claudeDir, []string{"registry-skill"})
+	if err := skills.WriteManifest(claudeDir, "claude", []string{"commands/registry-skill.md"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.cleanSkillsAt(claudeDir); err != nil {
+		t.Fatal(err)
+	}
 
 	if Exists(stale) {
 		t.Error("registry-derived stale command must be pruned")

@@ -1,0 +1,1 @@
+- Build missing Mills report snapshots on demand for requested windows and actor keys, and show an honest snapshot-unavailable state in the Mill Staff HUD instead of mislabeling the operator as unconfigured.

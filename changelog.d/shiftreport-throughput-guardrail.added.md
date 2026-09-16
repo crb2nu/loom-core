@@ -1,0 +1,1 @@
+- Add policy-thresholded escalation, cost-per-merge, scope queue-age, and starvation verdicts to shift-report JSON and Markdown (`pkg/mills`, `pkg/mills/shiftreport`, and `cmd/loom-mills-operator`).

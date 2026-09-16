@@ -15,6 +15,15 @@ spec:
       labels:
         app: mcpo
         component: mcpo
+      annotations:
+        # mcpo reads its mounted config once at startup — a ConfigMap edit
+        # alone never reaches the running process (the kubelet's ..data
+        # symlink swap is invisible to it). Every configmap.yaml change MUST
+        # bump this manually-computed sha256 of configmap.yaml so the
+        # Deployment rolls (mirrors the loom-mills policy-checksum pattern).
+        # Single replica: expect a short OpenAPI-proxy blip per rollout
+        # (planned in .loom/197-research-mcpo-sse-migration-2026-08.md §4).
+        loom.flexinfer.ai/config-checksum: 2e23aa396b758d3074ee97266f496bbf5887ba2dd1a88c4469d9ddd63f3a193f
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64

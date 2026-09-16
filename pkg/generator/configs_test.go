@@ -1745,7 +1745,7 @@ func TestBuildTargetMap_LoomModeLLMClientsAddToolFilterArgs(t *testing.T) {
 				"proxy",
 				"--agent-hint", profile.LoomProxy.AgentHint,
 				"--tool-profile", "llm-core",
-				"--max-tools", "167",
+				"--max-tools", "175",
 			}
 			if strings.Join(gotArgs, " ") != strings.Join(want, " ") {
 				t.Fatalf("loom-mode %s args = %v, want %v", targetName, gotArgs, want)

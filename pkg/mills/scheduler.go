@@ -68,6 +68,33 @@ type Scheduler struct {
 	// Defaults to time.Now.
 	Clock func() time.Time
 
+	// OnBootTick, when set, is called exactly once after Run's immediate boot
+	// reconcile returns — success, failure, or admission-closed skip alike.
+	// The operator releases the BootPhase that gates the escalation
+	// sweeper's first pass from it, so that pass never overlaps the boot
+	// tick on a cold store.
+	OnBootTick func()
+
+	// HousekeepingStagger spaces the reconciler's rate-limited housekeeping
+	// sweeps (regression attribution, signature mining, learning-signal
+	// export, retention) over the ticks AFTER boot, one per step, instead of
+	// letting all four fall due on the boot tick (see
+	// Reconciler.staggerHousekeeping). Zero uses the tick Interval; negative
+	// disables the stagger and restores the pre-2026-09-08 all-on-boot
+	// behaviour.
+	HousekeepingStagger time.Duration
+
+	// KPIRecordInterval is the minimum spacing between KPI snapshots. Zero
+	// records after every steady-state tick (the historical behaviour tests
+	// rely on); the operator wires DefaultKPIRecordInterval. Each Record
+	// writes one row per window (three by default), so a per-minute cadence
+	// grows kpi_snapshots by ~4.3k rows/day — 237k rows / 227MB and the
+	// single largest object in the production store on 2026-09-08 — for a
+	// signal whose readers (status, HUD sparklines, the circuit breaker, the
+	// shift report) are all fine with five-minute resolution.
+	KPIRecordInterval time.Duration
+	lastKPIRecord     time.Time
+
 	// stopCh is closed by Stop(); Run() returns once observed.
 	stopCh chan struct{}
 	stopMu sync.Mutex
@@ -89,7 +116,23 @@ const (
 	defaultIdleAfter          = 5 * time.Minute
 	schedulerTickTimeout      = 30 * time.Second
 	schedulerKPIRecordTimeout = 10 * time.Second
+	// DefaultKPIRecordInterval is the production KPI snapshot cadence (see
+	// Scheduler.KPIRecordInterval). Five minutes matches the idle tick
+	// cadence, so an idle operator's snapshot rate does not change.
+	DefaultKPIRecordInterval = 5 * time.Minute
 )
+
+// kpiRecordDue reports whether a KPI snapshot may be written at now, and
+// stamps the attempt when it may. A failed Record still consumes the slot: a
+// snapshot that timed out on a cold cache should not be retried every minute
+// while the store is at its slowest.
+func (s *Scheduler) kpiRecordDue(now time.Time) bool {
+	if s.KPIRecordInterval > 0 && !s.lastKPIRecord.IsZero() && now.Sub(s.lastKPIRecord) < s.KPIRecordInterval {
+		return false
+	}
+	s.lastKPIRecord = now
+	return true
+}
 
 // KPIRecorder is the minimal contract Scheduler needs from the KPI writer.
 type KPIRecorder interface {
@@ -156,11 +199,21 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// First tick fires immediately so the operator surfaces queued work
 	// without waiting a full interval after boot. The idle-streak clock
 	// only starts after the first tick observes a no-op, so a healthy
-	// boot doesn't trip the throttle.
+	// boot doesn't trip the throttle. The boot tick carries only the
+	// control law: the housekeeping sweeps are staggered onto the ticks
+	// that follow (HousekeepingStagger), against the reconciler's own clock
+	// because that is the clock their due-checks read.
+	if stagger := s.housekeepingStagger(interval); stagger > 0 {
+		s.Reconciler.staggerHousekeeping(s.Reconciler.now(), stagger)
+	}
 	idleSince := time.Time{}
-	if res, err := s.bootTickOnce(ctx); err != nil && s.Logger != nil {
+	res, err := s.bootTickOnce(ctx)
+	if s.OnBootTick != nil {
+		s.OnBootTick()
+	}
+	if err != nil && s.Logger != nil {
 		s.Logger.Warn("scheduler: initial tick failed", "error", err)
-	} else if res.IsNoOp() {
+	} else if err == nil && res.IsNoOp() {
 		idleSince = s.now()
 	}
 
@@ -259,6 +312,19 @@ func (s *Scheduler) nextInterval(
 	return interval, idleSince
 }
 
+// housekeepingStagger resolves HousekeepingStagger against the tick interval:
+// zero means one sweep per following tick, negative disables.
+func (s *Scheduler) housekeepingStagger(interval time.Duration) time.Duration {
+	switch {
+	case s.HousekeepingStagger < 0:
+		return 0
+	case s.HousekeepingStagger == 0:
+		return interval
+	default:
+		return s.HousekeepingStagger
+	}
+}
+
 func cadenceReason(next, fast time.Duration) string {
 	if next == fast {
 		return "active"
@@ -303,7 +369,7 @@ func (s *Scheduler) runTick(ctx context.Context, recordKPI bool) (TickResult, er
 	if s.stopRequested() {
 		return res, nil
 	}
-	if recordKPI && s.KPIRecorder != nil {
+	if recordKPI && s.KPIRecorder != nil && s.kpiRecordDue(s.now()) {
 		kpiCtx, kpiCancel := context.WithTimeout(ctx, schedulerKPIRecordTimeout)
 		if err := kpiCtx.Err(); err != nil {
 			kpiCancel()
@@ -321,8 +387,8 @@ func (s *Scheduler) runTick(ctx context.Context, recordKPI bool) (TickResult, er
 	if s.Logger != nil {
 		s.Logger.Debug("scheduler tick",
 			"inspected", res.Inspected, "started", res.Started,
-			"deferred", res.Deferred, "skipped", res.Skipped, "errored", res.Errored,
-			"skip_reason", res.SkipReason,
+			"deferred", res.Deferred, "skipped", res.Skipped, "held_human", res.HeldHuman,
+			"errored", res.Errored, "skip_reason", res.SkipReason,
 		)
 	}
 	return res, nil

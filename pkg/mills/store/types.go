@@ -1,9 +1,82 @@
 package store
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
+
+type WatchSubjectKind string
+
+const (
+	WatchSubjectBacklogItem  WatchSubjectKind = "backlog_item"
+	WatchSubjectMergeRequest WatchSubjectKind = "merge_request"
+	WatchSubjectPipelineRun  WatchSubjectKind = "pipeline_run"
+)
+
+type WatchState string
+
+const (
+	WatchActive    WatchState = "active"
+	WatchMet       WatchState = "met"
+	WatchExpired   WatchState = "expired"
+	WatchCancelled WatchState = "cancelled"
+)
+
+// Watch is durable custody of an operator's intent to be notified when a
+// subject reaches TerminalCondition. It never authorizes remediation.
+type Watch struct {
+	ID                string           `json:"id"`
+	SubjectKind       WatchSubjectKind `json:"subject_kind"`
+	SubjectID         string           `json:"subject_id"`
+	TerminalCondition string           `json:"terminal_condition"`
+	Note              string           `json:"note,omitempty"`
+	State             WatchState       `json:"state"`
+	CreatedAt         time.Time        `json:"created_at"`
+	ExpiresAt         time.Time        `json:"expires_at"`
+	ResolvedAt        *time.Time       `json:"resolved_at,omitempty"`
+	Resolution        string           `json:"resolution,omitempty"`
+}
+
+type WatchFilter struct {
+	State       WatchState
+	SubjectKind WatchSubjectKind
+	SubjectID   string
+}
+
+const MaxWatchTTL = 365 * 24 * time.Hour
+
+// ValidateWatchSubject validates the closed REST/store watch vocabulary.  The
+// non-MR identifiers are opaque, but whitespace/control characters are never
+// valid identifiers and make log/event correlation ambiguous.
+func ValidateWatchSubject(kind WatchSubjectKind, id, condition string) error {
+	id = strings.TrimSpace(id)
+	condition = strings.ToLower(strings.TrimSpace(condition))
+	if id == "" || len(id) > 256 || strings.IndexFunc(id, unicode.IsSpace) >= 0 || strings.IndexFunc(id, unicode.IsControl) >= 0 {
+		return fmt.Errorf("watch: invalid subject_id")
+	}
+	validCondition := false
+	switch kind {
+	case WatchSubjectBacklogItem:
+		validCondition = condition == "merged" || condition == "escalated" || condition == "paused" || condition == "retired"
+	case WatchSubjectPipelineRun:
+		validCondition = condition == "done" || condition == "escalated" || condition == "paused"
+	case WatchSubjectMergeRequest:
+		iid, err := strconv.ParseInt(id, 10, 64)
+		if err != nil || iid <= 0 {
+			return fmt.Errorf("watch: merge_request subject_id must be a positive iid")
+		}
+		validCondition = condition == "merged" || condition == "closed"
+	default:
+		return fmt.Errorf("watch: invalid subject_kind")
+	}
+	if !validCondition {
+		return fmt.Errorf("watch: invalid terminal_condition for %s", kind)
+	}
+	return nil
+}
 
 // BacklogState is the lifecycle state of a backlog item.
 type BacklogState string
@@ -79,6 +152,7 @@ type ItemPolicy struct {
 	RequireHumanReview    bool     `json:"require_human_review,omitempty"`
 	AutoMerge             bool     `json:"auto_merge,omitempty"`
 	ProtectedPathsTouched []string `json:"protected_paths_touched,omitempty"`
+	MaxDiffLines          int      `json:"max_diff_lines,omitempty"`
 
 	// WorkflowTemplate / WorkflowTemplateVersion select a named imperative
 	// workflow template from the CLOSED registry (S7,
@@ -227,6 +301,18 @@ type BacklogDeltas struct {
 	Closed  []string `json:"closed,omitempty"`
 }
 
+// IsEmpty reports whether the run intends no backlog mutation at all — the
+// "council deliberated and produced nothing actionable" outcome.
+func (d BacklogDeltas) IsEmpty() bool {
+	return len(d.Created) == 0 && len(d.Updated) == 0 && len(d.Closed) == 0
+}
+
+// PipelineTemplateExternalMerge is the template stamped on the compatibility
+// pipeline_runs row an external merge-queue candidate (an MR that did not come
+// out of a Mills slice) records for the queue's foreign key. Such rows span
+// only the queue wait, so slice-lifecycle KPIs must exclude them.
+const PipelineTemplateExternalMerge = "external_merge"
+
 // CouncilRun is one execution of the council ensemble.
 type CouncilRun struct {
 	ID              string
@@ -271,18 +357,19 @@ type CouncilBudgetReservation struct {
 type PipelineState string
 
 const (
-	PipelineQueued       PipelineState = "queued"
-	PipelinePlanning     PipelineState = "planning"
-	PipelineSlicing      PipelineState = "slicing"
-	PipelineImplementing PipelineState = "implementing"
-	PipelineTesting      PipelineState = "testing"
-	PipelineReviewing    PipelineState = "reviewing"
-	PipelineMR           PipelineState = "mr"
-	PipelineCI           PipelineState = "ci"
-	PipelineMerging      PipelineState = "merging"
-	PipelineDone         PipelineState = "done"
-	PipelineEscalated    PipelineState = "escalated"
-	PipelinePaused       PipelineState = "paused"
+	PipelineQueued          PipelineState = "queued"
+	PipelinePlanning        PipelineState = "planning"
+	PipelineSlicing         PipelineState = "slicing"
+	PipelineImplementing    PipelineState = "implementing"
+	PipelineTesting         PipelineState = "testing"
+	PipelineReviewing       PipelineState = "reviewing"
+	PipelineMR              PipelineState = "mr"
+	PipelineCI              PipelineState = "ci"
+	PipelineMerging         PipelineState = "merging"
+	PipelineDone            PipelineState = "done"
+	PipelineEscalated       PipelineState = "escalated"
+	PipelinePreflightFailed PipelineState = "preflight_failed"
+	PipelinePaused          PipelineState = "paused"
 )
 
 // PipelineRun is one execution of the pipeline DAG for a backlog item.
@@ -302,19 +389,23 @@ type PipelineRun struct {
 	// Revision is the pipeline row's mutation compare-and-swap version. It is
 	// independent of AggregateVersion and advances on every PutRun stage/state
 	// rollup so duplicate runners cannot overwrite newer progress.
-	Revision        int64
-	Template        string
-	State           PipelineState
-	CurrentStage    string
-	Attempts        int
-	WorktreePath    string
-	MRIID           *int64
-	StartedAt       time.Time
-	EndedAt         *time.Time
-	CostUSD         float64
-	ParentSessionID string
-	ParentRunID     *string
-	Depth           int
+	Revision     int64
+	Template     string
+	State        PipelineState
+	CurrentStage string
+	Attempts     int
+	WorktreePath string
+	MRIID        *int64
+	StartedAt    time.Time
+	EndedAt      *time.Time
+	CostUSD      float64
+	// SubscriptionCostUSD is the slice of CostUSD billed to a flat-rate
+	// vendor subscription rather than a metered API account (migration 039).
+	// CostUSD stays the total; the budget's metered spend is the difference.
+	SubscriptionCostUSD float64
+	ParentSessionID     string
+	ParentRunID         *string
+	Depth               int
 	// EscalationClass is the runner's historical ErrorClass spelling stamped on
 	// escalated runs (for example "infra" or "config").
 	EscalationClass string
@@ -332,6 +423,13 @@ type PipelineRun struct {
 	// RetryExhausted marks a retryable failure that reached its bounded
 	// auto-requeue cap and therefore requires escalation.
 	RetryExhausted *bool
+	// FailureSignature is the sigfp failure-shape fingerprint stamped at
+	// escalation classification time; empty = unstamped (pre-B2 run, or
+	// evidence too short to name a failure).
+	FailureSignature string
+	// VaccineRef identifies the Pattern Loom candidate minted from the
+	// regression that prevents this escalation class from recurring.
+	VaccineRef string
 }
 
 // PipelineStartLimits is the transactional budget/admission snapshot applied
@@ -479,8 +577,12 @@ type StageResult struct {
 	// telemetry roll-up (per-model economics). Both are optional: empty means
 	// the worker did not surface its identity, and the aggregation buckets such
 	// rows under "unknown". Persisted nullable via migration 013.
-	Model     string
-	Backend   string
+	Model   string
+	Backend string
+	// Billing records who pays for CostUSD (api | subscription | local, see
+	// BillingClass). Set by the runner from the worker's explicit attribution
+	// or BillingForBackend; migration 039 backfilled history the same way.
+	Billing   BillingClass
 	Artifacts map[string]any
 	LogTail   string
 }
@@ -657,40 +759,6 @@ type AuditFinding struct {
 	AuditorPool   []map[string]any
 	CostUSD       float64
 	CreatedAt     time.Time
-}
-
-// CrossRepoState is the lifecycle state of an atomic cross-repo run.
-type CrossRepoState string
-
-const (
-	CrossRepoPlanning   CrossRepoState = "planning"
-	CrossRepoOpen       CrossRepoState = "open"
-	CrossRepoGatesGreen CrossRepoState = "gates_green"
-	CrossRepoMerging    CrossRepoState = "merging"
-	CrossRepoMerged     CrossRepoState = "merged"
-	CrossRepoReverted   CrossRepoState = "reverted"
-	CrossRepoFailed     CrossRepoState = "failed"
-)
-
-// CrossRepoRepoEntry is one repo's slice of an atomic cross-repo run.
-type CrossRepoRepoEntry struct {
-	ProjectID  int64  `json:"project_id"`
-	RepoName   string `json:"repo_name,omitempty"`
-	Branch     string `json:"branch"`
-	MRIID      *int64 `json:"mr_iid,omitempty"`
-	CIStatus   string `json:"ci_status,omitempty"`
-	GateStatus string `json:"gate_status,omitempty"`
-}
-
-// CrossRepoRun coordinates a backlog item that spans multiple repos.
-type CrossRepoRun struct {
-	ID                string
-	BacklogItemID     string
-	Repos             []CrossRepoRepoEntry
-	State             CrossRepoState
-	AtomicityStrategy string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
 }
 
 // DebateRole names which step in a Council Debate round emitted this row.

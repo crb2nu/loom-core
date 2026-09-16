@@ -1,0 +1,1 @@
+- Promote strict OpenRouter 402, LiteLLM 401 no-API-key, and ClickHouse Code 432 merge-task signatures to terminal external-dependency incidents (`pkg/mills/pipeline/classifier.go`, `pkg/mills/pipeline/failure_classifier.go`).

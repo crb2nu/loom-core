@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,6 +81,14 @@ func provenanceStamp(at time.Time, runID string) *store.Event {
 
 func getConfigOutcomes(t *testing.T, op *operator, query string) (*httptest.ResponseRecorder, guard.ConfigOutcomeReport) {
 	t.Helper()
+	window := configOutcomesDefaultWindow
+	req := httptest.NewRequest(http.MethodGet, "/?"+strings.TrimPrefix(query, "?"), nil)
+	if raw := req.URL.Query().Get("window"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			window = d
+		}
+	}
+	materializeTestReport(t, op, "config_outcomes", window, "")
 	rec := httptest.NewRecorder()
 	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/config-outcomes"+query, nil))
 	var report guard.ConfigOutcomeReport

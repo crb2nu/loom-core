@@ -1,0 +1,1 @@
+- Add the fail-closed external dependency preflight gate, deterministic verdict tests, registry wiring, and operator runbook (`pkg/mills/gates/preflight.go`, `pkg/mills/gates/preflight_test.go`, `pkg/mills/gates/gates.go`, `docs/runbook-dependency-preflight.md`).

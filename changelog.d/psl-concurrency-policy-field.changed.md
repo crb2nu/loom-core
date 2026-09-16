@@ -1,0 +1,1 @@
+- Make Mills runner admission follow hot-reloaded `max_concurrent_pipelines` policy values via the shared policy resolver and dynamically resizable concurrency limiter (`pkg/policy/policy.go`, `internal/loomconcurrency/limit.go`, `pkg/mills/runner/runner.go`).

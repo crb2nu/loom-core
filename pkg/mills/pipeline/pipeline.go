@@ -190,13 +190,15 @@ type concurrencyLimiter interface {
 	SetConcurrencyLimit(int)
 }
 
-// ConfigureConcurrency validates and applies max_concurrency to the
+// ConfigureConcurrency resolves and validates max_concurrent_pipelines (and
+// its compatibility spellings) before applying the effective value to the
 // scheduler limiter, leaving the limiter unchanged when validation fails.
 func ConfigureConcurrency(limiter concurrencyLimiter, policy sharedpolicy.PipelineConcurrencyPolicy) error {
-	if err := policy.Validate(); err != nil {
+	limit, err := policy.ResolveLimit()
+	if err != nil {
 		return err
 	}
-	return loomconcurrency.ApplyValidated(limiter, policy.EffectiveLimit())
+	return loomconcurrency.ApplyValidated(limiter, limit)
 }
 
 // FailClosedPreflight wires the storage-health and local-config admission

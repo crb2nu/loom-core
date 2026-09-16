@@ -1,0 +1,1 @@
+- Bound and index Mills event, incident, and KPI hot reads in `pkg/mills/store` to prevent query deadline storms.

@@ -39,6 +39,10 @@ public struct OperatorScreen: View {
     @State private var plans: [MillsPlan] = []
     @State private var loading = true
     @State private var loadError: String?
+    /// Last time the deck refreshed the App-Group widget snapshots. The deck
+    /// is the home tab, so it owns the widget cadence now — see
+    /// `MillsWidgetPublisher.publishAll` for why (orphaned-publisher freeze).
+    @State private var lastWidgetPublish = Date.distantPast
     /// Roster row the command sheet is open for. Tapping an agent commands it
     /// in place — the deck is the one place to view AND control the fleet.
     @State private var commandAgent: UnifiedAgent?
@@ -99,13 +103,43 @@ public struct OperatorScreen: View {
     }
 
     /// Plans still waiting on a decision — the mobile queue mirrors the web
-    /// deck's "Ready" bucket (draft + planned).
+    /// deck's "Ready" bucket (draft + planned), bounded to plans touched in
+    /// the last 14 days. The plan store keeps every council draft forever
+    /// (2026-08-22: 51 draft+planned of which 14 hadn't moved since June or
+    /// July), and a queue card that counts fossils reads as noise, not load.
+    /// A plan with no parseable timestamp stays visible (fail-open) — only
+    /// provably old drafts drop off the card.
     private var readyPlans: [MillsPlan] {
-        plans.filter { $0.phase == "draft" || $0.phase == "planned" }
+        let cutoff = Date().addingTimeInterval(-14 * 24 * 3600)
+        return plans.filter { plan in
+            guard plan.phase == "draft" || plan.phase == "planned" else { return false }
+            guard
+                let stamp = plan.updatedAt ?? plan.createdAt,
+                let touched = LoomFormat.date(fromISO: stamp)
+            else { return true }
+            return touched > cutoff
+        }
     }
 
     private var liveAgents: [UnifiedAgent] {
         agents.filter { $0.status == .active || $0.status == .idle }
+    }
+
+    /// Agents provably working RIGHT NOW: status active AND a heartbeat
+    /// inside 10 minutes. The unified-agents summary counts every presence
+    /// row still marked active — on 2026-08-22 that was 41, of which 29 were
+    /// heartbeat-less Mills spawn-pod registrations that never get reaped,
+    /// while the dashboard's fleet-snapshot count said 11. Until the server
+    /// unifies the two definitions the headline card trusts only fresh
+    /// heartbeats; a missing heartbeat fails CLOSED here because the husk
+    /// population is exactly the heartbeat-less one.
+    private var freshActiveAgents: [UnifiedAgent] {
+        let cutoff = Date().addingTimeInterval(-10 * 60)
+        return agents.filter { agent in
+            guard agent.status == .active else { return false }
+            guard let heartbeat = LoomFormat.date(fromISO: agent.lastHeartbeat) else { return false }
+            return heartbeat > cutoff
+        }
     }
 
     /// Roster rows the deck shows: live agents plus anything flagged for
@@ -224,9 +258,9 @@ public struct OperatorScreen: View {
             ) { onNavigate(.mills) }
             signalChip(
                 label: "Agents",
-                value: "\(agentsSummary?.activeAgents ?? liveAgents.count)",
+                value: "\(freshActiveAgents.count)",
                 detail: "active",
-                color: (agentsSummary?.activeAgents ?? 0) > 0 ? LoomColors.statusActive : LoomColors.fgMuted
+                color: freshActiveAgents.isEmpty ? LoomColors.fgMuted : LoomColors.statusActive
             ) { onNavigate(.people) }
             signalChip(
                 label: "Queue",
@@ -864,6 +898,15 @@ public struct OperatorScreen: View {
         }
 
         loadError = anySucceeded ? nil : "Couldn't reach the HUD — showing the last snapshot."
+
+        // Home-screen widgets: the deck is the home tab, so it owns the
+        // publish cadence (the classic dashboard's publisher is unreachable
+        // in normal use). Throttled — the poll loop ticks every 10s but the
+        // widgets only need freshness on the order of minutes.
+        if anySucceeded, let client, Date().timeIntervalSince(lastWidgetPublish) > 240 {
+            lastWidgetPublish = Date()
+            await MillsWidgetPublisher.publishAll(using: client)
+        }
     }
 
     private func pollLoop() async {

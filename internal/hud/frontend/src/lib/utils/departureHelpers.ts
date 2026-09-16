@@ -60,6 +60,12 @@ const STAGE_DELAY_MS: Record<string, number> = {
   ci_watch: 25 * 60_000,
 };
 
+/** The delay fuse for a stage — shared with the shuttle board so both
+ * surfaces call the same run DELAYED at the same moment. */
+export function stageFuseMs(stage: string | undefined): number {
+  return STAGE_DELAY_MS[stage ?? ''] ?? DELAYED_AFTER_MS;
+}
+
 /**
  * Advance the stage-entry observation map from one poll to the next:
  * a run first seen, or seen in a new stage, is stamped `now`; a run

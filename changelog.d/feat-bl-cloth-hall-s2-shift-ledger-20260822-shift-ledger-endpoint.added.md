@@ -1,0 +1,1 @@
+- Add the deterministic server-side Mills shift ledger composer and `GET /api/mills/shift-report` endpoint (`pkg/mills/shiftreport`, `cmd/loom-mills-operator`).

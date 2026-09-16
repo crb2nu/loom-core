@@ -198,6 +198,7 @@ type responsesAPIErrorEnvelope struct {
 	Error struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
+		Code    string `json:"code"`
 	} `json:"error"`
 }
 
@@ -238,7 +239,9 @@ func (c *APIClient) Create(ctx context.Context, req TurnRequest) (TurnResponse, 
 		return TurnResponse{}, fmt.Errorf("responses body exceeded 2097152 bytes")
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return TurnResponse{}, decodeResponsesAPIError(resp.StatusCode, respBody)
+		apiErr := decodeResponsesAPIError(resp.StatusCode, respBody)
+		apiErr.RequestID = resp.Header.Get("x-request-id")
+		return TurnResponse{}, apiErr
 	}
 
 	var apiResp responsesAPIResponse
@@ -397,19 +400,34 @@ func extractConversationID(resp responsesAPIResponse) string {
 	return ""
 }
 
-func decodeResponsesAPIError(status int, body []byte) error {
+// APIError retains structured HTTP error metadata for caller-specific policy.
+type APIError struct {
+	Status    int
+	Code      string
+	Type      string
+	Message   string
+	RequestID string
+}
+
+func (e *APIError) Error() string {
+	if e.Type != "" {
+		return fmt.Sprintf("responses api HTTP %d (%s): %s", e.Status, e.Type, e.Message)
+	}
+	return fmt.Sprintf("responses api HTTP %d: %s", e.Status, e.Message)
+}
+func decodeResponsesAPIError(status int, body []byte) *APIError {
+	e := &APIError{Status: status}
 	var envelope responsesAPIErrorEnvelope
-	if err := json.Unmarshal(body, &envelope); err == nil && strings.TrimSpace(envelope.Error.Message) != "" {
-		if kind := strings.TrimSpace(envelope.Error.Type); kind != "" {
-			return fmt.Errorf("responses api HTTP %d (%s): %s", status, kind, envelope.Error.Message)
-		}
-		return fmt.Errorf("responses api HTTP %d: %s", status, envelope.Error.Message)
+	if json.Unmarshal(body, &envelope) == nil {
+		e.Code, e.Type, e.Message = envelope.Error.Code, envelope.Error.Type, envelope.Error.Message
 	}
-	msg := strings.TrimSpace(string(body))
-	if msg == "" {
-		msg = http.StatusText(status)
+	if strings.TrimSpace(e.Message) == "" {
+		e.Message = strings.TrimSpace(string(body))
 	}
-	return fmt.Errorf("responses api HTTP %d: %s", status, msg)
+	if e.Message == "" {
+		e.Message = http.StatusText(status)
+	}
+	return e
 }
 
 func mustJSON(v any) json.RawMessage {

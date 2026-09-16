@@ -10,16 +10,7 @@ import (
 
 // generateCodexSkill generates a Codex skill in SKILL.md + scripts/ + references/ + assets/ format.
 func (g *Generator) generateCodexSkill(skill *Skill) error {
-	// For Codex, OutputDir refers to the skills root directory (not the platform root).
-	outputDir := g.OutputDir
-	if outputDir == "" {
-		outputDir = g.CodexSkillsDir
-	}
-	if outputDir == "" {
-		outputDir = filepath.Join(g.CodexHome, "skills")
-	}
-
-	skillDir := filepath.Join(outputDir, skill.Name)
+	skillDir := filepath.Join(g.codexSkillsOutputDir(), skill.Name)
 
 	if g.Verbose {
 		fmt.Printf("Generating Codex skill: %s -> %s\n", skill.Name, skillDir)
@@ -28,6 +19,9 @@ func (g *Generator) generateCodexSkill(skill *Skill) error {
 	if g.DryRun {
 		fmt.Printf("[dry-run] Would create Codex skill: %s\n", skillDir)
 		return nil
+	}
+	if err := validateBundleDestination(g.resolveTargetDir("codex"), skillDir, skill); err != nil {
+		return err
 	}
 
 	// Create skill directory structure
@@ -46,55 +40,18 @@ func (g *Generator) generateCodexSkill(skill *Skill) error {
 		return fmt.Errorf("write SKILL.md: %w", err)
 	}
 
-	// Copy scripts
-	sourceSkillDir := filepath.Join(g.SourceDir, skill.Name)
-	if skill.Common.Scripts != nil {
-		for _, script := range skill.Common.Scripts {
-			srcPath := filepath.Join(sourceSkillDir, script.Path)
-			dstPath := filepath.Join(skillDir, script.Path)
+	return g.copyBundleResources(skill, skillDir)
+}
 
-			if err := copyFile(srcPath, dstPath); err != nil {
-				if g.Verbose {
-					fmt.Printf("Warning: could not copy script %s: %v\n", script.Path, err)
-				}
-			}
-		}
+func (g *Generator) codexSkillsOutputDir() string {
+	// For Codex, OutputDir is the skills root rather than the platform root.
+	if g.OutputDir != "" {
+		return g.OutputDir
 	}
-
-	// Copy references
-	if skill.Common.References != nil {
-		for _, ref := range skill.Common.References {
-			srcPath := filepath.Join(sourceSkillDir, "references", ref)
-			dstPath := filepath.Join(skillDir, "references", ref)
-
-			if err := copyFile(srcPath, dstPath); err != nil {
-				if g.Verbose {
-					fmt.Printf("Warning: could not copy reference %s: %v\n", ref, err)
-				}
-			}
-		}
+	if g.CodexSkillsDir != "" {
+		return g.CodexSkillsDir
 	}
-
-	// Copy assets
-	if skill.Common.Assets != nil {
-		for _, asset := range skill.Common.Assets {
-			srcPath := filepath.Join(sourceSkillDir, "assets", asset)
-			dstPath := filepath.Join(skillDir, "assets", asset)
-
-			// Ensure parent directory exists
-			if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-				return err
-			}
-
-			if err := copyFile(srcPath, dstPath); err != nil {
-				if g.Verbose {
-					fmt.Printf("Warning: could not copy asset %s: %v\n", asset, err)
-				}
-			}
-		}
-	}
-
-	return nil
+	return filepath.Join(g.CodexHome, "skills")
 }
 
 // generateCodexSkillMD generates the SKILL.md content for a Codex skill.
@@ -180,6 +137,9 @@ func (g *Generator) generateGeminiLikeSkill(skill *Skill, target string) error {
 		fmt.Printf("[dry-run] Would create %s skill: %s\n", target, skillDir)
 		return nil
 	}
+	if err := validateBundleDestination(baseDir, skillDir, skill); err != nil {
+		return err
+	}
 
 	for _, subdir := range []string{"scripts", "references", "assets/templates"} {
 		if err := os.MkdirAll(filepath.Join(skillDir, subdir), 0755); err != nil {
@@ -194,41 +154,7 @@ func (g *Generator) generateGeminiLikeSkill(skill *Skill, target string) error {
 		return fmt.Errorf("write SKILL.md: %w", err)
 	}
 
-	sourceSkillDir := filepath.Join(g.SourceDir, skill.Name)
-	if skill.Common.Scripts != nil {
-		for _, script := range skill.Common.Scripts {
-			srcPath := filepath.Join(sourceSkillDir, script.Path)
-			dstPath := filepath.Join(skillDir, script.Path)
-			if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
-				fmt.Printf("Warning: could not copy script %s: %v\n", script.Path, err)
-			}
-		}
-	}
-
-	if skill.Common.References != nil {
-		for _, ref := range skill.Common.References {
-			srcPath := filepath.Join(sourceSkillDir, "references", ref)
-			dstPath := filepath.Join(skillDir, "references", ref)
-			if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
-				fmt.Printf("Warning: could not copy reference %s: %v\n", ref, err)
-			}
-		}
-	}
-
-	if skill.Common.Assets != nil {
-		for _, asset := range skill.Common.Assets {
-			srcPath := filepath.Join(sourceSkillDir, "assets", asset)
-			dstPath := filepath.Join(skillDir, "assets", asset)
-			if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-				return err
-			}
-			if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
-				fmt.Printf("Warning: could not copy asset %s: %v\n", asset, err)
-			}
-		}
-	}
-
-	return nil
+	return g.copyBundleResources(skill, skillDir)
 }
 
 // generateGeminiSkillMD generates the SKILL.md content for a Gemini skill.

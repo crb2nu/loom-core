@@ -32,7 +32,23 @@ func (o *SpawnOrchestrator) redriveOrRun(spawnID string, req SpawnRequest) {
 // terminal-freeze fence (UpdateUnlessStoppingOrTerminal) and outcome
 // exactly-once (deterministic IdempotencyKey + journal readThrough) are
 // preserved — the supervisor adds continuity, never a second outcome path.
-func (o *SpawnOrchestrator) finishSupervisedOutcome(ctx context.Context, state *SpawnState, exitCode int) {
+func (o *SpawnOrchestrator) finishSupervisedOutcome(ctx context.Context, state *SpawnState, exitCode int, evidence ...*claudeParseResult) {
+	var parsed *claudeParseResult
+	if len(evidence) > 0 {
+		parsed = evidence[0]
+	}
+	if parsed == nil || !parsed.sawResult {
+		if durable := o.durableClaudeAuth(ctx, state); durable != nil && (durable.sawResult || durable.lastRetryNote != "") {
+			parsed = durable
+		}
+	}
+	if o.handleClaudeAuthCompletion(ctx, state, parsed, exitCode, nil) {
+		return
+	}
+	if parsed != nil && parsed.sawResult && parsed.isError {
+		o.failSpawn(ctx, state, "Claude result error: "+parsed.result)
+		return
+	}
 	if exitCode == 0 {
 		o.completeSpawn(ctx, state)
 		return
@@ -160,7 +176,11 @@ func (o *SpawnOrchestrator) runSpawnReattach(spawnID string, req SpawnRequest) {
 	switch kind {
 	case supervisorMarkerOutcome:
 		o.telemetry.Delete(spawnID)
-		o.finishSupervisedOutcome(context.Background(), state, code)
+		var evidence *claudeParseResult
+		if cp, ok := parser.(*ClaudeJSONLParser); ok {
+			evidence = cp.authSnapshot()
+		}
+		o.finishSupervisedOutcome(context.Background(), state, code, evidence)
 	case supervisorMarkerOrphan:
 		// Reaper died before recording an outcome — died mid-flight. Re-drive
 		// for liveness (the continuity gate cannot pass on this path).

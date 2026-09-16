@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -174,12 +176,12 @@ func StreamExec(parent context.Context, clientset kubernetes.Interface, restConf
 	if len(opts.Env) > 0 {
 		var envPrefix strings.Builder
 		for k, v := range opts.Env {
-			envPrefix.WriteString(fmt.Sprintf("export %s=%q; ", k, v))
+			envPrefix.WriteString(fmt.Sprintf("export %s=%s; ", k, shellQuote(v)))
 		}
 		shellCmd = envPrefix.String() + shellCmd
 	}
 	if opts.WorkDir != "" {
-		shellCmd = fmt.Sprintf("cd %q && %s", opts.WorkDir, shellCmd)
+		shellCmd = fmt.Sprintf("cd %s && %s", shellQuote(opts.WorkDir), shellCmd)
 	}
 
 	// NFS cache flush: force kernel to re-validate file attributes.
@@ -219,35 +221,20 @@ func StreamExec(parent context.Context, clientset kubernetes.Interface, restConf
 		},
 	}
 
-	// Set up stderr writer (optional callback + capture).
-	var stderrBuf bytes.Buffer
-	var stderrWriter *lineCallbackWriter
-	if opts.OnStderr != nil {
-		stderrWriter = &lineCallbackWriter{
-			onLine: func(line []byte) {
-				stderrBuf.Write(line)
-				stderrBuf.WriteByte('\n')
-				opts.OnStderr(line)
-			},
-		}
-	}
-
-	var stderrTarget = func() interface{ Write([]byte) (int, error) } {
-		if stderrWriter != nil {
-			return stderrWriter
-		}
-		return &stderrBuf
-	}()
+	// Capture the head and complete tail without retaining the middle.
+	stderrCapture := &stderrCapture{onLine: opts.OnStderr}
+	defer stderrCapture.Close()
 
 	streamErr := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
 		Stdout: stdoutWriter,
-		Stderr: stderrTarget,
+		Stderr: stderrCapture,
 	})
 
 	// Flush any remaining buffered partial lines.
 	stdoutWriter.Flush()
-	if stderrWriter != nil {
-		stderrWriter.Flush()
+	stderrCapture.Flush()
+	if stderrCapture.err != nil {
+		return nil, fmt.Errorf("capture stderr: %w", stderrCapture.err)
 	}
 
 	durationMs := time.Since(start).Milliseconds()
@@ -279,13 +266,15 @@ func StreamExec(parent context.Context, clientset kubernetes.Interface, restConf
 		// exec rejected) is visible instead of an empty buffer. The
 		// stdout side here is a line-streaming ring buffer so we gate
 		// on totalLines instead of a buffer length.
-		if stderrBuf.Len() == 0 && tail.total == 0 {
-			surfaceExecStreamError(nil, &stderrBuf, streamErr)
-		}
+		stderrCapture.surfaceError(tail.total, streamErr)
 	}
 
 	stdoutTail := strings.Join(tail.lines(), "\n")
-	stderrTail, stderrTotal, stderrTrunc := TruncateOutput(stderrBuf.String(), tailSize)
+	stderrTail, captureErr := stderrCapture.Tail()
+	if captureErr != nil {
+		return nil, fmt.Errorf("read stderr: %w", captureErr)
+	}
+	stderrTotal, stderrTrunc := stderrCapture.total, stderrCapture.total > tailSize
 
 	return &ExecResult{
 		ExitCode:    exitCode,
@@ -293,8 +282,165 @@ func StreamExec(parent context.Context, clientset kubernetes.Interface, restConf
 		StderrLines: stderrTotal,
 		StdoutTail:  stdoutTail,
 		StderrTail:  stderrTail,
+		StderrHead:  stderrHead(string(stderrCapture.head[:stderrCapture.headLen])),
 		DurationMs:  durationMs,
 		Truncated:   tail.total > tailSize || stderrTrunc,
 		OOMKilled:   exitCode == 137,
 	}, nil
+}
+
+// stderrCapture retains an 8 KiB head and 21 fixed line slots (20 completed
+// lines plus one in progress), using less than 64 KiB for tail buffers. A fixed
+// byte window cannot preserve arbitrary-length lines: oversized lines spill to
+// private temporary files, removed on eviction or Close. Only the retained
+// lines occupy disk. Tail and whole-line callbacks necessarily allocate their
+// complete output; those allocations are not retained by the capture.
+// Truncation remains line-based, matching TruncateOutput for gate consumers.
+type stderrCapture struct {
+	head               [8 * 1024]byte
+	headLen, headLines int
+	lines              [21]stderrLine
+	total              int
+	onLine             func([]byte)
+	err                error
+}
+
+type stderrLine struct {
+	buf  [3 * 1024]byte
+	n    int
+	file *os.File
+}
+
+func (l *stderrLine) close() {
+	if l.file != nil {
+		name := l.file.Name()
+		_ = l.file.Close()
+		_ = os.Remove(name)
+	}
+	l.file = nil
+	l.n = 0
+}
+
+func (l *stderrLine) write(p []byte) error {
+	if l.file == nil && len(p) <= len(l.buf)-l.n {
+		l.n += copy(l.buf[l.n:], p)
+		return nil
+	}
+	if l.file == nil {
+		f, err := os.CreateTemp("", "loom-stderr-*")
+		if err != nil {
+			return err
+		}
+		l.file = f
+		if _, err := f.Write(l.buf[:l.n]); err != nil {
+			return err
+		}
+	}
+	_, err := l.file.Write(p)
+	// n is also the nonempty marker for a spilled partial line.
+	l.n = 1
+	return err
+}
+
+func (l *stderrLine) text() (string, error) {
+	if l.file == nil {
+		return string(l.buf[:l.n]), nil
+	}
+	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	_, err := io.Copy(&b, l.file)
+	return b.String(), err
+}
+
+func (c *stderrCapture) Write(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	original := len(p)
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		n := len(p)
+		if i >= 0 {
+			n = i + 1
+		}
+		if c.headLines < 20 && c.headLen < len(c.head) {
+			c.headLen += copy(c.head[c.headLen:], p[:n])
+			if i >= 0 {
+				c.headLines++
+			}
+		}
+		content := n
+		if i >= 0 {
+			content--
+		}
+		if err := c.lines[c.total%21].write(p[:content]); err != nil {
+			c.err = err
+			return original - len(p), err
+		}
+		p = p[n:]
+		if i >= 0 {
+			c.finishLine()
+			if c.err != nil {
+				return original - len(p), c.err
+			}
+		}
+	}
+	return original, nil
+}
+
+func (c *stderrCapture) finishLine() {
+	if c.onLine != nil {
+		line, err := c.lines[c.total%21].text()
+		if err != nil {
+			c.err = err
+			return
+		}
+		c.onLine([]byte(line))
+	}
+	c.total++
+	c.lines[c.total%21].close()
+}
+
+func (c *stderrCapture) Flush() {
+	if c.err == nil && c.lines[c.total%21].n > 0 {
+		c.finishLine()
+	}
+}
+
+// Tail is called after Flush, when there is no partial line left.
+func (c *stderrCapture) Tail() (string, error) {
+	if c.err != nil {
+		return "", c.err
+	}
+	var b strings.Builder
+	start := max(0, c.total-20)
+	for i := start; i < c.total; i++ {
+		line, err := c.lines[i%21].text()
+		if err != nil {
+			return "", err
+		}
+		if i > start {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+	return b.String(), nil
+}
+
+func (c *stderrCapture) Close() {
+	for i := range c.lines {
+		c.lines[i].close()
+	}
+}
+
+func (c *stderrCapture) surfaceError(stdoutLines int, err error) {
+	if err == nil || c.total != 0 || stdoutLines != 0 {
+		return
+	}
+	// Match surfaceExecStreamError; synthetic diagnostics are not callbacks.
+	c.onLine = nil
+	_, _ = c.Write([]byte("exec error: " + err.Error() + "\n"))
+	c.Flush()
 }

@@ -16,15 +16,17 @@ import (
 
 // asyncExec represents a running or completed async exec.
 type asyncExec struct {
-	ID          string              `json:"id"`
-	Project     string              `json:"project"`
-	Command     string              `json:"command"`
-	Status      string              `json:"status"` // "running", "completed", "failed"
-	Result      *backend.ExecResult `json:"result,omitempty"`
-	Error       string              `json:"error,omitempty"`
-	StartedAt   time.Time           `json:"started_at"`
-	CompletedAt *time.Time          `json:"completed_at,omitempty"`
-	cancel      context.CancelFunc
+	ID           string              `json:"id"`
+	Project      string              `json:"project"`
+	Command      string              `json:"command"`
+	Status       string              `json:"status"` // "running", "completed", "failed"
+	Result       *backend.ExecResult `json:"result,omitempty"`
+	Error        string              `json:"error,omitempty"`
+	StartedAt    time.Time           `json:"started_at"`
+	CompletedAt  *time.Time          `json:"completed_at,omitempty"`
+	releaseDrain sync.Once
+	drainDone    func()
+	cancel       context.CancelFunc
 }
 
 // asyncRegistry tracks in-flight and recently completed async execs.
@@ -66,6 +68,9 @@ func (r *asyncRegistry) cleanup(maxAge time.Duration) {
 			completedAt = *e.CompletedAt
 		}
 		if completedAt.Before(cutoff) {
+			if e.drainDone != nil {
+				e.releaseDrain.Do(e.drainDone)
+			}
 			delete(r.execs, id)
 		}
 	}
@@ -132,6 +137,10 @@ func (m *manager) handleExecAsync(ctx context.Context, args map[string]any) (*mc
 		StartedAt: time.Now(),
 		cancel:    cancel,
 	}
+	if m.drain != nil {
+		m.drain.Retain()
+		ae.drainDone = m.drain.Release
+	}
 	m.asyncExecs.add(ae)
 	if m.events != nil {
 		m.events.Emit(ctx, "exec", projectName,
@@ -194,11 +203,16 @@ func (m *manager) handleExecPoll(_ context.Context, args map[string]any) (*mcp.C
 		return mcp.ErrorResult(err), nil
 	}
 
-	ae := m.asyncExecs.get(execID)
+	m.asyncExecs.mu.RLock()
+	defer m.asyncExecs.mu.RUnlock()
+	ae := m.asyncExecs.execs[execID]
 	if ae == nil {
 		return mcp.ErrorResult(fmt.Errorf("exec %q not found (may have expired)", execID)), nil
 	}
 
+	if ae.Status != "running" && ae.drainDone != nil {
+		ae.releaseDrain.Do(ae.drainDone)
+	}
 	result := map[string]any{
 		"exec_id":    ae.ID,
 		"status":     ae.Status,

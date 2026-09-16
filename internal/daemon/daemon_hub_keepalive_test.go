@@ -7,11 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"gitlab.flexinfer.ai/libs/mcp-go"
+
 	"github.com/crb2nu/loom/internal/hubproto"
 	"github.com/crb2nu/loom/internal/pool"
 	"github.com/crb2nu/loom/pkg/registry"
 	loomtransport "github.com/crb2nu/loom/pkg/transport"
-	"gitlab.flexinfer.ai/libs/mcp-go"
 )
 
 func TestHubKeepaliveLoop_ExitsOnDone(t *testing.T) {
@@ -49,7 +50,7 @@ func TestHandlePongResponse_CorrelatesAndGatesMisses(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := &mcp.Message{Result: json.RawMessage(encoded)}
-	if correlated, downgraded := d.handlePongResponse(resp, &live); !correlated || downgraded {
+	if correlated, downgraded := d.handlePongResponse("hub", resp, &live); !correlated || downgraded {
 		t.Fatalf("matching pong = correlated %v downgraded %v", correlated, downgraded)
 	}
 	if _, ok := live.Ping(2); !ok {
@@ -59,7 +60,7 @@ func TestHandlePongResponse_CorrelatesAndGatesMisses(t *testing.T) {
 	wrong := hubproto.NewPing("wrong", "hub", time.Now())
 	wrong.Method = hubproto.MethodPong
 	wrongBytes, _ := hubproto.Encode(wrong)
-	if correlated, downgraded := d.handlePongResponse(&mcp.Message{Result: wrongBytes}, &live); correlated || downgraded {
+	if correlated, downgraded := d.handlePongResponse("hub", &mcp.Message{Result: wrongBytes}, &live); correlated || downgraded {
 		t.Fatal("mismatched pong was accepted")
 	}
 	if _, ok := live.Ping(2); !ok {
@@ -91,7 +92,7 @@ func TestHandlePongResponse_RawCompatibilityDowngrade(t *testing.T) {
 	d := &Daemon{logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))}
 	var live loomtransport.Liveness
 	_, _ = live.Ping(1)
-	correlated, downgraded := d.handlePongResponse(&mcp.Message{Result: json.RawMessage(`{"tools":[]}`)}, &live)
+	correlated, downgraded := d.handlePongResponse("hub", &mcp.Message{Result: json.RawMessage(`{"tools":[]}`)}, &live)
 	if correlated || !downgraded {
 		t.Fatalf("raw response = correlated %v downgraded %v", correlated, downgraded)
 	}

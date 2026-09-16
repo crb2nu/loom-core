@@ -47,8 +47,17 @@ export function buildMaterials(
   for (const f of schema ?? []) {
     const v = raw[f.name];
     if (f.type === 'bool') {
-      // Checkboxes always carry an explicit value.
-      materials[f.name] = v === true;
+      // Tri-state: '' (or absent) omits the field so the stamp applies the
+      // pattern's default. The old checkbox semantics wrote explicit `false`
+      // for every untouched bool, silently overriding `default: true`
+      // materials — the divergence that split the two stamp forms.
+      if (v === true || v === 'true') {
+        materials[f.name] = true;
+      } else if (v === false || v === 'false') {
+        materials[f.name] = false;
+      } else if (f.required) {
+        errors.push(`${f.name} is required`);
+      }
       continue;
     }
     const text = typeof v === 'string' ? v.trim() : '';

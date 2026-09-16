@@ -75,15 +75,6 @@ func TestReadQuiescence_ExactDurableCounts(t *testing.T) {
 		}
 	}
 
-	for _, run := range []*CrossRepoRun{
-		{ID: "CROSS-QUIESCENCE-ACTIVE", BacklogItemID: pausedParent.ID, State: CrossRepoOpen},
-		{ID: "CROSS-QUIESCENCE-DONE", BacklogItemID: pausedParent.ID, State: CrossRepoMerged},
-	} {
-		if err := st.CrossRepo.PutRun(ctx, run); err != nil {
-			t.Fatalf("seed cross-repo run %s: %v", run.ID, err)
-		}
-	}
-
 	got, err := st.ReadQuiescence(ctx)
 	if err != nil {
 		t.Fatalf("read quiescence: %v", err)
@@ -94,7 +85,6 @@ func TestReadQuiescence_ExactDurableCounts(t *testing.T) {
 		ActiveWorkflowRuns:     3, // claimed DAG + explicit running + paused
 		ActiveSpinningRoomRuns: 2,
 		ActiveCouncilRuns:      1,
-		ActiveCrossRepoRuns:    1,
 		PendingDispatches:      1,
 	}
 	if got != want {
@@ -131,12 +121,6 @@ func TestReadQuiescence_UnknownStatesFailClosed(t *testing.T) {
 		ID: "SPIN-QUIESCENCE-FUTURE", Status: SpinStatus("future_spin_state"), StartedAt: now,
 	}); err != nil {
 		t.Fatalf("seed future spin state: %v", err)
-	}
-	if err := st.CrossRepo.PutRun(ctx, &CrossRepoRun{
-		ID: "CROSS-QUIESCENCE-FUTURE", BacklogItemID: item.ID,
-		State: CrossRepoState("future_cross_repo_state"),
-	}); err != nil {
-		t.Fatalf("seed future cross-repo state: %v", err)
 	}
 
 	// pending_dispatches has a current-version CHECK constraint. Simulate a
@@ -182,7 +166,7 @@ func TestReadQuiescence_UnknownStatesFailClosed(t *testing.T) {
 		t.Fatalf("read quiescence: %v", err)
 	}
 	if got.ActivePipelineRuns != 1 || got.ActiveWorkflowRuns != 1 ||
-		got.ActiveSpinningRoomRuns != 1 || got.ActiveCrossRepoRuns != 1 || got.PendingDispatches != 1 {
+		got.ActiveSpinningRoomRuns != 1 || got.PendingDispatches != 1 {
 		t.Fatalf("future states were not counted fail-closed: %+v", got)
 	}
 	if got.Quiescent() {
@@ -207,7 +191,6 @@ func TestReadQuiescence_ActiveIndexesInstalled(t *testing.T) {
 		"idx_pipeline_quiescence_active",
 		"idx_workflow_quiescence_active",
 		"idx_spin_quiescence_active",
-		"idx_cross_repo_quiescence_active",
 		"idx_dispatch_quiescence_active",
 	}
 	for _, name := range want {

@@ -1,0 +1,1 @@
+- Fixed Mills cross-repository path governance in `pkg/mills/policy.go` and `pkg/mills/gates/` by making per-repo protected paths replace global rules, retaining valid policy on bad reloads, and failing closed for unknown targets; this is the deployment precondition for the operator-approved-in-principle `libs/` token grant.

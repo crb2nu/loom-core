@@ -1,0 +1,1 @@
+- Make Mills branch-adoption probing survive shallow history and make operator repo refresh recover stale `.git/index.lock` files while bootstrapping full-history clones.

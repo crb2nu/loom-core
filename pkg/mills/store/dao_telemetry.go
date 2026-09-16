@@ -103,9 +103,11 @@ type FailureClassRow struct {
 // per-stage cost (provider-reported where the litellm/OpenRouter backend
 // supplies it, else the flat local-tier estimate), ErrorRate is errors/calls,
 // and AvgSeconds is the mean wall-clock over attempts with a measurable
-// duration. Stage rows whose model/backend are unattributed (historical rows,
-// or a worker that does not surface identity) bucket under "unknown"/"unknown"
-// so the tier totals stay complete.
+// duration. Stage rows whose model/backend are unattributed but carry cost
+// (historical rows, or a delegator that does not surface identity) bucket under
+// "unknown"/"unknown" so the tier totals stay complete; rows with neither
+// identity nor cost are deterministic stages and are excluded (see
+// isModelEconomicsRow).
 type ModelEconomicsRow struct {
 	Model      string  `json:"model"`
 	Backend    string  `json:"backend"`
@@ -276,20 +278,27 @@ func (d *TelemetryDAO) aggregateStages(ctx context.Context, since string, out *S
 
 		// Per-model economics accumulate off the same windowed scan so the
 		// tier counts stay internally consistent with the per-stage aggregates.
-		// A blank/NULL model or backend folds into the "unknown" bucket.
-		mk := modelBackendKey{model: modelBucket(model), backend: modelBucket(backend)}
-		mAcc := modelEcon[mk]
-		if mAcc == nil {
-			mAcc = &modelEconAccumulator{}
-			modelEcon[mk] = mAcc
-		}
-		mAcc.calls++
-		mAcc.costUSD += cost
-		if isError {
-			mAcc.errors++
-		}
-		if durOK {
-			mAcc.durations = append(mAcc.durations, durSec)
+		// A blank/NULL model or backend folds into the "unknown" bucket —
+		// unless the row is a deterministic stage (no identity AND no cost:
+		// tests, ci_watch, mr, merge, cleanup, an adopted-branch implement),
+		// which is not a model call at all and is left out. Live 2026-09-01
+		// telemetry rolled 27 such rows (9 errors, $0) into "unknown"/"unknown"
+		// at a 33% error rate, which read as an unreliable model tier.
+		if isModelEconomicsRow(model, backend, cost) {
+			mk := modelBackendKey{model: modelBucket(model), backend: modelBucket(backend)}
+			mAcc := modelEcon[mk]
+			if mAcc == nil {
+				mAcc = &modelEconAccumulator{}
+				modelEcon[mk] = mAcc
+			}
+			mAcc.calls++
+			mAcc.costUSD += cost
+			if isError {
+				mAcc.errors++
+			}
+			if durOK {
+				mAcc.durations = append(mAcc.durations, durSec)
+			}
 		}
 
 		if attempt > 1 {
@@ -339,6 +348,19 @@ func (d *TelemetryDAO) aggregateStages(ctx context.Context, since string, out *S
 // modelUnknownBucket is the label unattributed rows (blank model/backend)
 // aggregate under so per-model totals stay complete.
 const modelUnknownBucket = "unknown"
+
+// isModelEconomicsRow reports whether a stage row belongs in the per-model
+// economics roll-up. A row with no model, no backend, and no cost is a
+// deterministic (Go-driven) stage rather than a model call; counting it would
+// attribute CI/test/merge failures to an "unknown" model tier. A row with any
+// identity, or with cost but no identity (a delegator answered), still counts
+// — the latter under the "unknown" bucket so spend never disappears.
+func isModelEconomicsRow(model, backend sql.NullString, cost float64) bool {
+	if cost != 0 {
+		return true
+	}
+	return modelBucket(model) != modelUnknownBucket || modelBucket(backend) != modelUnknownBucket
+}
 
 // modelBucket maps a nullable model/backend column to its economics bucket,
 // folding NULL and blank values into "unknown".
@@ -590,7 +612,23 @@ var failureClassNeedles = []failureClassNeedle{
 	// 29 plan_slice rows in "other" that were all one of these two shapes
 	// (codex 0.143.0 gpt-5.6 version-gate hang, escalations #356-#359 class).
 	{class: "spawn_infra", needles: []string{"hud spawn", "image build failed", "pod creation failed", "turn driver lost", "exited 124", "exited 143", "command timed out", "deadline exceeded during reconciliation", "no agent output for"}},
+	// The devbox sandbox image for the target repo was still building when
+	// the tests stage's ensure-sandbox wait expired. Live 2026-09-01 telemetry:
+	// 6/6 tests-stage errors in the 1d window were this shape (every adopted
+	// branch's first tests attempt), all bucketed as "other" — the Pareto read
+	// "tests is the top failure class" hid that the cause was the sandbox
+	// substrate, not the code under test.
+	{class: "sandbox_build", needles: []string{"sandbox image still building", "sandbox image build in progress"}},
 	{class: "ci_poll_timeout", needles: []string{"poll deadline exceeded", "poll timed out"}},
+	// The branch pipeline reached a terminal failed status. The needle keeps
+	// the ") status=" shape of the GitLab poll log line so a spawn's own
+	// "status=failed" telemetry (already claimed by spawn_infra above) cannot
+	// alias into it.
+	{class: "ci_red", needles: []string{") status=failed"}},
+	// Serial merge queue verdicts: an eviction (rebase_conflict, head_moved,
+	// ci_red, queue_full, …) or a stale CI authorization after the head moved.
+	// Both are queue-lane outcomes, not code failures.
+	{class: "merge_queue", needles: []string{"queue evicted", "merge authorization is stale"}},
 	{class: "gitlab_api", needles: []string{"gitlab: post", "gitlab: put", "gitlab: delete"}},
 	{class: "devbox_gate_empty", needles: []string{"0/0 checks"}},
 }

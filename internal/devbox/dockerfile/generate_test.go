@@ -1,6 +1,8 @@
 package dockerfile
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -242,6 +244,43 @@ func TestGenerate_PythonProject_DefaultVersion(t *testing.T) {
 
 	if !strings.Contains(dockerfile, "python:3.11") {
 		t.Errorf("Python Dockerfile should default to python:3.11, got:\n%s", dockerfile)
+	}
+}
+
+// Regression: a ranged requires-python (">=3.11,<3.14", as in py-sprite-kit)
+// must resolve to a single concrete version end-to-end. The old detect parser
+// leaked the specifier tail into the tag, producing the invalid reference
+// "python:3.11,<3.14-slim-bookworm" and failing every sandbox image build.
+func TestGenerate_PythonProject_RangedRequiresPython(t *testing.T) {
+	dir := t.TempDir()
+
+	pyproject := `[project]
+name = "py-sprite-kit"
+requires-python = ">=3.11,<3.14"
+`
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0644); err != nil {
+		t.Fatalf("failed to write pyproject.toml: %v", err)
+	}
+
+	fp, err := detect.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("Fingerprint() returned error: %v", err)
+	}
+
+	out, err := Generate(fp)
+	if err != nil {
+		t.Fatalf("Generate() returned unexpected error: %v", err)
+	}
+
+	dockerfile := string(out)
+
+	if !strings.Contains(dockerfile, "FROM python:3.11-slim-bookworm") {
+		t.Errorf("Dockerfile should pin python:3.11-slim-bookworm, got:\n%s", dockerfile)
+	}
+	for _, line := range strings.Split(dockerfile, "\n") {
+		if strings.HasPrefix(line, "FROM ") && strings.ContainsAny(line, "<>,=!") {
+			t.Errorf("FROM line leaked specifier characters: %q", line)
+		}
 	}
 }
 

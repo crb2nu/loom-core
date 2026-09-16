@@ -29,12 +29,17 @@ func detectGo(projectDir string, fp *EnvFingerprint) {
 	fp.Languages = append(fp.Languages, spec)
 }
 
-// parseGoVersion extracts the Go version from go.mod content.
+// parseGoVersion extracts the Go version from go.mod content. The go
+// directive is always a single concrete version, but only the first field is
+// taken so a trailing comment cannot leak into an image tag.
 func parseGoVersion(content string) string {
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "go ") {
-			return strings.TrimPrefix(line, "go ")
+			fields := strings.Fields(strings.TrimPrefix(line, "go "))
+			if len(fields) > 0 {
+				return fields[0]
+			}
 		}
 	}
 	return ""

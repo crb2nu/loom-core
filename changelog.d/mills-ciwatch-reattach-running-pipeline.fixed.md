@@ -1,0 +1,1 @@
+- Re-attach `ci_watch` to the same running pipeline after a poll cap as a free transient retry, bounded by `pipeline.ci_watch.max_wall_clock_minutes`, while immediately escalating terminal CI states with pipeline identity and runtime (`pkg/mills/pipeline/dispatcher.go`, `pkg/mills/pipeline/error_class.go`, `pkg/mills/policy.go`).

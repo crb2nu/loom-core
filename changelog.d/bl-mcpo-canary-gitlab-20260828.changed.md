@@ -1,0 +1,1 @@
+- Migrated the `gitlab` mcpo entry in `k8s/base/servers/mcpo/configmap.yaml` to Streamable HTTP and updated the rollout checksum in `k8s/base/servers/mcpo/deployment.yaml`.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -137,11 +138,35 @@ func verifyTests(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	defer in.Close()
-	report, verifyErr := fleetgate.VerifyTestEvents(manifest, *group, in)
+	events, err := io.ReadAll(in)
+	if err != nil {
+		return err
+	}
+	writeReliabilityDiagnostics(events, stderr)
+	report, verifyErr := fleetgate.VerifyTestEvents(manifest, *group, bytes.NewReader(events))
 	if err := writeReport(*output, report, stdout); err != nil {
 		return err
 	}
 	return verifyErr
+}
+
+// writeReliabilityDiagnostics makes structured scenario measurements visible in
+// the gate log while leaving the stable JSON report schema unchanged.
+func writeReliabilityDiagnostics(events []byte, output io.Writer) {
+	decoder := json.NewDecoder(bytes.NewReader(events))
+	for {
+		var event struct {
+			Output string `json:"Output"`
+		}
+		if err := decoder.Decode(&event); errors.Is(err, io.EOF) {
+			return
+		} else if err != nil {
+			return
+		}
+		if marker := strings.Index(event.Output, "RELIABILITY_SCENARIO "); marker >= 0 {
+			fmt.Fprintf(output, "fleet-reliability-gate: %s", event.Output[marker:])
+		}
+	}
 }
 
 func compareBenchmarks(args []string, stdout, stderr io.Writer) error {

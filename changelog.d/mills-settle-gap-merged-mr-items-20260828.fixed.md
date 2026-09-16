@@ -1,0 +1,1 @@
+- Fixed Mills ghost-spark reconciliation in `pkg/mills/reconciler.go` and `pkg/mills/reconciler_auto_requeue.go` so rescue and merge-queue MRs settle escalated items in one sweep, earlier MR-bearing attempts are not obscured by auto-requeue, and durable skip events identify cooldown, candidate, provenance, and client-selection blockers.

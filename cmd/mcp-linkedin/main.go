@@ -12,6 +12,7 @@ import (
 	"time"
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/crb2nu/loom/internal/loomconcurrency"
 	"github.com/crb2nu/loom/pkg/env"
@@ -33,6 +34,10 @@ const (
 
 	defaultMessengerConversationsQueryID = "messengerConversations.0d5e6781bbee71c3e51c8843c6519f48"
 	defaultMessengerMessagesQueryID      = "messengerMessages.5846eeb71c981f11e0134cb6626cc314"
+
+	// Matches the BrowserKit chromium that mints the sessions, so raw HTTP
+	// calls present the same client identity the cookies were issued under.
+	defaultLinkedInHTTPUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
 var version = "0.1.0"
@@ -43,6 +48,8 @@ type linkedInServer struct {
 	accessToken  string
 	sessionToken string
 	jsessionID   string
+	cookieBundle string
+	userAgent    string
 	httpClient   *httpclient.Client
 
 	logger           *slog.Logger
@@ -78,16 +85,38 @@ func run(ctx context.Context) error {
 		logger.Warn("OTel tracer init failed", "error", err)
 	}
 	defer func() { _ = shutdownTracer(ctx) }()
-	tracer := mcpotel.Tracer(tp, "mcp-linkedin")
 
+	var secretStore secretSetter
+	if mgr, err := secrets.DefaultManager(); err != nil {
+		logger.Warn("unable to initialize secret manager", "error", err)
+	} else {
+		secretStore = mgr
+	}
+
+	server, err := newLinkedInServer(logger, mcpotel.Tracer(tp, "mcp-linkedin"), secretStore)
+	if err != nil {
+		return err
+	}
+	return server.Run(ctx)
+}
+
+// newLinkedInServer builds the MCP server without running it, so tests can
+// drive initialize, tools/list and tool calls in-process. Missing
+// credentials are not fatal: the server starts degraded and every
+// credential-bound tool answers NotConfigured naming the variable(s) the
+// selected LINKEDIN_MODE needs. secretStore may be nil when no secret
+// backend is available.
+func newLinkedInServer(logger *slog.Logger, tracer trace.Tracer, secretStore secretSetter) (*mcp.Server, error) {
 	baseURL := strings.TrimSuffix(env.String("LINKEDIN_BASE_URL", defaultLinkedInBaseURL), "/")
 	mode, err := parseLinkedInMode(env.String("LINKEDIN_MODE", linkedinModeAuto))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	accessToken := env.StringWithFallbacks("LINKEDIN_ACCESS_TOKEN", "LINKEDIN_TOKEN")
 	sessionToken := env.StringWithFallbacks("LINKEDIN_SESSION_COOKIE", "LINKEDIN_LI_AT", "LI_AT")
 	jsessionID := env.StringWithFallbacks("LINKEDIN_JSESSIONID", "JSESSIONID")
+	cookieBundle := strings.TrimSpace(env.String("LINKEDIN_COOKIE_BUNDLE", ""))
+	userAgent := strings.TrimSpace(env.String("LINKEDIN_HTTP_USER_AGENT", ""))
 	loginUsername := strings.TrimSpace(env.StringWithFallbacks("LINKEDIN_LOGIN_USERNAME", "LINKEDIN_USERNAME"))
 	loginPassword := strings.TrimSpace(env.StringWithFallbacks("LINKEDIN_LOGIN_PASSWORD", "LINKEDIN_PASSWORD"))
 	mailboxURN := strings.TrimSpace(env.String("LINKEDIN_MESSAGING_MAILBOX_URN", ""))
@@ -96,7 +125,7 @@ func run(ctx context.Context) error {
 
 	browserKitMode, err := parseLinkedInBrowserKitMode(env.String("LINKEDIN_BROWSERKIT_MODE", linkedInBrowserKitModeAuto))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	browserKitPython := defaultLinkedInBrowserKitPython()
 	browserKitStorageDir := strings.TrimSpace(env.String("LINKEDIN_BROWSERKIT_STORAGE_DIR", defaultLinkedInBrowserKitStorageDir()))
@@ -112,35 +141,17 @@ func run(ctx context.Context) error {
 
 	if browserKitMode == linkedInBrowserKitModeRequired {
 		if err := verifyBrowserKitDeps(browserKitPython); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	canBootstrapSession := browserKitMode != linkedInBrowserKitModeOff && loginUsername != "" && loginPassword != ""
 
-	if accessToken == "" && sessionToken == "" && !canBootstrapSession {
-		return mcperror.NotConfigured(
-			"LINKEDIN_ACCESS_TOKEN or LINKEDIN_SESSION_COOKIE",
-			"set LINKEDIN_ACCESS_TOKEN, LINKEDIN_SESSION_COOKIE/LINKEDIN_LI_AT/LI_AT, or LINKEDIN_LOGIN_USERNAME+LINKEDIN_LOGIN_PASSWORD with BrowserKit enabled",
-		)
-	}
-	if mode == linkedinModeOfficial && accessToken == "" {
-		return mcperror.NotConfigured("LINKEDIN_ACCESS_TOKEN", "required when LINKEDIN_MODE=official")
-	}
-	if mode == linkedinModeExperimental && sessionToken == "" && !canBootstrapSession {
-		return mcperror.NotConfigured(
-			"LINKEDIN_SESSION_COOKIE",
-			"required when LINKEDIN_MODE=experimental (or provide LINKEDIN_LOGIN_USERNAME+LINKEDIN_LOGIN_PASSWORD with BrowserKit enabled)",
-		)
+	missingEnv, configErr := linkedInConfigError(mode, accessToken, sessionToken, canBootstrapSession)
+	if configErr != nil {
+		logger.Warn("LinkedIn backend is not configured; credential-bound tool calls return NotConfigured", "mode", mode, "missing_env", missingEnv)
 	}
 	if sessionToken != "" && jsessionID == "" {
 		logger.Warn("LINKEDIN_JSESSIONID is not set; write operations may fail due to missing csrf-token header")
-	}
-
-	var secretStore secretSetter
-	if mgr, err := secrets.DefaultManager(); err != nil {
-		logger.Warn("unable to initialize secret manager", "error", err)
-	} else {
-		secretStore = mgr
 	}
 
 	ls := &linkedInServer{
@@ -149,6 +160,8 @@ func run(ctx context.Context) error {
 		accessToken:  accessToken,
 		sessionToken: sessionToken,
 		jsessionID:   jsessionID,
+		cookieBundle: cookieBundle,
+		userAgent:    userAgent,
 		httpClient:   httpclient.NewDefault(),
 		logger:       logger,
 		browserKit: linkedInBrowserKitConfig{
@@ -183,6 +196,7 @@ func run(ctx context.Context) error {
 	server := mcp.NewServer("mcp-linkedin", version)
 	loomconcurrency.Apply(server)
 	server.SetInstructions("LinkedIn personal account management. Supports profile reads and messaging operations. Configure via LINKEDIN_ACCESS_TOKEN or LINKEDIN_SESSION_COOKIE.")
+	requireConfig := func(handler mcp.ToolHandler) mcp.ToolHandler { return requireConfigured(configErr, handler) }
 
 	server.AddTool(mcp.Tool{
 		Name:        "linkedin_auth_status",
@@ -205,7 +219,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "linkedin_session_health", ls.handleSessionHealth))
+	}, mcpotel.TracedToolHandler(tracer, "linkedin_session_health", requireConfig(ls.handleSessionHealth)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linkedin_session_recover",
@@ -223,7 +237,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "linkedin_session_recover", ls.handleSessionRecover))
+	}, mcpotel.TracedToolHandler(tracer, "linkedin_session_recover", requireConfig(ls.handleSessionRecover)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linkedin_get_profile",
@@ -237,7 +251,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "linkedin_get_profile", ls.handleGetProfile))
+	}, mcpotel.TracedToolHandler(tracer, "linkedin_get_profile", requireConfig(ls.handleGetProfile)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linkedin_list_conversations",
@@ -259,7 +273,7 @@ func run(ctx context.Context) error {
 				},
 			},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "linkedin_list_conversations", ls.handleListConversations))
+	}, mcpotel.TracedToolHandler(tracer, "linkedin_list_conversations", requireConfig(ls.handleListConversations)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linkedin_get_conversation_messages",
@@ -286,7 +300,7 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"conversation_urn"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "linkedin_get_conversation_messages", ls.handleGetConversationMessages))
+	}, mcpotel.TracedToolHandler(tracer, "linkedin_get_conversation_messages", requireConfig(ls.handleGetConversationMessages)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "linkedin_send_message",
@@ -318,9 +332,48 @@ func run(ctx context.Context) error {
 			},
 			Required: []string{"text"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "linkedin_send_message", ls.handleSendMessage))
+	}, mcpotel.TracedToolHandler(tracer, "linkedin_send_message", requireConfig(ls.handleSendMessage)))
 
-	return server.Run(ctx)
+	return server, nil
+}
+
+// linkedInConfigError reports the credential gap for the selected mode: the
+// error every credential-bound tool returns, and the exact environment
+// variable(s) an operator must set to close it (comma-separated for the WARN
+// log). Official mode needs the access token, experimental mode the session
+// cookie (unless BrowserKit can bootstrap one from login credentials), and
+// auto mode either of them.
+func linkedInConfigError(mode, accessToken, sessionToken string, canBootstrapSession bool) (string, error) {
+	switch mode {
+	case linkedinModeOfficial:
+		if accessToken == "" {
+			return "LINKEDIN_ACCESS_TOKEN", mcperror.NotConfigured("LINKEDIN_ACCESS_TOKEN", "required when LINKEDIN_MODE=official")
+		}
+	case linkedinModeExperimental:
+		if sessionToken == "" && !canBootstrapSession {
+			return "LINKEDIN_SESSION_COOKIE", mcperror.NotConfigured(
+				"LINKEDIN_SESSION_COOKIE",
+				"required when LINKEDIN_MODE=experimental (or provide LINKEDIN_LOGIN_USERNAME+LINKEDIN_LOGIN_PASSWORD with BrowserKit enabled)",
+			)
+		}
+	default:
+		if accessToken == "" && sessionToken == "" && !canBootstrapSession {
+			return "LINKEDIN_ACCESS_TOKEN,LINKEDIN_SESSION_COOKIE", mcperror.NotConfigured(
+				"LINKEDIN_ACCESS_TOKEN or LINKEDIN_SESSION_COOKIE",
+				"set LINKEDIN_ACCESS_TOKEN, LINKEDIN_SESSION_COOKIE/LINKEDIN_LI_AT/LI_AT, or LINKEDIN_LOGIN_USERNAME+LINKEDIN_LOGIN_PASSWORD with BrowserKit enabled",
+			)
+		}
+	}
+	return "", nil
+}
+
+func requireConfigured(configErr error, handler mcp.ToolHandler) mcp.ToolHandler {
+	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		if configErr != nil {
+			return mcp.ErrorResult(configErr), nil
+		}
+		return handler(ctx, args)
+	}
 }
 
 func parseLinkedInMode(mode string) (string, error) {

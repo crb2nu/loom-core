@@ -1,0 +1,1 @@
+- **Correct Mills judge and status documentation** (`docs/weaver.md`, `docs/IMPLEMENTATION_STATUS.md`, `docs/README.md`): document the deployed LiteLLM judge binding and its configured fallback behavior, and identify the roadmap as the canonical current-status source while retaining the April 2026 implementation record as a historical snapshot.

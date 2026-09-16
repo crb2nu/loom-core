@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -381,6 +382,20 @@ func TestClassifyStageFailure(t *testing.T) {
 		{"spawn spawn-x stalled: no agent output for 15m0s (>= 15m0s stall timeout)", "spawn_infra"},
 		{"pipeline poll timed out after 30m0s", "ci_poll_timeout"},
 		{"spawn: poll deadline exceeded", "ci_poll_timeout"},
+		// Live 2026-09-01 tests-stage shape: the devbox sandbox image was still
+		// building when the ensure-sandbox wait expired (6/6 tests errors in 1d).
+		{`stage=tests attempt=1: devbox quality_gate: mcphub: devbox/devbox_quality_gate reported error: ensure sandbox: sandbox image still building after 8m0s: sandbox image build in progress for loom-core (elapsed 8m0s)`, "sandbox_build"},
+		// ci_watch tail whose branch pipeline went red. The "hud spawn …
+		// status=failed" shape must still classify as spawn_infra.
+		{"stage=ci_watch attempt=1: [2026-09-01T01:12:36Z] pipeline 25007 (push) status=failed https://gitlab.example/p/25007", "ci_red"},
+		{"stage=implement attempt=1 spawn=spawn-x: hud spawn xyz status=failed", "spawn_infra"},
+		// A ci_watch poll timeout whose worker tail carries the appended error
+		// line (runner.buildFailureLogTail) classifies off the error, not the
+		// still-running status lines.
+		{"stage=ci_watch attempt=1: [t] pipeline 1 (push) status=running url\nerror: pipeline: poll deadline exceeded", "ci_poll_timeout"},
+		// Serial merge queue verdicts.
+		{"stage=merge attempt=1: merge: queue evicted mr 1789 (rebase_conflict): rebase failed", "merge_queue"},
+		{"stage=merge attempt=2: merge: ci authorization was issued at head transition 0 but the run has settled 1: pipeline: merge authorization is stale", "merge_queue"},
 		{"gitlab: POST /projects: status 409", "gitlab_api"},
 		{"gitlab: PUT /merge: status 422", "gitlab_api"},
 		{"gitlab: DELETE /branch: status 400", "gitlab_api"},
@@ -437,14 +452,20 @@ func TestTelemetry_ModelEconomics(t *testing.T) {
 	now := time.Now().UTC()
 	since := now.Add(-7 * 24 * time.Hour)
 
-	// In-window run mixing three tiers plus an unattributed row:
+	// In-window run mixing three tiers plus an unattributed-but-costed row
+	// and two deterministic rows:
 	//  - (qwen, flexinfer): 2 calls, durations 10/30s, costs 0.01+0.03, 1 error
 	//  - (claude, spawn):   1 call,  duration 100s,     cost 5.00,      0 errors
-	//  - unattributed:      1 call,  duration 20s,      cost 0.00,      0 errors
+	//  - unattributed:      1 call,  duration 20s,      cost 0.02,      0 errors
+	//  - deterministic:     tests (error) + cleanup, no identity, $0 — these
+	//    are not model calls and must NOT appear (they used to inflate the
+	//    "unknown" tier's error rate).
 	seedTelemetryRun(t, st, "BACK-ME", "RUN-ME", 1, PipelineDone, now.Add(-3*time.Hour), []telemetrySeed{
 		{stage: "research", attempt: 1, dur: 10 * time.Second, outcome: StageOutcomeError, cost: 0.01, model: "qwen", backend: "flexinfer"},
 		{stage: "research", attempt: 2, dur: 30 * time.Second, outcome: StageOutcomeSuccess, cost: 0.03, model: "qwen", backend: "flexinfer"},
 		{stage: "implement", attempt: 1, dur: 100 * time.Second, outcome: StageOutcomeSuccess, cost: 5.00, model: "claude", backend: "spawn"},
+		{stage: "research", attempt: 3, dur: 20 * time.Second, outcome: StageOutcomeSuccess, cost: 0.02},
+		{stage: "tests", attempt: 1, dur: 480 * time.Second, outcome: StageOutcomeError, cost: 0.00},
 		{stage: "cleanup", attempt: 1, dur: 20 * time.Second, outcome: StageOutcomeSuccess, cost: 0.00},
 	})
 
@@ -462,7 +483,7 @@ func TestTelemetry_ModelEconomics(t *testing.T) {
 		t.Fatalf("model economics rows = %d, want 3: %+v", len(tel.ModelEconomics), tel.ModelEconomics)
 	}
 
-	// Cost-descending order: claude/spawn (5.00) > qwen/flexinfer (0.04) > unknown (0).
+	// Cost-descending order: claude/spawn (5.00) > qwen/flexinfer (0.04) > unknown (0.02).
 	if got := tel.ModelEconomics[0]; got.Model != "claude" || got.Backend != "spawn" {
 		t.Errorf("row[0] = %+v, want claude/spawn first (highest cost)", got)
 	}
@@ -490,8 +511,41 @@ func TestTelemetry_ModelEconomics(t *testing.T) {
 	}
 
 	unknown := findModelEcon(t, tel, "unknown", "unknown")
-	if unknown.Calls != 1 || unknown.CostUSD != 0.00 {
-		t.Errorf("unknown bucket = %+v, want 1 call / 0 cost", unknown)
+	if unknown.Calls != 1 || unknown.CostUSD != 0.02 || unknown.Errors != 0 {
+		t.Errorf("unknown bucket = %+v, want 1 call / 0.02 cost / 0 errors (deterministic $0 rows excluded)", unknown)
+	}
+	// The deterministic tests error still counts in the per-stage aggregate
+	// and the failure-class histogram — only the model roll-up drops it.
+	var testsErrors int
+	for _, s := range tel.Stages {
+		if s.Stage == "tests" {
+			testsErrors = s.Errors
+		}
+	}
+	if testsErrors != 1 {
+		t.Errorf("tests stage errors = %d, want 1 (deterministic rows stay in stage aggregates)", testsErrors)
+	}
+}
+
+func TestIsModelEconomicsRow(t *testing.T) {
+	ns := func(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
+	cases := []struct {
+		name           string
+		model, backend string
+		cost           float64
+		want           bool
+	}{
+		{"deterministic stage", "", "", 0, false},
+		{"whitespace identity is blank", "  ", "", 0, false},
+		{"model only", "codex", "", 0, true},
+		{"backend only", "", "spawn", 0, true},
+		{"delegator cost without identity", "", "", 0.02, true},
+		{"attributed", "kimi", "flexinfer", 0.37, true},
+	}
+	for _, c := range cases {
+		if got := isModelEconomicsRow(ns(c.model), ns(c.backend), c.cost); got != c.want {
+			t.Errorf("%s: isModelEconomicsRow(%q,%q,%v) = %v, want %v", c.name, c.model, c.backend, c.cost, got, c.want)
+		}
 	}
 }
 

@@ -1,0 +1,1 @@
+- Expose recent settled merge-queue entries from the Mills store and operator API, and show merged and evicted lane history with eviction reasons in the HUD press panel.

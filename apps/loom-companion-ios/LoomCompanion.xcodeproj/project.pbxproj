@@ -75,6 +75,7 @@
 		529481AA1364F008AABB1D7A /* TimelineListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F6913A8C8AD409B9046B8A0 /* TimelineListView.swift */; };
 		5297427D09FA2F13F26C87D8 /* LoomPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FC1E43EB5C7C2F5E3FDD87 /* LoomPill.swift */; };
 		55724E9ADBBBFEAFB5114C4E /* MillsKPIModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B961306165B104E6FF37AB20 /* MillsKPIModel.swift */; };
+		56479BDFA3C8AA5BA31ABD8A /* MillsOperatorStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7AAFCE33FDF95A7E6505DB7 /* MillsOperatorStatus.swift */; };
 		578796F162ACA1E54A1E1E8A /* AttentionLaneKind.swift in Sources */ = {isa = PBXBuildFile; fileRef = 816D0777AD3B1554F09D9B40 /* AttentionLaneKind.swift */; };
 		58BE00777930FB0F87CC784E /* SessionsListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80E9760E8E87921284992C11 /* SessionsListView.swift */; };
 		5A1DA4CE8BBC4C58F06ECB3F /* MillsControlAPITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E11D580A8EFBF890A95FF9E4 /* MillsControlAPITests.swift */; };
@@ -84,6 +85,7 @@
 		5CBA7A390991726272361590 /* CheckFleetHealthIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41BD976B82B11491D10ECF8C /* CheckFleetHealthIntent.swift */; };
 		5CF5B5DB89BBB3A35F5BD427 /* UnifiedAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEF7CF71931F67C441B7105D /* UnifiedAgent.swift */; };
 		5E6331B973C36CE1999E6FD7 /* MillsWidgetPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A7D6B531DA58618282729FD /* MillsWidgetPublisher.swift */; };
+		5EF71E63F76DEE0AF4321083 /* MillsOperatorStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A14EBAD313B90A3E9F0F078 /* MillsOperatorStatusTests.swift */; };
 		5F1C81A230F9A17DEFF44944 /* LoomCompanionKit.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 0965F79DE443186E70D59245 /* LoomCompanionKit.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		5F6E3220FCE0E01535FC42FE /* SpawnViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A293C272A9E36E9DEEA49E27 /* SpawnViewModelTests.swift */; };
 		5F78A20657E4DFE5F2B1AD95 /* AgentCommandViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3ABE7C667E8DD3B1BE7A2F50 /* AgentCommandViewModelTests.swift */; };
@@ -117,6 +119,7 @@
 		77BFCECC498D9849675515DA /* SpawnAgentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1F8AFB3D108C89254C6CF32 /* SpawnAgentView.swift */; };
 		7B90BC5EB2D5A482C5059181 /* TaskStatusChart.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FD17C0F3B8954C8FA32E1D1 /* TaskStatusChart.swift */; };
 		7C0585CF2C44295A95EC45B4 /* DashboardDataTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0878FA5DA01A99E903107CE5 /* DashboardDataTests.swift */; };
+		7CE1C54D6DE3765F5C18BA27 /* MillsTasteModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D45E78CB7DB1C75B2A23CAF /* MillsTasteModels.swift */; };
 		80BBE700C61ED9C78A195C8D /* ConnectionHealthTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5FDFE7384455881D052A20C /* ConnectionHealthTests.swift */; };
 		80E4590AB92C48FDBCB4EDEC /* LANPermissionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2ED40FA4A31DB113C275C811 /* LANPermissionView.swift */; };
 		826DBE87BA8FAE930FE9AA58 /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4BD6A1A6CD4E744094A320A /* LiveActivityManager.swift */; };
@@ -433,6 +436,7 @@
 		864429C75818340C0A047A6F /* AlertPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertPolicyTests.swift; sourceTree = "<group>"; };
 		88F2FE450A41EBC1375D96E2 /* LoomCompanionApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoomCompanionApp.swift; sourceTree = "<group>"; };
 		8929B83B6B80F343A36602A5 /* LiveSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveSessionsView.swift; sourceTree = "<group>"; };
+		8A14EBAD313B90A3E9F0F078 /* MillsOperatorStatusTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MillsOperatorStatusTests.swift; sourceTree = "<group>"; };
 		8AFE9E2FCE3B97F57F2D3637 /* ShiftReportSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShiftReportSheet.swift; sourceTree = "<group>"; };
 		8D1CD8736BFEC1535C91792C /* SessionEntriesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionEntriesSection.swift; sourceTree = "<group>"; };
 		8EC6B15F5BB0F1EA00B89CDB /* ProportionBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProportionBar.swift; sourceTree = "<group>"; };
@@ -455,6 +459,7 @@
 		9AFC594F979F95F7D0BAB750 /* LoomEmptyState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoomEmptyState.swift; sourceTree = "<group>"; };
 		9BCC13E0C8BCA4FEBD821204 /* OpsRuntimeSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpsRuntimeSection.swift; sourceTree = "<group>"; };
 		9C8910526CF468521F9E5CEC /* HealthGaugeChart.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthGaugeChart.swift; sourceTree = "<group>"; };
+		9D45E78CB7DB1C75B2A23CAF /* MillsTasteModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MillsTasteModels.swift; sourceTree = "<group>"; };
 		9D65752DA1D831C10454937C /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
 		A27203B6F1F94EAE9A946F3E /* AlertInboxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertInboxTests.swift; sourceTree = "<group>"; };
 		A293C272A9E36E9DEEA49E27 /* SpawnViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpawnViewModelTests.swift; sourceTree = "<group>"; };
@@ -528,6 +533,7 @@
 		F3C8ACEAE965833A67C3AFBA /* AgentsViewModelGroupingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsViewModelGroupingTests.swift; sourceTree = "<group>"; };
 		F5AC39AB40980D11D457D933 /* PipelineActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipelineActivity.swift; sourceTree = "<group>"; };
 		F6B6BE80F5A951DBB15A9D5C /* Fixtures */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Fixtures; path = Tests/LoomCompanionKitTests/Fixtures; sourceTree = SOURCE_ROOT; };
+		F7AAFCE33FDF95A7E6505DB7 /* MillsOperatorStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MillsOperatorStatus.swift; sourceTree = "<group>"; };
 		F8EBAD7BBD75B088B1545875 /* AgentsListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsListView.swift; sourceTree = "<group>"; };
 		F8FC1E43EB5C7C2F5E3FDD87 /* LoomPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoomPill.swift; sourceTree = "<group>"; };
 		F96726B96A5D4BFB2C9237E0 /* PushNotificationsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushNotificationsViewModel.swift; sourceTree = "<group>"; };
@@ -764,10 +770,12 @@
 				F04AB112226E5AFF58611F8C /* MillsAPI.swift */,
 				AD6F8B67C2F5E2B047FB012C /* MillsControlAPI.swift */,
 				B961306165B104E6FF37AB20 /* MillsKPIModel.swift */,
+				F7AAFCE33FDF95A7E6505DB7 /* MillsOperatorStatus.swift */,
 				906555E193E439E2AB5BACBD /* MillsPlanModels.swift */,
 				EEF68B98189B00AFA15971AA /* MillsShiftModels.swift */,
 				BEF043FBDFE396FDB5ECF649 /* MillsShiftReport.swift */,
 				9A6A2CA187F3D6A37029159A /* MillsSpinModels.swift */,
+				9D45E78CB7DB1C75B2A23CAF /* MillsTasteModels.swift */,
 			);
 			path = Mills;
 			sourceTree = "<group>";
@@ -1053,6 +1061,7 @@
 				EF8C114780D55A8E45F25ABF /* MillsAPITests.swift */,
 				E11D580A8EFBF890A95FF9E4 /* MillsControlAPITests.swift */,
 				90AE00641A11B10FFA76B5F8 /* MillsKPIModelTests.swift */,
+				8A14EBAD313B90A3E9F0F078 /* MillsOperatorStatusTests.swift */,
 				909DB84368C299EF5FB0592B /* MillsPipelineEscalateTests.swift */,
 				1F89E8FCE0A02D8AF32B0CE1 /* MillsShiftReportTests.swift */,
 				15E93BA7A587807AA3BB682A /* MillsWidgetDataTests.swift */,
@@ -1467,6 +1476,7 @@
 				2693FBC5023D13FCAEFA9353 /* MillsAPITests.swift in Sources */,
 				5A1DA4CE8BBC4C58F06ECB3F /* MillsControlAPITests.swift in Sources */,
 				0F634E074E5B775F82DA1D69 /* MillsKPIModelTests.swift in Sources */,
+				5EF71E63F76DEE0AF4321083 /* MillsOperatorStatusTests.swift in Sources */,
 				F54CDC0EFA2047DDBC5C5714 /* MillsPipelineEscalateTests.swift in Sources */,
 				BD7422C7AEBAD9F2E0F5EAEE /* MillsRawDecodeTests.swift in Sources */,
 				EFC94A25809C9C8F34012F9C /* MillsShiftReportTests.swift in Sources */,
@@ -1528,10 +1538,12 @@
 				CCB9E2876B99DFFD66E3669F /* MillsAPI.swift in Sources */,
 				A75BC5E7F07215B19BE924BA /* MillsControlAPI.swift in Sources */,
 				55724E9ADBBBFEAFB5114C4E /* MillsKPIModel.swift in Sources */,
+				56479BDFA3C8AA5BA31ABD8A /* MillsOperatorStatus.swift in Sources */,
 				9773163FD9DCDB1774FC823E /* MillsPlanModels.swift in Sources */,
 				D6D66EC54B6E7A06B1A021ED /* MillsShiftModels.swift in Sources */,
 				04DBA039F643F15BC58EF635 /* MillsShiftReport.swift in Sources */,
 				905B28FB7AAB896B40FC6271 /* MillsSpinModels.swift in Sources */,
+				7CE1C54D6DE3765F5C18BA27 /* MillsTasteModels.swift in Sources */,
 				A5BB4FD6BB2F82353422B1CC /* MillsWidgetData.swift in Sources */,
 				5E6331B973C36CE1999E6FD7 /* MillsWidgetPublisher.swift in Sources */,
 				3409D3C5743108AC528BA9AC /* OperatorInboxViewModel.swift in Sources */,

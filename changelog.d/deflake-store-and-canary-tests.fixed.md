@@ -1,0 +1,1 @@
+- Make the deep-queue claim checks in `pkg/mills/store/dao_pipeline_start_test.go` structural and drive the cadence scenarios in `pkg/mills/workflow/killtest/process_observer_test.go` with a fake clock, eliminating runner-timing flakes.

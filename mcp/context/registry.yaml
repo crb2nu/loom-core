@@ -513,6 +513,24 @@ servers:
         type: stdio
         command: "${repo}/services/loom-core/bin/mcp-time"
         args: []
+  - name: edilint
+    categories: [dev, local-only]
+    common:
+      description: Pre-send linter for healthcare interchange files (X12, HL7v2, EDIFACT, delimited, fixed-width)
+      hint: Lint an interchange file with lint_file or lint_text before it is sent or committed; explain_rule decodes an EL#### finding and names the TA1/999 code a partner would return
+      command: "${HOME}/go/bin/edilint"
+      args: ["mcp"]
+      always_allow:
+        - lint_file
+        - lint_text
+        - list_rules
+        - explain_rule
+      timeout: 60
+    targets:
+      vscode:
+        type: stdio
+        command: "${HOME}/go/bin/edilint"
+        args: ["mcp"]
   - name: git
     categories: [devops, scm]
     common:
@@ -1228,6 +1246,53 @@ servers:
           QDRANT_URL: "${env:QDRANT_URL:-http://192.168.50.176:6333}"
           QDRANT_API_KEY: "${env:QDRANT_API_KEY}"
 
+  - name: mills
+    categories: [mills, factory, ops]
+    common:
+      description: Loom Mills factory operations — backlog, runs, KPIs, escalation triage, and revision-safe state transitions with the requeue branch-guard
+      hint: Do not list changelog fragments; root-level files serialize the whole tree. For a scope-gate escalation, use mills_backlog_amend_scope to widen files/tests and optionally requeue (matching open scope-rescue drafts are allowed). Reads are tokenless. mills_escalation_diagnose gives a requeue-vs-rescue verdict before touching anything; mills_backlog_update_state refuses a requeue while an implement branch exists. Mutations need LOOM_MILLS_TOKEN or its alias LOOM_MILLS_OPERATOR_TOKEN, the name loomd already carries (k8s secret loom-mills/loom-mills-admin — NOT the HUD admin token).
+      command: "${repo}/services/loom-core/bin/mcp-mills"
+      args: []
+      env:
+        LOOM_MILLS_OPERATOR_URL: "${env:LOOM_MILLS_OPERATOR_URL:-https://mills.flexinfer.ai}"
+        LOOM_MILLS_TOKEN: "${env:LOOM_MILLS_TOKEN}"
+        # Same credential under the name the loomd/HUD environment sets; the
+        # server resolves LOOM_MILLS_TOKEN first, then this, then
+        # LOOM_MILLS_ADMIN_TOKEN.
+        LOOM_MILLS_OPERATOR_TOKEN: "${env:LOOM_MILLS_OPERATOR_TOKEN:-}"
+        # Read matching scope-rescue draft MRs in private GitLab projects.
+        GITLAB_PERSONAL_ACCESS_TOKEN: "${env:GITLAB_PERSONAL_ACCESS_TOKEN:-}"
+        GITLAB_TOKEN: "${env:GITLAB_TOKEN:-}"
+        # Cloudflare Access service token for the public operator edge; the
+        # server prefers the LOOM_MILLS_* pair, falls back to CF_ACCESS_CLIENT_*,
+        # and skips both for loopback targets (port-forward).
+        LOOM_MILLS_CF_ACCESS_ID: "${env:LOOM_MILLS_CF_ACCESS_ID:-}"
+        LOOM_MILLS_CF_ACCESS_SECRET: "${env:LOOM_MILLS_CF_ACCESS_SECRET:-}"
+        CF_ACCESS_CLIENT_ID: "${env:CF_ACCESS_CLIENT_ID:-}"
+        CF_ACCESS_CLIENT_SECRET: "${env:CF_ACCESS_CLIENT_SECRET:-}"
+      timeout: 60
+      always_allow:
+        - mills_status
+        - mills_backlog_list
+        - mills_backlog_get
+        - mills_runs
+        - mills_kpis
+        - mills_escalation_diagnose
+  - name: speak
+    categories: [voice, local-only, fun]
+    common:
+      description: Agent voice output — synthesize via the tts.lan lane and play on this machine's speakers
+      hint: Use speak for short spoken updates (piper voices alan/amy; orpheus GPU voices tara/leah/jess/leo/dan/mia/zac/zoe). Non-blocking by default.
+      command: "${repo}/services/loom-core/bin/mcp-speak"
+      args: []
+      env:
+        SPEAK_TTS_BASE: "${env:SPEAK_TTS_BASE:-http://tts.lan}"
+        SPEAK_PLAYER: "${env:SPEAK_PLAYER:-afplay}"
+        SPEAK_DEFAULT_VOICE: "${env:SPEAK_DEFAULT_VOICE:-leo}"
+      timeout: 150
+      always_allow:
+        - speak
+        - list_voices
   - name: quality
     categories: [quality, dev, testing, local-only]
     common:
@@ -1437,7 +1502,7 @@ servers:
     categories: [ai, kubernetes, inference, local-only]
     common:
       description: FlexInfer AI inference operator — model lifecycle, GPU status, proxy, benchmarks
-      hint: Use for managing AI inference models deployed via FlexInfer. List/create/scale/delete Models, check GPU nodes, query the inference proxy, and view benchmarks.
+      hint: Use for managing AI inference models deployed via FlexInfer. List/create/scale/delete Models, check GPU nodes, query the inference proxy, and view benchmarks. flexinfer_rag searches the embedded codebase indexes (loom-core/loom/flexinfer/flexdeck) on the gfx906 retrieval plane — prefer it over grepping when asking conceptual questions about those repos.
       command: "${repo}/services/loom-core/bin/mcp-flexinfer"
       args: []
       timeout: 120
@@ -1453,6 +1518,7 @@ servers:
         - flexinfer_proxy_models
         - flexinfer_proxy_health
         - flexinfer_probe
+        - flexinfer_rag
       env:
         FLEXINFER_KUBECONFIG: "${env:KUBECONFIG:-${repo}/platform/gitops/.kube/k3s.yaml}"
         FLEXINFER_NAMESPACE: "flexinfer-system"
@@ -1751,7 +1817,7 @@ servers:
         - minio_get_object
         - minio_stat_object
       env:
-        MINIO_ENDPOINT: "${env:MINIO_ENDPOINT:-http://192.168.50.246:9000}"
+        MINIO_ENDPOINT: "${env:MINIO_ENDPOINT:-http://192.168.50.240:9000}"
         MINIO_ACCESS_KEY: "${keychain:MINIO_ACCESS_KEY}"
         MINIO_SECRET_KEY: "${keychain:MINIO_SECRET_KEY}"
         MINIO_PORT_FORWARD: "false"
@@ -1761,7 +1827,7 @@ servers:
         command: "${repo}/services/loom-core/bin/mcp-minio"
         args: []
         env:
-          MINIO_ENDPOINT: "${env:MINIO_ENDPOINT:-http://192.168.50.246:9000}"
+          MINIO_ENDPOINT: "${env:MINIO_ENDPOINT:-http://192.168.50.240:9000}"
           MINIO_ACCESS_KEY: "${env:MINIO_ACCESS_KEY}"
           MINIO_SECRET_KEY: "${env:MINIO_SECRET_KEY}"
           MINIO_PORT_FORWARD: "false"
@@ -2199,10 +2265,22 @@ platform_permissions:
 
   codex:
     settings:
-      # Default approval policy for autonomous runs.
-      # Modern Codex CLI versions (>=4.x) respect the top-level "never" string
-      # reliably when paired with server-level approval_mode = "always".
-      approval_policy: "never"
+      # Approval policy for interactive Codex surfaces (TUI + desktop app).
+      # "on-request" restores the sandbox-escalation path: the model may ask to
+      # run a command outside the workspace-write sandbox (git commit/push need
+      # this — .git is force-mounted read-only by design, openai/codex#15505),
+      # the user approves once, and Codex persists an allow-rule. Commands
+      # matched by the execpolicy rules below still run with no prompt, so the
+      # day-to-day flow stays quiet, Claude-Code-style (allowlist runs silently,
+      # everything else asks). Switched from "never" 2026-08-30: under "never"
+      # the model is told escalation is impossible, so desktop sessions skipped
+      # git writes entirely and autonomous shipping wedged at commit — and the
+      # desktop app's unified exec wraps every command in `/bin/zsh -lc`, which
+      # execpolicy prefix rules cannot match, so the rules alone cannot unwedge
+      # that surface. Headless Mills spawns are unaffected: they pass
+      # --dangerously-bypass-approvals-and-sandbox explicitly (internal/hud/
+      # spawn_config.go).
+      approval_policy: "on-request"
       suppress_unstable_features_warning: true
       sandbox_mode: "workspace-write"
       web_search: "live"
@@ -2212,9 +2290,9 @@ platform_permissions:
       # decision "allow" runs the matched command OUTSIDE the sandbox without
       # prompting, everything unmatched keeps the sandbox. Needed because the
       # workspace-write sandbox force-mounts .git (incl. resolved worktree
-      # gitdirs) read-only by design with no config override, and
-      # approval_policy "never" removes the escalation prompt — git commit/push
-      # wedge with "cannot lock ref ... Operation not permitted".
+      # gitdirs) read-only by design with no config override — without a rule,
+      # git commit/push either wedge with "cannot lock ref ... Operation not
+      # permitted" or need an approval prompt on every single invocation.
       # Docs: https://learn.chatgpt.com/docs/agent-configuration/rules.md
       # Limitation: https://github.com/openai/codex/issues/15505
       # Sync merges the managed block in place; rules outside the markers
@@ -2224,7 +2302,7 @@ platform_permissions:
       rules:
         - pattern: ["git"]
           decision: "allow"
-          justification: "Auto-Ship Policy: git needs .git metadata writes; the workspace-write sandbox blocks them and approval_policy=never prevents escalation."
+          justification: "Auto-Ship Policy: git needs .git metadata writes; the workspace-write sandbox blocks them, so bare git runs outside the sandbox without prompting."
           match:
             - ["git", "status"]
             - ["git", "commit", "-m", "fix: example"]

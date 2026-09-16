@@ -29,7 +29,7 @@ try:
     from browser_kit.browser import BrowserConfig, BrowserManager  # noqa: F401
 except Exception as e:
     print(f"ERROR: failed to import flexinfer-browser-kit: {e}", file=sys.stderr)
-    print("Install:\n  python3 -m pip install -U flexinfer-browser-kit playwright", file=sys.stderr)
+    print("Install:\n  bash scripts/browserkit/install_deps.sh", file=sys.stderr)
     raise SystemExit(2)
 
 try:

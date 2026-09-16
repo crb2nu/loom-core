@@ -1,0 +1,1 @@
+- Added durable Mills operator watches with authenticated registration and resolution, open filtering, and reconciler attention events for terminal conditions and TTL expiry (`pkg/mills/store`, `cmd/loom-mills-operator`, `pkg/mills/reconciler.go`).

@@ -1,0 +1,1 @@
+- Surface overseer dry-run decision and agreement counters from `pkg/mills/overseer/overseer.go` in a deterministic S2 soak section from `pkg/mills/shiftreport/report.go`.

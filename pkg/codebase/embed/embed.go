@@ -3,7 +3,47 @@ package embed
 
 import (
 	"context"
+	"math"
 )
+
+// CosineSimilarity returns the cosine similarity of two embedding vectors in
+// [-1, 1]. ok is false when the vectors cannot represent a valid similarity:
+// they are empty, differ in dimension, contain non-finite components, or have
+// a zero or non-finite norm.
+//
+// Norms are accumulated with Hypot and components are divided before the dot
+// product. This keeps valid vectors near float64's limits from overflowing or
+// underflowing during intermediate calculations.
+func CosineSimilarity(a, b []float64) (similarity float64, ok bool) {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0, false
+	}
+
+	var normA, normB float64
+	for i := range a {
+		if !isFinite(a[i]) || !isFinite(b[i]) {
+			return 0, false
+		}
+		normA = math.Hypot(normA, a[i])
+		normB = math.Hypot(normB, b[i])
+	}
+	if normA == 0 || normB == 0 || !isFinite(normA) || !isFinite(normB) {
+		return 0, false
+	}
+
+	for i := range a {
+		similarity += (a[i] / normA) * (b[i] / normB)
+	}
+	if !isFinite(similarity) {
+		return 0, false
+	}
+	// Floating-point accumulation may stray fractionally outside the range.
+	return math.Max(-1, math.Min(1, similarity)), true
+}
+
+func isFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
 
 // QueryEmbedder is the smallest interface needed by semantic query callers.
 type QueryEmbedder interface {

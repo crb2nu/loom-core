@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -108,12 +110,49 @@ func TestIncidentDAO_DistinctFingerprintsAndAggregation(t *testing.T) {
 	if len(list) != 2 {
 		t.Fatalf("ListSince len = %d, want 2", len(list))
 	}
-	aggregated, err := st.Incidents.ListAggregated(ctx)
+	aggregated, err := st.Incidents.ListAggregated(ctx, when.Add(-time.Minute), 10)
 	if err != nil {
 		t.Fatalf("ListAggregated: %v", err)
 	}
 	if len(aggregated) != 1 || aggregated[0].Occurrences != 3 {
 		t.Fatalf("ListAggregated = %+v, want one summary with 3 occurrences", aggregated)
+	}
+}
+
+func TestIncidentDAO_ListAggregatedRequiresBounds(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if _, err := st.Incidents.ListAggregated(ctx, time.Time{}, 10); err == nil {
+		t.Fatal("zero since should fail")
+	}
+	if _, err := st.Incidents.ListAggregated(ctx, time.Now().UTC(), 0); err == nil {
+		t.Fatal("non-positive limit should fail")
+	}
+}
+
+func TestIncidentDAO_ListSinceRequiresLimit(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.Incidents.ListSince(context.Background(), time.Now().Add(-time.Hour), 0); err == nil {
+		t.Fatal("non-positive limit should fail")
+	}
+}
+
+// TestIncidentDAO_ListSinceUsesKindIndex runs the ListSince shape UNPINNED and
+// asserts the planner picks migration 029's (kind, occurred_at) index. The
+// previous version of this test pinned idx_events_occurred via INDEXED BY and
+// so certified the exact plan that walked the whole 24h window and timed the
+// council brief out (2026-09-03..07); a pin in a test proves nothing about
+// what production runs.
+func TestIncidentDAO_ListSinceUsesKindIndex(t *testing.T) {
+	st := newTestStore(t)
+	details := queryPlan(t, st, `EXPLAIN QUERY PLAN
+		SELECT `+eventColumns+` FROM events
+		WHERE kind = ? AND occurred_at >= ?
+		ORDER BY occurred_at DESC, id DESC LIMIT ?`,
+		[]any{IncidentEventKind, timeRFC3339(time.Now().Add(-24 * time.Hour)), 200})
+	assertPlanUsesIndexWithoutTableScan(t, details, "idx_events_kind_occurred", "events")
+	if plan := strings.Join(details, "\n"); strings.Contains(plan, "idx_events_occurred ") || strings.HasSuffix(plan, "idx_events_occurred") {
+		t.Fatalf("incident window read regressed to the time-only index:\n%s", plan)
 	}
 }
 
@@ -142,5 +181,37 @@ func TestIncidentDAO_ValidationAndNotFound(t *testing.T) {
 	}
 	if _, err := st.Incidents.Get(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get missing = %v, want ErrNotFound", err)
+	}
+}
+
+func TestIncidentDAO_ListBoundsAggregationAndDeadline(t *testing.T) {
+	st := newTestStoreWithOptions(t, Options{IncidentReadLimit: 3})
+	ctx := context.Background()
+	base := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		record := &IncidentRecord{
+			ID: fmt.Sprintf("INC-%d", i), Fingerprint: fmt.Sprintf("fp-%d", i),
+			Class: IncidentClassExternalDependency, Source: "test", Dependency: "dep",
+			Shape: fmt.Sprintf("shape-%d", i), Summary: "failure", OccurredAt: base.Add(time.Duration(i) * time.Minute),
+		}
+		if _, err := st.Incidents.Put(ctx, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.Incidents.ListSince(ctx, base.Add(-time.Minute), 100)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("ListSince = %d rows, %v; want 3", len(got), err)
+	}
+	if !got[0].OccurredAt.After(got[1].OccurredAt) || !got[1].OccurredAt.After(got[2].OccurredAt) {
+		t.Fatalf("ListSince ordering = %+v", got)
+	}
+	aggregated, err := st.Incidents.ListAggregated(ctx, base.Add(-time.Minute), 100)
+	if err != nil || len(aggregated) != 3 {
+		t.Fatalf("ListAggregated = %d rows, %v; want bounded 3", len(aggregated), err)
+	}
+	expired, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer cancel()
+	if _, err := st.Incidents.ListSince(expired, base, 10); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "incident list") {
+		t.Fatalf("expired ListSince error = %v", err)
 	}
 }

@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/httpclient"
 	"gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/pkg/httpclient"
 )
 
 // orderedSessionsQdrantStub mimics a Qdrant scroll endpoint that returns

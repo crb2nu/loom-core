@@ -1,0 +1,1 @@
+- Add a visible, auditable per-item `max_diff_lines` override in `pkg/mills/store`, `pkg/mills/gates`, and `pkg/mills/pipeline` for cleanup diffs expected to be at least 90% deletions, with planner justification required in the SpecDoc.

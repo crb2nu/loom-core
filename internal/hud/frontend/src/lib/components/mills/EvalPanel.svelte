@@ -185,6 +185,19 @@
             </td>
           </tr>
         {/if}
+      {:else}
+        <!-- The loop filter can empty the table while scores exist; a bare
+             header over nothing reads as a load failure. Name the filter. -->
+        <tr class="no-match-row">
+          <td colspan="6" class="no-match">
+            {#if loopFilter != null}
+              No Loop {loopFilter} scores in this window.
+              <button type="button" class="link-btn" onclick={() => (loopFilter = null)}>Show all loops</button>
+            {:else}
+              No scores in this window.
+            {/if}
+          </td>
+        </tr>
       {/each}
     </tbody>
   </table>
@@ -207,6 +220,22 @@
   .pill-btn:focus-visible { outline: 2px solid color-mix(in srgb, var(--info) 55%, transparent); outline-offset: 2px; }
   .pill-btn.pill-active { outline: 2px solid var(--accent); outline-offset: 1px; }
   .mills-table-wrap { overflow-x: auto; }
+  .no-match {
+    padding: var(--space-4) !important;
+    text-align: center;
+    color: var(--text-muted);
+  }
+  .link-btn {
+    margin-left: var(--space-2);
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--info);
+    font: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .link-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .mills-table { width: 100%; border-collapse: collapse; font-size: var(--text-12); }
   .mills-table th, .mills-table td {
     text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border-subtle);

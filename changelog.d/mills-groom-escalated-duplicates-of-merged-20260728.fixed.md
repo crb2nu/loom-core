@@ -24,7 +24,17 @@ Also removes the early return on an empty queued lane — `queue_depth` 0 is the
 steady state between council rounds, which is exactly when the escalated pile
 most needs draining. The tick still stays silent when both lanes are empty.
 
-This covers the case the merged-branch reconciler pass deliberately could not:
-work delivered under a *different* item's branch, e.g.
+This targets the case the merged-branch reconciler pass deliberately could
+not: work delivered under a *different* item's branch.
+
+Correction (2026-08-25): this fragment originally cited
 `…spawn-state-pruning-with-hud-pressure-s-2` shipping inside
-`bl-hud-spawn-state-pressure-prune-20260726`.
+`bl-hud-spawn-state-pressure-prune-20260726` as the motivating example. That
+claim was wrong. The sibling's merge (!1241) delivered only the prune
+mechanics (`internal/spawn/`, `pkg/mills/pipeline/spawn_class.go`); the `-2`
+slice's deliverables — spawn-state metrics and the HUD pressure indicator in
+`internal/hud/monitor/` and fleetview — never landed on main and sit on an
+unmerged branch. The item remains deliberately escalated, and the pass now
+requires the merged canonical's delivered files to cover the candidate's
+declared slice files before retiring (see the merged-dedup scope-evidence
+fragment).

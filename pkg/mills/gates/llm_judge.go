@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
@@ -95,9 +96,12 @@ type RubricJudge interface {
 
 // RubricVerdict is the structured response from a RubricJudge call.
 type RubricVerdict struct {
-	Score   float64
-	Reasons []string
-	Model   string
+	// JudgedBy and Skipped carry chain attribution, including on exhaustion.
+	JudgedBy string
+	Skipped  []string
+	Score    float64
+	Reasons  []string
+	Model    string
 }
 
 // FakeRubricJudge returns canned verdicts. Used in tests + dryrun mode.
@@ -151,6 +155,21 @@ type LLMGate struct {
 	// TiebreakerName labels the tiebreaker backend in JudgedBy (e.g.
 	// "anthropic"). Empty defaults to "tiebreaker".
 	TiebreakerName string
+	// Shadow, when non-nil, is a second judge consulted on EVERY scored
+	// verdict, concurrently with the primary, purely for calibration
+	// evidence (issue #755): its verdict is appended to Outcome.Judgements
+	// under JudgeRoleShadow and persisted like any other judgement, and it
+	// never touches Pass, JudgedBy or Reasons. This is how a candidate local
+	// judge is graded against the frontier primary on live traffic without
+	// steering a single gate outcome. A shadow error or timeout appends
+	// nothing; the canary/disabled/nil-judge short circuits and the
+	// primary's scoreless error paths (unparseable, transport) never
+	// record it.
+	Shadow RubricJudge
+	// ShadowTimeout bounds the shadow call (it runs concurrently with the
+	// primary, so this is also the most a slow shadow can delay the gate
+	// after the primary answers). Zero defaults to DefaultShadowTimeout.
+	ShadowTimeout time.Duration
 	// Logger is optional; nil falls back to slog.Default().
 	Logger *slog.Logger
 }
@@ -213,6 +232,7 @@ func (g *LLMGate) Evaluate(ctx context.Context, in StageInput) (Outcome, error) 
 	if threshold <= 0 {
 		threshold = 0.8
 	}
+	shadow := g.startShadow(ctx, in)
 	v, err := g.Judge.Judge(ctx, g.RubricName, in)
 	if err != nil {
 		if isJudgeUnparseable(err) {
@@ -243,10 +263,83 @@ func (g *LLMGate) Evaluate(ctx context.Context, in StageInput) (Outcome, error) 
 	if !out.Pass {
 		out.Reasons = append([]string{fmt.Sprintf("score=%.2f below threshold=%.2f", v.Score, threshold)}, v.Reasons...)
 	}
+	// The shadow rides along before any tiebreak so the persisted order is
+	// primary, shadow, tiebreaker and appendTiebreakerJudgement copies it.
+	out.Judgements = g.joinShadow(ctx, shadow, out.Judgements, threshold)
 	if !out.Pass && in.TestsPassed && g.Tiebreaker != nil {
 		return g.breakTie(ctx, in, out, model, threshold)
 	}
 	return out, nil
+}
+
+// DefaultShadowTimeout bounds a shadow judge call when LLMGate.ShadowTimeout
+// is zero. Matches the tiebreaker client's deadline: a rubric verdict on a
+// local 27B lane fits comfortably, and a lane that is cold-starting must not
+// hold a gate open.
+const DefaultShadowTimeout = 2 * time.Minute
+
+// shadowVerdict carries the shadow judge's answer across its goroutine.
+type shadowVerdict struct {
+	v   RubricVerdict
+	err error
+}
+
+// startShadow launches the shadow judge concurrently with the primary. The
+// returned channel is nil when no shadow is wired; otherwise it yields exactly
+// one result within shadowTimeout() (the call's context is bounded), so a slow
+// or hung shadow can never hold a gate longer than that after the primary.
+func (g *LLMGate) startShadow(ctx context.Context, in StageInput) <-chan shadowVerdict {
+	if g.Shadow == nil {
+		return nil
+	}
+	ch := make(chan shadowVerdict, 1)
+	sctx, cancel := context.WithTimeout(ctx, g.shadowTimeout())
+	go func() {
+		defer cancel()
+		v, err := g.Shadow.Judge(sctx, g.RubricName, in)
+		ch <- shadowVerdict{v: v, err: err}
+	}()
+	return ch
+}
+
+func (g *LLMGate) shadowTimeout() time.Duration {
+	if g.ShadowTimeout > 0 {
+		return g.ShadowTimeout
+	}
+	return DefaultShadowTimeout
+}
+
+// joinShadow waits for the shadow verdict and appends it as a JudgeRoleShadow
+// judgement without aliasing the caller's slice. Any error, timeout or parent
+// cancellation appends nothing and is logged: the shadow is evidence, never a
+// verdict, so nothing here can change the gate's outcome.
+func (g *LLMGate) joinShadow(ctx context.Context, ch <-chan shadowVerdict, judgements []Judgement, threshold float64) []Judgement {
+	if ch == nil {
+		return judgements
+	}
+	var res shadowVerdict
+	select {
+	case res = <-ch:
+	case <-ctx.Done():
+		g.logger().Warn("shadow judge abandoned: parent context done",
+			"gate", g.GateName, "rubric", g.RubricName, "error", ctx.Err())
+		return judgements
+	}
+	if res.err != nil {
+		g.logger().Warn("shadow judge failed; no shadow judgement recorded",
+			"gate", g.GateName, "rubric", g.RubricName, "error", res.err)
+		return judgements
+	}
+	model := res.v.Model
+	if model == "" {
+		model = JudgeRoleShadow
+	}
+	out := make([]Judgement, 0, len(judgements)+1)
+	out = append(out, judgements...)
+	return append(out, Judgement{
+		Role: JudgeRoleShadow, Model: model,
+		Score: res.v.Score, Threshold: threshold, Pass: res.v.Score >= threshold,
+	})
 }
 
 // breakTie resolves the dissent between a failing primary verdict and a
@@ -258,6 +351,7 @@ func (g *LLMGate) breakTie(ctx context.Context, in StageInput, primary Outcome, 
 		name = "tiebreaker"
 	}
 	tv, terr := g.Tiebreaker.Judge(ctx, g.RubricName, in)
+	primary.Reasons = append(primary.Reasons, tv.Skipped...)
 	if terr != nil {
 		// Fail closed: keep the primary fail verdict, but record that the
 		// tiebreaker was consulted and unavailable so the escalation shows
@@ -272,14 +366,19 @@ func (g *LLMGate) breakTie(ctx context.Context, in StageInput, primary Outcome, 
 	if tModel == "" {
 		tModel = name
 	}
+	overruledBy := fmt.Sprintf("flexinfer:%s overruled-by %s:%s", primaryModel, name, tModel)
+	if tv.JudgedBy != "" {
+		overruledBy = tv.JudgedBy
+	}
 	if tv.Score >= threshold {
+		primary.Reasons = append(primary.Reasons, tv.Reasons...)
 		g.logger().Info("llm gate: tiebreaker overruled primary fail (tests stage passed)",
 			"gate", g.GateName, "rubric", g.RubricName,
 			"primary_model", primaryModel, "tiebreaker_model", tModel,
 			"tiebreaker_score", tv.Score)
 		return Outcome{
 			Pass:     true,
-			JudgedBy: fmt.Sprintf("flexinfer:%s overruled-by %s:%s", primaryModel, name, tModel),
+			JudgedBy: overruledBy,
 			Reasons: append(
 				[]string{fmt.Sprintf("primary judge dissented from the passing tests stage; %s:%s scored %.2f >= %.2f and overruled. Primary reasons preserved for audit:", name, tModel, tv.Score, threshold)},
 				primary.Reasons...),
@@ -294,6 +393,9 @@ func (g *LLMGate) breakTie(ctx context.Context, in StageInput, primary Outcome, 
 		"primary_model", primaryModel, "tiebreaker_model", tModel,
 		"tiebreaker_score", tv.Score)
 	primary.JudgedBy = fmt.Sprintf("flexinfer:%s corroborated-by %s:%s", primaryModel, name, tModel)
+	if tv.JudgedBy != "" {
+		primary.JudgedBy = tv.JudgedBy
+	}
 	primary.Reasons = append(primary.Reasons,
 		fmt.Sprintf("[corroborated: %s:%s scored %.2f < %.2f]", name, tModel, tv.Score, threshold))
 	primary.Reasons = append(primary.Reasons, tv.Reasons...)
@@ -323,12 +425,33 @@ func RegisterLLMGates(r *Registry, judge RubricJudge) {
 // tiebreaker (see LLMGate.Tiebreaker). A nil tiebreaker degrades to the
 // plain registration.
 func RegisterLLMGatesWithTiebreaker(r *Registry, judge, tiebreaker RubricJudge, tiebreakerName string) {
-	sc := NewSpecConformanceGate(judge)
-	sc.Tiebreaker = tiebreaker
-	sc.TiebreakerName = tiebreakerName
-	pr := NewPRSelfReviewGate(judge)
-	pr.Tiebreaker = tiebreaker
-	pr.TiebreakerName = tiebreakerName
+	RegisterLLMGatesWired(r, LLMGateWiring{Judge: judge, Tiebreaker: tiebreaker, TiebreakerName: tiebreakerName})
+}
+
+// LLMGateWiring bundles every judge an LLM gate can carry: the primary, the
+// dissent tiebreaker (see LLMGate.Tiebreaker) and the calibration shadow (see
+// LLMGate.Shadow). Nil optional judges degrade to the plain registration.
+type LLMGateWiring struct {
+	Judge          RubricJudge
+	Tiebreaker     RubricJudge
+	TiebreakerName string
+	Shadow         RubricJudge
+	ShadowTimeout  time.Duration
+}
+
+// RegisterLLMGatesWired registers spec_conformance and pr_self_review with the
+// full judge wiring; both gates carry the same judges.
+func RegisterLLMGatesWired(r *Registry, w LLMGateWiring) {
+	sc := NewSpecConformanceGate(w.Judge)
+	sc.Tiebreaker = w.Tiebreaker
+	sc.TiebreakerName = w.TiebreakerName
+	sc.Shadow = w.Shadow
+	sc.ShadowTimeout = w.ShadowTimeout
+	pr := NewPRSelfReviewGate(w.Judge)
+	pr.Tiebreaker = w.Tiebreaker
+	pr.TiebreakerName = w.TiebreakerName
+	pr.Shadow = w.Shadow
+	pr.ShadowTimeout = w.ShadowTimeout
 	r.Register(sc)
 	r.Register(pr)
 }

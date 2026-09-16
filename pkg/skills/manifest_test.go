@@ -10,6 +10,9 @@ func TestWriteAndReadManifest(t *testing.T) {
 	dir := t.TempDir()
 
 	files := []string{"commands/deploy.md", "rules/security.md"}
+	for _, rel := range files {
+		writePruneFile(t, filepath.Join(dir, rel), "delivered content")
+	}
 	if err := WriteManifest(dir, "claude", files); err != nil {
 		t.Fatalf("WriteManifest: %v", err)
 	}

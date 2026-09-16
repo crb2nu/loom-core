@@ -31,6 +31,8 @@ type fakePlanReader struct {
 	planCalls       []planReadCall
 	planErrors      map[planReadCall]error
 	sliceCalls      map[string]int
+	cachedStamps    map[string]string
+	cachedSlices    map[string][]clients.PlanSliceSummary
 }
 
 type blockingPlanReader struct{}
@@ -42,6 +44,10 @@ func (blockingPlanReader) ListPlans(ctx context.Context, _, _, _ string) ([]clie
 
 func (blockingPlanReader) ListSlices(context.Context, string) ([]clients.PlanSliceSummary, error) {
 	return nil, errors.New("unexpected ListSlices call")
+}
+
+func (blockingPlanReader) ListSlicesIfChanged(context.Context, clients.PlanSummary) ([]clients.PlanSliceSummary, error) {
+	return nil, errors.New("unexpected ListSlicesIfChanged call")
 }
 
 func (blockingPlanReader) GetSlice(context.Context, string) (clients.PlanSliceSummary, error) {
@@ -94,6 +100,19 @@ func (f *fakePlanReader) ListSlices(_ context.Context, planID string) ([]clients
 	}
 	f.sliceCalls[planID]++
 	return f.slices[planID], nil
+}
+
+func (f *fakePlanReader) ListSlicesIfChanged(ctx context.Context, plan clients.PlanSummary) ([]clients.PlanSliceSummary, error) {
+	if plan.UpdatedAt != "" && f.cachedStamps[plan.ID] == plan.UpdatedAt {
+		return f.cachedSlices[plan.ID], nil
+	}
+	if f.cachedStamps == nil {
+		f.cachedStamps = map[string]string{}
+		f.cachedSlices = map[string][]clients.PlanSliceSummary{}
+	}
+	f.cachedStamps[plan.ID] = plan.UpdatedAt
+	f.cachedSlices[plan.ID] = append([]clients.PlanSliceSummary(nil), f.slices[plan.ID]...)
+	return f.ListSlices(ctx, plan.ID)
 }
 
 func (f *fakePlanReader) GetSlice(_ context.Context, sliceID string) (clients.PlanSliceSummary, error) {
@@ -613,6 +632,38 @@ func TestSliceToBacklog_PreDeclaresProtectedTouches(t *testing.T) {
 	}
 }
 
+// TestPlanSliceEmitter_ProtectedHitterReceivesTargetProject: the pre-declare
+// hook must be told WHICH repo's protected surface to judge — a cross-repo
+// demand item is matched against the target repo's
+// protected_paths_per_repo overlay, not only the home repo's globs.
+func TestPlanSliceEmitter_ProtectedHitterReceivesTargetProject(t *testing.T) {
+	pr, st := emitterFixture(), newFakeStore()
+	e := testEmitter(pr, st)
+	var gotProjects []string
+	e.SetProtectedPathHitter(func(project string, paths []string) []string {
+		gotProjects = append(gotProjects, project)
+		return nil
+	})
+	if _, err := e.emitForProject(context.Background(), "services/flexdeck", "services/flexdeck"); err != nil {
+		t.Fatalf("emitForProject: %v", err)
+	}
+	if len(gotProjects) == 0 {
+		t.Fatal("protected hitter never invoked")
+	}
+	for _, p := range gotProjects {
+		if p != "services/flexdeck" {
+			t.Fatalf("hitter project=%q, want services/flexdeck", p)
+		}
+	}
+	item, err := st.Get(context.Background(), planSliceBacklogID("plan-ready#1"))
+	if err != nil || item == nil {
+		t.Fatalf("expected emitted item, err=%v", err)
+	}
+	if item.TargetProject != "services/flexdeck" {
+		t.Fatalf("TargetProject=%q, want services/flexdeck", item.TargetProject)
+	}
+}
+
 func TestPlanSliceEmitter_DedupesOnReRun(t *testing.T) {
 	pr, st := emitterFixture(), newFakeStore()
 	e := testEmitter(pr, st)
@@ -923,6 +974,7 @@ func TestPlanSliceEmitter_GrounderReceivesOnlyConcretePaths(t *testing.T) {
 // (it would double-count the verdict metric every tick).
 func TestPlanSliceEmitter_GrounderSkippedForExistingItems(t *testing.T) {
 	pr, st := emitterFixture(), newFakeStore()
+	pr.plans[0].UpdatedAt = "2026-09-12T11:00:00Z"
 	e := testEmitter(pr, st)
 	calls := installGrounder(e, "rev1", true, nil)
 	if _, err := e.Tick(context.Background()); err != nil {
@@ -933,5 +985,8 @@ func TestPlanSliceEmitter_GrounderSkippedForExistingItems(t *testing.T) {
 	}
 	if len(*calls) != 1 {
 		t.Fatalf("grounder calls=%d after two ticks, want 1 (existing item skips grounding)", len(*calls))
+	}
+	if got := pr.sliceCalls[pr.plans[0].ID]; got != 1 {
+		t.Fatalf("live slice-list calls=%d after unchanged ticks, want 1", got)
 	}
 }

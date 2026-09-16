@@ -1,0 +1,1 @@
+- Fixed the Mills tests-stage dispatcher and devbox quality gate to check out, verify, and record the run branch's exact tested commit before declared tests execute.

@@ -1,0 +1,1 @@
+- Reuse validated embedding cosine similarity in `pkg/codebase/embed/embed.go` and preserve lexical fallback while blending semantic work-title scores in `pkg/mills/textsim/textsim.go`.

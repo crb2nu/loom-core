@@ -146,13 +146,27 @@ describe('millsStaffStore.refresh', () => {
   });
 
   it('flips disabled on a 503 (operator not configured) without an error', async () => {
-    globalThis.fetch = routedFetch(() => ({ status: 503, body: 'operator not configured' }));
+    globalThis.fetch = routedFetch(() => ({ status: 503, body: JSON.stringify({ error: 'operator not configured' }) }));
 
     await millsStaffStore.refresh();
 
     expect(millsStaffStore.promotion.disabled).toBe(true);
     expect(millsStaffStore.promotion.error).toBeNull();
     expect(millsStaffStore.signatures.disabled).toBe(true);
+  });
+
+  it('distinguishes a missing snapshot 503 from an unconfigured operator', async () => {
+    globalThis.fetch = routedFetch(() => ({
+      status: 503,
+      body: JSON.stringify({ error: 'report snapshot not yet available' }),
+    }));
+
+    await millsStaffStore.refresh();
+
+    expect(millsStaffStore.promotion.disabled).toBe(false);
+    expect(millsStaffStore.promotion.snapshotUnavailable).toBe(true);
+    expect(millsStaffStore.promotion.error).toBeNull();
+    expect(millsStaffStore.signatures.snapshotUnavailable).toBe(true);
   });
 
   it('keeps the last good snapshot when a refresh fails', async () => {

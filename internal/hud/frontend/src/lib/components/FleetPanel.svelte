@@ -29,6 +29,13 @@
   import ActivityCard from './fleet/ActivityCard.svelte';
   import MemoryTiersCard from './fleet/MemoryTiersCard.svelte';
   import SessionDetail from './fleet/SessionDetail.svelte';
+  // Task/Nudge moved here from the retired Presence ▸ Agents tab: Fleet is
+  // the canonical roster, so the dispatch and nudge modals mount here and
+  // the table rows get the triggers. The modals are store-driven
+  // (presenceActionsStore) and take no props.
+  import { presenceActionsStore } from '../stores/presenceActions.svelte.ts';
+  import DispatchTaskModal from './presence/DispatchTaskModal.svelte';
+  import NudgeAgentModal from './presence/NudgeAgentModal.svelte';
 
   const fleetPollingOwner = Symbol('FleetPanel');
   const tracePollingOwner = Symbol('FleetPanelTraces');
@@ -137,6 +144,8 @@
       onSessionClick={navigateToSession}
       onTraceClick={navigateToTrace}
       onSpawnClick={navigateToSpawn}
+      onDispatchClick={(agentId) => presenceActionsStore.onOpenDispatch(agentId)}
+      onNudgeClick={(agentId) => presenceActionsStore.onOpenNudge(agentId)}
     />
 
     <FleetStatsGrid
@@ -156,6 +165,9 @@
     onClose={backToFleet}
   />
 </div>
+
+<DispatchTaskModal />
+<NudgeAgentModal />
 
 <style>
   .fleet-panel {

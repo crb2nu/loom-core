@@ -192,6 +192,7 @@ func (d *DockerBackend) Exec(ctx context.Context, opts ExecOpts) (*ExecResult, e
 		StderrLines: stderrTotal,
 		StdoutTail:  stdoutTail,
 		StderrTail:  stderrTail,
+		StderrHead:  stderrHead(stderrBuf.String()),
 		DurationMs:  durationMs,
 		Truncated:   stdoutTrunc || stderrTrunc,
 		OOMKilled:   oomKilled,

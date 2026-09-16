@@ -2,14 +2,127 @@ package overseer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/guard"
 	"github.com/crb2nu/loom/pkg/mills/store"
 	telemetrypkg "github.com/crb2nu/loom/pkg/telemetry"
 )
+
+// PromotionMode is the effective overseer execution mode selected from the
+// persisted soak-complete artifact.
+type PromotionMode string
+
+const (
+	PromotionModeDryRun PromotionMode = "dry-run"
+	PromotionModeActive PromotionMode = "active"
+
+	// Stable operator-facing reasons. A rejection names the first condition
+	// the artifact fails, in the order SoakProgress.CompleteAt checks them.
+	PromotionReasonArtifactMissing      = "soak-complete artifact is missing"
+	PromotionReasonArtifactUnreadable   = "soak-complete artifact is unreadable"
+	PromotionReasonArtifactMalformed    = "soak-complete artifact is malformed"
+	PromotionReasonSoakStartFutureDated = "soak-complete artifact soak start is after its generated_at"
+	PromotionReasonSoakTooShort         = "soak-complete artifact covers less than 168 hours"
+	PromotionReasonSoakDiverged         = "soak-complete artifact records policy divergences"
+	PromotionReasonSoakIncomplete       = "soak-complete artifact does not satisfy the S2 soak contract"
+	PromotionReasonSoakComplete         = "soak-complete artifact satisfies the S2 soak contract"
+)
+
+// PromotionDecision records both the effective mode and its operator-facing
+// reason. Callers must use Mode, rather than interpreting an error as approval.
+type PromotionDecision struct {
+	Mode   PromotionMode `json:"mode"`
+	Reason string        `json:"reason"`
+}
+
+// SoakCompleteArtifact is the on-disk promotion evidence: the soak projection
+// the shift report already emits (generated_at plus soak_progress), deposited
+// by an operator once the S2 checklist has passed. It carries no verdict of
+// its own. Completion is decided by SoakProgress.CompleteAt at the artifact's
+// own generated_at, exactly as shiftreport.Compose derives soak_complete, so
+// the gate can never disagree with the report the evidence came from. Any
+// other field in the file, including a projected soak_complete, is ignored
+// rather than trusted.
+type SoakCompleteArtifact struct {
+	GeneratedAt  time.Time     `json:"generated_at"`
+	SoakProgress *SoakProgress `json:"soak_progress"`
+}
+
+// PromotionGate reads the artifact on every decision, allowing a newly
+// deposited (or removed) artifact to take effect without a process restart.
+// ReadFile is an optional test seam; production callers should leave it nil.
+type PromotionGate struct {
+	ArtifactPath string
+	Logger       *slog.Logger
+	ReadFile     func(string) ([]byte, error)
+}
+
+// Decide returns active mode only for a readable, well-formed artifact whose
+// soak progress SoakProgress.CompleteAt accepts: a persisted start no later
+// than generated_at, at least S2SoakMinimumDuration elapsed, and zero
+// divergences. Every uncertainty fails closed to dry-run and is logged.
+func (g PromotionGate) Decide() PromotionDecision {
+	readFile := g.ReadFile
+	if readFile == nil {
+		readFile = os.ReadFile
+	}
+	b, err := readFile(g.ArtifactPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return g.reject(PromotionReasonArtifactMissing)
+		}
+		return g.reject(PromotionReasonArtifactUnreadable)
+	}
+
+	var artifact SoakCompleteArtifact
+	if err := json.Unmarshal(b, &artifact); err != nil {
+		return g.reject(PromotionReasonArtifactMalformed)
+	}
+	if !artifact.SoakProgress.CompleteAt(artifact.GeneratedAt) {
+		return g.reject(explainIncompleteSoak(artifact.SoakProgress, artifact.GeneratedAt))
+	}
+
+	decision := PromotionDecision{Mode: PromotionModeActive, Reason: PromotionReasonSoakComplete}
+	g.logger().Info("overseer promotion gate evaluated", "mode", decision.Mode, "reason", decision.Reason, "artifact", g.ArtifactPath)
+	return decision
+}
+
+// explainIncompleteSoak names the first S2 condition a soak projection fails.
+// It is consulted only after SoakProgress.CompleteAt has rejected the
+// evidence, so it chooses the reason but never the verdict; a condition it
+// does not recognise still reads as incomplete.
+func explainIncompleteSoak(p *SoakProgress, observedAt time.Time) string {
+	switch {
+	case p == nil || observedAt.IsZero() || p.StartedAt.IsZero() || p.ElapsedSeconds < 0 || p.Divergences < 0:
+		return PromotionReasonArtifactMalformed
+	case p.StartedAt.After(observedAt):
+		return PromotionReasonSoakStartFutureDated
+	case p.ElapsedSeconds < S2SoakMinimumSeconds:
+		return PromotionReasonSoakTooShort
+	case p.Divergences > 0:
+		return PromotionReasonSoakDiverged
+	}
+	return PromotionReasonSoakIncomplete
+}
+
+func (g PromotionGate) reject(reason string) PromotionDecision {
+	decision := PromotionDecision{Mode: PromotionModeDryRun, Reason: reason}
+	g.logger().Warn("overseer promotion gate rejected artifact", "mode", decision.Mode, "reason", reason, "artifact", g.ArtifactPath)
+	return decision
+}
+
+func (g PromotionGate) logger() *slog.Logger {
+	if g.Logger != nil {
+		return g.Logger
+	}
+	return slog.Default()
+}
 
 const (
 	// S2SoakMinimumDuration is the closed evidence window required before an
@@ -21,11 +134,66 @@ const (
 	S2SoakMinimumWouldHaveActed = 1
 	// S2SoakMaximumDivergences requires exact agreement with reviewed policy.
 	S2SoakMaximumDivergences = 0
+	// S2SoakMinimumSeconds is the wire-level form of the seven-day gate.
+	S2SoakMinimumSeconds int64 = 604800
 )
+
+// SoakProgress is the stable telemetry contract shared with shift reports.
+// StartedAt is persisted once by SoakProgressStore; elapsed time is projected
+// from an injected observation time and is therefore deterministic.
+type SoakProgress struct {
+	StartedAt      time.Time `json:"soak_started_at"`
+	ElapsedSeconds int64     `json:"soak_elapsed_seconds"`
+	Divergences    int       `json:"soak_divergences"`
+}
+
+// Complete fails closed for structurally malformed telemetry. Call CompleteAt
+// when an observation time is available and future-dated starts must also be
+// rejected. The duration threshold is inclusive and divergences must be zero.
+func (p *SoakProgress) Complete() bool {
+	return p != nil && !p.StartedAt.IsZero() && p.ElapsedSeconds >= S2SoakMinimumSeconds && p.Divergences == 0
+}
+
+// CompleteAt evaluates completion relative to the timestamp of the containing
+// observation, preventing future-dated telemetry from opening the gate.
+func (p *SoakProgress) CompleteAt(observedAt time.Time) bool {
+	return !observedAt.IsZero() && p.Complete() && !p.StartedAt.After(observedAt)
+}
+
+// SoakProgressStore atomically initializes and returns the durable S2 soak
+// start. Implementations must return the existing value after the first call.
+type SoakProgressStore interface {
+	EnsureOverseerSoakStart(context.Context, time.Time) (time.Time, error)
+}
+
+// ObserveSoakProgress persists the first observation time and projects the
+// current machine-readable progress. Callers supply now so tests and replays do
+// not depend on the wall clock. Storage failures and invalid values fail closed.
+func ObserveSoakProgress(ctx context.Context, persistence SoakProgressStore, now time.Time, divergences int) (*SoakProgress, error) {
+	if persistence == nil {
+		return nil, errors.New("overseer soak start persistence is not configured")
+	}
+	if now.IsZero() {
+		return nil, errors.New("overseer soak observation time is required")
+	}
+	startedAt, err := persistence.EnsureOverseerSoakStart(ctx, now.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("persist overseer soak start: %w", err)
+	}
+	startedAt = startedAt.UTC()
+	if startedAt.IsZero() || startedAt.After(now.UTC()) || divergences < 0 {
+		return nil, errors.New("overseer soak telemetry is malformed")
+	}
+	return &SoakProgress{
+		StartedAt:      startedAt,
+		ElapsedSeconds: int64(now.UTC().Sub(startedAt) / time.Second),
+		Divergences:    divergences,
+	}, nil
+}
 
 const (
 	// SoakGateMinimumDuration is the inclusive minimum observation window.
-	SoakGateMinimumDuration = 168 * time.Hour
+	SoakGateMinimumDuration = S2SoakMinimumDuration
 	// SoakGatePassMetric is a stable numeric projection of the gate verdict.
 	SoakGatePassMetric = "mills_overseer_s2_soak_gate_pass"
 )
@@ -67,14 +235,41 @@ const (
 // projection of the persisted promotion report plus reviewed divergences; it
 // never changes an allow flag or performs an overseer action.
 type SoakMetrics struct {
-	ElapsedDays     int      `json:"mills_overseer_soak_elapsed_days"`
-	DryRunDecisions int      `json:"mills_overseer_soak_dry_run_decisions"`
-	WouldHaveActed  int      `json:"mills_overseer_soak_would_have_acted"`
-	Divergences     int      `json:"mills_overseer_soak_divergences"`
-	Promotable      bool     `json:"promotable"`
-	FailClosed      bool     `json:"fail_closed"`
-	FailureReasons  []string `json:"failure_reasons,omitempty"`
+	StartedAt       time.Time `json:"started_at"`
+	ElapsedDays     int       `json:"mills_overseer_soak_elapsed_days"`
+	DryRunDecisions int       `json:"mills_overseer_soak_dry_run_decisions"`
+	WouldHaveActed  int       `json:"mills_overseer_soak_would_have_acted"`
+	Divergences     int       `json:"mills_overseer_soak_divergences"`
+	Promotable      bool      `json:"promotable"`
+	FailClosed      bool      `json:"fail_closed"`
+	FailureReasons  []string  `json:"failure_reasons,omitempty"`
 }
+
+// DecisionCount returns the number of reviewed dry-run decisions in the soak.
+func (m SoakMetrics) DecisionCount() int { return m.DryRunDecisions }
+
+// AgreementCount returns reviewed decisions that agreed with approved policy.
+// Invalid telemetry is clamped to zero so report consumers never display a
+// negative agreement count.
+func (m SoakMetrics) AgreementCount() int {
+	agreements := m.DryRunDecisions - m.Divergences
+	if agreements < 0 {
+		return 0
+	}
+	return agreements
+}
+
+// AgreementRate returns the fraction of reviewed decisions that agreed with
+// approved policy. The boolean is false when no decisions have been reviewed.
+func (m SoakMetrics) AgreementRate() (float64, bool) {
+	if m.DryRunDecisions <= 0 {
+		return 0, false
+	}
+	return float64(m.AgreementCount()) / float64(m.DryRunDecisions), true
+}
+
+// SoakStart returns the start of the evidence window in UTC.
+func (m SoakMetrics) SoakStart() time.Time { return m.StartedAt.UTC() }
 
 // SoakTelemetryStore is the persistence contract used by overseer dry-run
 // decisions and status evaluation. *store.Store satisfies this interface.
@@ -113,6 +308,7 @@ func EvaluatePersistedS2Soak(ctx context.Context, telemetry SoakTelemetryStore, 
 	}
 	end := now.UTC().Truncate(24 * time.Hour)
 	start := end.AddDate(0, 0, -7)
+	result.StartedAt = start
 	if len(days) != 7 {
 		return failSoak(result, "soak telemetry does not contain seven complete UTC days")
 	}
@@ -150,6 +346,10 @@ func EvaluateS2Soak(report *guard.PromotionReport, divergences int) SoakMetrics 
 	if report == nil {
 		return failSoak(result, "promotion evidence is missing or unreadable")
 	}
+	if report.WindowStart.IsZero() || report.WindowEnd.IsZero() {
+		return failSoak(result, "promotion evidence window is missing or unreadable")
+	}
+	result.StartedAt = report.WindowStart.UTC()
 
 	window := report.WindowEnd.Sub(report.WindowStart)
 	if window > 0 {

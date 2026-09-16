@@ -9,7 +9,7 @@ When a v2 feature misbehaves in production, the cheapest mitigation is almost al
 | Squad routing degrading merge rate | [Disable squads (8.3-1)](#disable-squads) |
 | Audit pool flooding noise / blocking merges | [Disable audit OR flip back to advisory_only (8.3-2)](#disable-audit) |
 | Council debate burning budget without quality gain | [Disable debate for that trigger (8.3-3)](#disable-debate) |
-| Cross-repo coordinator stuck mid-merge | [Disable cross_repo + force-revert atomic merge (8.3-4)](#disable-cross-repo) |
+| Cross-repo item misbehaving on a non-home repo | [Disable cross_repo routing (8.3-4)](#disable-cross-repo) |
 | Adaptive proposal applied a bad policy | [Revert the proposal (slice 7.2)](#revert-an-applied-policy-proposal) |
 | Operator boot loop / DB integrity check fails | [Restore DB from MinIO backup](MILLS_RUNBOOK.md#recover-from-a-corrupted-db) |
 
@@ -72,28 +72,32 @@ In-flight debates run to budget; the next council will use the single-pass (non-
 
 ### Disable cross-repo
 
-Cross-repo is the riskiest v2 feature because it can leave half-merged state across two MRs. Disable + abort:
+`cross_repo.enabled` gates whether a backlog item whose `TargetProject` names a
+non-home repo may start at all. Turning it off fail-closes that routing: the
+reconciler skips such items with `reason=cross_repo_disabled` and they stay
+queued until it is re-enabled or the target is corrected. Home-repo items are
+unaffected.
 
 ```bash
-# 1. Stop accepting new cross-repo runs:
+# 1. Stop starting items bound for non-home repos:
 yq -i '.policy.cross_repo.enabled = false' k3s/mills/configmap-policy.yaml
 git commit -am "ops(mills): disable cross_repo (incident YYYY-MM-DD)"
 git push && flux reconcile kustomization apps -n flux-system
 
-# 2. Find in-flight cross-repo runs:
-curl -sf "$LOOM_MILLS_OPERATOR_URL/api/mills/cross-repo/runs?state=running" | jq
-
-# 3. Abort each one (admin token required):
-curl -X POST -H "Authorization: Bearer $LOOM_MILLS_ADMIN_TOKEN" \
-  "$LOOM_MILLS_OPERATOR_URL/api/mills/cross-repo/runs/<id>/abort"
-
-# 4. The integrator's revert path runs automatically when abort is called
-#    on a run that already merged one side; verify:
-curl -sf "$LOOM_MILLS_OPERATOR_URL/api/mills/cross-repo/runs/<id>" | jq '.state'
-# expect: "reverted" within ~60s, or "revert_failed" requiring manual cleanup.
+# 2. Confirm the gate is live (skips appear as reconciler.skipped events):
+curl -sf "$LOOM_MILLS_OPERATOR_URL/api/mills/events?kind=reconciler.skipped" \
+  | jq '.[] | select(.data.reason == "cross_repo_disabled")'
 ```
 
-If `revert_failed`: the per-MR rollback plan is in `MILLS_RUNBOOK.md → Force-revert a cross-repo merge`. Each side is a regular MR — `git revert` + open a follow-up MR to drop the change cleanly.
+Each cross-repo item is an ordinary single-repo pipeline run against another
+project, so anything already in flight is rolled back the same way as any other
+run — there is no multi-repo half-merged state to unwind. To back out work that
+already merged, revert its MR on the target repo.
+
+> Atomic multi-repo merge (one item, several repos, all-or-nothing) was
+> specified as slices 4.2–4.5 but never built; the machinery and its
+> `/api/mills/cross-repo/runs` endpoints were removed on 2026-08-15. If that
+> capability is ever built, this section needs a revert playbook again.
 
 ### Disable adaptive proposal job
 

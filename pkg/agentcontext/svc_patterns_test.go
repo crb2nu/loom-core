@@ -2,17 +2,91 @@ package agentcontext
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/crb2nu/loom/pkg/codebase/embed"
+	"github.com/crb2nu/loom/pkg/httpclient"
 )
+
+type patternErrorEmbedder struct{ err error }
+
+func (e patternErrorEmbedder) EmbedQuery(context.Context, string) ([]float64, error) {
+	return nil, e.err
+}
+func (e patternErrorEmbedder) EmbedDocuments(context.Context, []string) ([][]float64, error) {
+	return nil, e.err
+}
+func (patternErrorEmbedder) Name() string  { return "pattern-error" }
+func (patternErrorEmbedder) Model() string { return "none" }
+
+func newPatternPersistQdrant(t *testing.T, upserts *int) (*QdrantClient, func()) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/collections/"+CollPatterns:
+			writeJSON(t, w, map[string]any{"result": map[string]any{"config": map[string]any{"params": map[string]any{"vectors": map[string]any{"size": 3}}}}})
+		case r.Method == http.MethodPut && r.URL.Path == "/collections/"+CollPatterns+"/points":
+			*upserts++
+			writeJSON(t, w, map[string]any{"status": "ok", "result": map[string]any{"status": "acknowledged"}})
+		default:
+			t.Fatalf("unexpected qdrant request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	return NewQdrantClient(httpclient.NewDefault(), srv.URL, "", CollPatterns, "Cosine"), srv.Close
+}
 
 func newTestPatternSvc() *PatternSvc {
 	// nil Qdrant/embedder exercises the in-memory cache path (Qdrant-first fetch
 	// falls back to the cache), matching newTestPlanSvc.
 	return NewPatternSvc(nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func TestPatternPersist_EmbedderUnavailableFailsClosed(t *testing.T) {
+	upserts := 0
+	qdrant, closeServer := newPatternPersistQdrant(t, &upserts)
+	t.Cleanup(closeServer)
+	metrics := NewMetrics()
+	ps := NewPatternSvc(qdrant, patternErrorEmbedder{err: embed.ErrEmbedderUnavailable}, nil, slog.Default())
+	ps.metrics = metrics
+
+	err := ps.persist(context.Background(), &Pattern{ID: "pattern-test", Name: "test", Makes: "service"})
+	if !errors.Is(err, embed.ErrEmbedderUnavailable) {
+		t.Fatalf("persist error = %v, want ErrEmbedderUnavailable", err)
+	}
+	if upserts != 0 {
+		t.Fatalf("qdrant upserts = %d, want 0", upserts)
+	}
+	if got := metrics.PatternEmbedFailclosed.Load(); got != 1 {
+		t.Fatalf("pattern fail-closed counter = %d, want 1", got)
+	}
+	if output := metrics.PrometheusFormat(); !strings.Contains(output, "pattern_embed_failclosed_total 1") {
+		t.Fatalf("Prometheus output missing fail-closed counter:\n%s", output)
+	}
+}
+
+func TestPatternPersist_GenericEmbedFailureUsesFallback(t *testing.T) {
+	upserts := 0
+	qdrant, closeServer := newPatternPersistQdrant(t, &upserts)
+	t.Cleanup(closeServer)
+	ps := NewPatternSvc(qdrant, patternErrorEmbedder{err: errors.New("provider unavailable")}, nil, slog.Default())
+	ps.metrics = NewMetrics()
+
+	if err := ps.persist(context.Background(), &Pattern{ID: "pattern-test", Name: "test", Makes: "service"}); err != nil {
+		t.Fatalf("persist generic embedding failure: %v", err)
+	}
+	if upserts != 1 {
+		t.Fatalf("qdrant upserts = %d, want 1", upserts)
+	}
+	if got := ps.metrics.PatternEmbedFailclosed.Load(); got != 0 {
+		t.Fatalf("pattern fail-closed counter = %d, want 0", got)
+	}
 }
 
 // TestPattern_AddGetRoundTrip verifies a Pattern with nested structures

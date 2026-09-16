@@ -676,3 +676,232 @@ func itemsCount(t *testing.T, res *mcp.CallToolResult) int {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// HandleEngramGraph — root-less full catalog (the HUD tech-tree contract)
+// ---------------------------------------------------------------------------
+
+// TestHandleEngramGraph_FullCatalog pins the empty-args call the HUD bridge
+// has always made: it must return the whole catalog as RICH nodes keyed by
+// engram URI (edges reference URIs, so any other node key breaks the tree
+// join), with dangling prerequisite targets stubbed and deterministic order.
+func TestHandleEngramGraph_FullCatalog(t *testing.T) {
+	t.Parallel()
+	svc := newEngramTestService()
+	ctx := context.Background()
+
+	if _, err := svc.HandleEngramAdd(ctx, map[string]any{
+		"title": "base idiom", "problem": "p", "solution": "s", "proof": "f:1",
+		"family": "full-base", "slug": "x",
+	}); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := svc.HandleEngramAdd(ctx, map[string]any{
+		"title": "composite", "problem": "p", "solution": "s", "proof": "command: go test ./...",
+		"family": "full-comp", "slug": "x", "tier": 2,
+		"prerequisites": []any{"engram://full-base/x", "engram://full-missing/x"},
+	}); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	res, err := svc.HandleEngramGraph(ctx, map[string]any{})
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if res.IsError {
+		t.Fatalf("empty-args graph must not error (the required-root schema kept the HUD tree from ever rendering): %+v", res)
+	}
+	payload := readResultJSON(t, res)
+
+	if truncated, _ := payload["truncated"].(bool); truncated {
+		t.Errorf("tiny catalog reported truncated")
+	}
+
+	nodes := payload["nodes"].([]any)
+	byURI := map[string]map[string]any{}
+	for _, raw := range nodes {
+		n := raw.(map[string]any)
+		uri, _ := n["uri"].(string)
+		if uri == "" {
+			t.Fatalf("node missing uri key: %v", n)
+		}
+		byURI[uri] = n
+	}
+	base, ok := byURI["engram://full-base/x"]
+	if !ok {
+		t.Fatalf("base engram missing from full graph: %v", byURI)
+	}
+	if base["title"] != "base idiom" || base["proof_status"] != "unverified" {
+		t.Errorf("base node not rich: %v", base)
+	}
+	comp := byURI["engram://full-comp/x"]
+	if comp == nil || comp["tier"].(float64) != 2 {
+		t.Errorf("composite node wrong: %v", comp)
+	}
+	// The dangling prerequisite target must appear as a stub node so the
+	// edge keeps two resolvable ends — and say so: the HUD summary rollup
+	// counts engrams off this payload and must be able to leave gaps out.
+	stub, ok := byURI["engram://full-missing/x"]
+	if !ok {
+		t.Fatalf("dangling prerequisite not stubbed: %v", byURI)
+	}
+	if stub["stub"] != true {
+		t.Errorf("stub node lacks the stub marker: %v", stub)
+	}
+	for _, uri := range []string{"engram://full-base/x", "engram://full-comp/x"} {
+		if _, marked := byURI[uri]["stub"]; marked {
+			t.Errorf("catalog node %s carries a stub marker: %v", uri, byURI[uri])
+		}
+	}
+
+	edges := payload["edges"].([]any)
+	if len(edges) != 2 {
+		t.Fatalf("expected 2 edges, got %d: %v", len(edges), edges)
+	}
+	// Deterministic order: edges sorted by (from, to).
+	e0 := edges[0].(map[string]any)
+	e1 := edges[1].(map[string]any)
+	if e0["to"].(string) > e1["to"].(string) {
+		t.Errorf("edges not deterministically ordered: %v then %v", e0, e1)
+	}
+
+	// A second call must produce byte-identical node order (cache-stable).
+	res2, err := svc.HandleEngramGraph(ctx, map[string]any{})
+	if err != nil || res2.IsError {
+		t.Fatalf("second call failed: %v %+v", err, res2)
+	}
+	if res.Content[0].Text != res2.Content[0].Text {
+		t.Errorf("full graph not deterministic across calls")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// One identity: URI is the id everywhere
+// ---------------------------------------------------------------------------
+
+// The dual-ID model this pins against: list/recall used to serve the backing
+// memory-item id as "id" while the graph keyed nodes by URI (with no id at
+// all), so a response's own prerequisites could not be resolved against its
+// own id space and every client grew a tolerant three-way matcher.
+func TestEngramIdentity_URIIsTheIDEverywhere(t *testing.T) {
+	t.Parallel()
+	svc := newEngramTestService()
+	ctx := context.Background()
+
+	if _, err := svc.HandleEngramAdd(ctx, map[string]any{
+		"title": "Base idiom", "problem": "p", "solution": "s",
+		"proof": "file.go:1", "family": "identity-base", "slug": "go", "tier": 1,
+	}); err != nil {
+		t.Fatalf("add base: %v", err)
+	}
+	if _, err := svc.HandleEngramAdd(ctx, map[string]any{
+		"title": "Composite", "problem": "p", "solution": "s",
+		"proof": "command: go test", "family": "identity-comp", "slug": "go", "tier": 2,
+		// One resolvable prerequisite and one dangling target: the graph must
+		// key BOTH ends of both edges in the same id space.
+		"prerequisites": []any{"engram://identity-base/go", "engram://identity-missing/go"},
+	}); err != nil {
+		t.Fatalf("add composite: %v", err)
+	}
+
+	// List: id == uri, and the storage id stays available as memory_id.
+	listRes, err := svc.HandleEngramList(ctx, map[string]any{"limit": 50})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	items := readResultJSON(t, listRes)["items"].([]any)
+	if len(items) < 2 {
+		t.Fatalf("expected both engrams, got %d", len(items))
+	}
+	for _, raw := range items {
+		m := raw.(map[string]any)
+		id, uri := m["id"].(string), m["uri"].(string)
+		memID, _ := m["memory_id"].(string)
+		if id != uri {
+			t.Errorf("list item id %q != uri %q", id, uri)
+		}
+		if memID == "" {
+			t.Errorf("list item %q lost its memory_id", uri)
+		}
+		if memID == uri {
+			t.Errorf("memory_id %q should be the storage id, not the uri", memID)
+		}
+	}
+
+	// Full graph: every node (stubs included) carries id == uri, and every
+	// edge endpoint resolves against the node id set — the join the tree
+	// renders from.
+	graphRes, err := svc.HandleEngramGraph(ctx, map[string]any{})
+	if err != nil {
+		t.Fatalf("graph: %v", err)
+	}
+	graph := readResultJSON(t, graphRes)
+	nodeIDs := map[string]bool{}
+	for _, raw := range graph["nodes"].([]any) {
+		n := raw.(map[string]any)
+		id, uri := n["id"].(string), n["uri"].(string)
+		if id == "" || id != uri {
+			t.Errorf("graph node id %q != uri %q", id, uri)
+		}
+		nodeIDs[id] = true
+	}
+	if !nodeIDs["engram://identity-missing/go"] {
+		t.Error("dangling prerequisite did not become an id-carrying stub node")
+	}
+	for _, raw := range graph["edges"].([]any) {
+		e := raw.(map[string]any)
+		if !nodeIDs[e["from"].(string)] || !nodeIDs[e["to"].(string)] {
+			t.Errorf("edge %v->%v does not resolve against node ids", e["from"], e["to"])
+		}
+	}
+
+	// Recall rides the same projection as list.
+	recallRes, err := svc.HandleEngramRecall(ctx, map[string]any{"query": "Composite"})
+	if err != nil {
+		t.Fatalf("recall: %v", err)
+	}
+	recallItems, _ := readResultJSON(t, recallRes)["items"].([]any)
+	if len(recallItems) == 0 {
+		t.Fatal("recall returned no items")
+	}
+	for _, raw := range recallItems {
+		m := raw.(map[string]any)
+		if m["id"].(string) != m["uri"].(string) {
+			t.Errorf("recall item id %q != uri %q", m["id"], m["uri"])
+		}
+	}
+}
+
+// Legacy recipe items predating the engram URI metadata stay uniquely
+// addressable: their id falls back to the storage id instead of collapsing
+// to an empty string.
+func TestEngramIdentity_LegacyRecipeWithoutURIKeepsStorageID(t *testing.T) {
+	t.Parallel()
+	svc := newEngramTestService()
+	ctx := context.Background()
+
+	if _, err := svc.HandleMemoryAdd(ctx, map[string]any{
+		"items": []any{map[string]any{
+			"title": "Old recipe", "content": "legacy", "tier": "long_term",
+			"importance": "high", "category": "recipe",
+		}},
+	}); err != nil {
+		t.Fatalf("seed legacy recipe: %v", err)
+	}
+
+	res, err := svc.HandleEngramList(ctx, map[string]any{"limit": 50})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	items := readResultJSON(t, res)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("expected the legacy recipe, got %d items", len(items))
+	}
+	m := items[0].(map[string]any)
+	if m["uri"].(string) != "" {
+		t.Fatalf("legacy recipe unexpectedly carries uri %q", m["uri"])
+	}
+	if id := m["id"].(string); id == "" || id != m["memory_id"].(string) {
+		t.Errorf("legacy recipe id %q must fall back to memory_id %q", id, m["memory_id"])
+	}
+}

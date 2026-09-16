@@ -29,7 +29,7 @@
   import {
     diffStagePicks,
     diffTerminalRuns,
-    fuelReading,
+    fuelReadings,
     policyTapeSeed,
     seededPattern,
     stageLabel,
@@ -50,8 +50,30 @@
   import { bookNamesByRun, patternBooks } from '../../utils/patternBooks.ts';
   import PatternShelf from './PatternShelf.svelte';
   import MillEfficiencyStrip from './MillEfficiencyStrip.svelte';
+  import ShuttleBoard from './ShuttleBoard.svelte';
+  import RescueShelf from './RescueShelf.svelte';
+  import { rescueRows } from '../../utils/rescueHelpers.ts';
+  import PressLanes from './PressLanes.svelte';
+  import OverseerStrip from './OverseerStrip.svelte';
+  import { millsOverseersStore } from '../../stores/mills_overseers.svelte.ts';
+  import {
+    buildLane,
+    overseerRows,
+    pressRows,
+    sortLanes,
+    sparkSplit,
+    type LaneDetailInput,
+  } from '../../utils/shuttleBoardHelpers.ts';
+  import { createPoller } from '../../utils/poller.ts';
 
   const fleetPollingOwner = Symbol('FactoryPanel');
+
+  // Resolve stage/gate detail for at most this many shuttles per pass, and
+  // re-read an in-flight stage's log this often. Mirrors the Sparks panel's
+  // bounded gate fetch: a run storm must not fan out into dozens of detail
+  // GETs on every poll.
+  const LANE_DETAIL_MAX = 8;
+  const LANE_DETAIL_REFRESH_MS = 45_000;
 
   $effect(() => {
     millsStore.startPolling(15000);
@@ -61,6 +83,11 @@
     // fetch plus the archive strip's 60s poller rhythm is honest without
     // adding load to the 15s tick.
     void millsStore.fetchDemandLog();
+    // The press instrument reads the serial merge lane; opt into its
+    // shared-tick refresh (same contract as historyActive) with one
+    // mount-time fetch so the gauge isn't blank until the next tick.
+    millsStore.mergeQueueActive = true;
+    void millsStore.fetchMergeQueue();
     fleetStore.startPolling(60000, fleetPollingOwner);
     // One-shot catalog fetch for the pattern shelf: the catalog is
     // near-static and the patterns poller has no owner refcount, so a
@@ -68,9 +95,17 @@
     void patternsStore.fetch();
     return () => {
       millsStore.historyActive = false;
+      millsStore.mergeQueueActive = false;
       millsStore.stopPolling();
       fleetStore.stopPolling(fleetPollingOwner);
     };
+  });
+
+  const rescuePoller = createPoller(() => millsStore.fetchRescueShelf(), 15_000);
+  $effect(() => {
+    void rescuePoller.refresh();
+    rescuePoller.start();
+    return () => rescuePoller.stop();
   });
 
   let activeRuns = $derived(millsStore.pipelineRuns ?? []);
@@ -95,10 +130,84 @@
   // plus the council's recent refusals (demand). Suppressions cap at 2 so
   // the board stays a log of motion with a note of judgment, not the
   // reverse.
+  // Active runs live on the shuttle board below; the departures board is
+  // the arrivals log — what just rolled off, diverted, or was held — so no
+  // run is drawn twice on the floor.
   let boardRows = $derived([
-    ...departureRows(activeRuns, millsStore.pipelineHistory, stageSinceMap, Date.now()),
+    ...departureRows([], millsStore.pipelineHistory, stageSinceMap, Date.now()),
     ...suppressionRows(millsStore.demandLog, 2),
   ]);
+
+  // --- Shuttle board -------------------------------------------------------
+  // A clock the lanes' ages tick against; the store polls at 15s, so a 15s
+  // beat keeps "3m 20s in counting picks" moving between polls.
+  let now = $state(Date.now());
+  let rescues = $derived(rescueRows(millsStore.rescueItems, millsStore.rescueRunsByItem, now));
+  $effect(() => {
+    const t = setInterval(() => (now = Date.now()), 15_000);
+    return () => clearInterval(t);
+  });
+
+  // Overseers are the mill staff on the floor; the strip reads their store.
+  $effect(() => {
+    millsOverseersStore.startPolling(15000);
+    return () => millsOverseersStore.stopPolling();
+  });
+
+  // Stage/gate detail per active run, budgeted. A run whose stage or
+  // attempt count changed is invalidated so its lane re-reads the new
+  // stage record; the ensure is a no-op for loaded or in-flight entries.
+  // The signature map is read untracked so writing it never re-triggers.
+  let laneSig = new Map<string, string>();
+  $effect(() => {
+    const runs = activeRuns;
+    const prev = untrack(() => laneSig);
+    const next = new Map<string, string>();
+    let budget = LANE_DETAIL_MAX;
+    for (const run of runs) {
+      const sig = `${run.CurrentStage ?? ''}:${run.Attempts ?? 0}`;
+      next.set(run.ID, sig);
+      if (prev.has(run.ID) && prev.get(run.ID) !== sig) millsStore.invalidateRunDetail(run.ID);
+      if (budget <= 0) continue;
+      budget--;
+      millsStore.ensureRunDetailLoaded(run.ID);
+    }
+    laneSig = next;
+  });
+
+  // In-flight stage logs move while the stage stays the same; re-read the
+  // top lanes on a slow cadence so "what it is doing now" stays current.
+  const laneRefresh = createPoller(() => {
+    let budget = LANE_DETAIL_MAX;
+    for (const run of untrack(() => activeRuns)) {
+      if (budget-- <= 0) break;
+      millsStore.invalidateRunDetail(run.ID);
+      millsStore.ensureRunDetailLoaded(run.ID);
+    }
+  }, LANE_DETAIL_REFRESH_MS);
+  $effect(() => {
+    laneRefresh.start(LANE_DETAIL_REFRESH_MS);
+    return () => laneRefresh.stop();
+  });
+
+  function laneDetail(runID: string): LaneDetailInput {
+    const entry = millsStore.pipelineDetailByRun[runID];
+    if (!entry || entry.status === 'idle' || entry.status === 'loading') return { status: 'pending' };
+    if (entry.status === 'error') return { status: 'unavailable' };
+    return { status: 'loaded', detail: entry.detail };
+  }
+
+  let lanes = $derived(
+    sortLanes(
+      activeRuns.map((run) =>
+        buildLane(run, millsStore.backlog, laneDetail(run.ID), stageSinceMap.get(run.ID), now),
+      ),
+    ),
+  );
+
+  let press = $derived(pressRows(millsStore.mergeQueue, now));
+  let overseers = $derived(overseerRows(millsOverseersStore.status, now));
+  let sparks = $derived(sparkSplit(metrics?.escalations_by_class));
   // Pattern shelf (concept 8): the catalog as books, with run counts
   // attributed run → backlog PlanID → pattern slug.
   let books = $derived(
@@ -149,9 +258,15 @@
   function pct(v: number | undefined): string {
     return typeof v === 'number' ? `${Math.round(v * 100)}%` : '—';
   }
+  // The press: serial merge-lane depth (entries rebasing/re-proving/merging
+  // toward a bolt). Lane count feeds the tooltip so a multi-repo pile-up is
+  // visible without leaving the floor.
+  let pressDepth = $derived(millsStore.mergeQueue?.summary?.depth ?? 0);
+  let pressLanes = $derived(Object.keys(millsStore.mergeQueue?.summary?.lanes ?? {}).length);
+  let pressOff = $derived(millsStore.mergeQueue?.summary?.enabled === false);
   // Fuel gauge (research 7's deferred third dial): the rolling-24h
   // pipeline budget window, straight off the operator's status payload.
-  let fuel = $derived(fuelReading(millsStore.status?.budget?.pipeline));
+  let fuel = $derived(fuelReadings(millsStore.status?.budget?.pipeline));
   // Needle sweep for the pass-rate dial: 0 -> -90deg, 1 -> +90deg.
   let needleDeg = $derived(
     typeof metrics?.gate_pass_rate === 'number'
@@ -599,8 +714,25 @@
 <div class="panel factory-panel">
   <PanelHeader title="Factory" icon={'❖'} count={activeRuns.length}>
     {#snippet stats()}
+      {#if rescues.length > 0}<span class="tone-warning" aria-label="Escalated items">Rescues {rescues.length}</span>{/if}
       {#if millsStore.status}
         <Badge text={millsPaused ? 'paused' : 'weaving'} variant={millsPaused ? 'warning' : 'success'} />
+      {/if}
+      <!-- Autonomy blockers and a degraded feed are the two ways the
+           factory can look alive while not actually running itself; both
+           were polled and never drawn here. -->
+      {#if millsStore.autonomyReady === false}
+        <span
+          class="autonomy-blocked"
+          title={millsStore.autonomyBlockers.length > 0
+            ? `Autonomy blocked: ${millsStore.autonomyBlockers.join(' · ')}`
+            : 'Autonomy blocked'}
+        >⚠ autonomy blocked{millsStore.autonomyBlockers.length > 0 ? ` · ${millsStore.autonomyBlockers[0]}` : ''}</span>
+      {/if}
+      {#if millsStore.degraded}
+        <span class="feed-degraded" title={millsStore.degraded}>◐ feed degraded</span>
+      {:else if millsStore.reconnecting}
+        <span class="feed-degraded">◌ reconnecting…</span>
       {/if}
       <span class="text-muted text-xs">lights-out software manufacture, live</span>
     {/snippet}
@@ -682,13 +814,36 @@
         <span class="inst-label">shuttles</span>
         <span class="inst-value tone-accent"><RollingNumber value={activeRuns.length} /></span>
       </div>
+      <div
+        class="inst"
+        title={pressOff
+          ? 'Serial merge queue disabled by policy — proven MRs merge directly'
+          : `Serial merge queue: entries rebasing, re-proving, or merging toward a bolt${pressLanes > 1 ? ` across ${pressLanes} lanes` : ''}`}
+      >
+        <span class="inst-label">press</span>
+        {#if pressOff}
+          <span class="inst-value tone-warning">off</span>
+        {:else}
+          <span class="inst-value" class:tone-accent={pressDepth > 0}><RollingNumber value={pressDepth} /></span>
+        {/if}
+      </div>
       <div class="inst" title="Runs merged in the KPI window">
         <span class="inst-label">bolts · 24h</span>
         <span class="inst-value tone-success"><RollingNumber value={metrics?.pipeline_merged_runs} /></span>
       </div>
-      <div class="inst" title="Runs escalated in the KPI window">
+      <div
+        class="inst"
+        title={sparks
+          ? `Runs escalated in the KPI window — ${sparks.classes.map((c) => `${c.cls} ${c.n}`).join(' · ')}`
+          : 'Runs escalated in the KPI window'}
+      >
         <span class="inst-label">sparks · 24h</span>
         <span class="inst-value tone-warning"><RollingNumber value={metrics?.pipeline_escalated_runs} /></span>
+        {#if sparks}
+          <!-- infra-vs-real is the split that decides whether the floor
+               needs a human or a requeue; the class list rides the title. -->
+          <span class="inst-sub mono">{sparks.infra} infra · {sparks.real} real</span>
+        {/if}
       </div>
       <div class="inst" title="Backlog strung on the beam: queued, ready, running, escalated, paused">
         <span class="inst-label">on the beam</span>
@@ -713,23 +868,58 @@
         <span class="inst-label">weavers</span>
         <span class="inst-value tone-info">{fleetStore.liveAgentCount}</span>
       </div>
-      <div class="inst inst-fuel fuel-{fuel.tone}" title="Rolling 24-hour pipeline budget: spent / ceiling">
+      <div class="inst inst-fuel">
         <span class="inst-label">fuel · 24h</span>
-        <span class="inst-value fuel-row">
-          {#if fuel.frac !== null}
-            <span class="tank" role="img" aria-label="{Math.round(fuel.frac * 100)}% of the 24-hour pipeline budget remaining">
-              <span class="tank-fill" style="width: {fuel.frac * 100}%"></span>
+        <span class="inst-value fuel-tanks">
+          {#each fuel as tank (tank.kind)}
+            <span class="fuel-row fuel-{tank.tone}" title={tank.title}>
+              <span class="inst-label">{tank.kind}</span>
+              {#if tank.unbounded || tank.frac !== null}
+                <span class="tank" class:unbounded={tank.unbounded} role="img" aria-label={tank.unbounded
+                  ? `${tank.kind} subscription budget: no cap`
+                  : `${Math.round(tank.frac! * 100)}% of the 24-hour ${tank.kind} pipeline budget remaining`}>
+                  <span class="tank-fill" style="width: {tank.unbounded ? 100 : tank.frac! * 100}%"></span>
+                </span>
+              {/if}
+              <span class="fuel-label">{tank.label}</span>
             </span>
-          {/if}
-          <span class="fuel-label">{fuel.label}</span>
+          {/each}
         </span>
       </div>
     </div>
 
-    <!-- News above ambience: the floor log sits directly under the machine
-         it narrates; the near-static pattern library closes the page. -->
-    <div class="floor" aria-label="Factory floor log">
-      <span class="floor-tag">departures</span>
+    <!-- The facts beside the rhythm. The canvas above shows that the floor
+         is moving; the shuttle board says exactly what each shuttle is
+         doing, the press says what is waiting to become a bolt, the
+         overseers say whether the staff are awake. Then the arrivals log
+         and, last, the near-static pattern library. -->
+    <ShuttleBoard
+      {lanes}
+      {now}
+      lastCouncilAt={millsStore.status?.last_council_at ?? null}
+      lastMergeAt={millsStore.status?.last_merge_at ?? null}
+      onSelect={(id) => millsStore.openRunDetail(id)}
+    />
+
+    <div class="floor-staff">
+      <PressLanes
+        rows={press}
+        off={pressOff}
+        error={millsStore.mergeQueueError}
+        onSelect={(id) => millsStore.openRunDetail(id)}
+      />
+      <OverseerStrip
+        rows={overseers}
+        disabled={millsOverseersStore.disabled}
+        error={millsOverseersStore.error}
+        loading={millsOverseersStore.loading}
+      />
+    </div>
+
+    <RescueShelf rows={rescues} error={millsStore.rescueError} />
+
+    <div class="floor" aria-label="Factory arrivals log">
+      <span class="floor-tag">arrivals</span>
       <DepartureBoard rows={boardRows} />
     </div>
 
@@ -752,7 +942,13 @@
 {/if}
 
 <style>
-  .factory-panel { display: flex; flex-direction: column; overflow: hidden; }
+  /* overflow-y auto, NOT hidden: the loom stage (flex: 1) absorbs spare
+     height on tall viewports, but the fixed-height sections around it
+     (efficiency strip, instrument rail, departures, pattern shelf) exceed
+     short viewports — with hidden, everything below the rail was
+     unreachable (+307px clipped at 720p, 2026-08-15). When space runs out
+     the stage bottoms out at its 300px min-height and the panel scrolls. */
+  .factory-panel { display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; }
 
   .loom-stage {
     position: relative;
@@ -873,11 +1069,12 @@
     line-height: 1.1;
   }
   /* Fuel wants the most room (tank + spent/ceiling); let it take it. */
-  .inst-fuel { flex: 1.6 1 0; min-width: 168px; }
+  .inst-fuel { flex: 1.6 1 260px; min-width: 0; }
   .tone-info { color: var(--info); text-shadow: var(--glow-shadow-lg) var(--glow-info); }
   .tone-accent { color: var(--accent); text-shadow: var(--glow-shadow-lg) var(--glow-accent); }
   .tone-success { color: var(--success); text-shadow: var(--glow-shadow-lg) var(--glow-success); }
   .tone-warning { color: var(--warning); text-shadow: var(--glow-shadow-lg) var(--glow-warning); }
+  .fuel-tanks { display: flex; flex-wrap: wrap; gap: var(--space-3); }
   .fuel-row { display: flex; align-items: center; gap: var(--space-2); white-space: nowrap; }
   .fuel-label { font-size: var(--text-lg); font-family: var(--font-mono); }
   .tank {
@@ -895,6 +1092,12 @@
     height: 100%;
     background: var(--fuel-tone, var(--info));
     transition: width 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .tank.unbounded .tank-fill {
+    background: repeating-linear-gradient(135deg, var(--info) 0 4px, var(--bg-secondary) 4px 8px);
+  }
+  @media (max-width: 480px) {
+    .fuel-tanks { flex-direction: column; gap: var(--space-2); }
   }
   .fuel-ok { --fuel-tone: var(--success); color: var(--success); }
   .fuel-wr { --fuel-tone: var(--warning); color: var(--warning); }
@@ -932,6 +1135,39 @@
     color: var(--accent);
     border-right: 1px solid var(--border);
     background: var(--bg-primary);
+    white-space: nowrap;
+  }
+
+  /* Press + overseers side by side; stack on narrow floors. */
+  .floor-staff {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+    flex-shrink: 0;
+  }
+  @media (max-width: 900px) {
+    .floor-staff { grid-template-columns: minmax(0, 1fr); }
+  }
+
+  .inst-sub {
+    font-size: var(--text-2xs);
+    color: var(--fg-muted);
+    white-space: nowrap;
+  }
+  .mono { font-family: var(--font-mono); }
+
+  .autonomy-blocked {
+    font-size: var(--text-xs);
+    color: var(--warning);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 40ch;
+  }
+  .feed-degraded {
+    font-size: var(--text-xs);
+    color: var(--fg-muted);
     white-space: nowrap;
   }
 </style>

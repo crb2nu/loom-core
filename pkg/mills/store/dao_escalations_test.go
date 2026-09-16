@@ -117,6 +117,38 @@ func TestListByEndedSince_ProjectsOnlyLatestRetryableEscalations(t *testing.T) {
 	}
 }
 
+func TestRescuedWithoutVaccineContract(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	seed := func(itemID, runID string, itemState BacklogState, runState PipelineState) {
+		t.Helper()
+		seedRelaunchItem(t, st, itemID, itemState, &PipelineRun{ID: runID, State: runState, Attempts: 1, StartedAt: now, EndedAt: &now})
+	}
+	seed("rescued-missing", "run-missing", BacklogMerged, PipelineEscalated)
+	seed("rescued-vaccinated", "run-vaccinated", BacklogMerged, PipelineEscalated)
+	if err := st.Pipeline.SetVaccineRef(ctx, "run-vaccinated", "pattern-vaccine-run-vaccinated"); err != nil {
+		t.Fatal(err)
+	}
+	seed("still-escalated", "run-still", BacklogEscalated, PipelineEscalated)
+	seed("never-escalated", "run-green", BacklogMerged, PipelineDone)
+
+	got, err := st.Backlog.ListRescuedWithoutVaccine(ctx, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].BacklogID != "rescued-missing" || got[0].EscalationRun != "run-missing" {
+		t.Fatalf("rescued without vaccine = %+v, want only rescued-missing", got)
+	}
+	run, err := st.Pipeline.GetRun(ctx, "run-vaccinated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.VaccineRef != "pattern-vaccine-run-vaccinated" {
+		t.Fatalf("vaccine_ref = %q", run.VaccineRef)
+	}
+}
+
 func TestListByEndedSince_WindowOrderingAndLimit(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

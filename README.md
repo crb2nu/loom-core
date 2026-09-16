@@ -75,6 +75,22 @@ make build
 - Streamable HTTP remote transport for team and remote daemon topologies.
 - Skills generation with priority assembly, variable escaping, and asset validation.
 
+## Devbox rollout draining
+
+For Kubernetes-backed devbox, SIGTERM closes tool admission and fails the hub
+wrapper's readiness probe while liveness remains healthy. Already admitted calls
+retain their transport until their responses are written; detached async execs
+remain available through terminal polling (or result expiry). New calls receive
+an MCP error with `retryable: true`; existing `devbox_exec_poll` calls may continue.
+`DEVBOX_DRAIN_TIMEOUT` defaults to `30m`, followed by at most 20 seconds of cleanup;
+active Kubernetes sandboxes are protected from shutdown deletion. Docker retains
+its immediate shutdown behavior. The devbox Deployment and final base Kustomize
+patch set a 1860-second termination grace period, retaining the fleet's five-second
+preStop. Increase the grace period to at least the configured drain timeout plus
+60 seconds when raising the timeout. After rollout, check devbox logs for
+`devbox: draining` and `devbox: drain complete`, and compare tests-stage TCP timeout
+failures over a day containing at least five rollouts.
+
 ## Development Quality Gates
 
 ```bash

@@ -1,0 +1,1 @@
+- Make auto-requeue starvation tests in `pkg/mills/reconciler_auto_requeue_starvation_test.go` explicitly expire their deadline contexts at the intended interruption points, preventing slow runners from changing cursor progress or escalation timeout assertions under `-race`.

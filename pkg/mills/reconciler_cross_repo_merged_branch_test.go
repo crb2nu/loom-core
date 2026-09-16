@@ -43,6 +43,7 @@ func bindEscalationTarget(t *testing.T, env *recTestEnv, runID, backlogID, targe
 		context.Background(), env.store.Events, "pipeline",
 		&store.PipelineRun{ID: runID},
 		&store.BacklogItem{ID: backlogID, TargetProject: targetProject},
+		env.rec.HomeProject,
 	)
 	if err != nil || !appended {
 		t.Fatalf("bind escalation target %s→%s: appended=%v err=%v", runID, targetProject, appended, err)
@@ -330,12 +331,12 @@ func TestAppendEscalationTargetBindingFirstWriter(t *testing.T) {
 	run := &store.PipelineRun{ID: "PIPE-BINDING-ONCE"}
 
 	appended, err := AppendEscalationTargetBinding(ctx, env.store.Events, "pipeline",
-		run, &store.BacklogItem{ID: "BL-1", TargetProject: " services/procmodel "})
+		run, &store.BacklogItem{ID: "BL-1", TargetProject: " services/procmodel "}, "services/loom-core")
 	if err != nil || !appended {
 		t.Fatalf("first append: appended=%v err=%v", appended, err)
 	}
 	appended, err = AppendEscalationTargetBinding(ctx, env.store.Events, "pipeline",
-		run, &store.BacklogItem{ID: "BL-1", TargetProject: "services/other"})
+		run, &store.BacklogItem{ID: "BL-1", TargetProject: "services/other"}, "services/loom-core")
 	if err != nil || appended {
 		t.Fatalf("second append must be a no-op: appended=%v err=%v", appended, err)
 	}

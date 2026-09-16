@@ -57,11 +57,28 @@ type CouncilScheduler struct {
 	// set this to a much smaller value paired with a controlled Now.
 	Interval time.Duration
 
+	// CatchUpGrace bounds how far back Run looks for a cron slot the process
+	// missed while it was not running (rollouts land at HH:59–HH:01 often
+	// enough that "0 */6 * * *" was skipped outright on 2026-09-02: the pod
+	// stopped 17:59:32 and the scheduler re-armed 18:01:04, 64s past the
+	// slot, and the initial check only covers the CURRENT minute). Zero
+	// uses DefaultCouncilCatchUpGrace; negative disables catch-up.
+	CatchUpGrace time.Duration
+	// RanSince reports whether a council run already started at or after
+	// the given time — the previous process may have fired the slot before
+	// it died. Nil means "unknown", which fails open to firing (a duplicate
+	// ~$0.70 pass beats a silently skipped six-hour window).
+	RanSince func(ctx context.Context, since time.Time) (bool, error)
+
 	mu              sync.Mutex
 	lastFiredMinute time.Time
 	warnedBadCron   string
 	active          atomic.Int64
 }
+
+// DefaultCouncilCatchUpGrace is how far back a starting scheduler looks for
+// a missed cron slot. Fifteen minutes covers an image roll plus boot.
+const DefaultCouncilCatchUpGrace = 15 * time.Minute
 
 // NewCouncilScheduler returns a scheduler wired to a run function + policy.
 // Either argument may be nil; the resulting scheduler is a no-op that
@@ -88,8 +105,10 @@ func (s *CouncilScheduler) Run(ctx context.Context) error {
 		interval = time.Minute
 	}
 	// Initial check so a pod that restarts on a scheduled minute still
-	// fires that minute rather than skipping a whole window.
+	// fires that minute rather than skipping a whole window — and a
+	// catch-up for a slot that fell inside the restart gap.
 	s.maybeFire(ctx)
+	s.catchUp(ctx)
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -159,6 +178,76 @@ func (s *CouncilScheduler) maybeFire(ctx context.Context) {
 	// the runtime scheduled it.
 	handedOff = true
 	go s.fire(ctx)
+}
+
+// catchUp fires once for the most recent cron slot inside CatchUpGrace that
+// this process did not fire and no run already covered. Runs only at Run
+// start: a slot missed by a rollout gap, not by policy (the kill switch and
+// enabled gates still apply through the same checks maybeFire makes).
+func (s *CouncilScheduler) catchUp(ctx context.Context) {
+	grace := s.CatchUpGrace
+	if grace == 0 {
+		grace = DefaultCouncilCatchUpGrace
+	}
+	if grace < 0 {
+		return
+	}
+	if s.Enabled != nil && !s.Enabled() {
+		return
+	}
+	pol := s.Policy.Current()
+	if pol == nil || !pol.IsEnabled() {
+		return
+	}
+	expr := strings.TrimSpace(pol.Council.ScheduleCron)
+	if expr == "" {
+		return
+	}
+	now := s.now().UTC().Truncate(time.Minute)
+	var slot time.Time
+	for back := time.Minute; back <= grace; back += time.Minute {
+		candidate := now.Add(-back)
+		matches, err := cronMatches(expr, candidate)
+		if err != nil {
+			s.warnBadCron(expr, err)
+			return
+		}
+		if matches {
+			slot = candidate
+			break
+		}
+	}
+	if slot.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	alreadyFired := !s.lastFiredMinute.Before(slot)
+	s.mu.Unlock()
+	if alreadyFired {
+		return
+	}
+	if s.RanSince != nil {
+		ran, err := s.RanSince(ctx, slot)
+		if err != nil && s.Logger != nil {
+			s.Logger.Warn("council catch-up: could not check for a prior run; firing", "slot", slot.Format(time.RFC3339), "error", err)
+		}
+		if err == nil && ran {
+			return
+		}
+	}
+	s.mu.Lock()
+	s.lastFiredMinute = now
+	s.mu.Unlock()
+	if s.Logger != nil {
+		s.Logger.Info("council scheduler firing missed slot", "trigger", "cron", "slot", slot.Format(time.RFC3339), "at", now.Format(time.RFC3339))
+	}
+	s.active.Add(1)
+	go func() {
+		defer s.active.Add(-1)
+		if err := s.RunFn(ctx, store.CouncilTriggerCron, "scheduler catch-up: missed slot "+slot.Format(time.RFC3339)); err != nil && s.Logger != nil {
+			s.Logger.Warn("catch-up council run failed", "error", err)
+		}
+	}()
 }
 
 func (s *CouncilScheduler) fire(ctx context.Context) {

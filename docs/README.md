@@ -6,8 +6,8 @@ This is the main docs index for users, contributors, and operators.
 
 If you need to know what is shipped vs still in progress:
 
-- [Implementation status](IMPLEMENTATION_STATUS.md)
-- [Roadmap](../ROADMAP.md)
+- [Roadmap](../ROADMAP.md) (canonical current status)
+- [Implementation status](IMPLEMENTATION_STATUS.md) (historical April 2026 snapshot)
 
 ## Quick Paths By Audience
 
@@ -23,6 +23,8 @@ If you need to know what is shipped vs still in progress:
 - Manage repository branding through MCP: `mcp-brand-kit` provides repository listing, inspection, lint, preview, render, and fix tools.
 - Understand compatibility commitments: [API stability](API_STABILITY.md)
 - Follow MCP error-handling standards: [Error handling](ERROR_HANDLING.md)
+- Respond to Mills dependency and CI signature incidents: [External incident runbook](runbook-external-incidents.md)
+- Identify recurring external incident signatures and labels: [External incident clusters](runbooks/external-incident-clusters.md)
 - Configure enterprise controls: [Enterprise security](ENTERPRISE_SECURITY.md)
 - Configure remote transport: [Streamable HTTP](STREAMABLE_HTTP.md)
 - Mobile companion API contract (draft): [Mobile companion API](MOBILE_COMPANION_API.md)
@@ -60,7 +62,7 @@ can be corrected directly.
 ## Suggested Reading Order
 
 1. [Project README](../README.md)
-2. [Implementation status](IMPLEMENTATION_STATUS.md)
+2. [Implementation status (historical snapshot)](IMPLEMENTATION_STATUS.md)
 3. [User guide](USER_GUIDE.md)
 4. [Architecture](ARCHITECTURE.md)
 5. [Developer guide](DEVELOPER_GUIDE.md)

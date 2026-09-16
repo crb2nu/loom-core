@@ -1,0 +1,1 @@
+- Avoid stale tests-effective counts in the run drawer when the latest failed tests attempt has missing or unknown retry metadata (`PipelineRunDetail.svelte`); cover legacy and future classifications and explicit run-counter precedence in `PipelineRunDetail.dom.test.ts`.

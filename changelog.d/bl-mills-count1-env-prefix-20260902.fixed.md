@@ -1,0 +1,1 @@
+- Make the devbox quality gate inject `-count=1` into environment-prefixed `go test` commands and report skipped injection in check artifacts (`cmd/mcp-devbox/quality_gate.go`, `cmd/mcp-devbox/quality_gate_test.go`).

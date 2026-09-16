@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
 func TestEscalationSweeper_ShutsDownOnCancel(t *testing.T) {
@@ -24,6 +25,41 @@ func TestEscalationSweeper_ShutsDownOnCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("sweeper did not stop after cancellation")
+	}
+}
+
+func TestSweepVaccineAttentionEmitsDedicatedEventAndGauge(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	item := &store.BacklogItem{ID: "rescued-no-vaccine", Title: "rescued", State: store.BacklogMerged, Priority: store.P2, CreatedBy: "test"}
+	if err := env.store.Backlog.Put(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{ID: "escalation-run", BacklogID: item.ID, Template: "mills-default-pipeline", State: store.PipelineEscalated, Attempts: 1, StartedAt: now, EndedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := env.rec.SweepVaccineAttention(ctx)
+	if err != nil || count != 1 {
+		t.Fatalf("attention = %d, %v", count, err)
+	}
+	count, err = env.rec.SweepVaccineAttention(ctx)
+	if err != nil || count != 1 {
+		t.Fatalf("repeat attention = %d, %v", count, err)
+	}
+	events, err := env.store.Events.ListSince(ctx, time.Unix(0, 0), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matches int
+	for _, event := range events {
+		if event.Kind == RescuedWithoutVaccineEventKind {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("attention events = %d, want exactly one", matches)
 	}
 }
 
@@ -128,5 +164,44 @@ func TestEscalationSweeper_ExpiredGhostAllocationDoesNotStarveAutoRequeue(t *tes
 
 	if got := backlogState(t, env, "MILLS-SWEEP-AFTER-DEADLINE"); got != store.BacklogQueued {
 		t.Fatalf("auto-requeue state after ghost allocation expired = %s, want queued", got)
+	}
+}
+
+// Capture the actual deadline reaching the requeue side effect, so a fixed
+// budget/3 timeout accidentally restored at the caller fails this test.
+type autoRequeueDeadlineCommenter struct{ remaining time.Duration }
+
+func (c *autoRequeueDeadlineCommenter) CommentAutoRequeued(ctx context.Context, _ *store.BacklogItem, _ *store.PipelineRun, _ string) error {
+	deadline, _ := ctx.Deadline()
+	c.remaining = time.Until(deadline)
+	return nil
+}
+
+func TestEscalationSweeper_AutoRequeueCandidateDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		allowance, minimum, maximum time.Duration
+		capped                      bool
+	}{
+		{"candidate allowance", 250 * time.Millisecond, 250 * time.Millisecond, 750 * time.Millisecond, false},
+		{"remaining pass", 4 * time.Second, 2 * time.Second, 3 * time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newAutoRequeueEnv(t, autoRequeuePolicyYAML(100, 10, 5, 100))
+			seedThreeEligibleItems(t, env)
+			commenter := &autoRequeueDeadlineCommenter{}
+			env.rec.AutoRequeueIssueCommenter = commenter
+			env.rec.AutoRequeuePerCandidateAllowance = tc.allowance
+			sweeper := NewEscalationSweeper(env.rec, env.policy)
+			sweeper.Budget = 3 * time.Second
+			sweeper.runPass(context.Background())
+			if commenter.remaining < tc.minimum || commenter.remaining > tc.maximum {
+				t.Fatalf("actual remaining deadline=%s, want [%s,%s]", commenter.remaining, tc.minimum, tc.maximum)
+			}
+			rows := eventsOfKind(t, env, "reconciler.auto_requeue_sweep")
+			if len(rows) != 1 || rows[0].Payload["deadline_capped"] != tc.capped {
+				t.Fatalf("summary=%+v", rows)
+			}
+		})
 	}
 }

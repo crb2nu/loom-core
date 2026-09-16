@@ -1,0 +1,1 @@
+- Preserve bounded stdout and stderr for sandbox lint parity in `cmd/mcp-devbox/quality_gate.go`, carry degradation metadata through `pkg/mills/clients/devbox.go`, and classify empty nonzero candidate/baseline results as retryable `lint_parity_no_output` infrastructure in `pkg/mills/gates/lint_parity.go` and `pkg/mills/pipeline`; document triage in `docs/MILLS_RUNBOOK.md`.

@@ -20,6 +20,22 @@ var (
 
 // GradeRun records a supervised taste signal for the work produced by runID.
 func GradeRun(ctx context.Context, st *store.Store, runID, grade, note, actor string) (*store.BacklogItem, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, fmt.Errorf("grade run: run ID and actor are required")
+	}
+	run, err := st.Pipeline.GetRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	return gradeItem(ctx, st, run.BacklogID, grade, note, actor, &runID)
+}
+
+// GradeItem records a supervised taste signal directly on terminal work.
+func GradeItem(ctx context.Context, st *store.Store, itemID, grade, note, actor string) (*store.BacklogItem, error) {
+	return gradeItem(ctx, st, itemID, grade, note, actor, nil)
+}
+
+func gradeItem(ctx context.Context, st *store.Store, itemID, grade, note, actor string, runID *string) (*store.BacklogItem, error) {
 	grade = strings.ToLower(strings.TrimSpace(grade))
 	if grade != "keep" && grade != "meh" && grade != "regret" {
 		return nil, ErrInvalidGrade
@@ -28,10 +44,11 @@ func GradeRun(ctx context.Context, st *store.Store, runID, grade, note, actor st
 		return nil, ErrInvalidGradeNote
 	}
 	actor = strings.TrimSpace(actor)
-	if runID == "" || actor == "" {
-		return nil, fmt.Errorf("grade run: run ID and actor are required")
+	itemID = strings.TrimSpace(itemID)
+	if itemID == "" || actor == "" {
+		return nil, fmt.Errorf("grade item: item ID and actor are required")
 	}
-	item, err := st.Backlog.GradeRun(ctx, runID, grade, strings.TrimSpace(note), actor, time.Now().UTC())
+	item, err := st.Backlog.GradeItem(ctx, itemID, grade, strings.TrimSpace(note), actor, time.Now().UTC(), runID)
 	if errors.Is(err, store.ErrBacklogNotGradable) {
 		return nil, fmt.Errorf("%w: %v", ErrNotGradable, err)
 	}

@@ -1,0 +1,1 @@
+- Fix Mills admission serialization in `pkg/mills/scope_overlap.go` and `pkg/mills/store/scope_overlap.go` to compare declared literal files exactly and reserve directories only for globs, allowing independent files in the same package to run concurrently while preserving merged-item coverage.

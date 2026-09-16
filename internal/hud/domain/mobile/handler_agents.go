@@ -234,7 +234,7 @@ func (d *MobileDomain) handleMobileAgents(w http.ResponseWriter, r *http.Request
 	claimHints := buildMobileAgentHintsFromClaims(snap.FileClaims)
 
 	for _, pa := range joined {
-		status := normalizeMobilePresenceStatus(pa.Status)
+		status := mobileFleetAgentStatus(pa)
 		agentType := pa.AgentType
 		if agentType == "" || agentType == "unknown" {
 			agentType = inferAgentType(pa.AgentID)
@@ -270,6 +270,9 @@ func (d *MobileDomain) handleMobileAgents(w http.ResponseWriter, r *http.Request
 			SessionID:       pa.SessionID,
 			SessionStatus:   pa.SessionStatus,
 			SessionStarted:  pa.SessionStartedAt,
+		}
+		if pa.HasPresence && strings.TrimSpace(pa.LastHeartbeat) == "" && status == "offline" {
+			ua.IsOrphan = true
 		}
 		if pa.HasSession {
 			if sess, ok := sessionByID[pa.SessionID]; ok {
@@ -309,7 +312,7 @@ func (d *MobileDomain) handleMobileAgents(w http.ResponseWriter, r *http.Request
 			ua := &unifiedAgent{
 				AgentID:         sp.AgentID,
 				AgentType:       sp.AgentType,
-				Status:          "active",
+				Status:          "offline",
 				Source:          "spawn",
 				Description:     sp.Task,
 				Branch:          sp.Branch,
@@ -317,6 +320,7 @@ func (d *MobileDomain) handleMobileAgents(w http.ResponseWriter, r *http.Request
 				SpawnStatus:     sp.Status,
 				Project:         sp.Project,
 				TelemetryStatus: "spawn",
+				IsOrphan:        true,
 			}
 			agentMap[sp.AgentID] = ua
 		}

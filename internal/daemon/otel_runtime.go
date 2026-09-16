@@ -6,8 +6,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/crb2nu/loom/pkg/mcpotel"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/crb2nu/loom/pkg/mcpotel"
 )
 
 // daemonOTelState captures the runtime OTel wiring resolved for the daemon.

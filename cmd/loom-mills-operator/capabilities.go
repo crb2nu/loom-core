@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/mills/clients"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 )
 
@@ -297,6 +298,12 @@ func (o *operator) capabilityReport(ctx context.Context) capabilityReport {
 		rows = append(rows, row)
 	}
 
+	// Open vendor circuits are advisory: fallback roles may remain available.
+	for _, vendor := range []string{"anthropic", "openai"} {
+		if state := clients.DefaultVendorBreaker.State(vendor); state.Breaker == "open" {
+			rows = append(rows, capabilityRow{ID: vendor + "_api", Status: string(capabilityYellow), Mode: string(capabilityModeReal), LastCheckedAt: now, Message: string(state.Kind)})
+		}
+	}
 	blockers := autonomyBlockers(policyEnabled, rows)
 	if !policyEnabled {
 		blockers = append([]string{"policy.enabled=false"}, blockers...)

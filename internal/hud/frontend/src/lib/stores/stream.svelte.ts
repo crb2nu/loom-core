@@ -21,6 +21,12 @@ export interface StreamResponse {
   entries: StreamEntry[];
 }
 
+/** Epoch ms of an entry's timestamp; unparseable/missing sorts oldest. */
+export function entryTime(e: StreamEntry): number {
+  const t = Date.parse(e.timestamp ?? '');
+  return Number.isNaN(t) ? 0 : t;
+}
+
 class StreamStore {
   entries = $state<StreamEntry[]>([]);
   loading = $state(false);
@@ -84,17 +90,23 @@ class StreamStore {
 
     if (unique.length === 0) return;
 
-    // Prepend new entries, keep max 500.
-    this.entries = [...unique, ...this.entries].slice(0, 500);
+    // Merge and keep newest-first by parsed timestamp, max 500. Entries
+    // arrive with mixed offsets (-04:00 daemon-local vs Z from the hub), so
+    // a string compare or "prepend in arrival order" both misorder; the
+    // Deck's ambient lens showed June entries above August ones.
+    this.entries = [...unique, ...this.entries]
+      .sort((a, b) => entryTime(b) - entryTime(a))
+      .slice(0, 500);
 
     // Trim seenIds to match entries.
     if (this.seenIds.size > 600) {
       this.seenIds = new Set(this.entries.map((e) => e.id));
     }
 
-    // Track latest timestamp for incremental HTTP fetching.
-    if (unique[0].timestamp) {
-      this.lastTimestamp = unique[0].timestamp;
+    // Track the newest timestamp seen for incremental HTTP fetching.
+    const newest = this.entries[0];
+    if (newest?.timestamp) {
+      this.lastTimestamp = newest.timestamp;
     }
 
     this.lastUpdated = new Date();

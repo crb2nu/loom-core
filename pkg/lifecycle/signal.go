@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
@@ -110,4 +111,60 @@ func RunWithCustomSignals(ctx context.Context, signals Signals, fn func(ctx cont
 	}()
 
 	return fn(ctx)
+}
+
+// Drain atomically closes admission and tracks work through result delivery.
+// Existing work may retain additional holds (for example detached jobs).
+// The zero value is ready for use.
+type Drain struct {
+	mu       sync.Mutex
+	draining bool
+	active   int
+	done     chan struct{}
+}
+
+// Admit reserves work unless draining has started.
+func (d *Drain) Admit() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.draining {
+		return false
+	}
+	d.active++
+	return true
+}
+
+// Retain extends work that was already admitted. Call before releasing its hold.
+func (d *Drain) Retain() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.draining && d.active == 0 {
+		return false
+	}
+	d.active++
+	return true
+}
+
+// Release completes one admitted or retained unit of work.
+func (d *Drain) Release() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.active--
+	if d.draining && d.active == 0 {
+		close(d.done)
+	}
+}
+
+// Begin refuses new work and returns the outstanding count and completion signal.
+func (d *Drain) Begin() (int, <-chan struct{}) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.draining {
+		d.draining = true
+		d.done = make(chan struct{})
+		if d.active == 0 {
+			close(d.done)
+		}
+	}
+	return d.active, d.done
 }

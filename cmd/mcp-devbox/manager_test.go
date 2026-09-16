@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -142,8 +144,6 @@ func TestContainerName(t *testing.T) {
 		{"hello world", "", "devbox-hello-world"},
 		{"loom-core", "claude-code", "devbox-loom-core-claude-code"},
 		{"loom-core", "codex", "devbox-loom-core-codex"},
-		{"flexdeck", "very-long-agent-name-here", "devbox-flexdeck-very-long-ag"},
-		{"loom-core", "codex-mills-verify", "devbox-loom-core-codex-mills"},
 	}
 
 	for _, tt := range tests {
@@ -151,6 +151,129 @@ func TestContainerName(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("containerName(%q, %q) = %q, want %q", tt.project, tt.agentID, got, tt.want)
 		}
+	}
+}
+
+// TestContainerNameLongAgentIDsStayDistinct pins the fix for the shared
+// Mills sandbox: every pipeline run's agent id starts with
+// "loom-mills-operator-", so truncating to twelve characters mapped all of
+// them onto one pod. Long ids must keep a readable prefix, stay within the
+// twelve-character agent budget, be deterministic, and differ per id.
+func TestContainerNameLongAgentIDsStayDistinct(t *testing.T) {
+	t.Parallel()
+
+	m := &manager{}
+	hexDigest := regexp.MustCompile(`^[0-9a-f]{5}$`)
+
+	long := []struct {
+		project, agentID, wantPrefix string
+	}{
+		{"loom-core", "loom-mills-operator-8b916b47cece", "devbox-loom-core-loom-m-"},
+		{"loom-core", "loom-mills-operator-373090d6b8f2", "devbox-loom-core-loom-m-"},
+		{"loom-core", "codex-mills-verify", "devbox-loom-core-codex-"},
+		{"flexdeck", "very-long-agent-name-here", "devbox-flexdeck-very-l-"},
+	}
+	seen := map[string]string{}
+	for _, tt := range long {
+		got := m.containerName(tt.project, tt.agentID)
+		if !strings.HasPrefix(got, tt.wantPrefix) {
+			t.Fatalf("containerName(%q, %q) = %q, want prefix %q", tt.project, tt.agentID, got, tt.wantPrefix)
+		}
+		if digest := strings.TrimPrefix(got, tt.wantPrefix); !hexDigest.MatchString(digest) {
+			t.Fatalf("containerName(%q, %q) = %q, want a five-hex digest after the prefix", tt.project, tt.agentID, got)
+		}
+		if suffix := strings.TrimPrefix(got, "devbox-"+sanitizeContainerName(tt.project)+"-"); len(suffix) > agentSuffixBudget {
+			t.Fatalf("agent suffix %q exceeds the %d-character budget", suffix, agentSuffixBudget)
+		}
+		if again := m.containerName(tt.project, tt.agentID); again != got {
+			t.Fatalf("containerName is not deterministic: %q then %q", got, again)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Fatalf("agent ids %q and %q collide on sandbox name %q", prev, tt.agentID, got)
+		}
+		seen[got] = tt.agentID
+	}
+}
+
+// TestSandboxGoCache pins the shared-cache wiring: no claim keeps the pod
+// spec byte-identical (same env map, no mounts); a claim yields a COPY of the
+// env pointing every Go cache at the mount, with the fingerprint's own map
+// untouched.
+func TestSandboxGoCache(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name      string
+		claim     string
+		env       map[string]string
+		wantDebug string
+	}{
+		{name: "no claim nil"},
+		{name: "no claim unchanged", env: map[string]string{"GODEBUG": "goindex=1,gctrace=1", "GOCACHE": "/original"}},
+		{name: "fresh", claim: "cache"},
+		{name: "preserve environment", claim: "cache", env: map[string]string{"FOO": "bar", "GOCACHE": "/old"}},
+		{name: "empty", claim: "cache", env: map[string]string{"GODEBUG": ""}},
+		{name: "append", claim: "cache", env: map[string]string{"GODEBUG": "gctrace=1"}, wantDebug: "gctrace=1,goindex=0"},
+		{name: "replace", claim: "cache", env: map[string]string{"GODEBUG": "goindex=1"}},
+		{name: "already disabled", claim: "cache", env: map[string]string{"GODEBUG": "goindex=0"}},
+		{name: "duplicates", claim: "cache", env: map[string]string{"GODEBUG": "goindex=1,gctrace=1,goindex=0,asyncpreemptoff=1,goindex=1"}, wantDebug: "gctrace=1,asyncpreemptoff=1,goindex=0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := maps.Clone(tt.env)
+			env, mounts := sandboxGoCache(tt.env, tt.claim)
+			if !maps.Equal(tt.env, before) {
+				t.Fatalf("input mutated: got %v, want %v", tt.env, before)
+			}
+			if tt.claim == "" {
+				if mounts != nil || !maps.Equal(env, before) || (env == nil) != (tt.env == nil) {
+					t.Fatalf("no claim: env=%v mounts=%v", env, mounts)
+				}
+				if env != nil {
+					env["probe"] = "same map"
+					if tt.env["probe"] != "same map" {
+						t.Fatal("no claim must return the original map")
+					}
+				}
+				return
+			}
+			if len(mounts) != 1 || mounts[0].ClaimName != tt.claim || mounts[0].MountPath != sandboxGoCacheMountPath {
+				t.Fatalf("unexpected mounts: %+v", mounts)
+			}
+			want := maps.Clone(before)
+			if want == nil {
+				want = make(map[string]string)
+			}
+			want["GOCACHE"] = sandboxGoCacheMountPath + "/go-build"
+			want["GOMODCACHE"] = sandboxGoCacheMountPath + "/gomod"
+			want["GOLANGCI_LINT_CACHE"] = sandboxGoCacheMountPath + "/golangci-lint"
+			want["GODEBUG"] = tt.wantDebug
+			if want["GODEBUG"] == "" {
+				want["GODEBUG"] = "goindex=0"
+			}
+			if !maps.Equal(env, want) {
+				t.Fatalf("env = %v, want %v", env, want)
+			}
+			env["probe"] = "copy"
+			if !maps.Equal(tt.env, before) {
+				t.Fatal("returned map aliases input")
+			}
+		})
+	}
+}
+
+func TestGateTimeoutsFallBackToDefaults(t *testing.T) {
+	t.Parallel()
+
+	m := &manager{}
+	if got := m.gateCheckTimeout(); got != defaultGateCheckTimeoutSec {
+		t.Fatalf("check timeout = %d, want default %d", got, defaultGateCheckTimeoutSec)
+	}
+	if got := m.gateTestTimeout(); got != defaultGateTestTimeoutSec {
+		t.Fatalf("test timeout = %d, want default %d", got, defaultGateTestTimeoutSec)
+	}
+	m.cfg.gateCheckTimeoutSec, m.cfg.gateTestTimeoutSec = 120, 1200
+	if m.gateCheckTimeout() != 120 || m.gateTestTimeout() != 1200 {
+		t.Fatalf("configured timeouts = %d/%d, want 120/1200", m.gateCheckTimeout(), m.gateTestTimeout())
 	}
 }
 
@@ -303,7 +426,7 @@ func TestGenerateSandboxDockerfile_GitCloneAllowsNoLocalLanguages(t *testing.T) 
 		t.Fatalf("generateSandboxDockerfile returned error: %v", err)
 	}
 	got := string(df)
-	for _, want := range []string{"FROM registry.harbor.lan/mcp/devbox-base/go:1.25", `ENV PATH="/usr/local/go/bin:${PATH}"`, "nodejs npm python3", "WORKDIR /workspace"} {
+	for _, want := range []string{"ARG DEVBOX_BASE_IMAGE=registry.harbor.lan/mcp/devbox-base/go:1.25", "FROM ${DEVBOX_BASE_IMAGE}", `ENV PATH="/usr/local/go/bin:${PATH}"`, "nodejs npm python3", "WORKDIR /workspace"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("fallback Dockerfile missing %q:\n%s", want, got)
 		}
@@ -638,6 +761,66 @@ func TestReapIdle_K8sKeepsWarmThenHardReaps(t *testing.T) {
 	}
 }
 
+// TestReapIdle_MillsBackstop pins bl-devbox-sandbox-quota-headroom-20260913: under
+// DEVBOX_MILLS_IDLE_TIMEOUT a Mills per-run sandbox (main or baseline) is hard-reaped
+// as soon as it passes the backstop — no 2× keep-warm grace — while every other
+// sandbox keeps the global timeout; with the backstop unset, Mills sandboxes follow
+// the global policy, warm grace included.
+func TestReapIdle_MillsBackstop(t *testing.T) {
+	const (
+		mills    = "loom-core/loom-mills-operator-698e4c672a6c"
+		baseline = mills + "-baseline"
+		fresh    = "loom-core/loom-mills-operator-0a8a7c27a051"
+		other    = "loom-core/claude-code" // another agent's sandbox
+		shared   = "loom-core"             // the shared per-repo sandbox
+	)
+	for _, tc := range []struct {
+		name                          string
+		idleTimeout, millsIdleTimeout time.Duration
+		active                        []string
+		idle                          map[string]time.Duration // key -> idle span
+		want                          map[string]string        // key -> status after one reap
+	}{
+		{
+			name: "backstop set", idleTimeout: 2 * time.Hour, millsIdleTimeout: 5 * time.Minute,
+			idle: map[string]time.Duration{mills: 6 * time.Minute, baseline: 6 * time.Minute, fresh: 4 * time.Minute, other: 6 * time.Minute, shared: 6 * time.Minute},
+			want: map[string]string{mills: "stopped", baseline: "stopped", fresh: "running", other: "running", shared: "running"},
+		},
+		{
+			name: "active Mills gate", idleTimeout: 2 * time.Hour, millsIdleTimeout: 5 * time.Minute,
+			idle:   map[string]time.Duration{mills: 90 * time.Minute},
+			active: []string{mills}, want: map[string]string{mills: "running"},
+		},
+		{
+			name: "backstop unset", idleTimeout: 5 * time.Minute,
+			idle: map[string]time.Duration{mills: 7 * time.Minute, baseline: 15 * time.Minute},
+			want: map[string]string{mills: "running", baseline: "stopped"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, _ := newTestStore(filepath.Join(t.TempDir(), "cache"))
+			for key, span := range tc.idle {
+				_ = store.Set(key, &stateEntry{Status: "running", LastUsed: time.Now().Add(-span)})
+			}
+			m := &manager{
+				cfg:     managerConfig{backendType: "k8s", idleTimeout: tc.idleTimeout, millsIdleTimeout: tc.millsIdleTimeout},
+				backend: &fakeBackend{statuses: map[string]*fakeStatus{}},
+				store:   store,
+				logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			for _, key := range tc.active {
+				m.incActiveExecs(key)
+			}
+			m.reapIdle(context.Background())
+			for key, want := range tc.want {
+				if e := store.Get(key); e == nil || e.Status != want {
+					t.Errorf("%s: status = %v, want %s", key, e, want)
+				}
+			}
+		})
+	}
+}
+
 func TestReapIdle_SkipsWarmPoolProjects(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	store, _ := newTestStore(filepath.Join(t.TempDir(), "cache"))
@@ -713,4 +896,61 @@ func TestLangNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestShutdownProtectsActiveK8sSandbox(t *testing.T) {
+	for _, kind := range []string{"k8s", "docker"} {
+		t.Run(kind, func(t *testing.T) {
+			store, err := newTestStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = store.Set("busy", &stateEntry{Status: "running"})
+			_ = store.Set("idle", &stateEntry{Status: "running"})
+			b := &shutdownRecorder{}
+			m := &manager{cfg: managerConfig{backendType: kind}, backend: b, store: store, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			m.incActiveExecs("busy")
+			m.shutdownAll(context.Background())
+			entries := store.List()
+			want := "stopped"
+			wantStops := 2
+			if kind == "k8s" {
+				want = "running"
+				wantStops = 1
+			}
+			if len(b.stopped) != wantStops {
+				t.Fatalf("unexpected sandbox stops: %v", b.stopped)
+			}
+			if entries["busy"].Status != want || entries["idle"].Status != "stopped" {
+				t.Fatalf("wrong cleanup: %+v", entries)
+			}
+		})
+	}
+}
+
+func TestShutdownBoundsUncooperativeAsyncWorker(t *testing.T) {
+	store, err := newTestStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &manager{cfg: managerConfig{backendType: "k8s"}, backend: &fakeBackend{}, store: store, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	m.asyncWg.Add(1)
+	defer m.asyncWg.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	m.shutdownAll(ctx)
+	if time.Since(start) > time.Second {
+		t.Fatal("cleanup ignored deadline")
+	}
+}
+
+type shutdownRecorder struct {
+	fakeBackend
+	stopped []string
+}
+
+func (b *shutdownRecorder) Stop(_ context.Context, name string) error {
+	b.stopped = append(b.stopped, name)
+	return nil
 }

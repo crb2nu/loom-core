@@ -2,7 +2,28 @@
 set -euo pipefail
 
 DOC_FILE="docs/FLEXINFER_SITE_INTEGRATION.md"
-SITE_REPO="${FLEXINFER_SITE_REPO:-../flexinfer-site}"
+
+# Resolve the sibling flexinfer-site checkout relative to the CANONICAL
+# loom-core checkout, not the current working tree. Inside a linked worktree
+# (<repo>/.worktrees/<branch>, <repo>/.claude/worktrees/<name>) a plain
+# ../flexinfer-site points at nothing, and until 2026-09-10 this guardrail
+# silently reported "local flexinfer-site repo not present, skipped mapping
+# check" from every worktree — the one place agents actually commit from.
+# Mirrors sourceLayoutRoot() in flexinfer-site/scripts/sync-docs.mjs.
+resolve_site_repo() {
+  if [[ -n "${FLEXINFER_SITE_REPO:-}" ]]; then
+    printf '%s\n' "${FLEXINFER_SITE_REPO}"
+    return
+  fi
+  local common_dir
+  if common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    printf '%s/flexinfer-site\n' "$(dirname "$(dirname "${common_dir}")")"
+    return
+  fi
+  printf '../flexinfer-site\n'
+}
+
+SITE_REPO="$(resolve_site_repo)"
 SYNC_SCRIPT="${SITE_REPO}/scripts/sync-docs.mjs"
 
 if [[ ! -f "${DOC_FILE}" ]]; then
@@ -38,8 +59,8 @@ if [[ -f "${SYNC_SCRIPT}" ]]; then
     fi
   done
 
-  echo "flexinfer-site-guardrail: passed (verified docs + local flexinfer-site sync mapping)"
+  echo "flexinfer-site-guardrail: passed (verified docs + flexinfer-site sync mapping at ${SITE_REPO})"
   exit 0
 fi
 
-echo "flexinfer-site-guardrail: passed (verified docs; local flexinfer-site repo not present, skipped mapping check)"
+echo "flexinfer-site-guardrail: passed (verified docs; flexinfer-site checkout not found at ${SITE_REPO}, skipped mapping check)"

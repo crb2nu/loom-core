@@ -14,6 +14,14 @@ type recurringInfrastructureSignature struct {
 
 var recurringInfrastructureSignatures = []recurringInfrastructureSignature{
 	{
+		dependency: "s3",
+		pattern:    regexp.MustCompile(`(?i)\blangfuse\b[\s\S]*\bfailed to upload event to s3\b|\bfailed to upload event to s3\b[\s\S]*\blangfuse\b`),
+	},
+	{
+		dependency: "storage",
+		pattern:    regexp.MustCompile(`(?i)\bno available disk for replica\b`),
+	},
+	{
 		dependency: CIIncidentDependencyClickHouse,
 		pattern:    regexp.MustCompile(`(?i)\b(?:clickhouse|mergetree|merge(?:d|ing)? parts?)\b[\s\S]*\bcode\s*:?\s*432\b|\bcode\s*:?\s*432\b[\s\S]*\b(?:clickhouse|mergetree|merge(?:d|ing)? parts?)\b`),
 	},

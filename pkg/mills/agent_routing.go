@@ -79,6 +79,9 @@ type AgentDecision struct {
 	// the caller can warn once at dispatch; routing itself proceeds as if the
 	// labels were absent.
 	IgnoredLabels []string
+	// DroppedModel identifies a rejected stage pin; DropReason explains why.
+	DroppedModel string
+	DropReason   string
 }
 
 // AgentRoutingPolicy routes individual backlog items to a harness+model by
@@ -172,6 +175,7 @@ func (p PipelinePolicy) AgentRoutingEnabled() bool {
 //
 // Model resolution follows the agent, because a stage_models pin names a
 // vendor-native id that is meaningless to a different vendor:
+//   - stage pins require an explicit stage agent and a compatible model family;
 //   - a route's own model always wins;
 //   - a route that keeps the baseline agent inherits stage_models[stage];
 //   - a route that RE-TARGETS the vendor drops stage_models and returns empty,
@@ -189,6 +193,14 @@ func (p *Policy) ResolveAgentRoute(stage string, item *store.BacklogItem) AgentD
 		baseline.DecidedBy = AgentDecidedByStageAgents
 	}
 	baseline.Model = p.ModelForStage(stage)
+	if baseline.Model != "" {
+		switch {
+		case baseline.DecidedBy == AgentDecidedByDefault:
+			baseline.dropModel("stage_agent_not_explicit")
+		case modelAgent(baseline.Model) != "" && modelAgent(baseline.Model) != baseline.Agent:
+			baseline.dropModel("stage_model_vendor_mismatch")
+		}
+	}
 	if item == nil || !p.Pipeline.AgentRoutingEnabled() {
 		return baseline
 	}
@@ -224,9 +236,31 @@ func routeOnto(baseline AgentDecision, route AgentRoute, decidedBy string) Agent
 	case route.Model != "":
 		d.Model = route.Model
 	case route.Agent != baseline.Agent:
-		d.Model = ""
+		d.dropModel("route_agent_changed")
 	}
 	return d
+}
+
+// dropModel preserves the first rejected stage pin through later routing rungs.
+func (d *AgentDecision) dropModel(reason string) {
+	if d.Model != "" {
+		d.DroppedModel, d.DropReason = d.Model, reason
+		d.Model = ""
+	}
+}
+
+// Unknown model families are left to the explicitly selected harness.
+func modelAgent(model string) string {
+	switch {
+	case strings.HasPrefix(model, "gpt-"), strings.HasPrefix(model, "o"):
+		return "codex"
+	case strings.HasPrefix(model, "claude-"):
+		return "claude-code"
+	case strings.HasPrefix(model, "gemini-"):
+		return "gemini"
+	default:
+		return ""
+	}
 }
 
 // agentLabelOverride returns the harness named by the item's agent/* label,

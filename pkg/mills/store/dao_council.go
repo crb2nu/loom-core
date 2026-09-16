@@ -114,6 +114,21 @@ func (d *CouncilDAO) List(ctx context.Context, limit int) ([]*CouncilRun, error)
 	return out, rows.Err()
 }
 
+// SumLocalCostSince returns the local-inference (flexinfer) slice of council
+// spend since the timestamp — electricity, not a bill. The budget subtracts
+// it from SumCostSince so the council's daily cap governs metered API spend.
+func (d *CouncilDAO) SumLocalCostSince(ctx context.Context, since time.Time) (float64, error) {
+	row := d.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(cost_local_usd), 0)
+		FROM council_runs WHERE started_at >= ?
+	`, timeRFC3339(since))
+	var total float64
+	if err := row.Scan(&total); err != nil {
+		return 0, fmt.Errorf("council sum-local-cost: %w", err)
+	}
+	return total, nil
+}
+
 // SumCostSince returns total council spend (frontier + local) since the given
 // timestamp. Used by the budget enforcer to honor per-day caps.
 func (d *CouncilDAO) SumCostSince(ctx context.Context, since time.Time) (float64, error) {

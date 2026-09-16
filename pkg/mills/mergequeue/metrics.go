@@ -37,4 +37,23 @@ var (
 		Name: "mills_mergequeue_merged_total",
 		Help: "Merge queue candidates merged.",
 	})
+
+	ProofSourceTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_merge_queue_proof_source_total",
+		Help: "Successful merge queue pipeline proofs by source.",
+	}, []string{"source"})
+
+	SpeculationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_merge_queue_speculation_total",
+		Help: "Speculative merge queue pipelines by terminal outcome.",
+	}, []string{"outcome"})
 )
+
+// EvictionRequeuesTotal counts the shepherd-A2 hop: evictions re-admitted as
+// external candidates, by original reason and enqueue outcome. A rising
+// duplicate rate means the same head keeps evicting — a coordination problem
+// the hop deliberately refuses to loop on (one hop per producer identity).
+var EvictionRequeuesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "mills_mergequeue_eviction_requeues_total",
+	Help: "Merge queue evictions re-enqueued as external candidates, by reason and outcome.",
+}, []string{"reason", "outcome"})

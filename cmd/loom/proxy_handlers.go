@@ -69,9 +69,14 @@ func handleProxyToolsList(ctx context.Context, daemon mcp.Transport, msg *mcp.Me
 		return nil, err
 	}
 
+	kept, displaced := filterProxyToolsReport(cachedResult.Tools, agentHintGlobal, toolProfileGlobal, maxToolsGlobal)
+	if len(displaced) > 0 {
+		_, limit := resolveProxyToolFilter(agentHintGlobal, toolProfileGlobal, maxToolsGlobal)
+		reportDisplacedTools(agentHintGlobal, toolProfileGlobal, limit, displaced)
+	}
 	result := struct {
 		Tools []mcp.Tool `json:"tools"`
-	}{Tools: filterProxyTools(cachedResult.Tools, agentHintGlobal, toolProfileGlobal, maxToolsGlobal)}
+	}{Tools: kept}
 
 	return mcp.NewResponse(msg.ID, result)
 }

@@ -450,7 +450,7 @@ func (f *Foreman) composeIssueBody(ctx context.Context, a *Anomaly) string {
 			"Do not invent numbers beyond the evidence. Do not use JSON or markdown code fences.\n\n"+
 			"Rule: %s\nSeverity: %s\nEvidence JSON: %s\n",
 		a.Rule, a.Severity, string(evidence))
-	content, _, err := f.Triage.Client.ChatStructured(ctx, f.Triage.Client.JudgeModel(), prompt, foremanIssueSummaryMaxTokens)
+	content, _, err := f.Triage.chat(ctx, prompt, foremanIssueSummaryMaxTokens)
 	if err != nil || strings.TrimSpace(content) == "" {
 		if err != nil && f.Logger != nil {
 			f.Logger.Warn("foreman issue body compose failed; using template", "rule", a.Rule, "error", err)

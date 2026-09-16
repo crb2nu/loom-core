@@ -25,6 +25,15 @@ const (
 	ComponentCouncilReviewer = "mills-council-reviewer"
 	// ComponentEvalJudge is the contradiction/eval judge.
 	ComponentEvalJudge = "mills-eval-judge"
+	// ComponentAudit is the post-merge / post-council audit reviewer pool
+	// (FlexInferAuditReviewer.Review). Until 2026-09-14 these bulk reviews —
+	// the largest local-lane consumer by prompt tokens — landed under
+	// ComponentFlexInfer and were indistinguishable from any untagged caller.
+	ComponentAudit = "mills-audit"
+	// ComponentTriage is the overseer triage (groomer dedup/zombie verdicts,
+	// foreman issue bodies; overseer.Triage). Separate from ComponentJudge
+	// so a triage model override is visible per component.
+	ComponentTriage = "mills-triage"
 	// ComponentMemory is item-memory consolidation
 	// (pipeline.MemoryConsolidator). Defined in pkg/mills/pipeline because
 	// that is where the call site lives and the import only points one way;

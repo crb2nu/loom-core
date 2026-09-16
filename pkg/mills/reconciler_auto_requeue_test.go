@@ -35,14 +35,15 @@ func dwellHistogramCount(t *testing.T, outcome string) uint64 {
 // seedRequeueSpec describes one escalated backlog item + its most-recent run for
 // the auto-requeue tests.
 type seedRequeueSpec struct {
-	id           string
-	class        string // escalation_class stamped on the run ("" == unclassified)
-	endedAgo     time.Duration
-	extDep       string // external_dependency name (marks an external incident)
-	mrIID        int64  // > 0 attaches an MR to the run
-	priorRequeue int    // pre-seed N prior auto_requeued events for this item
-	retryable    *bool  // classifier retryable verdict on the run
-	costUSD      float64
+	id               string
+	class            string // escalation_class stamped on the run ("" == unclassified)
+	endedAgo         time.Duration
+	extDep           string // external_dependency name (marks an external incident)
+	mrIID            int64  // > 0 attaches an MR to the run
+	priorRequeue     int    // pre-seed N prior auto_requeued events for this item
+	retryable        *bool  // classifier retryable verdict on the run
+	costUSD          float64
+	failureSignature string
 }
 
 // seedEscalatedForRequeue inserts an escalated backlog item and its escalated
@@ -62,14 +63,15 @@ func seedEscalatedForRequeue(t *testing.T, env *recTestEnv, spec seedRequeueSpec
 	}
 	ended := env.now.Add(-spec.endedAgo)
 	run := &store.PipelineRun{
-		ID:              "PIPE-" + spec.id,
-		BacklogID:       spec.id,
-		Template:        "mills-default-pipeline",
-		State:           store.PipelineEscalated,
-		Attempts:        1,
-		StartedAt:       ended.Add(-time.Minute),
-		EndedAt:         &ended,
-		EscalationClass: spec.class,
+		ID:               "PIPE-" + spec.id,
+		BacklogID:        spec.id,
+		Template:         "mills-default-pipeline",
+		State:            store.PipelineEscalated,
+		Attempts:         1,
+		StartedAt:        ended.Add(-time.Minute),
+		EndedAt:          &ended,
+		EscalationClass:  spec.class,
+		FailureSignature: spec.failureSignature,
 	}
 	run.EscalationRetryable = spec.retryable
 	run.CostUSD = spec.costUSD
@@ -94,6 +96,13 @@ func seedEscalatedForRequeue(t *testing.T, env *recTestEnv, spec seedRequeueSpec
 		}); err != nil {
 			t.Fatalf("seed prior requeue event %s: %v", spec.id, err)
 		}
+	}
+}
+
+func recordRecovery(t *testing.T, env *recTestEnv, capability string, redAgo, greenAgo time.Duration) {
+	t.Helper()
+	if err := env.rec.RecordSubstrateRecovered(context.Background(), SubstrateRecoveryWindow{Capability: capability, RedAt: env.now.Add(-redAgo), GreenAt: env.now.Add(-greenAgo)}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -522,6 +531,34 @@ func TestAutoRequeue_OpenMRSkip(t *testing.T) {
 	}
 }
 
+// A failed retry without an MR must not hide an earlier rescue MR. The IID
+// ghost-spark pass deliberately falls back to that MR-bearing attempt, so
+// auto-requeue must preserve it instead of spawning more work.
+func TestAutoRequeue_EarlierMRBearingRunSkip(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	seedEscalatedForRequeue(t, env, seedRequeueSpec{
+		id: "MILLS-EARLIER-MR", class: "infra", endedAgo: 40 * time.Minute, mrIID: 4242,
+	})
+	ended := env.now.Add(-20 * time.Minute)
+	if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{
+		ID: "PIPE-MILLS-EARLIER-MR-RETRY", BacklogID: "MILLS-EARLIER-MR",
+		Template: "mills-default-pipeline", State: store.PipelineEscalated,
+		Attempts: 2, StartedAt: ended.Add(-time.Minute), EndedAt: &ended,
+		EscalationClass: "infra",
+	}); err != nil {
+		t.Fatalf("seed newer MR-less retry: %v", err)
+	}
+
+	res, err := env.rec.SweepAutoRequeue(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if res.Requeued != 0 || res.Skipped != 1 || backlogState(t, env, "MILLS-EARLIER-MR") != store.BacklogEscalated {
+		t.Fatalf("earlier MR must reserve item for settlement: res=%+v state=%s", res, backlogState(t, env, "MILLS-EARLIER-MR"))
+	}
+}
+
 // TestAutoRequeue_EventAppendedOnce proves one requeue writes exactly one event
 // and bumps the metric once; a second sweep (the item now queued) is a no-op.
 func TestAutoRequeue_EventAppendedOnce(t *testing.T) {
@@ -700,5 +737,82 @@ func TestAutoRequeue_CodeConfigOptIn(t *testing.T) {
 				t.Fatalf("want skipped/escalated, got res=%+v state=%s", res, gotState)
 			}
 		})
+	}
+}
+
+func TestSubstrateRecoveryRelease_MatchesWindowClassAndSignatureOutsideCaps(t *testing.T) {
+	env := newAutoRequeueEnv(t, autoRequeuePolicyYAML(100, 10, 1, 1))
+	ctx := context.Background()
+	// Exhaust both ordinary counters for the matching item. The recovery below
+	// is for hud_spawn, which spawn_infra signatures map to; sandbox_build maps
+	// to mcp_hub_session, so "wrong-cap" is inside the window but belongs to a
+	// capability that did not recover.
+	seedEscalatedForRequeue(t, env, seedRequeueSpec{id: "match", class: "transient", endedAgo: 30 * time.Minute, priorRequeue: 1, failureSignature: "spawn_infra:websocket"})
+	seedEscalatedForRequeue(t, env, seedRequeueSpec{id: "code", class: "code", endedAgo: 30 * time.Minute, failureSignature: "spawn_infra:websocket"})
+	seedEscalatedForRequeue(t, env, seedRequeueSpec{id: "wrong-cap", class: "infra", endedAgo: 30 * time.Minute, failureSignature: "sandbox_build:docker"})
+	seedEscalatedForRequeue(t, env, seedRequeueSpec{id: "old", class: "infra", endedAgo: 90 * time.Minute, failureSignature: "spawn_infra:timeout"})
+	if err := env.store.Events.Append(ctx, &store.Event{OccurredAt: env.now.Add(-time.Minute), Actor: "reconciler", Kind: eventKindAutoRequeued, SubjectKind: autoRequeueSubjectKind, SubjectID: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	recordRecovery(t, env, "hud_spawn", 45*time.Minute, 15*time.Minute)
+	res, err := env.rec.SweepAutoRequeue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requeued != 1 || backlogState(t, env, "match") != store.BacklogQueued {
+		t.Fatalf("result=%+v match=%s", res, backlogState(t, env, "match"))
+	}
+	for _, id := range []string{"code", "wrong-cap", "old"} {
+		if got := backlogState(t, env, id); got != store.BacklogEscalated {
+			t.Errorf("%s state=%s", id, got)
+		}
+	}
+	if got := autoRequeueEventCount(t, env, "match"); got != 1 {
+		t.Fatalf("ordinary counter=%d, want unchanged 1", got)
+	}
+	event, err := env.store.Events.FirstBySubjectKind(ctx, "pipeline_run", "PIPE-match", eventKindSubstrateReleased)
+	if err != nil || event.Payload["released_by"] != "substrate_recovered:hud_spawn" {
+		t.Fatalf("release event=%+v err=%v", event, err)
+	}
+}
+
+func TestSubstrateRecoveryRelease_RedSuppressesOrdinaryRetry(t *testing.T) {
+	env := newAutoRequeueEnv(t, autoRequeuePolicyYAML(100, 10, 2, 6))
+	seedEscalatedForRequeue(t, env, seedRequeueSpec{id: "red", class: "infra", endedAgo: 30 * time.Minute, failureSignature: "spawn_infra:timeout"})
+	if err := env.rec.RecordSubstrateRed(context.Background(), "hud_spawn", env.now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := env.rec.SweepAutoRequeue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requeued != 0 || backlogState(t, env, "red") != store.BacklogEscalated || autoRequeueEventCount(t, env, "red") != 0 {
+		t.Fatalf("result=%+v state=%s", res, backlogState(t, env, "red"))
+	}
+}
+
+func TestSubstrateRecoveryRelease_PerSweepOverflowDrainsLater(t *testing.T) {
+	yaml := strings.Replace(autoRequeuePolicyYAML(100, 10, 2, 1), "auto_requeue: { enabled: true, cooldown_minutes: 10, per_item_max: 2, per_day_max: 1 }", "auto_requeue:\n    enabled: true\n    cooldown_minutes: 10\n    per_item_max: 2\n    per_day_max: 1\n    release: { max_per_sweep: 2 }", 1)
+	env := newAutoRequeueEnv(t, yaml)
+	for i := 0; i < 3; i++ {
+		seedEscalatedForRequeue(t, env, seedRequeueSpec{id: "overflow-" + itoa(i), class: "transient_quota", endedAgo: 30 * time.Minute, failureSignature: "ci_poll_timeout:quota"})
+	}
+	recordRecovery(t, env, "gitlab", 45*time.Minute, 15*time.Minute)
+	first, err := env.rec.SweepAutoRequeue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := env.rec.SweepAutoRequeue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Requeued != 2 || second.Requeued != 1 {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+}
+
+func TestAutoRequeueSubstrateUsesInfrastructureBudget(t *testing.T) {
+	if got := autoRequeueBaseClass(&store.PipelineRun{EscalationClass: "substrate"}); got != autoRequeueClassInfra {
+		t.Fatalf("substrate budget class = %q", got)
 	}
 }

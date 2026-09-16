@@ -31,6 +31,7 @@ func TestPlanClient_AuthorDraftPlan_HappyPath(t *testing.T) {
 		Model:       "claude-opus",
 		Backend:     "flexinfer",
 		Brief:       "Retry on 5xx",
+		Notes:       []string{"frame=opus primary=anthropic:opus fell back to openai:gpt-5.5: billing"},
 		Competitors: []string{"ring", "mule"},
 		Slices: []council.PlanSliceSpec{
 			{Name: "client", Goal: "retry", Files: []string{"pkg/x/client.go"}},
@@ -79,7 +80,7 @@ func TestPlanClient_AuthorDraftPlan_HappyPath(t *testing.T) {
 	}
 	// spec_doc records the audit trail (frame + brief + competitive siblings).
 	spec, _ := params.Arguments["spec_doc"].(string)
-	if spec == "" || !containsAll(spec, "opus", "Retry on 5xx", "Spinning Room") {
+	if spec == "" || !containsAll(spec, "opus", "Retry on 5xx", "Spinning Room", "frame=opus primary=anthropic:opus fell back to openai:gpt-5.5: billing") {
 		t.Errorf("spec_doc missing audit trail: %q", spec)
 	}
 	if !containsAll(spec, "Competing frames", "ring, mule") {
@@ -182,4 +183,12 @@ func containsAll(s string, subs ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestDraftSpecDocFrameFallbackNotes(t *testing.T) {
+	note := "frame=jacquard primary=anthropic:opus fell back to openai:gpt-5.5: billing"
+	got := draftSpecDoc(spin.DraftPlanInput{Title: "Retry", Frame: "jacquard", Notes: []string{"existing note", note}})
+	if !strings.Contains(got, "## Frame notes\n\n- existing note\n- "+note+"\n") {
+		t.Fatal(got)
+	}
 }

@@ -58,7 +58,7 @@ func councilAsyncOperator(t *testing.T) (*operator, func()) {
 		cleanup()
 		t.Fatalf("write roadmap: %v", err)
 	}
-	r, _ := buildCouncilRunner(op.store, op.policy, op.budget, repo, nil, nil, nil, "",
+	r, _ := buildCouncilRunner(op.store, op.policy, op.budget, repo, nil, nil, nil, "", nil,
 		runner.DefaultStageBudgets(), discardLogger())
 	if r == nil {
 		cleanup()

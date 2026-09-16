@@ -24,14 +24,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/agentcontext"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
+	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/mills/workflow"
 	"github.com/crb2nu/loom/pkg/mills/workflow/killtest"
 )
 
@@ -133,42 +140,84 @@ var mergingMode bool
 
 func run() (runErr error) {
 	var (
-		operatorURL       = flag.String("operator-url", "http://localhost:8090", "restart-stable operator REST base URL")
-		adminToken        = flag.String("admin-token", os.Getenv("LOOM_MILLS_ADMIN_TOKEN"), "admin bearer token (default $LOOM_MILLS_ADMIN_TOKEN)")
-		expectedGitOps    = flag.String("expected-gitops-revision", os.Getenv("S1C_EXPECTED_GITOPS_REVISION"), "reviewed remote GitOps main SHA (required for a full gate)")
-		expectedLoomCore  = flag.String("expected-loom-core-revision", os.Getenv("S1C_EXPECTED_LOOM_CORE_REVISION"), "reviewed remote loom-core main SHA (required for a full gate)")
-		gitOpsIdentity    = flag.String("gitops-identity-mode", envOrDefault("S1C_GITOPS_IDENTITY_MODE", killtest.GitOpsIdentityModeExactRevision), "GitOps identity contract: exact-revision | protected-scope")
-		gitOpsRepo        = flag.String("gitops-repo", os.Getenv("S1C_GITOPS_REPO"), "local platform/gitops repository used for protected identity and reviewed Flux spec binding")
-		loomCoreRepo      = flag.String("loom-core-repo", os.Getenv("S1C_LOOM_CORE_REPO"), "local loom-core repository used for protected identity and exact reviewed Deployment rendering")
-		fluxBin           = flag.String("flux-bin", envOrDefault("S1C_FLUX_BIN", "flux"), "Flux CLI used for exact reviewed Deployment rendering")
-		hudURL            = flag.String("hud-url", envOrDefault("S1C_HUD_URL", "https://hud.flexinfer.ai"), "restart-stable mobile-hud base URL used for exact spawn cleanup")
-		hudAdminToken     = flag.String("hud-admin-token", os.Getenv("HUD_ADMIN_TOKEN"), "mobile-hud admin token used for exact spawn cleanup (default $HUD_ADMIN_TOKEN)")
-		phase             = flag.String("phase", "full", "phase to run: preflight | full | verify")
-		attachRunID       = flag.String("run-id", "", "attach to an existing running imperative run instead of launching a fresh canary")
-		agentType         = flag.String("agent-type", killtest.AgentTypeClaudeCode, "canary spawn agent: claude-code | codex")
-		evidence          = flag.String("evidence", "s1c-evidence.json", "path to write the evidence JSON")
-		runs              = flag.Int("runs", 3, "number of consecutive full dual-crash runs (the S1c gate requires exactly 3)")
-		stepTimeout       = flag.Duration("step-timeout", 5*time.Minute, "max wait for the pending spawn step")
-		termTimeout       = flag.Duration("terminal-timeout", 30*time.Minute, "max wait for the run to reach a terminal state")
-		crashDelay        = flag.Duration("crash-delay", 15*time.Second, "wait after the spawn is confirmed before CRASH A, and between CRASH A and CRASH B")
-		merging           = flag.Bool("merging", false, "S6-full merging canary: template v3 with a journaled merge('canary') effect; PASS-3 evaluated from real GitLab evidence")
-		gitlabAPIURL      = flag.String("gitlab-api-url", envOrDefault("S1C_GITLAB_API_URL", "https://gitlab.flexinfer.ai/api/v4"), "GitLab API base for PASS-3 merge verification (merging mode)")
-		gitlabToken       = flag.String("gitlab-token", os.Getenv("GITLAB_TOKEN"), "GitLab token for PASS-3 merge verification (default $GITLAB_TOKEN)")
-		gitlabProject     = flag.String("gitlab-project", envOrDefault("S1C_GITLAB_PROJECT", "services/loom-core"), "GitLab project the merging canary merges into")
-		scenario          = flag.String("scenario", "", "deterministic scenario: queued-proof | mr-awareness")
-		scenarioMaxAge    = flag.Duration("scenario-max-age", 5*time.Minute, "maximum age of scenario evidence")
-		queuedProofID     = flag.String("queued-proof-backlog-id", "", "existing queued backlog item to drive through live terminal MR proof")
-		queuedProofPlan   = flag.String("queued-proof-plan-id", "", "canonical Pattern Loom plan id to seed for the live queued-proof")
-		queuedProofTarget = flag.String("queued-proof-target-project", "", "declared target project for the queued proof (required for live runs)")
-		queuedProofResume = flag.Bool("queued-proof-resume", false, "resume the admitted run recorded in --evidence instead of starting another run")
-		queuedProofPoll   = flag.Duration("queued-proof-poll", 5*time.Second, "live queued-proof polling interval")
+		operatorURL        = flag.String("operator-url", "http://localhost:8090", "restart-stable operator REST base URL")
+		mode               = flag.String("mode", "", "kill-test mode: queued-proof")
+		adminToken         = flag.String("admin-token", os.Getenv("LOOM_MILLS_ADMIN_TOKEN"), "admin bearer token (default $LOOM_MILLS_ADMIN_TOKEN)")
+		expectedGitOps     = flag.String("expected-gitops-revision", os.Getenv("S1C_EXPECTED_GITOPS_REVISION"), "reviewed remote GitOps main SHA (required for a full gate)")
+		expectedLoomCore   = flag.String("expected-loom-core-revision", os.Getenv("S1C_EXPECTED_LOOM_CORE_REVISION"), "reviewed remote loom-core main SHA (required for a full gate)")
+		gitOpsIdentity     = flag.String("gitops-identity-mode", envOrDefault("S1C_GITOPS_IDENTITY_MODE", killtest.GitOpsIdentityModeExactRevision), "GitOps identity contract: exact-revision | protected-scope")
+		gitOpsRepo         = flag.String("gitops-repo", os.Getenv("S1C_GITOPS_REPO"), "local platform/gitops repository used for protected identity and reviewed Flux spec binding")
+		loomCoreRepo       = flag.String("loom-core-repo", os.Getenv("S1C_LOOM_CORE_REPO"), "local loom-core repository used for protected identity and exact reviewed Deployment rendering")
+		fluxBin            = flag.String("flux-bin", envOrDefault("S1C_FLUX_BIN", "flux"), "Flux CLI used for exact reviewed Deployment rendering")
+		hudURL             = flag.String("hud-url", envOrDefault("S1C_HUD_URL", "https://hud.flexinfer.ai"), "restart-stable mobile-hud base URL used for exact spawn cleanup")
+		hudAdminToken      = flag.String("hud-admin-token", os.Getenv("HUD_ADMIN_TOKEN"), "mobile-hud admin token used for exact spawn cleanup (default $HUD_ADMIN_TOKEN)")
+		phase              = flag.String("phase", "full", "phase to run: preflight | full | verify")
+		attachRunID        = flag.String("run-id", "", "attach to an existing running imperative run instead of launching a fresh canary")
+		agentType          = flag.String("agent-type", killtest.AgentTypeClaudeCode, "canary spawn agent: claude-code | codex")
+		evidence           = flag.String("evidence", "s1c-evidence.json", "path to write the evidence JSON")
+		runs               = flag.Int("runs", 3, "number of consecutive full dual-crash runs (the S1c gate requires exactly 3)")
+		stepTimeout        = flag.Duration("step-timeout", 5*time.Minute, "max wait for the pending spawn step")
+		termTimeout        = flag.Duration("terminal-timeout", 30*time.Minute, "max wait for the run to reach a terminal state")
+		crashDelay         = flag.Duration("crash-delay", 15*time.Second, "wait after the spawn is confirmed before CRASH A, and between CRASH A and CRASH B")
+		merging            = flag.Bool("merging", false, "S6-full merging canary: template v3 with a journaled merge('canary') effect; PASS-3 evaluated from real GitLab evidence")
+		gitlabAPIURL       = flag.String("gitlab-api-url", envOrDefault("S1C_GITLAB_API_URL", "https://gitlab.flexinfer.ai/api/v4"), "GitLab API base for PASS-3 merge verification (merging mode)")
+		gitlabToken        = flag.String("gitlab-token", os.Getenv("GITLAB_TOKEN"), "GitLab token for PASS-3 merge verification (default $GITLAB_TOKEN)")
+		gitlabProject      = flag.String("gitlab-project", envOrDefault("S1C_GITLAB_PROJECT", "services/loom-core"), "GitLab project the merging canary merges into")
+		scenario           = flag.String("scenario", "", "deterministic scenario: queued-proof | mr-awareness")
+		scenarioMaxAge     = flag.Duration("scenario-max-age", 5*time.Minute, "maximum age of scenario evidence")
+		queuedProofID      = flag.String("queued-proof-backlog-id", "", "existing queued backlog item to drive through live terminal MR proof")
+		queuedProofPlan    = flag.String("queued-proof-plan-id", "", "canonical Pattern Loom plan id to seed for the live queued-proof")
+		queuedProofTarget  = flag.String("queued-proof-target-project", "", "declared target project for the queued proof (required for live runs)")
+		queuedProofResume  = flag.Bool("queued-proof-resume", false, "resume the admitted run recorded in --evidence instead of starting another run")
+		queuedProofPoll    = flag.Duration("queued-proof-poll", 5*time.Second, "live queued-proof polling interval")
+		embedHealthURL     = flag.String("queued-proof-embed-health-url", os.Getenv("AGENT_CONTEXT_EMBED_HEALTH_URL"), "embedder health snapshot URL required for live queued-proof admission")
+		embedHealthWindow  = flag.Duration("queued-proof-embed-health-window", 5*time.Minute, "maximum age of the embedder health snapshot and its trailing fail-closed window")
+		embedHealthTimeout = flag.Duration("queued-proof-embed-health-timeout", 5*time.Second, "timeout for the live queued-proof embedder health precondition")
+		queuedProofWorker  = flag.String("queued-proof-worker-command", "", "command that starts the isolated operator worker (required by --mode queued-proof)")
+		queuedProofState   = flag.String("queued-proof-state-dir", "", "empty isolated state directory used across the worker restart (required by --mode queued-proof)")
+		queuedProofStamp   = flag.String("queued-proof-stamp-id", "", "target-project stamp identity (default: generated; deterministic in --dry-run)")
+		queuedProofWait    = flag.Duration("queued-proof-worker-timeout", 30*time.Second, "maximum wait for each queued-proof worker start or stop")
+		queuedProofDryRun  = flag.Bool("dry-run", false, "emit the queued-proof plan without starting or killing a worker")
+		mrWorker           = flag.String("mr-awareness-worker-command", "", "command that starts the isolated operator worker")
+		mrState            = flag.String("mr-awareness-state-dir", "", "isolated state directory preserved across restart")
+		mrBacklog          = flag.String("mr-awareness-backlog-id", "", "queued backlog item whose run creates the test MR")
+		mrSourceBranch     = flag.String("mr-awareness-source-branch", "", "expected GitLab source branch (recorded on first execution)")
+		mrWait             = flag.Duration("mr-awareness-timeout", 20*time.Minute, "maximum wait for MR creation and worker restart")
+		mrPoll             = flag.Duration("mr-awareness-poll", 2*time.Second, "poll interval for durable run and GitLab evidence")
+		mrRecoveryMaxAge   = flag.Duration("mr-awareness-recovery-max-age", 24*time.Hour, "maximum age of existing recovery evidence")
 	)
 	flag.Parse()
+	if *mode != "" {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		switch *mode {
+		case string(pipeline.KilltestQueuedProof):
+			return runQueuedAdmissionKilltest(ctx, os.Stdout, queuedAdmissionOptions{
+				OperatorURL: *operatorURL, AdminToken: *adminToken, WorkerCommand: *queuedProofWorker,
+				StateDir: *queuedProofState, EvidencePath: *evidence, Timeout: *queuedProofWait, DryRun: *queuedProofDryRun,
+				TargetProject: *queuedProofTarget, StampID: *queuedProofStamp,
+			})
+		case string(pipeline.KilltestMRAwareness):
+			return runMRAwarenessKilltest(ctx, os.Stdout, mrAwarenessOptions{
+				OperatorURL: *operatorURL, AdminToken: *adminToken, WorkerCommand: *mrWorker,
+				StateDir: *mrState, EvidencePath: *evidence, BacklogID: *mrBacklog,
+				SourceBranch: *mrSourceBranch, GitLabURL: *gitlabAPIURL, GitLabToken: *gitlabToken,
+				GitLabProject: *gitlabProject, Timeout: *mrWait, Poll: *mrPoll, RecoveryMaxAge: *mrRecoveryMaxAge,
+			})
+		default:
+			return emitQueuedAdmissionFailure(os.Stdout, *evidence, "invalid_mode", fmt.Errorf("invalid --mode %q (want queued-proof or mr-awareness)", *mode))
+		}
+	}
 	if *scenario != "" {
 		if *scenario == string(pipeline.KilltestQueuedProof) && (*queuedProofID != "" || *queuedProofPlan != "") {
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
-			return runLiveQueuedProof(ctx, queuedProofDriver{operatorURL: *operatorURL, adminToken: *adminToken, gitlabURL: *gitlabAPIURL, gitlabToken: *gitlabToken, gitlabProject: *queuedProofTarget, client: &http.Client{Timeout: 30 * time.Second}, poll: *queuedProofPoll, resume: *queuedProofResume}, *queuedProofID, *queuedProofPlan, *evidence, *termTimeout)
+			if err := runQueuedProofWithEmbedPrecondition(ctx, &http.Client{Timeout: *embedHealthTimeout}, *embedHealthURL, *embedHealthWindow, time.Now().UTC(), func() error {
+				return runLiveQueuedProof(ctx, queuedProofDriver{operatorURL: *operatorURL, adminToken: *adminToken, gitlabURL: *gitlabAPIURL, gitlabToken: *gitlabToken, gitlabProject: *queuedProofTarget, client: &http.Client{Timeout: 30 * time.Second}, poll: *queuedProofPoll, resume: *queuedProofResume}, *queuedProofID, *queuedProofPlan, *evidence, *termTimeout)
+			}); err != nil {
+				return err
+			}
+			return verifyLiveQueuedProof(*evidence, *queuedProofTarget)
 		}
 		return runScenario(pipeline.KilltestScenario(*scenario), *evidence, *scenarioMaxAge, time.Now().UTC())
 	}
@@ -409,6 +458,51 @@ func run() (runErr error) {
 	return nil
 }
 
+func requireHealthyEmbedder(ctx context.Context, client *http.Client, endpoint string, trailingWindow time.Duration, now time.Time) error {
+	if _, err := agentcontext.ProbeEmbedHealth(ctx, client, endpoint, now, trailingWindow); err != nil {
+		return fmt.Errorf("embedder_unhealthy: %w", err)
+	}
+	return nil
+}
+
+func runQueuedProofWithEmbedPrecondition(ctx context.Context, client *http.Client, endpoint string, trailingWindow time.Duration, now time.Time, runQueuedProof func() error) error {
+	if err := requireHealthyEmbedder(ctx, client, endpoint, trailingWindow, now); err != nil {
+		return err
+	}
+	return runQueuedProof()
+}
+
+// verifyLiveQueuedProof is the final fail-closed boundary for the live path.
+// The driver persists external-dependency diagnostics for operators, but a
+// diagnostic is not proof that the queued workflow completed and auto-merged.
+func verifyLiveQueuedProof(evidencePath, declaredTarget string) error {
+	f, err := os.Open(evidencePath)
+	if err != nil {
+		return fmt.Errorf("open live queued-proof evidence: %w", err)
+	}
+	defer f.Close()
+
+	var report queuedProofReport
+	decoder := json.NewDecoder(f)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&report); err != nil {
+		return fmt.Errorf("decode live queued-proof evidence: %w", err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("decode live queued-proof evidence: trailing JSON data")
+	}
+	if report.Verdict != queuedProofVerdictPass {
+		return fmt.Errorf("live queued-proof verdict is %q, want %q", report.Verdict, queuedProofVerdictPass)
+	}
+	if strings.TrimSpace(declaredTarget) == "" || report.DeclaredTarget != declaredTarget || report.MR.Project != declaredTarget {
+		return fmt.Errorf("live queued-proof target identity is contradictory: declared=%q report=%q MR=%q", declaredTarget, report.DeclaredTarget, report.MR.Project)
+	}
+	if err := workflow.AssertQueuedProof(report.QueuedProofEvidence); err != nil {
+		return fmt.Errorf("verify live queued-proof evidence: %w", err)
+	}
+	return nil
+}
+
 func runScenario(scenario pipeline.KilltestScenario, evidencePath string, maxAge time.Duration, now time.Time) error {
 	return runScenarioTo(os.Stdout, scenario, evidencePath, maxAge, now)
 }
@@ -450,6 +544,662 @@ func writeScenarioFailure(out io.Writer, scenario pipeline.KilltestScenario, cod
 	}
 	return cause
 }
+
+type queuedAdmissionOptions struct {
+	OperatorURL, AdminToken, WorkerCommand, StateDir, EvidencePath string
+	TargetProject, StampID                                         string
+	Timeout                                                        time.Duration
+	DryRun                                                         bool
+}
+
+type queuedAdmissionSnapshot struct {
+	ID            string `json:"ID"`
+	State         string `json:"State"`
+	ClaimVersion  int64  `json:"ClaimVersion"`
+	TargetProject string `json:"TargetProject"`
+}
+
+type queuedAdmissionRun struct {
+	ID        string `json:"ID"`
+	BacklogID string `json:"BacklogID"`
+}
+
+type queuedAdmissionVerdict struct {
+	Mode                  string                          `json:"mode"`
+	Verdict               string                          `json:"verdict"`
+	Passed                bool                            `json:"passed"`
+	ReasonCode            string                          `json:"reason_code,omitempty"`
+	Detail                string                          `json:"detail,omitempty"`
+	Stamp                 string                          `json:"stamp,omitempty"`
+	TargetID              string                          `json:"target_id,omitempty"`
+	TargetAdmissions      int                             `json:"target_admissions"`
+	CollateralTransitions []string                        `json:"collateral_transitions"`
+	Before                []queuedAdmissionSnapshot       `json:"before,omitempty"`
+	After                 []queuedAdmissionSnapshot       `json:"after,omitempty"`
+	WorkerRestarts        int                             `json:"worker_restarts"`
+	DryRun                bool                            `json:"dry_run,omitempty"`
+	Proof                 workflow.QueuedRequeueProof     `json:"proof"`
+	TargetProof           workflow.QueuedTargetStampProof `json:"target_proof"`
+}
+
+// runQueuedAdmissionKilltest owns an isolated worker process. It deliberately
+// sends admission asynchronously and terminates the worker at that boundary;
+// the assertion is valid whether the transaction commits immediately before
+// or after termination because restart recovery must still expose one run.
+func runQueuedAdmissionKilltest(ctx context.Context, out io.Writer, o queuedAdmissionOptions) error {
+	fail := func(code string, err error) error { return emitQueuedAdmissionFailure(out, o.EvidencePath, code, err) }
+	o.TargetProject = strings.TrimSpace(o.TargetProject)
+	o.StampID = strings.TrimSpace(o.StampID)
+	if o.DryRun {
+		if o.TargetProject == "" {
+			// No declared target: plan the requeue proof only (offline, deterministic).
+			proof, err := workflow.PlanQueuedRequeueProof("queued-proof-target")
+			if err != nil {
+				return fail("dry_run_failed", err)
+			}
+			return writeQueuedAdmissionVerdict(out, o.EvidencePath, queuedAdmissionVerdict{Mode: "queued-proof", Verdict: "PLANNED", DryRun: true, Stamp: "dry-run", TargetID: proof.ItemID, Proof: proof}, nil)
+		}
+		if o.StampID == "" {
+			o.StampID = "queued-proof-dry-run"
+		}
+		proof := workflow.QueuedTargetStampProof{StampID: o.StampID, TargetProject: o.TargetProject, LandedTargetProject: o.TargetProject, QueueStates: []string{"queued", "admitted"}, Admissions: 1, CollisionDetected: true}
+		if err := workflow.AssertQueuedTargetStampProof(proof); err != nil {
+			return fail("malformed_evidence", err)
+		}
+		return writeQueuedAdmissionVerdict(out, o.EvidencePath, queuedAdmissionVerdict{Mode: "queued-proof", Verdict: "PASS", Passed: true, DryRun: true, Stamp: o.StampID, TargetID: o.StampID + "-target", TargetAdmissions: 1, TargetProof: proof}, nil)
+	}
+	if o.TargetProject == "" {
+		return fail("invalid_configuration", errors.New("--mode queued-proof requires --queued-proof-target-project"))
+	}
+	if strings.TrimSpace(o.WorkerCommand) == "" || strings.TrimSpace(o.StateDir) == "" || strings.TrimSpace(o.AdminToken) == "" {
+		return fail("invalid_configuration", errors.New("--mode queued-proof requires --queued-proof-worker-command, --queued-proof-state-dir, and --admin-token"))
+	}
+	if o.Timeout <= 0 {
+		return fail("invalid_configuration", errors.New("--queued-proof-worker-timeout must be positive"))
+	}
+	stateDir, err := filepath.Abs(o.StateDir)
+	if err != nil {
+		return fail("invalid_configuration", err)
+	}
+	entries, err := os.ReadDir(stateDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fail("invalid_configuration", fmt.Errorf("read state directory: %w", err))
+	}
+	if err == nil && len(entries) != 0 {
+		return fail("unsafe_state_directory", fmt.Errorf("queued-proof state directory %s is not empty", stateDir))
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fail("invalid_configuration", fmt.Errorf("create state directory: %w", err))
+	}
+
+	startWorker := func() (*exec.Cmd, error) {
+		cmd := exec.CommandContext(ctx, "sh", "-c", o.WorkerCommand)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = append(os.Environ(), "LOOM_MILLS_DB_PATH="+filepath.Join(stateDir, "mills.db"))
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		if err := waitOperator(ctx, o.OperatorURL, o.Timeout); err != nil {
+			_ = stopQueuedWorker(cmd, o.Timeout)
+			return nil, err
+		}
+		return cmd, nil
+	}
+	worker, err := startWorker()
+	if err != nil {
+		return fail("worker_start_failed", err)
+	}
+	defer func() { _ = stopQueuedWorker(worker, o.Timeout) }()
+
+	stamp := o.StampID
+	if stamp == "" {
+		stamp = fmt.Sprintf("queued-proof-%d", time.Now().UTC().UnixNano())
+	}
+	stampStore, err := store.Open(ctx, store.Options{Path: filepath.Join(stateDir, "mills.db")})
+	if err != nil {
+		return fail("stamp_store_failed", err)
+	}
+	stampRecord := &store.Stamp{ID: stamp, TargetProject: o.TargetProject}
+	if err := stampStore.Stamps.Put(ctx, stampRecord); err != nil {
+		_ = stampStore.Close()
+		return fail("stamp_collision", err)
+	}
+	collisionErr := stampStore.Stamps.Put(ctx, &store.Stamp{ID: stamp, TargetProject: o.TargetProject})
+	persistedStamp, getStampErr := stampStore.Stamps.Get(ctx, o.TargetProject, stamp)
+	if err := stampStore.Close(); err != nil {
+		return fail("stamp_store_failed", err)
+	}
+	if collisionErr == nil {
+		return fail("stamp_collision_missing", errors.New("duplicate target-project stamp was accepted"))
+	}
+	if getStampErr != nil {
+		return fail("stamp_evidence_unavailable", fmt.Errorf("read original stamp after collision: %w", getStampErr))
+	}
+	if persistedStamp.ID != stamp || persistedStamp.TargetProject != o.TargetProject {
+		return fail("stamp_collision_overwrite", fmt.Errorf("duplicate write changed stamp tuple: got (%q, %q), want (%q, %q)", persistedStamp.TargetProject, persistedStamp.ID, o.TargetProject, stamp))
+	}
+	ids := []string{stamp + "-target", stamp + "-control-a", stamp + "-control-b"}
+	client := &http.Client{Timeout: o.Timeout}
+	for _, id := range ids {
+		seed := map[string]any{"ID": id, "Title": "queued-proof stamped item " + id, "State": "queued", "Labels": []string{"queued-proof-killtest", stamp}, "CreatedBy": "mills-workflow-killtest", "TargetProject": o.TargetProject}
+		if err := queuedAdmissionRequest(ctx, client, o.OperatorURL, o.AdminToken, http.MethodPost, "/api/mills/backlog", seed, nil, http.StatusCreated); err != nil {
+			return fail("seed_failed", err)
+		}
+	}
+	before, err := queuedAdmissionItems(ctx, client, o, ids)
+	if err != nil {
+		return fail("snapshot_failed", err)
+	}
+	for _, item := range before {
+		if item.State != "queued" || item.ClaimVersion != 0 || item.TargetProject != o.TargetProject {
+			return fail("malformed_evidence", fmt.Errorf("seeded item %s was not pristine queued evidence: state=%q claim_version=%d", item.ID, item.State, item.ClaimVersion))
+		}
+	}
+
+	admissionWritten := make(chan struct{}, 1)
+	releaseAdmission := make(chan struct{})
+	admissionDone := make(chan error, 1)
+	go func() {
+		requestCtx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) {
+			admissionWritten <- struct{}{}
+			<-releaseAdmission
+		}})
+		admissionDone <- queuedAdmissionRequest(requestCtx, client, o.OperatorURL, o.AdminToken, http.MethodPost, "/api/mills/pipeline/runs/"+ids[0]+"/start", nil, nil, http.StatusCreated)
+	}()
+	select {
+	case <-admissionWritten:
+	case err := <-admissionDone:
+		close(releaseAdmission)
+		return fail("admission_not_dispatched", fmt.Errorf("admission request settled before dispatch boundary: %w", err))
+	case <-time.After(o.Timeout):
+		close(releaseAdmission)
+		return fail("admission_timeout", errors.New("admission request was not written before timeout"))
+	}
+	if err := killQueuedWorker(worker, o.Timeout); err != nil {
+		close(releaseAdmission)
+		return fail("worker_kill_failed", err)
+	}
+	worker = nil
+	close(releaseAdmission)
+	// The request may fail with EOF because the kill landed before its response;
+	// durable evidence after restart, not the transport result, decides the test.
+	select {
+	case <-admissionDone:
+	case <-time.After(o.Timeout):
+		return fail("admission_timeout", errors.New("admission request did not settle after worker termination"))
+	}
+	worker, err = startWorker()
+	if err != nil {
+		return fail("worker_restart_failed", err)
+	}
+	// Replay the same identity to exercise the restart dedupe boundary. A 409
+	// is expected when the first transaction committed; 201 is permitted only
+	// when it did not, and the run-count assertion below remains authoritative.
+	if err := queuedAdmissionRequest(ctx, client, o.OperatorURL, o.AdminToken, http.MethodPost, "/api/mills/pipeline/runs/"+ids[0]+"/start", nil, nil, http.StatusCreated, http.StatusConflict); err != nil {
+		return fail("replay_failed", err)
+	}
+
+	after, err := queuedAdmissionItems(ctx, client, o, ids)
+	if err != nil {
+		return fail("snapshot_failed", err)
+	}
+	var runs []queuedAdmissionRun
+	if err := queuedAdmissionRequest(ctx, client, o.OperatorURL, o.AdminToken, http.MethodGet, "/api/mills/pipeline/runs?backlog_id="+ids[0], nil, &runs, http.StatusOK); err != nil {
+		return fail("evidence_unavailable", err)
+	}
+	for _, run := range runs {
+		if strings.TrimSpace(run.ID) == "" || run.BacklogID != ids[0] {
+			return fail("malformed_evidence", fmt.Errorf("contradictory run evidence: id=%q backlog_id=%q", run.ID, run.BacklogID))
+		}
+	}
+	collateral := changedCollateral(before, after, ids[0])
+	events := []workflow.QueuedProofEvent{{ItemID: ids[0], Kind: workflow.QueuedProofSeeded}, {ItemID: ids[0], Kind: workflow.QueuedProofInterrupted}, {ItemID: ids[0], Kind: workflow.QueuedProofRequeued}}
+	for _, run := range runs {
+		events = append(events, workflow.QueuedProofEvent{ItemID: ids[0], Kind: workflow.QueuedProofExecuted, AttemptID: run.ID})
+	}
+	proof, proofErr := workflow.ProveQueuedRequeue(ids[0], events)
+	landedTarget := ""
+	for _, item := range after {
+		if item.ID == ids[0] {
+			landedTarget = item.TargetProject
+		}
+	}
+	targetProof := workflow.QueuedTargetStampProof{StampID: stamp, TargetProject: o.TargetProject, LandedTargetProject: landedTarget, QueueStates: []string{"queued", "admitted"}, Admissions: len(runs), CollisionDetected: collisionErr != nil}
+	report := queuedAdmissionVerdict{Mode: "queued-proof", Verdict: "PASS", Passed: true, Stamp: stamp, TargetID: ids[0], TargetAdmissions: len(runs), CollateralTransitions: collateral, Before: before, After: after, WorkerRestarts: 1, Proof: proof, TargetProof: targetProof}
+	if proofErr != nil || len(runs) != 1 || len(collateral) != 0 {
+		report.Verdict, report.Passed, report.ReasonCode = "FAIL", false, "invariant_violation"
+		report.Detail = fmt.Sprintf("queued requeue proof=%v, target runs=%d (want 1), collateral transitions=%d (want 0)", proofErr, len(runs), len(collateral))
+		return writeQueuedAdmissionVerdict(out, o.EvidencePath, report, errors.New(report.Detail))
+	}
+	if err := workflow.AssertQueuedTargetStampProof(targetProof); err != nil {
+		report.Verdict, report.Passed, report.ReasonCode, report.Detail = "FAIL", false, "target_proof_failed", err.Error()
+		return writeQueuedAdmissionVerdict(out, o.EvidencePath, report, err)
+	}
+	return writeQueuedAdmissionVerdict(out, o.EvidencePath, report, nil)
+}
+
+func waitOperator(ctx context.Context, base string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: time.Second}
+	for time.Now().Before(deadline) {
+		// The operator exposes health on its optional metrics listener, not the
+		// REST listener supplied here. Any HTTP response proves the controlled
+		// REST listener is accepting requests; later authenticated calls verify
+		// the API itself.
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/", nil)
+		if resp, err := client.Do(req); err == nil {
+			_ = resp.Body.Close()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return errors.New("timed out waiting for operator REST listener")
+}
+
+func stopQueuedWorker(cmd *exec.Cmd, timeout time.Duration) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				return err
+			}
+		}
+		return nil
+	case <-time.After(timeout):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-done
+		return nil
+	}
+}
+
+func killQueuedWorker(cmd *exec.Cmd, timeout time.Duration) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		var exitErr *exec.ExitError
+		if err != nil && !errors.As(err, &exitErr) {
+			return err
+		}
+		return nil
+	case <-time.After(timeout):
+		return errors.New("timed out waiting for killed worker to exit")
+	}
+}
+
+func queuedAdmissionRequest(ctx context.Context, client *http.Client, base, token, method, path string, body, out any, allowed ...int) error {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = strings.NewReader(string(encoded))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, reader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	accepted := false
+	for _, status := range allowed {
+		accepted = accepted || resp.StatusCode == status
+	}
+	if !accepted {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s %s returned %s: %s", method, path, resp.Status, strings.TrimSpace(string(data)))
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return fmt.Errorf("decode %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func queuedAdmissionItems(ctx context.Context, client *http.Client, o queuedAdmissionOptions, ids []string) ([]queuedAdmissionSnapshot, error) {
+	items := make([]queuedAdmissionSnapshot, 0, len(ids))
+	for _, id := range ids {
+		var item queuedAdmissionSnapshot
+		if err := queuedAdmissionRequest(ctx, client, o.OperatorURL, o.AdminToken, http.MethodGet, "/api/mills/backlog/"+id, nil, &item, http.StatusOK); err != nil {
+			return nil, err
+		}
+		if item.ID != id {
+			return nil, fmt.Errorf("contradictory backlog identity: got %q want %q", item.ID, id)
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	return items, nil
+}
+
+func changedCollateral(before, after []queuedAdmissionSnapshot, target string) []string {
+	b := make(map[string]queuedAdmissionSnapshot, len(before))
+	for _, item := range before {
+		b[item.ID] = item
+	}
+	var changed []string
+	for _, item := range after {
+		if item.ID == target {
+			continue
+		}
+		prior, ok := b[item.ID]
+		if !ok || prior.State != item.State || prior.ClaimVersion != item.ClaimVersion || prior.TargetProject != item.TargetProject {
+			changed = append(changed, item.ID)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+func emitQueuedAdmissionFailure(out io.Writer, path, code string, err error) error {
+	report := queuedAdmissionVerdict{Mode: "queued-proof", Verdict: "FAIL", ReasonCode: code}
+	if err != nil {
+		report.Detail = err.Error()
+	}
+	return writeQueuedAdmissionVerdict(out, path, report, err)
+}
+
+func writeQueuedAdmissionVerdict(out io.Writer, path string, report queuedAdmissionVerdict, cause error) error {
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	if path != "" {
+		if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+			return fmt.Errorf("write queued-proof evidence: %w", err)
+		}
+	}
+	if _, err := fmt.Fprintf(out, "%s\n", encoded); err != nil {
+		return err
+	}
+	return cause
+}
+
+type mrAwarenessOptions struct {
+	OperatorURL, AdminToken, WorkerCommand, StateDir, EvidencePath string
+	BacklogID, SourceBranch, GitLabURL, GitLabToken, GitLabProject string
+	Timeout, Poll, RecoveryMaxAge                                  time.Duration
+}
+
+type mrAwarenessRun struct {
+	ID           string `json:"ID"`
+	BacklogID    string `json:"BacklogID"`
+	State        string `json:"State"`
+	CurrentStage string `json:"CurrentStage"`
+	MRIID        *int64 `json:"MRIID"`
+}
+
+type mrAwarenessSummary struct {
+	Mode              string    `json:"mode"`
+	Verdict           string    `json:"verdict"`
+	Passed            bool      `json:"passed"`
+	ReasonCode        string    `json:"reason_code,omitempty"`
+	Detail            string    `json:"detail,omitempty"`
+	BacklogID         string    `json:"backlog_id,omitempty"`
+	RunID             string    `json:"run_id,omitempty"`
+	MRProject         string    `json:"mr_project,omitempty"`
+	MRIID             int64     `json:"mr_iid,omitempty"`
+	MRURL             string    `json:"mr_url,omitempty"`
+	SourceBranch      string    `json:"source_branch,omitempty"`
+	MRCount           int       `json:"mr_count"`
+	StageBeforeKill   string    `json:"stage_before_kill,omitempty"`
+	StageAfterRestart string    `json:"stage_after_restart,omitempty"`
+	WorkerRestarts    int       `json:"worker_restarts"`
+	Recovered         bool      `json:"recovered"`
+	CapturedAt        time.Time `json:"captured_at"`
+}
+
+type gitLabMRIdentity struct {
+	IID          int64  `json:"iid"`
+	WebURL       string `json:"web_url"`
+	SourceBranch string `json:"source_branch"`
+}
+
+// runMRAwarenessKilltest kills only after the MR identity is durable in the
+// canonical run row. Its summary is also a recovery token: rerunning with the
+// same state and summary adopts that run instead of admitting another one.
+func runMRAwarenessKilltest(ctx context.Context, out io.Writer, o mrAwarenessOptions) error {
+	report := mrAwarenessSummary{Mode: string(pipeline.KilltestMRAwareness), Verdict: "FAIL", BacklogID: o.BacklogID, MRProject: o.GitLabProject, SourceBranch: o.SourceBranch, CapturedAt: time.Now().UTC()}
+	fail := func(code string, err error) error {
+		report.ReasonCode = code
+		if err != nil {
+			report.Detail = err.Error()
+		}
+		return writeMRAwarenessSummary(out, o.EvidencePath, report, err)
+	}
+	if strings.TrimSpace(o.WorkerCommand) == "" || strings.TrimSpace(o.StateDir) == "" || strings.TrimSpace(o.BacklogID) == "" ||
+		strings.TrimSpace(o.SourceBranch) == "" || strings.TrimSpace(o.AdminToken) == "" || strings.TrimSpace(o.GitLabToken) == "" || strings.TrimSpace(o.GitLabProject) == "" || o.Timeout <= 0 || o.Poll <= 0 || o.RecoveryMaxAge <= 0 {
+		return fail("invalid_configuration", errors.New("mr-awareness mode requires worker command, state dir, backlog id, source branch, admin token, GitLab token/project, and positive timeout/poll"))
+	}
+	stateDir, err := filepath.Abs(o.StateDir)
+	if err != nil {
+		return fail("invalid_configuration", err)
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fail("invalid_configuration", err)
+	}
+
+	// A valid prior summary is authoritative recovery evidence. Malformed or
+	// contradictory evidence fails closed; it is never silently replaced.
+	if data, readErr := os.ReadFile(o.EvidencePath); readErr == nil {
+		prior, code, recoveryErr := validateMRAwarenessRecovery(data, o, time.Now().UTC())
+		if prior.Mode != "" {
+			report = prior
+		}
+		report.Verdict, report.Passed, report.ReasonCode, report.Detail = "FAIL", false, "", ""
+		if recoveryErr != nil {
+			return fail(code, recoveryErr)
+		}
+		report.Recovered = true
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return fail("evidence_unavailable", readErr)
+	}
+
+	startWorker := func() (*exec.Cmd, error) {
+		cmd := exec.CommandContext(ctx, "sh", "-c", o.WorkerCommand)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = append(os.Environ(), "LOOM_MILLS_DB_PATH="+filepath.Join(stateDir, "mills.db"))
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		if err := waitOperator(ctx, o.OperatorURL, o.Timeout); err != nil {
+			_ = stopQueuedWorker(cmd, o.Timeout)
+			return nil, err
+		}
+		return cmd, nil
+	}
+	worker, err := startWorker()
+	if err != nil {
+		return fail("worker_start_failed", err)
+	}
+	defer func() { _ = stopQueuedWorker(worker, o.Timeout) }()
+	client := &http.Client{Timeout: minDuration(o.Timeout, 30*time.Second)}
+	if report.RunID == "" {
+		var started queuedProofStartResponse
+		if err := queuedAdmissionRequest(ctx, client, o.OperatorURL, o.AdminToken, http.MethodPost, "/api/mills/pipeline/runs/"+urlPathEscape(o.BacklogID)+"/start", nil, &started, http.StatusCreated); err != nil {
+			return fail("start_failed", err)
+		}
+		if started.RunID == "" || started.BacklogID != o.BacklogID {
+			return fail("mismatched_identity", errors.New("start returned contradictory run identity"))
+		}
+		report.RunID = started.RunID
+		if err := writeMRAwarenessSummary(io.Discard, o.EvidencePath, report, nil); err != nil {
+			return err
+		}
+	}
+
+	deadline := time.Now().Add(o.Timeout)
+	before, err := awaitMRAwarenessRun(ctx, client, o, report.RunID, deadline, true)
+	if err != nil {
+		return fail("mr_not_created", err)
+	}
+	if err := recoveredMRIdentityError(report, *before.MRIID); err != nil {
+		return fail("mismatched_identity", err)
+	}
+	report.StageBeforeKill, report.MRIID = before.CurrentStage, *before.MRIID
+	if !stageAtOrBeyondMR(before.CurrentStage) {
+		return fail("stage_regression", fmt.Errorf("MR identity appeared at stage %q before mr", before.CurrentStage))
+	}
+	if err := writeMRAwarenessSummary(io.Discard, o.EvidencePath, report, nil); err != nil {
+		return err
+	}
+	if err := killQueuedWorker(worker, o.Timeout); err != nil {
+		return fail("worker_kill_failed", err)
+	}
+	worker = nil
+	worker, err = startWorker()
+	if err != nil {
+		return fail("worker_restart_failed", err)
+	}
+	report.WorkerRestarts++
+	after, err := awaitMRAwarenessRun(ctx, client, o, report.RunID, deadline, false)
+	if err != nil {
+		return fail("restart_observation_failed", err)
+	}
+	report.StageAfterRestart = after.CurrentStage
+	if after.BacklogID != report.BacklogID || after.MRIID == nil || *after.MRIID != report.MRIID {
+		return fail("mismatched_identity", errors.New("run or MR identity changed after restart"))
+	}
+	if !stageAtOrBeyondMR(after.CurrentStage) {
+		return fail("stage_regression", fmt.Errorf("resumed at stage %q before mr", after.CurrentStage))
+	}
+	mrs, err := listBranchMRs(ctx, client, o, report.SourceBranch)
+	if err != nil {
+		return fail("gitlab_evidence_unavailable", err)
+	}
+	report.MRCount = len(mrs)
+	if len(mrs) != 1 {
+		return fail("mr_count_violation", fmt.Errorf("source branch %q has %d merge requests; want exactly 1", report.SourceBranch, len(mrs)))
+	}
+	if mrs[0].IID != report.MRIID || mrs[0].SourceBranch != report.SourceBranch {
+		return fail("mismatched_identity", errors.New("GitLab MR identity contradicts persisted run"))
+	}
+	report.MRURL, report.Verdict, report.Passed, report.ReasonCode, report.Detail = mrs[0].WebURL, "PASS", true, "", ""
+	return writeMRAwarenessSummary(out, o.EvidencePath, report, nil)
+}
+
+func recoveredMRIdentityError(report mrAwarenessSummary, observed int64) error {
+	if report.Recovered && report.MRIID > 0 && observed != report.MRIID {
+		return fmt.Errorf("recovered MR IID %d contradicts persisted run MR IID %d", report.MRIID, observed)
+	}
+	return nil
+}
+
+func validateMRAwarenessRecovery(data []byte, o mrAwarenessOptions, now time.Time) (mrAwarenessSummary, string, error) {
+	var prior mrAwarenessSummary
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&prior); err != nil || dec.Decode(&struct{}{}) != io.EOF {
+		return prior, "malformed_evidence", errors.New("existing MR-awareness recovery evidence is malformed")
+	}
+	if prior.CapturedAt.IsZero() || now.Sub(prior.CapturedAt) > o.RecoveryMaxAge || prior.CapturedAt.After(now.Add(time.Minute)) {
+		return prior, "stale_evidence", errors.New("existing MR-awareness recovery evidence is stale or future-dated")
+	}
+	if prior.Mode != string(pipeline.KilltestMRAwareness) || prior.BacklogID != o.BacklogID || prior.RunID == "" || prior.MRIID < 0 || prior.MRProject != o.GitLabProject ||
+		(o.SourceBranch != "" && prior.SourceBranch != o.SourceBranch) {
+		return prior, "mismatched_identity", errors.New("existing MR-awareness recovery evidence contradicts requested identity")
+	}
+	return prior, "", nil
+}
+
+func awaitMRAwarenessRun(ctx context.Context, client *http.Client, o mrAwarenessOptions, runID string, deadline time.Time, requireMR bool) (mrAwarenessRun, error) {
+	for time.Now().Before(deadline) {
+		var detail struct {
+			Run mrAwarenessRun `json:"run"`
+		}
+		err := queuedAdmissionRequest(ctx, client, o.OperatorURL, o.AdminToken, http.MethodGet, "/api/mills/pipeline/runs/"+urlPathEscape(runID), nil, &detail, http.StatusOK)
+		if err == nil && detail.Run.ID == runID && detail.Run.BacklogID == o.BacklogID && (!requireMR || detail.Run.MRIID != nil && *detail.Run.MRIID > 0) {
+			return detail.Run, nil
+		}
+		select {
+		case <-ctx.Done():
+			return mrAwarenessRun{}, ctx.Err()
+		case <-time.After(o.Poll):
+		}
+	}
+	return mrAwarenessRun{}, errors.New("timed out waiting for durable run/MR evidence")
+}
+
+func stageAtOrBeyondMR(stage string) bool {
+	mrIndex := -1
+	for i, candidate := range pipeline.DefaultStages {
+		if candidate.ID == "mr" {
+			mrIndex = i
+		}
+		if candidate.ID == stage {
+			return mrIndex >= 0 && i >= mrIndex
+		}
+	}
+	// A terminal run clears CurrentStage after completing the entire DAG.
+	return stage == ""
+}
+
+func listBranchMRs(ctx context.Context, client *http.Client, o mrAwarenessOptions, branch string) ([]gitLabMRIdentity, error) {
+	if strings.TrimSpace(branch) == "" {
+		return nil, errors.New("source branch is missing from recovery evidence")
+	}
+	path := strings.TrimRight(o.GitLabURL, "/") + "/projects/" + urlPathEscape(o.GitLabProject) + "/merge_requests?scope=all&source_branch=" + urlQueryEscape(branch) + "&per_page=100"
+	var mrs []gitLabMRIdentity
+	if err := queuedAdmissionRequest(ctx, client, path, o.GitLabToken, http.MethodGet, "", nil, &mrs, http.StatusOK); err != nil {
+		return nil, err
+	}
+	return mrs, nil
+}
+
+func writeMRAwarenessSummary(out io.Writer, path string, report mrAwarenessSummary, cause error) error {
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	if path != "" {
+		if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+			return fmt.Errorf("write MR-awareness summary: %w", err)
+		}
+	}
+	if out != nil {
+		if _, err := fmt.Fprintf(out, "%s\n", encoded); err != nil {
+			return err
+		}
+	}
+	return cause
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+func urlPathEscape(s string) string  { return url.PathEscape(s) }
+func urlQueryEscape(s string) string { return url.QueryEscape(s) }
 
 func verifyAndSealGateSummary(
 	path string,

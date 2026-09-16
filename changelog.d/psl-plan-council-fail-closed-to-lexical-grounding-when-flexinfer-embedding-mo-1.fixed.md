@@ -1,0 +1,1 @@
+- Classify FlexInfer cold-start responses as retryable model-not-ready errors while preserving HTTP status details in `pkg/flexinfer/client.go`.

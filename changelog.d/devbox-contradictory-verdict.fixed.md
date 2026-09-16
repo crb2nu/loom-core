@@ -1,0 +1,1 @@
+- Devbox tests-stage verdicts fail closed on contradictory check results: a not-passed gate with every check exit-0 is classified as an infrastructure contradiction instead of a code failure.

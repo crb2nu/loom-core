@@ -57,6 +57,10 @@ export async function runCodexDriver(args: DriverArgs): Promise<number> {
   if (args.workingDir) {
     threadOptions.workingDirectory = args.workingDir;
   }
+  if (args.model) {
+    // Same pin the CLI path applies via `codex exec --model`.
+    threadOptions.model = args.model;
+  }
 
   if (args.multiTurn) {
     return runMultiTurn(args, threadOptions);

@@ -196,6 +196,14 @@ const (
 	AuthModeMissing AuthMode = "missing"
 )
 
+// AuthFailure records an account exclusion without storing credential values.
+type AuthFailure struct {
+	Account string    `json:"account"` // Secret key name only.
+	Outcome string    `json:"outcome"`
+	At      time.Time `json:"at"`
+	ResetAt time.Time `json:"reset_at,omitempty"`
+}
+
 // State holds the state of a spawned agent.
 type State struct {
 	SpawnID string `json:"spawn_id"`
@@ -224,6 +232,24 @@ type State struct {
 	// AuthMode records which cluster credential path the pod was
 	// configured to use. Populated by the orchestrator before pod start.
 	AuthMode AuthMode `json:"auth_mode,omitempty"`
+	// AuthAccount names which cluster credential the pod was given when the
+	// vendor has more than one subscription on file — the cluster-agent-auth
+	// key, e.g. "claude-oauth-token-2" (see SPAWN_CLAUDE_OAUTH_TOKEN_KEYS).
+	// Empty means the vendor's single default credential.
+	AuthAccount string `json:"auth_account,omitempty"`
+	// AuthOutcome is oauth_rejected, oauth_quota, api_billing, api_auth, or
+	// unknown; empty means not classified.
+	AuthOutcome      string        `json:"auth_outcome,omitempty"`
+	AuthFailures     []AuthFailure `json:"auth_failures,omitempty"`
+	AuthFallbackAt   *time.Time    `json:"auth_fallback_at,omitempty"`
+	AuthFallbackFrom string        `json:"auth_fallback_from,omitempty"` // Previous auth mode, e.g. cluster_oauth.
+	// AuthRetryPending marks a spawn whose runtime is being replaced after an
+	// auth failure: the lifecycle relaunches it under the rewritten AuthMode
+	// and AuthAccount, and Reconcile leaves the row alone until then.
+	AuthRetryPending bool `json:"auth_retry_pending,omitempty"`
+	// AuthFallbackLimit travels with a cross-mode reservation so shared stores
+	// enforce the daily cap inside their own transaction.
+	AuthFallbackLimit int `json:"auth_fallback_limit,omitempty"`
 	// CleanupAt records when the terminal hook ran for this spawn. Used
 	// by the reconciler to fire the hook at most once per spawn — without
 	// this, every Reconcile tick after termination would re-attempt
@@ -404,4 +430,18 @@ func RuntimeIdentityLabelsForState(state *State) map[string]string {
 		return nil
 	}
 	return RuntimeIdentityLabels(state.SpawnID, state.AgentID, state.DriverOwnerID, state.StartedAt)
+}
+
+// retainAuthState preserves the daily UTC fallback ledger and live account
+// exclusions even after a spawn has completed.
+func retainAuthState(state *State, now time.Time) bool {
+	if state.AuthFallbackAt != nil && state.AuthFallbackAt.UTC().Format(time.DateOnly) == now.UTC().Format(time.DateOnly) {
+		return true
+	}
+	for _, failure := range state.AuthFailures {
+		if failure.ResetAt.After(now) {
+			return true
+		}
+	}
+	return false
 }

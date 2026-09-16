@@ -183,9 +183,10 @@ func (s *FileStore) PruneCompleted(ctx context.Context, maxAge time.Duration) er
 	if err != nil {
 		return err
 	}
-	cutoff := time.Now().Add(-maxAge)
+	now := time.Now()
+	cutoff := now.Add(-maxAge)
 	for _, st := range states {
-		if !IsTerminal(st.Status) {
+		if !IsTerminal(st.Status) || retainAuthState(st, now) {
 			continue
 		}
 		if st.EndedAt != nil && st.EndedAt.Before(cutoff) {
@@ -284,7 +285,10 @@ func (s *K8sConfigMapStore) Save(ctx context.Context, state *State) error {
 
 	var mergeErr error
 	err = s.mutateCM(ctx, configMapMutationSave, func(entries map[string]string) bool {
-		mergeErr = nil
+		mergeErr = checkAuthEntries(entries, state)
+		if mergeErr != nil {
+			return false
+		}
 		existingData, exists := entries[state.SpawnID]
 		if !exists {
 			entries[state.SpawnID] = string(incomingData)
@@ -358,6 +362,9 @@ func mergeK8sSpawnState(existingData string, incoming *State) (*State, bool, err
 		return &claimed, true, nil
 	}
 
+	if len(incoming.AuthFailures) < len(existing.AuthFailures) || (existing.AuthFallbackAt != nil && (incoming.AuthFallbackAt == nil || !incoming.AuthFallbackAt.Equal(*existing.AuthFallbackAt))) {
+		return nil, false, fmt.Errorf("%w: stale auth attempt for %s", ErrSpawnStateConflict, incoming.SpawnID)
+	}
 	existingKey := existing.Request.IdempotencyKey
 	incomingKey := incoming.Request.IdempotencyKey
 	switch {
@@ -411,8 +418,10 @@ func mergeK8sSpawnState(existingData string, incoming *State) (*State, bool, err
 	if existing.SessionID != "" {
 		merged.SessionID = existing.SessionID
 	}
-	if existing.AuthMode != "" {
+	// An authoritative same-generation writer may update the final auth pair.
+	if merged.AuthMode == "" {
 		merged.AuthMode = existing.AuthMode
+		merged.AuthAccount = existing.AuthAccount
 	}
 	if existing.PodName != "" && merged.PodName == "" {
 		merged.PodName = existing.PodName
@@ -604,12 +613,13 @@ func pruneTerminalEntriesOldestFirst(
 		at    time.Time
 	}
 	var candidates []candidate
+	now := time.Now()
 	for id, raw := range next.Data {
 		if exclude[id] {
 			continue
 		}
 		var state State
-		if err := json.Unmarshal([]byte(raw), &state); err != nil || !IsTerminal(state.Status) {
+		if err := json.Unmarshal([]byte(raw), &state); err != nil || !IsTerminal(state.Status) || retainAuthState(&state, now) {
 			continue
 		}
 		at := state.StartedAt

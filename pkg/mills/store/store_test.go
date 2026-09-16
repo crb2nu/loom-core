@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,19 @@ func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := Open(context.Background(), Options{Path: filepath.Join(dir, "mills.db")})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func newTestStoreWithOptions(t *testing.T, opts Options) *Store {
+	t.Helper()
+	if opts.Path == "" {
+		opts.Path = filepath.Join(t.TempDir(), "mills.db")
+	}
+	st, err := Open(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -54,6 +68,42 @@ func TestOpen_AppliesMigrations(t *testing.T) {
 			t.Errorf("backlog_items.%s missing: count=%d err=%v", column, count, err)
 		}
 	}
+}
+
+func TestHotReadIndexes_FreshAndUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mills.db")
+	st, err := Open(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"idx_kpi_window_snapshot"}
+	assertIndexes := func(db *sql.DB) {
+		t.Helper()
+		for _, name := range want {
+			var got string
+			if err := db.QueryRowContext(context.Background(), `SELECT name FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&got); err != nil {
+				t.Errorf("index %s missing: %v", name, err)
+			}
+		}
+	}
+	assertIndexes(st.DB())
+	for _, name := range want {
+		if _, err := st.DB().ExecContext(context.Background(), `DROP INDEX `+name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.DB().ExecContext(context.Background(), `DELETE FROM schema_migrations WHERE version=30`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("reopen pre-030 database: %v", err)
+	}
+	defer st.Close()
+	assertIndexes(st.DB())
 }
 
 func TestBacklog_RoundTrip(t *testing.T) {
@@ -567,6 +617,29 @@ func TestKPI_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestKPI_RangeBoundAndDeadline(t *testing.T) {
+	st := newTestStoreWithOptions(t, Options{KPIReadLimit: 3})
+	ctx := context.Background()
+	base := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		if err := st.KPI.RecordSnapshot(ctx, &KPISnapshot{SnapshotAt: base.Add(time.Duration(i) * time.Minute), WindowSeconds: 60, Metrics: map[string]any{"i": i}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.KPI.Range(ctx, 60, base.Add(-time.Minute), base.Add(time.Hour))
+	if err != nil || len(got) != 3 {
+		t.Fatalf("Range = %d rows, %v; want 3", len(got), err)
+	}
+	if !got[0].SnapshotAt.Before(got[1].SnapshotAt) || !got[1].SnapshotAt.Before(got[2].SnapshotAt) {
+		t.Fatalf("Range order = %v, %v, %v", got[0].SnapshotAt, got[1].SnapshotAt, got[2].SnapshotAt)
+	}
+	expired, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer cancel()
+	if _, err := st.KPI.Range(expired, 60, base, base.Add(time.Hour)); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "kpi range") {
+		t.Fatalf("expired Range error = %v", err)
+	}
+}
+
 func TestEval_RoundTrip(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -627,6 +700,30 @@ func TestEvents_RoundTrip(t *testing.T) {
 	all, err := st.Events.ListSince(ctx, time.Now().Add(-time.Hour), 10)
 	if err != nil || len(all) != 3 {
 		t.Errorf("since: err=%v len=%d", err, len(all))
+	}
+}
+
+func TestEvents_ListSinceBoundAndDeadline(t *testing.T) {
+	st := newTestStoreWithOptions(t, Options{EventReadLimit: 3})
+	ctx := context.Background()
+	base := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		if err := st.Events.Append(ctx, &Event{OccurredAt: base.Add(time.Duration(i) * time.Minute), Actor: "test", Kind: "hot-read"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.Events.ListSince(ctx, base.Add(-time.Minute), 100)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("ListSince = %d rows, %v; want 3", len(got), err)
+	}
+	if !got[0].OccurredAt.After(got[1].OccurredAt) || !got[1].OccurredAt.After(got[2].OccurredAt) {
+		t.Fatalf("ListSince order = %v, %v, %v", got[0].OccurredAt, got[1].OccurredAt, got[2].OccurredAt)
+	}
+	expired, cancel := context.WithTimeout(ctx, time.Nanosecond)
+	time.Sleep(time.Millisecond)
+	defer cancel()
+	if _, err := st.Events.ListSince(expired, base, 10); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "event list-since") {
+		t.Fatalf("expired ListSince error = %v", err)
 	}
 }
 
@@ -849,6 +946,22 @@ func TestPipeline_LatestMergedAt(t *testing.T) {
 	put("DONE-OLD", PipelineDone, now.Add(-48*time.Hour))
 	put("ESC-NEW", PipelineEscalated, now.Add(-1*time.Minute))
 	put("DONE-NEW", PipelineDone, now.Add(-2*time.Hour))
+	// An external merge-queue placeholder row is `done` from enqueue time and
+	// gets ended_at stamped even when the candidate is EVICTED; it must never
+	// advance "last merge" past the newest real pipeline merge.
+	externalEnded := now.Add(-5 * time.Minute)
+	if err := st.Backlog.Put(ctx, &BacklogItem{
+		ID: "external-mq-newest", Title: "External merge candidate", State: BacklogRetired,
+		Priority: P2, CreatedBy: "mrwatch_shepherd",
+	}); err != nil {
+		t.Fatalf("put external backlog: %v", err)
+	}
+	if err := st.Pipeline.PutRun(ctx, &PipelineRun{
+		ID: "external-mq-newest", BacklogID: "external-mq-newest", Template: PipelineTemplateExternalMerge,
+		State: PipelineDone, Attempts: 1, StartedAt: externalEnded.Add(-time.Minute), EndedAt: &externalEnded,
+	}); err != nil {
+		t.Fatalf("put external run: %v", err)
+	}
 
 	got, err = st.Pipeline.LatestMergedAt(ctx)
 	if err != nil {

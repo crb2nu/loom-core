@@ -47,11 +47,18 @@ const GhostSparkClosedEventKind = "reconciler.ghost_spark_closed"
 // from clean merges.
 const RunVerdictClassMergedAfterEscalation = "merged_after_escalation"
 
+// RunVerdictKindMergeQueueSettled is appended by the merge-queue processor
+// when a settle lands an MR whose owning pipeline run had already escalated
+// (stage-wait timeout, eviction whose re-enqueue merged, external candidate).
+// The literal is duplicated in pkg/mills/mergequeue (import direction); a
+// sync test pins the pair.
+const RunVerdictKindMergeQueueSettled = RunVerdictEventKindPrefix + "mergequeue_settled"
+
 // RunVerdictCorrectionKinds lists every event kind that supersedes an
 // escalated run's verdict, for bulk window scans (the foreman storm rule,
 // KPI writer, and guard reports read corrections in one filtered query).
 func RunVerdictCorrectionKinds() []string {
-	return []string{RunVerdictKindGhostSparkMerged, RunVerdictKindOperatorOverride, GhostSparkClosedEventKind}
+	return []string{RunVerdictKindGhostSparkMerged, RunVerdictKindOperatorOverride, RunVerdictKindMergeQueueSettled, GhostSparkClosedEventKind}
 }
 
 // runVerdictKindLister is the narrow events read the bulk resolver needs.

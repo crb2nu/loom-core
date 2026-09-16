@@ -163,7 +163,11 @@ func (o *SpawnOrchestrator) runHeartbeatLoop(ctx context.Context, state *SpawnSt
 				return
 			}
 			agentID := live.AgentID
-			task := live.Request.TaskDescription
+			// The full task description is a prompt (Mills implement prompts
+			// open with a shouting section header); the presence heartbeat
+			// carries a one-line label so fleet/Deck rows read as a task, and
+			// falls back to the branch when no line qualifies.
+			task := compactTaskLabel(live.Request.TaskDescription)
 			branch := live.Request.Branch
 			o.driversMu.Unlock()
 			if o.agentBridge == nil {

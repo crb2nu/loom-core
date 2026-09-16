@@ -11,6 +11,66 @@ import (
 	"time"
 )
 
+type processObserverFakeClock struct {
+	mu         sync.Mutex
+	now        time.Time
+	waiters    []processObserverFakeWaiter
+	registered chan struct{}
+}
+
+type processObserverFakeWaiter struct {
+	at time.Time
+	ch chan time.Time
+}
+
+func newProcessObserverFakeClock(now time.Time) *processObserverFakeClock {
+	return &processObserverFakeClock{now: now, registered: make(chan struct{}, 16)}
+}
+
+func (c *processObserverFakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *processObserverFakeClock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	c.waiters = append(c.waiters, processObserverFakeWaiter{at: c.now.Add(d), ch: ch})
+	select {
+	case c.registered <- struct{}{}:
+	default:
+	}
+	return ch
+}
+
+func (c *processObserverFakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	now := c.now
+	pending := c.waiters[:0]
+	for _, waiter := range c.waiters {
+		if !waiter.at.After(now) {
+			waiter.ch <- now
+			close(waiter.ch)
+			continue
+		}
+		pending = append(pending, waiter)
+	}
+	c.waiters = pending
+	c.mu.Unlock()
+}
+
+func waitForProcessObserverTimer(t *testing.T, clock *processObserverFakeClock) {
+	t.Helper()
+	select {
+	case <-clock.registered:
+	case <-time.After(time.Second):
+		t.Fatal("observer did not register its next fake-clock timer")
+	}
+}
+
 func TestCanaryProcessObserverStartsSynchronouslyAndCapturesRolloutViolation(t *testing.T) {
 	h := New(Config{ProcessPollInterval: time.Millisecond, ProcessMaxSampleGap: time.Second})
 	h.kubectlFn = func(_ context.Context, args ...string) (string, error) {
@@ -225,10 +285,13 @@ func TestCanaryProcessObserverRejectsMissingInitialProcessProof(t *testing.T) {
 
 func TestCanaryProcessObserverUsesProbeStartForCadenceDeadline(t *testing.T) {
 	const (
-		maxGap       = 80 * time.Millisecond
-		transportLag = 55 * time.Millisecond
+		maxGap       = 800 * time.Millisecond
+		transportLag = 550 * time.Millisecond
 	)
+	clock := newProcessObserverFakeClock(time.Now().UTC())
 	h := New(Config{ProcessPollInterval: time.Millisecond, ProcessMaxSampleGap: maxGap})
+	h.processObserverNow = clock.Now
+	h.processObserverAfter = clock.After
 	h.kubectlFn = func(_ context.Context, args ...string) (string, error) {
 		if strings.Contains(strings.Join(args, " "), "--field-selector metadata.name=spawn-abc") {
 			return spawnPodListJSON("spawn-abc", "uid-1", "Running"), nil
@@ -239,12 +302,12 @@ func TestCanaryProcessObserverUsesProbeStartForCadenceDeadline(t *testing.T) {
 	var firstResponseAt time.Time
 	h.processProbeFn = func(context.Context, string, int, uint64, int, uint64) (CanaryProcessSample, error) {
 		call := probes.Add(1)
-		sample := processObserverSample(time.Now().UTC())
+		sample := processObserverSample(clock.Now())
 		// Model a transport that captures the remote snapshot immediately, then
 		// returns it late without honoring context cancellation.
-		time.Sleep(transportLag)
+		clock.Advance(transportLag)
 		if call == 1 {
-			firstResponseAt = time.Now().UTC()
+			firstResponseAt = clock.Now()
 		}
 		if call > 2 {
 			return CanaryProcessSample{}, errors.New("cadence deadline allowed a third probe")
@@ -252,11 +315,13 @@ func TestCanaryProcessObserverUsesProbeStartForCadenceDeadline(t *testing.T) {
 		return sample, nil
 	}
 
-	crashAt := time.Now().UTC()
+	crashAt := clock.Now()
 	observer, err := h.StartCanaryProcessObservation(context.Background(), "abc", processObserverInitial(), crashAt)
 	if err != nil {
 		t.Fatalf("StartCanaryProcessObservation() error = %v", err)
 	}
+	waitForProcessObserverTimer(t, clock)
+	clock.Advance(time.Millisecond)
 	select {
 	case <-observer.done:
 	case <-time.After(500 * time.Millisecond):
@@ -426,8 +491,11 @@ func TestProcessObserverRejectsCompletedExecutionBeforeCrashBDelete(t *testing.T
 }
 
 func TestCanaryProcessObserverRejectsOverdueInFlightProbe(t *testing.T) {
-	const maxGap = 30 * time.Millisecond
+	const maxGap = 300 * time.Millisecond
+	clock := newProcessObserverFakeClock(time.Now().UTC())
 	h := New(Config{ProcessPollInterval: time.Millisecond, ProcessMaxSampleGap: maxGap})
+	h.processObserverNow = clock.Now
+	h.processObserverAfter = clock.After
 	h.kubectlFn = func(_ context.Context, args ...string) (string, error) {
 		if strings.Contains(strings.Join(args, " "), "--field-selector metadata.name=spawn-abc") {
 			return spawnPodListJSON("spawn-abc", "uid-1", "Running"), nil
@@ -444,27 +512,29 @@ func TestCanaryProcessObserverRejectsOverdueInFlightProbe(t *testing.T) {
 	h.processProbeFn = func(ctx context.Context, _ string, _ int, _ uint64, _ int, _ uint64) (CanaryProcessSample, error) {
 		probes++
 		if probes == 1 {
-			return processObserverSample(time.Now().UTC()), nil
+			return processObserverSample(clock.Now()), nil
 		}
 		deadline, hasDeadline := ctx.Deadline()
-		remaining := time.Until(deadline)
+		remaining := deadline.Sub(clock.Now())
 		blocked <- hasDeadline && remaining > 0 && remaining <= maxGap
 		<-release
-		return processObserverSample(time.Now().UTC()), nil
+		return processObserverSample(clock.Now()), nil
 	}
 
-	crashAt := time.Now().UTC()
+	crashAt := clock.Now()
 	observer, err := h.StartCanaryProcessObservation(context.Background(), "abc", processObserverInitial(), crashAt)
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitForProcessObserverTimer(t, clock)
+	clock.Advance(time.Millisecond)
 	var hasDeadline bool
 	select {
 	case hasDeadline = <-blocked:
 	case <-time.After(time.Second):
 		t.Fatal("observer did not enter its second process probe")
 	}
-	time.Sleep(2 * maxGap)
+	clock.Advance(2 * maxGap)
 
 	ev := Evidence{SpawnPodName: "spawn-abc", CrashBAt: crashAt, CanaryHoldInitial: processObserverInitial()}
 	activeErr := observer.AssertActiveFreshForDelete()
@@ -601,7 +671,10 @@ func TestCanaryProcessObserverRejectsConfiguredGapAboveEvidenceContract(t *testi
 }
 
 func TestCanaryProcessObserverRejectsRuntimeSamplingGap(t *testing.T) {
+	clock := newProcessObserverFakeClock(time.Now().UTC())
 	h := New(Config{ProcessPollInterval: time.Millisecond, ProcessMaxSampleGap: 20 * time.Millisecond})
+	h.processObserverNow = clock.Now
+	h.processObserverAfter = clock.After
 	h.kubectlFn = func(_ context.Context, args ...string) (string, error) {
 		if strings.Contains(strings.Join(args, " "), "--field-selector metadata.name=spawn-abc") {
 			return spawnPodListJSON("spawn-abc", "uid-1", "Running"), nil
@@ -612,17 +685,23 @@ func TestCanaryProcessObserverRejectsRuntimeSamplingGap(t *testing.T) {
 	h.processProbeFn = func(context.Context, string, int, uint64, int, uint64) (CanaryProcessSample, error) {
 		probes++
 		if probes > 1 {
-			time.Sleep(40 * time.Millisecond)
+			clock.Advance(40 * time.Millisecond)
 		}
-		return processObserverSample(time.Now().UTC()), nil
+		return processObserverSample(clock.Now()), nil
 	}
 
-	crashAt := time.Now().UTC()
+	crashAt := clock.Now()
 	observer, err := h.StartCanaryProcessObservation(context.Background(), "abc", processObserverInitial(), crashAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-observer.done
+	waitForProcessObserverTimer(t, clock)
+	clock.Advance(time.Millisecond)
+	select {
+	case <-observer.done:
+	case <-time.After(time.Second):
+		t.Fatal("observer did not terminate after fake-clock sampling-gap breach")
+	}
 	ev := Evidence{SpawnPodName: "spawn-abc", CrashBAt: crashAt, CanaryHoldInitial: processObserverInitial()}
 	if err := observer.Record(&ev); err == nil || !strings.Contains(err.Error(), "sampling gap") {
 		t.Fatalf("runtime cadence gap accepted: error=%v evidence=%+v", err, ev)
@@ -784,7 +863,10 @@ func TestCanaryProcessObserverBoundsHungProbeAttempt(t *testing.T) {
 // failing, no sample completes inside ProcessMaxSampleGap and beginSample
 // reports the gap breach as a fatal observation error.
 func TestCanaryProcessObserverPersistentTransportFailureBreachesGap(t *testing.T) {
+	clock := newProcessObserverFakeClock(time.Now().UTC())
 	h := New(Config{ProcessPollInterval: time.Millisecond, ProcessMaxSampleGap: 30 * time.Millisecond})
+	h.processObserverNow = clock.Now
+	h.processObserverAfter = clock.After
 	var reads atomic.Int64
 	h.kubectlFn = func(_ context.Context, args ...string) (string, error) {
 		if reads.Add(1) == 1 {
@@ -796,17 +878,25 @@ func TestCanaryProcessObserverPersistentTransportFailureBreachesGap(t *testing.T
 	h.processProbeFn = func(context.Context, string, int, uint64, int, uint64) (CanaryProcessSample, error) {
 		probes++
 		if probes == 1 {
-			return processObserverSample(time.Now().UTC()), nil
+			return processObserverSample(clock.Now()), nil
 		}
 		return CanaryProcessSample{}, errors.New("probe should not be reached after pod reads fail")
 	}
 
-	crashAt := time.Now().UTC()
+	crashAt := clock.Now()
 	observer, err := h.StartCanaryProcessObservation(context.Background(), "abc", processObserverInitial(), crashAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-observer.done
+	waitForProcessObserverTimer(t, clock)
+	clock.Advance(time.Millisecond)
+	waitForProcessObserverTimer(t, clock)
+	clock.Advance(29 * time.Millisecond)
+	select {
+	case <-observer.done:
+	case <-time.After(time.Second):
+		t.Fatal("observer did not terminate after fake-clock persistent-outage gap breach")
+	}
 	ev := Evidence{SpawnPodName: "spawn-abc", CrashBAt: crashAt, CanaryHoldInitial: processObserverInitial()}
 	_ = observer.Record(&ev)
 	if len(ev.ObservationErrors) == 0 {

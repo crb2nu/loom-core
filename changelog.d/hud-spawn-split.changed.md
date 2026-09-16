@@ -1,0 +1,1 @@
+- Split `internal/hud/spawn.go` process and backend wiring into `internal/hud/spawn_process.go`, keeping orchestration and configuration concerns isolated without changing behavior.

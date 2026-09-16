@@ -584,6 +584,87 @@ func registerTestClient(t *testing.T, s *OAuthServer, redirectURI string) string
 	return client.ClientID
 }
 
+func TestOAuthCIMDAuthorizationCodeFlow(t *testing.T) {
+	const redirectURI = "http://localhost:8765/callback"
+	var clientID string
+	metadataServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id":%q,"redirect_uris":[%q],"token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"],"code_challenge_methods_supported":["S256"]}`, clientID, redirectURI)
+	}))
+	defer metadataServer.Close()
+	clientID = strings.Replace(metadataServer.URL, "127.0.0.1", "client.example", 1)
+
+	s := newTestOAuthServer(t)
+	s.cimd = testCIMDResolver(metadataServer)
+	verifier := "cimd-test-verifier-with-sufficient-entropy"
+	authURL := "/oauth2/authorize?response_type=code&client_id=" + url.QueryEscape(clientID) +
+		"&redirect_uri=" + url.QueryEscape(redirectURI) +
+		"&code_challenge=" + url.QueryEscape(pkceS256(verifier)) +
+		"&code_challenge_method=S256&state=cimd-state"
+	w := httptest.NewRecorder()
+	s.HandleAuthorize(w, httptest.NewRequest(http.MethodGet, authURL, nil))
+	if w.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d, body: %s", w.Code, w.Body.String())
+	}
+	location, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	if err := validateAuthorizationIssuer(s.issuer, location.Query().Get("iss")); err != nil {
+		t.Fatalf("validate RFC 9207 issuer: %v", err)
+	}
+	if location.Query().Get("state") != "cimd-state" {
+		t.Fatalf("state = %q", location.Query().Get("state"))
+	}
+	code := location.Query().Get("code")
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {verifier},
+		"client_id":     {clientID},
+	}
+	w = httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.HandleToken(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("token status = %d, body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestOAuthCIMDRedirectMismatch(t *testing.T) {
+	const registeredRedirect = "http://localhost:8765/callback"
+	var clientID string
+	metadataServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id":%q,"redirect_uris":[%q],"token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"],"code_challenge_methods_supported":["S256"]}`, clientID, registeredRedirect)
+	}))
+	defer metadataServer.Close()
+	clientID = strings.Replace(metadataServer.URL, "127.0.0.1", "client.example", 1)
+	s := newTestOAuthServer(t)
+	s.cimd = testCIMDResolver(metadataServer)
+	authURL := "/oauth2/authorize?response_type=code&client_id=" + url.QueryEscape(clientID) +
+		"&redirect_uri=" + url.QueryEscape("http://localhost:9999/wrong") +
+		"&code_challenge=" + url.QueryEscape(pkceS256("verifier")) + "&code_challenge_method=S256"
+	w := httptest.NewRecorder()
+	s.HandleAuthorize(w, httptest.NewRequest(http.MethodGet, authURL, nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestValidateAuthorizationIssuer(t *testing.T) {
+	if err := validateAuthorizationIssuer("https://issuer.example", "https://issuer.example"); err != nil {
+		t.Fatalf("matching issuer rejected: %v", err)
+	}
+	for _, received := range []string{"", "https://attacker.example"} {
+		if err := validateAuthorizationIssuer("https://issuer.example", received); err == nil {
+			t.Fatalf("issuer %q accepted", received)
+		}
+	}
+}
+
 func getAuthCode(t *testing.T, s *OAuthServer, clientID, redirectURI, challenge string) string {
 	t.Helper()
 	authURL := "/oauth2/authorize?response_type=code&client_id=" + clientID +

@@ -6,10 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/crb2nu/loom/pkg/mills/sigfp"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -35,10 +38,37 @@ const (
 // entries in the same normalized form stored in candidate events so additions
 // are easy to review alongside observed miner output.
 var signatureMiningStopPhrases = map[string]struct{}{
-	"go test <path>":               {},
-	"go test <path> <path>":        {},
-	"go test <path> <path> <path>": {},
+	"cargo test":        {},
+	"git status":        {},
+	"go build":          {},
+	"go fmt":            {},
+	"go test":           {},
+	"go vet":            {},
+	"golangci lint run": {},
+	"gradle test":       {},
+	"make":              {},
+	"make test":         {},
+	"mvn test":          {},
+	"npm run test":      {},
+	"npm test":          {},
+	"pnpm test":         {},
+	"python m pytest":   {},
+	"terraform plan":    {},
+	"yarn test":         {},
 }
+
+// signatureMiningExactStopPhrases are failure words and fragments that carry
+// no distinguishing information on their own. Unlike command stop phrases,
+// these only match the complete normalized candidate so a useful phrase such
+// as "error openrouter http <num> insufficient credits" remains eligible.
+var signatureMiningExactStopPhrases = map[string]struct{}{
+	"context deadline exceeded": {},
+	"error":                     {},
+	"exit status <num>":         {},
+	"failed":                    {},
+}
+
+var signatureMiningUnixTimestampPattern = regexp.MustCompile(`^\d{10}(?:\d{3})?$`)
 
 const (
 	// DefaultSignatureMiningInterval is how often the sweep runs when the
@@ -255,12 +285,108 @@ func (r *Reconciler) appendSignatureCandidate(
 	return appended, err
 }
 
-// isSignatureMiningStopPhrase normalizes its input before lookup so callers
-// cannot bypass the guard with case, punctuation, or concrete path variants.
+// isSignatureMiningStopPhrase rejects shapes that identify an invocation or
+// occurrence, but say nothing about why it failed. It normalizes before
+// inspecting command fragments so case, punctuation, and concrete arguments
+// cannot bypass the guard.
 func isSignatureMiningStopPhrase(phrase string) bool {
-	normalized := strings.Join(normalizeEvidenceTokens(phrase), " ")
-	_, stopped := signatureMiningStopPhrases[normalized]
-	return stopped
+	if !sigfp.EligibleCandidate(phrase) {
+		return true
+	}
+
+	// Keep angle brackets: callers on the persistence path pass already
+	// normalized phrases whose variable tokens are rendered as <path>, <uuid>,
+	// and peers.
+	trimmed := strings.Trim(strings.TrimSpace(phrase), "[](){},;\"'")
+	if isSignatureMiningTimestamp(trimmed) {
+		return true
+	}
+
+	tokens := normalizeEvidenceTokens(trimmed)
+	if len(tokens) == 0 {
+		return true
+	}
+	if _, stopped := signatureMiningExactStopPhrases[strings.Join(tokens, " ")]; stopped {
+		return true
+	}
+	allPlaceholders := true
+	for _, token := range tokens {
+		if !isSignaturePlaceholder(token) {
+			allPlaceholders = false
+			break
+		}
+	}
+	if allPlaceholders || isNormalizedTimestampShape(tokens) {
+		return true
+	}
+
+	for command := range signatureMiningStopPhrases {
+		commandTokens := strings.Fields(command)
+		if len(tokens) < len(commandTokens) {
+			continue
+		}
+		matched := true
+		for i, token := range commandTokens {
+			if tokens[i] != token {
+				matched = false
+				break
+			}
+		}
+		if matched && signatureMiningGenericArguments(tokens[len(commandTokens):]) {
+			return true
+		}
+	}
+	return false
+}
+
+func signatureMiningGenericArguments(tokens []string) bool {
+	for _, token := range tokens {
+		if !isSignaturePlaceholder(token) && token != "all" && token != "run" &&
+			token != "short" && token != "verbose" {
+			return false
+		}
+	}
+	return true
+}
+
+func isSignatureMiningTimestamp(value string) bool {
+	if signatureMiningUnixTimestampPattern.MatchString(value) {
+		seconds := value
+		if len(seconds) == 13 {
+			seconds = seconds[:10]
+		}
+		_, err := strconv.ParseInt(seconds, 10, 64)
+		return err == nil
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano, time.RFC1123, time.RFC1123Z, time.RFC822, time.RFC822Z,
+		"2006-01-02 15:04:05", "2006-01-02 15:04:05.999999999", "2006-01-02",
+	} {
+		if _, err := time.Parse(layout, value); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func isNormalizedTimestampShape(tokens []string) bool {
+	hasVariable := false
+	for _, token := range tokens {
+		if isSignaturePlaceholder(token) {
+			hasVariable = true
+			continue
+		}
+		switch token {
+		case "am", "pm", "t", "utc", "gmt", "z",
+			"mon", "monday", "tue", "tues", "tuesday", "wed", "wednesday",
+			"thu", "thur", "thurs", "thursday", "fri", "friday", "sat", "saturday", "sun", "sunday",
+			"jan", "january", "feb", "february", "mar", "march", "apr", "april", "may", "jun", "june",
+			"jul", "july", "aug", "august", "sep", "sept", "september", "oct", "october", "nov", "november", "dec", "december":
+		default:
+			return false
+		}
+	}
+	return hasVariable
 }
 
 // signaturePhraseFingerprint is the durable identity of a proposal. It hashes

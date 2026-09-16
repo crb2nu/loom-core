@@ -2,11 +2,18 @@
   /**
    * SparksPanel — the broken picks that flew off the loom (spec §3.3).
    *
-   * Surfaces every escalated run as a spark with *why* it flew (its failing
-   * gate names + reasons, resolved lazily in the background) and a one-click
-   * requeue. Active escalations come from the live run poll; today's struck
-   * sparks come from the terminal archive (millsStore.fetchArchiveRuns — NEVER
-   * pipelineHistory, which the loom diffs into weave events, house rule #9).
+   * Leads with what still needs a human — millsStore.openSparks, one run per
+   * backlog item whose CURRENT state is escalated/paused — and keeps the
+   * all-time escalation history (millsStore.escalatedRuns, every attempt of
+   * every item, merged or retired since) behind an explicit "history" scope.
+   * The header count, the nav badge, and the floor spine all read openSparks,
+   * so the screen carries one spark number with one meaning.
+   *
+   * Each spark shows *why* it flew (its failing gate names + reasons, resolved
+   * lazily in the background) and a one-click requeue. Active escalations come
+   * from the live run poll; today's struck sparks come from the terminal
+   * archive (millsStore.fetchArchiveRuns — NEVER pipelineHistory, which the
+   * loom diffs into weave events, house rule #9).
    *
    * Requeue reflects the full RequeueOutcome per row: a 409 ghost-spark
    * (already merged/done) and a 403 policy/token refusal render as their own
@@ -41,12 +48,20 @@
 
   // "why" enrichment: runID → its failing gate names + verbatim reasons. Filled
   // lazily in the background; a run absent from the map has not been resolved
-  // yet (cell shows "—"), a run present with empty gates resolved clean.
+  // yet (cell shows "—"), a run present with empty gates escalated outside any
+  // gate (infra/transient/merge faults never write a gate outcome), and a run
+  // whose detail fetch failed is recorded as unavailable so the fetch budget
+  // is not spent on it again every poll.
   interface SparkWhy {
     gates: string[];
     reasons: string[];
+    unavailable?: boolean;
   }
   let whyByRun = $state<Record<string, SparkWhy>>({});
+
+  // Scope: open sparks (needs a human) by default; history is every escalated
+  // attempt ever archived, opt-in from the toolbar.
+  let showHistory = $state(false);
 
   // Per-row requeue state, keyed by run ID so a late outcome can never render
   // under an unrelated row (the table re-orders as runs land/clear).
@@ -82,40 +97,12 @@
     };
   });
 
-  // --- Async "why" enrichment ----------------------------------------------
-  // Reacts to the set of sparks changing. For each not-yet-resolved spark (up
-  // to the fetch budget) pull its stages+gates WITHOUT touching the drawer
-  // cache and record its failing gates. All writes to whyByRun go through
-  // untrack so this effect never re-triggers on its own writes (house rule #4).
-  $effect(() => {
-    const sparks = millsStore.escalatedRuns;
-    let cancelled = false;
-    void (async () => {
-      let budget = GATE_FETCH_MAX;
-      for (const run of sparks) {
-        if (cancelled) return;
-        if (budget <= 0) break;
-        const already = untrack(() => run.ID in whyByRun);
-        if (already) continue;
-        budget--;
-        const detail = await millsStore.fetchArchiveRunDetail(run.ID);
-        if (cancelled) return;
-        if (!detail) continue;
-        const failed = (detail.gates ?? []).filter((g) => g.Outcome === 'fail');
-        const gates = failed.map((g) => g.GateName);
-        const reasons = failed.flatMap((g) => g.Reasons ?? []);
-        untrack(() => {
-          whyByRun = { ...whyByRun, [run.ID]: { gates, reasons } };
-        });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  });
-
   // --- Derivations ---------------------------------------------------------
-  let sparks = $derived(millsStore.escalatedRuns);
+  // openSparks: what needs a human now. historySparks: every escalated attempt
+  // in the loaded window. The table shows one or the other, never a mix.
+  let openSparks = $derived(millsStore.openSparks);
+  let historySparks = $derived(millsStore.escalatedRuns);
+  let sparks = $derived(showHistory ? historySparks : openSparks);
   let disabled = $derived(millsStore.disabled);
   // A failed run poll is the panel's error; the archive refresh swallows its
   // own failures (it keeps last-good data), so it never red-flags the panel.
@@ -147,14 +134,63 @@
     });
   });
 
-  // Header tally: N on the floor now (active escalated/paused) + today's
-  // archived strikes, split infra-vs-real from the escalation class.
-  let activeCount = $derived(
-    (millsStore.pipelineRuns ?? []).filter((r) => isSparkLive(r.State)).length,
-  );
-  let struckToday = $derived(
-    (millsStore.archiveRuns ?? []).filter((r) => (r.State ?? '').toLowerCase() === 'escalated'),
-  );
+  // True when the operator has narrowed the table themselves — decides whether
+  // an empty table reads "no match" or "nothing needs a human".
+  let anyFilterActive = $derived(search.trim() !== '' || classFilter !== '' || retryFilter !== '');
+
+  // --- Async "why" enrichment ----------------------------------------------
+  // Reacts to the set of sparks on screen changing. For each not-yet-resolved
+  // spark (up to the fetch budget) pull its stages+gates WITHOUT touching the
+  // drawer cache and record its failing gates. All writes to whyByRun go
+  // through untrack so this effect never re-triggers on its own writes (house
+  // rule #4). The open set is resolved first because it is small and is what
+  // the operator is looking at; history rows fill in as budget allows.
+  $effect(() => {
+    const targets = sparks;
+    let cancelled = false;
+    void (async () => {
+      let budget = GATE_FETCH_MAX;
+      for (const run of targets) {
+        if (cancelled) return;
+        if (budget <= 0) break;
+        const already = untrack(() => run.ID in whyByRun);
+        if (already) continue;
+        budget--;
+        const detail = await millsStore.fetchArchiveRunDetail(run.ID);
+        if (cancelled) return;
+        if (!detail) {
+          untrack(() => {
+            whyByRun = { ...whyByRun, [run.ID]: { gates: [], reasons: [], unavailable: true } };
+          });
+          continue;
+        }
+        const failed = (detail.gates ?? []).filter((g) => g.Outcome === 'fail');
+        const gates = failed.map((g) => g.GateName);
+        const reasons = failed.flatMap((g) => g.Reasons ?? []);
+        untrack(() => {
+          whyByRun = { ...whyByRun, [run.ID]: { gates, reasons } };
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  // Header tally: today's archived strikes, split infra-vs-real from the
+  // escalation class. This is the only place the strike count is drawn.
+  // The archive is the last N terminal runs, not a day window, so "today"
+  // is enforced here: a run counts when it ended since local midnight.
+  let struckToday = $derived.by(() => {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const since = dayStart.getTime();
+    return (millsStore.archiveRuns ?? []).filter((r) => {
+      if ((r.State ?? '').toLowerCase() !== 'escalated') return false;
+      const t = Date.parse(r.EndedAt ?? r.StartedAt ?? '');
+      return Number.isFinite(t) && t >= since;
+    });
+  });
   let infraToday = $derived(struckToday.filter((r) => isInfraClass(escalationClass(r))).length);
   let realToday = $derived(struckToday.length - infraToday);
 
@@ -163,17 +199,12 @@
     { key: 'warp', label: 'Warp' },
     { key: 'class', label: 'Class' },
     { key: 'retry', label: 'Retry?', align: 'center' as const },
-    { key: 'why', label: 'Why (failing gate)', hideBelow: 720 },
+    { key: 'why', label: 'Failing gate', hideBelow: 720 },
     { key: 'mr', label: 'MR' },
     { key: 'act', label: '', align: 'right' as const },
   ];
 
   // --- Helpers -------------------------------------------------------------
-  function isSparkLive(state: string | undefined): boolean {
-    const s = (state ?? '').toLowerCase();
-    return s === 'escalated' || s === 'paused';
-  }
-
   // The runner's error-class spelling wins; fall back to the policy-facing
   // taxonomy, then a stable sentinel so a classless spark still filters.
   function escalationClass(r: PipelineRun): string {
@@ -301,12 +332,12 @@
 <PanelShell
   title="Sparks"
   icon="⚡"
-  count={sparks.length}
+  count={openSparks.length}
   {loading}
-  error={error && sparks.length === 0 ? error : null}
+  error={error && historySparks.length === 0 ? error : null}
   errorHeading="Couldn't read the floor"
   empty={!error
-    && sparks.length === 0
+    && historySparks.length === 0
     && !millsStore.relaunchCandidatesLoading
     && !millsStore.relaunchCandidatesError
     && millsStore.relaunchCandidates.length === 0}
@@ -320,8 +351,8 @@
   {#snippet actions()}
     <!-- Today's strike split rides in the header rather than as small body
          text: the infra-vs-real ratio is how an operator decides whether the
-         floor needs a human or a requeue. Rendered here ONLY — the body tally
-         below carries the live floor count, so neither number is repeated. -->
+         floor needs a human or a requeue. Rendered here ONLY; the count chip
+         beside the title is the open-spark count, a different number. -->
     <span class="struck-today" role="status" aria-live="polite">
       <span class="struck-count">{struckToday.length}</span>
       <span class="struck-label">struck today</span>
@@ -333,16 +364,7 @@
 
   <LineageRibbon mode="spine" segments={millsStore.millFloorSpine} current="sparks" />
 
-  <div class="spark-tally" role="status" aria-live="polite">
-    <span class="tally-lead">⚡ {activeCount} spark{activeCount === 1 ? '' : 's'} on the floor</span>
-  </div>
-
   <div class="spark-kpis">
-    <MetricCard
-      label="escalated (24h)"
-      value={fmtCount(metrics?.pipeline_escalated_runs)}
-      color="var(--warning)"
-    />
     <MetricCard
       label="escalation rate"
       value={fmtPct(metrics?.escalation_rate)}
@@ -356,7 +378,12 @@
   </div>
 
   <section class="relaunch-queue" aria-labelledby="relaunch-queue-title">
-    <h3 id="relaunch-queue-title">relaunch queue</h3>
+    <h3 id="relaunch-queue-title">
+      relaunch queue
+      {#if millsStore.relaunchCandidates.length > 0}
+        <span class="queue-count">{millsStore.relaunchCandidates.length}</span>
+      {/if}
+    </h3>
     {#if millsStore.relaunchCandidatesLoading && millsStore.relaunchCandidates.length === 0}
       <p class="queue-state">Loading relaunch candidates…</p>
     {:else if millsStore.relaunchCandidatesError}
@@ -404,11 +431,45 @@
       onSearch={(v) => (search = v)}
       {onFilter}
       onClear={clearFilters}
-    />
+    >
+      {#snippet actions()}
+        <!-- Scope toggle: which spark set the table shows. Open is the
+             default because it is the set that needs a human; history is
+             every escalated attempt in the loaded archive window. -->
+        <div class="scope-toggle" role="group" aria-label="Spark scope">
+          <button
+            type="button"
+            class="scope-btn"
+            class:active={!showHistory}
+            aria-pressed={!showHistory}
+            onclick={() => (showHistory = false)}
+            title="Items whose current state is escalated or paused — needs a human"
+          >open <span class="scope-n">{openSparks.length}</span></button>
+          <button
+            type="button"
+            class="scope-btn"
+            class:active={showHistory}
+            aria-pressed={showHistory}
+            onclick={() => (showHistory = true)}
+            title="Every escalated attempt in the loaded archive, including items since merged or retired"
+          >history <span class="scope-n">{historySparks.length}</span></button>
+        </div>
+      {/snippet}
+    </FilterBar>
   </div>
 
   {#if filtered.length === 0}
-    <p class="spark-nomatch">No sparks match this filter.</p>
+    {#if anyFilterActive}
+      <p class="spark-nomatch">No sparks match this filter.</p>
+    {:else if showHistory}
+      <p class="spark-nomatch">No escalated attempts in the loaded archive window.</p>
+    {:else}
+      <p class="spark-nomatch spark-clear">
+        <span class="spark-clear-lead">✨ nothing needs a human</span>
+        <span class="spark-clear-hint">Every escalated item has since been requeued, merged, or retired.
+          {#if historySparks.length > 0}Switch to history to browse past attempts.{/if}</span>
+      </p>
+    {/if}
   {:else}
     <DataTable
       {columns}
@@ -428,17 +489,24 @@
             <span class="state-pill">paused</span>
           {/if}
         </td>
+        <!-- Flex lives on an inner wrapper, never on the td: a td with a
+             non-table display leaves the row's cell structure, and adjacent
+             ones fuse into a single anonymous cell, shifting every header. -->
         <td class="warp-cell">
-          {#if item?.Priority}
-            <Badge text={item.Priority} variant={priorityTone(item.Priority)} />
-          {/if}
-          <span class="mono warp-id" title={r.BacklogID}>{r.BacklogID || '—'}</span>
+          <div class="cell-flex">
+            {#if item?.Priority}
+              <Badge text={item.Priority} variant={priorityTone(item.Priority)} />
+            {/if}
+            <span class="mono warp-id" title={r.BacklogID}>{r.BacklogID || '—'}</span>
+          </div>
         </td>
         <td class="class-cell">
-          <Badge text={escalationClass(r)} variant={isInfraClass(escalationClass(r)) ? 'info' : 'error'} />
-          {#if r.ExternalDependency}
-            <span class="ext-dep" title="known upstream incident">{r.ExternalDependency}</span>
-          {/if}
+          <div class="cell-flex cell-flex-wrap">
+            <Badge text={escalationClass(r)} variant={isInfraClass(escalationClass(r)) ? 'info' : 'error'} />
+            {#if r.ExternalDependency}
+              <span class="ext-dep" title="known upstream incident">{r.ExternalDependency}</span>
+            {/if}
+          </div>
         </td>
         <td class="retry-cell" style="text-align:center">
           {#if retry === 'yes'}
@@ -453,8 +521,13 @@
           <td class="why-cell">
             {#if !why}
               <span class="why-pending" aria-label="resolving failing gate">—</span>
+            {:else if why.unavailable}
+              <span class="why-pending" title="run detail could not be loaded">—</span>
             {:else if why.gates.length === 0}
-              <span class="why-clean">no failing gate recorded</span>
+              <!-- Infra/transient/merge faults escalate without ever writing
+                   a gate outcome; say that once, quietly, instead of
+                   repeating a filler sentence down the column. -->
+              <span class="why-clean" title="escalated outside a gate — no gate outcome was recorded for this run">outside a gate</span>
             {:else}
               <span class="why-gate">{why.gates.join(', ')}</span>
               {#if why.reasons.length > 0}
@@ -516,17 +589,6 @@
 <PipelineRunDetail />
 
 <style>
-  .spark-tally {
-    display: flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    margin: var(--space-3) 0 var(--space-2);
-    font-size: var(--text-sm);
-    color: var(--fg-secondary);
-  }
-  .tally-lead { font-weight: 600; color: var(--warning); }
-
   /* Header strike tally. Escalation tone (warning) matches the spark
      vocabulary everywhere else on the floor. */
   .struck-today {
@@ -557,7 +619,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-2);
-    margin-bottom: var(--space-3);
+    margin: var(--space-3) 0;
   }
   .spark-kpis :global(.metric-card) {
     flex: 1 1 140px;
@@ -574,6 +636,9 @@
     background: var(--bg-subtle);
   }
   .relaunch-queue h3 {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
     margin: 0 0 var(--space-2);
     color: var(--fg-muted);
     font-size: var(--text-2xs);
@@ -581,11 +646,29 @@
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
+  .queue-count {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: var(--info);
+    letter-spacing: 0;
+  }
   .queue-state { margin: 0; color: var(--fg-muted); font-size: var(--text-sm); }
   .queue-unavailable { color: var(--warning); }
-  .queue-list { display: grid; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
+  /* The candidate list is unbounded upstream; cap it at a handful of rows so
+     a relaunch storm scrolls inside its own box instead of pushing the spark
+     table off-screen. */
+  .queue-list {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    max-height: calc(5 * (1.5em + var(--space-2)));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
   .queue-list li { display: flex; align-items: center; gap: var(--space-2); }
-  .queue-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .queue-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .queue-age { color: var(--fg-muted); font-size: var(--text-xs); white-space: nowrap; }
 
   .spark-nomatch {
@@ -593,6 +676,52 @@
     text-align: center;
     color: var(--fg-muted);
     font-size: var(--text-sm);
+  }
+  /* "Nothing needs a human" is a good state, not a no-match: give it the
+     ready tone the shell's empty state uses, at table scale. */
+  .spark-clear {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-5) var(--space-4);
+    border: 1px dashed color-mix(in srgb, var(--success) 35%, var(--border-subtle));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--success) 4%, transparent);
+  }
+  .spark-clear-lead { font-weight: 600; color: var(--success); }
+  .spark-clear-hint { font-size: var(--text-xs); }
+
+  /* Scope toggle: a two-state segmented control in the filter bar's action
+     slot. Same chip vocabulary as the retry pills and MR chips. */
+  .scope-toggle {
+    display: inline-flex;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
+    overflow: hidden;
+  }
+  .scope-btn {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-1);
+    padding: 2px 10px;
+    border: 0;
+    background: transparent;
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .scope-btn + .scope-btn { border-left: 1px solid var(--border-subtle); }
+  .scope-btn:hover { color: var(--fg-primary); }
+  .scope-btn.active {
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    color: var(--warning);
+  }
+  .scope-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+  .scope-n {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
   }
 
   .mono { font-family: var(--font-mono); }
@@ -608,20 +737,16 @@
     color: var(--warning);
   }
 
-  .warp-cell {
+  /* Cells stay table-cells; the flex box is the wrapper inside them. */
+  .warp-cell { white-space: nowrap; }
+  .cell-flex {
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    white-space: nowrap;
   }
+  .cell-flex-wrap { flex-wrap: wrap; }
   .warp-id { color: var(--fg-muted); font-size: var(--text-xs); }
 
-  .class-cell {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-  }
   .ext-dep {
     font-family: var(--font-mono);
     font-size: var(--text-2xs);

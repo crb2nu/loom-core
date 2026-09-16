@@ -23,6 +23,11 @@
     actions,
     emptyAction,
     errorAction,
+    grouped = false,
+    collapsible = false,
+    collapsed = false,
+    contentId,
+    oncollapsedchange,
     children,
   }: {
     title: string;
@@ -42,14 +47,46 @@
     actions?: Snippet;
     emptyAction?: Snippet;
     errorAction?: Snippet;
+    /** Opt in to a scrollable stack of complete child panels. */
+    grouped?: boolean;
+    /** Add an accessible header toggle without unmounting panel content. */
+    collapsible?: boolean;
+    collapsed?: boolean;
+    contentId?: string;
+    oncollapsedchange?: (collapsed: boolean) => void;
     children: Snippet;
   } = $props();
+
+  let toggle: HTMLElement;
+
+  function toggleCollapsed(): void {
+    if (!collapsed && document.activeElement instanceof HTMLElement) {
+      const content = contentId ? document.getElementById(contentId) : null;
+      if (content?.contains(document.activeElement)) toggle?.focus();
+    }
+    oncollapsedchange?.(!collapsed);
+  }
 </script>
 
-<section class="panel-shell" aria-label={title}>
+<section
+  class="panel-shell"
+  class:is-grouped={grouped}
+  aria-label={title}
+  role={grouped ? 'group' : undefined}
+>
   <!-- Panel header -->
   <div class="panel-shell-header">
-    <div class="panel-shell-title-row">
+    <svelte:element
+      this={collapsible ? 'button' : 'div'}
+      class="panel-shell-title-row"
+      class:panel-shell-toggle={collapsible}
+      type={collapsible ? 'button' : undefined}
+      role={collapsible ? 'button' : undefined}
+      aria-expanded={collapsible ? !collapsed : undefined}
+      aria-controls={collapsible ? contentId : undefined}
+      onclick={collapsible ? toggleCollapsed : undefined}
+      bind:this={toggle}
+    >
       {#if icon}
         <span class="panel-shell-icon">{icon}</span>
       {/if}
@@ -57,7 +94,10 @@
       {#if count != null}
         <span class="panel-shell-count">{count}</span>
       {/if}
-    </div>
+      {#if collapsible}
+        <span class="panel-shell-chevron" aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
+      {/if}
+    </svelte:element>
     {#if actions}
       <div class="panel-shell-actions">
         {@render actions()}
@@ -87,7 +127,12 @@
   {/if}
 
   <!-- Content area -->
-  <div class="panel-shell-content" class:is-empty={(empty || error) && !loading}>
+  <div
+    id={contentId}
+    class="panel-shell-content"
+    class:is-empty={(empty || error) && !loading}
+    hidden={collapsible && collapsed}
+  >
     {#if error && !loading}
       <!-- Error precedes empty: a failed fetch is not the same signal as
            "no rows". Mirrors the .empty-state shape so empty/error feel
@@ -147,6 +192,22 @@
     gap: var(--space-2);
   }
 
+  .panel-shell-toggle {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    padding: var(--space-1);
+    margin: calc(-1 * var(--space-1));
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .panel-shell-toggle:hover { background: var(--bg-hover); }
+  .panel-shell-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .panel-shell-chevron { color: var(--mills-color-text-muted); }
+
   .panel-shell-icon {
     font-size: var(--mills-text-title);
     color: var(--mills-color-text-muted);
@@ -203,6 +264,26 @@
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+  }
+
+  /* Group shells own scrolling for the complete stack. Child PanelShell
+     instances can therefore keep their normal state gating and semantics
+     without competing for the viewport's flex height. Strictly opt-in so
+     every existing standalone consumer retains its current layout. */
+  .panel-shell.is-grouped > .panel-shell-content {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+
+  .panel-shell.is-grouped :global(.panel-shell) {
+    flex: none;
+    overflow: visible;
+    padding: 0;
+  }
+
+  .panel-shell.is-grouped :global(.panel-shell-content) {
+    overflow: visible;
   }
 
   /* When the panel is empty, let the empty-state fill and center within the

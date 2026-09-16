@@ -21,6 +21,9 @@ const (
 	gateLabelScope         = "scope"
 	gateLabelOther         = "other"
 	verdictLabelUnknown    = "unknown"
+
+	overseerSoakWouldActLabel = "would_have_acted"
+	overseerSoakDivergedLabel = "diverged"
 )
 
 var (
@@ -59,7 +62,7 @@ func NewOverseerSoakMetrics(reg prometheus.Registerer) *OverseerSoakMetrics {
 		DecisionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: OverseerDryRunDecisionsMetric,
 			Help: "Persisted overseer S2 dry-run decisions partitioned by whether they would act and diverge from approved policy.",
-		}, []string{"would_have_acted", "diverged"}),
+		}, []string{overseerSoakWouldActLabel, overseerSoakDivergedLabel}),
 	}
 	if reg != nil {
 		if err := reg.Register(m.DecisionsTotal); err != nil {

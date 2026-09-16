@@ -35,8 +35,8 @@ func TestReconciler_ScopeFairnessReservationConvoy(t *testing.T) {
 	ctx := context.Background()
 	blocker := itemWithFiles("RUNNING", "pkg/mills/pipeline/blocker.go")
 	blocker.State = store.BacklogRunning
-	starved := itemWithFiles("STARVED", "pkg/mills/pipeline/starved.go")
-	newer := itemWithFiles("NEWER", "pkg/mills/pipeline/newer.go")
+	starved := itemWithFiles("STARVED", "pkg/mills/pipeline/blocker.go")
+	newer := itemWithFiles("NEWER", "pkg/mills/pipeline/blocker.go")
 	for _, item := range []*store.BacklogItem{blocker, starved, newer} {
 		if err := env.store.Backlog.Put(ctx, item); err != nil {
 			t.Fatal(err)
@@ -56,7 +56,7 @@ func TestReconciler_ScopeFairnessReservationConvoy(t *testing.T) {
 		t.Fatalf("state=%+v err=%v", state, err)
 	}
 	decision, _, reason, err := env.rec.tryStart(ctx, newer, policy)
-	if err != nil || decision != decisionDeferred || !strings.Contains(reason, starved.ID) {
+	if err != nil || decision != decisionDeferred || !strings.Contains(reason, blocker.ID) {
 		t.Fatalf("newer decision=%v reason=%q err=%v", decision, reason, err)
 	}
 	blocker.State = store.BacklogMerged
@@ -70,6 +70,99 @@ func TestReconciler_ScopeFairnessReservationConvoy(t *testing.T) {
 	}
 	if _, err := env.store.Backlog.ScopeFairness(ctx, starved.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("fairness state survived start: %v", err)
+	}
+}
+
+func TestReconciler_ScopeFairnessExcludesIneligibleReservations(t *testing.T) {
+	cases := []struct {
+		name       string
+		wantReason string
+		configure  func(*testing.T, context.Context, *recTestEnv, *Policy, *store.BacklogItem)
+	}{
+		{
+			name: "item human review", wantReason: "require_human_review",
+			configure: func(_ *testing.T, _ context.Context, _ *recTestEnv, _ *Policy, item *store.BacklogItem) {
+				item.Policy.RequireHumanReview = true
+			},
+		},
+		{
+			name: "repository human review", wantReason: "per_repo_require_human_review",
+			configure: func(_ *testing.T, _ context.Context, _ *recTestEnv, policy *Policy, item *store.BacklogItem) {
+				yes := true
+				item.TargetProject = "services/flexdeck"
+				policy.Pipeline.PerRepoOverrides = map[string]RepoExecutionOverride{
+					"services/flexdeck": {RequireHumanReview: &yes},
+				}
+			},
+		},
+		{
+			name: "unmet dependency", wantReason: "dependencies_unmet",
+			configure: func(t *testing.T, ctx context.Context, env *recTestEnv, _ *Policy, item *store.BacklogItem) {
+				dep := itemWithFiles("BLOCKED-DEP", "pkg/other/dep.go")
+				if err := env.store.Backlog.Put(ctx, dep); err != nil {
+					t.Fatal(err)
+				}
+				item.Dependencies = []string{dep.ID}
+			},
+		},
+		{
+			name: "repository budget exhausted", wantReason: "per_repo_budget_exhausted",
+			configure: func(t *testing.T, ctx context.Context, env *recTestEnv, policy *Policy, item *store.BacklogItem) {
+				env.rec.HomeProject = "services/loom-core"
+				item.TargetProject = "services/flexdeck"
+				policy.Pipeline.PerRepoOverrides = map[string]RepoExecutionOverride{
+					"services/flexdeck": {MaxRunsPerDay: 1},
+				}
+				old := itemWithFiles("OLD-RUN", "pkg/other/old.go")
+				old.State = store.BacklogMerged
+				old.TargetProject = item.TargetProject
+				if err := env.store.Backlog.Put(ctx, old); err != nil {
+					t.Fatal(err)
+				}
+				if err := env.store.Pipeline.PutRun(ctx, &store.PipelineRun{ID: "PIPE-OLD", BacklogID: old.ID, Template: "test", State: store.PipelineDone, StartedAt: env.now.Add(-time.Hour)}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newRecEnv(t, nil)
+			ctx := context.Background()
+			policy := env.policy.Current()
+			reserved := itemWithFiles("RESERVED", "docs/MILLS.md")
+			tc.configure(t, ctx, env, policy, reserved)
+			if err := env.store.Backlog.Put(ctx, reserved); err != nil {
+				t.Fatal(err)
+			}
+			if _, tripped, err := env.store.Backlog.RecordScopeDeferral(ctx, reserved.ID, env.now, 1, time.Hour); err != nil || !tripped {
+				t.Fatalf("reserve: tripped=%v err=%v", tripped, err)
+			}
+			contender := itemWithFiles("CONTENDER", "docs/MILLS.md")
+			contender.TargetProject = reserved.TargetProject
+			passCtx := withStarvedExclusionAudit(ctx)
+			for i := 0; i < 2; i++ {
+				blocker, _, err := env.rec.scopeReservationBlocker(passCtx, contender, policy, 2*time.Hour)
+				if err != nil || blocker != "" {
+					t.Fatalf("check %d: blocker=%q err=%v", i+1, blocker, err)
+				}
+			}
+			events, err := env.store.Events.ListSince(ctx, time.Time{}, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "starved_candidate_excluded:" + tc.wantReason
+			matches := 0
+			for _, event := range events {
+				if event.Kind == "reconciler.skipped" && event.Payload["item"] == reserved.ID && event.Payload["reason"] == want {
+					matches++
+				}
+			}
+			if matches != 1 {
+				t.Fatalf("matching skipped events=%d want 1 (reason %q)", matches, want)
+			}
+		})
 	}
 }
 
@@ -94,7 +187,7 @@ func TestScopeFairness_TimeBoundaryAndCapRestartAging(t *testing.T) {
 	if err := env.store.Backlog.Put(ctx, other); err != nil {
 		t.Fatal(err)
 	}
-	blocker, _, err := env.rec.scopeReservationBlocker(ctx, other, 2*time.Hour)
+	blocker, _, err := env.rec.scopeReservationBlocker(ctx, other, env.policy.Current(), 2*time.Hour)
 	if err != nil || blocker != "" {
 		t.Fatalf("cap release blocker=%q err=%v", blocker, err)
 	}
@@ -114,23 +207,30 @@ func TestScopeEnvelope_Overlaps(t *testing.T) {
 		want    bool
 		witness string
 	}{
+		{name: "cleaned literal", a: []string{" ./pkg/mills/../mills/policy.go "}, b: []string{"pkg/mills/policy.go"}, want: true, witness: "pkg/mills/policy.go"},
+		{name: "policy and spin", a: []string{"pkg/mills/policy.go"}, b: []string{"pkg/mills/spin/spin.go"}, want: false, witness: ""},
+		{name: "pipeline glob", a: []string{"pkg/mills/pipeline/*.go"}, b: []string{"pkg/mills/pipeline/dispatcher.go"}, want: true, witness: "pkg/mills/pipeline"},
+		{name: "glob below literal directory", a: []string{"pkg/mills/pipeline/*.go"}, b: []string{"pkg/mills/policy.go"}, want: true, witness: "pkg/mills/pipeline"},
+		{name: "glob ancestor", a: []string{"pkg/mills/**"}, b: []string{"pkg/mills/pipeline/*.go"}, want: true, witness: "pkg/mills"},
+		{name: "segment boundary", a: []string{"pkg/mills/*.go"}, b: []string{"pkg/mills-extra/main.go"}, want: false, witness: ""},
+		{name: "root glob", a: []string{"./*.go"}, b: []string{"pkg/mills/policy.go"}, want: false, witness: ""},
 		{
 			name: "same directory different basenames",
 			a:    []string{"pkg/mills/pipeline/escalate.go"},
 			b:    []string{"pkg/mills/pipeline/runner.go"},
-			want: true, witness: "pkg/mills/pipeline",
+			want: false,
 		},
 		{
 			name: "descendant directory",
 			a:    []string{"pkg/mills/store/store.go"},
 			b:    []string{"pkg/mills/store/migrations/011_x.sql"},
-			want: true, witness: "pkg/mills/store",
+			want: false,
 		},
 		{
 			name: "ancestor directory (reversed)",
 			a:    []string{"pkg/mills/store/migrations/011_x.sql"},
 			b:    []string{"pkg/mills/store/store.go"},
-			want: true, witness: "pkg/mills/store",
+			want: false,
 		},
 		{
 			name: "disjoint packages",
@@ -157,9 +257,15 @@ func TestScopeEnvelope_Overlaps(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "glob static prefix vs literal in same tree",
+			name: "glob static prefix reserves literal file",
+			a:    []string{"docs/*.md"},
+			b:    []string{"docs/MILLS.md"},
+			want: true, witness: "docs",
+		},
+		{
+			name: "identical non-exempt globs overlap",
 			a:    []string{"cmd/loom/*.go"},
-			b:    []string{"cmd/loom/proxy_tool_filter.go"},
+			b:    []string{"cmd/loom/*.go"},
 			want: true, witness: "cmd/loom",
 		},
 		{
@@ -195,14 +301,16 @@ func TestScopeEnvelope_Overlaps(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			a := envelopeForItem(itemWithFiles("A", tc.a...))
-			b := envelopeForItem(itemWithFiles("B", tc.b...))
-			got, witness := a.overlaps(b)
-			if got != tc.want {
-				t.Fatalf("overlaps=%v want %v (witness=%q)", got, tc.want, witness)
-			}
-			if tc.want && witness != tc.witness {
-				t.Errorf("witness=%q want %q", witness, tc.witness)
+			for _, pair := range [][2][]string{{tc.a, tc.b}, {tc.b, tc.a}} {
+				left, right := itemWithFiles("A", pair[0]...), itemWithFiles("B", pair[1]...)
+				hit, witness := store.BacklogScopesOverlap(left, right, "")
+				if hit != tc.want || witness != tc.witness {
+					t.Fatalf("store overlap=(%v, %q), want (%v, %q)", hit, witness, tc.want, tc.witness)
+				}
+				hit, witness = envelopeForItem(left).overlaps(envelopeForItem(right))
+				if hit != tc.want || witness != tc.witness {
+					t.Fatalf("envelope overlap=(%v, %q), want (%v, %q)", hit, witness, tc.want, tc.witness)
+				}
 			}
 		})
 	}
@@ -257,7 +365,7 @@ func TestSerializeOverlappingScopesEnabled_Defaults(t *testing.T) {
 }
 
 // TestReconciler_DefersOnScopeOverlap pins the dispatch guard end-to-end:
-// two queued items declaring files in the same package must not run
+// two queued items declaring the same file must not run
 // concurrently — the second defers within the SAME tick that starts the
 // first (tryStart persists state=running before the loop advances), and
 // dispatches once the blocker leaves running.
@@ -267,7 +375,7 @@ func TestReconciler_DefersOnScopeOverlap(t *testing.T) {
 
 	first := itemWithFiles("MILLS-OVL-A", "pkg/mills/pipeline/escalate.go")
 	first.Priority = store.P1
-	second := itemWithFiles("MILLS-OVL-B", "pkg/mills/pipeline/runner.go")
+	second := itemWithFiles("MILLS-OVL-B", "pkg/mills/pipeline/escalate.go")
 	if err := env.store.Backlog.Put(ctx, first); err != nil {
 		t.Fatalf("seed A: %v", err)
 	}
@@ -313,7 +421,7 @@ func TestReconciler_ConcurrentDistinctOverlappingStartsHaveOneWinner(t *testing.
 	env := newRecEnv(t, nil)
 	ctx := context.Background()
 	first := itemWithFiles("MILLS-OVL-RACE-A", "pkg/mills/pipeline/escalate.go")
-	second := itemWithFiles("MILLS-OVL-RACE-B", "pkg/mills/pipeline/runner.go")
+	second := itemWithFiles("MILLS-OVL-RACE-B", "pkg/mills/pipeline/escalate.go")
 	for _, item := range []*store.BacklogItem{first, second} {
 		if err := env.store.Backlog.Put(ctx, item); err != nil {
 			t.Fatalf("seed %s: %v", item.ID, err)
@@ -400,7 +508,7 @@ func TestReconciler_ScopeOverlapPolicyOptOut(t *testing.T) {
 	if err := env.store.Backlog.Put(ctx, running); err != nil {
 		t.Fatalf("seed running: %v", err)
 	}
-	queued := itemWithFiles("MILLS-OFF-B", "pkg/mills/pipeline/runner.go")
+	queued := itemWithFiles("MILLS-OFF-B", "pkg/mills/pipeline/escalate.go")
 	if err := env.store.Backlog.Put(ctx, queued); err != nil {
 		t.Fatalf("seed queued: %v", err)
 	}
@@ -430,7 +538,7 @@ func TestReconciler_ScopeOverlapIgnoresOtherRepos(t *testing.T) {
 	if err := env.store.Backlog.Put(ctx, running); err != nil {
 		t.Fatalf("seed running: %v", err)
 	}
-	queued := itemWithFiles("MILLS-XR-B", "pkg/mills/pipeline/runner.go")
+	queued := itemWithFiles("MILLS-XR-B", "pkg/mills/pipeline/escalate.go")
 	if err := env.store.Backlog.Put(ctx, queued); err != nil {
 		t.Fatalf("seed queued: %v", err)
 	}
@@ -442,5 +550,321 @@ func TestReconciler_ScopeOverlapIgnoresOtherRepos(t *testing.T) {
 	}
 	if res.Started != 1 || res.Deferred != 0 {
 		t.Fatalf("same paths in different repos must not serialize, got %+v", res)
+	}
+}
+
+func TestReconciler_ScopeFairnessPriorityMatrix(t *testing.T) {
+	for _, priority := range []store.Priority{store.P0, store.P1, store.P2, store.P3} {
+		t.Run(string(priority), func(t *testing.T) {
+			env := newRecEnv(t, nil)
+			ctx := context.Background()
+			reserved := itemWithFiles("reserved", "pkg/shared/a.go")
+			candidate := itemWithFiles("candidate", "pkg/shared/a.go")
+			candidate.Priority = priority
+			for _, item := range []*store.BacklogItem{reserved, candidate} {
+				if err := env.store.Backlog.Put(ctx, item); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, _, err := env.store.Backlog.RecordScopeDeferral(ctx, reserved.ID, env.now, 1, time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			decision, _, reason, err := env.rec.tryStart(ctx, candidate, env.policy.Current())
+			want := decisionDeferred
+			if priority < store.P2 {
+				want = decisionStarted
+			}
+			if err != nil || decision != want {
+				t.Fatalf("decision=%v want=%v reason=%s err=%v", decision, want, reason, err)
+			}
+			events, err := env.store.Events.ListBySubject(ctx, "backlog_item", candidate.ID, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			kind := "reconciler.deferred"
+			if priority < store.P2 {
+				kind = "reconciler.scope_reservation_override"
+			}
+			found := false
+			for _, event := range events {
+				if event.Kind == kind {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("missing %s on candidate", kind)
+			}
+		})
+	}
+}
+
+func TestReconciler_ScopeFairnessBlockedReserverRelief(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	active := itemWithFiles("active", "pkg/a/active.go")
+	active.State = store.BacklogRunning
+	reserved := itemWithFiles("reserved", "pkg/a/active.go", "pkg/c/reserved.go")
+	candidate := itemWithFiles("candidate", "pkg/c/reserved.go")
+	for _, item := range []*store.BacklogItem{active, reserved, candidate} {
+		if err := env.store.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _, err := env.store.Backlog.RecordScopeDeferral(ctx, reserved.ID, env.now, 1, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, _, err := env.rec.scopeReservationBlocker(ctx, candidate, env.policy.Current(), 2*time.Hour)
+	if err != nil || blocker != "" {
+		t.Fatalf("blocker=%s err=%v", blocker, err)
+	}
+	after, err := env.store.Backlog.ScopeFairness(ctx, reserved.ID)
+	if err != nil || after.DeferralCount != before.DeferralCount || !after.FirstDeferredAt.Equal(before.FirstDeferredAt) || !after.ReservedAt.Equal(*before.ReservedAt) {
+		t.Fatalf("aging changed: before=%+v after=%+v err=%v", before, after, err)
+	}
+	active.State = store.BacklogMerged
+	if err := env.store.Backlog.Put(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	blocker, _, err = env.rec.scopeReservationBlocker(ctx, candidate, env.policy.Current(), 2*time.Hour)
+	if err != nil || blocker != reserved.ID {
+		t.Fatalf("reservation did not reactivate: blocker=%s err=%v", blocker, err)
+	}
+	active.State = store.BacklogRunning
+	if err := env.store.Backlog.Put(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	decision, _, reason, err := env.rec.tryStart(ctx, candidate, env.policy.Current())
+	if err != nil || decision != decisionStarted {
+		t.Fatalf("convoy: decision=%v reason=%s err=%v", decision, reason, err)
+	}
+}
+
+func TestReconciler_ScopeReservationOldestWins(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		count          int
+		tieReservation bool
+		tieCreation    bool
+		highPriority   bool
+	}{
+		{name: "two reservations", count: 2},
+		{name: "younger higher priority", count: 2, highPriority: true},
+		{name: "three reservations", count: 3},
+		{name: "creation breaks reservation tie", count: 3, tieReservation: true},
+		{name: "ID breaks timestamp ties", count: 3, tieReservation: true, tieCreation: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newRecEnv(t, nil)
+			ctx := context.Background()
+			items := make([]*store.BacklogItem, tc.count)
+			for i := range items {
+				// Reverse IDs and creation age so reservation order must win.
+				id := []string{"C", "B", "A"}[i]
+				if tc.tieCreation {
+					id = []string{"A", "B", "C"}[i]
+				}
+				item := itemWithFiles(id, "pkg/shared/a.go")
+				if tc.highPriority && i == 1 {
+					item.Priority = store.P0
+				}
+				item.CreatedAt = env.now.Add(-time.Duration(i+1) * time.Hour)
+				if tc.tieReservation {
+					item.CreatedAt = env.now.Add(time.Duration(i-4) * time.Hour)
+				}
+				if tc.tieCreation {
+					item.CreatedAt = env.now.Add(-4 * time.Hour)
+				}
+				if err := env.store.Backlog.Put(ctx, item); err != nil {
+					t.Fatal(err)
+				}
+				reservedAt := env.now.Add(time.Duration(i-4) * time.Minute)
+				if tc.tieReservation {
+					reservedAt = env.now.Add(-4 * time.Minute)
+				}
+				if _, tripped, err := env.store.Backlog.RecordScopeDeferral(ctx, item.ID, reservedAt, 1, time.Hour); err != nil || !tripped {
+					t.Fatalf("reserve %s: tripped=%v err=%v", item.ID, tripped, err)
+				}
+				items[i] = item
+			}
+			if tc.highPriority {
+				items[0], items[1] = items[1], items[0]
+			}
+			for i, item := range items {
+				want := items[0].ID
+				if i == 0 {
+					want = ""
+				}
+				blocker, _, err := env.rec.scopeReservationBlocker(ctx, item, env.policy.Current(), 2*time.Hour)
+				if err != nil || blocker != want {
+					t.Fatalf("%s: blocker=%q want=%q err=%v", item.ID, blocker, want, err)
+				}
+			}
+			for _, item := range items[1:] {
+				events, err := env.store.Events.ListSince(ctx, time.Time{}, 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				matches := 0
+				for _, event := range events {
+					if event.Kind == "reconciler.scope_reservation_yield" && event.Payload["item"] == item.ID {
+						if event.Payload["item"] != item.ID || event.Payload["yields_to"] != items[0].ID || event.Payload["shared_scope"] != "pkg/shared/a.go" {
+							t.Fatalf("unexpected yield: %+v", event.Payload)
+						}
+						matches++
+					}
+				}
+				if matches != len(items) {
+					t.Fatalf("yield events=%d want=%d", matches, len(items))
+				}
+			}
+			// Exercise the transaction with the actual reconciler winner, including
+			// the reservation read after its provisional RUNNING CAS.
+			winner := items[0]
+			_, err := env.store.ClaimPipelineStart(ctx, store.ClaimPipelineStartRequest{
+				BacklogID: winner.ID, ExpectedRevision: winner.Revision,
+				ExpectedClaimVersion:       winner.ClaimVersion,
+				SerializeOverlappingScopes: true, EnforceScopeReservations: true,
+				HomeProject: env.rec.HomeProject, Template: "mills-default-pipeline", Now: env.now,
+			})
+			if err != nil {
+				t.Fatalf("reconciler winner rejected by store: %v", err)
+			}
+
+		})
+	}
+}
+
+func TestReconciler_ScopeReservationSuppressionBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		files       []string
+		target      string
+		wantBlocker string
+	}{
+		{name: "suppressed envelope cannot block third party", files: []string{"pkg/a/a.go", "pkg/b/b.go"}},
+		{name: "separate scopes stay eligible", files: []string{"pkg/b/b.go"}, wantBlocker: "younger"},
+		{name: "separate targets stay eligible", files: []string{"pkg/a/a.go", "pkg/b/b.go"}, target: "services/other", wantBlocker: "younger"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newRecEnv(t, nil)
+			ctx := context.Background()
+			env.rec.HomeProject = "services/loom-core"
+			older := itemWithFiles("older", "pkg/a/a.go")
+			younger := itemWithFiles("younger", tc.files...)
+			younger.TargetProject = tc.target
+			for i, item := range []*store.BacklogItem{older, younger} {
+				if err := env.store.Backlog.Put(ctx, item); err != nil {
+					t.Fatal(err)
+				}
+				if _, tripped, err := env.store.Backlog.RecordScopeDeferral(ctx, item.ID, env.now.Add(time.Duration(i-2)*time.Minute), 1, time.Hour); err != nil || !tripped {
+					t.Fatalf("reserve: tripped=%v err=%v", tripped, err)
+				}
+			}
+			candidate := itemWithFiles("candidate", "pkg/b/b.go")
+			candidate.TargetProject = tc.target
+			blocker, _, err := env.rec.scopeReservationBlocker(ctx, candidate, env.policy.Current(), 2*time.Hour)
+			if err != nil || blocker != tc.wantBlocker {
+				t.Fatalf("blocker=%q want=%q err=%v", blocker, tc.wantBlocker, err)
+			}
+			events, err := env.store.Events.ListSince(ctx, time.Time{}, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range events {
+				if tc.wantBlocker != "" && event.Kind == "reconciler.scope_reservation_yield" {
+					t.Fatalf("independent reservation yielded: %+v", event.Payload)
+				}
+			}
+		})
+	}
+}
+
+func TestReconciler_SiblingFileScopesRunConcurrently(t *testing.T) {
+	for _, other := range []string{"pkg/mills/other.go", "pkg/mills/spin/spin.go"} {
+		t.Run(other, func(t *testing.T) {
+			env := newRecEnv(t, nil)
+			ctx := context.Background()
+			for _, item := range []*store.BacklogItem{
+				itemWithFiles("A", "pkg/mills/policy.go"),
+				itemWithFiles("B", other),
+			} {
+				if err := env.store.Backlog.Put(ctx, item); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := env.rec.Tick(ctx)
+			if err != nil || result.Started != 2 || result.Deferred != 0 {
+				t.Fatalf("independent files: result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
+// These are the five queued examples named in the September 14 operator
+// evidence, checked against the running files explicitly identified there.
+// The complete running envelope and eight other queued envelopes were not
+// supplied, so this is a reduced regression, not a 13-item snapshot replay.
+func TestScopeEnvelope_ReportedIncidentExamples(t *testing.T) {
+	running := itemWithFiles("bl-devbox-sandbox-quota-headroom-20260913",
+		"pkg/mills/pipeline/dispatcher.go", "pkg/mills/pipeline/error_class.go")
+	cases := []struct {
+		id      string
+		files   []string
+		witness string
+	}{
+		{"bl-mills-spinning-room-cross-vendor-hop-20260914", []string{"cmd/loom-mills-operator/main.go", "pkg/mills/policy.go", "pkg/mills/spin/spin.go"}, ""},
+		{"bl-hud-spawn-auth-state-and-billing-artifacts-20260914", []string{"internal/spawn/*.go", "pkg/mills/clients/spawn.go"}, ""},
+		{"bl-mills-autonomy-breaker-hold-on-transient-capability-red-20260914", []string{"pkg/mills/pipeline/autonomy_gate.go"}, ""},
+		{"bl-mills-ciwatch-reattach-running-pipeline-20260906", []string{"pkg/mills/pipeline/dispatcher.go", "pkg/mills/pipeline/error_class.go"}, "pkg/mills/pipeline/dispatcher.go"},
+		{"bl-mills-lintparity-empty-output-tail-20260910", []string{"pkg/mills/pipeline/*.go"}, "pkg/mills/pipeline"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			queued := itemWithFiles(tc.id, tc.files...)
+			for _, pair := range [][2]*store.BacklogItem{{running, queued}, {queued, running}} {
+				hit, witness := store.BacklogScopesOverlap(pair[0], pair[1], "")
+				if hit != (tc.witness != "") || witness != tc.witness {
+					t.Fatalf("store overlap=(%v, %q), want witness %q", hit, witness, tc.witness)
+				}
+				hit, witness = envelopeForItem(pair[0]).overlaps(envelopeForItem(pair[1]))
+				if hit != (tc.witness != "") || witness != tc.witness {
+					t.Fatalf("envelope overlap=(%v, %q), want witness %q", hit, witness, tc.witness)
+				}
+			}
+		})
+	}
+}
+
+func TestScopeEnvelopeFiltersTestCommands(t *testing.T) {
+	for _, command := range []string{"go test ./pkg/mills/ -run 'Scope|Envelope'", "cd internal/hud/frontend && pnpm test", "pnpm test", "npm test", "make test", "go\ttest", "go\ntest", "go\u00a0test", "a&&b", "a|b", "a;b", "a>b", ""} {
+		t.Run(command, func(t *testing.T) {
+			item := &store.BacklogItem{Slices: []store.Slice{{Tests: []string{command}}}}
+			if got := envelopeForItem(item); !got.empty() {
+				t.Fatalf("command contributed scope: %+v", got)
+			}
+			left := &store.BacklogItem{Slices: []store.Slice{{Files: []string{"pkg/alpha/a.go"}, Tests: []string{command}}}}
+			right := &store.BacklogItem{Slices: []store.Slice{{Files: []string{"pkg/beta/b.go"}, Tests: []string{command}}}}
+			a, b := envelopeForItem(left), envelopeForItem(right)
+			if hit, witness := a.overlaps(b); hit || witness != "" {
+				t.Fatalf("command overlap: %v %q", hit, witness)
+			}
+		})
+	}
+}
+
+func TestScopeEnvelopePreservesTestDeclarations(t *testing.T) {
+	item := &store.BacklogItem{Slices: []store.Slice{{Files: []string{"dir with spaces/file.go"}, Tests: []string{"pkg/alpha/a_test.go", "pkg/beta/*_test.go"}}}}
+	got := envelopeForItem(item)
+	for _, file := range []string{"dir with spaces/file.go", "pkg/alpha/a_test.go"} {
+		if _, ok := got.files[file]; !ok {
+			t.Errorf("missing literal %q", file)
+		}
+	}
+	if _, ok := got.literalDirs["pkg/alpha"]; !ok {
+		t.Error("missing test directory")
+	}
+	if _, ok := got.globDirs["pkg/beta"]; !ok {
+		t.Error("missing test glob directory")
 	}
 }

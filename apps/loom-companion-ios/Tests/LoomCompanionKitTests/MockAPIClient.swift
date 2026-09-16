@@ -71,6 +71,12 @@ final class MockAPIClient: LoomAPIClientProtocol, @unchecked Sendable {
     var planDetailResponse: MillsPlanDetail?
     var planAdvanceResponse: MillsPlanAdvanceAck?
     var millsPipelineEscalateResponse: MillsPipelineEscalateAck?
+    var millsTasteAggregatesResponse: MillsTasteAggregates?
+    var millsMergeQueueResponse: MillsMergeQueueSnapshot?
+    var millsGradeAckResponse: MillsGradeAck?
+    /// (run id, grade, note) captured from the last grade request.
+    var lastGrade: (id: String, grade: String, note: String?)?
+    var millsStatusResponse: MillsOperatorStatus?
     /// Body captured from the last millsSpinAsync request, for assertions.
     var lastSpinRequest: MillsSpinRequest?
     /// Status query captured from the last sessions/sessionsTree request.
@@ -256,6 +262,15 @@ final class MockAPIClient: LoomAPIClientProtocol, @unchecked Sendable {
         case let .millsPipelineEscalate(id, reason):
             lastEscalate = (id, reason)
             if let r = millsPipelineEscalateResponse as? T { return r }
+        case .millsTasteAggregates:
+            if let r = millsTasteAggregatesResponse as? T { return r }
+        case let .millsPipelineGrade(id, grade, note):
+            lastGrade = (id, grade, note)
+            if let r = millsGradeAckResponse as? T { return r }
+        case .millsMergeQueue:
+            if let r = millsMergeQueueResponse as? T { return r }
+        case .millsStatus:
+            if let r = millsStatusResponse as? T { return r }
         case .weaverStatus:
             if let r = weaverStatusResponse as? T { return r }
         case .weaverHistory:

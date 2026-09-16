@@ -70,7 +70,9 @@ nodes:
   - id: post_review_gate
     type: auto_gate
     input: { review_notes, diff }
-    # FlexInfer-judged spec_conformance + pr_self_review gates here.
+    # Deterministic tested_head first (the review's resulting head must equal
+    # the tests stage's tested_sha; a mismatch re-dispatches tests for the
+    # review head), then FlexInfer-judged spec_conformance + pr_self_review.
 
   # ----- Open MR -----
   - id: mr

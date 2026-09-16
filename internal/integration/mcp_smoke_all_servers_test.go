@@ -69,9 +69,19 @@ func TestMCP_AllServers_InitializeAndToolsList(t *testing.T) {
 		"mcp-gcp": "GOOGLE_APPLICATION_CREDENTIALS",
 	}
 
+	// Binaries under cmd/mcp-* that are not stdio MCP servers on their own.
+	notStandaloneServers := map[string]string{
+		// A CLI that execs a named server through the hub; with no positional
+		// server argument it prints usage and exits 2.
+		"mcp-hub-wrapper": "wrapper CLI, needs a <server> argument",
+	}
+
 	ran := false
 	for _, serverName := range servers {
 		t.Run(serverName, func(t *testing.T) {
+			if why, ok := notStandaloneServers[serverName]; ok {
+				t.Skipf("skipping %s: %s", serverName, why)
+			}
 			if envVar, ok := requiredEnvVars[serverName]; ok && os.Getenv(envVar) == "" {
 				t.Skipf("%s not set; skipping %s smoke test", envVar, serverName)
 			}

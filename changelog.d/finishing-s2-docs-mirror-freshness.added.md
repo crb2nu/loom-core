@@ -1,0 +1,1 @@
+- Add deterministic docs-mirror freshness checks, cached operator and HUD endpoints, shift-ledger projection, metrics, tests, and J5 operating documentation.

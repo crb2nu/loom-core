@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,7 +14,11 @@ import (
 
 	"github.com/crb2nu/loom/pkg/llmusage"
 	"github.com/crb2nu/loom/pkg/mills"
+	"github.com/crb2nu/loom/pkg/mills/gates"
+	"github.com/crb2nu/loom/pkg/mills/sigfp"
+	"github.com/crb2nu/loom/pkg/mills/spin"
 	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/mills/webhookbus"
 )
 
 // effectiveProject resolves the repo a stage targets for the given item: the
@@ -48,6 +53,10 @@ type JobContext struct {
 	// dispatch of the SAME attempt dedupes into a re-attach. Zero when the
 	// dispatch path did not stamp it (direct Worker.Run calls in tests).
 	Attempt int
+	// CIWatchState is restored from the most recent timed-out ci_watch result.
+	// It pins retries to one GitLab pipeline and preserves the actual first
+	// observation time across attempts and operator restarts.
+	CIWatchState *CIWatchState
 	// RetryContext is non-nil when the runner is re-dispatching this stage
 	// because a downstream auto_gate failed. Prompt builders use it to tell
 	// the fresh agent it is a retry: which gate failed, and that any plan-
@@ -82,8 +91,9 @@ type Worker interface {
 // Dispatcher routes stages to workers. The zero value is unusable; use
 // NewDispatcher.
 type Dispatcher struct {
-	routes  map[string]Worker
-	fallthr Worker
+	routes    map[string]Worker
+	fallthr   Worker
+	lifecycle func(run *store.PipelineRun, item *store.BacklogItem, stage Stage, attempt int)
 }
 
 // NewDispatcher constructs a Dispatcher from a route table. A nil routes
@@ -95,6 +105,22 @@ func NewDispatcher(routes map[string]Worker, fallback Worker) *Dispatcher {
 		routes = make(map[string]Worker)
 	}
 	return &Dispatcher{routes: routes, fallthr: fallback}
+}
+
+// SynchronousCallTimeout returns the longest declared silent call for a stage.
+// Workers without this optional capability retain the policy watchdog budget.
+func (d *Dispatcher) SynchronousCallTimeout(stage string) time.Duration {
+	if d == nil {
+		return 0
+	}
+	w := d.routes[stage]
+	if w == nil {
+		w = d.fallthr
+	}
+	if provider, ok := w.(interface{ SynchronousCallTimeout() time.Duration }); ok {
+		return provider.SynchronousCallTimeout()
+	}
+	return 0
 }
 
 // Dispatch implements WorkerDispatcher. It looks up the stage's worker
@@ -117,7 +143,11 @@ func (d *Dispatcher) Dispatch(
 		return StageOutput{}, fmt.Errorf("dispatcher: no worker for stage %q", stage.ID)
 	}
 	env := BuildMillsEnv(run, item, stage)
-	env["LOOM_MILLS_ATTEMPT"] = strconv.Itoa(stageAttemptFromContext(ctx))
+	attempt := stageAttemptFromContext(ctx)
+	env["LOOM_MILLS_ATTEMPT"] = strconv.Itoa(attempt)
+	if d.lifecycle != nil {
+		d.lifecycle(run, item, stage, attempt)
+	}
 	jc := JobContext{
 		Run:                                  run,
 		Item:                                 item,
@@ -125,6 +155,7 @@ func (d *Dispatcher) Dispatch(
 		Prior:                                prior,
 		ResumeSpawnID:                        resumeSpawnIDFromContext(ctx),
 		Attempt:                              stageAttemptFromContext(ctx),
+		CIWatchState:                         ciWatchStateFromPrior(prior),
 		RetryContext:                         StageRetryContextFromContext(ctx),
 		MergeRecoveryPipelineCreateAttempted: mergeRecoveryPipelineCreateAttemptedFromContext(ctx),
 		HeadTransitionSeq:                    headTransitionSeqFromContext(ctx),
@@ -132,6 +163,41 @@ func (d *Dispatcher) Dispatch(
 		Env:                                  env,
 	}
 	return w.Run(ctx, jc)
+}
+
+func ciWatchStateFromPrior(prior map[string]StageOutput) *CIWatchState {
+	out, ok := prior[ciWatchStatePriorKey]
+	if !ok || out.Artifacts == nil {
+		return nil
+	}
+	a := out.Artifacts
+	id, _ := ciWatchArtifactInt64(a[ciWatchPipelineIDArtifact])
+	started, _ := time.Parse(time.RFC3339Nano, artifactString(a[ciWatchPipelineStartedArtifact]))
+	if id == 0 || started.IsZero() {
+		return nil
+	}
+	return &CIWatchState{PipelineID: id, PipelineURL: artifactString(a[ciWatchPipelineURLArtifact]), StartedAt: started, LastStatus: artifactString(a[ciWatchPipelineStatusArtifact])}
+}
+
+func artifactString(v any) string { s, _ := v.(string); return s }
+
+func ciWatchArtifactInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	default:
+		return 0, false
+	}
+}
+
+// SetLifecycleObserver observes dispatch without becoming part of its success
+// path. Implementations must return immediately (the Flightdeck client does).
+func (d *Dispatcher) SetLifecycleObserver(fn func(*store.PipelineRun, *store.BacklogItem, Stage, int)) {
+	d.lifecycle = fn
 }
 
 // Register adds or replaces the worker for a stage id. Useful when wiring
@@ -153,6 +219,7 @@ func BuildMillsEnv(run *store.PipelineRun, item *store.BacklogItem, stage Stage)
 		"LOOM_MILLS_RUN_ID":     run.ID,
 		"LOOM_MILLS_BACKLOG_ID": item.ID,
 		"LOOM_MILLS_STAGE":      stage.ID,
+		"LOOM_MILLS_ATTEMPT":    "0",
 	}
 	if run.ParentSessionID != "" {
 		env["LOOM_PARENT_SESSION_ID"] = run.ParentSessionID
@@ -195,20 +262,19 @@ var ErrSpawnPollTimeout = errors.New("spawn: poll deadline exceeded")
 // clients.HUDSpawnClient.pollSpawn and workflow.WorkflowInterpreter.Run.
 var ErrSpawnTerminalFailure = errors.New("spawn: terminal non-completed status")
 
-// ErrPipelinePollTimeout is returned (wrapped) by a GitLabClient when the
-// ci_watch stage's PollPipeline exceeds its PollDeadline without the MR's
-// branch pipeline reaching a terminal state. Clients MUST wrap it
-// (fmt.Errorf("...: %w", ErrPipelinePollTimeout)) so Classify can tag the
-// failure ClassInfra instead of the default ClassCode: a poll timeout means
-// the pipeline is stuck/slow at the CI layer, not that the diff is a real code
-// bug, so conflating it with code failures both mis-attributed the escalation-
-// class metric (escalations #149/#153) and buried it among genuine build/test
-// breaks. Infra shares Code's retry accounting (both count against MaxAttempts,
-// neither is a free transient retry), so the total wall-clock is bounded at
-// MaxAttempts × PollDeadline while the class is reported at the cluster/CI layer
-// where the fix lives. Wrapped errors should also embed the pipeline web_url so
-// the escalation is directly actionable.
+// ErrPipelinePollTimeout is returned by GitLab polling when its session deadline
+// expires. Ordinary polling, including merge recovery, consumes the infrastructure
+// retry budget. ci_watch promotes a still-running pipeline below its wall-clock
+// ceiling to ErrCIWatchPollTimeout for free reattachment instead.
 var ErrPipelinePollTimeout = errors.New("pipeline: poll deadline exceeded")
+
+// ErrCIWatchPollTimeout marks a running CI watch eligible for free reattachment.
+// Ordinary pipeline polling (including merge recovery) keeps its retry budget.
+var ErrCIWatchPollTimeout = fmt.Errorf("ci_poll_timeout: %w", ErrPipelinePollTimeout)
+
+// ErrCIWatchCeiling marks expiry of the separate, policy-controlled wall-clock
+// ceiling. Unlike a poll-session timeout this is not a free retry.
+var ErrCIWatchCeiling = errors.New("pipeline: ci watch wall-clock ceiling exceeded")
 
 // ErrMRHeadSHAUnavailable is returned (wrapped) by a GitLabClient when the MR
 // reported no head SHA for the whole bounded head-SHA window, so the branch
@@ -225,16 +291,15 @@ var ErrPipelinePollTimeout = errors.New("pipeline: poll deadline exceeded")
 var ErrMRHeadSHAUnavailable = errors.New("pipeline: merge request head sha never materialized")
 
 // ErrBranchPipelineUnavailable is the with-a-head-SHA twin of
-// ErrMRHeadSHAUnavailable: GitLab published the MR head, but no `push` pipeline
-// for it ever appeared within the bounded branch-pipeline window. The causes are
-// all project configuration — `workflow:rules` that admit only
-// `merge_request_event`, CI disabled on the project, an operator deleting the
-// pipeline — so a re-poll observes the identical nothing. It is DISTINCT from
+// ErrMRHeadSHAUnavailable: GitLab published the MR head, but neither a `push`
+// pipeline nor its exact `merge_request_event` pipeline appeared within the
+// bounded window. CI disabled on the project or an operator deleting every
+// pipeline are typical causes, so a re-poll observes the identical nothing. It is DISTINCT from
 // ErrPipelinePollTimeout for the same reason its twin is: ci_watch answers a
 // poll timeout by extending the watch, which for a pipeline that cannot exist
 // only replays "MR <n> branch pipeline pending for <sha>" across the full 90m
 // cap and then blames a phantom stall. Classify maps it ClassConfig.
-var ErrBranchPipelineUnavailable = errors.New("pipeline: no branch pipeline for merge request head sha")
+var ErrBranchPipelineUnavailable = errors.New("pipeline: no pipeline for merge request head sha")
 
 // ErrMergeRequestClosed marks a merge that must stop because an operator closed
 // the MR. Clients wrap it so Classify can preserve that manual stop as terminal
@@ -449,23 +514,33 @@ var ErrMergeRequestLocked = errors.New("pipeline: merge request is temporarily l
 // preserved (code — the diff broke CI) so metrics stay honest.
 var ErrCIPipelineTerminal = errors.New("pipeline: ci reached terminal non-success state")
 
-// CIWatchStalledError is returned by the ci_watch stage when the MR's branch
-// pipeline was STILL RUNNING at the ci_watch watch hard cap
-// (MILLS_CI_WATCH_MAX_MINUTES, default 90m) after exhausting its poll-session
-// extensions. It is NOT a code failure: a slow-but-healthy CI run stalled the
-// watch (live evidence 2026-07-16: 7/7d ci_watch errors were poll timeouts with
-// the pipeline status still running/pending, 5 runs escalated here — the single
-// largest escalation sink). The runner escalates once as a RETRYABLE
-// external-dependency incident keyed on the stuck pipeline URL (a later requeue
-// can still succeed once CI drains) instead of burning the attempt budget or
-// blaming the diff. It unwraps to ErrPipelinePollTimeout so a caller that does
-// not special-case it still classifies it ClassInfra rather than ClassCode. (S3)
+// CIWatchStalledError is returned only when the independent wall-clock ceiling
+// expires while the pipeline remains non-terminal. Poll-session caps below the
+// ceiling return ErrPipelinePollTimeout and reattach for free; this ceiling
+// outcome escalates as infrastructure and carries actionable identity/runtime.
 type CIWatchStalledError struct {
 	PipelineURL string
+	PipelineID  string
 	MaxMinutes  int
+	Runtime     time.Duration
 	MRIID       int64
 	LastStatus  string
 }
+
+// CIWatchBaselineRedError marks a branch failure that is also present on the
+// latest failed target-branch pipeline. It is held as an external incident;
+// retrying is free once the target branch returns green.
+type CIWatchBaselineRedError struct {
+	TargetBranch string
+	PipelineURL  string
+	FailedJobs   []FailedJob
+}
+
+func (e *CIWatchBaselineRedError) Error() string {
+	return fmt.Sprintf("ci_watch: target branch %s is baseline-red in %s (%s)", e.TargetBranch, failedJobNames(e.FailedJobs), e.PipelineURL)
+}
+
+func (e *CIWatchBaselineRedError) Unwrap() error { return ErrPipelinePollTimeout }
 
 func (e *CIWatchStalledError) Error() string {
 	loc := e.PipelineURL
@@ -476,17 +551,28 @@ func (e *CIWatchStalledError) Error() string {
 	if status == "" {
 		status = "running"
 	}
-	return fmt.Sprintf("ci_watch: mr %d pipeline still %s after the %dm watch cap (%s)",
-		e.MRIID, status, e.MaxMinutes, loc)
+	id := e.PipelineID
+	if id == "" {
+		id = pipelineIDFromURL(e.PipelineURL)
+	}
+	return fmt.Sprintf("ci_watch: mr %d pipeline %s still %s after %s (wall-clock ceiling %dm; %s)",
+		e.MRIID, id, status, e.Runtime.Round(time.Second), e.MaxMinutes, loc)
 }
 
-// Unwrap lets errors.Is(err, ErrPipelinePollTimeout) and Classify treat an
-// unhandled stall as ClassInfra (bounded retries) rather than ClassCode.
-func (e *CIWatchStalledError) Unwrap() error { return ErrPipelinePollTimeout }
+// Unwrap distinguishes the wall-clock ceiling from a free poll-session expiry.
+func (e *CIWatchStalledError) Unwrap() error { return ErrCIWatchCeiling }
+
+func pipelineIDFromURL(raw string) string {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if i := strings.LastIndexByte(raw, '/'); i >= 0 && i+1 < len(raw) {
+		return raw[i+1:]
+	}
+	return "unknown"
+}
 
 const (
-	// ciWatchDefaultMaxMinutes is the total ci_watch wall-clock cap, spread
-	// across poll-session extensions, when MILLS_CI_WATCH_MAX_MINUTES is unset.
+	// ciWatchDefaultMaxMinutes is the total ci_watch wall-clock cap when neither
+	// policy nor MILLS_CI_WATCH_MAX_MINUTES supplies one.
 	// The default (90m) is 3× the 30m per-poll-session deadline so a slow CI run
 	// gets two extensions before it is treated as an external-dependency stall.
 	ciWatchDefaultMaxMinutes = 90
@@ -526,7 +612,10 @@ func ciWatchMaxMinutes(env map[string]string) int {
 // stall. 0 preserves the pre-S3 single-session behavior (escalate on the first
 // timeout). For the 90m default over 30m sessions this is 2.
 func ciWatchExtensionBudget(env map[string]string) int {
-	maxMin := ciWatchMaxMinutes(env)
+	return ciWatchExtensionBudgetFor(ciWatchMaxMinutes(env))
+}
+
+func ciWatchExtensionBudgetFor(maxMin int) int {
 	sessions := maxMin / ciWatchPollSessionMinutes
 	if maxMin%ciWatchPollSessionMinutes != 0 {
 		sessions++ // ceil: a partial session still gets a full watch window
@@ -677,6 +766,13 @@ type SpawnResponse struct {
 	// CostSource (real|estimated|unavailable) from this plus CostUSD.
 	CostEstimated bool
 
+	// Billing says who pays for CostUSD, derived by the spawn client from
+	// the credential path the HUD reports for the spawn (auth_mode):
+	// cluster_oauth → subscription, cluster_api_key / service account →
+	// api. Empty when the HUD did not say; the runner then falls back to
+	// store.BillingForBackend ("spawn" → subscription).
+	Billing store.BillingClass
+
 	// TokenUsage is the spawn's cumulative token accounting, mirroring
 	// bridge.SpawnTokenUsage. Before this field a spawn-dispatched stage
 	// reported cost-USD only, so "did the agent harness get its prompt
@@ -723,6 +819,16 @@ func (u SpawnTokenUsage) Reported() bool {
 // plan_slice, pr_self_review, and implement (with a worktree).
 type SpawnWorker struct {
 	Client SpawnClient
+	// ResolveBranchHead returns the remote head of (project, branch) once a
+	// pr_self_review spawn has finished. It feeds the pushed_commits artifact
+	// the tested_head gate compares against the tests stage's tested_sha; nil
+	// leaves the artifact unset and that gate advisory.
+	ResolveBranchHead func(ctx context.Context, project, branch string) (string, error)
+	// CompareForProject resolves the authoritative remote branch comparer used
+	// when this process has no checkout from which cumulative git capture can
+	// run (the normal spawn-shaped, cross-repo case). Nil preserves the
+	// fail-closed capture_unavailable verdict.
+	CompareForProject func(project string) BranchCompareClient
 	// Model overrides the request's model field. Empty falls through
 	// to the spawn service default.
 	Model string
@@ -757,6 +863,17 @@ type SpawnWorker struct {
 	// operator's main clone across concurrent runs is safe. Empty with
 	// no run worktree skips the capture (legacy behavior).
 	RepoRoot string
+	// AdoptionProbe optionally overrides the origin-branch probe used before an
+	// implement spawn. A non-empty branch diff is returned as a successful,
+	// spawn-less implement result so externally completed work is gated rather
+	// than overwritten. Implement workers with a usable working directory use
+	// GitBranchAdoptionProbe by default; tests and specialized callers can inject
+	// a deterministic implementation here.
+	AdoptionProbe BranchAdoptionProbe
+	// OpenMRForBranch protects a colliding legacy ref that still backs an open
+	// merge request. RecordBranchRefRetired durably records successful cleanup.
+	OpenMRForBranch        func(context.Context, string, string) (bool, error)
+	RecordBranchRefRetired func(context.Context, string, string, string) error
 	// SubstrateFor returns the devbox backend the spawn service should
 	// use for the given stage id. The operator wires this from
 	// PolicyManager.Current().SubstrateForStage so hot-reloaded policy
@@ -789,6 +906,43 @@ type SpawnWorker struct {
 	// stage; a non-empty Model sets SpawnRequest.AgentModel, which — for the
 	// codex path — pins `codex exec --model`.
 	RouteFor func(ctx context.Context, stage string, item *store.BacklogItem) mills.AgentDecision
+	// RequiredCredentials are presence-checked immediately before implement
+	// dispatch. Only their names can reach the preflight result.
+	RequiredCredentials []string
+	CredentialLookup    func(string) (string, bool)
+}
+
+func (w *SpawnWorker) preflight(jc JobContext) spin.PreflightResult {
+	prompt := ""
+	if w.PromptFor != nil {
+		prompt = w.PromptFor(jc)
+	}
+	workdir := jc.Run.WorktreePath
+	if workdir == "" {
+		workdir = w.RepoRoot
+	}
+	lookup := w.CredentialLookup
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	return spin.CheckPreflight(spin.PreflightInput{
+		Workdir: workdir, RequiredCredentials: w.RequiredCredentials,
+		CredentialLookup: lookup, Prompt: prompt, PromptDeliverable: w.Client != nil,
+	})
+}
+
+// PreflightImplement resolves the implement worker's local invocation inputs
+// without calling Worker.Run or the spawn client.
+func (d *Dispatcher) PreflightImplement(_ context.Context, run *store.PipelineRun, item *store.BacklogItem, stage Stage, prior map[string]StageOutput) spin.PreflightResult {
+	if d == nil {
+		return spin.PreflightResult{Reason: spin.PreflightPromptUndeliverable, Detail: "implement dispatcher is not configured"}
+	}
+	w, _ := d.routes[stage.ID].(*SpawnWorker)
+	if w == nil {
+		return spin.PreflightResult{Reason: spin.PreflightPromptUndeliverable, Detail: "implement spawn worker is not configured"}
+	}
+	jc := JobContext{Run: run, Item: item, Stage: stage, Prior: prior, Budget: item.Budget, Env: BuildMillsEnv(run, item, stage)}
+	return w.preflight(jc)
 }
 
 // Run satisfies Worker.
@@ -852,6 +1006,47 @@ func (w *SpawnWorker) Run(ctx context.Context, jc JobContext) (StageOutput, erro
 	if workingDir == "" && store.SameRepo(project, home) {
 		workingDir = w.RepoRoot
 	}
+	adoptionProbe := w.AdoptionProbe
+	var adoptionProbeArtifacts map[string]any
+	if adoptionProbe == nil && workingDir != "" {
+		// Remote spawn substrates and tests may carry a prospective working
+		// directory that is not materialized in this process. Only auto-probe
+		// when there is a local checkout to inspect; an explicitly injected
+		// probe remains authoritative regardless of local path state.
+		if _, err := os.Stat(workingDir); err == nil {
+			adoptionProbe = GitBranchAdoptionProbe{}
+		}
+	}
+	if jc.Stage.ID == "implement" && jc.ResumeSpawnID == "" && adoptionProbe != nil {
+		if preflight, ok := adoptionProbe.(BranchRefCollisionPreflight); ok {
+			retired, err := preflight.PreflightRefCollisions(ctx, workingDir, branch, jc.Item, func(ref string) (bool, error) {
+				if w.OpenMRForBranch == nil {
+					return false, errors.New("open-MR lookup is not configured")
+				}
+				return w.OpenMRForBranch(ctx, project, ref)
+			})
+			if err != nil {
+				return StageOutput{}, fmt.Errorf("[branch_contract.ref_collision] %w: %v", ErrBranchContractRefCollision, err)
+			}
+			for _, ref := range retired {
+				if w.RecordBranchRefRetired != nil {
+					if err := w.RecordBranchRefRetired(ctx, jc.Run.ID, branch, ref); err != nil {
+						return StageOutput{}, fmt.Errorf("[branch_contract.ref_collision] %w: record retired ref %q: %v", ErrBranchContractRefCollision, ref, err)
+					}
+				}
+			}
+		}
+		adopted, err := adoptionProbe.Probe(ctx, workingDir, baseBranch, branch)
+		if err != nil {
+			return StageOutput{}, fmt.Errorf("spawn worker: probe implement branch adoption: %w", err)
+		}
+		if adopted != nil {
+			if _, unresolved := adopted.Artifacts[AdoptionProbeUnresolvedArtifact]; !unresolved {
+				return *adopted, nil
+			}
+			adoptionProbeArtifacts = adopted.Artifacts
+		}
+	}
 	req := SpawnRequest{
 		Prompt:          prompt,
 		WorkingDir:      workingDir,
@@ -880,6 +1075,14 @@ func (w *SpawnWorker) Run(ctx context.Context, jc JobContext) (StageOutput, erro
 	stamp := func(out StageOutput) StageOutput {
 		out.Model = model
 		out.Backend = spawnBackendLabel
+		if len(adoptionProbeArtifacts) != 0 {
+			if out.Artifacts == nil {
+				out.Artifacts = map[string]any{}
+			}
+			for key, value := range adoptionProbeArtifacts {
+				out.Artifacts[key] = value
+			}
+		}
 		if mills.AgentRouted(routing) {
 			if out.Artifacts == nil {
 				out.Artifacts = map[string]any{}
@@ -905,7 +1108,8 @@ func (w *SpawnWorker) Run(ctx context.Context, jc JobContext) (StageOutput, erro
 				BaseBranch: baseBranch,
 				Branch:     branch,
 			})
-			return stamp(spawnResponseToStageOutput(resp)), err
+			out := stamp(w.withRemoteBranchDiff(ctx, jc.Stage.ID, project, baseBranch, branch, workingDir, spawnResponseToStageOutput(resp)))
+			return w.withReviewPushArtifact(ctx, jc, project, branch, out, err)
 		}
 		resumer, ok := w.Client.(SpawnResumeClient)
 		if !ok {
@@ -915,13 +1119,379 @@ func (w *SpawnWorker) Run(ctx context.Context, jc JobContext) (StageOutput, erro
 		if err != nil {
 			return stamp(spawnResponseToStageOutput(resp)), err
 		}
-		return stamp(spawnResponseToStageOutput(resp)), nil
+		out := stamp(w.withRemoteBranchDiff(ctx, jc.Stage.ID, project, baseBranch, branch, workingDir, spawnResponseToStageOutput(resp)))
+		return w.withReviewPushArtifact(ctx, jc, project, branch, out, nil)
 	}
 	resp, err := w.Client.Run(ctx, req)
 	if err != nil {
 		return stamp(spawnResponseToStageOutput(resp)), err
 	}
-	return stamp(spawnResponseToStageOutput(resp)), nil
+	out := stamp(w.withRemoteBranchDiff(ctx, jc.Stage.ID, project, baseBranch, branch, workingDir, spawnResponseToStageOutput(resp)))
+	return w.withReviewPushArtifact(ctx, jc, project, branch, out, nil)
+}
+
+// reviewPushedCommitsArtifactKey is the pr_self_review stage artifact
+// ({count, head_sha}) recording whether the review rewrote the tree. The
+// tested_head gate reads head_sha; the shift ledger and escalation issue read
+// count. head_error accompanies an empty head_sha when the head could not be
+// resolved.
+const reviewPushedCommitsArtifactKey = "pushed_commits"
+
+const reviewHeadResolveAttempts = 3
+
+// reviewHeadResolveBackoff separates head-resolution attempts; a var so tests
+// can drop the wait.
+var reviewHeadResolveBackoff = 2 * time.Second
+
+// withReviewPushArtifact stamps pushed_commits on a finished pr_self_review
+// output: the remote branch head after the review and how many commits the
+// review added on top of the implement stage's cumulative list. A head that
+// cannot be resolved is recorded as unresolved (with the error) rather than
+// failing the stage: the review's work is done and respawning it cannot fix
+// GitLab, and the tested_head gate skips on an unresolved head — that run
+// merely lacks the re-test, which is where every run stood before it.
+func (w *SpawnWorker) withReviewPushArtifact(ctx context.Context, jc JobContext, project, branch string, out StageOutput, runErr error) (StageOutput, error) {
+	if runErr != nil || jc.Stage.ID != prSelfReviewStageID || w.ResolveBranchHead == nil {
+		return out, runErr
+	}
+	pushed := map[string]any{"count": reviewCommitCount(jc, out), "head_sha": ""}
+	if head, err := w.resolveReviewHead(ctx, project, branch); err != nil {
+		pushed["head_error"] = err.Error()
+	} else {
+		pushed["head_sha"] = head
+	}
+	if out.Artifacts == nil {
+		out.Artifacts = map[string]any{}
+	}
+	out.Artifacts[reviewPushedCommitsArtifactKey] = pushed
+	return out, nil
+}
+
+// resolveReviewHead retries the head lookup a few times: the review just
+// pushed, and a GitLab edge blip right after must not turn into an
+// unresolved head that leaves this run without the tested_head check.
+func (w *SpawnWorker) resolveReviewHead(ctx context.Context, project, branch string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < reviewHeadResolveAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(reviewHeadResolveBackoff):
+			}
+		}
+		head, err := w.ResolveBranchHead(ctx, project, branch)
+		if err == nil {
+			if head = strings.TrimSpace(head); head != "" {
+				return head, nil
+			}
+			err = errors.New("empty branch head")
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("resolve branch head after %d attempts: %w", reviewHeadResolveAttempts, lastErr)
+}
+
+// reviewCommitCount is how many commits the review session added: its
+// cumulative branch commit list minus the implement stage's. Clamped at zero
+// because a review without a git capture reports an empty list.
+func reviewCommitCount(jc JobContext, out StageOutput) int {
+	if count := len(out.CommitMessages) - len(jc.Prior["implement"].CommitMessages); count > 0 {
+		return count
+	}
+	return 0
+}
+
+// BranchCompareClient returns the remote branch-vs-base view used when local
+// cumulative capture has no working-directory coordinate. exists=false means
+// the source branch is absent; callers preserve the original capture evidence.
+type BranchCompareClient interface {
+	CompareBranch(ctx context.Context, baseBranch, branch string) (out StageOutput, exists bool, err error)
+}
+
+func (w *SpawnWorker) withRemoteBranchDiff(ctx context.Context, stageID, project, baseBranch, branch, workingDir string, out StageOutput) StageOutput {
+	if stageID != "implement" || strings.TrimSpace(workingDir) != "" || hasDiffEvidence(out) || w.CompareForProject == nil {
+		return out
+	}
+	client := w.CompareForProject(project)
+	if client == nil {
+		return out
+	}
+	compared, exists, err := client.CompareBranch(ctx, baseBranch, branch)
+	if err != nil {
+		setGitCaptureReason(&out, "remote branch compare failed: "+err.Error())
+		return out
+	}
+	if !exists {
+		return out
+	}
+	// The remote comparison is the cumulative capture substitute, so its
+	// branch-wide evidence is authoritative over per-attempt telemetry.
+	out.FilesChanged = compared.FilesChanged
+	out.LinesAdded = compared.LinesAdded
+	out.LinesRemoved = compared.LinesRemoved
+	out.DiffPatch = compared.DiffPatch
+	out.CommitMessages = compared.CommitMessages
+	if out.Artifacts == nil {
+		out.Artifacts = map[string]any{}
+	}
+	status := "captured"
+	if !hasDiffEvidence(out) {
+		status = "captured_empty"
+	}
+	out.Artifacts[GitCaptureArtifactKey] = map[string]any{
+		"status": status, "reason": "remote branch-vs-base compare", "base_ref": baseBranch, "head_ref": branch,
+		"files": len(out.FilesChanged), "diff_bytes": len(out.DiffPatch),
+	}
+	return out
+}
+
+func setGitCaptureReason(out *StageOutput, reason string) {
+	if out.Artifacts == nil {
+		out.Artifacts = map[string]any{}
+	}
+	capture, _ := out.Artifacts[GitCaptureArtifactKey].(map[string]any)
+	if capture == nil {
+		capture = map[string]any{"status": "skipped_no_capture_context"}
+	}
+	capture["reason"] = reason
+	out.Artifacts[GitCaptureArtifactKey] = capture
+}
+
+// BranchAdoptionProbe returns a gate-ready implement output when branch exists
+// on origin and differs from base. A nil output means the branch is absent or
+// empty and normal implement dispatch should proceed.
+type BranchAdoptionProbe interface {
+	Probe(ctx context.Context, workingDir, baseBranch, branch string) (*StageOutput, error)
+}
+
+// BranchRefCollisionPreflight is implemented by origin-aware adoption probes.
+type BranchRefCollisionPreflight interface {
+	PreflightRefCollisions(ctx context.Context, workingDir, contractBranch string, item *store.BacklogItem, hasOpenMR func(string) (bool, error)) ([]string, error)
+}
+
+// ErrBranchContractRefCollision marks an origin ref layout that cannot be
+// repaired safely without operator action. It is terminal for the current run.
+var ErrBranchContractRefCollision = errors.New("branch contract ref collision")
+
+// AdoptionProbeUnresolvedArtifact marks a branch-adoption optimization that
+// could not establish a merge base even after its one bounded remediation.
+// The implement spawn still runs normally; this evidence makes that degraded
+// decision durable on the stage result.
+const AdoptionProbeUnresolvedArtifact = "adoption_probe_unresolved"
+
+// GitBranchAdoptionProbe reads authoritative origin refs without checking out
+// or modifying the caller's branch. Probe errors are returned so dispatch fails
+// closed instead of risking an overwrite when origin cannot be inspected.
+type GitBranchAdoptionProbe struct {
+	runGit func(context.Context, string, ...string) ([]byte, error)
+}
+
+func (p GitBranchAdoptionProbe) PreflightRefCollisions(ctx context.Context, workingDir, contractBranch string, item *store.BacklogItem, hasOpenMR func(string) (bool, error)) ([]string, error) {
+	if strings.TrimSpace(workingDir) == "" {
+		return nil, errors.New("git ref-collision preflight: working directory unavailable")
+	}
+	run := func(args ...string) ([]byte, error) {
+		if p.runGit != nil {
+			return p.runGit(ctx, workingDir, args...)
+		}
+		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", workingDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return out, nil
+	}
+	out, err := run("ls-remote", "--refs", "--heads", "origin")
+	if err != nil {
+		if isNotAGitRepoProbe(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var refs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			refs = append(refs, fields[1])
+		}
+	}
+	collisions := BranchRefCollisions(contractBranch, refs, item)
+	for _, collision := range collisions {
+		if !collision.SameItemLegacyForm {
+			itemID := ""
+			if item != nil {
+				itemID = item.ID
+			}
+			return nil, fmt.Errorf("origin ref %q conflicts with contract branch %q and is not owned by item %q", collision.Ref, contractBranch, itemID)
+		}
+	}
+	var retired []string
+	for _, collision := range collisions {
+		open, lookupErr := hasOpenMR(collision.Ref)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("check open MR for legacy ref %q: %w", collision.Ref, lookupErr)
+		}
+		if open {
+			return nil, fmt.Errorf("legacy ref %q conflicts with contract branch %q and has an open MR", collision.Ref, contractBranch)
+		}
+		if _, err := run("push", "origin", ":refs/heads/"+collision.Ref); err != nil {
+			return nil, fmt.Errorf("retire legacy ref %q: %w", collision.Ref, err)
+		}
+		slog.Default().Info("mills branch-contract preflight retired legacy origin ref",
+			"retired_ref", collision.Ref, "contract_branch", contractBranch)
+		retired = append(retired, collision.Ref)
+	}
+	return retired, nil
+}
+
+func (p GitBranchAdoptionProbe) Probe(ctx context.Context, workingDir, baseBranch, branch string) (*StageOutput, error) {
+	if strings.TrimSpace(workingDir) == "" {
+		return nil, errors.New("git adoption probe: working directory unavailable")
+	}
+	run := func(args ...string) ([]byte, error) {
+		if p.runGit != nil {
+			return p.runGit(ctx, workingDir, args...)
+		}
+		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", workingDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return out, nil
+	}
+	remote, err := run("ls-remote", "--refs", "origin", "refs/heads/"+branch)
+	if err != nil {
+		if isNotAGitRepoProbe(err) {
+			return unresolvedAdoptionOutput("origin/"+baseBranch, "origin/"+branch, "workdir_not_git_repository", err), nil
+		}
+		return nil, err
+	}
+	fields := strings.Fields(string(remote))
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	if len(fields) < 2 {
+		return nil, fmt.Errorf("git adoption probe: malformed ls-remote output %q", strings.TrimSpace(string(remote)))
+	}
+	headSHA := fields[0]
+	if _, err := run("fetch", "--no-tags", "origin", "+refs/heads/"+baseBranch+":refs/remotes/origin/"+baseBranch, "+refs/heads/"+branch+":refs/remotes/origin/"+branch); err != nil {
+		return nil, err
+	}
+	baseRef, headRef := "origin/"+baseBranch, "origin/"+branch
+	mergeBase, reason := verifiedAdoptionMergeBase(run, baseRef, headRef)
+	if reason != nil {
+		if _, fetchErr := run("fetch", "--deepen=2000", "--no-tags", "origin", "+refs/heads/"+baseBranch+":refs/remotes/origin/"+baseBranch, "+refs/heads/"+branch+":refs/remotes/origin/"+branch); fetchErr != nil {
+			return unresolvedAdoptionOutput(baseRef, headRef, "fetch_deepen_2000", fetchErr), nil
+		}
+		mergeBase, reason = verifiedAdoptionMergeBase(run, baseRef, headRef)
+		if reason != nil {
+			return unresolvedAdoptionOutput(baseRef, headRef, "fetch_deepen_2000", reason), nil
+		}
+	}
+	diffRange := mergeBase + ".." + headRef
+	names, err := run("diff", "--name-only", diffRange)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, name := range strings.Split(strings.TrimSpace(string(names)), "\n") {
+		if name != "" {
+			files = append(files, name)
+		}
+	}
+	if len(files) == 0 {
+		return nil, nil
+	}
+	patch, err := run("diff", "--no-ext-diff", diffRange)
+	if err != nil {
+		return nil, err
+	}
+	numstat, err := run("diff", "--numstat", diffRange)
+	if err != nil {
+		return nil, err
+	}
+	added, removed := 0, 0
+	for _, line := range strings.Split(strings.TrimSpace(string(numstat)), "\n") {
+		cols := strings.Fields(line)
+		if len(cols) < 2 {
+			continue
+		}
+		if n, e := strconv.Atoi(cols[0]); e == nil {
+			added += n
+		}
+		if n, e := strconv.Atoi(cols[1]); e == nil {
+			removed += n
+		}
+	}
+	log, err := run("log", "--format=%s", baseRef+".."+headRef)
+	if err != nil {
+		return nil, err
+	}
+	var commits []string
+	for _, msg := range strings.Split(strings.TrimSpace(string(log)), "\n") {
+		if msg != "" {
+			commits = append(commits, msg)
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return &StageOutput{
+		LogTail: "implement: adopted pre-existing origin branch " + branch,
+		Artifacts: map[string]any{
+			"adopted_branch": branch, "adopted_head_sha": headSHA, "adopted_at": now,
+			GitCaptureArtifactKey: map[string]any{"status": "ok", "base_ref": baseRef, "head_ref": headRef, "files": len(files), "diff_bytes": len(patch)},
+		},
+		FilesChanged: files, LinesAdded: added, LinesRemoved: removed,
+		DiffPatch: patch, CommitMessages: commits,
+	}, nil
+}
+
+// verifiedAdoptionMergeBase rejects a merge-base which is itself a shallow
+// graft. Git otherwise treats that artificial boundary as a real root and a
+// triple-dot diff can silently include changes made only on the base branch.
+func verifiedAdoptionMergeBase(run func(...string) ([]byte, error), baseRef, headRef string) (string, error) {
+	out, err := run("merge-base", baseRef, headRef)
+	if err != nil {
+		return "", err
+	}
+	mergeBase := strings.TrimSpace(string(out))
+	if mergeBase == "" {
+		return "", errors.New("git merge-base returned no commit")
+	}
+	shallow, err := run("rev-parse", "--is-shallow-repository")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(shallow)) == "true" {
+		if _, err := run("rev-parse", mergeBase+"^"); err != nil {
+			return "", fmt.Errorf("merge-base %s is an unverified shallow boundary: %w", mergeBase, err)
+		}
+	}
+	return mergeBase, nil
+}
+
+// isNotAGitRepoProbe matches the exit-128 shapes where the working directory
+// cannot address origin at all (bare scratch dirs in E2E fixtures, synthetic
+// spawn worktrees). Adoption is impossible there rather than ambiguous — no
+// origin means no pre-existing branch work to protect — so the probe degrades
+// to a normal implementation instead of burning code-class attempts.
+func isNotAGitRepoProbe(err error) bool {
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "exit status 128") {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "not a git repository") ||
+		strings.Contains(message, "does not appear to be a git repository")
+}
+
+func unresolvedAdoptionOutput(baseRef, headRef, remediation string, err error) *StageOutput {
+	return &StageOutput{
+		LogTail: "implement: branch adoption probe unresolved; continuing with normal implementation",
+		Artifacts: map[string]any{AdoptionProbeUnresolvedArtifact: map[string]any{
+			"base_ref": baseRef, "head_ref": headRef, "remediation": remediation,
+			"error": err.Error(), "degraded_at": time.Now().UTC().Format(time.RFC3339Nano),
+		}},
+	}
 }
 
 // spawnBackendLabel is the telemetry backend bucket for spawn-dispatched stages
@@ -1002,6 +1572,7 @@ func spawnResponseToStageOutput(resp SpawnResponse) StageOutput {
 		DiffPatch:      resp.DiffPatch,
 		CommitMessages: resp.CommitMessages,
 		CostEstimated:  resp.CostEstimated,
+		Billing:        resp.Billing,
 	}
 }
 
@@ -1112,6 +1683,22 @@ func (w *WeaverWorker) Run(ctx context.Context, jc JobContext) (StageOutput, err
 		BudgetUSD:     jc.Budget.MaxCostUSD,
 		DeclaredPaths: declaredSlicePaths(jc.Item),
 	})
+	art := map[string]any{}
+	if resp.Notes != "" {
+		art["research_notes"] = resp.Notes
+	}
+	if resp.Citation != nil {
+		art["citation"] = resp.Citation
+	}
+	addResearchTokenArtifacts(art, resp.Usage)
+	out := StageOutput{
+		CostUSD:   resp.CostUSD,
+		SpawnID:   resp.SpawnID,
+		LogTail:   resp.LogTail,
+		Model:     resp.Model,
+		Backend:   resp.Backend,
+		Artifacts: art,
+	}
 	if err != nil {
 		// Research is advisory context, not load-bearing. When every candidate
 		// model is unavailable (503-parked shared GPU), soft-skip with an
@@ -1130,21 +1717,16 @@ func (w *WeaverWorker) Run(ctx context.Context, jc JobContext) (StageOutput, err
 				},
 			}, nil
 		}
-		return StageOutput{}, err
+		// A failed completion can still carry the resolved model, token usage,
+		// cost, provider log tail, and citation metadata. Preserve that partial
+		// response so the runner can persist the same provenance it does for a
+		// successful research attempt.
+		return out, err
 	}
-	art := map[string]any{"research_notes": resp.Notes}
-	if resp.Citation != nil {
-		art["citation"] = resp.Citation
+	if _, ok := art["research_notes"]; !ok {
+		art["research_notes"] = ""
 	}
-	addResearchTokenArtifacts(art, resp.Usage)
-	return StageOutput{
-		CostUSD:   resp.CostUSD,
-		SpawnID:   resp.SpawnID,
-		LogTail:   resp.LogTail,
-		Model:     resp.Model,
-		Backend:   resp.Backend,
-		Artifacts: art,
-	}, nil
+	return out, nil
 }
 
 // declaredSlicePaths flattens the item's slice file lists for the research
@@ -1212,6 +1794,32 @@ type DevboxClient interface {
 	QualityGate(ctx context.Context, req DevboxRequest) (DevboxResponse, error)
 }
 
+// DevboxStopClient confirms sandbox termination. Resumed tests require it;
+// fresh gates remain compatible with clients that only implement QualityGate.
+type DevboxStopClient interface {
+	Stop(ctx context.Context, project, agentID string) error
+}
+
+// releaseSandbox stops one run-scoped sandbox as soon as its gate returns, so
+// each identity is released exactly once: the main sandbox before the baseline
+// oracle can mint a second one (one sandbox of devbox quota per run at peak),
+// the baseline sandbox right after its own gate. The release is unconditional
+// on the gate's outcome and uses a fresh bounded context because the gate
+// context may already be cancelled or timed out. Failures are logged, never
+// returned: a leaked sandbox is reaped by the devbox idle timeout and must not
+// change the gate verdict.
+func (w *DevboxWorker) releaseSandbox(ctx context.Context, project, agentID string) {
+	releaser, ok := w.Client.(DevboxStopClient)
+	if !ok {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	if err := releaser.Stop(cleanupCtx, project, agentID); err != nil {
+		slog.Default().Warn("mills devbox sandbox release failed", "project", project, "agent_id", agentID, "error", err)
+	}
+}
+
 // DevboxRequest carries the project + agent id + env to a quality-gate run.
 //
 // Checks, when non-empty, scopes the gate to the named subset (one of
@@ -1224,24 +1832,32 @@ type DevboxRequest struct {
 	Env          map[string]string
 	Checks       []string
 	TestCommands []string
+	// LintPackages is the touched-package scope for the default-on CI-parity
+	// lint check. Clients that execute in-process may consume it directly;
+	// the standard worker also materialises it as the first test command.
+	LintPackages []string
 }
 
 // DevboxResponse summarises the gate verdict + per-check results.
 type DevboxResponse struct {
-	Passed   bool
-	CostUSD  float64
-	LogTail  string
-	Checks   []DevboxCheck
-	Language string
+	Passed    bool
+	CostUSD   float64
+	LogTail   string
+	Checks    []DevboxCheck
+	Language  string
+	TestedSHA string
 }
 
 // DevboxCheck captures one fmt/lint/test run inside the gate.
 type DevboxCheck struct {
-	Name     string
-	Passed   bool
-	ExitCode int
-	Duration float64
-	Output   string
+	Degraded         bool
+	Warning          string
+	FailureSignature string
+	Name             string
+	Passed           bool
+	ExitCode         int
+	Duration         float64
+	Output           string
 }
 
 // ErrDevboxGateNoChecks is returned (wrapped) by the tests stage when the
@@ -1257,9 +1873,58 @@ var ErrDevboxGateNoChecks = errors.New("devbox: quality gate reported not-passed
 
 // DevboxWorker dispatches the tests stage.
 type DevboxWorker struct {
-	Client  DevboxClient
-	Project string
-	AgentID string
+	Client    DevboxClient
+	GitLab    GitLabClient
+	Project   string
+	AgentID   string
+	GitToken  string
+	GoPrivate string
+	// ResolveHead is the legacy worktree resolver and final fallback.
+	ResolveHead func(context.Context, string) (string, error)
+	// BaselineOracle gates the rerun-without-patch check (shepherd B3): on a
+	// gate failure the FAILED subset re-runs against the bare main checkout,
+	// and a subset that also fails there classifies as infrastructure. nil
+	// or false disables the oracle.
+	BaselineOracle func() bool
+}
+
+// ErrDevboxBaselineAlsoFails marks a tests-stage failure whose failed checks
+// ALSO fail against the bare main checkout: the environment or the baseline
+// is broken, not the change. Classify maps it to ClassInfra so the run stops
+// burning code-class attempts on a failure it cannot fix.
+var ErrDevboxBaselineAlsoFails = errors.New("devbox: failed checks also fail against bare main")
+
+func (w *DevboxWorker) testsGitEnv(jobEnv map[string]string) map[string]string {
+	env := make(map[string]string, 2)
+	for _, key := range []string{"GIT_TOKEN", "GOPRIVATE"} {
+		if value := strings.TrimSpace(jobEnv[key]); value != "" {
+			env[key] = value
+		}
+	}
+	if value := strings.TrimSpace(w.GitToken); value != "" {
+		env["GIT_TOKEN"] = value
+	}
+	if value := strings.TrimSpace(w.GoPrivate); value != "" {
+		env["GOPRIVATE"] = value
+	}
+	return env
+}
+
+var ErrDevboxCheckoutInfra = errors.New("devbox: tests checkout infrastructure")
+
+func resolveWorktreeHead(ctx context.Context, worktree string) (string, error) {
+	if strings.TrimSpace(worktree) == "" {
+		return "", errors.New("run worktree unavailable")
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse HEAD in %q: %w", worktree, err)
+	}
+	sha := strings.TrimSpace(string(out))
+	if sha == "" {
+		return "", errors.New("git rev-parse HEAD returned an empty sha")
+	}
+	return sha, nil
 }
 
 // gitCloneTestsScope is the devbox quality-gate selector for every Mills
@@ -1281,6 +1946,9 @@ type DevboxWorker struct {
 var gitCloneTestsScope = []string{"fmt"}
 
 const skippedDeclaredTestsArtifactKey = "skipped_declared_tests"
+const touchedTestPackagesArtifactKey = "touched_test_packages"
+
+const maxTouchedTestPackages = 25
 
 // devboxScopeFor returns the quality-gate Checks selector for a backlog item.
 // All items use the sandbox-safe scope (see gitCloneTestsScope); GitLab CI,
@@ -1298,6 +1966,29 @@ func devboxScopeFor(_ *store.BacklogItem) []string {
 // "go.work requires go >= 1.26.4 (running go 1.26.0; GOTOOLCHAIN=local)",
 // FAIL test:0 in ~100ms while the same command passed under GOWORK=off).
 var declaredTestEnvWord = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+`)
+var declaredGoTestVerb = regexp.MustCompile(`^go[\t ]+test`)
+
+func normalizeDeclaredGoTest(command string) (string, bool) {
+	rest := command
+	for {
+		m := declaredTestEnvWord.FindString(rest)
+		if m == "" {
+			break
+		}
+		rest = rest[len(m):]
+	}
+	verb := declaredGoTestVerb.FindString(rest)
+	if verb == "" || (len(rest) > len(verb) && rest[len(verb)] != ' ' && rest[len(verb)] != '\t') {
+		return command, false
+	}
+	for _, field := range strings.Fields(command) {
+		if field == "-count=1" {
+			return command, true
+		}
+	}
+	verbEnd := len(command) - len(rest) + len(verb)
+	return command[:verbEnd] + " -count=1" + command[verbEnd:], true
+}
 
 func declaredDevboxTests(item *store.BacklogItem) (allowed, skipped []string) {
 	if item == nil {
@@ -1316,7 +2007,9 @@ func declaredDevboxTests(item *store.BacklogItem) (allowed, skipped []string) {
 			}
 			rest = rest[len(m):]
 		}
-		if !strings.HasPrefix(rest, "go test ") {
+		var ok bool
+		command, ok = normalizeDeclaredGoTest(command)
+		if !ok {
 			skipped = append(skipped, command)
 			continue
 		}
@@ -1332,38 +2025,242 @@ func declaredDevboxTests(item *store.BacklogItem) (allowed, skipped []string) {
 	return allowed, skipped
 }
 
+func touchedPackageTestCommand(packages, declared []string) (string, []string) {
+	if len(packages) == 0 || declaredTestsCoverPackages(declared, packages) {
+		return "", nil
+	}
+	effective := packages
+	if len(effective) > maxTouchedTestPackages {
+		effective = []string{commonPackagePattern(effective)}
+	}
+	quoted := make([]string, 0, len(effective))
+	for _, pkg := range effective {
+		quoted = append(quoted, shellQuoteTestPackage(pkg))
+	}
+	return "GOWORK=off go test -count=1 " + strings.Join(quoted, " "), effective
+}
+
+func shellQuoteTestPackage(pkg string) string {
+	return "'" + strings.ReplaceAll(pkg, "'", "'\"'\"'") + "'"
+}
+
+func declaredTestsCoverPackages(commands, packages []string) bool {
+	covered := make(map[string]bool, len(packages))
+	for _, command := range commands {
+		for _, field := range strings.Fields(command) {
+			if field != "." && !strings.HasPrefix(field, "./") {
+				continue
+			}
+			for _, pkg := range packages {
+				if field == pkg || field == "./..." || (strings.HasSuffix(field, "/...") && strings.HasPrefix(pkg+"/", strings.TrimSuffix(field, "..."))) {
+					covered[pkg] = true
+				}
+			}
+		}
+	}
+	return len(covered) == len(packages)
+}
+
+func commonPackagePattern(packages []string) string {
+	common := strings.Split(strings.TrimPrefix(packages[0], "./"), "/")
+	for _, pkg := range packages[1:] {
+		parts := strings.Split(strings.TrimPrefix(pkg, "./"), "/")
+		n := len(common)
+		if len(parts) < n {
+			n = len(parts)
+		}
+		i := 0
+		for i < n && common[i] == parts[i] {
+			i++
+		}
+		common = common[:i]
+	}
+	if len(common) == 0 {
+		return "./..."
+	}
+	return "./" + strings.Join(common, "/") + "/..."
+}
+
+func addCommandOutputHeader(checks []DevboxCheck, commandIndex int, command string) {
+	if command == "" {
+		return
+	}
+	name := fmt.Sprintf("test:%d", commandIndex)
+	for i := range checks {
+		if checks[i].Name == name {
+			checks[i].Output = "Command: " + command + "\n" + checks[i].Output
+			return
+		}
+	}
+}
+
+// SynchronousCallTimeout exposes the actual client's gate budget, including
+// configuration overrides, without coupling the pipeline to a concrete client.
+func (w *DevboxWorker) SynchronousCallTimeout() time.Duration {
+	if provider, ok := w.Client.(interface{ EffectiveGateTimeout() time.Duration }); ok {
+		return provider.EffectiveGateTimeout()
+	}
+	return 0
+}
+
 // Run satisfies Worker.
-func (w *DevboxWorker) Run(ctx context.Context, jc JobContext) (StageOutput, error) {
+func (w *DevboxWorker) Run(ctx context.Context, jc JobContext) (out StageOutput, runErr error) {
+	if resume, _ := ctx.Value(resumeTestsKey{}).(bool); resume {
+		evidence := []string{"cancel stale run and baseline sandboxes before redispatch"}
+		defer func() {
+			if out.Artifacts == nil {
+				out.Artifacts = map[string]any{}
+			}
+			out.Artifacts["resume_sandbox_cleanup"] = evidence
+		}()
+		record := func() error {
+			if recorder, ok := ctx.Value(resumeCleanupRecorderKey{}).(func([]string) error); ok {
+				return recorder(evidence)
+			}
+			return nil
+		}
+		if err := record(); err != nil {
+			return out, fmt.Errorf("persist resume cleanup: %w", err)
+		}
+		stopper, ok := w.Client.(DevboxStopClient)
+		if !ok {
+			return out, fmt.Errorf("devbox resume: client cannot stop stale sandboxes")
+		}
+		for _, suffix := range []string{"", "baseline"} {
+			agent := devboxAgentID(w.AgentID, jc.Run.ID, suffix)
+			if err := stopper.Stop(ctx, effectiveProject(jc.Item, w.Project), agent); err != nil {
+				evidence = append(evidence, agent+": stop failed: "+err.Error())
+				return out, fmt.Errorf("devbox resume cleanup: %w", err)
+			}
+			evidence = append(evidence, agent+": stopped")
+			if err := record(); err != nil {
+				return out, fmt.Errorf("persist resume cleanup: %w", err)
+			}
+		}
+	}
 	if w.Client == nil {
 		return StageOutput{}, fmt.Errorf("devbox worker: client not configured")
 	}
+	branch := BranchContractFor(jc.Run, jc.Item, jc.Stage, "").SourceBranch
+	expectedSHA := strings.TrimSpace(jc.Env["LOOM_MILLS_EXPECTED_SHA"])
+	if expectedSHA == "" && jc.RetryContext != nil {
+		// Post-review re-test (bl-verify-s3b): verify the head the review
+		// pushed, not the implement stage's adopted-head pin below, which is
+		// exactly the stale revision the re-test exists to replace.
+		expectedSHA = strings.TrimSpace(jc.RetryContext.ExpectedHeadSHA)
+	}
+	if expectedSHA == "" {
+		if implement, ok := jc.Prior["implement"]; ok {
+			expectedSHA, _ = implement.Artifacts["adopted_head_sha"].(string)
+			expectedSHA = strings.TrimSpace(expectedSHA)
+		}
+	}
+	if expectedSHA == "" && w.GitLab != nil {
+		resolved, err := w.GitLab.BranchHeadSHA(ctx, effectiveProject(jc.Item, w.Project), branch)
+		if err == nil {
+			expectedSHA = strings.TrimSpace(resolved)
+		}
+	}
+	if expectedSHA == "" {
+		resolver := w.ResolveHead
+		if resolver == nil {
+			resolver = resolveWorktreeHead
+		}
+		resolved, err := resolver(ctx, jc.Run.WorktreePath)
+		if err == nil {
+			expectedSHA = strings.TrimSpace(resolved)
+		}
+	}
+	// bl-mills-tests-stage-pin-or-fail-20260902: a passing gate must always
+	// describe the exact pushed revision it tested.
+	if expectedSHA == "" {
+		return StageOutput{}, fmt.Errorf("%w: pushed head unresolvable for %s", ErrDevboxCheckoutInfra, branch)
+	}
 	testCommands, skippedTests := declaredDevboxTests(jc.Item)
-	resp, err := w.Client.QualityGate(ctx, DevboxRequest{
+	// The gate env stays allowlisted (git credentials only) with the two
+	// checkout keys layered on: the devbox side consumes them for the
+	// tested-SHA checkout and filters them back out of check exec env.
+	execEnv := w.testsGitEnv(jc.Env)
+	gitToken := execEnv["GIT_TOKEN"]
+	execEnv["LOOM_MILLS_BRANCH"] = branch
+	execEnv["LOOM_MILLS_EXPECTED_SHA"] = expectedSHA
+	if runID := strings.TrimSpace(jc.Env["LOOM_MILLS_RUN_ID"]); runID != "" {
+		execEnv["LOOM_MILLS_RUN_ID"] = runID
+	} else if jc.Run != nil {
+		execEnv["LOOM_MILLS_RUN_ID"] = jc.Run.ID
+	}
+	var changed []string
+	if implement, ok := jc.Prior["implement"]; ok {
+		changed = implement.FilesChanged
+	}
+	lintPackages := gates.TouchedGoPackages("", changed)
+	touchedCommand, touchedTestPackages := touchedPackageTestCommand(lintPackages, testCommands)
+	if command := gates.LintParityCommand(lintPackages); command != "" {
+		testCommands = append([]string{command}, testCommands...)
+	}
+	touchedCommandIndex := -1
+	if touchedCommand != "" {
+		touchedCommandIndex = len(testCommands)
+		testCommands = append(testCommands, touchedCommand)
+	}
+	project := effectiveProject(jc.Item, w.Project)
+	mainID := devboxAgentID(w.AgentID, jc.Run.ID, "")
+	resp, err := w.qualityGate(ctx, DevboxRequest{
 		// Per-item cross-repo routing: the devbox sandbox clones the target
 		// repo fresh (git-clone mode), so honoring the item's TargetProject is
 		// enough to run the tests stage against another repo. Empty target =
 		// the worker's home repo (unchanged).
-		Project:      effectiveProject(jc.Item, w.Project),
-		AgentID:      w.AgentID,
-		Env:          jc.Env,
+		Project:      project,
+		AgentID:      mainID,
+		Env:          execEnv,
 		Checks:       devboxScopeFor(jc.Item),
 		TestCommands: testCommands,
+		LintPackages: lintPackages,
 	})
+	// bl-devbox-sandbox-quota-headroom-20260913: the run sandbox is released
+	// exactly once, here, whatever the gate returned. Nothing before this
+	// point mints a sandbox, and the baseline oracle below mints its own, so
+	// releasing first keeps the run to one sandbox of devbox quota at a time
+	// instead of two idling until the reaper.
+	w.releaseSandbox(ctx, project, mainID)
+	noteSandboxRefusal(jc, project, mainID, err)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "tested sha") || strings.Contains(strings.ToLower(err.Error()), "tests checkout infrastructure") {
+			return StageOutput{}, fmt.Errorf("%w: %v", ErrDevboxCheckoutInfra, err)
+		}
 		return StageOutput{}, err
 	}
+	classifyDevboxLintParity(&resp)
+	addCommandOutputHeader(resp.Checks, touchedCommandIndex, touchedCommand)
+	if gitToken != "" {
+		resp.LogTail = strings.ReplaceAll(resp.LogTail, gitToken, "[REDACTED]")
+		for i := range resp.Checks {
+			resp.Checks[i].Output = strings.ReplaceAll(resp.Checks[i].Output, gitToken, "[REDACTED]")
+		}
+	}
+	if expectedSHA != "" && !strings.EqualFold(resp.TestedSHA, expectedSHA) {
+		return StageOutput{Artifacts: map[string]any{"tested_sha": resp.TestedSHA}}, fmt.Errorf("%w: tested sha mismatch: got %q want %q", ErrDevboxCheckoutInfra, resp.TestedSHA, expectedSHA)
+	}
 	if !resp.Passed {
+		failedSummary := summarizeFailedChecks(resp.Checks)
 		artifacts := map[string]any{
-			"checks":   resp.Checks,
-			"language": resp.Language,
+			"checks":                       resp.Checks,
+			"passed":                       false,
+			"failed_summary":               failedSummary,
+			"language":                     resp.Language,
+			"tested_sha":                   testedSHAOrUnresolved(resp.TestedSHA, expectedSHA),
+			touchedTestPackagesArtifactKey: touchedTestPackages,
 		}
 		if len(skippedTests) > 0 {
 			artifacts[skippedDeclaredTestsArtifactKey] = skippedTests
 		}
 		out := StageOutput{
 			CostUSD:   resp.CostUSD,
-			LogTail:   resp.LogTail,
+			LogTail:   appendFailedCheckSummary(resp.LogTail, failedSummary),
 			Artifacts: artifacts,
+		}
+		if err := lintParityNoOutputError(resp.Checks); err != nil {
+			return out, err
 		}
 		if len(resp.Checks) == 0 {
 			// Not-passed with ZERO executed checks is an infrastructure contract
@@ -1376,22 +2273,48 @@ func (w *DevboxWorker) Run(ctx context.Context, jc JobContext) (StageOutput, err
 			// reported not passed" ×4).
 			return out, fmt.Errorf("devbox quality gate reported not-passed with no executed checks; gate tail: %q: %w", strings.TrimSpace(resp.LogTail), ErrDevboxGateNoChecks)
 		}
-		// Treat a quality-gate fail as an error so the runner can retry
-		// implement; the gate-fail/escalate path picks it up by attempt count.
-		//
-		// The error must name the FAILING checks and carry their output tails:
-		// the old shape ("devbox quality gate failed: 1 checks") counted the
-		// TOTAL checks and discarded the failure text, so Classify could never
-		// see infra needles like `container not found ("devbox")` — a recycled
-		// sandbox pod burned all attempts as class=code in ~4s and the
-		// escalation gave the operator nothing to act on (escalation #289,
-		// 2026-07-08).
-		return out, fmt.Errorf("devbox quality gate failed (%s)", summarizeFailedChecks(resp.Checks))
+		if hasContradictoryDevboxVerdict(resp.Checks) {
+			// "backend unavailable" is an established transient classifier
+			// needle. This result contains no trustworthy code verdict.
+			return out, fmt.Errorf("devbox quality gate backend unavailable after contradictory verdict (%s)", failedSummary)
+		}
+		// Rerun-without-patch (B3): before the failure burns a code-class
+		// attempt, ask whether the FAILED subset also fails without the
+		// change. One extra devbox call, policy-gated, best-effort — an
+		// unavailable oracle changes nothing.
+		if w.BaselineOracle != nil && w.BaselineOracle() {
+			if alsoFails, baseline, ok := w.runBaselineOracle(ctx, jc, resp.Checks, testCommands); ok {
+				out.Artifacts["baseline_checks"] = baseline
+				if err := lintParityNoOutputError(baseline); err != nil {
+					return out, err
+				}
+				if alsoFails {
+					out.Artifacts["baseline_verdict"] = "environment"
+					return out, fmt.Errorf("devbox quality gate failed (%s); the failed checks also fail against bare main: %w", failedSummary, ErrDevboxBaselineAlsoFails)
+				}
+				out.Artifacts["baseline_verdict"] = "change_implicated"
+			}
+		}
+		gateErr := fmt.Errorf("devbox quality gate failed (%s)", failedSummary)
+		for _, check := range resp.Checks {
+			if check.Passed {
+				continue
+			}
+			checkClass := Classify(fmt.Errorf("devbox quality gate failed (%s[exit=%d]: %s)", check.Name, check.ExitCode, check.Output))
+			if checkClass == ClassInfra || IsFreeRetry(checkClass) {
+				return out, gateErr
+			}
+		}
+		// A genuine code verdict is successful stage transport. The
+		// post_tests_gate consumes the artifacts and rewinds to implement.
+		return out, nil
 	}
 	artifacts := map[string]any{
-		"checks":   resp.Checks,
-		"language": resp.Language,
-		"passed":   true,
+		"checks":                       resp.Checks,
+		"language":                     resp.Language,
+		"passed":                       true,
+		"tested_sha":                   testedSHAOrUnresolved(resp.TestedSHA, expectedSHA),
+		touchedTestPackagesArtifactKey: touchedTestPackages,
 	}
 	if len(skippedTests) > 0 {
 		artifacts[skippedDeclaredTestsArtifactKey] = skippedTests
@@ -1401,6 +2324,176 @@ func (w *DevboxWorker) Run(ctx context.Context, jc JobContext) (StageOutput, err
 		LogTail:   resp.LogTail,
 		Artifacts: artifacts,
 	}, nil
+}
+
+// Normalize older producers that have not classified the raw lint result.
+func classifyDevboxLintParity(resp *DevboxResponse) {
+	changed := false
+	for i := range resp.Checks {
+		c := &resp.Checks[i]
+		if c.Name != gates.LintParityCheckName || c.Degraded {
+			continue
+		}
+		verdict := gates.ClassifyLintParity(c.ExitCode, c.Output)
+		if !verdict.Degraded {
+			continue
+		}
+		c.Passed, c.Degraded, c.Warning = verdict.Passed, verdict.Degraded, verdict.Warning
+		c.FailureSignature = verdict.FailureSignature
+		c.Output = verdict.Output
+		changed = true
+	}
+	if changed {
+		resp.Passed = len(resp.Checks) > 0
+		for _, c := range resp.Checks {
+			resp.Passed = resp.Passed && c.Passed
+		}
+	}
+}
+
+func lintParityNoOutputError(checks []DevboxCheck) error {
+	for _, c := range checks {
+		if c.FailureSignature == gates.LintParityNoOutput {
+			return fmt.Errorf("%s: %s", gates.LintParityNoOutput, gates.LintParityInfraWarning)
+		}
+	}
+	return nil
+}
+
+func hasContradictoryDevboxVerdict(checks []DevboxCheck) bool {
+	allPassed := len(checks) > 0
+	for _, check := range checks {
+		if !check.Passed {
+			allPassed = false
+		}
+		// A command exit of zero is not a command failure. If its per-check
+		// Passed bit disagrees, fail closed as an infrastructure contradiction
+		// regardless of whether an older producer attached output.
+		if !check.Passed && check.ExitCode == 0 {
+			return true
+		}
+	}
+	// The aggregate cannot truthfully be failed when every executed check
+	// passed. Keep that producer/transport disagreement out of code-failure
+	// classification as well.
+	return allPassed
+}
+
+// runBaselineOracle re-runs only the FAILED checks/commands against the bare
+// main checkout: the request omits the LOOM_MILLS_BRANCH/EXPECTED_SHA keys,
+// so the devbox skips the tested-SHA checkout and executes in the canonical
+// workspace. Returns (every-failed-check-also-fails, baseline checks, ok);
+// ok=false means the oracle could not produce a verdict (client error, or
+// nothing re-runnable) and the caller keeps the original classification.
+func (w *DevboxWorker) runBaselineOracle(
+	ctx context.Context, jc JobContext, failed []DevboxCheck, testCommands []string,
+) (bool, []DevboxCheck, bool) {
+	var namedChecks, extraCmds []string
+	for _, check := range failed {
+		if check.Passed {
+			continue
+		}
+		switch {
+		case check.Name == gates.LintParityCheckName:
+			for _, cmd := range testCommands {
+				if strings.Contains(cmd, "golangci-lint run --config .golangci.yml ") {
+					extraCmds = append(extraCmds, cmd)
+					namedChecks = append(namedChecks, check.Name)
+					break
+				}
+			}
+		case strings.HasPrefix(check.Name, "test:"):
+			idx, err := strconv.Atoi(strings.TrimPrefix(check.Name, "test:"))
+			if err == nil && idx >= 0 && idx < len(testCommands) {
+				extraCmds = append(extraCmds, testCommands[idx])
+				namedChecks = append(namedChecks, check.Name)
+			}
+		default:
+			namedChecks = append(namedChecks, check.Name)
+		}
+	}
+	if len(namedChecks) == 0 && len(extraCmds) == 0 {
+		return false, nil, false
+	}
+	// An absent Checks selector makes devbox run its default fmt/lint/test
+	// suite. Extra commands therefore retain their result name as an explicit
+	// selector. Devbox skips selectors without a built-in command, then runs
+	// only extraCmds and assigns their canonical result names.
+	project := effectiveProject(jc.Item, w.Project)
+	baselineID := devboxAgentID(w.AgentID, jc.Run.ID, "baseline")
+	resp, err := w.qualityGate(ctx, DevboxRequest{
+		Project:      project,
+		AgentID:      baselineID,
+		Env:          w.testsGitEnv(jc.Env), // no branch/sha keys: bare main
+		Checks:       namedChecks,
+		TestCommands: extraCmds,
+	})
+	// The baseline sandbox is minted only here, so this is its single release
+	// (unconditional: an oracle error or empty verdict still leaves a pod).
+	w.releaseSandbox(ctx, project, baselineID)
+	noteSandboxRefusal(jc, project, baselineID, err)
+	if err != nil || len(resp.Checks) == 0 {
+		return false, nil, false
+	}
+	classifyDevboxLintParity(&resp)
+	for _, check := range resp.Checks {
+		if check.Passed {
+			return false, resp.Checks, true // the change is implicated
+		}
+	}
+	return true, resp.Checks, true
+}
+
+// A completed gate is observed activity. Refresh before a possible baseline
+// gate; never keep an in-flight synchronous call alive with a timer.
+func (w *DevboxWorker) qualityGate(ctx context.Context, req DevboxRequest) (DevboxResponse, error) {
+	resp, err := w.Client.QualityGate(ctx, req)
+	RecordStageHeartbeat(ctx)
+	return resp, err
+}
+
+// testedSHAOrUnresolved keeps the tested-SHA gap visible: when enforcement
+// was degraded (no resolvable expected SHA) and the devbox reported none,
+// the artifact says so instead of an empty string.
+func testedSHAOrUnresolved(tested, expected string) string {
+	if tested == "" && expected == "" {
+		return "unresolved"
+	}
+	return tested
+}
+
+// devboxAgentID derives the per-run sandbox identity WITHOUT blowing the
+// Kubernetes 63-char label bound. !1671 joined the FULL run id onto the
+// operator agent id ("loom-mills-operator-PIPE-psl-plan-council-…"), and the
+// devbox backend stamps that string into the pod's devbox/agent-id label —
+// every sandbox pod since was rejected as invalid (2026-08-20 incident,
+// second layer). The run's trailing UUID token is unique per run and keeps
+// the whole identity comfortably inside the label bound.
+func devboxAgentID(base, runID, suffix string) string {
+	token := runID
+	if i := strings.LastIndex(runID, "-"); i >= 0 && i+1 < len(runID) {
+		token = runID[i+1:]
+	}
+	if len(token) > 12 {
+		token = token[len(token)-12:]
+	}
+	parts := []string{base, token}
+	if suffix != "" {
+		parts = append(parts, suffix)
+	}
+	return strings.Trim(strings.Join(parts, "-"), "-")
+}
+
+func appendFailedCheckSummary(logTail, summary string) string {
+	const maxSummaryBytes = 2048
+	summary = strings.TrimSpace(summary)
+	if len(summary) > maxSummaryBytes {
+		summary = summary[:maxSummaryBytes] + "…"
+	}
+	if strings.TrimSpace(logTail) == "" {
+		return summary
+	}
+	return logTail + "\n" + summary
 }
 
 // summarizeFailedChecks renders the failing quality-gate checks as
@@ -1435,6 +2528,7 @@ func summarizeFailedChecks(checks []DevboxCheck) string {
 // GitLabClient is the merge-request lifecycle facade for the mr / ci_watch
 // / merge / cleanup stages.
 type GitLabClient interface {
+	BranchHeadSHA(ctx context.Context, project, branch string) (string, error)
 	CreateMR(ctx context.Context, req CreateMRRequest) (CreateMRResponse, error)
 	PollPipeline(ctx context.Context, req PollPipelineRequest) (PollPipelineResponse, error)
 	Merge(ctx context.Context, req MergeRequestArgs) (MergeResponse, error)
@@ -1443,6 +2537,17 @@ type GitLabClient interface {
 
 type GitLabJobRetrier interface {
 	RetryJob(context.Context, int64) error
+}
+
+type BaselinePipeline struct {
+	Status, URL string
+	FailedJobs  []FailedJob
+}
+
+// GitLabBaselineInspector is optional so non-GitLab test and downstream
+// clients retain source compatibility.
+type GitLabBaselineInspector interface {
+	LatestPipelineForRef(context.Context, string) (BaselinePipeline, error)
 }
 
 // GitLabPollDeadlineProvider exposes the client's configured per-session
@@ -1458,6 +2563,35 @@ type FailedJob struct {
 	ID            int64
 	Name          string
 	FailureReason string
+	Trace         string
+}
+
+func baselineRedMatch(branch, baseline []FailedJob) bool {
+	if len(branch) == 0 || len(baseline) == 0 {
+		return false
+	}
+	baselineNames := make(map[string]struct{}, len(baseline))
+	for _, job := range baseline {
+		baselineNames[job.Name] = struct{}{}
+	}
+	subset := true
+	for _, job := range branch {
+		if _, ok := baselineNames[job.Name]; !ok {
+			subset = false
+			break
+		}
+	}
+	if subset {
+		return true
+	}
+	left, right := make([]string, 0, len(branch)), make([]string, 0, len(baseline))
+	for _, job := range branch {
+		left = append(left, job.Trace)
+	}
+	for _, job := range baseline {
+		right = append(right, job.Trace)
+	}
+	return sigfp.SharedFingerprint(left, right)
 }
 
 // CreateMRRequest is the bundle a `mr` stage ships.
@@ -1484,6 +2618,7 @@ type CreateMRResponse struct {
 	Project      string
 	SourceBranch string
 	TargetBranch string
+	SHA          string
 	CostUSD      float64
 	// Adopted is true when CreateMR did not open a new MR but instead adopted
 	// an existing open MR for the source branch (GitLab returned 409 "Another
@@ -1500,12 +2635,21 @@ type PollPipelineRequest struct {
 	Project      string
 	SourceBranch string
 	TargetBranch string
-	Env          map[string]string
+	// PipelineID pins a reattached watch to an already-observed pipeline.
+	// Zero lets the client select the MR-head pipeline on the first watch.
+	PipelineID int64
+	// Wake carries untrusted webhook hints. The client re-checks GitLab on
+	// receipt; it never derives pipeline state from the event itself.
+	Wake <-chan webhookbus.Event
+	// FallbackInterval is the safety polling cadence while Wake is live.
+	FallbackInterval time.Duration
+	Env              map[string]string
 }
 
 // PollPipelineResponse reports the terminal CI verdict.
 type PollPipelineResponse struct {
-	Status string // "success" | "failed" | "canceled" | "timeout"
+	PipelineID int64
+	Status     string // "success" | "failed" | "canceled" | "timeout"
 	// Project, SourceBranch, TargetBranch, and SHA form the durable CI
 	// authorization. The merge stage persists and reuses the exact tuple so a
 	// reroute, source change, retarget, or later branch push cannot bypass the
@@ -1521,6 +2665,8 @@ type PollPipelineResponse struct {
 	// timeout so the ci_watch stage can extend the watch and, at the hard cap,
 	// key the external-dependency stall on the stuck pipeline. (S3)
 	PipelineURL string
+	// PipelineObservedAt is when this PollPipeline call first saw PipelineID.
+	PipelineObservedAt time.Time
 	// LastStatus is the last NON-terminal pipeline status observed when a poll
 	// session times out ("running"|"pending"|"created"|""). Empty on a terminal
 	// return. Used only for richer ci_watch extension logging. (S3)
@@ -1530,6 +2676,23 @@ type PollPipelineResponse struct {
 	// a complete set, so callers must retain the conservative code verdict.
 	FailedJobReasons []string
 	FailedJobs       []FailedJob
+}
+
+const ciWatchStatePriorKey = "__ci_watch_state"
+
+const (
+	ciWatchPipelineIDArtifact      = "ci_watch_pipeline_id"
+	ciWatchPipelineURLArtifact     = "ci_watch_pipeline_url"
+	ciWatchPipelineStartedArtifact = "ci_watch_pipeline_started_at"
+	ciWatchPipelineStatusArtifact  = "ci_watch_pipeline_status"
+)
+
+// CIWatchState is the durable identity/runtime anchor for one pipeline watch.
+type CIWatchState struct {
+	PipelineID  int64
+	PipelineURL string
+	StartedAt   time.Time
+	LastStatus  string
 }
 
 // MergeRequestArgs collects the inputs for the merge call.
@@ -1545,8 +2708,9 @@ type MergeRequestArgs struct {
 
 // MergeResponse returns the merge sha.
 type MergeResponse struct {
-	MergedSHA string
-	CostUSD   float64
+	MergedSHA    string
+	CostUSD      float64
+	Remediations []string
 }
 
 // CleanupRequest tells the GitLab/git layer to release the worktree +
@@ -1588,7 +2752,8 @@ type BranchPusher interface {
 // GitLabWorker dispatches mr / ci_watch / merge / cleanup. The same
 // worker handles all four stages; it dispatches internally on jc.Stage.ID.
 type GitLabWorker struct {
-	Client GitLabClient
+	Client   GitLabClient
+	Webhooks *webhookbus.Bus
 	// MRTitle / MRDescription return the strings the worker should send
 	// to CreateMR. The operator wires these to draw from the spec doc;
 	// tests can return constants.
@@ -1629,6 +2794,11 @@ type GitLabWorker struct {
 	// FlakyJobs resolves the policy-listed jobs eligible for one bounded retry.
 	// Nil/empty disables rescue; the operator supplies the production defaults.
 	FlakyJobs func() []string
+	// CIWatchMaxWallClockMinutes resolves the hot-reloadable policy ceiling.
+	// Nil or a non-positive result uses the 90 minute default.
+	CIWatchMaxWallClockMinutes func() int
+	// Now is injectable for deterministic wall-clock tests.
+	Now func() time.Time
 	// MergeQueue, when wired together with a true MergeQueueEnabled, reroutes
 	// the merge stage through the serial merge queue: enqueue the CI-authorized
 	// candidate, wait for the processor's verdict. Nil → direct merge
@@ -1763,6 +2933,7 @@ func (w *GitLabWorker) runMR(ctx context.Context, jc JobContext) (StageOutput, e
 			"mr_project":       resp.Project,
 			"mr_source_branch": resp.SourceBranch,
 			"mr_target_branch": resp.TargetBranch,
+			"mr_sha":           resp.SHA,
 			"branch":           req.SourceBranch,
 			"created":          !resp.Adopted,
 			"adopted":          resp.Adopted,
@@ -1779,8 +2950,50 @@ func (w *GitLabWorker) runCI(ctx context.Context, jc JobContext) (StageOutput, e
 	if err != nil {
 		return StageOutput{}, err
 	}
+	now := time.Now
+	if w.Now != nil {
+		now = w.Now
+	}
+	watch := jc.CIWatchState
+	if watch != nil {
+		pollReq.PipelineID = watch.PipelineID
+	}
 	client := w.clientForProject(pollReq.Project)
-	maxExtensions := ciWatchExtensionBudget(jc.Env)
+	if w.Webhooks != nil {
+		sha, _ := jc.Prior["mr"].Artifacts["mr_sha"].(string)
+		wake, unsubscribe := w.Webhooks.Subscribe(pollReq.Project, strings.TrimSpace(sha), mrIID)
+		defer unsubscribe()
+		pollReq.Wake = wake
+		pollReq.FallbackInterval = 5 * time.Minute
+	}
+	maxMinutes := ciWatchMaxMinutes(jc.Env)
+	if strings.TrimSpace(jc.Env["MILLS_CI_WATCH_MAX_MINUTES"]) == "" && w.CIWatchMaxWallClockMinutes != nil {
+		if configured := w.CIWatchMaxWallClockMinutes(); configured > 0 {
+			maxMinutes = configured
+		}
+	}
+	if jc.Attempt > 0 {
+		runtime := ciWatchRuntime(now(), watch)
+		remaining := time.Duration(maxMinutes)*time.Minute - runtime
+		if remaining <= 0 {
+			return StageOutput{Artifacts: ciWatchStateArtifacts(watch)}, &CIWatchStalledError{
+				PipelineURL: watch.PipelineURL, PipelineID: strconv.FormatInt(watch.PipelineID, 10),
+				MaxMinutes: maxMinutes, Runtime: runtime, MRIID: mrIID, LastStatus: watch.LastStatus,
+			}
+		}
+		// Bound this session by the remaining wall-clock allowance, including
+		// time spent between attempts or while the operator was stopped.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, remaining)
+		defer cancel()
+	}
+	maxExtensions := ciWatchExtensionBudgetFor(maxMinutes)
+	// Runner dispatches carry a durable, monotonic attempt number. In that path
+	// one PollPipeline call is one bounded session; a timeout returns to Runner
+	// as a free transient, and the next attempt reattaches using the same durable
+	// MR/head authorization. Direct worker calls (Attempt == 0) retain the old
+	// in-process extension loop for compatibility with embedders.
+	durableReattach := jc.Attempt > 0
 	pollCtx := ctx
 	cancelPoll := func() {}
 	if provider, ok := client.(GitLabPollDeadlineProvider); ok && provider.PipelinePollDeadline() > 0 {
@@ -1795,15 +3008,34 @@ func (w *GitLabWorker) runCI(ctx context.Context, jc JobContext) (StageOutput, e
 	rescued := ciWatchFlakeRescueAttemptedFromContext(ctx)
 	firstFailure := ciWatchFlakeRescueFirstJobsFromContext(ctx)
 
-	// The GitLab client enforces a per-poll-session deadline (default 30m). A
-	// slow-but-healthy CI run must not kill the autonomous run, so when a poll
-	// session times out with the pipeline still non-terminal we keep watching in
-	// bounded extensions up to the MILLS_CI_WATCH_MAX_MINUTES hard cap. Only at
-	// the cap do we escalate — as a retryable external-dependency stall, not a
-	// code failure (see CIWatchStalledError). (S3)
+	// The GitLab client enforces a per-poll-session deadline (default 30m).
+	// Durable Runner calls return at that boundary for a free reattach attempt;
+	// direct legacy calls extend in-process. Both share the wall-clock ceiling.
 	for extension := 0; ; extension++ {
 		resp, err := client.PollPipeline(pollCtx, pollReq)
 		cost += resp.CostUSD
+		if resp.PipelineID == 0 {
+			resp.PipelineID, _ = strconv.ParseInt(pipelineIDFromURL(resp.PipelineURL), 10, 64)
+		}
+		if resp.PipelineID != 0 {
+			if watch == nil {
+				started := resp.PipelineObservedAt
+				if started.IsZero() {
+					started = now().UTC()
+				}
+				watch = &CIWatchState{PipelineID: resp.PipelineID, StartedAt: started}
+			}
+			if watch.PipelineID != resp.PipelineID {
+				return StageOutput{CostUSD: cost, LogTail: logTail.String()}, fmt.Errorf("ci_watch: selected pipeline changed from %d to %d: %w", watch.PipelineID, resp.PipelineID, ErrMergeAuthorizationStale)
+			}
+			watch.PipelineURL = resp.PipelineURL
+		}
+		if watch != nil && resp.LastStatus != "" {
+			watch.LastStatus = resp.LastStatus
+		}
+		if watch != nil && resp.Status != "" && resp.Status != "timeout" {
+			watch.LastStatus = resp.Status
+		}
 		appendCIWatchLog(&logTail, resp.LogTail)
 		if resp.PipelineURL != "" {
 			lastPipelineURL = resp.PipelineURL
@@ -1822,6 +3054,8 @@ func (w *GitLabWorker) runCI(ctx context.Context, jc JobContext) (StageOutput, e
 				"ci_source_branch": resp.SourceBranch,
 				"ci_target_branch": resp.TargetBranch,
 				"ci_sha":           resp.SHA,
+				"ci_pipeline_id":   resp.PipelineID,
+				"ci_pipeline_url":  resp.PipelineURL,
 				// The head-movement fence travels WITH the authorization it
 				// belongs to. merge re-reads it and refuses to run when the
 				// ledger has advanced since (#374).
@@ -1833,6 +3067,16 @@ func (w *GitLabWorker) runCI(ctx context.Context, jc JobContext) (StageOutput, e
 				Artifacts: artifacts,
 			}
 			if resp.Status != "success" {
+				if inspector, ok := client.(GitLabBaselineInspector); ok {
+					baseline, baselineErr := inspector.LatestPipelineForRef(ctx, pollReq.TargetBranch)
+					if baselineErr != nil {
+						fmt.Fprintf(&logTail, "ci_watch: target-branch baseline lookup unavailable: %v; retaining code classification\n", baselineErr)
+					} else if baseline.Status == "failed" && baselineRedMatch(resp.FailedJobs, baseline.FailedJobs) {
+						fmt.Fprintf(&logTail, "ci_watch: target branch %s is failing the same CI baseline (%s)\n", pollReq.TargetBranch, baseline.URL)
+						out.LogTail = logTail.String()
+						return out, &CIWatchBaselineRedError{TargetBranch: pollReq.TargetBranch, PipelineURL: baseline.URL, FailedJobs: resp.FailedJobs}
+					}
+				}
 				if !rescued && flakyRetryEligible(resp.FailedJobs, callStrings(w.FlakyJobs)) {
 					if err := recordCIWatchFlakeRescue(ctx, resp.FailedJobs); err != nil {
 						return out, fmt.Errorf("persist ci_watch flake rescue fence: %w", err)
@@ -1856,6 +3100,7 @@ func (w *GitLabWorker) runCI(ctx context.Context, jc JobContext) (StageOutput, e
 				}
 				return out, &CIPipelineTerminalError{
 					Status: resp.Status, MRIID: mrIID, FailedJobReasons: resp.FailedJobReasons,
+					PipelineID: strconv.FormatInt(resp.PipelineID, 10), ObservedRuntime: ciWatchRuntime(now(), watch),
 					FailedJobs: resp.FailedJobs, FirstFailedJobs: firstFailure, AutoRetried: rescued,
 				}
 			}
@@ -1864,8 +3109,44 @@ func (w *GitLabWorker) runCI(ctx context.Context, jc JobContext) (StageOutput, e
 
 		// A non-timeout error (network blip, context cancel, GitLab 5xx) is not a
 		// stall — surface it unchanged so the runner classifies/retries it.
-		if !errors.Is(err, ErrPipelinePollTimeout) {
-			return StageOutput{CostUSD: cost, LogTail: logTail.String()}, err
+		//
+		// The stage's OWN per-session deadline (pollCtx, sized from the client's
+		// PipelinePollDeadline) is the exception: it was created a hair before
+		// the client's internal poll deadline, so it always fires first and the
+		// client answers with a bare context.DeadlineExceeded from the run
+		// context branch instead of ErrPipelinePollTimeout. Left unhandled,
+		// that bare error escaped here on every long pipeline — live 2026-09-02
+		// (PIPE-bl-fifhir-capability-statement-…-01a06213): attempt 1 ended
+		// `error: context deadline exceeded` at exactly +30m with pipeline 25391
+		// still running, the runner retried the stage as a free transient with no
+		// extension note, and the S3 extension/stall path below never ran in
+		// production. A session deadline with the run context still live IS the
+		// poll-session timeout; treat it as one.
+		// On a durable reattach the run context is bounded by the remaining
+		// wall-clock allowance, so its deadline expiring at the ceiling is the
+		// ceiling firing (handled below), not a raw context error.
+		ceilingReached := durableReattach && watch != nil && ciWatchRuntime(now(), watch) >= time.Duration(maxMinutes)*time.Minute
+		ceilingDeadlineHit := ceilingReached && errors.Is(err, context.DeadlineExceeded)
+		if !errors.Is(err, ErrPipelinePollTimeout) && !ciWatchSessionDeadlineHit(err, pollCtx, ctx) && !ceilingDeadlineHit {
+			return StageOutput{CostUSD: cost, LogTail: logTail.String(), Artifacts: ciWatchStateArtifacts(watch)}, err
+		}
+
+		if durableReattach {
+			runtime := ciWatchRuntime(now(), watch)
+			out := StageOutput{CostUSD: cost, LogTail: logTail.String(), Artifacts: ciWatchStateArtifacts(watch)}
+			if watch != nil && isCIWatchReattachStatus(watch.LastStatus) && runtime < time.Duration(maxMinutes)*time.Minute {
+				return out, fmt.Errorf(
+					"ci_poll_timeout: ci_watch pipeline %s still %s after %s; reattach on next attempt: %w",
+					strconv.FormatInt(watch.PipelineID, 10), watch.LastStatus, runtime.Round(time.Second), ErrCIWatchPollTimeout)
+			}
+			pipelineID := resp.PipelineID
+			if watch != nil {
+				pipelineID, lastPipelineURL, lastStatus = watch.PipelineID, watch.PipelineURL, watch.LastStatus
+			}
+			return out, &CIWatchStalledError{
+				PipelineURL: lastPipelineURL, PipelineID: strconv.FormatInt(pipelineID, 10),
+				MaxMinutes: maxMinutes, Runtime: runtime, MRIID: mrIID, LastStatus: lastStatus,
+			}
 		}
 
 		// Poll session timed out. PollPipeline only returns a nil error on a
@@ -1891,11 +3172,51 @@ func (w *GitLabWorker) runCI(ctx context.Context, jc JobContext) (StageOutput, e
 		// incident keyed on the stuck pipeline URL (handled in the runner).
 		return StageOutput{CostUSD: cost, LogTail: logTail.String()}, &CIWatchStalledError{
 			PipelineURL: lastPipelineURL,
-			MaxMinutes:  ciWatchMaxMinutes(jc.Env),
+			MaxMinutes:  maxMinutes,
+			Runtime:     time.Duration(maxMinutes) * time.Minute,
 			MRIID:       mrIID,
 			LastStatus:  lastStatus,
 		}
 	}
+}
+
+func ciWatchRuntime(now time.Time, state *CIWatchState) time.Duration {
+	if state == nil || state.StartedAt.IsZero() || now.Before(state.StartedAt) {
+		return 0
+	}
+	return now.Sub(state.StartedAt)
+}
+
+func isCIWatchReattachStatus(status string) bool {
+	return status == "running" || status == "pending" || status == "created"
+}
+
+func ciWatchStateArtifacts(state *CIWatchState) map[string]any {
+	if state == nil || state.PipelineID == 0 || state.StartedAt.IsZero() {
+		return nil
+	}
+	return map[string]any{
+		ciWatchPipelineIDArtifact:      state.PipelineID,
+		ciWatchPipelineURLArtifact:     state.PipelineURL,
+		ciWatchPipelineStartedArtifact: state.StartedAt.UTC().Format(time.RFC3339Nano),
+		ciWatchPipelineStatusArtifact:  state.LastStatus,
+	}
+}
+
+// ciWatchSessionDeadlineHit reports whether err is the ci_watch stage's own
+// per-session deadline (sessionCtx) expiring while the run context is still
+// live. That is a poll-session timeout in everything but wrapping: the client
+// saw its caller's context die and returned the bare context error before its
+// own PollDeadline could produce ErrPipelinePollTimeout. A cancelled or expired
+// run context is NOT a session timeout and stays a plain error.
+func ciWatchSessionDeadlineHit(err error, sessionCtx, runCtx context.Context) bool {
+	if err == nil || sessionCtx == nil || runCtx == nil {
+		return false
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return sessionCtx.Err() != nil && runCtx.Err() == nil
 }
 
 func callStrings(fn func() []string) []string {
@@ -1982,9 +3303,11 @@ func (w *GitLabWorker) runMergeDirect(ctx context.Context, jc JobContext, mrIID 
 	return StageOutput{
 		CostUSD:   resp.CostUSD,
 		MergedSHA: resp.MergedSHA,
+		LogTail:   strings.Join(resp.Remediations, "\n"),
 		Artifacts: map[string]any{
-			"merged_sha":     resp.MergedSHA,
-			"merged_project": mergeReq.Project,
+			"merged_sha":         resp.MergedSHA,
+			"merged_project":     mergeReq.Project,
+			"merge_remediations": resp.Remediations,
 		},
 	}, nil
 }
@@ -2024,8 +3347,8 @@ func (w *GitLabWorker) runCleanup(ctx context.Context, jc JobContext) (StageOutp
 // computeAutoMerge resolves the policy intent carried on CreateMRRequest.
 // GitLab creation deliberately does not map it to MWPS; the explicit merge
 // stage remains authoritative. Precedence:
-//  1. If AutoMergeFor callback is wired, it wins (operator main routes
-//     policy.LabelOverrideFor + item.Policy.AutoMerge through here).
+//  1. If AutoMergeFor callback is wired, it wins (operator main routes the
+//     narrowing per-repo overlay before label/item intent through here).
 //  2. Else fall back to the item's own ItemPolicy.AutoMerge.
 //
 // Disabled by default so an operator without explicit opt-in keeps the same
@@ -2244,12 +3567,18 @@ func DefaultRoutes(spawn SpawnClient, weaver WeaverClient, devbox DevboxClient, 
 		promptFor = func(string) func(JobContext) string { return nil }
 	}
 	gw := &GitLabWorker{Client: gitlab}
+	resolveReviewHead := func(ctx context.Context, project, branch string) (string, error) {
+		if gitlab == nil {
+			return "", errors.New("gitlab client is not configured")
+		}
+		return gitlab.BranchHeadSHA(ctx, project, branch)
+	}
 	return map[string]Worker{
 		"plan_slice":     &SpawnWorker{Client: spawn, PromptFor: promptFor("plan_slice"), SubstrateFor: substrateFor, RouteFor: routeFor},
 		"research":       &WeaverWorker{Client: weaver, PromptFor: promptFor("research")},
 		"implement":      &SpawnWorker{Client: spawn, PromptFor: promptFor("implement"), NeedsWorktree: true, SubstrateFor: substrateFor, RouteFor: routeFor},
-		"tests":          &DevboxWorker{Client: devbox, Project: project, AgentID: agentID},
-		"pr_self_review": &SpawnWorker{Client: spawn, PromptFor: promptFor("pr_self_review"), SubstrateFor: substrateFor, RouteFor: routeFor},
+		"tests":          &DevboxWorker{Client: devbox, GitLab: gitlab, Project: project, AgentID: agentID},
+		"pr_self_review": &SpawnWorker{Client: spawn, PromptFor: promptFor("pr_self_review"), SubstrateFor: substrateFor, RouteFor: routeFor, ResolveBranchHead: resolveReviewHead},
 		"mr":             gw,
 		"ci_watch":       gw,
 		"merge":          gw,

@@ -9,7 +9,7 @@ import (
 // Zero value = fully off, and every accessor resolves a safe default.
 func TestOverseersZeroValueIsOff(t *testing.T) {
 	var p Policy
-	if p.GroomerEnabled() || p.SentinelEnabled() || p.ForemanEnabled() {
+	if p.GroomerEnabled() || p.SentinelEnabled() || p.ForemanEnabled() || p.SandboxDrillEnabled() {
 		t.Fatal("zero-value overseers enabled an agent")
 	}
 	// Master gate off keeps agents off even when individually enabled.
@@ -85,6 +85,15 @@ func TestOverseersAccessorDefaultsAndClamps(t *testing.T) {
 	if got := f.BurnRatio(); got != 0.9 {
 		t.Fatalf("burn ratio default = %v", got)
 	}
+
+	var d SandboxDrillPolicy
+	if d.Interval() != 6*time.Hour || d.Budget() != 900*time.Second || d.GateConcurrency() != 2 || d.DrillProject() != "loom-core" || d.ThrottlingCeiling() != 25 {
+		t.Fatalf("sandbox drill defaults incorrect: interval=%v budget=%v concurrency=%d project=%q ceiling=%d", d.Interval(), d.Budget(), d.GateConcurrency(), d.DrillProject(), d.ThrottlingCeiling())
+	}
+	d = SandboxDrillPolicy{IntervalMinutes: 999999, BudgetSeconds: 999999, Concurrency: 999, CPUThrottlingCeilingPercent: 999}
+	if d.Interval() != 24*time.Hour || d.Budget() != time.Hour || d.GateConcurrency() != 8 || d.ThrottlingCeiling() != 100 {
+		t.Fatalf("sandbox drill clamps incorrect: %+v", d)
+	}
 }
 
 func TestOverseersValidation(t *testing.T) {
@@ -153,6 +162,13 @@ overseers:
     max_actions_per_tick: 3
     dedup_auto_threshold: 0.9
     allow: { dedup_close: true, reprioritize: true }
+  sandbox_drill:
+    enabled: true
+    interval_minutes: 360
+    budget_seconds: 900
+    concurrency: 2
+    project: loom-core
+    cpu_throttling_ceiling_percent: 25
 `
 	p, err := ParsePolicy([]byte(yaml))
 	if err != nil {
@@ -172,5 +188,8 @@ overseers:
 	}
 	if p.Overseers.Groomer.Allow.CloseObsolete {
 		t.Fatal("close_obsolete defaulted on")
+	}
+	if !p.SandboxDrillEnabled() || p.Overseers.SandboxDrill.Interval() != 6*time.Hour {
+		t.Fatal("sandbox_drill block not parsed")
 	}
 }

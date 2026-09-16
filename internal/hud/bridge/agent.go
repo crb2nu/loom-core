@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+	"golang.org/x/sync/singleflight"
 )
 
 // AgentBridge wraps agent-context tool calls, routing them through the daemon's
@@ -32,6 +33,22 @@ type AgentBridge struct {
 	client Caller       // Caller interface (DaemonClient or LocalCaller)
 	cache  *Cache       // session lookup cache (internal, always in-memory)
 	tracer trace.Tracer // OTel tracer for bridge operations
+
+	// engramGraphFlight coalesces concurrent agent_engram_graph fetches so
+	// GET /api/engrams/graph and GET /api/engrams/summary, which the HUD
+	// requests together, share one upstream call. engramGraphTTL is how long
+	// that result stays reusable afterwards; <= 0 keeps only the in-flight
+	// coalescing. See EngramGraph.
+	engramGraphFlight singleflight.Group
+	engramGraphTTL    time.Duration
+
+	// sessionListFlight coalesces the light agent_session_list projections
+	// the HUD monitors poll in overlapping cadences; sessionListTTL is how
+	// long a fetched projection is reused and sessionListBudget adapts the
+	// recv budget to the store's current latency. See agent_session_light.go.
+	sessionListFlight singleflight.Group
+	sessionListTTL    time.Duration
+	sessionListBudget sessionListBudget
 }
 
 const defaultSessionListLimit = 1000
@@ -40,9 +57,11 @@ const defaultSessionListLimit = 1000
 // The tracer defaults to a no-op; use SetTracer to enable OTel instrumentation.
 func NewAgentBridge(client Caller) *AgentBridge {
 	return &AgentBridge{
-		client: client,
-		cache:  NewCache(),
-		tracer: noop.NewTracerProvider().Tracer(""),
+		client:         client,
+		cache:          NewCache(),
+		tracer:         noop.NewTracerProvider().Tracer(""),
+		engramGraphTTL: defaultEngramGraphTTL,
+		sessionListTTL: sessionListCacheTTL,
 	}
 }
 
@@ -87,12 +106,20 @@ func (a *AgentBridge) callWithSpan(toolName string, call toolCallFn, target any)
 		return fmt.Errorf("agent tool %s: %w", toolName, err)
 	}
 
-	if target == nil {
-		if err := checkToolError(raw); err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+	// A tool error envelope is the server's own failure ("list sessions: max
+	// retries exceeded: … connection refused"), not a decode failure. Check it
+	// before decoding so the log names the tool that failed instead of
+	// labelling a dead upstream "unmarshal <tool> result" (the 2026-09-10
+	// qdrant outage produced ~5,500 such lines in one day).
+	if err := checkToolError(raw); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		if target == nil {
 			return err
 		}
+		return fmt.Errorf("agent tool %s failed: %w", toolName, err)
+	}
+	if target == nil {
 		span.SetStatus(codes.Ok, "")
 		return nil
 	}
@@ -127,4 +154,7 @@ func (a *AgentBridge) callAgentToolTimeout(toolName string, args map[string]any,
 // invalidateSessionCache removes the cached active-session entry for an agent.
 func (a *AgentBridge) invalidateSessionCache(agentID string) {
 	a.cache.Invalidate("active_session:" + agentID)
+	// A session started or ended through this bridge must show on the next
+	// monitor tick, not after the light projections' reuse window.
+	a.InvalidateSessionLists()
 }

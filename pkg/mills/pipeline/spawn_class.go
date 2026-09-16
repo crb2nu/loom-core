@@ -117,6 +117,14 @@ const (
 	// registry/image misconfig that a fresh pod hits identically, so it stays
 	// unmatched here and falls through to ClassInfra in Classify.
 	SpawnReasonPodLifecycle = "spawn-pod-lifecycle"
+
+	// SpawnReasonLivenessStall: the pipeline liveness watchdog killed a spawn
+	// after it produced no output for the configured stall timeout. Shared
+	// inference-plane starvation can cause this even when the agent and prompt
+	// are healthy; a genuinely wedged agent produces the same evidence. Treat
+	// both as a free retry bounded by transientRetryCap, so repeated stalls
+	// still escalate instead of retrying forever.
+	SpawnReasonLivenessStall = "spawn-liveness-stall"
 )
 
 // spawnTransientReasons are the spawn reasons whose defect clears on its own
@@ -126,6 +134,7 @@ const (
 var spawnTransientReasons = map[string]struct{}{
 	SpawnReasonRuntimeIdentityConflict: {},
 	SpawnReasonPodLifecycle:            {},
+	SpawnReasonLivenessStall:           {},
 }
 
 // spawnReasonErrorClass maps a spawn reason token to the ErrorClass Classify
@@ -166,6 +175,14 @@ func SpawnInfraReason(err error) (string, bool) {
 
 func spawnInfraReasonFromString(msg string) (string, bool) {
 	lower := strings.ToLower(msg)
+	// The pipeline liveness watchdog stopped a spawn that emitted no output for
+	// the whole stall window. Require all three producer clauses so unrelated
+	// watchdog failures, generic spawn stalls, and application-level "no output"
+	// errors retain the conservative ClassCode default.
+	if strings.Contains(lower, "liveness watchdog: agent produced no output within stall timeout:") &&
+		strings.Contains(lower, " stalled: no agent output for ") && strings.Contains(lower, "spawn ") {
+		return SpawnReasonLivenessStall, true
+	}
 	// Agent CLI killed by the exec timeout: exit 124 / the devbox backends'
 	// "command timed out" StdoutTail, exit 143 (the spawn command's own
 	// `timeout` wrapper SIGTERM at the deadline), or the HUD reconciler's

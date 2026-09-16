@@ -60,7 +60,7 @@ func (r *Runner) hydrateSliceScope(ctx context.Context, run *store.PipelineRun, 
 	// handler and the plan-slice emitter. An UNDECLARED protected touch the
 	// implement stage introduces still fails the gate.
 	if len(item.Policy.ProtectedPathsTouched) == 0 {
-		if hit := r.policy().ProtectedPathsHit(files); len(hit) > 0 {
+		if hit := r.policy().ProtectedPathsHitFor(item.TargetProject, files); len(hit) > 0 {
 			item.Policy.ProtectedPathsTouched = append([]string(nil), hit...)
 		}
 	}

@@ -1,0 +1,1 @@
+- Add durable spawn auth outcomes, account failure history, and fallback metadata in `internal/spawn/types.go`, with retention across pruning in `store.go` and `controller.go`; mirror final auth mode, account, outcome, and fallback source into Mills artifacts and billing in `pkg/mills/clients/spawn.go`.

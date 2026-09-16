@@ -4,16 +4,52 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/budget"
 	"github.com/crb2nu/loom/pkg/mills/clients"
 	"github.com/crb2nu/loom/pkg/mills/store"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+func (o *operator) handleBacklogGrade(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	var req pipelineGradeRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid grade request", http.StatusUnprocessableEntity)
+		return
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		http.Error(w, "invalid grade request", http.StatusUnprocessableEntity)
+		return
+	}
+	item, err := mills.GradeItem(r.Context(), o.store, id, req.Grade, req.Note, operatorOverrideActor)
+	if err != nil {
+		switch {
+		case errors.Is(err, mills.ErrInvalidGrade), errors.Is(err, mills.ErrInvalidGradeNote), errors.Is(err, mills.ErrNotGradable):
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		case errors.Is(err, store.ErrNotFound):
+			http.Error(w, "backlog item not found", http.StatusNotFound)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run_id": nil, "item_id": item.ID, "grade": item.Grade, "note": item.GradeNote, "actor": item.GradeActor, "graded_at": item.GradedAt})
+}
 
 var (
 	tastePlanGrades           = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "mills_taste_plan_grades", Help: "Merged backlog taste grades by plan and grade."}, []string{"plan_id", "grade"})
@@ -426,7 +462,7 @@ func (o *operator) hydratePlanSliceScope(ctx context.Context, item *store.Backlo
 	}
 	item.Slices = out
 	if o.policy != nil && len(item.Policy.ProtectedPathsTouched) == 0 {
-		if hit := o.policy.Current().ProtectedPathsHit(allFiles); len(hit) > 0 {
+		if hit := o.policy.Current().ProtectedPathsHitFor(item.TargetProject, allFiles); len(hit) > 0 {
 			item.Policy.ProtectedPathsTouched = append([]string(nil), hit...)
 		}
 	}

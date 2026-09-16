@@ -1,0 +1,1 @@
+- Fixed ghost-spark reconciliation in `pkg/mills` and pipeline escalation binding writers so legacy home-project rescue MRs settle after merging without weakening foreign-project provenance or advancing cooldown on provenance skips.

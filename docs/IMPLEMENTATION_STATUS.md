@@ -1,7 +1,8 @@
 # Loom Core Implementation Status
 
 > Last Updated: April 14, 2026
-> Canonical status source for shipped vs in-progress work.
+> Historical snapshot retained for the April 2026 implementation record.
+> [`ROADMAP.md`](../ROADMAP.md) is the canonical current-status source under the 2026-H2 portfolio convention.
 
 ## Current State
 

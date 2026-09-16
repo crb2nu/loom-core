@@ -211,3 +211,23 @@ func TestComputeHash_HashLength(t *testing.T) {
 		}
 	}
 }
+
+func TestRecipeHash(t *testing.T) {
+	base := "092ff5cc7c9e"
+	a := RecipeHash(base, []byte("FROM registry.harbor.lan/mcp/devbox-base/go:1.26\n"))
+	b := RecipeHash(base, []byte("FROM registry.harbor.lan/mcp/devbox-base/go:1.26\n"))
+	c := RecipeHash(base, []byte("FROM golang:1.26-alpine\nRUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest\n"))
+	d := RecipeHash("deadbeef0000", []byte("FROM registry.harbor.lan/mcp/devbox-base/go:1.26\n"))
+	if a != b {
+		t.Fatalf("same inputs hashed differently: %q vs %q", a, b)
+	}
+	if a == c {
+		t.Fatalf("different recipes collided on %q", a)
+	}
+	if a == d {
+		t.Fatalf("different dependency hashes collided on %q", a)
+	}
+	if a == base || len(a) != 12 {
+		t.Fatalf("recipe hash %q must be a fresh 12-hex digest, not the input", a)
+	}
+}

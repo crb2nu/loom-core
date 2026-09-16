@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -153,16 +155,153 @@ func TestEngramRoutesHappyPathAndCORS(t *testing.T) {
 			}
 		}
 	}
+
+	// The summary rides the graph fetch just served and gets the same CORS
+	// treatment; its one node is the whole rollup.
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/engrams/summary", nil))
+	if rr.Code != http.StatusOK || rr.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("summary: status=%d cors=%q body=%s", rr.Code, rr.Header().Get("Access-Control-Allow-Origin"), rr.Body.String())
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["total"] != float64(1) || summary["degraded"] != false {
+		t.Fatalf("summary: body=%v", summary)
+	}
+}
+
+// TestEngramSummaryAndGraphShareOneUpstreamFetch pins the request budget the
+// engrams store relies on: it fires GET /api/engrams/graph and
+// GET /api/engrams/summary together on every poll, and the summary used to
+// cost a second upstream call (agent_engram_list with the catalog list's exact
+// arguments). One agent_engram_graph fetch must now serve both routes, in
+// either order, with both response shapes unchanged.
+func TestEngramSummaryAndGraphShareOneUpstreamFetch(t *testing.T) {
+	const graphPayload = `{"nodes":[
+		{"id":"engram://a/x","uri":"engram://a/x","title":"A","tier":1,"proof_status":"verified","prerequisites":[],"content":"","proof":"a.go:1"},
+		{"id":"engram://b/x","uri":"engram://b/x","title":"B","tier":2,"proof_status":"stale","prerequisites":["engram://a/x","engram://gone/x"],"content":"","proof":""},
+		{"id":"engram://gone/x","uri":"engram://gone/x","title":"","tier":1,"proof_status":"unverified","prerequisites":[],"stub":true}
+	],"edges":[{"from":"engram://b/x","to":"engram://a/x"},{"from":"engram://b/x","to":"engram://gone/x"}],"truncated":false}`
+
+	for _, order := range [][]string{
+		{"/api/engrams/graph", "/api/engrams/summary"},
+		{"/api/engrams/summary", "/api/engrams/graph"},
+	} {
+		t.Run(strings.Join(order, " then "), func(t *testing.T) {
+			var graphCalls, listCalls atomic.Int32
+			caller := &engramAPICaller{callTool: func(name string, _ map[string]any) (json.RawMessage, error) {
+				switch name {
+				case "agent_context__agent_engram_graph":
+					graphCalls.Add(1)
+					return apiMCPResult(graphPayload), nil
+				case "agent_context__agent_engram_list":
+					listCalls.Add(1)
+					return nil, errors.New("the summary must not re-list the catalog")
+				default:
+					return nil, fmt.Errorf("unexpected tool %s", name)
+				}
+			}}
+			a := apiTestApp(caller)
+			mux := http.NewServeMux()
+			a.registerRoutes(mux)
+
+			bodies := map[string]map[string]any{}
+			for _, path := range order {
+				rr := httptest.NewRecorder()
+				mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+				if rr.Code != http.StatusOK {
+					t.Fatalf("%s: status=%d body=%s", path, rr.Code, rr.Body.String())
+				}
+				var body map[string]any
+				if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+					t.Fatalf("%s: %v", path, err)
+				}
+				bodies[path] = body
+			}
+			if g, l := graphCalls.Load(), listCalls.Load(); g != 1 || l != 0 {
+				t.Fatalf("upstream calls: agent_engram_graph=%d agent_engram_list=%d; want exactly one graph fetch serving both routes", g, l)
+			}
+
+			// Graph shape unchanged: the stub stays a node (the tree renders the
+			// gap) and the marker never reaches the wire.
+			graph := bodies["/api/engrams/graph"]
+			nodes, _ := graph["nodes"].([]any)
+			edges, _ := graph["edges"].([]any)
+			if len(nodes) != 3 || len(edges) != 2 || graph["degraded"] != false {
+				t.Fatalf("graph shape changed: %v", graph)
+			}
+			for _, n := range nodes {
+				if _, leaked := n.(map[string]any)["stub"]; leaked {
+					t.Fatalf("stub marker leaked onto the graph wire: %v", n)
+				}
+			}
+
+			// Summary shape identical to the list-era contract; the stub is a
+			// gap, not an engram, so it is not counted.
+			summary := bodies["/api/engrams/summary"]
+			if summary["total"] != float64(2) || summary["degraded"] != false {
+				t.Fatalf("summary = %v; want total 2 and degraded=false", summary)
+			}
+			byStatus, _ := summary["by_status"].(map[string]any)
+			for key, want := range map[string]float64{"verified": 1, "stale": 1, "unverified": 0, "failing": 0} {
+				if got, ok := byStatus[key]; !ok || got != want {
+					t.Fatalf("by_status[%s] = %v (present=%v), want %v: %v", key, got, ok, want, byStatus)
+				}
+			}
+			byTier, _ := summary["by_tier"].(map[string]any)
+			if byTier["tier:1"] != float64(1) || byTier["tier:2"] != float64(1) || len(byTier) != 2 {
+				t.Fatalf("by_tier = %v", byTier)
+			}
+		})
+	}
 }
 
 func TestEngramHandlersBridgeErrorReturnsBadGateway(t *testing.T) {
 	caller := &engramAPICaller{callTool: func(string, map[string]any) (json.RawMessage, error) { return nil, errors.New("bridge offline") }}
 	a := apiTestApp(caller)
-	for _, handler := range []http.HandlerFunc{a.handleEngramList, a.handleEngramGraph} {
+	for _, handler := range []http.HandlerFunc{a.handleEngramList, a.handleEngramGraph, a.handleEngramSummary} {
 		rr := httptest.NewRecorder()
 		handler(rr, httptest.NewRequest(http.MethodGet, "/", nil))
 		if rr.Code != http.StatusBadGateway {
 			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 		}
+	}
+}
+
+// TestHandleEngramSummary_UpstreamErrorIsNotSticky: a failed fetch must not
+// poison the shared graph result — the next poll retries and succeeds.
+func TestHandleEngramSummary_UpstreamErrorIsNotSticky(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	caller := &engramAPICaller{callTool: func(string, map[string]any) (json.RawMessage, error) {
+		if fail.Load() {
+			return nil, errors.New("bridge offline")
+		}
+		return apiMCPResult(`{"nodes":[{"id":"e1","uri":"e1","title":"HTTP","tier":2,"proof_status":"verified","prerequisites":[]}],"edges":[]}`), nil
+	}}
+	a := apiTestApp(caller)
+
+	rr := httptest.NewRecorder()
+	a.handleEngramSummary(rr, httptest.NewRequest(http.MethodGet, "/api/engrams/summary", nil))
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s, want 502 while the bridge is offline", rr.Code, rr.Body.String())
+	}
+
+	fail.Store(false)
+	rr = httptest.NewRecorder()
+	a.handleEngramSummary(rr, httptest.NewRequest(http.MethodGet, "/api/engrams/summary", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 once the bridge is back", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Total != 1 {
+		t.Fatalf("total = %d, want 1 from the fresh fetch", got.Total)
 	}
 }

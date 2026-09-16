@@ -1432,7 +1432,11 @@ func TestGenerateClaudeAgentSkill_PrunesStaleCommandFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := WriteManifest(filepath.Join(dir, ".claude"), "claude", []string{"commands/migrated-skill.md"}); err != nil {
+		t.Fatal(err)
+	}
 	g := &Generator{
+		RepoRoot:      dir,
 		SourceDir:     filepath.Join(dir, "skills"),
 		CodexHome:     filepath.Join(dir, "codex"),
 		WorkspaceRoot: dir,
@@ -1440,8 +1444,9 @@ func TestGenerateClaudeAgentSkill_PrunesStaleCommandFile(t *testing.T) {
 	skill := newTestSkill("migrated-skill", "Migrated skill.")
 	skill.Targets = map[string]*TargetSpec{"claude": {Type: "skill"}}
 
-	if _, err := g.generateClaudeSkillByType(skill); err != nil {
-		t.Fatalf("generateClaudeSkillByType: %v", err)
+	g.Registry = &Registry{Skills: []*Skill{skill}}
+	if err := g.generateForTarget("claude"); err != nil {
+		t.Fatalf("generateForTarget: %v", err)
 	}
 
 	if _, err := os.Stat(staleCmd); !os.IsNotExist(err) {

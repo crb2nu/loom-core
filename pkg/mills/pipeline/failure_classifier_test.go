@@ -3,6 +3,7 @@ package pipeline
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,7 +46,7 @@ func TestExternalIncidentPatternIDsLinkedToOperatorRunbook(t *testing.T) {
 		},
 		{
 			name:      "clickhouse merge task",
-			message:   "ClickHouse background worker: merge task failed: cannot select parts",
+			message:   "ClickHouse Code: 432: merge task failed: cannot select parts",
 			patternID: "external_dependency.clickhouse.merge_task",
 		},
 		{
@@ -55,7 +56,7 @@ func TestExternalIncidentPatternIDsLinkedToOperatorRunbook(t *testing.T) {
 		},
 		{
 			name:      "litellm missing api key",
-			message:   "LiteLLM authentication error: missing API key for provider",
+			message:   "LiteLLM status 401: Authentication Error, No api key passed in.",
 			patternID: "external_dependency.litellm.missing_api_key",
 		},
 		{
@@ -214,6 +215,45 @@ func TestClassifyFailureRecord(t *testing.T) {
 	}
 }
 
+func TestClassifyFailureRecord_AllRunnerTimeoutsAreFreeGitLabCIInfra(t *testing.T) {
+	tests := []struct {
+		name    string
+		reasons []string
+		want    FailureClass
+	}{
+		{name: "job execution timeout", reasons: []string{"job_execution_timeout"}, want: FailureInfrastructure},
+		{name: "stuck or timeout", reasons: []string{"stuck_or_timeout_failure"}, want: FailureInfrastructure},
+		{name: "runner system failure", reasons: []string{"runner_system_failure"}, want: FailureInfrastructure},
+		{name: "accepted mixture", reasons: []string{"job_execution_timeout", "runner_system_failure"}, want: FailureInfrastructure},
+		{name: "mixed code failure", reasons: []string{"job_execution_timeout", "script_failure"}, want: FailureCode},
+		{name: "unsupported runner reason", reasons: []string{"runner_unsupported"}, want: FailureCode},
+		{name: "missing evidence", reasons: nil, want: FailureCode},
+		{name: "empty evidence", reasons: []string{}, want: FailureCode},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			typed := &CIPipelineTerminalError{Status: "failed", MRIID: 42, FailedJobReasons: tt.reasons}
+			got := ClassifyFailureRecord(fmt.Errorf("ci_watch: %w", typed))
+			if got.Class != tt.want {
+				t.Fatalf("Class = %q, want %q: %+v", got.Class, tt.want, got)
+			}
+			if tt.want == FailureInfrastructure {
+				if !got.Retryable || !got.FreeRetry || got.Terminal ||
+					got.ExternalDependencyID != "external_dependency.gitlab.ci_infrastructure" ||
+					got.ExternalDependency != "gitlab_ci" {
+					t.Fatalf("infra policy record = %+v", got)
+				}
+				ctx := IncidentContextFromFailureClassification("ci_watch", got)
+				if ctx.Class != council.CIIncidentExternalDependency {
+					t.Fatalf("incident classification = %q, want external_dependency_incident", ctx.Class)
+				}
+			} else if got.FreeRetry || got.ExternalDependencyID != "" || got.ExternalDependency != "" {
+				t.Fatalf("code failure was promoted: %+v", got)
+			}
+		})
+	}
+}
+
 func TestClassifyFailureRecordExternalIncident(t *testing.T) {
 	cases := []struct {
 		name               string
@@ -269,7 +309,7 @@ func TestClassifyFailureRecordObservedExternalIncidentSignatures(t *testing.T) {
 	}{
 		{
 			name:       "clickhouse merge task",
-			message:    "ClickHouse background worker: merge task failed: DB::Exception: cannot select parts",
+			message:    "ClickHouse Code: 432: merge task failed: DB::Exception: cannot select parts",
 			dependency: "clickhouse",
 			externalID: "external_dependency.clickhouse.merge_task",
 		},
@@ -281,7 +321,7 @@ func TestClassifyFailureRecordObservedExternalIncidentSignatures(t *testing.T) {
 		},
 		{
 			name:       "litellm missing api key",
-			message:    "LiteLLM authentication error: missing API key for provider openrouter",
+			message:    "LiteLLM status 401: Authentication Error, No api key passed in.",
 			dependency: "litellm",
 			externalID: "external_dependency.litellm.missing_api_key",
 		},
@@ -307,14 +347,48 @@ func TestClassifyFailureRecordObservedExternalIncidentSignatures(t *testing.T) {
 	}
 }
 
+func TestPromotedExternalFailureRecordsAreTerminal(t *testing.T) {
+	tests := []struct {
+		name       string
+		message    string
+		id         string
+		dependency string
+	}{
+		{"openrouter live", `flexinfer chat: status 402: litellm.APIError: OpenrouterException - This request requires more credits`, "external_dependency.openrouter.credits_exhausted", "openrouter"},
+		{"openrouter case", `OPENROUTER HTTP 402: INSUFFICIENT CREDITS`, "external_dependency.openrouter.credits_exhausted", "openrouter"},
+		{"litellm live", `LiteLLM status 401: Authentication Error, No api key passed in.`, "external_dependency.litellm.missing_api_key", "litellm"},
+		{"litellm case", `LITELLM HTTP 401: NO API KEY PASSED IN`, "external_dependency.litellm.missing_api_key", "litellm"},
+		{"clickhouse live", `ClickHouse exception Code: 432. DB::Exception: Cannot merge parts because a merge with the same resulting part is already running`, "external_dependency.clickhouse.merge_task", "clickhouse"},
+		{"clickhouse case", `CLICKHOUSE CODE: 432: MERGE TASK FAILED`, "external_dependency.clickhouse.merge_task", "clickhouse"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClassifyFailureRecord(errors.New(tt.message))
+			if got.Class != FailureConfiguration || got.Retryable || got.FreeRetry || !got.Terminal {
+				t.Fatalf("classification = %+v, want terminal non-retryable external incident", got)
+			}
+			if got.ExternalDependencyID != tt.id || got.ExternalDependency != tt.dependency {
+				t.Fatalf("identity = %q/%q, want %q/%q", got.ExternalDependencyID, got.ExternalDependency, tt.id, tt.dependency)
+			}
+		})
+	}
+}
+
 func TestClassifyFailureRecordObservedExternalIncidentNearMisses(t *testing.T) {
 	for _, message := range []string{
 		"merge task failed while compacting the local cache",
 		"ClickHouse merge task completed successfully",
+		"ClickHouse merge task failed: DB::Exception: cannot select parts",
+		"Code: 432 merge task failed: DB::Exception: cannot select parts",
+		"ClickHouse Code: 432 query failed",
 		"no available disk on node worker-2",
 		"Longhorn volume is healthy and has an available disk",
 		"missing API key for provider openrouter",
 		"LiteLLM request failed with status 500",
+		"LiteLLM request failed: No api key passed in",
+		"status 401: No api key passed in",
+		"LiteLLM status 401: API key rejected",
 		"agent is unauthenticated",
 		"GitLab agent connected successfully",
 	} {

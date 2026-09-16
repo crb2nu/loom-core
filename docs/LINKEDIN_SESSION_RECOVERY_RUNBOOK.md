@@ -13,8 +13,7 @@ Recover LinkedIn MCP experimental messaging sessions when LinkedIn invalidates c
 ## Prerequisites
 
 1. BrowserKit runtime on host:
-- `pip install flexinfer-browser-kit playwright`
-- `python3 -m playwright install chromium`
+- `bash scripts/browserkit/install_deps.sh` (pinned flexinfer-browser-kit + playwright, then the chromium download)
 
 2. Secrets configured:
 - `LINKEDIN_SESSION_COOKIE`
@@ -51,6 +50,46 @@ Recover LinkedIn MCP experimental messaging sessions when LinkedIn invalidates c
 - Cooldown active: wait for `LINKEDIN_SESSION_RECOVERY_COOLDOWN_SECONDS`
 - Checkpoint/CAPTCHA unresolved: complete manually in interactive browser and re-run recovery
 - Persistent challenge: rotate session credentials and retry
+
+## Cluster (loom-hub) Deployment
+
+The `linkedin` pod in `loom-hub` runs with `LINKEDIN_BROWSERKIT_MODE=off`:
+the `mcp/custom-server` image ships no python/chromium, so health probes and
+recovery can never run in-cluster. The pod does cookie-only Voyager HTTP; a
+stale cookie surfaces as a clean auth-challenge error instead of a
+`LINKEDIN_BROWSERKIT_PYTHON` NotConfigured error.
+
+Refreshing the cluster session:
+
+1. Run recovery on a workstation (see procedure above). Recovered `li_at` +
+   `JSESSIONID` persist to the local Loom secret store (macOS Keychain,
+   service `loom`).
+2. Build `LINKEDIN_COOKIE_BUNDLE` from the refreshed BrowserKit storage state
+   (`~/.config/loom/linkedin-browserkit/<session>.json`): every cookie on a
+   `linkedin.com` domain EXCEPT `li_at`/`JSESSIONID`, serialized as
+   `name=value; name=value`. The device cookies (`bcookie`, `bscookie`,
+   `lidc`, ...) must accompany the session cookie — LinkedIn revokes a
+   `li_at` presented without them (observed twice, 2026-09-01: session died
+   on the pod's first messaging call while curl probes with the same li_at
+   kept working).
+3. Sync `LINKEDIN_SESSION_COOKIE`, `LINKEDIN_JSESSIONID`, and
+   `LINKEDIN_COOKIE_BUNDLE` into
+   `platform/gitops/k3s/loom-hub/secrets.yaml` via `sops set` and merge.
+4. `flux reconcile` the owning kustomization, then
+   `kubectl rollout restart deployment/linkedin -n loom-hub` (env-from-secret
+   is not hot-reloaded).
+5. Do NOT exercise the pod's tools until the deployment is running a build
+   with browser-fidelity headers (User-Agent + Accept-Language +
+   `LINKEDIN_COOKIE_BUNDLE` support in `cmd/mcp-linkedin/transport.go`) — a
+   pod without them burns the fresh session on its first messaging call.
+
+Mode caveats:
+
+- `silent` recovery CLEARS the persisted browser storage state before it
+  attempts login, and headless login is currently defeated by LinkedIn's login
+  page (form fields not found). Prefer `interactive` — it reuses nothing
+  destructive, pre-fills the form, and waits up to 4 minutes for a human to
+  complete login/2FA.
 
 ## Safety Constraints
 

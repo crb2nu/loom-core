@@ -34,10 +34,14 @@ func (c *PlanClient) UpdateSlicePhase(ctx context.Context, sliceID, phase string
 	if strings.TrimSpace(sliceID) == "" {
 		return errors.New("plan: slice_id required")
 	}
-	return c.planWrite(ctx, "agent_plan_slice_update", map[string]any{
+	err := c.planWrite(ctx, "agent_plan_slice_update", map[string]any{
 		"slice_id": sliceID,
 		"phase":    phase,
 	})
+	if err == nil {
+		c.invalidateSlice(sliceID)
+	}
+	return err
 }
 
 // UpdateSliceMRRef records a slice's merge request reference via
@@ -61,10 +65,14 @@ func (c *PlanClient) UpdateSliceMRRef(ctx context.Context, sliceID, mrRef string
 	if strings.TrimSpace(mrRef) == "" {
 		return errors.New("plan: mr_ref required")
 	}
-	return c.planWrite(ctx, "agent_plan_slice_update", map[string]any{
+	err := c.planWrite(ctx, "agent_plan_slice_update", map[string]any{
 		"slice_id": sliceID,
 		"mr_ref":   mrRef,
 	})
+	if err == nil {
+		c.invalidateSlice(sliceID)
+	}
+	return err
 }
 
 // AppendSliceDecision appends a decision/blocker note to a slice via
@@ -76,10 +84,14 @@ func (c *PlanClient) AppendSliceDecision(ctx context.Context, sliceID, note stri
 	if strings.TrimSpace(sliceID) == "" {
 		return errors.New("plan: slice_id required")
 	}
-	return c.planWrite(ctx, "agent_plan_slice_update", map[string]any{
+	err := c.planWrite(ctx, "agent_plan_slice_update", map[string]any{
 		"slice_id":     sliceID,
 		"add_decision": note,
 	})
+	if err == nil {
+		c.invalidateSlice(sliceID)
+	}
+	return err
 }
 
 // AdvancePlan advances a plan's lifecycle phase via

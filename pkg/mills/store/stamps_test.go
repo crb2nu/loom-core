@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func TestStampRoundTripRequiresTargetProject(t *testing.T) {
 	if err := st.Stamps.Put(ctx, want); err != nil {
 		t.Fatalf("put stamp: %v", err)
 	}
-	got, err := st.Stamps.Get(ctx, want.ID)
+	got, err := st.Stamps.Get(ctx, "services/widgets", want.ID)
 	if err != nil {
 		t.Fatalf("get stamp: %v", err)
 	}
@@ -24,6 +25,29 @@ func TestStampRoundTripRequiresTargetProject(t *testing.T) {
 	}
 	if !got.CreatedAt.Equal(wantTime) {
 		t.Fatalf("created_at = %v, want %v", got.CreatedAt, wantTime)
+	}
+}
+
+func TestStampCompositeIdentityAndCollision(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	first := &Stamp{ID: " pattern-rest ", TargetProject: " services/widgets ", CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)}
+	if err := st.Stamps.Put(ctx, first); err != nil {
+		t.Fatalf("put first stamp: %v", err)
+	}
+	if err := st.Stamps.Put(ctx, &Stamp{ID: "pattern-rest", TargetProject: "services/catalog"}); err != nil {
+		t.Fatalf("put same pattern for another target: %v", err)
+	}
+	if err := st.Stamps.Put(ctx, &Stamp{ID: " pattern-rest ", TargetProject: " services/widgets "}); !errors.Is(err, ErrStampCollision) {
+		t.Fatalf("duplicate put error = %v, want ErrStampCollision", err)
+	}
+
+	got, err := st.Stamps.Get(ctx, "services/widgets", "pattern-rest")
+	if err != nil {
+		t.Fatalf("get original stamp: %v", err)
+	}
+	if !got.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("collision changed original created_at: got %v want %v", got.CreatedAt, first.CreatedAt)
 	}
 }
 
@@ -107,7 +131,7 @@ func TestStampDAODoesNotWriteBlankID(t *testing.T) {
 	}
 }
 
-func TestStampDAORejectsCorruptTargetlessRow(t *testing.T) {
+func TestStampDAOBackfillsCorruptTargetlessRowIdempotently(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	// Simulate a corrupt or externally restored database. Normal writes cannot
@@ -121,7 +145,16 @@ func TestStampDAORejectsCorruptTargetlessRow(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("insert corrupt stamp: %v", err)
 	}
-	if _, err := st.Stamps.Get(ctx, "corrupt"); err == nil {
-		t.Fatal("Get corrupt target-less stamp succeeded")
+	stamp, err := st.Stamps.GetForSource(ctx, "corrupt", "services/loom-core")
+	if err != nil || stamp.TargetProject != "services/loom-core" {
+		t.Fatalf("GetForSource = %+v, %v", stamp, err)
+	}
+	updated, err := st.Stamps.BackfillTargetProject(ctx, "corrupt", "services/loom-core")
+	if err != nil || updated {
+		t.Fatalf("second BackfillTargetProject = %v, %v, want false, nil", updated, err)
+	}
+	stamp, err = st.Stamps.Get(ctx, "services/loom-core", "corrupt")
+	if err != nil || stamp.TargetProject != "services/loom-core" {
+		t.Fatalf("Get after backfill = %+v, %v", stamp, err)
 	}
 }

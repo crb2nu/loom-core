@@ -1,0 +1,1 @@
+- Migrate the mcpo `codebase-memory` entry in `k8s/base/servers/mcpo/configmap.yaml` to Streamable HTTP and update its deployment config checksum.

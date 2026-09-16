@@ -139,7 +139,18 @@ func (o *operator) runCouncil(w http.ResponseWriter, r *http.Request, dryrun boo
 	// Council runs can take minutes when the editor is a real spawn.
 	// Cap at 10 minutes per request; the operator's scheduler runs them
 	// without an HTTP-side cap.
-	ctx, cancel := context.WithTimeout(r.Context(), councilRequestBudget)
+	//
+	// Detached from the request's cancellation on purpose: a council run
+	// spends real money in its first seconds (reviewers), and a client that
+	// gives up waiting must not cancel the editor mid-flight. Live 2026-09-02
+	// 18:19Z: `loom mills council run` with its default short timeout closed
+	// the connection at 90s, the request context cancelled the editor call
+	// ("flexinfer chat: … context canceled"), and the run persisted as `error`
+	// after $1.75 of reviewer spend with no artifacts and no backlog delta.
+	// The run still persists its own row, so a disconnected caller reads the
+	// outcome from GET /api/mills/council/runs; only the budget cap and
+	// operator shutdown bound it now.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), councilRequestBudget)
 	defer cancel()
 
 	res, err := o.runner.Run(ctx, runner.RunInput{

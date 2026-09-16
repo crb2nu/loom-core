@@ -58,3 +58,36 @@ even when the proposal title omits the word "incident". File-backed follow-ups
 using either council plan slices or legacy backlog slices are preserved and
 labeled when the surrounding council output identifies an external dependency
 incident.
+
+## Substrate recovery releases
+
+The reconciler treats a capability recovery as a separate release path from
+ordinary auto-requeue. Health tracking records `substrate_red` when an incident
+opens and `substrate_recovered` when it closes; the recovery event carries the
+capability plus the inclusive `red_at`/`green_at` window.
+
+On each tick, Mills requeues escalated items whose latest run:
+
+- ended inside that window;
+- has an eligible escalation class (`transient`, `infra`, or
+  `transient_quota` by default); and
+- has a failure signature mapped to the recovered capability.
+
+Recovery releases do not consume the rolling 24-hour auto-requeue allowance or
+the item's lifetime retry count. They still pass the pipeline run-budget and
+concurrency admission check, enter the normal queued path (including scope
+serialization), and are bounded by `release.max_per_sweep` (default 10). A
+remaining pile is reconsidered on later ticks. While the latest health edge for
+a mapped capability is red, ordinary auto-requeue leaves its victims parked so
+it does not spend retry budget on a known-broken substrate.
+
+Each successful release atomically records a pipeline-run event with
+`released_by=substrate_recovered:<capability>` while preserving the run's
+original escalation class. Configure the class and signature mapping under
+`pipeline.auto_requeue.release`; set `enabled: false` there for the release-path
+kill switch. Built-in signatures each name a distinct capability row:
+`spawn_infra` releases on `hud_spawn` (spawn pod readiness), `sandbox_build`
+and `mcp_hub_session` release on `mcp_hub_session` (the devbox quality gate is
+reached through the hub session, and its outages surface there), and
+`ci_poll_timeout` releases on `gitlab`. Custom mappings may name any capability
+row exposed by the operator.

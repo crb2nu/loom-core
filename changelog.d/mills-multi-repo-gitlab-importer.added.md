@@ -1,0 +1,1 @@
+- Add fail-closed multi-repository GitLab issue intake with cross-repository backlog routing in `pkg/mills/intake`, operator policy wiring, tests, and Mills documentation.

@@ -593,14 +593,13 @@ type QuiescenceCounts struct {
 	ActiveWorkflowRuns     int `json:"active_workflow_runs"`
 	ActiveSpinningRoomRuns int `json:"active_spinning_room_runs"`
 	ActiveCouncilRuns      int `json:"active_council_runs"`
-	ActiveCrossRepoRuns    int `json:"active_cross_repo_runs"`
 	PendingDispatches      int `json:"pending_dispatches"`
 }
 
 func (c QuiescenceCounts) unrelatedIdle(expectedWorkflowRuns int) bool {
 	return c.QueuedBacklog == 0 && c.ActivePipelineRuns == 0 &&
 		c.ActiveWorkflowRuns == expectedWorkflowRuns && c.ActiveSpinningRoomRuns == 0 &&
-		c.ActiveCouncilRuns == 0 && c.ActiveCrossRepoRuns == 0 && c.PendingDispatches == 0
+		c.ActiveCouncilRuns == 0 && c.PendingDispatches == 0
 }
 
 // DeploymentIdentity proves a singleton deployment is fully observed and

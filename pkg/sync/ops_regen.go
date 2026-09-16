@@ -109,7 +109,7 @@ func (m *Manager) Regenerate(p *Profile, hubMode bool, hubURL string, loomMode b
 	// Generate skills if the profile has a skills target (unless SkipSkills is set)
 	if p.SkillsTarget != "" && !m.SkipSkills {
 		if err := m.regenerateSkills(p); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: skills generation failed for %s: %v\n", p.Name, err)
+			return fmt.Errorf("skills generation failed for %s: %w", p.Name, err)
 		}
 	}
 
@@ -121,11 +121,6 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 	skillsRegPath := discoverSkillsRegistryPath(m.RepoRoot)
 	if skillsRegPath == "" {
 		return nil // No skills registry found, skip silently
-	}
-
-	// When skills go directly to home, clean stale repo copies first.
-	if p.SkillsDirectToHome {
-		m.cleanRepoSkills(p, registrySkillNames(skillsRegPath))
 	}
 
 	repoPath := m.ResolveRepoPath(p)
@@ -190,12 +185,23 @@ func (m *Manager) regenerateSkills(p *Profile) error {
 		return fmt.Errorf("generate skills: %w", err)
 	}
 
+	// Retain the last usable repo mirror until home delivery succeeds. Cleanup
+	// uses manifest ownership so user-authored neighbors remain untouched.
+	if p.SkillsDirectToHome {
+		if err := m.cleanRepoSkills(p); err != nil {
+			return fmt.Errorf("clean repo skills after home delivery: %w", err)
+		}
+	}
+
 	// Read manifest from the directory where skills were generated.
 	manifestDir := repoPath
 	if p.SkillsDirectToHome {
 		manifestDir = skillsHomeManifestDir(p, m.ResolveHomePath(p))
 	}
-	manifest, _ := skills.ReadManifest(manifestDir)
+	manifest, err := skills.ReadManifest(manifestDir)
+	if err != nil {
+		return fmt.Errorf("read generated skill manifest: %w", err)
+	}
 	if manifest != nil {
 		fmt.Printf("Generated %d skill files for %s\n", len(manifest.Generated), p.Name)
 	}
@@ -224,76 +230,51 @@ func skillsHomeManifestDir(p *Profile, homePath string) string {
 	return homePath
 }
 
-// registrySkillNames returns the names of all skills in the registry at the
-// given path, or nil when it cannot be read. Used to scope stale-file pruning
-// to registry-derived filenames only.
-func registrySkillNames(registryPath string) []string {
-	reg, err := skills.Load(registryPath)
-	if err != nil {
-		return nil
-	}
-	names := make([]string, 0, len(reg.Skills))
-	for _, s := range reg.Skills {
-		if s != nil && s.Name != "" {
-			names = append(names, s.Name)
-		}
-	}
-	return names
-}
-
-// cleanRepoSkills removes stale skill files from the repo directory when
-// skills are generated directly to home (SkillsDirectToHome).
-// Also cleans the workspace root if it differs from the repo root.
-// skillNames scopes legacy commands/ pruning to registry-derived files.
-func (m *Manager) cleanRepoSkills(p *Profile, skillNames []string) {
-	m.cleanSkillsAt(m.ResolveRepoPath(p), skillNames)
-
-	// Also clean workspace root if different from repo root
+// cleanRepoSkills removes managed repo mirrors after successful home delivery.
+func (m *Manager) cleanRepoSkills(p *Profile) error {
+	dirs := []string{m.ResolveRepoPath(p)}
 	if m.WorkspaceRoot != "" && m.WorkspaceRoot != m.RepoRoot {
-		wsPath := filepath.Join(m.WorkspaceRoot, p.RepoDir)
-		if wsPath != m.ResolveHomePath(p) {
-			m.cleanSkillsAt(wsPath, skillNames)
-		}
+		dirs = append(dirs, filepath.Join(m.WorkspaceRoot, p.RepoDir))
 	}
-}
-
-// cleanSkillsAt removes stale skill files from the given directory.
-// Legacy commands/<name>.md pruning is name-scoped to registry skills so
-// hand-authored command files are never touched.
-func (m *Manager) cleanSkillsAt(dir string, skillNames []string) {
-	for _, name := range skillNames {
-		cmdPath := filepath.Join(dir, "commands", name+".md")
-		if !Exists(cmdPath) {
+	homePath := skillsHomeManifestDir(p, m.ResolveHomePath(p))
+	homeInfo, homeErr := os.Stat(homePath)
+	for _, dir := range dirs {
+		if filepath.Clean(dir) == filepath.Clean(homePath) {
 			continue
 		}
-		if err := os.Remove(cmdPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not remove stale repo command %s: %v\n", cmdPath, err)
+		// A repo/workspace root can be a symlink to the home root. Compare
+		// filesystem identity before deleting through a differently named alias.
+		if info, err := os.Stat(dir); err == nil && homeErr == nil && os.SameFile(info, homeInfo) {
+			continue
+		}
+		if err := m.cleanSkillsAt(dir); err != nil {
+			return err
 		}
 	}
-	skillsDir := filepath.Join(dir, "skills")
-	if Exists(skillsDir) {
-		if err := os.RemoveAll(skillsDir); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not remove stale repo skills %s: %v\n", skillsDir, err)
-		} else {
-			fmt.Printf("Cleaned stale repo skills: %s\n", skillsDir)
-		}
-	}
+	return nil
+}
 
-	manifestPath := filepath.Join(dir, skills.ManifestFilename)
-	if Exists(manifestPath) {
-		if err := os.Remove(manifestPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not remove stale manifest %s: %v\n", manifestPath, err)
-		}
+// cleanSkillsAt deletes only files whose manifest hashes still match. Untracked
+// files, legacy files without ownership hashes, and modified files are preserved.
+func (m *Manager) cleanSkillsAt(dir string) error {
+	manifest, err := skills.ReadManifest(dir)
+	if err != nil {
+		return fmt.Errorf("read stale repo manifest at %s: %w", dir, err)
 	}
-
-	for _, f := range []string{"instructions.md", "GEMINI.md"} {
-		p := filepath.Join(dir, f)
-		if Exists(p) {
-			if err := os.Remove(p); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not remove stale %s %s: %v\n", f, p, err)
-			}
-		}
+	if manifest == nil {
+		return nil
 	}
+	removed, err := skills.PruneManifest(dir, manifest, nil)
+	if err != nil {
+		return fmt.Errorf("prune stale repo skills at %s: %w", dir, err)
+	}
+	if err := os.Remove(filepath.Join(dir, skills.ManifestFilename)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale repo manifest at %s: %w", dir, err)
+	}
+	if len(removed) > 0 {
+		fmt.Printf("Cleaned %d managed repo skill files from %s\n", len(removed), dir)
+	}
+	return nil
 }
 
 // cleanRepoGenerated removes stale generated config files from the repo
@@ -359,7 +340,10 @@ func (m *Manager) SyncSkills(profileName string, repoOnly bool) error {
 	if p.SkillsDirectToHome {
 		homePath := m.ResolveHomePath(p)
 		manifestDir := skillsHomeManifestDir(p, homePath)
-		manifest, _ := skills.ReadManifest(manifestDir)
+		manifest, err := skills.ReadManifest(manifestDir)
+		if err != nil {
+			return fmt.Errorf("read generated skill manifest: %w", err)
+		}
 		if manifest != nil {
 			fmt.Printf("Generated %d skill files directly to %s\n", len(manifest.Generated), manifestDir)
 		}
@@ -370,35 +354,11 @@ func (m *Manager) SyncSkills(profileName string, repoOnly bool) error {
 	repoPath := m.ResolveRepoPath(p)
 	homePath := m.ResolveHomePath(p)
 
-	manifest, _ := skills.ReadManifest(repoPath)
-	if manifest == nil || len(manifest.Generated) == 0 {
-		fmt.Println("No skill files to sync")
-		return nil
+	count, err := skills.SyncGeneratedFiles(repoPath, homePath)
+	if err != nil {
+		return fmt.Errorf("sync skills for %s: %w", profileName, err)
 	}
-
-	for _, relPath := range manifest.Generated {
-		srcFile := filepath.Join(repoPath, relPath)
-		dstFile := filepath.Join(homePath, relPath)
-		if Exists(srcFile) {
-			if err := os.MkdirAll(filepath.Dir(dstFile), 0755); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not create dir for %s: %v\n", relPath, err)
-				continue
-			}
-			if err := CopyFile(srcFile, dstFile); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not sync %s: %v\n", relPath, err)
-			}
-		}
-	}
-
-	// Copy manifest
-	manifestSrc := filepath.Join(repoPath, skills.ManifestFilename)
-	if Exists(manifestSrc) {
-		if err := CopyFile(manifestSrc, filepath.Join(homePath, skills.ManifestFilename)); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not sync manifest: %v\n", err)
-		}
-	}
-
-	fmt.Printf("Synced %d skill files for %s\n", len(manifest.Generated), profileName)
+	fmt.Printf("Synced %d skill files for %s\n", count, profileName)
 	return nil
 }
 

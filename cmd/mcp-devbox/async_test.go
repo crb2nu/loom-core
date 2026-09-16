@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	"github.com/crb2nu/loom/pkg/lifecycle"
 )
 
 func TestAsyncRegistryCleanup_UsesCompletedTimestamp(t *testing.T) {
@@ -64,4 +67,35 @@ func TestAsyncRegistryCleanup_BackCompatWithoutCompletedTimestamp(t *testing.T) 
 	if got := registry.get("legacy-entry"); got != nil {
 		t.Fatalf("expected legacy completed async exec to be removed based on started time fallback")
 	}
+}
+
+func TestAsyncDrainWaitsForTerminalPoll(t *testing.T) {
+	d := &lifecycle.Drain{}
+	d.Admit()  // launching call
+	d.Retain() // detached job
+	r := newAsyncRegistry()
+	ae := &asyncExec{ID: "job", Status: "running", StartedAt: time.Now(), drainDone: d.Release}
+	r.add(ae)
+	m := &manager{asyncExecs: r}
+	_, done := d.Begin()
+	d.Release()
+	if _, err := m.handleExecPoll(context.Background(), map[string]any{"exec_id": "job"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+		t.Fatal("running job released")
+	default:
+	}
+	ae.Status = "completed"
+	if _, err := m.handleExecPoll(context.Background(), map[string]any{"exec_id": "job"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("terminal poll did not release job")
+	}
+	// Repeated polls must not double-release the hold.
+	_, _ = m.handleExecPoll(context.Background(), map[string]any{"exec_id": "job"})
 }

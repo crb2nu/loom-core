@@ -174,6 +174,16 @@ func TestPipeline_CountEscalationsByClassSince(t *testing.T) {
 	}
 }
 
+func TestPipeline_CountEscalationsByClassSinceUsesHotReadIndex(t *testing.T) {
+	st := newTestStore(t)
+	details := queryPlan(t, st, `EXPLAIN QUERY PLAN
+		SELECT COALESCE(NULLIF(escalation_class, ''), 'unclassified') AS class, COUNT(*)
+		FROM pipeline_runs
+		WHERE state = 'escalated' AND started_at >= ?
+		GROUP BY class`, []any{timeRFC3339(time.Now().Add(-24 * time.Hour))})
+	assertPlanUsesIndexWithoutTableScan(t, details, "idx_pipeline_escalation_window", "pipeline_runs")
+}
+
 // TestPipeline_SetEscalationClass covers the writer's edge cases: an empty
 // class is a no-op (column stays NULL → run keeps counting), and an unknown
 // run id surfaces ErrNotFound rather than silently succeeding.

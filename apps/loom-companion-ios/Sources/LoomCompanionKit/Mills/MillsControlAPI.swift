@@ -41,6 +41,20 @@ public protocol MillsControlAPIProtocol: Sendable {
     /// unimplemented (501), so this is the only real per-run intervention.
     @discardableResult
     func escalatePipeline(id: String, reason: String?) async throws -> MillsPipelineEscalateAck
+
+    /// One-tap taste grade on a merged run (keep/meh/regret). Admin-gated
+    /// like spin/escalate; throws 422 on a non-gradable run (not merged) and
+    /// 401 when the pairing bearer isn't the HUD admin token. Defaulted so
+    /// existing conformances (test fakes, previews) keep compiling.
+    @discardableResult
+    func gradeRun(id: String, grade: MillsGrade, note: String?) async throws -> MillsGradeAck
+}
+
+extension MillsControlAPIProtocol {
+    @discardableResult
+    public func gradeRun(id: String, grade: MillsGrade, note: String? = nil) async throws -> MillsGradeAck {
+        throw LoomAPIError.apiError(code: .notFound, message: "grading unavailable", requestId: "")
+    }
 }
 
 /// Operator response to POST …/pipeline/runs/{id}/escalate.
@@ -136,6 +150,11 @@ public struct MillsControlAPI: MillsControlAPIProtocol, Sendable {
     @discardableResult
     public func escalatePipeline(id: String, reason: String? = nil) async throws -> MillsPipelineEscalateAck {
         try await client.requestRaw(.millsPipelineEscalate(id: id, reason: reason))
+    }
+
+    @discardableResult
+    public func gradeRun(id: String, grade: MillsGrade, note: String? = nil) async throws -> MillsGradeAck {
+        try await client.requestRaw(.millsPipelineGrade(id: id, grade: grade.rawValue, note: note))
     }
 }
 

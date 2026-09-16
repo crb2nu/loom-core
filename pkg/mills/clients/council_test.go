@@ -442,13 +442,20 @@ func TestFlexInferEvalJudge_PricesKnownOpenAIGatewayModelWithoutProviderCost(t *
 	if err != nil {
 		t.Fatalf("judge: %v", err)
 	}
-	want := (600*2.50 + 400*0.25 + 100*15.0) / 1_000_000
+	// gpt-5.6-terra from the pkg/llmpricing snapshot: $2/M uncached input,
+	// $0.20/M cached input, $12/M output.
+	want := (600*2.00 + 400*0.20 + 100*12.0) / 1_000_000
 	if math.Abs(result.CostUSD-want) > 1e-12 || result.CostUnpriced {
 		t.Fatalf("result = %+v; want priced cost %.8f", result, want)
 	}
 }
 
-func TestFlexInferEvalJudge_KnownGatewayModelWithoutUsageMarksCostUnpriced(t *testing.T) {
+// A known gateway model that answers WITHOUT a usage block is charged its
+// bounded worst case (prompt + max_tokens at the pinned rate) rather than
+// left unpriced — unpriced spend consumes the whole run reservation, which
+// is a $15 charge for a call whose ceiling is cents (see
+// unpricedAttemptCeilingUSD).
+func TestFlexInferEvalJudge_KnownGatewayModelWithoutUsageChargesCeiling(t *testing.T) {
 	cli := newStubClient(t, `{
 		"model":"oa/gpt-5.6-terra",
 		"choices":[{"message":{"role":"assistant","content":"{\"score\":0.9,\"findings\":[]}"}}]
@@ -459,8 +466,29 @@ func TestFlexInferEvalJudge_KnownGatewayModelWithoutUsageMarksCostUnpriced(t *te
 	if err != nil {
 		t.Fatalf("judge: %v", err)
 	}
+	if result.CostUnpriced {
+		t.Fatal("known gateway model without usage must be ceiling-priced, not unpriced")
+	}
+	if result.CostUSD <= 0 || result.CostUSD > 1.00 {
+		t.Fatalf("want a small bounded ceiling charge, got %v", result.CostUSD)
+	}
+}
+
+// An UNKNOWN gateway model without usage still preserves the conservative
+// reservation accounting — ceilings never leak onto aliases.
+func TestFlexInferEvalJudge_UnknownGatewayModelWithoutUsageMarksCostUnpriced(t *testing.T) {
+	cli := newStubClient(t, `{
+		"model":"oa/gpt-next",
+		"choices":[{"message":{"role":"assistant","content":"{\"score\":0.9,\"findings\":[]}"}}]
+	}`, http.StatusOK)
+	judge := &FlexInferEvalJudge{Client: cli, Model: "oa/gpt-next", Backend: "litellm"}
+
+	result, err := judge.JudgeContradiction(context.Background(), eval.Input{})
+	if err != nil {
+		t.Fatalf("judge: %v", err)
+	}
 	if !result.CostUnpriced {
-		t.Fatal("known gateway model without usage must preserve conservative reservation accounting")
+		t.Fatal("unknown gateway model without usage must preserve conservative reservation accounting")
 	}
 }
 

@@ -1,0 +1,1 @@
+- Prefer MCP `structuredContent` in Mills and HUD tool-result consumers, preserving lossless arrays and verdict fields while retaining legacy text and TOON fallbacks (`pkg/mills/clients/mcphub.go`, `internal/hud/bridge/tool_result.go`).

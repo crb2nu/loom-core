@@ -1,0 +1,1 @@
+- Add launch-spec builder and launcher seams around the HUD spawn path, with characterization coverage in `internal/hud/spawn.go` and `internal/hud/spawn_test.go`.

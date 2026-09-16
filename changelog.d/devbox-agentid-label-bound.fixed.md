@@ -1,0 +1,1 @@
+- HOTFIX: the per-run devbox agent id keeps only the run's trailing UUID token, staying inside the Kubernetes 63-char label bound — the full run-id join made every sandbox pod invalid (incident 2026-08-20, second layer).

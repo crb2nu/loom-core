@@ -8,7 +8,7 @@ RUN apk add --no-cache \
     gcc musl-dev
 
 # Common Go tools pinned for Go 1.24 compatibility.
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8 && \
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0 && \
     go install golang.org/x/tools/cmd/goimports@v0.42.0
 
 WORKDIR /workspace

@@ -105,6 +105,7 @@ func (c *PlanClient) AuthorDraftPlan(ctx context.Context, in spin.DraftPlanInput
 	if !parsed.OK && parsed.PlanID == "" {
 		return "", fmt.Errorf("plan: author draft reported failure: %q", truncateBody(body, 240))
 	}
+	c.invalidatePlan(parsed.PlanID)
 	return parsed.PlanID, nil
 }
 
@@ -136,6 +137,13 @@ func draftSpecDoc(in spin.DraftPlanInput) string {
 		fmt.Fprintf(&b, "- **Respun from**: `%s`\n", rf)
 	}
 	fmt.Fprintf(&b, "- **Spun at**: %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	if len(in.Notes) > 0 {
+		b.WriteString("## Frame notes\n\n")
+		for _, note := range in.Notes {
+			fmt.Fprintf(&b, "- %s\n", note)
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString("## Brief (roving)\n\n")
 	b.WriteString(strings.TrimSpace(in.Brief))
 	b.WriteString("\n")

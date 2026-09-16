@@ -239,6 +239,86 @@ func TestShouldAutoMirrorToMemory(t *testing.T) {
 	}
 }
 
+// TestAdd_NoEmbedAPIKeyStillPersistsContext pins the regression where an
+// empty EmbedAPIKey rejected every context write before the embedder was even
+// consulted. The default flexinfer provider needs no key and
+// storeContextEntries already falls back to deterministic vectors on embed
+// failure, so the write must reach Qdrant with no key configured.
+func TestAdd_NoEmbedAPIKeyStillPersistsContext(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
+
+	var upserts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/collections/context":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/collections/context":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","result":true}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/collections/context/points":
+			upserts++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","result":{"status":"acknowledged"}}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/collections/context/index":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","result":{"status":"acknowledged"}}`))
+		default:
+			t.Fatalf("unexpected qdrant request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	cfg := Config{
+		QdrantURL:         server.URL,
+		QdrantDistance:    "Cosine",
+		ContextCollection: "context",
+		EmbedAPIKey:       "", // the hub's agent-context runs keyless against the in-cluster proxy
+	}
+	vectorSize := 0
+	session := &Session{ID: "sess-nokey", AgentID: "agent-1", Namespace: "test/ns"}
+	cs := &ContextSvc{
+		qdrant:     NewQdrantRegistry(httpclient.NewDefault(), cfg),
+		embed:      embed.NewDummyEmbedder(3),
+		vectorSize: &vectorSize,
+		cfg:        cfg,
+		metrics:    NewMetrics(),
+		getSession: func(context.Context, string) (*Session, error) {
+			return session, nil
+		},
+	}
+
+	result, err := cs.Add(context.Background(), map[string]any{
+		"session_id": session.ID,
+		"entries": []any{
+			map[string]any{
+				"entry_type": "note",
+				"title":      "Escalation recorded",
+				"content":    "Run PIPE-1 escalated at ci_watch with class=code.",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if result == nil || len(result.Content) == 0 {
+		t.Fatal("expected tool result content")
+	}
+	if result.IsError {
+		t.Fatalf("Add rejected a keyless context write: %s", result.Content[0].Text)
+	}
+	payload := decodeToolPayload(t, result.Content[0].Text)
+	routed, ok := payload["routed"].(map[string]any)
+	if !ok {
+		t.Fatalf("routed = %#v, want map", payload["routed"])
+	}
+	if got := routed["context"]; got != float64(1) {
+		t.Fatalf("routed.context = %v, want 1", got)
+	}
+	if upserts != 1 {
+		t.Fatalf("qdrant upserts = %d, want 1 (the entry must persist without an embed key)", upserts)
+	}
+}
+
 func TestAdd_AutoMirrorsHighValueEntriesToMemory(t *testing.T) {
 	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "json")
 

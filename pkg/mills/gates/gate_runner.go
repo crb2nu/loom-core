@@ -79,6 +79,11 @@ type GateRunner struct {
 	Now           func() time.Time
 }
 
+// LintParity is default-on for post-implement verification. It lives on the
+// runner contract so operators can expose the default without adding a second
+// policy definition (and therefore without policy/config drift).
+func (r GateRunner) LintParity() bool { return true }
+
 // Run evaluates the admission gates in order. Local config is deliberately
 // not evaluated after an unsafe storage result: the workflow is already
 // blocked and avoiding extra work keeps the failure evidence unambiguous.

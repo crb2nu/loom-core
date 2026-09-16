@@ -47,9 +47,12 @@ const (
 // GitLabImporterConfig captures the operator-tunable knobs. Defaults
 // apply when fields are zero.
 type GitLabImporterConfig struct {
-	EligibleLabel   string
-	PollInterval    time.Duration
-	DefaultPriority store.Priority
+	EligibleLabel          string
+	PollInterval           time.Duration
+	DefaultPriority        store.Priority
+	HomeProject            string
+	Projects               []string
+	IssuesClientForProject func(string) GitLabIssuesClient
 }
 
 func (c *GitLabImporterConfig) applyDefaults() {
@@ -140,17 +143,49 @@ func (im *GitLabImporter) Tick(ctx context.Context) (int, error) {
 	if im.Enabled != nil && !im.Enabled() {
 		return 0, nil
 	}
-	issues, err := im.client.ListIssues(ctx, clients.ListIssuesOpts{
-		Labels:  []string{im.cfg.EligibleLabel},
-		State:   "opened",
-		PerPage: 100,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("list issues: %w", err)
+	imported := 0
+	for _, project := range im.effectiveProjects() {
+		client := im.client
+		if im.cfg.IssuesClientForProject != nil {
+			client = im.cfg.IssuesClientForProject(project)
+		}
+		if client == nil {
+			im.logger.Warn("gitlab importer project client unavailable", "project", project)
+			continue
+		}
+		issues, err := client.ListIssues(ctx, clients.ListIssuesOpts{
+			Labels: []string{im.cfg.EligibleLabel}, State: "opened", PerPage: 100,
+		})
+		if err != nil {
+			im.logger.Warn("gitlab importer list failed", "project", project, "err", err)
+			continue
+		}
+		imported += im.importIssues(ctx, project, issues)
 	}
+	return imported, nil
+}
+
+func (im *GitLabImporter) effectiveProjects() []string {
+	projects := []string{im.cfg.HomeProject}
+	if len(im.cfg.Projects) == 0 {
+		return projects
+	}
+	for _, project := range im.cfg.Projects {
+		if store.SameRepo(project, im.cfg.HomeProject) {
+			continue
+		}
+		projects = append(projects, project)
+	}
+	return projects
+}
+
+func (im *GitLabImporter) importIssues(ctx context.Context, project string, issues []clients.IssueListItem) int {
 	imported := 0
 	for _, issue := range issues {
 		item := issueToBacklog(issue, im.cfg.DefaultPriority)
+		if !store.SameRepo(project, im.cfg.HomeProject) {
+			item.TargetProject = project
+		}
 		// Skip closed/locked issues defensively; GitLab's labels filter
 		// can leak issues whose state changed mid-query window.
 		if issue.State != "" && issue.State != "opened" {
@@ -179,10 +214,10 @@ func (im *GitLabImporter) Tick(ctx context.Context) (int, error) {
 		}
 		imported++
 		im.logger.Info("gitlab importer created backlog item",
-			"id", item.ID, "iid", issue.IID, "title", issue.Title,
+			"id", item.ID, "iid", issue.IID, "project", project, "title", issue.Title,
 			"priority", item.Priority)
 	}
-	return imported, nil
+	return imported
 }
 
 // ActiveOperations reports importer passes currently executing.

@@ -103,20 +103,20 @@ func TestLearningSignalExporterPublishesGauges(t *testing.T) {
 	}
 
 	gaugeValue(t, `mean_score{gate="code_review",outcome="merged"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeMerged)), 0.92)
+		testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeMerged, "primary")), 0.92)
 	gaugeValue(t, `mean_score{gate="code_review",outcome="escalated"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeEscalated)), 0.35)
+		testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeEscalated, "primary")), 0.35)
 	gaugeValue(t, `discrimination{gate="code_review"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("code_review")), 0.57)
+		testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("code_review", "primary")), 0.57)
 	gaugeValue(t, `graded_runs{gate="code_review"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationGradedRuns.WithLabelValues("code_review")), 4)
+		testutil.ToFloat64(mills.JudgeCalibrationGradedRuns.WithLabelValues("code_review", "primary")), 4)
 
 	// The converged judge: same mean on both sides, so the alert's headline
 	// series reads exactly zero rather than "no data".
 	gaugeValue(t, `discrimination{gate="docs_guard"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("docs_guard")), 0)
+		testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("docs_guard", "primary")), 0)
 	gaugeValue(t, `graded_runs{gate="docs_guard"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationGradedRuns.WithLabelValues("docs_guard")), 2)
+		testutil.ToFloat64(mills.JudgeCalibrationGradedRuns.WithLabelValues("docs_guard", "primary")), 2)
 
 	gaugeValue(t, `promotion_evidence_actions{actor="overseer.groomer"}`,
 		testutil.ToFloat64(mills.PromotionEvidenceActions.WithLabelValues("overseer.groomer")), 3)
@@ -154,16 +154,16 @@ func TestLearningSignalExporterOneSidedGateReportsNaN(t *testing.T) {
 	}
 
 	gaugeValue(t, `mean_score{outcome="merged"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeMerged)), 0.90)
-	escalated := testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeEscalated))
+		testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeMerged, "primary")), 0.90)
+	escalated := testutil.ToFloat64(mills.JudgeCalibrationMeanScore.WithLabelValues("code_review", JudgeOutcomeEscalated, "primary"))
 	if !math.IsNaN(escalated) {
 		t.Errorf(`mean_score{outcome="escalated"} = %v, want NaN (no escalated verdicts)`, escalated)
 	}
-	discrimination := testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("code_review"))
+	discrimination := testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("code_review", "primary"))
 	if !math.IsNaN(discrimination) {
 		t.Errorf("discrimination = %v, want NaN (one-sided window)", discrimination)
 	}
-	gaugeValue(t, "graded_runs", testutil.ToFloat64(mills.JudgeCalibrationGradedRuns.WithLabelValues("code_review")), 1)
+	gaugeValue(t, "graded_runs", testutil.ToFloat64(mills.JudgeCalibrationGradedRuns.WithLabelValues("code_review", "primary")), 1)
 }
 
 // TestLearningSignalExporterEmptyWindowClearsGauges: a window that recorded
@@ -239,7 +239,7 @@ func TestLearningSignalExporterFailureLeavesGaugesIntact(t *testing.T) {
 	}
 
 	gaugeValue(t, `discrimination{gate="code_review"}`,
-		testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("code_review")), 0.57)
+		testutil.ToFloat64(mills.JudgeCalibrationDiscrimination.WithLabelValues("code_review", "primary")), 0.57)
 	gaugeValue(t, "config_outcome_runs", testutil.ToFloat64(mills.ConfigOutcomeRuns), 4)
 	gaugeValue(t, "regressions_window_total", testutil.ToFloat64(mills.RegressionsWindowTotal), 1)
 }

@@ -1,0 +1,17 @@
+-- Retire the atomic multi-repo merge substrate (Mills v2 slices 4.2-4.5).
+--
+-- cross_repo_runs was created by migration 002 to coordinate one backlog item
+-- across several repos under all-or-revert semantics. That capability was never
+-- finished: no production code path ever called CrossRepoDAO.PutRun, so the
+-- table has never held a row outside tests. The REST (4.4), CLI (4.5), and HUD
+-- surfaces that read it were therefore permanently empty.
+--
+-- The cross-repo EXECUTION goal shipped by a different route and stays: a
+-- per-item BacklogItem.TargetProject threads through the ordinary single-repo
+-- pipeline, gated by CrossRepoPolicy. Nothing in that live path touches this
+-- table. cross_repo_stamps (migration 021) is a separate concern and is NOT
+-- dropped here.
+--
+-- Dropping the table also drops idx_cross_repo_state and idx_cross_repo_backlog
+-- (migration 002) plus idx_cross_repo_quiescence_active (migration 012).
+DROP TABLE IF EXISTS cross_repo_runs;

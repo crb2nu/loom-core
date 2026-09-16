@@ -1,0 +1,1 @@
+- Prevent duplicate GitLab CI load by adopting exact-head pipelines before merge-queue, `ci_watch`, or mrwatch shepherd recovery mints; add attribution metrics and incident guidance.

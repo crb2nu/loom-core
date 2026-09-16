@@ -521,3 +521,80 @@ func TestAgentRouting_ValidatesWhileDisabled(t *testing.T) {
 		t.Fatal("expected disabled-but-invalid routing table to fail validation")
 	}
 }
+
+func TestResolveAgentRoute_BaselineModelGuard(t *testing.T) {
+	for _, tc := range []struct{ agent, model, reason string }{
+		{"", "gpt-6-astra", "stage_agent_not_explicit"},
+		{"", "claude-opus-5", "stage_agent_not_explicit"},
+		{"", "custom-model", "stage_agent_not_explicit"},
+		{"codex", "gpt-6-astra", ""},
+		{"codex", "o3", ""},
+		{"claude-code", "o3", "stage_model_vendor_mismatch"},
+		{"codex", "claude-opus-5", "stage_model_vendor_mismatch"},
+		{"gemini", "gpt-6-astra", "stage_model_vendor_mismatch"},
+		{"claude-code", "gemini-pro", "stage_model_vendor_mismatch"},
+		{"gemini", "gemini-pro", ""},
+		{"claude-code", "claude-opus-5", ""},
+		{"codex", "custom-model", ""},
+		{"", "", ""},
+	} {
+		t.Run(tc.agent+"/"+tc.model, func(t *testing.T) {
+			p := Default()
+			p.Pipeline.StageAgents = map[string]string{"pr_self_review": tc.agent}
+			p.Pipeline.StageModels = map[string]string{"pr_self_review": tc.model}
+			for _, item := range []*store.BacklogItem{nil, itemWith(nil, store.P2, "testdata/mills-canary/heartbeat.md")} {
+				d := p.ResolveAgentRoute("pr_self_review", item)
+				wantAgent := tc.agent
+				if wantAgent == "" {
+					wantAgent = AgentDefault
+				}
+				wantModel, dropped := tc.model, ""
+				if tc.reason != "" {
+					wantModel, dropped = "", tc.model
+				}
+				if d.Agent != wantAgent || d.Model != wantModel || d.DroppedModel != dropped || d.DropReason != tc.reason {
+					t.Fatalf("decision = %+v; want agent=%q model=%q dropped=%q reason=%q", d, wantAgent, wantModel, dropped, tc.reason)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveAgentRoute_GuardedPinRouting(t *testing.T) {
+	p := parseRoutingFixture(t)
+	p.Pipeline.StageAgents = map[string]string{"implement": "claude-code"}
+	p.Pipeline.StageModels = map[string]string{"implement": "gpt-6-astra"}
+	for _, tc := range []struct {
+		item  *store.BacklogItem
+		model string
+	}{
+		{itemWith(nil, store.P2, "pkg/x.go"), "gpt-5.6-sol"},
+		{itemWith([]string{"agent/codex"}, store.P2, "pkg/x.go"), ""},
+	} {
+		d := p.ResolveAgentRoute("implement", tc.item)
+		if d.Agent != "codex" || d.Model != tc.model || d.DroppedModel != "gpt-6-astra" {
+			t.Fatalf("decision = %+v", d)
+		}
+	}
+	p.Pipeline.StageModels["implement"] = "claude-opus-5"
+	d := p.ResolveAgentRoute("implement", itemWith(nil, store.P0, "docs/x.md"))
+	if d.Model != "" || d.DroppedModel != "claude-opus-5" || d.DropReason != "route_agent_changed" {
+		t.Fatalf("retarget = %+v", d)
+	}
+}
+
+// Replay the canary's unmatched testdata path before and after the gitops pairing.
+func TestResolveAgentRoute_CanaryReplay(t *testing.T) {
+	p := parseRoutingFixture(t)
+	p.Pipeline.StageModels = map[string]string{"pr_self_review": "gpt-6-astra"}
+	item := itemWith(nil, store.P2, "testdata/mills-canary/heartbeat.md")
+	before := p.ResolveAgentRoute("pr_self_review", item)
+	if before.Agent != "claude-code" || before.Model != "" || before.DropReason != "stage_agent_not_explicit" {
+		t.Fatalf("before pairing = %+v", before)
+	}
+	p.Pipeline.StageAgents = map[string]string{"pr_self_review": "codex"}
+	after := p.ResolveAgentRoute("pr_self_review", item)
+	if after.Agent != "codex" || after.Model != "gpt-6-astra" || after.DroppedModel != "" {
+		t.Fatalf("after pairing = %+v", after)
+	}
+}

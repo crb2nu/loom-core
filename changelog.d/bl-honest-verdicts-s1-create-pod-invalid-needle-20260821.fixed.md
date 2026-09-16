@@ -1,0 +1,1 @@
+- Classify synchronous Kubernetes pod validation rejections as terminal configuration errors in `pkg/mills/pipeline/error_class.go`, and stamp a synthetic verdict-keyed failure signature (`sigfp.SyntheticFingerprint`) when escalation evidence falls below the miner's shape floor, so classified escalations never land with an empty signature.

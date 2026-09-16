@@ -41,6 +41,8 @@
 #   FLAKE_RERUN_ATTEMPTS      --rerun-fails value (default 2)
 #   FLAKE_RERUN_MAX_FAILURES  --rerun-fails-max-failures value (default 5)
 #   FLAKE_RERUN_REPORT        rerun report path (default rerun-report.txt)
+#   UNIT_TEST_TIMEOUT         per-package `go test -timeout` (default 30m; see
+#                             the note above the gotestsum invocation)
 #
 # Exit code is gotestsum's verdict: 0 when everything passed (including
 # flake-then-pass), non-zero when any test failed every attempt or the failure
@@ -52,6 +54,7 @@ GOTESTSUM_VERSION="${GOTESTSUM_VERSION:-v1.13.0}"
 RERUN_ATTEMPTS="${FLAKE_RERUN_ATTEMPTS:-2}"
 RERUN_MAX_FAILURES="${FLAKE_RERUN_MAX_FAILURES:-5}"
 RERUN_REPORT="${FLAKE_RERUN_REPORT:-rerun-report.txt}"
+UNIT_TEST_TIMEOUT="${UNIT_TEST_TIMEOUT:-30m}"
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -99,7 +102,7 @@ fi
 # --- test run ----------------------------------------------------------------
 
 echo ""
-echo "Running unit tests (reruns: ${RERUN_ATTEMPTS}, abort above ${RERUN_MAX_FAILURES} failures)..."
+echo "Running unit tests (reruns: ${RERUN_ATTEMPTS}, abort above ${RERUN_MAX_FAILURES} failures, per-package timeout ${UNIT_TEST_TIMEOUT})..."
 
 # `--packages` is REQUIRED, not decorative: gotestsum refuses to combine
 # --rerun-fails with explicit `go test` args unless the package list arrives
@@ -107,6 +110,21 @@ echo "Running unit tests (reruns: ${RERUN_ATTEMPTS}, abort above ${RERUN_MAX_FAI
 # packages to test must be specified by the --packages flag"). Passing the list
 # here (and NOT as positional args) also keeps reruns scoped to the failing
 # package instead of re-walking the whole tree.
+#
+# `-timeout` is per TEST BINARY (one per package), and Go's 10m default assumes
+# a quiet machine. On a shared runner node whose disk is saturated by
+# neighbouring jobs, the SQLite-fixture packages (pkg/mills, pkg/mills/store,
+# pkg/mills/pipeline, cmd/loom-mills-operator) run 15–30× slower than normal:
+# on 2026-09-15 four test:unit jobs on one overflow node hit `panic: test
+# timed out after 10m0s` in exactly those packages, every in-flight test
+# parked in fsync(2), with the package 38–64 % done. A timeout PANIC is worse
+# than a slow package: gotestsum treats it as a suspected panic and aborts
+# every rerun ("rerun aborted because previous run had a suspected panic"),
+# so a genuine one-off flake elsewhere in the suite becomes a hard red. 30m
+# turns starvation back into a slow green while staying inside the job's 1h
+# ceiling (a quiet run finishes the whole suite in 5–7 minutes). Test stores
+# also skip fsync under `go test` (pkg/mills/store buildDSNFor), so this is
+# the backstop, not the fix. See docs/FLAKE_QUARANTINE.md.
 set +e
 "$gobin/gotestsum" \
   --format testname \
@@ -115,7 +133,7 @@ set +e
   --rerun-fails-report="$RERUN_REPORT" \
   --junitfile="$JUNIT_FILE" \
   --packages="${PKGS[*]}" \
-  -- -cover -covermode=count -args -test.gocoverdir="$COVER_DIR"
+  -- -cover -covermode=count -timeout "$UNIT_TEST_TIMEOUT" -args -test.gocoverdir="$COVER_DIR"
 test_exit=$?
 set -e
 

@@ -1,0 +1,1 @@
+- Add per-bolt operator deployment confirmation to the Mills shift ledger, with finishing summaries, rollout gauges, tests, and operator documentation.

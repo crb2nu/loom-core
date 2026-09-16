@@ -54,7 +54,7 @@ func (execCommandRunner) Run(ctx context.Context, dir, name string, args ...stri
 // git. It's the production implementation of the integrator's branch-
 // combination step: each parallel slice produced its own branch in its
 // own worktree; we fast-forward-or-merge them onto a fresh integration
-// branch off main, detecting conflicts via `git status --porcelain`.
+// branch off the requested base, detecting conflicts via `git status --porcelain`.
 //
 // Conflict policy: any unresolved hunk in the working tree after the
 // final merge is a conflict, regardless of whether earlier branches

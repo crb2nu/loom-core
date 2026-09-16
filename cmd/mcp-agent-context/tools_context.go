@@ -106,13 +106,22 @@ func registerContextTools(server *mcp.Server, svc *agentcontext.Service, tracer 
 
 	server.AddTool(mcp.Tool{
 		Name:        "agent_context_search",
-		Description: "Semantic search across agent context entries. Returns entries most similar to the query.",
+		Description: "Semantic search across agent context entries. Returns entries most similar to the query. With sort=recent it instead lists entries newest-first (optionally only those since an RFC3339 timestamp) and the query is ignored.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Search query text.",
+					"description": "Search query text. Ignored when sort=recent.",
+				},
+				"sort": map[string]any{
+					"type":        "string",
+					"enum":        []string{"relevance", "recent"},
+					"description": "relevance (default): rank by similarity to query. recent: newest entries first, no ranking.",
+				},
+				"since": map[string]any{
+					"type":        "string",
+					"description": "RFC3339 lower bound on entry timestamp; used with sort=recent.",
 				},
 				"agent_id": map[string]any{
 					"type":        "string",

@@ -58,6 +58,9 @@ func (f *fakeSliceMRStore) ListSlices(_ context.Context, planID string) ([]clien
 	}
 	return out, nil
 }
+func (f *fakeSliceMRStore) ListSlicesIfChanged(ctx context.Context, plan clients.PlanSummary) ([]clients.PlanSliceSummary, error) {
+	return f.ListSlices(ctx, plan.ID)
+}
 
 func (f *fakeSliceMRStore) GetSlice(_ context.Context, sliceID string) (clients.PlanSliceSummary, error) {
 	f.detailFetch = append(f.detailFetch, sliceID)

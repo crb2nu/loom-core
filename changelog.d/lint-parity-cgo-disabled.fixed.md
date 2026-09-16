@@ -1,0 +1,1 @@
+- Mills lint:parity command carries CGO_ENABLED=0 itself, so cgo-bearing dependencies (fi-accel) no longer fail typecheck on sandbox images without C headers; the devbox matcher tolerates env-prefix skew.

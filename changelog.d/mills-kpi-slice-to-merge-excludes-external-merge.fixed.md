@@ -1,0 +1,1 @@
+- `slice_to_merge_p50_seconds` excludes external merge-queue candidate runs (template `external_merge`), whose `done` compatibility rows span only the queue wait. With the queue live they outnumbered real slices and dragged the median to 0.02s.

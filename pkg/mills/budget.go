@@ -20,8 +20,15 @@ const (
 // each provide the concrete methods; pkg/mills.NewStoreBudgetReader wires
 // them up.
 type BudgetReader interface {
+	// CouncilCostSince and PipelineCostSince return every attributed dollar
+	// in the window regardless of who pays. The two *SubscriptionCostSince /
+	// *LocalCostSince readers below return the slices that bill nothing per
+	// token (see store.BillingClass); the metered spend the daily USD caps
+	// govern is the difference.
 	CouncilCostSince(ctx context.Context, since time.Time) (float64, error)
+	CouncilLocalCostSince(ctx context.Context, since time.Time) (float64, error)
 	PipelineCostSince(ctx context.Context, since time.Time) (float64, error)
+	PipelineSubscriptionCostSince(ctx context.Context, since time.Time) (float64, error)
 	CouncilRunsSince(ctx context.Context, since time.Time) (int, error)
 	// PipelineRunsSince returns the count of pipeline runs in the window that
 	// count toward MaxRunsPerDay. The store adapter maps this to
@@ -68,11 +75,51 @@ type Decision struct {
 	// Reasons explains every cap that contributed to the verdict. For an
 	// allowed decision Reasons is empty unless a soft warning was attached.
 	Reasons []string
-	// SpentUSD is what the canonical store reported for the rolling day.
+	// SpentUSD is the tier's METERED spend for the rolling day: what an API
+	// account is actually billed. Subscription turns and local inference are
+	// excluded (store.BillingClass); SubscriptionSpentUSD carries the former.
 	SpentUSD float64
-	// RemainingUSD is the day-cap minus spent, floored at zero. Zero when
-	// no day cap is configured.
+	// SubscriptionSpentUSD is the list-price equivalent of subscription turns
+	// (Claude Code / Codex under the cluster OAuth accounts) in the window.
+	SubscriptionSpentUSD float64
+	// RemainingUSD is the day-cap minus metered spent, floored at zero. Zero
+	// when no day cap is configured.
 	RemainingUSD float64
+}
+
+// ThroughputSignals is the current KPI view. Presence flags distinguish a
+// real zero from a snapshot that did not report the metric.
+type ThroughputSignals struct {
+	EscalationRate, CostPerMergedPipelineUSD, ScopeMaxQueueAgeSeconds                            float64
+	StarvedQueues                                                                                int
+	HasEscalationRate, HasCostPerMergedPipelineUSD, HasScopeMaxQueueAgeSeconds, HasStarvedQueues bool
+}
+
+type ThroughputGuardrailVerdict struct {
+	Breached bool     `json:"breached"`
+	Reasons  []string `json:"reasons"`
+}
+
+// EvaluateThroughputGuardrail deterministically evaluates every present
+// signal. Equality is healthy; a breach requires a value strictly above its
+// effective threshold.
+func EvaluateThroughputGuardrail(signals ThroughputSignals, configured ThroughputGuardrailThresholds) ThroughputGuardrailVerdict {
+	t := configured.Effective()
+	v := ThroughputGuardrailVerdict{Reasons: []string{}}
+	if signals.HasEscalationRate && signals.EscalationRate > t.MaxEscalationRate {
+		v.Reasons = append(v.Reasons, fmt.Sprintf("escalation_rate %.4f exceeds %.4f", signals.EscalationRate, t.MaxEscalationRate))
+	}
+	if signals.HasCostPerMergedPipelineUSD && signals.CostPerMergedPipelineUSD > t.MaxCostPerMergedPipelineUSD {
+		v.Reasons = append(v.Reasons, fmt.Sprintf("cost_per_merged_pipeline_usd %.2f exceeds %.2f", signals.CostPerMergedPipelineUSD, t.MaxCostPerMergedPipelineUSD))
+	}
+	if signals.HasScopeMaxQueueAgeSeconds && signals.ScopeMaxQueueAgeSeconds > t.MaxScopeQueueAgeSeconds {
+		v.Reasons = append(v.Reasons, fmt.Sprintf("scope_max_queue_age_seconds %.0f exceeds %.0f", signals.ScopeMaxQueueAgeSeconds, t.MaxScopeQueueAgeSeconds))
+	}
+	if signals.HasStarvedQueues && signals.StarvedQueues > t.MaxStarvedQueues {
+		v.Reasons = append(v.Reasons, fmt.Sprintf("scope_starvation_reservations %d exceeds %d", signals.StarvedQueues, t.MaxStarvedQueues))
+	}
+	v.Breached = len(v.Reasons) > 0
+	return v
 }
 
 // NewBudget builds a Budget from a PolicyManager and a BudgetReader.
@@ -132,6 +179,24 @@ func (b *Budget) Allow(ctx context.Context, tier Tier, estimateUSD float64) (Dec
 		}
 	}
 
+	// (b2) per-day subscription-equivalent cap. Subscription turns (Claude
+	// Code and Codex under the cluster OAuth accounts) bill nothing per
+	// token, so they are excluded from the metered cap above; this optional
+	// cap bounds their list-price equivalent separately so a runaway harness
+	// still stops before the vendor's own rate limits do. Zero = uncapped.
+	subscription, err := b.subscriptionSpentSince(ctx, tier, since)
+	if err != nil {
+		return Decision{}, err
+	}
+	d.SubscriptionSpentUSD = subscription
+	if limits.MaxSubscriptionUSDPerDay > 0 && subscription+estimateUSD > limits.MaxSubscriptionUSDPerDay {
+		d.Allowed = false
+		d.Reasons = append(d.Reasons, fmt.Sprintf(
+			"%s daily subscription cap %.2f reached: spent %.2f + estimate %.2f",
+			tier, limits.MaxSubscriptionUSDPerDay, subscription, estimateUSD,
+		))
+	}
+
 	// (c) per-day run-count cap (only meaningful for the pipeline tier today,
 	//     but applied consistently for both via the same policy field).
 	if limits.MaxRunsPerDay > 0 {
@@ -183,10 +248,20 @@ func (b *Budget) DebateSpentSince(ctx context.Context) (float64, error) {
 // gauge can render spent-against-cap without a second policy fetch;
 // zero caps mean "not configured" (an uncapped tank, not an empty one).
 type WindowUsage struct {
+	// SpentUSD is the METERED spend: what an API account is billed. It
+	// excludes subscription turns (Claude Code / Codex under the cluster
+	// OAuth accounts) and local inference; CapUSD is the cap on it.
 	SpentUSD float64 `json:"spent_usd"`
 	CapUSD   float64 `json:"cap_usd"`
 	Runs     int     `json:"runs"`
 	RunsCap  int     `json:"runs_cap"`
+	// TotalSpentUSD is every attributed dollar in the window regardless of
+	// who pays — the pre-attribution meaning of spent_usd.
+	TotalSpentUSD float64 `json:"total_spent_usd"`
+	// SubscriptionSpentUSD is the list-price equivalent of subscription turns
+	// in the window; SubscriptionCapUSD its optional policy cap (0 = none).
+	SubscriptionSpentUSD float64 `json:"subscription_spent_usd"`
+	SubscriptionCapUSD   float64 `json:"subscription_cap_usd"`
 }
 
 // WindowUsage reports the tier's rolling-24h spend and run count against
@@ -205,15 +280,26 @@ func (b *Budget) WindowUsage(ctx context.Context, tier Tier) (WindowUsage, error
 	if err != nil {
 		return WindowUsage{}, err
 	}
+	total, err := b.totalSpentSince(ctx, tier, since)
+	if err != nil {
+		return WindowUsage{}, err
+	}
+	subscription, err := b.subscriptionSpentSince(ctx, tier, since)
+	if err != nil {
+		return WindowUsage{}, err
+	}
 	runs, err := b.runsSince(ctx, tier, since)
 	if err != nil {
 		return WindowUsage{}, err
 	}
 	return WindowUsage{
-		SpentUSD: spent,
-		CapUSD:   limits.MaxUSDPerDay,
-		Runs:     runs,
-		RunsCap:  limits.MaxRunsPerDay,
+		SpentUSD:             spent,
+		CapUSD:               limits.MaxUSDPerDay,
+		Runs:                 runs,
+		RunsCap:              limits.MaxRunsPerDay,
+		TotalSpentUSD:        total,
+		SubscriptionSpentUSD: subscription,
+		SubscriptionCapUSD:   limits.MaxSubscriptionUSDPerDay,
 	}, nil
 }
 
@@ -244,12 +330,48 @@ func (b *Budget) now() time.Time {
 	return time.Now()
 }
 
+// spentSince returns the tier's METERED spend in the window — what an API
+// account is actually billed. Subscription turns and local inference are
+// subtracted (store.BillingClass); see subscriptionSpentSince for the former.
 func (b *Budget) spentSince(ctx context.Context, tier Tier, since time.Time) (float64, error) {
+	total, err := b.totalSpentSince(ctx, tier, since)
+	if err != nil {
+		return 0, err
+	}
+	var unmetered float64
+	switch tier {
+	case TierCouncil:
+		unmetered, err = b.Reader.CouncilLocalCostSince(ctx, since)
+	case TierPipeline:
+		unmetered, err = b.Reader.PipelineSubscriptionCostSince(ctx, since)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return max0(total - unmetered), nil
+}
+
+// totalSpentSince returns every attributed dollar in the window regardless of
+// who pays — the pre-attribution meaning of "spent".
+func (b *Budget) totalSpentSince(ctx context.Context, tier Tier, since time.Time) (float64, error) {
 	switch tier {
 	case TierCouncil:
 		return b.Reader.CouncilCostSince(ctx, since)
 	case TierPipeline:
 		return b.Reader.PipelineCostSince(ctx, since)
+	}
+	return 0, fmt.Errorf("budget: unknown tier %q", tier)
+}
+
+// subscriptionSpentSince returns the tier's subscription-billed spend (list
+// price equivalent) in the window. Only the pipeline tier has any today: the
+// council runs on metered API keys and local flexinfer.
+func (b *Budget) subscriptionSpentSince(ctx context.Context, tier Tier, since time.Time) (float64, error) {
+	switch tier {
+	case TierCouncil:
+		return 0, nil
+	case TierPipeline:
+		return b.Reader.PipelineSubscriptionCostSince(ctx, since)
 	}
 	return 0, fmt.Errorf("budget: unknown tier %q", tier)
 }

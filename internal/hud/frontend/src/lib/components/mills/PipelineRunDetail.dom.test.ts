@@ -390,3 +390,126 @@ describe('PipelineRunDetail — run verdict chip', () => {
     expect(chip(target)).toBeNull();
   });
 });
+
+describe('PipelineRunDetail — resume affordance', () => {
+  // Pause was one-way in the HUD: the drawer could stop a run but a paused
+  // run showed no way back (un-parking took an admin curl against
+  // POST /pipeline/runs/{id}/resume). Resume is offered on paused runs ONLY —
+  // in-flight runs get Stop, escalated runs get Requeue, and the three must
+  // never appear together.
+  const label = (target: HTMLElement, text: string): HTMLButtonElement | null =>
+    [...target.querySelectorAll<HTMLButtonElement>('button')].find((b) =>
+      (b.textContent ?? '').includes(text),
+    ) ?? null;
+
+  it('offers Resume on a paused run — and not Stop', () => {
+    const target = openLoaded('paused');
+    expect(label(target, 'Resume')).not.toBeNull();
+    expect(label(target, 'Stop')).toBeNull();
+  });
+
+  it('offers Stop but not Resume while the run is in flight', () => {
+    const target = openLoaded('implementing');
+    expect(label(target, 'Stop')).not.toBeNull();
+    expect(label(target, 'Resume')).toBeNull();
+  });
+
+  it('offers neither on a merged run', () => {
+    const target = openLoaded('merged');
+    expect(label(target, 'Resume')).toBeNull();
+    expect(label(target, 'Stop')).toBeNull();
+  });
+
+  it('confirms, then posts the resume through the store action', async () => {
+    const resume = vi.spyOn(millsStore, 'resumeRun').mockResolvedValue(true);
+    const target = openLoaded('paused');
+    label(target, 'Resume')!.click();
+    flushSync();
+    // The confirm dialog owns the actual mutation.
+    const confirm = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent?.trim() === 'Resume',
+    );
+    expect(confirm).not.toBeUndefined();
+    confirm!.click();
+    flushSync();
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledWith(RUN_ID, 'resumed from HUD');
+  });
+});
+
+describe('PipelineRunDetail — retry attempt ledger', () => {
+  function show(classes: (string | null)[], counts: (number | undefined)[], total?: number, latestOutcome: 'success' | 'error' | null = 'error'): HTMLElement {
+    const detail = detailFor();
+    detail.run.Attempts = classes.length;
+    detail.run.EffectiveAttempts = total;
+    detail.stages = classes.map((cls, i) => ({
+      ID: i + 1, PipelineRunID: RUN_ID, Stage: 'tests', Attempt: i + 1,
+      StartedAt: '2026-09-13T23:47:00Z', CostUSD: 0, Outcome: i === classes.length - 1 ? latestOutcome : 'error',
+      LogTail: `${cls === 'transient' ? 'mcphub: recv devbox/devbox_quality_gate: read message: read tcp' : i === 0 ? 'corrupted shared Go module cache' : 'stale .git/index.lock'}\nMore details`,
+      Artifacts: { ...(cls === null ? {} : { retry_class: cls }), ...(counts[i] === undefined ? {} : { effective_attempts: counts[i] }) },
+    }));
+    millsStore.selectedRunID = RUN_ID;
+    millsStore.pipelineDetailByRun = { [RUN_ID]: { status: 'loaded', detail } };
+    return mountDrawer();
+  }
+
+  it('shows three free transport attempts, zero and first-line tooltips', () => {
+    const target = show(['transient', 'transient', 'transient'], [0, 0, 0]);
+    expect(target.textContent).toContain('3 (tests-effective 0)');
+    const chips = target.querySelectorAll<HTMLElement>('.retry-chip');
+    expect(chips).toHaveLength(3);
+    chips.forEach((chip, i) => {
+      expect(chip.textContent).toBe(`try ${i + 1} · transient`);
+      expect(chip.dataset.retryClass).toBe('transient');
+      expect(chip.title).toBe('mcphub: recv devbox/devbox_quality_gate: read message: read tcp');
+    });
+    target.querySelector<HTMLButtonElement>('.stage-head')!.click();
+    flushSync();
+    expect(target.querySelector('.stage-body')?.textContent).toContain('More details');
+  });
+
+  it('shows substrate cache and lock attempts with the latest snapshot', () => {
+    const target = show(['substrate', 'substrate'], [2, 1]);
+    expect(target.textContent).toContain('2 (tests-effective 1)');
+    const chips = target.querySelectorAll<HTMLElement>('[data-retry-class="substrate"]');
+    expect(chips).toHaveLength(2);
+    expect(chips[0].title).toBe('corrupted shared Go module cache');
+    expect(chips[1].title).toBe('stale .git/index.lock');
+  });
+
+  it('renders real and exhausted chips and prefers an explicit run counter including zero', () => {
+    const target = show(['real', 'exhausted'], [1, 3], 0);
+    expect(target.textContent).toContain('2 (effective 0)');
+    expect(target.querySelector('[data-retry-class="real"]')?.textContent).toBe('try 1 · real');
+    expect(target.querySelector('[data-retry-class="exhausted"]')?.textContent).toBe('try 2 · exhausted');
+  });
+
+  it('leaves legacy and unknown metadata unclassified', () => {
+    const target = show([null, 'future'], [undefined, 0]);
+    expect(target.querySelector('.retry-chip')).toBeNull();
+    expect(target.textContent).not.toContain('effective');
+    expect(target.querySelector('.stage-attempt')?.textContent).toBe('try 1');
+  });
+
+  it('does not substitute an older count when the latest classification lacks one', () => {
+    const target = show(['substrate', 'real'], [1, undefined]);
+    expect(target.textContent).not.toContain('effective');
+  });
+
+  it.each([null, 'future'])('does not reuse a stale count after a newer %s classification', (classification) => {
+    const target = show(['substrate', classification], [2, 0]);
+    expect(target.textContent).not.toContain('effective');
+    expect(target.querySelectorAll('.retry-chip')).toHaveLength(1);
+  });
+
+  it('keeps the explicit run counter when a newer failure is unclassified', () => {
+    const target = show(['substrate', null], [2, undefined], 0);
+    expect(target.textContent).toContain('2 (effective 0)');
+  });
+
+  it.each(['success', null] as const)('retains the last retry snapshot during a newer %s attempt', (outcome) => {
+    const target = show(['substrate', null], [2, undefined], undefined, outcome);
+    expect(target.textContent).toContain('2 (tests-effective 2)');
+  });
+
+});

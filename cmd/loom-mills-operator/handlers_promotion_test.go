@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,18 @@ func seedPromotionEvents(t *testing.T, op *operator) {
 
 func getPromotionReport(t *testing.T, op *operator, query string) (*httptest.ResponseRecorder, guard.PromotionReport) {
 	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/?"+strings.TrimPrefix(query, "?"), nil)
+	actor := req.URL.Query().Get("actor")
+	if actor == "" {
+		actor = promotionReportDefaultActor
+	}
+	window := promotionReportDefaultWindow
+	if raw := req.URL.Query().Get("window"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			window = d
+		}
+	}
+	materializeTestReport(t, op, "promotion", window, actor)
 	rec := httptest.NewRecorder()
 	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/promotion-report"+query, nil))
 	var report guard.PromotionReport

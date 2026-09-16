@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/crb2nu/loom/pkg/mcperror"
@@ -74,7 +75,10 @@ func ClassifyFailure(err error) FailureClass {
 	if classification, ok := ClassifyCIFailureSignature(err.Error()); ok {
 		return classification.Class
 	}
-	if _, _, ok := classifyObservedExternalIncident(err.Error()); ok {
+	if signature, ok := ClassifyPersistedFailureSignature(err.Error()); ok && !signature.Retryable {
+		return FailureConfiguration
+	}
+	if _, _, ok := classifyLegacyObservedExternalIncident(err.Error()); ok {
 		return FailureConfiguration
 	}
 	if incident, ok := mcperror.ClassifyExternalCIIncident(err.Error()); ok {
@@ -99,7 +103,7 @@ func FailureClassFromErrorClass(c ErrorClass) FailureClass {
 		return FailureTransient
 	case ClassTransientQuota:
 		return FailureTransientQuota
-	case ClassInfra:
+	case ClassInfra, ClassSubstrate:
 		return FailureInfrastructure
 	case ClassConfig:
 		return FailureConfiguration
@@ -152,7 +156,49 @@ func ClassifyFailureRecord(err error) FailureClassification {
 	if err == nil {
 		return classification
 	}
-	if id, dependency, ok := classifyObservedExternalIncident(err.Error()); ok {
+	if errors.Is(err, ErrDevboxBaselineAlsoFails) {
+		classification.Class = FailureInfrastructure
+		classification.Retryable = true
+		classification.FreeRetry = true
+		classification.Terminal = false
+		classification.ExternalDependencyID = "devbox_baseline"
+		classification.ExternalDependency = "devbox_baseline"
+		return classification
+	}
+	if isDevboxQuotaRefusal(err) {
+		// The devbox ResourceQuota refused the sandbox pod: budgeted infra
+		// attributed to the quota (see escalationMetadataFromEvidence).
+		classification.Class = FailureInfrastructure
+		classification.Retryable = true
+		classification.FreeRetry = false
+		classification.Terminal = false
+		classification.ExternalDependencyID = DevboxQuotaDependency
+		classification.ExternalDependency = DevboxQuotaDependency
+		return classification
+	}
+	var terminalCI *CIPipelineTerminalError
+	if errors.As(err, &terminalCI) && terminalCI.allRunnerLevelFailures() {
+		// This is an infrastructure incident, but unlike general infrastructure
+		// failures it is safe to retry without charging the code-attempt budget.
+		classification.Class = FailureInfrastructure
+		classification.Retryable = true
+		classification.FreeRetry = true
+		classification.Terminal = false
+		classification.ExternalDependencyID = "external_dependency.gitlab.ci_infrastructure"
+		classification.ExternalDependency = "gitlab_ci"
+		return classification
+	}
+	if promoted, ok := ClassifyCIFailureSignature(err.Error()); ok {
+		return promoted
+	}
+	if signature, ok := ClassifyPersistedFailureSignature(err.Error()); ok {
+		classification.ExternalDependencyID = signature.ID
+		classification.ExternalDependency = signature.Dependency
+		classification.Retryable = signature.Retryable
+		classification.Terminal = !signature.Retryable
+		return classification
+	}
+	if id, dependency, ok := classifyLegacyObservedExternalIncident(err.Error()); ok {
 		classification.ExternalDependencyID = id
 		classification.ExternalDependency = dependency
 		return classification
@@ -180,15 +226,26 @@ func classifyObservedExternalIncident(text string) (id, dependency string, ok bo
 			strings.Contains(lower, "merge task failure") ||
 			strings.Contains(lower, "failed to execute merge task")):
 		return "external_dependency.clickhouse.merge_task", "clickhouse", true
-	case strings.Contains(lower, "longhorn") &&
-		(strings.Contains(lower, "no available disk") ||
-			strings.Contains(lower, "no available disks")):
-		return "external_dependency.longhorn.no_available_disk", "longhorn", true
 	case strings.Contains(lower, "litellm") &&
 		(strings.Contains(lower, "missing api key") ||
 			strings.Contains(lower, "api key is missing") ||
 			strings.Contains(lower, "no api key")):
 		return "external_dependency.litellm.missing_api_key", "litellm", true
+	default:
+		return classifyLegacyObservedExternalIncident(text)
+	}
+}
+
+// classifyLegacyObservedExternalIncident retains non-promoted observed
+// signatures. Promoted signatures are intentionally excluded so runtime
+// classification cannot bypass their stricter provider/status/wording gates.
+func classifyLegacyObservedExternalIncident(text string) (id, dependency string, ok bool) {
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "longhorn") &&
+		(strings.Contains(lower, "no available disk") ||
+			strings.Contains(lower, "no available disks")):
+		return "external_dependency.longhorn.no_available_disk", "longhorn", true
 	default:
 		return "", "", false
 	}

@@ -374,6 +374,20 @@ type ContextConfig struct {
 
 	// CustomProfilePath points to custom profile definitions
 	CustomProfilePath string `yaml:"custom_profile_path,omitempty"`
+
+	// MaxTools caps the daemon's aggregate tool cache under the built-in
+	// "full" profile. 0 (the default) means no cap: every tool every
+	// registered and hub-discovered server exposes is published, and per-client
+	// shaping happens at the proxy boundary (`loom proxy --tool-profile`).
+	//
+	// The upstream profile library ships "full" with a 500-tool ceiling, which
+	// this daemon crossed on 2026-09-12 (589 tools): the last 89 tools in source
+	// order were dropped from the cache before any proxy profile saw them, so
+	// a hint-less or `--tool-profile full` client lost whole servers and the
+	// llm-core priority list could not match tools it never received. A custom
+	// profile file (CustomProfilePath) that defines "full" still wins over
+	// this value.
+	MaxTools int `yaml:"max_tools,omitempty"`
 }
 
 // HubConfig configures the MCP hub connection.

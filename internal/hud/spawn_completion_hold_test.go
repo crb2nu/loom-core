@@ -77,6 +77,7 @@ func TestCompletionHoldWrapsSDKDriverCommand(t *testing.T) {
 		"spawn-1",
 		"/workspace/loom-core",
 		"",
+		"",
 		0,
 		0,
 	)

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/crb2nu/loom/pkg/mills"
@@ -320,5 +323,43 @@ func TestSpawnRouteFor_NilStoreAndItemlessBaseline(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Errorf("item-less probe wrote %d event(s); expected none", len(events))
+	}
+}
+
+func TestSpawnRouteFor_DroppedBaselineDiagnostics(t *testing.T) {
+	for _, envModel := range []string{"", "global-model"} {
+		t.Run(envModel, func(t *testing.T) {
+			t.Setenv("LOOM_MILLS_SPAWN_AGENT", "")
+			t.Setenv("LOOM_MILLS_SPAWN_MODEL", envModel)
+			pm := newAgentPolicyManager(t, strings.Replace(policyNoAgentRouting, "implement: codex", "implement: claude-code", 1))
+			st := openTestStore(t)
+			var logs bytes.Buffer
+			route := spawnRouteFor(pm, st, slog.New(slog.NewJSONHandler(&logs, nil)))
+			item := routedItem("BL-DROPPED", nil, "testdata/mills-canary/heartbeat.md")
+			d := route(context.Background(), "implement", item)
+			if d.Agent != "claude-code" || d.Model != envModel || d.DroppedModel != "gpt-5.6-terra" || d.DropReason != "stage_model_vendor_mismatch" {
+				t.Fatalf("decision = %+v", d)
+			}
+			events, err := st.Events.ListBySubject(context.Background(), "backlog_item", item.ID, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != 1 || events[0].Kind != agentRoutedEventKind || events[0].Payload["dropped_model"] != d.DroppedModel || events[0].Payload["drop_reason"] != d.DropReason {
+				t.Fatalf("events = %+v", events)
+			}
+			if strings.Count(logs.String(), "\"level\":\"WARN\"") != 1 {
+				t.Fatalf("logs = %s", logs.String())
+			}
+			route(context.Background(), "implement", nil)
+			if strings.Count(logs.String(), "\"level\":\"WARN\"") != 1 {
+				t.Fatal("itemless probe emitted warning")
+			}
+			snap := buildWiringSnapshot(wiringInputs{policy: pm.Current(), agentFor: agentForStage(pm), modelFor: modelForStage(pm)})
+			for _, stage := range snap.Stages {
+				if stage.Stage == "implement" && (stage.Agent != d.Agent || stage.Model != d.Model) {
+					t.Fatalf("wiring drift: %+v vs %+v", stage, d)
+				}
+			}
+		})
 	}
 }

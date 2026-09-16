@@ -91,16 +91,17 @@ func registerEngramTools(server *mcp.Server, svc *agentcontext.Service, tracer t
 
 	server.AddTool(mcp.Tool{
 		Name: "agent_engram_graph",
-		Description: "Return the prerequisite-graph adjacency list rooted at a URI. " +
-			"direction=down walks prerequisites, direction=up walks dependents.",
+		Description: "Return the prerequisite-graph adjacency list. With root, walk from that URI " +
+			"(direction=down walks prerequisites, direction=up walks dependents). Without root, " +
+			"return the full catalog graph with rich nodes (uri/title/tier/proof_status/prerequisites), " +
+			"bounded and deterministically ordered.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
-				"root":      map[string]any{"type": "string", "description": "Engram URI (engram://family/slug)."},
-				"direction": map[string]any{"type": "string", "enum": []string{"down", "up"}, "description": "Default down (prerequisites)."},
-				"max_depth": map[string]any{"type": "integer", "description": "Default 3."},
+				"root":      map[string]any{"type": "string", "description": "Optional engram URI (engram://family/slug). Omit for the full catalog graph."},
+				"direction": map[string]any{"type": "string", "enum": []string{"down", "up"}, "description": "Default down (prerequisites). Ignored without root."},
+				"max_depth": map[string]any{"type": "integer", "description": "Default 3. Ignored without root."},
 			},
-			Required: []string{"root"},
 		},
 	}, traced(tracer, "agent_engram_graph", func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		return svc.HandleEngramGraph(ctx, args)

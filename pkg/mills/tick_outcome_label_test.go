@@ -29,6 +29,21 @@ func TestTickOutcomeLabel(t *testing.T) {
 			want: "skipped",
 		},
 		{
+			name: "held human when the only unstarted work is human-gated",
+			res:  TickResult{Inspected: 1, HeldHuman: 1},
+			want: "held_human",
+		},
+		{
+			name: "a genuine skip beside a human hold still reads as skipped",
+			res:  TickResult{Inspected: 2, Skipped: 1, HeldHuman: 1},
+			want: "skipped",
+		},
+		{
+			name: "deferred takes precedence over held human",
+			res:  TickResult{Inspected: 2, Deferred: 1, HeldHuman: 1},
+			want: "deferred",
+		},
+		{
 			name: "all zero",
 			res:  TickResult{},
 			want: "no_op",

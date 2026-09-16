@@ -1,0 +1,1 @@
+- Migrate the tavily, qdrant, zep, and github mcpo entries in `k8s/base/servers/mcpo/configmap.yaml` to Streamable HTTP and update the rollout checksum in `k8s/base/servers/mcpo/deployment.yaml`.

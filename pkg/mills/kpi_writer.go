@@ -3,9 +3,11 @@ package mills
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
@@ -33,6 +35,8 @@ type KPIWriter struct {
 	Store  *store.Store
 	Policy *PolicyManager
 	Logger *slog.Logger
+	// HomeProject names empty TargetProject items in per-repo KPI maps.
+	HomeProject string
 
 	// Windows defaults to 1d, 7d, and 30d to match /api/mills/kpis.
 	Windows []time.Duration
@@ -53,6 +57,14 @@ func NewKPIWriter(st *store.Store, pm *PolicyManager) *KPIWriter {
 }
 
 // Record appends one snapshot per configured window.
+//
+// Windows are independent: a failure in one window (typically the 30d scan
+// exhausting the scheduler's KPI budget on a cold cache) is logged and the
+// remaining windows still run, so the 1d snapshot that drives the status
+// endpoint, the HUD, and the circuit breaker lands even when a wider window
+// does not. Errors are joined and returned after every window has been tried;
+// a spent context short-circuits the remaining windows since they cannot
+// succeed either.
 func (w *KPIWriter) Record(ctx context.Context) error {
 	if w == nil || w.Store == nil || w.Store.KPI == nil {
 		return fmt.Errorf("kpi writer: store not configured")
@@ -62,16 +74,23 @@ func (w *KPIWriter) Record(ctx context.Context) error {
 	if len(windows) == 0 {
 		windows = []time.Duration{kpiWindow1d, kpiWindow7d, kpiWindow30d}
 	}
+	var errs []error
 	for _, window := range windows {
 		if window <= 0 {
 			return fmt.Errorf("kpi writer: window must be positive")
 		}
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("kpi window %s: %w", windowLabel(window), err))
+			break
+		}
 		snap, err := w.snapshot(ctx, now, window)
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("kpi window %s: %w", windowLabel(window), err))
+			continue
 		}
 		if err := w.Store.KPI.RecordSnapshot(ctx, snap); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("kpi window %s: %w", windowLabel(window), err))
+			continue
 		}
 		// Mirror the durable merged-run count into the restart-safe
 		// AutonomousMerges gauge (snapshot() already computed it from the
@@ -87,7 +106,7 @@ func (w *KPIWriter) Record(ctx context.Context) error {
 			AutonomousMergesReal.WithLabelValues(windowLabel(window)).Set(float64(real))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // SeedDurableGauges recomputes the AutonomousMerges gauge for every configured
@@ -160,11 +179,19 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 	if err != nil {
 		return nil, err
 	}
-	pipelineRuns, err := w.Store.Pipeline.CountSince(ctx, since)
+	pipelineRuns, err := countPipelineRunsSince(ctx, w.Store, since)
 	if err != nil {
 		return nil, err
 	}
 	pipelineCost, err := w.Store.Pipeline.SumCostSince(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	pipelineSubscriptionCost, err := w.Store.Pipeline.SumSubscriptionCostSince(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	councilLocalCost, err := w.Store.Council.SumLocalCostSince(ctx, since)
 	if err != nil {
 		return nil, err
 	}
@@ -173,6 +200,10 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 		return nil, err
 	}
 	realMergedRuns, err := countRealMergedRunsSince(ctx, w.Store, since)
+	if err != nil {
+		return nil, err
+	}
+	mergedByRepo, err := countMergedRunsByRepoSince(ctx, w.Store, since, w.HomeProject)
 	if err != nil {
 		return nil, err
 	}
@@ -238,18 +269,30 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 	if err != nil {
 		return nil, err
 	}
+	externalMerged, err := countExternalMergeQueueMergedSince(ctx, w.Store, since)
+	if err != nil {
+		return nil, err
+	}
 
 	metrics := map[string]any{
-		"policy_enabled":          w.policyEnabled(),
-		"queue_depth":             queueDepth,
-		"active_pipeline_runs":    active,
-		"council_runs":            councilRuns,
-		"council_cost_usd":        councilCost,
-		"pipeline_runs":           pipelineRuns,
-		"pipeline_cost_usd":       pipelineCost,
-		"pipeline_merged_runs":    mergedRuns,
-		"pipeline_merged_real":    realMergedRuns,
-		"pipeline_escalated_runs": escalatedRuns,
+		"policy_enabled":       w.policyEnabled(),
+		"queue_depth":          queueDepth,
+		"active_pipeline_runs": active,
+		"council_runs":         councilRuns,
+		"council_cost_usd":     councilCost,
+		"pipeline_runs":        pipelineRuns,
+		"pipeline_cost_usd":    pipelineCost,
+		// Cost attribution (store.BillingClass): *_cost_usd above stay the
+		// total list-price equivalent; these split out what actually bills
+		// (api) from subscription harness time and local inference.
+		"pipeline_api_cost_usd":          max0(pipelineCost - pipelineSubscriptionCost),
+		"pipeline_subscription_cost_usd": pipelineSubscriptionCost,
+		"council_api_cost_usd":           max0(councilCost - councilLocalCost),
+		"council_local_cost_usd":         councilLocalCost,
+		"pipeline_merged_runs":           mergedRuns,
+		"pipeline_merged_real":           realMergedRuns,
+		"pipeline_merged_by_repo":        mergedByRepo,
+		"pipeline_escalated_runs":        escalatedRuns,
 		// _active nets out escalations whose verdict was superseded (MR
 		// merged after escalation); _superseded is the discount itself.
 		// The raw gauge above keeps its historical meaning for existing
@@ -274,6 +317,15 @@ func (w *KPIWriter) snapshot(ctx context.Context, now time.Time, window time.Dur
 		// summed over stage_results rather than pipeline_runs so it isolates the
 		// retry share. Always emitted (0 when nothing retried).
 		"retry_cost_usd": retryCost,
+		// mergequeue_external_merged: MRs the serial merge queue landed for
+		// fleet producers (mrwatch shepherd, mcp-gitlab) in the window. These
+		// are NOT pipeline runs: the queue records a terminal `done`
+		// compatibility row per external candidate at ENQUEUE time (before any
+		// merge, and even when the candidate is later evicted), so every
+		// pipeline_* counter above excludes the external_merge template and the
+		// landed count is surfaced here instead — counted from settled queue
+		// rows, so an evicted candidate never reads as merged.
+		"mergequeue_external_merged": externalMerged,
 	}
 	if gateTotal > 0 {
 		metrics["gate_pass_rate"] = float64(gatePass) / float64(gateTotal)
@@ -459,6 +511,14 @@ func mergedRunDurationP50(ctx context.Context, st *store.Store, since time.Time)
 		if r == nil || r.EndedAt == nil {
 			continue
 		}
+		// External merge-queue candidates record a `done` compatibility row
+		// spanning only their queue wait (milliseconds to minutes). They are
+		// not slices, and with the queue live they outnumber real slices —
+		// live 2026-09-01: 6 of 8 merged runs, dragging the "slice to merge"
+		// median to 0.02s.
+		if r.Template == store.PipelineTemplateExternalMerge {
+			continue
+		}
 		d := r.EndedAt.Sub(r.StartedAt).Seconds()
 		if d <= 0 {
 			continue
@@ -499,15 +559,64 @@ func countBacklogState(ctx context.Context, st *store.Store, state store.Backlog
 	return len(items), nil
 }
 
+// externalMergeTemplate is bound into every pipeline_runs KPI query so the
+// serial merge queue's external-candidate compatibility rows never count as
+// pipeline work. ExternalEnqueuer records one `done` pipeline_runs row per
+// fleet candidate at enqueue time (pkg/mills/mergequeue/external.go) — the row
+// is a foreign-key placeholder, not a merge: it exists before the queue has
+// rebased anything and survives an eviction unchanged. Live 2026-09-08 the 1d
+// window counted 13 merged runs of which 7 were such placeholders, five of them
+// for candidates the queue had EVICTED (ci_red, ci_timeout, rebase_conflict) —
+// inflating auto_merge_rate, council_roi, and pipeline_merged_real (which the
+// circuit breaker reads) while diluting cost_per_merged_change. The landed
+// external count is reported separately as mergequeue_external_merged.
+const externalMergeTemplate = store.PipelineTemplateExternalMerge
+
+// countPipelineRunsSince counts pipeline runs started at-or-after `since`,
+// excluding external merge-queue placeholder rows. The DAO's CountSince stays a
+// raw row count for callers that want every row.
+func countPipelineRunsSince(ctx context.Context, st *store.Store, since time.Time) (int, error) {
+	row := st.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM pipeline_runs
+		WHERE started_at >= ? AND template <> ?
+	`, kpiTime(since), externalMergeTemplate)
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("kpi pipeline run count: %w", err)
+	}
+	return n, nil
+}
+
 func countPipelineStateSince(ctx context.Context, st *store.Store, state store.PipelineState, since time.Time) (int, error) {
 	row := st.DB().QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM pipeline_runs
-		WHERE state = ? AND started_at >= ?
-	`, string(state), kpiTime(since))
+		WHERE state = ? AND started_at >= ? AND template <> ?
+	`, string(state), kpiTime(since), externalMergeTemplate)
 	var n int
 	if err := row.Scan(&n); err != nil {
 		return 0, fmt.Errorf("kpi pipeline state count: %w", err)
+	}
+	return n, nil
+}
+
+// countExternalMergeQueueMergedSince counts external merge-queue candidates
+// that actually LANDED in the window: settled queue rows in state `merged`
+// whose pipeline run carries the external_merge template. Settled-at is the
+// merge time, so the count windows like the pipeline merge counters; evicted
+// candidates are excluded by the state predicate.
+func countExternalMergeQueueMergedSince(ctx context.Context, st *store.Store, since time.Time) (int, error) {
+	row := st.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM merge_queue mq
+		JOIN pipeline_runs pr ON pr.id = mq.pipeline_run_id
+		WHERE mq.state = ? AND mq.settled_at IS NOT NULL AND mq.settled_at >= ?
+		  AND pr.template = ?
+	`, string(store.MergeQueueMerged), kpiTime(since), externalMergeTemplate)
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("kpi external merge-queue merged count: %w", err)
 	}
 	return n, nil
 }
@@ -525,14 +634,45 @@ func countRealMergedRunsSince(ctx context.Context, st *store.Store, since time.T
 		SELECT COUNT(*)
 		FROM pipeline_runs pr
 		JOIN backlog_items bi ON bi.id = pr.backlog_id
-		WHERE pr.state = ? AND pr.started_at >= ?
+		WHERE pr.state = ? AND pr.started_at >= ? AND pr.template <> ?
 		  AND bi.labels_json NOT LIKE ?
-	`, string(store.PipelineDone), kpiTime(since), canaryPattern)
+	`, string(store.PipelineDone), kpiTime(since), externalMergeTemplate, canaryPattern)
 	var n int
 	if err := row.Scan(&n); err != nil {
 		return 0, fmt.Errorf("kpi real merged count: %w", err)
 	}
 	return n, nil
+}
+
+func countMergedRunsByRepoSince(ctx context.Context, st *store.Store, since time.Time, homeProject string) (map[string]int, error) {
+	rows, err := st.DB().QueryContext(ctx, `
+		SELECT COALESCE(bi.target_project, ''), COUNT(*)
+		FROM pipeline_runs pr
+		JOIN backlog_items bi ON bi.id = pr.backlog_id
+		WHERE pr.state = ? AND pr.started_at >= ? AND pr.template <> ?
+		GROUP BY bi.target_project
+	`, string(store.PipelineDone), kpiTime(since), externalMergeTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("kpi merged runs by repo: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var repo string
+		var count int
+		if err := rows.Scan(&repo, &count); err != nil {
+			return nil, fmt.Errorf("kpi merged runs by repo: %w", err)
+		}
+		repo = strings.TrimSpace(repo)
+		if repo == "" {
+			repo = strings.TrimSpace(homeProject)
+		}
+		if repo == "" {
+			repo = "home"
+		}
+		out[repo] += count
+	}
+	return out, rows.Err()
 }
 
 func countGateOutcomesSince(ctx context.Context, st *store.Store, since time.Time) (passes, total int, err error) {
@@ -626,10 +766,10 @@ func costPerMergedChange(ctx context.Context, st *store.Store, since time.Time) 
 		WHERE backlog_id IN (
 			SELECT DISTINCT backlog_id
 			FROM pipeline_runs
-			WHERE state = ? AND started_at >= ?
+			WHERE state = ? AND started_at >= ? AND template <> ?
 		)
-		AND started_at >= ?
-	`, string(store.PipelineDone), kpiTime(since), kpiTime(since))
+		AND started_at >= ? AND template <> ?
+	`, string(store.PipelineDone), kpiTime(since), externalMergeTemplate, kpiTime(since), externalMergeTemplate)
 	var cost float64
 	var denom int
 	if err := row.Scan(&cost, &denom); err != nil {
@@ -656,8 +796,8 @@ func regressionRateFromLabels(ctx context.Context, st *store.Store, since time.T
 			COUNT(DISTINCT pr.backlog_id)
 		FROM pipeline_runs pr
 		JOIN backlog_items bi ON pr.backlog_id = bi.id
-		WHERE pr.state = ? AND pr.started_at >= ?
-	`, "%\""+regressionFixLabel+"\"%", string(store.PipelineDone), kpiTime(since))
+		WHERE pr.state = ? AND pr.started_at >= ? AND pr.template <> ?
+	`, "%\""+regressionFixLabel+"\"%", string(store.PipelineDone), kpiTime(since), externalMergeTemplate)
 	var num, denom int
 	if err := row.Scan(&num, &denom); err != nil {
 		return 0, 0, fmt.Errorf("kpi regression-rate: %w", err)

@@ -1,0 +1,1 @@
+- Guard Mills stage model pins against implicit or mismatched harnesses in `pkg/mills/agent_routing.go`; report dropped pins in operator dispatch events and WARN logs, and use the guarded route for wiring model resolution in `cmd/loom-mills-operator/main.go`.

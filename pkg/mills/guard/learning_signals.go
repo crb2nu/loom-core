@@ -71,13 +71,20 @@ func (e *LearningSignalExporter) PublishLearningSignals(ctx context.Context, sin
 	for _, gate := range calibration.PerGate {
 		merged := meanOrNaN(gate.MeanScoreMerged, gate.MergedVerdicts)
 		escalated := meanOrNaN(gate.MeanScoreEscalated, gate.EscalatedVerdicts)
-		mills.JudgeCalibrationMeanScore.WithLabelValues(gate.Gate, JudgeOutcomeMerged).Set(merged)
-		mills.JudgeCalibrationMeanScore.WithLabelValues(gate.Gate, JudgeOutcomeEscalated).Set(escalated)
+		// One series per (gate, role): the primary's row is the gate's real
+		// grading and the only one an alert may page on; a shadow judge's row
+		// sits beside it for comparison (issue #755).
+		role := gate.Role
+		if role == "" {
+			role = "primary"
+		}
+		mills.JudgeCalibrationMeanScore.WithLabelValues(gate.Gate, JudgeOutcomeMerged, role).Set(merged)
+		mills.JudgeCalibrationMeanScore.WithLabelValues(gate.Gate, JudgeOutcomeEscalated, role).Set(escalated)
 		// NaN propagates through the subtraction, so a gate that has only ever
 		// merged reports no discrimination rather than its merged mean.
-		mills.JudgeCalibrationDiscrimination.WithLabelValues(gate.Gate).Set(merged - escalated)
+		mills.JudgeCalibrationDiscrimination.WithLabelValues(gate.Gate, role).Set(merged - escalated)
 		graded := gate.MergedVerdicts + gate.EscalatedVerdicts
-		mills.JudgeCalibrationGradedRuns.WithLabelValues(gate.Gate).Set(float64(graded))
+		mills.JudgeCalibrationGradedRuns.WithLabelValues(gate.Gate, role).Set(float64(graded))
 		res.Gates++
 		res.JoinedVerdicts += graded
 	}

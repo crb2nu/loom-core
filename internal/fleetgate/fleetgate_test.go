@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testManifest() Manifest {
@@ -388,5 +389,109 @@ func TestNewEvidenceMetadataDerivesScenarioCounts(t *testing.T) {
 	}
 	if metadata.ScenarioTotal != 2 || metadata.ScenarioCounts["required"] != 1 || metadata.ScenarioCounts["benchmark"] != 1 {
 		t.Fatalf("unexpected derived metadata: %+v", metadata)
+	}
+}
+
+func waiverManifest(until string) Manifest {
+	m := testManifest()
+	m.Waivers = []BenchmarkWaiver{{
+		Benchmark:      "BenchmarkRequired",
+		MaxTimePercent: 60,
+		Until:          until,
+		Reason:         "test waiver",
+	}}
+	return m
+}
+
+// TestCompareBenchmarksWaiver covers the three waiver behaviors: an active
+// waiver admits a regression above the global threshold but under its cap,
+// records the application in the report, still rejects a regression beyond
+// its cap, and an expired waiver reverts to the global threshold.
+func TestCompareBenchmarksWaiver(t *testing.T) {
+	mk := func(candidateNanos float64) (*strings.Reader, *strings.Reader) {
+		baseline := strings.NewReader(benchmarkOutput(
+			"BenchmarkRequired",
+			repeatedMetric(100, minimumBenchmarkSamples),
+			repeatedMetric(10, minimumBenchmarkSamples),
+			repeatedMetric(1, minimumBenchmarkSamples),
+		))
+		candidate := strings.NewReader(benchmarkOutput(
+			"BenchmarkRequired",
+			repeatedMetric(candidateNanos, minimumBenchmarkSamples),
+			repeatedMetric(10, minimumBenchmarkSamples),
+			repeatedMetric(1, minimumBenchmarkSamples),
+		))
+		return baseline, candidate
+	}
+
+	restore := nowFunc
+	defer func() { nowFunc = restore }()
+	nowFunc = func() time.Time { return time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC) }
+
+	// +52% under an active waiver capped at 60%: passes, application recorded.
+	baseline, candidate := mk(152)
+	report, err := CompareBenchmarks(waiverManifest("2026-09-15"), baseline, candidate)
+	if err != nil {
+		t.Fatalf("waived regression should pass: %v", err)
+	}
+	if !report.Passed {
+		t.Fatalf("waived report not passed: %+v", report)
+	}
+	if report.Benchmarks[0].WaiverApplied == "" {
+		t.Fatal("waiver application was not recorded in the report")
+	}
+
+	// +80% exceeds even the waiver cap: fails.
+	baseline, candidate = mk(180)
+	if _, err := CompareBenchmarks(waiverManifest("2026-09-15"), baseline, candidate); err == nil {
+		t.Fatal("regression beyond the waiver cap must still fail")
+	}
+
+	// Same +52% after expiry: fails at the global threshold again.
+	baseline, candidate = mk(152)
+	if _, err := CompareBenchmarks(waiverManifest("2026-08-01"), baseline, candidate); err == nil {
+		t.Fatal("expired waiver must revert to the global threshold")
+	}
+
+	// Inclusive expiry: still active on the Until date itself.
+	nowFunc = func() time.Time { return time.Date(2026, 9, 15, 23, 0, 0, 0, time.UTC) }
+	baseline, candidate = mk(152)
+	if report, err := CompareBenchmarks(waiverManifest("2026-09-15"), baseline, candidate); err != nil || !report.Passed {
+		t.Fatalf("waiver must remain active through its Until date: err=%v", err)
+	}
+}
+
+// TestManifestValidateWaivers pins the fail-closed validation rules.
+func TestManifestValidateWaivers(t *testing.T) {
+	base := testManifest()
+	cases := []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{"unknown benchmark", func(m *Manifest) {
+			m.Waivers = []BenchmarkWaiver{{Benchmark: "BenchmarkNope", MaxTimePercent: 60, Until: "2026-09-15", Reason: "r"}}
+		}},
+		{"cap not above global", func(m *Manifest) {
+			m.Waivers = []BenchmarkWaiver{{Benchmark: "BenchmarkRequired", MaxTimePercent: m.Thresholds.TimePercent, Until: "2026-09-15", Reason: "r"}}
+		}},
+		{"missing reason", func(m *Manifest) {
+			m.Waivers = []BenchmarkWaiver{{Benchmark: "BenchmarkRequired", MaxTimePercent: 60, Until: "2026-09-15"}}
+		}},
+		{"bad date", func(m *Manifest) {
+			m.Waivers = []BenchmarkWaiver{{Benchmark: "BenchmarkRequired", MaxTimePercent: 60, Until: "soon", Reason: "r"}}
+		}},
+		{"duplicate", func(m *Manifest) {
+			w := BenchmarkWaiver{Benchmark: "BenchmarkRequired", MaxTimePercent: 60, Until: "2026-09-15", Reason: "r"}
+			m.Waivers = []BenchmarkWaiver{w, w}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base
+			tc.mutate(&m)
+			if err := m.Validate(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
 	}
 }

@@ -3,7 +3,6 @@ package skills
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -294,38 +293,6 @@ func escapeYAMLString(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "\"", "\\\"")
 	return s
-}
-
-// copyFile copies a file from src to dst.
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
-
-	// Ensure parent directory exists
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		return err
-	}
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	if err != nil {
-		return err
-	}
-
-	// Preserve executable bit
-	info, err := sourceFile.Stat()
-	if err != nil {
-		return err
-	}
-	return os.Chmod(dst, info.Mode())
 }
 
 // toTitleCase converts kebab-case to Title Case.

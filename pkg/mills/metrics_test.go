@@ -1,12 +1,36 @@
 package mills
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+func TestPlanSliceListCallsMetricHasBoundedOutcomes(t *testing.T) {
+	for _, outcome := range []string{"fetched", "cached"} {
+		if got := testutil.ToFloat64(PlanSliceListCallsTotal.WithLabelValues(outcome)); got < 0 {
+			t.Fatalf("%s counter = %v", outcome, got)
+		}
+	}
+}
+
+func TestSandboxDrillMetricsObserveBoundedOutcomes(t *testing.T) {
+	for _, outcome := range []string{"verdict", "timeout", "error"} {
+		before := testutil.CollectAndCount(SandboxDrillSeconds)
+		SandboxDrillSeconds.WithLabelValues(outcome).Observe(1)
+		if got := testutil.CollectAndCount(SandboxDrillSeconds); got < before {
+			t.Fatalf("histogram disappeared after %s observation", outcome)
+		}
+	}
+	SandboxDrillLastSuccessTimestamp.Set(123)
+	if got := testutil.ToFloat64(SandboxDrillLastSuccessTimestamp); got != 123 {
+		t.Fatalf("last success = %v, want 123", got)
+	}
+}
 
 // TestMetricsRegistered confirms every metric is non-nil and registered
 // against the default registry. A typo in promauto naming would manifest
@@ -18,7 +42,11 @@ func TestMetricsRegistered(t *testing.T) {
 		name      string
 		collector prometheus.Collector
 	}{
+		{"mills_pipeline_stage_silent_total", PipelineStageSilentTotal},
 		{"mills_council_runs_total", CouncilRunsTotal},
+		{"mills_finishing_bolts_pending", FinishingBoltsPending},
+		{"mills_finishing_bolts_unknown", FinishingBoltsUnknown},
+		{"mills_finishing_digest_total", FinishingDigestTotal},
 		{"mills_council_cost_usd_total", CouncilCostUSDTotal},
 		{"mills_council_duration_seconds", CouncilDurationSeconds},
 		{"mills_mcphub_calls_total", MCPHubCallsTotal},
@@ -26,9 +54,16 @@ func TestMetricsRegistered(t *testing.T) {
 		{"mills_mcphub_queue_wait_seconds", MCPHubQueueWaitSeconds},
 		{"mills_mcphub_transport_retries_total", MCPHubTransportRetriesTotal},
 		{"mills_pipeline_runs_total", PipelineRunsTotal},
+		{"mills_pipeline_mints_total", PipelineMintsTotal},
+		{"mills_merge_queue_pipeline_wall_seconds", MergeQueuePipelineWallSeconds},
+		{"mills_merge_queue_pipeline_queued_seconds", MergeQueuePipelineQueuedSeconds},
+		{"mills_pipeline_adoptions_total", PipelineAdoptionsTotal},
+		{"mills_pipeline_review_head_moved_total", PipelineReviewHeadMovedTotal},
 		{"mills_pipeline_active", PipelineActiveGauge},
 		{"mills_pipeline_stage_attempts_total", PipelineStageAttemptsTotal},
 		{"mills_pipeline_stage_error_class_total", PipelineStageErrorClassTotal},
+		{"mills_pipeline_stall_conversions_total", PipelineStallConversionsTotal},
+		{"mills_pipeline_drive_aborted_terminal_total", PipelineDriveAbortedTerminalTotal},
 		{"mills_pipeline_stage_duration_seconds", PipelineStageDurationSeconds},
 		{"mills_pipeline_cost_usd_total", PipelineCostUSDTotal},
 		{"mills_autonomous_merges", AutonomousMerges},
@@ -43,6 +78,7 @@ func TestMetricsRegistered(t *testing.T) {
 		{"mills_escalation_handoffs_created_total", EscalationHandoffCreatedTotal},
 		{"mills_ghost_sparks_closed_total", GhostSparksClosedTotal},
 		{"mills_auto_requeues_total", AutoRequeuesTotal},
+		{"mills_rescued_without_vaccine", RescuedWithoutVaccine},
 		{"mills_reconciler_ticks_total", ReconcileTicksTotal},
 		{"mills_reconciler_tick_duration_seconds", ReconcileTickDurationSeconds},
 		{"mills_pipeline_start_claims_total", PipelineStartClaimsTotal},
@@ -96,6 +132,8 @@ func TestMetricsRegistered(t *testing.T) {
 		{"mills_overseer_tick_duration_seconds", OverseerTickDurationSeconds},
 		{"mills_overseer_actions_total", OverseerActionsTotal},
 		{"mills_overseer_suppression_active", OverseerSuppressionActive},
+		{"mills_sandbox_drill_seconds", SandboxDrillSeconds},
+		{"mills_sandbox_drill_last_success_timestamp", SandboxDrillLastSuccessTimestamp},
 		{"mills_judge_calibration_mean_score", JudgeCalibrationMeanScore},
 		{"mills_judge_calibration_discrimination", JudgeCalibrationDiscrimination},
 		{"mills_judge_calibration_graded_runs", JudgeCalibrationGradedRuns},
@@ -111,6 +149,46 @@ func TestMetricsRegistered(t *testing.T) {
 				t.Fatalf("metric %s is nil", tc.name)
 			}
 		})
+	}
+}
+
+func TestPipelineMintAdoptionMetricsUseMintedByLabel(t *testing.T) {
+	mints := PipelineMintsTotal.WithLabelValues("test.path")
+	adoptions := PipelineAdoptionsTotal.WithLabelValues("test.path")
+	mintBefore, adoptionBefore := testutil.ToFloat64(mints), testutil.ToFloat64(adoptions)
+	mints.Inc()
+	adoptions.Inc()
+	if got := testutil.ToFloat64(mints); got != mintBefore+1 {
+		t.Fatalf("mints delta = %v, want 1", got-mintBefore)
+	}
+	if got := testutil.ToFloat64(adoptions); got != adoptionBefore+1 {
+		t.Fatalf("adoptions delta = %v, want 1", got-adoptionBefore)
+	}
+}
+
+func TestRescuedWithoutVaccineGaugeValue(t *testing.T) {
+	RescuedWithoutVaccine.Set(3)
+	t.Cleanup(func() { RescuedWithoutVaccine.Set(0) })
+	if got := testutil.ToFloat64(RescuedWithoutVaccine); got != 3 {
+		t.Fatalf("rescued-without-vaccine gauge = %v, want 3", got)
+	}
+}
+
+func TestPipelineRecoveryCountersIncrement(t *testing.T) {
+	stall := PipelineStallConversionsTotal.WithLabelValues("implement")
+	stallBefore := testutil.ToFloat64(stall)
+	stall.Inc()
+	if got := testutil.ToFloat64(stall); got != stallBefore+1 {
+		t.Fatalf("stall conversions counter = %v, want %v", got, stallBefore+1)
+	}
+
+	for _, state := range []string{"escalated", "paused", "done"} {
+		aborted := PipelineDriveAbortedTerminalTotal.WithLabelValues(state)
+		before := testutil.ToFloat64(aborted)
+		aborted.Inc()
+		if got := testutil.ToFloat64(aborted); got != before+1 {
+			t.Errorf("drive aborted terminal counter for %q = %v, want %v", state, got, before+1)
+		}
 	}
 }
 
@@ -137,6 +215,10 @@ func TestCounterVecLabelsAccept(t *testing.T) {
 	PipelineStageErrorClassTotal.WithLabelValues("implement", "transient_quota").Inc()
 	PipelineStageErrorClassTotal.WithLabelValues("tests", "infra").Inc()
 	PipelineStageErrorClassTotal.WithLabelValues("implement", "code").Inc()
+	PipelineStallConversionsTotal.WithLabelValues("implement").Inc()
+	PipelineDriveAbortedTerminalTotal.WithLabelValues("escalated").Inc()
+	PipelineDriveAbortedTerminalTotal.WithLabelValues("paused").Inc()
+	PipelineDriveAbortedTerminalTotal.WithLabelValues("done").Inc()
 	PipelineStageDurationSeconds.WithLabelValues("tests").Observe(180.0)
 	PipelineCostUSDTotal.WithLabelValues("done").Add(1.25)
 	AutonomousMerges.WithLabelValues("1d").Set(2)
@@ -266,10 +348,10 @@ func TestCounterVecLabelsAccept(t *testing.T) {
 	// terminal verdict outcomes (guard.JudgeOutcomeMerged/Escalated); "other"
 	// is never exported because a run that has not finished carries no
 	// calibration signal.
-	JudgeCalibrationMeanScore.WithLabelValues("code_review", "merged").Set(0.91)
-	JudgeCalibrationMeanScore.WithLabelValues("code_review", "escalated").Set(0.42)
-	JudgeCalibrationDiscrimination.WithLabelValues("code_review").Set(0.49)
-	JudgeCalibrationGradedRuns.WithLabelValues("code_review").Set(12)
+	JudgeCalibrationMeanScore.WithLabelValues("code_review", "merged", "primary").Set(0.91)
+	JudgeCalibrationMeanScore.WithLabelValues("code_review", "escalated", "primary").Set(0.42)
+	JudgeCalibrationDiscrimination.WithLabelValues("code_review", "primary").Set(0.49)
+	JudgeCalibrationGradedRuns.WithLabelValues("code_review", "primary").Set(12)
 	PromotionEvidenceActions.WithLabelValues("overseer.groomer").Set(7)
 	ConfigOutcomeMergeRate.Set(0.6)
 	ConfigOutcomeRuns.Set(20)
@@ -376,6 +458,8 @@ func TestGatherableExposesMillsMetrics(t *testing.T) {
 		"mills_overseer_tick_duration_seconds":           false,
 		"mills_overseer_actions_total":                   false,
 		"mills_overseer_suppression_active":              false,
+		"mills_sandbox_drill_seconds":                    false,
+		"mills_sandbox_drill_last_success_timestamp":     false,
 		"mills_judge_calibration_mean_score":             false,
 		"mills_judge_calibration_discrimination":         false,
 		"mills_judge_calibration_graded_runs":            false,
@@ -400,5 +484,100 @@ func TestGatherableExposesMillsMetrics(t *testing.T) {
 		if strings.HasPrefix(mf.GetName(), "mills_") && mf.GetHelp() == "" {
 			t.Errorf("metric %s has empty help text", mf.GetName())
 		}
+	}
+}
+
+func TestAdmissionDeferredSubjectsCooldownAndMetrics(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	counter := AdmissionDeferredTotal.WithLabelValues("scope_reserved")
+	before := testutil.ToFloat64(counter)
+	emit := func(id string) {
+		env.rec.append(ctx, "reconciler.deferred", "scope_reservation_transaction", map[string]any{"item": id, "blocked_by": "reserver", "witness": "pkg/shared"})
+	}
+	emit("one")
+	emit("one")
+	emit("two")
+	check := func(id string, want int) {
+		t.Helper()
+		events, err := env.store.Events.ListBySubject(ctx, "backlog_item", id, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != want {
+			t.Fatalf("%s events=%d want=%d", id, len(events), want)
+		}
+		for _, e := range events {
+			if e.Payload["outcome"] != "scope_reservation_transaction" {
+				t.Fatalf("outcome=%s", e.Payload["outcome"])
+			}
+			if e.Payload["reason"] != "scope_reserved" || e.Payload["blocker"] != "reserver" || e.Payload["shared_scope"] != "pkg/shared" || e.Payload["blocked_by"] != "reserver" || e.Payload["witness"] != "pkg/shared" {
+				t.Fatalf("payload=%v", e.Payload)
+			}
+		}
+	}
+	check("one", 1)
+	check("two", 1)
+	env.rec.Clock = func() time.Time { return env.now.Add(eventNoiseCooldown) }
+	emit("one")
+	check("one", 2)
+	if got := testutil.ToFloat64(counter) - before; got != 4 {
+		t.Fatalf("deferrals=%v want=4 including suppressed event", got)
+	}
+	for _, tc := range []struct{ outcome, want string }{{"scope_reservation_transaction", "scope_reserved"}, {"scope_overlap_transaction", "scope_overlap_active"}, {"budget_transaction", "budget"}, {"unbounded detail", "other"}} {
+		if got := admissionDeferralReason(tc.outcome); got != tc.want {
+			t.Fatalf("%s => %s want %s", tc.outcome, got, tc.want)
+		}
+	}
+}
+
+func TestAdmissionDeferredPreservesLegacyBudgetReason(t *testing.T) {
+	env := newRecEnv(t, nil)
+	ctx := context.Background()
+	counter := AdmissionDeferredTotal.WithLabelValues("budget")
+	before := testutil.ToFloat64(counter)
+	detail := "per-repo max_runs_per_day reached (1/1)"
+	env.rec.append(ctx, "reconciler.deferred", "budget", map[string]any{"item": "budget-item", "reason": detail})
+	events, err := env.store.Events.ListBySubject(ctx, "backlog_item", "budget-item", 10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events=%v err=%v", events, err)
+	}
+	if events[0].Payload["reason"] != detail {
+		t.Fatalf("lost legacy reason: %v", events[0].Payload)
+	}
+	if testutil.ToFloat64(counter)-before != 1 {
+		t.Fatal("budget reason was not normalized for metric")
+	}
+}
+
+func TestPipelineStageSilentLimitLabel(t *testing.T) {
+	counter, err := PipelineStageSilentTotal.GetMetricWith(prometheus.Labels{"stage": "tests", "limit_seconds": "3900"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := testutil.ToFloat64(counter)
+	counter.Inc()
+	if got := testutil.ToFloat64(counter); got != before+1 {
+		t.Fatalf("counter = %v", got)
+	}
+}
+
+func TestAutonomyBreakerMetrics(t *testing.T) {
+	counter := AutonomyBreakerHoldsTotal.WithLabelValues("mcp_hub_session")
+	before := testutil.ToFloat64(counter)
+	counter.Inc()
+	if got := testutil.ToFloat64(counter); got != before+1 {
+		t.Fatalf("holds=%v", got)
+	}
+	before = testutil.ToFloat64(AutonomyBreakerHeldRuns)
+	AutonomyBreakerHeldRuns.Inc()
+	AutonomyBreakerHeldRuns.Inc()
+	if got := testutil.ToFloat64(AutonomyBreakerHeldRuns); got != before+2 {
+		t.Fatalf("concurrent held runs=%v", got)
+	}
+	AutonomyBreakerHeldRuns.Dec()
+	AutonomyBreakerHeldRuns.Dec()
+	if got := testutil.ToFloat64(AutonomyBreakerHeldRuns); got != before {
+		t.Fatalf("gauge leaked: %v", got)
 	}
 }

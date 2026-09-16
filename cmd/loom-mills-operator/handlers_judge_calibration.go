@@ -3,8 +3,6 @@ package main
 import (
 	"net/http"
 	"time"
-
-	"github.com/crb2nu/loom/pkg/mills/guard"
 )
 
 // judgeCalibrationDefaultWindow is two weeks: long enough for the runs graded
@@ -25,17 +23,5 @@ func (o *operator) handleJudgeCalibration(w http.ResponseWriter, r *http.Request
 		}
 		window = d
 	}
-	if o.store == nil || o.store.Events == nil || o.store.Pipeline == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "events store unavailable"})
-		return
-	}
-
-	now := time.Now().UTC()
-	report, err := guard.BuildJudgeCalibrationReport(r.Context(), o.store.Events, o.store.Pipeline, now.Add(-window), now)
-	if err != nil {
-		o.logger.Warn("judge calibration report failed", "window", window.String(), "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, report)
+	o.writeReportRollup(w, r, "judge_calibration", window, "")
 }

@@ -8,7 +8,29 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/crb2nu/loom/pkg/mills/finishing"
 )
+
+// NewestPathCommit returns the newest commit touching path on ref.
+func (c *GitLabClient) NewestPathCommit(ctx context.Context, project, ref, repoPath string) (*time.Time, error) {
+	endpoint := fmt.Sprintf("/projects/%s/repository/commits?path=%s&ref_name=%s&per_page=1",
+		url.PathEscape(project), url.QueryEscape(repoPath), url.QueryEscape(ref))
+	var rows []struct {
+		CommittedDate time.Time `json:"committed_date"`
+	}
+	if err := c.requestJSON(ctx, http.MethodGet, endpoint, nil, &rows); err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	t := rows[0].CommittedDate.UTC()
+	return &t, nil
+}
+
+var _ finishing.TreeLister = (*GitLabClient)(nil)
+var _ finishing.CommitLister = (*GitLabClient)(nil)
 
 // CommitListItem is a bounded, read-only view of one repository commit as
 // returned by the commits list endpoint.

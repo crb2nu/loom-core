@@ -69,6 +69,16 @@ func (e *eventEmitter) Emit(ctx context.Context, eventType, project, detail stri
 	resp.Body.Close()
 }
 
+func (e *eventEmitter) EmitBaseImageFallback(ctx context.Context, project, language, version, reason string) {
+	detail, err := json.Marshal(map[string]string{
+		"project": project, "language": language, "version": version, "reason": reason,
+	})
+	if err != nil {
+		return
+	}
+	e.Emit(ctx, "base_image_fallback", project, string(detail))
+}
+
 // handleSummary returns an aggregated status summary for HUD display.
 func (m *manager) handleSummary(_ context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
 	entries := m.store.List()

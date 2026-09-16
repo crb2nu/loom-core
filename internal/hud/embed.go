@@ -47,6 +47,20 @@ const (
 	embeddedSnapshotCacheTTL         = 10 * time.Minute
 )
 
+// validateConfig rejects configurations that cannot function as deployed.
+// Inbound webhooks with no secret for either vendor is the one case today:
+// both verifiers fail closed on an empty secret, so an enabled-but-secretless
+// deployment would 401 every real webhook forever. Refusing to start surfaces
+// the misconfiguration at boot instead (docs/harvest-gitlab-hookify-notify-contract.md
+// §8.3 item 1). A single configured secret is fine — the other vendor's
+// endpoint simply rejects all requests.
+func validateConfig(cfg Config) error {
+	if cfg.WebhookInboundEnabled && cfg.WebhookGitLabSecret == "" && cfg.WebhookGitHubSecret == "" {
+		return fmt.Errorf("inbound webhooks enabled with no secret configured: set WEBHOOK_GITLAB_SECRET and/or WEBHOOK_GITHUB_SECRET, or unset WEBHOOK_INBOUND_ENABLED")
+	}
+	return nil
+}
+
 // NewApp constructs a HUD App with the given caller and configuration.
 // It does NOT start any background work — caller responsibilities are:
 //
@@ -71,6 +85,9 @@ const (
 // See docs/HUD_EMBEDDING.md for embedding patterns, lifecycle rules, and
 // a worked in-process example.
 func NewApp(cfg Config, caller bridge.Caller, logger *slog.Logger) (*App, error) {
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
 	if logger == nil {
 		logger = slog.Default().With("component", "hud")
 	}

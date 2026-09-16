@@ -1143,6 +1143,7 @@ func (h *HarvesterVMBackend) Exec(_ context.Context, opts ExecOpts) (*ExecResult
 		StderrLines: stderrTotal,
 		StdoutTail:  stdoutTail,
 		StderrTail:  stderrTail,
+		StderrHead:  stderrHead(string(stderr)),
 		DurationMs:  durationMs,
 		Truncated:   stdoutTrunc || stderrTrunc,
 		OOMKilled:   exitCode == 137,
@@ -1405,7 +1406,14 @@ func (h *HarvesterVMBackend) buildProvisionScript(opts StartOpts, gitToken strin
 		dest := strings.TrimSuffix(opts.WorkDir, "/")
 		parts := strings.Split(dest, "/")
 		project := parts[len(parts)-1]
-		repoURL := strings.TrimSuffix(h.cfg.GitBaseURL, "/") + "/" + project + ".git"
+		// Prefer caller-supplied workspace metadata for the remote path so a
+		// group-neutral GitBaseURL still clones services/<name> (and libs/<name>)
+		// correctly; the basename fallback preserves legacy callers.
+		gitProjectPath := strings.Trim(strings.TrimSpace(opts.GitProjectPath), "/")
+		if gitProjectPath == "" {
+			gitProjectPath = project
+		}
+		repoURL := joinRepoURL(h.cfg.GitBaseURL, gitProjectPath)
 		scheme := "https"
 		if strings.HasPrefix(repoURL, "http://") {
 			scheme = "http"

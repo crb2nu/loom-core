@@ -1,0 +1,1 @@
+- Add secure Client ID Metadata Document resolution alongside DCR and RFC 9207 authorization-response issuer validation in `internal/daemon/oauth.go` and `internal/daemon/oauth_cimd.go`.

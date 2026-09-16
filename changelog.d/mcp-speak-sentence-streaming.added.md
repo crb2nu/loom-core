@@ -1,0 +1,1 @@
+- Stream `mcp-speak` synthesis and playback sentence-by-sentence with ordered, bounded lookahead in `cmd/mcp-speak/main.go`, including injectable offline-tested audio boundaries.

@@ -10,6 +10,26 @@ Sources: `pkg/mills/store/types.go:127-142`,
 `pkg/mills/clients/spawn.go`, `internal/spawn/types.go:55-66`,
 `cmd/loom-mills-operator/handlers_pipeline.go`.
 
+## Cross-repository stamp write contract
+
+Stamp writes pass through one fail-closed boundary with these transitions:
+
+1. **Normalize** — trim the stamp ID, source project, and target project.
+2. **Validate** — reject missing IDs and missing or malformed project paths;
+   new writes never infer a target.
+3. **Authorize** — same-project writes proceed without an allowlist entry.
+   A source/target pair that crosses projects proceeds only when explicitly
+   present in `policy.StampTargetPolicy`; an absent pair is denied.
+4. **Write** — only a validated, authorized stamp reaches persistence.
+5. **Audit** — the boundary emits exactly one structured event for every
+   attempt, including validation, policy, and persistence failures. The event
+   records source, target, stamp ID, decision, and reason.
+
+Legacy target-less records follow a separate read/migration transition: the
+source repository becomes the target and is persisted with a conditional
+update. Repeating the backfill is a no-op, and it cannot overwrite a target
+that another writer has already supplied.
+
 ---
 
 ## Regression-test audit (Slice 4a)
@@ -73,6 +93,17 @@ carries the `PipelineState` it advances `PipelineRun.State` to.
 ```
 
 Notes:
+- A genuine lint or test failure completes the `tests` transport with a
+  `passed:false` artifact. The deterministic `tests_verdict` check in
+  `post_tests_gate` then rewinds to `implement` and carries the failed-check
+  findings into that retry. Provisioning, checkout, contradictory/no-check,
+  baseline-environment, and classified infrastructure/transient failures stay
+  on the tests-stage error path and retry that substrate operation in place.
+- A `pr_self_review` that pushes a commit fails the deterministic `tested_head`
+  check in `post_review_gate` (review head differs from `tested_sha`). The
+  runner rewinds to `tests` pinned to the review head, not to `pr_self_review`
+  or `implement`, and skips the review on the way back; the run passes through
+  `testing` again before returning to `reviewing`.
 - `paused` and `escalated` are terminal-for-the-reconciler in that the
   reconciler does not re-drive them on tick; the operator owns the next
   move.

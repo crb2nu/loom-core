@@ -1,0 +1,1 @@
+- Gate merged dependencies that change `pkg/mills/` or `cmd/loom-mills-operator/` until their merge commit is present in the running operator build, and expose that build SHA in operator status.

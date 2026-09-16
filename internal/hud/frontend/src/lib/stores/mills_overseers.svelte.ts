@@ -8,6 +8,8 @@
 // error surfaces via `error` WITHOUT blanking the previously-loaded snapshot,
 // so a transient operator blip doesn't blank the panel mid-poll.
 
+import { untrack } from 'svelte';
+import type { PromotionReport } from './mills_staff.svelte.ts';
 import { createPoller } from '../utils/poller.ts';
 
 // OverseerTickResult mirrors overseer.TickResult — the summary of one agent
@@ -55,10 +57,25 @@ export interface OverseerEvent {
 }
 
 // OverseersStatus is the full GET /api/mills/overseers response.
+// OverseerSoak is the S2 dry-run promotion verdict (overseer.SoakMetrics):
+// the persisted decisions over the last seven complete UTC days, projected
+// through the promotion runbook's checklist. Absent on operators older than
+// the 2026-09-02 soak wiring.
+export interface OverseerSoak {
+  mills_overseer_soak_elapsed_days: number;
+  mills_overseer_soak_dry_run_decisions: number;
+  mills_overseer_soak_would_have_acted: number;
+  mills_overseer_soak_divergences: number;
+  promotable: boolean;
+  fail_closed: boolean;
+  failure_reasons?: string[];
+}
+
 export interface OverseersStatus {
   enabled: boolean; // master gate
   agents: OverseerAgent[];
   recent_actions: Record<string, OverseerEvent[] | null>;
+  soak?: OverseerSoak;
 }
 
 // zeroResult keeps a $derived from ever spreading an undefined last_result when
@@ -80,10 +97,53 @@ function normalise(raw: OverseersStatus | null): OverseersStatus {
       last_result: a.last_result ?? zeroResult,
     })),
     recent_actions: raw.recent_actions ?? {},
+    // Optional on older operators; must survive normalisation or the Alley
+    // card can never show the verdict.
+    soak: raw.soak,
   };
 }
 
-class MillsOverseersStore {
+export const OVERSEER_REPORT_INTERVAL_MS = 5 * 60_000;
+
+export class MillsOverseersStore {
+  report = $state<PromotionReport | null>(null);
+  reportError = $state<string | null>(null);
+  reportLoading = $state(false);
+  reportUpdated = $state<Date | null>(null);
+  private reportAttempt: number | null = null;
+
+  private async refreshReport(): Promise<void> {
+    const now = Date.now();
+    if (this.reportLoading || (this.reportAttempt !== null && now - this.reportAttempt < OVERSEER_REPORT_INTERVAL_MS)) return;
+    this.reportAttempt = now; // Throttle failed attempts as well as successes.
+    this.reportLoading = true;
+    try {
+      const raw = await this.getJSON<PromotionReport>(
+        '/api/mills/promotion-report?actor=overseer.&window=168h',
+      );
+      if (!raw) throw new Error('Promotion report unavailable');
+      this.report = {
+        ...raw,
+        per_actor: (raw.per_actor ?? []).map((actor) => ({
+          ...actor,
+          per_action: (actor.per_action ?? []).map((action) => ({
+            ...action,
+            dry_run: action.dry_run ?? 0,
+            executed: action.executed ?? 0,
+            unique_subjects: action.unique_subjects ?? 0,
+            subject_sample: action.subject_sample ?? [],
+          })),
+        })),
+      };
+      this.reportUpdated = new Date();
+      this.reportError = null;
+    } catch (e) {
+      this.reportError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.reportLoading = false;
+    }
+  }
+
   status = $state<OverseersStatus | null>(null);
 
   loading = $state(false);
@@ -96,6 +156,10 @@ class MillsOverseersStore {
   }, 15000);
 
   async refresh(): Promise<void> {
+    await Promise.all([this.refreshStatus(), this.refreshReport()]);
+  }
+
+  private async refreshStatus(): Promise<void> {
     this.loading = true;
     try {
       const raw = await this.getJSON<OverseersStatus>('/api/mills/overseers');
@@ -120,7 +184,8 @@ class MillsOverseersStore {
   }
 
   startPolling(intervalMs = 15000): void {
-    void this.refresh();
+    // Called from mounting effects: loading state must not restart polling.
+    untrack(() => { void this.refresh(); });
     this.poller.start(intervalMs);
   }
 

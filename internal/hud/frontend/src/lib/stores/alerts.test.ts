@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { alertsStore, formatGoDuration, isZeroTime } from './alerts.svelte.ts';
+import { alertsStore, formatGoDuration, isZeroTime, parseGoDuration } from './alerts.svelte.ts';
 import { labsAuthStore } from './labsAuth.svelte.ts';
 
 // Fetch-boundary + action coverage for the alerting/auto-fix store.
@@ -417,5 +417,80 @@ describe('Go wire-format helpers', () => {
     expect(isZeroTime('0001-01-01T00:00:00Z')).toBe(true);
     expect(isZeroTime('')).toBe(true);
     expect(isZeroTime('2026-07-25T17:32:15Z')).toBe(false);
+  });
+});
+
+describe('parseGoDuration', () => {
+  it('parses unit suffixes into nanoseconds', () => {
+    expect(parseGoDuration('30s')).toBe(30e9);
+    expect(parseGoDuration('5m')).toBe(300e9);
+    expect(parseGoDuration('2h')).toBe(7200e9);
+    expect(parseGoDuration('1d')).toBe(86400e9);
+  });
+
+  it('treats a bare number as minutes — never as raw nanoseconds', () => {
+    // The wire unit is ns; a naive "5" written through as-is would be a 5ns
+    // cooldown, i.e. no cooldown at all.
+    expect(parseGoDuration('5')).toBe(300e9);
+  });
+
+  it('rejects garbage instead of guessing', () => {
+    expect(parseGoDuration('soon')).toBeNull();
+    expect(parseGoDuration('-5m')).toBeNull();
+    expect(parseGoDuration('')).toBe(0);
+  });
+});
+
+describe('alertsStore.updateRules', () => {
+  function methodFetch(): typeof globalThis.fetch {
+    // The rules fragment answers BOTH the fresh pre-write GET and the PUT,
+    // so this harness switches on method (routeFetch cannot).
+    return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      calls.push({ url, method, body: typeof init?.body === 'string' ? init.body : null });
+      if (url.includes('/api/alerts/rules') && method === 'PUT') {
+        const rules = JSON.parse(String(init?.body ?? '{}')).rules ?? [];
+        return Promise.resolve(jsonResponse(200, JSON.stringify({ updated: true, count: rules.length })));
+      }
+      if (url.includes('/api/alerts/rules')) return Promise.resolve(jsonResponse(200, RULES_BODY));
+      if (url.includes('/api/alerts?limit=100')) return Promise.resolve(jsonResponse(200, ALERTS_BODY));
+      if (url.includes('/api/autofix/proposals')) return Promise.resolve(jsonResponse(200, PROPOSALS_BODY));
+      if (url.includes('/api/autofix/executions')) return Promise.resolve(jsonResponse(200, EXECUTIONS_BODY));
+      return Promise.resolve(jsonResponse(404, 'not found', 'text/plain'));
+    }) as unknown as typeof globalThis.fetch;
+  }
+
+  it('mutates a FRESH copy and round-trips last_fired verbatim', async () => {
+    globalThis.fetch = methodFetch();
+    // Poison the poll cache: the mutator must see the server's rules, not
+    // this stale (empty) cache — re-read-then-write is the only clobber
+    // protection the no-CAS endpoint offers.
+    alertsStore.rules = [];
+
+    const count = await alertsStore.updateRules((fresh) =>
+      fresh.map((r) => (r.id === 'pipeline-stuck' ? { ...r, enabled: true } : r)),
+    );
+
+    expect(count).toBe(2);
+    const put = calls.find((c) => c.method === 'PUT');
+    expect(put?.url).toContain('/api/alerts/rules');
+    const sent = JSON.parse(put?.body ?? '{}').rules;
+    expect(sent).toHaveLength(2);
+    const stuck = sent.find((r: { id: string }) => r.id === 'pipeline-stuck');
+    expect(stuck.enabled).toBe(true);
+    // Live cooldown state must ride along untouched.
+    expect(stuck.last_fired).toBe('2026-07-25T17:32:15Z');
+    // And the write is followed by a refetch of the panel's spine.
+    expect(calls.some((c) => c.method === 'GET' && c.url.includes('/api/alerts?limit=100'))).toBe(true);
+  });
+
+  it('refuses to write an empty set unless explicitly allowed', async () => {
+    globalThis.fetch = methodFetch();
+    await expect(alertsStore.updateRules(() => [])).rejects.toThrow(/empty rule set/);
+    expect(calls.some((c) => c.method === 'PUT')).toBe(false);
+
+    await alertsStore.updateRules(() => [], { allowEmpty: true });
+    expect(calls.some((c) => c.method === 'PUT')).toBe(true);
   });
 });

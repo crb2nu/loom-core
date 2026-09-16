@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/llmpricing"
 	"github.com/crb2nu/loom/pkg/llmusage"
 	"github.com/crb2nu/loom/pkg/mills/council"
 	"github.com/crb2nu/loom/pkg/openairesponses"
@@ -27,32 +28,15 @@ type responsesClient interface {
 // req/min-per-key overflow threshold by the editor's cadence.
 const openAICouncilPromptCacheKey = "loom-mills-council-editor"
 
+// openAITokenPrice is the row shape of the OpenRouter CEILING table in
+// council.go. OpenAI list prices themselves live in pkg/llmpricing — one
+// snapshot shared with the HUD Codex spawn parser, so the council and the
+// spawn accounting can no longer drift apart. Unknown models remain unpriced
+// (zero, ok=false) rather than inheriting an incorrect alias rate.
 type openAITokenPrice struct {
 	InputPerMillion       float64
 	CachedInputPerMillion float64
 	OutputPerMillion      float64
-}
-
-// Prices are pinned to the official model catalog. Unknown models remain
-// unpriced (zero) rather than inheriting an incorrect alias rate.
-var openAICouncilTokenPrices = map[string]openAITokenPrice{
-	"gpt-5.4": {
-		InputPerMillion: 2.50, CachedInputPerMillion: 0.25, OutputPerMillion: 15.00,
-	},
-	"gpt-5.4-2026-03-05": {
-		InputPerMillion: 2.50, CachedInputPerMillion: 0.25, OutputPerMillion: 15.00,
-	},
-	// The gpt-5.6 family launched 2026-07-09. Do not let gateway aliases
-	// inherit another model's rate: lookup below strips only the oa/ prefix.
-	"gpt-5.6-sol": {
-		InputPerMillion: 5.00, CachedInputPerMillion: 0.50, OutputPerMillion: 30.00,
-	},
-	"gpt-5.6-terra": {
-		InputPerMillion: 2.50, CachedInputPerMillion: 0.25, OutputPerMillion: 15.00,
-	},
-	"gpt-5.6-luna": {
-		InputPerMillion: 1.00, CachedInputPerMillion: 0.10, OutputPerMillion: 6.00,
-	},
 }
 
 // OpenAIResponsesCouncilEditor drives a frontier OpenAI model (e.g. gpt-5.4)
@@ -64,6 +48,7 @@ var openAICouncilTokenPrices = map[string]openAITokenPrice{
 // unchanged; only the synthesis model differs. A single stateless Responses
 // turn per Edit — no tools, no conversation state.
 type OpenAIResponsesCouncilEditor struct {
+	Breaker *VendorBreaker // nil uses the process-wide breaker
 	Client  responsesClient
 	Model   string // e.g. "gpt-5.4"
 	Backend string // attribution only; default "openai-responses"
@@ -87,11 +72,16 @@ type OpenAIResponsesCouncilEditor struct {
 
 // Edit implements council.Editor.
 func (e *OpenAIResponsesCouncilEditor) Edit(ctx context.Context, brief *council.Brief, reviews []council.ReviewerOutput) (*council.EditorOutput, error) {
+	return e.editWithVendor(ctx, brief, reviews, "openai", openAICouncilResponseCostUSD)
+}
+
+// editWithVendor shares prompt grounding, artifact parsing and guardrails across transports.
+func (e *OpenAIResponsesCouncilEditor) editWithVendor(ctx context.Context, brief *council.Brief, reviews []council.ReviewerOutput, vendor string, price func(string, openairesponses.TurnResponse) (float64, bool)) (*council.EditorOutput, error) {
 	if e == nil || e.Client == nil {
-		return nil, errors.New("openai council editor: client not configured")
+		return nil, fmt.Errorf("%s council editor: client not configured", vendor)
 	}
 	if brief == nil {
-		return nil, errors.New("openai council editor: brief required")
+		return nil, fmt.Errorf("%s council editor: brief required", vendor)
 	}
 	patterns := fetchApprovedPatterns(ctx, e.Patterns)
 	repoTree := RepoPackageLayout(e.RepoRoot, councilLayoutMaxEntries)
@@ -103,20 +93,36 @@ func (e *OpenAIResponsesCouncilEditor) Edit(ctx context.Context, brief *council.
 	memory := council.MemoryBlock(ctx, e.Memory)
 	prompt := buildCouncilEditorPrompt(brief, reviews, patterns, repoTree, memory)
 	started := time.Now().UTC()
-	resp, err := e.Client.Create(ctx, openairesponses.TurnRequest{
-		Model:          e.Model,
-		Input:          prompt,
-		Context:        openairesponses.ContextStrategy{Mode: openairesponses.ContextModeStateless},
-		PromptCacheKey: openAICouncilPromptCacheKey,
-	})
+	b := vendorBreaker(e.Breaker)
+	var resp openairesponses.TurnResponse
+	err := b.check(vendor)
+	if err == nil {
+		resp, err = e.Client.Create(ctx, openairesponses.TurnRequest{
+			Model:          e.Model,
+			Input:          prompt,
+			Context:        openairesponses.ContextStrategy{Mode: openairesponses.ContextModeStateless},
+			PromptCacheKey: openAICouncilPromptCacheKey,
+		})
+		if err != nil {
+			err = b.failure(vendor, err)
+		} else {
+			b.Reset(vendor)
+		}
+	}
 	if err != nil {
-		cost, priced := openAICouncilResponseCostUSD(e.Model, resp)
+		cost, priced := price(e.Model, resp)
 		hasUsage := resp.PromptTokens > 0 || resp.CachedTokens > 0 || resp.CompletionTokens > 0
+		unpriced := !priced || !hasUsage
+		notes := ""
+		if !hasUsage && vendorKnownZero(err) {
+			cost, unpriced = 0, false
+			notes = "no charge: " + err.Error()
+		}
 		return &council.EditorOutput{
 			Backend: e.backend(), Model: e.Model, CostUSD: cost,
-			CostUnpriced: !priced || !hasUsage,
-			Sidecar:      council.Sidecar{StartedAt: started, CostUSD: council.SidecarCost{Frontier: cost}},
-		}, fmt.Errorf("openai council editor: %w", err)
+			CostUnpriced: unpriced,
+			Sidecar:      council.Sidecar{StartedAt: started, Notes: notes, CostUSD: council.SidecarCost{Frontier: cost}},
+		}, fmt.Errorf("%s council editor: %w", vendor, err)
 	}
 
 	raw := strings.TrimSpace(resp.OutputText)
@@ -129,14 +135,14 @@ func (e *OpenAIResponsesCouncilEditor) Edit(ctx context.Context, brief *council.
 		sections.implementation = strings.TrimSpace(sections.implementation[:i])
 	}
 	models := councilModels(e.Model, reviews)
-	notes := fmt.Sprintf("generated by OpenAI Responses council editor (in=%d out=%d cached=%d tokens)",
+	notes := fmt.Sprintf("generated by %s council editor (in=%d out=%d cached=%d tokens)", vendor,
 		resp.PromptTokens, resp.CompletionTokens, resp.CachedTokens)
 	if empty {
 		notes = fmt.Sprintf("editor model %q returned no content; run marked error", e.Model)
 	} else if n := councilProposalsNote(propStatus, propDetail); n != "" {
 		notes += "; " + n
 	}
-	cost, costPriced := openAICouncilResponseCostUSD(e.Model, resp)
+	cost, costPriced := price(e.Model, resp)
 	hasUsage := resp.PromptTokens > 0 || resp.CachedTokens > 0 || resp.CompletionTokens > 0
 	out := &council.EditorOutput{
 		Backend:      e.backend(),
@@ -192,27 +198,23 @@ func openAICouncilChatResponseCostUSD(model string, resp *chatResponse) (float64
 // openAICouncilTokenCostUSD prices a known Council OpenAI model from its
 // OpenAI-compatible usage block. LiteLLM routes OpenAI models as oa/<model>;
 // remove only that gateway prefix so aliases cannot accidentally inherit a
-// different model's rate.
+// different model's rate (lookupOpenAIPrice: policy overlay, then the
+// compiled llmpricing snapshot). promptTokens is the OpenAI total (cached
+// share included); llmpricing wants the two halves, and applies the >272K
+// long-context multipliers itself.
 func openAICouncilTokenCostUSD(model string, promptTokens, cachedTokens, completionTokens int) (float64, bool) {
-	model = strings.TrimPrefix(strings.TrimSpace(model), "oa/")
-	price, ok := openAICouncilTokenPrices[model]
+	row, ok := lookupOpenAIPrice(model)
 	if !ok {
 		return 0, false
 	}
+	price := llmpricing.OpenAIPrice{
+		InputPer1M:       row.InputPerMillion,
+		CachedInputPer1M: row.CachedInputPerMillion,
+		OutputPer1M:      row.OutputPerMillion,
+	}
 	prompt := max(promptTokens, 0)
-	cached := max(cachedTokens, 0)
-	if cached > prompt {
-		cached = prompt
-	}
-	completion := max(completionTokens, 0)
-	uncached := prompt - cached
-	inputMultiplier, outputMultiplier := 1.0, 1.0
-	if prompt > 272_000 {
-		inputMultiplier = 2
-		outputMultiplier = 1.5
-	}
-	return inputMultiplier*(float64(uncached)*price.InputPerMillion+float64(cached)*price.CachedInputPerMillion)/1_000_000 +
-		outputMultiplier*float64(completion)*price.OutputPerMillion/1_000_000, true
+	cached := min(max(cachedTokens, 0), prompt)
+	return price.CostUSD(prompt-cached, cached, completionTokens), true
 }
 
 func (e *OpenAIResponsesCouncilEditor) backend() string {
@@ -233,6 +235,13 @@ type FallbackCouncilEditor struct {
 	Primary  council.Editor
 	Fallback council.Editor
 	Logger   *slog.Logger
+	// PrimaryLabel / FallbackLabel name the two editors in the fallback log
+	// line ("anthropic:claude-fable-5-1" → "openai:gpt-5.5→flexinfer"). They
+	// exist because chains nest (primary → cross-vendor → local) and an
+	// unlabelled "falling back to secondary editor" no longer says which hop
+	// fired. Optional; empty renders as "primary"/"fallback".
+	PrimaryLabel  string
+	FallbackLabel string
 }
 
 // Edit implements council.Editor.
@@ -249,7 +258,15 @@ func (e *FallbackCouncilEditor) Edit(ctx context.Context, brief *council.Brief, 
 		if primaryErr != nil {
 			reason = primaryErr.Error()
 		}
-		e.Logger.Warn("primary council editor failed; falling back to secondary editor", "reason", reason)
+		primaryLabel, fallbackLabel := e.PrimaryLabel, e.FallbackLabel
+		if primaryLabel == "" {
+			primaryLabel = "primary"
+		}
+		if fallbackLabel == "" {
+			fallbackLabel = "fallback"
+		}
+		e.Logger.Warn("primary council editor failed; falling back to secondary editor",
+			"primary", primaryLabel, "fallback", fallbackLabel, "reason", reason)
 	}
 	fallbackOut, fallbackErr := e.Fallback.Edit(ctx, brief, reviews)
 	merged := mergeCouncilEditorAttempts(fallbackOut, primaryOut)
@@ -259,12 +276,34 @@ func (e *FallbackCouncilEditor) Edit(ctx context.Context, brief *council.Brief, 
 	if merged != nil && ((primaryErr != nil && primaryOut == nil) || (fallbackErr != nil && fallbackOut == nil)) {
 		merged.CostUnpriced = true
 	}
+	if merged != nil && (fallbackErr != nil || fallbackOut == nil || fallbackOut.Empty) {
+		merged.Empty = true
+	}
+	if merged != nil && fallbackErr == nil && fallbackOut != nil && !fallbackOut.Empty {
+		kind := "empty_output"
+		if primaryErr != nil {
+			kind = "unknown"
+		}
+		if ve, ok := AsVendorError(primaryErr); ok {
+			kind = string(ve.Kind)
+		}
+		if errors.Is(primaryErr, ErrVendorBreakerOpen) {
+			kind = "breaker_open"
+		}
+		destination := fallbackOut.Backend + ":" + fallbackOut.Model
+		hop := council.EditorFallbackHop{Primary: e.PrimaryLabel, Destination: destination, Kind: kind}
+		merged.FallbackHops = append([]council.EditorFallbackHop{hop}, merged.FallbackHops...)
+	}
 	return merged, fallbackErr
 }
 
 func mergeCouncilEditorAttempts(result, prior *council.EditorOutput) *council.EditorOutput {
 	if result == nil {
-		return prior
+		if prior == nil {
+			return nil
+		}
+		merged := *prior
+		return &merged
 	}
 	merged := *result
 	if prior == nil {

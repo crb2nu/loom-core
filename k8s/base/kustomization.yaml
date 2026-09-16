@@ -126,6 +126,7 @@ resources:
   # === SANDBOX (K8s backend, needs ServiceAccount for pod management) ===
   - servers/devbox/configmap.yaml
   - servers/devbox/deployment.yaml
+  - servers/devbox/pvc.yaml
   - servers/devbox/service.yaml
   - servers/devbox/serviceaccount.yaml
 
@@ -269,3 +270,12 @@ patches:
     target:
       kind: Deployment
       labelSelector: component=mcp-server
+
+  # Applied after the fleet default; retain its preStop hook.
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/terminationGracePeriodSeconds
+        value: 1860
+    target:
+      kind: Deployment
+      name: devbox

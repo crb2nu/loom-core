@@ -10,7 +10,6 @@ import (
 	"gitlab.flexinfer.ai/libs/mcp-go"
 
 	"github.com/crb2nu/loom/internal/devbox/backend"
-	"github.com/crb2nu/loom/internal/devbox/detect"
 	"github.com/crb2nu/loom/internal/devbox/dockerfile"
 	"github.com/crb2nu/loom/internal/devbox/state"
 	"github.com/crb2nu/loom/pkg/poll"
@@ -142,7 +141,7 @@ func (m *manager) handleBuild(ctx context.Context, args map[string]any) (*mcp.Ca
 		return mcp.ErrorResult(err), nil
 	}
 
-	fp, err := detect.Fingerprint(projectDir)
+	fp, err := m.fingerprintProject(ctx, projectDir)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("fingerprint: %w", err)), nil
 	}
@@ -267,6 +266,8 @@ func (m *manager) handleStatus(ctx context.Context, args map[string]any) (*mcp.C
 }
 
 func (m *manager) handleStop(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	defer cancel()
 	v := validate.NewArgs(args)
 	project := v.Required("project")
 	agentID := v.String("agent_id", "")
@@ -280,10 +281,17 @@ func (m *manager) handleStop(ctx context.Context, args map[string]any) (*mcp.Cal
 	}
 
 	key := storeKey(projectName, agentID)
+	if err := m.lockGateLifecycle(ctx, key, true); err != nil {
+		return mcp.ErrorResult(err), nil
+	}
+	defer m.projectLock(key).Unlock()
+
 	containerID := m.containerName(projectName, agentID)
 	if err := m.backend.Stop(ctx, containerID); err != nil {
 		return mcp.ErrorResult(fmt.Errorf("stop failed: %w", err)), nil
 	}
+
+	m.gateCleanupFailures.Delete(key)
 
 	entry := m.store.Get(key)
 	if entry != nil {
@@ -306,7 +314,7 @@ func (m *manager) handleDetect(ctx context.Context, args map[string]any) (*mcp.C
 		return mcp.ErrorResult(err), nil
 	}
 
-	fp, err := detect.Fingerprint(projectDir)
+	fp, err := m.fingerprintProject(ctx, projectDir)
 	if err != nil {
 		return mcp.ErrorResult(fmt.Errorf("fingerprint: %w", err)), nil
 	}
@@ -424,4 +432,22 @@ func (m *manager) handleWriteFile(ctx context.Context, args map[string]any) (*mc
 		"path":    path,
 		"bytes":   len(content),
 	})
+}
+
+// Protect the sandbox during setup and non-exec operations as well as execution.
+// Detached execs acquire their own hold before their launch handler returns.
+func (m *manager) protectSandbox(next mcp.ToolHandler) mcp.ToolHandler {
+	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		if m.isK8sBackend() {
+			if project, ok := args["project"].(string); ok && project != "" {
+				if _, name, err := m.resolveProject(project); err == nil {
+					agentID, _ := args["agent_id"].(string)
+					key := storeKey(name, agentID)
+					m.incActiveExecs(key)
+					defer m.decActiveExecs(key)
+				}
+			}
+		}
+		return next(ctx, args)
+	}
 }

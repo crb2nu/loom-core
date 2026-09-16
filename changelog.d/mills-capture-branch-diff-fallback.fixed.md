@@ -1,0 +1,1 @@
+- Fix `pkg/mills/pipeline/dispatcher.go` capture-less spawn runs by loading the pushed branch-versus-base diff through the project GitLab client before `nonempty_diff` evaluates implement output.

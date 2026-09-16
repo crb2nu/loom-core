@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"time"
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 )
@@ -34,6 +35,24 @@ var (
 // runaway servers do not blow memory before the drop-and-meter path kicks in.
 const notifyChanBuffer = 16
 
+// abandonedTTL is how long an id whose Recv caller gave up stays recognisable
+// so that its late response is filed as "late" (the server did the work, the
+// caller had already timed out) rather than "unsolicited". Two minutes covers
+// every per-call budget the daemon hands out, including extended ones.
+const abandonedTTL = 2 * time.Minute
+
+// abandonedSweepAt is the set size from which each insert first sweeps
+// expired entries. Below it the set is too small to be worth scanning; above
+// it a scan per insert is still cheap because inserts only happen on
+// timeouts.
+const abandonedSweepAt = 256
+
+// abandonedMax bounds the abandoned-id set after the sweep. The cap only
+// matters if a caller abandons thousands of calls inside one TTL window, in
+// which case arbitrary survivors are dropped and their late responses
+// degrade to the unsolicited path (a WARN, never a leak).
+const abandonedMax = 4096
+
 // Transport multiplexes JSON-RPC requests over a single underlying mcp.Transport
 // by routing inbound messages to per-id channels.
 //
@@ -46,6 +65,7 @@ type Transport struct {
 
 	mu         sync.Mutex
 	pending    map[string]chan *mcp.Message
+	abandoned  map[string]time.Time // ids whose Recv caller gave up, keyed to when
 	closed     bool
 	closeCause error // first inner.Recv error observed by readLoop; nil on deliberate Close
 
@@ -69,6 +89,7 @@ func New(inner mcp.Transport, opts ...Option) *Transport {
 	t := &Transport{
 		inner:        inner,
 		pending:      make(map[string]chan *mcp.Message),
+		abandoned:    make(map[string]time.Time),
 		notifyCh:     make(chan *mcp.Message, notifyChanBuffer),
 		readerCtx:    ctx,
 		readerCancel: cancel,
@@ -151,10 +172,59 @@ func (t *Transport) Recv(ctx context.Context, id any) (*mcp.Message, error) {
 		}
 		return msg, nil
 	case <-ctx.Done():
+		// The caller is giving up on a call the server may still be working
+		// on. Remember the id so the response, if it ever lands, is filed as
+		// late work rather than as an unsolicited message. The deferred
+		// pending delete runs after this, so a response racing in right now
+		// still dispatches into ch (buffer 1) and is simply never read.
+		t.markAbandoned(key)
 		return nil, ctx.Err()
 	case <-t.done:
 		return nil, t.closedErr()
 	}
+}
+
+// markAbandoned records that the Recv caller for key gave up before the
+// response arrived. Expired entries are pruned on the way in; the set is
+// hard-capped so a caller storm cannot grow it without bound.
+func (t *Transport) markAbandoned(key string) {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.abandoned) >= abandonedSweepAt {
+		for k, at := range t.abandoned {
+			if now.Sub(at) > abandonedTTL {
+				delete(t.abandoned, k)
+			}
+		}
+	}
+	// Still full after the TTL sweep: drop arbitrary survivors so the newest
+	// abandonment is always tracked.
+	for k := range t.abandoned {
+		if len(t.abandoned) < abandonedMax {
+			break
+		}
+		delete(t.abandoned, k)
+	}
+	t.abandoned[key] = now
+}
+
+// takeAbandoned reports whether key was abandoned within abandonedTTL and, if
+// so, removes it and returns how long after the abandonment the response
+// arrived.
+func (t *Transport) takeAbandoned(key string) (time.Duration, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	at, ok := t.abandoned[key]
+	if !ok {
+		return 0, false
+	}
+	delete(t.abandoned, key)
+	late := time.Since(at)
+	if late > abandonedTTL {
+		return 0, false
+	}
+	return late, true
 }
 
 // closedErr returns ErrClosed annotated with the underlying read error when
@@ -282,8 +352,18 @@ func (t *Transport) readLoop() {
 		ch, ok := t.pending[key]
 		t.mu.Unlock()
 		if !ok {
-			// No registered waiter (caller cancelled before response arrived,
-			// or server sent an unsolicited response).
+			// No registered waiter. Two very different situations land here:
+			// the caller timed out and the server has now finished anyway
+			// (expected under load, and the interesting number is HOW late),
+			// or the server emitted a response nobody asked for (a protocol
+			// fault). Only the second deserves a warning.
+			if late, abandoned := t.takeAbandoned(key); abandoned {
+				t.metrics.IncMuxLateResponses()
+				t.logger.Debug("muxstdio: late response for abandoned call",
+					slog.String("id", key),
+					slog.Duration("late_by", late))
+				continue
+			}
 			t.metrics.IncMuxDropsNoPending()
 			t.logger.Warn("muxstdio: dropped response (no pending waiter)",
 				slog.String("id", key))

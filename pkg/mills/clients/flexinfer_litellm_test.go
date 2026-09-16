@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -250,5 +251,46 @@ func TestWeaverClient_LiteLLMCostPassthrough(t *testing.T) {
 	}
 	if out.Model != "or/kimi-k3" {
 		t.Errorf("weaver Model = %q, want or/kimi-k3", out.Model)
+	}
+}
+
+// TestNewFlexInferClient_IgnoreFallbackEnvKeepsProxyChainBackendLocal is the
+// mirror image of the two tests above: when the operator has moved a role to
+// the gateway, the FlexInfer-PROXY client must not inherit that role's env
+// fallback list (gateway ids) either — the blank primary resolves through the
+// registry and the chain stays FlexInfer-only. The contrast client shows the
+// default (env honoured) is unchanged for a role left on the proxy.
+func TestNewFlexInferClient_IgnoreFallbackEnvKeepsProxyChainBackendLocal(t *testing.T) {
+	t.Setenv("FLEXINFER_JUDGE_MODEL_FALLBACKS", "oa/gpt-5.6-terra")
+	t.Setenv("FLEXINFER_WEAVER_MODEL_FALLBACKS", "or/kimi-k2.7-code")
+	gatewayID := func(id string) bool { return strings.HasPrefix(id, "oa/") || strings.HasPrefix(id, "or/") }
+
+	proxy, err := NewFlexInferClient(FlexInferConfig{
+		ProxyURL:                "http://flexinfer.test",
+		IgnoreJudgeFallbackEnv:  true,
+		IgnoreWeaverFallbackEnv: true,
+	})
+	if err != nil {
+		t.Fatalf("proxy ctor: %v", err)
+	}
+	for role, id := range map[string]string{"judge": proxy.JudgeModel(), "weaver": proxy.WeaverModel()} {
+		if id == "" || gatewayID(id) {
+			t.Errorf("%s model = %q, want a registry-resolved FlexInfer id", role, id)
+		}
+	}
+	for role, chain := range map[string][]string{"judge": proxy.JudgeModelFallbacks(), "weaver": proxy.WeaverModelFallbacks()} {
+		for _, id := range chain {
+			if gatewayID(id) {
+				t.Errorf("%s fallbacks = %v leak a gateway id despite Ignore*FallbackEnv", role, chain)
+			}
+		}
+	}
+
+	def, err := NewFlexInferClient(FlexInferConfig{ProxyURL: "http://flexinfer.test", JudgeModel: "gemma4-26b-a4b-gptq"})
+	if err != nil {
+		t.Fatalf("default ctor: %v", err)
+	}
+	if got := def.JudgeModelFallbacks(); !slices.Contains(got, "oa/gpt-5.6-terra") {
+		t.Errorf("default judge fallbacks = %v, want the env list honoured when not ignored", got)
 	}
 }

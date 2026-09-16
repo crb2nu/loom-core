@@ -1,13 +1,25 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestShellQuotePreservesHostileEnvironmentValues(t *testing.T) {
+	value := "space ' quote $HOME `command`\nnewline"
+	quoted := shellQuote(value)
+	if !strings.HasPrefix(quoted, "'") || !strings.Contains(quoted, `'\''`) || !strings.Contains(quoted, "\n") {
+		t.Fatalf("shellQuote(%q) = %q", value, quoted)
+	}
+}
 
 func TestStreamExecContext_RelaysWatchdogCancellation(t *testing.T) {
 	parent, cancelParent := context.WithCancelCause(context.Background())
@@ -342,5 +354,140 @@ func TestStreamLineCallbackWriter_CallbackGetsCopy(t *testing.T) {
 	w.Write([]byte("second\n"))
 	if string(captured) != "second" {
 		t.Errorf("captured: got %q, want %q", string(captured), "second")
+	}
+}
+
+func TestStderrCaptureParity(t *testing.T) {
+	var numbered strings.Builder
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&numbered, "line %d\n", i)
+	}
+	cases := []string{"", "\n", "a\n\n", "partial", numbered.String(),
+		strings.Repeat("overlap\n", 15), strings.Repeat("x\n", 20), strings.Repeat("x\n", 21),
+		strings.Repeat(strings.Repeat("x", 1000)+"\n", 15),
+		strings.Repeat("huge", 40000),
+		strings.Repeat(strings.Repeat("z", 70000)+"\n", 25) + "last",
+	}
+	for index, input := range cases {
+		for _, chunk := range []int{1, 137, 65536} {
+			// Smaller fixtures cover single-byte boundaries, including spills;
+			// avoid millions of individual disk writes for the longest stream.
+			if chunk == 1 && len(input) > 200000 {
+				continue
+			}
+			for _, callback := range []bool{false, true} {
+				t.Run(fmt.Sprintf("case%d/chunk%d/callback%v", index, chunk, callback), func(t *testing.T) {
+					t.Setenv("TMPDIR", t.TempDir())
+					c := &stderrCapture{}
+					defer c.Close()
+					var gotLines [][]byte
+					if callback {
+						c.onLine = func(p []byte) { gotLines = append(gotLines, p) }
+					}
+					for offset := 0; offset < len(input); offset += chunk {
+						p := []byte(input[offset:min(offset+chunk, len(input))])
+						if n, err := c.Write(p); err != nil || n != len(p) {
+							t.Fatalf("write: %d, %v", n, err)
+						}
+					}
+					c.Flush()
+					c.Flush() // A second flush must not duplicate the partial line.
+					got, err := c.Tail()
+					want, count, truncated := TruncateOutput(input, 20)
+					if err != nil || got != want || c.total != count || (c.total > 20) != truncated {
+						t.Fatalf("tail mismatch: error=%v bytes=%d/%d lines=%d/%d", err, len(got), len(want), c.total, count)
+					}
+					if head := stderrHead(string(c.head[:c.headLen])); head != stderrHead(input) {
+						t.Fatal("head mismatch")
+					}
+					if callback {
+						var expected [][]byte
+						w := &lineCallbackWriter{onLine: func(p []byte) { expected = append(expected, p) }}
+						_, _ = w.Write([]byte(input))
+						w.Flush()
+						if !reflect.DeepEqual(gotLines, expected) {
+							t.Fatal("callback mismatch")
+						}
+					}
+					// The only retained byte buffers are fixed arrays, even for huge lines.
+					capacity := len(c.head)
+					for i := range c.lines {
+						capacity += len(c.lines[i].buf)
+					}
+					if capacity > 8*1024+64*1024 {
+						t.Fatalf("retained capacity = %d", capacity)
+					}
+					c.Close()
+					files, err := os.ReadDir(os.Getenv("TMPDIR"))
+					if err != nil || len(files) != 0 {
+						t.Fatalf("temporary files leaked: %v, %v", files, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestStderrCaptureSpillEviction(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	c := &stderrCapture{}
+	defer c.Close()
+	_, err := c.Write([]byte(strings.Repeat("a", 70000) + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, _ := os.ReadDir(dir)
+	if len(files) != 1 {
+		t.Fatalf("expected one spill, got %d", len(files))
+	}
+	_, err = c.Write([]byte(strings.Repeat("short\n", 20)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, _ = os.ReadDir(dir)
+	if len(files) != 0 {
+		t.Fatal("evicted spill still exists")
+	}
+}
+
+func TestStderrCaptureSpillError(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir()+"/missing")
+	c := &stderrCapture{}
+	defer c.Close()
+	if _, err := c.Write([]byte(strings.Repeat("x", 70000))); err == nil {
+		t.Fatal("expected spill error")
+	}
+	c.Flush()
+	if _, err := c.Tail(); err == nil {
+		t.Fatal("capture error was hidden")
+	}
+}
+
+func TestStderrCaptureTransportError(t *testing.T) {
+	for _, existing := range []string{"", "\n", "diagnostic"} {
+		for _, stdout := range []int{0, 1} {
+			c := &stderrCapture{onLine: func([]byte) { t.Error("synthetic callback") }}
+			// Existing output has already been delivered to the real callback.
+			c.onLine = nil
+			_, _ = c.Write([]byte(existing))
+			c.Flush()
+			c.onLine = func([]byte) { t.Error("synthetic callback") }
+			streamErr := errors.New("upgrade rejected")
+			c.surfaceError(stdout, streamErr)
+			got, err := c.Tail()
+			var old bytes.Buffer
+			old.WriteString(existing)
+			var out bytes.Buffer
+			if stdout > 0 {
+				out.WriteString("stdout")
+			}
+			surfaceExecStreamError(&out, &old, streamErr)
+			want, _, _ := TruncateOutput(old.String(), 20)
+			if err != nil || got != want {
+				t.Fatalf("got %q, %v; want %q", got, err, want)
+			}
+			c.Close()
+		}
 	}
 }

@@ -44,6 +44,7 @@ raw.githubusercontent.com	raw\.githubusercontent\.com	vendor the file into the r
 github-release-download	github\.com/[^ "']*/releases/download	vendor the asset into Harbor or the repo, or allowlist with a reason
 get.docker.com	get\.docker\.com	install from the distro mirror or a prebuilt image
 sh.rustup.rs	sh\.rustup\.rs	use a rust toolchain image instead of a curl|sh installer
+golangci-lint.run	golangci-lint\.run|golangci-lint config verify[[:space:]]*$	bare `config verify` fetches its schema from golangci-lint.run at runtime — pass --schema ci/golangci.v<MAJ>.<MIN>.jsonschema.json (vendored in-repo)
 EOF
 )
 

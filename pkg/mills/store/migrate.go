@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,12 @@ const migrationsDir = "migrations"
 // integer applied in ascending order. Each file is executed as a single
 // statement batch inside one transaction.
 func Migrate(ctx context.Context, db *sql.DB) error {
+	return migrateUpTo(ctx, db, math.MaxInt)
+}
+
+// migrateUpTo applies pending migrations whose version is <= maxVersion. Tests
+// use it to freeze a schema at a given version; Migrate passes math.MaxInt.
+func migrateUpTo(ctx context.Context, db *sql.DB, maxVersion int) error {
 	if _, err := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    INTEGER PRIMARY KEY,
@@ -48,6 +55,9 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	}
 
 	for _, m := range files {
+		if m.version > maxVersion {
+			break
+		}
 		if applied[m.version] {
 			continue
 		}
@@ -179,7 +189,7 @@ func applyOne(ctx context.Context, db *sql.DB, m migration) error {
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
-		m.version, m.name, time.Now().UTC().Format(time.RFC3339Nano),
+		m.version, m.name, timeRFC3339(time.Now()),
 	); err != nil {
 		return fmt.Errorf("record migration %d: %w", m.version, err)
 	}

@@ -1,0 +1,15 @@
+test:mills-mr-awareness-killtest:
+  extends: .go-template
+  stage: test
+  needs:
+    - job: prepare:go-cache
+      artifacts: false
+  script:
+    - sh -n scripts/mr_awareness_killtest.sh
+    - scripts/mr_awareness_killtest.sh
+  rules:
+    - changes:
+        - pkg/mills/mergequeue/**/*
+        - scripts/mr_awareness_killtest.sh
+        - ci/mills.gitlab-ci.yml
+        - .gitlab-ci.yml

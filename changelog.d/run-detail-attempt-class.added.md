@@ -1,0 +1,1 @@
+- Show per-attempt retry classes and tests-effective counts in the Mills run drawer, preserving retry metadata through `pkg/mills/pipeline/runner.go` and `cmd/loom-mills-operator/handlers_pipeline.go` and rendering it in `PipelineRunDetail.svelte` with the `mills.svelte.ts` run type.

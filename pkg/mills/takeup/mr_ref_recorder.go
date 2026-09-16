@@ -37,7 +37,7 @@ import (
 // PlanSliceMRStore is the Plan Store surface the recorder needs, satisfied by
 // *clients.PlanClient. Narrow so tests fake it without the MCP hub.
 type PlanSliceMRStore interface {
-	ListSlices(ctx context.Context, planID string) ([]clients.PlanSliceSummary, error)
+	ListSlicesIfChanged(ctx context.Context, plan clients.PlanSummary) ([]clients.PlanSliceSummary, error)
 	GetSlice(ctx context.Context, sliceID string) (clients.PlanSliceSummary, error)
 	UpdateSliceMRRef(ctx context.Context, sliceID, mrRef string) error
 	AppendSliceDecision(ctx context.Context, sliceID, note string) error
@@ -98,7 +98,10 @@ func (r *MRRefRecorder) RecordMRRef(ctx context.Context, planID, backlogID, mrRe
 	if mrRef == "" {
 		return "", errors.New("take-up: mr_ref required")
 	}
-	slices, err := r.plans.ListSlices(ctx, planID)
+	// This legacy call path has only a plan ID, so the empty stamp deliberately
+	// fails safe to a live read. Callers that acquire a PlanSummary can use the
+	// cache without inventing a freshness signal.
+	slices, err := r.plans.ListSlicesIfChanged(ctx, clients.PlanSummary{ID: planID})
 	if err != nil {
 		return "", fmt.Errorf("take-up: list slices for plan %s: %w", planID, err)
 	}

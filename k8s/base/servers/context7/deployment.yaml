@@ -5,7 +5,7 @@ metadata:
     app: context7
     component: mcp-server
     mcp.server/name: context7
-    mcp.server/type: python
+    mcp.server/type: node
   name: context7
 spec:
   replicas: 2
@@ -39,8 +39,8 @@ spec:
             - name: MCP_SERVER_NAME
               value: context7
             - name: MCP_SERVER_COMMAND
-              value: python3 scripts/mcp/run_cached_node_server.py context7
-          image: registry.harbor.lan/mcp/python-server:latest
+              value: context7-mcp
+          image: registry.harbor.lan/mcp/custom-server:latest
           imagePullPolicy: IfNotPresent
           livenessProbe:
             httpGet:

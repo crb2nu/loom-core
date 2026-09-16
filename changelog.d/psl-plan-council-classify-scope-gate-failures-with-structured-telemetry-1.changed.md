@@ -1,0 +1,1 @@
+- Classify failed scope-gate evaluations as `missing_directory`, `wrong_basename`, or `genuine_detour`, attach the bounded class to structured gate records, and increment `scope_failure_class` exactly once in `pkg/mills/gates/scope.go`, `pkg/mills/gates/gates.go`, and `pkg/telemetry/telemetry.go`.

@@ -1,0 +1,1 @@
+- New shepherd overseer (default-off, dry-run default): bounded audited escalated-to-queued relaunches for aged retryable escalations the auto-requeue sweep structurally cannot reach (MR-bearing, cross-repo, code-class), plus once-only attention flags for closed-MR orphans. Policy section overseers.shepherd with allow.relaunch opt-in and per-tick/day caps.

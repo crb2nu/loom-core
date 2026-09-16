@@ -1,0 +1,1 @@
+- Add a presence-only model credential preflight in `pkg/mills/clients/client.go` and gate council admission in `pkg/mills/runner/runner.go`, failing closed with class `model_auth` before provider or durable work.

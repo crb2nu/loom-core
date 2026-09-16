@@ -234,6 +234,24 @@ func run(ctx context.Context) error {
 	}, mcpotel.TracedToolHandler(tracer, "flexinfer_proxy_health", f.handleProxyHealth))
 
 	server.AddTool(mcp.Tool{
+		Name:        "flexinfer_rag",
+		Description: "Search an embedded codebase index on the gfx906 retrieval plane (bge embed -> qdrant -> bge rerank) and return reranked code chunks with path citations. Collections: codebase_memory_bge_v1 (loom-core, default), codebase_memory_bge_loom_v1, codebase_memory_bge_flexinfer_v1, codebase_memory_bge_flexdeck_v1. Default retrieve_only=true is sub-second and touches no chat GPU lane — synthesize the answer yourself from the returned chunks. retrieve_only=false asks the server for a generated cited answer (may cold-start a chat lane; can take minutes).",
+		InputSchema: mcp.InputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"query":         map[string]any{"type": "string", "description": "Natural-language question about the codebase"},
+				"collection":    map[string]any{"type": "string", "description": "Qdrant collection to search (default: codebase_memory_bge_v1 = loom-core)"},
+				"retrieve_only": map[string]any{"type": "boolean", "description": "true (default): return chunks only, sub-second; false: server-side generated answer"},
+				"top_k":         map[string]any{"type": "integer", "description": "Chunks returned after rerank (default: service RETR_K=6)"},
+				"top_n":         map[string]any{"type": "integer", "description": "Cosine candidates fed to the reranker (default: service RETR_N=24)"},
+				"max_per_path":  map[string]any{"type": "integer", "description": "Per-file cap on returned chunks (0 = uncapped)"},
+				"proxy_url":     map[string]any{"type": "string", "description": "Override proxy URL (default: FLEXINFER_PROXY_URL env)"},
+			},
+			Required: []string{"query"},
+		},
+	}, mcpotel.TracedToolHandler(tracer, "flexinfer_rag", f.handleRAG))
+
+	server.AddTool(mcp.Tool{
 		Name:        "flexinfer_probe",
 		Description: "Diagnostic: check CRDs installed, controller/proxy pods, GPU node count",
 		InputSchema: mcp.InputSchema{

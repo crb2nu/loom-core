@@ -101,6 +101,42 @@ type patternRecordEnvelope struct {
 	PatternHarvest
 }
 
+// MintVaccine upserts the Pattern Loom candidate representing a rescued
+// escalation's prevention rule. The stable escalation-derived id makes retries
+// exactly-once; the regression path is carried as the candidate's proof.
+func (c *PatternClient) MintVaccine(ctx context.Context, runID, backlogID, title, regressionPath string) (string, error) {
+	if c == nil || c.Hub == nil {
+		return "", fmt.Errorf("pattern: mint vaccine: client not configured")
+	}
+	runID = strings.TrimSpace(runID)
+	regressionPath = strings.TrimSpace(regressionPath)
+	if runID == "" || regressionPath == "" {
+		return "", fmt.Errorf("pattern: mint vaccine: run id and regression path required")
+	}
+	id := "pattern-vaccine-" + strings.ToLower(strings.NewReplacer("_", "-", "/", "-", " ", "-").Replace(runID))
+	body, err := c.Hub.CallTool(ctx, c.serverName(), "agent_pattern_add", map[string]any{
+		"id": id, "name": "Vaccine: " + strings.TrimSpace(title),
+		"makes": "Prevention for rescued Mills escalation", "status": "candidate",
+		"description": "Prevents recurrence of escalation " + runID + " for backlog item " + backlogID,
+		"provenance":  map[string]any{"author": "loom-mills-operator", "notes": "regression proof: " + regressionPath},
+		"tags":        []string{"mills-vaccine", "rescued-escalation"},
+	})
+	if err != nil && body == "" {
+		return "", fmt.Errorf("pattern: mint vaccine: %w", err)
+	}
+	var env struct {
+		OK        bool   `json:"ok"`
+		PatternID string `json:"pattern_id"`
+	}
+	if derr := decodeListBody(body, &env); derr != nil {
+		return "", fmt.Errorf("pattern: mint vaccine decode: %w; raw=%q", derr, truncateBody(body, 240))
+	}
+	if !env.OK || strings.TrimSpace(env.PatternID) == "" {
+		return "", fmt.Errorf("pattern: mint vaccine rejected: %s", truncateBody(body, 240))
+	}
+	return env.PatternID, nil
+}
+
 // RecordInstance records a merged pattern-stamped instance against the taste
 // gate (Pattern Loom B2/J2 auto-harvest): increments instances_shipped_green,
 // which auto-promotes a candidate at the policy threshold. mrRef lands in the

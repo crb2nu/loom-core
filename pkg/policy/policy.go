@@ -3,10 +3,30 @@
 package policy
 
 import (
-	"fmt"
+	"context"
+	"errors"
+	"strings"
+	"time"
 
 	"github.com/crb2nu/loom/internal/loomconcurrency"
 )
+
+const DefaultMainRedExternalHold = 2 * time.Hour
+const MaxMainRedExternalHold = 24 * time.Hour
+
+type MainRedExternalHoldPolicy struct {
+	HoldMinutes int `json:"hold_minutes,omitempty" yaml:"hold_minutes,omitempty"`
+}
+
+func (p MainRedExternalHoldPolicy) Duration() time.Duration {
+	if p.HoldMinutes <= 0 {
+		return DefaultMainRedExternalHold
+	}
+	if p.HoldMinutes > int(MaxMainRedExternalHold/time.Minute) {
+		return MaxMainRedExternalHold
+	}
+	return time.Duration(p.HoldMinutes) * time.Minute
+}
 
 const (
 	// DefaultExternalIncidentThreshold is the maximum number of external
@@ -23,32 +43,76 @@ const (
 	// DefaultPipelineConcurrencyLimit preserves the effective concurrency used
 	// before the policy knob existed. Raising it is a separate rollout decision.
 	DefaultPipelineConcurrencyLimit = loomconcurrency.DefaultLimit
+
+	// MinConcurrency and MaxConcurrency are the inclusive hard bounds accepted
+	// by pipeline concurrency policy fields.
+	MinConcurrency = loomconcurrency.MinLimit
+	MaxConcurrency = loomconcurrency.MaxLimit
 )
+
+// StampTargetPolicy is the explicit source-to-target allowlist for stamp
+// writes. Same-project writes are always permitted; every cross-project pair
+// must be present or authorization fails closed.
+type StampTargetPolicy struct {
+	AllowedTargets map[string][]string `json:"allowed_targets,omitempty" yaml:"allowed_targets,omitempty"`
+}
+
+// Allows reports whether source may write a stamp targeting target. Project
+// names are trimmed for comparison, while empty identities are always denied.
+func (p StampTargetPolicy) Allows(source, target string) bool {
+	source = strings.TrimSpace(source)
+	target = strings.TrimSpace(target)
+	if source == "" || target == "" {
+		return false
+	}
+	if source == target {
+		return true
+	}
+	for configuredSource, targets := range p.AllowedTargets {
+		if strings.TrimSpace(configuredSource) != source {
+			continue
+		}
+		for _, allowed := range targets {
+			if strings.TrimSpace(allowed) == target {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// AuthorizeStamp implements the cross-repository stamp authorization contract.
+func (p StampTargetPolicy) AuthorizeStamp(_ context.Context, source, target string) error {
+	if !p.Allows(source, target) {
+		return errors.New("policy: stamp source/target relationship is not allowed")
+	}
+	return nil
+}
 
 // PipelineConcurrencyPolicy controls concurrency in pipeline supervision. A
 // nil limit resolves to the compiled, behavior-neutral default. Explicit
-// values, including zero, must pass Validate before being applied.
+// values, including zero, must pass ResolveLimit before being applied.
 type PipelineConcurrencyPolicy struct {
-	// MaxConcurrency bounds simultaneous council read-autonomy work. Nil
-	// preserves the compiled conservative default for older policy documents.
+	// MaxConcurrency is a compatibility spelling retained for policy documents
+	// written during the field-name regression.
 	MaxConcurrency *int `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
 
-	// MaxConcurrentPipelines bounds simultaneous pipeline scheduler work. Nil
-	// preserves compatibility with the earlier policy spelling.
+	// MaxConcurrentPipelines bounds simultaneous pipeline scheduler work. This
+	// is the canonical field used by the Mills policy and production ConfigMap.
 	MaxConcurrentPipelines *int `json:"max_concurrent_pipelines,omitempty" yaml:"max_concurrent_pipelines,omitempty"`
 
 	// Limit is the legacy spelling retained while existing callers migrate.
-	// New policy documents must use max_concurrency.
+	// New policy documents must use max_concurrent_pipelines.
 	Limit *int `json:"concurrency_limit,omitempty" yaml:"concurrency_limit,omitempty"`
 }
 
 // EffectiveLimit returns the configured limit or the compiled default.
 func (p PipelineConcurrencyPolicy) EffectiveLimit() int {
-	if p.MaxConcurrency != nil {
-		return *p.MaxConcurrency
-	}
 	if p.MaxConcurrentPipelines != nil {
 		return *p.MaxConcurrentPipelines
+	}
+	if p.MaxConcurrency != nil {
+		return *p.MaxConcurrency
 	}
 	if p.Limit == nil {
 		return DefaultPipelineConcurrencyLimit
@@ -56,33 +120,20 @@ func (p PipelineConcurrencyPolicy) EffectiveLimit() int {
 	return *p.Limit
 }
 
-// Validate rejects explicit values outside the supported concurrency range.
-func (p PipelineConcurrencyPolicy) Validate() error {
-	configured := 0
-	for _, limit := range []*int{p.MaxConcurrency, p.MaxConcurrentPipelines, p.Limit} {
-		if limit != nil {
-			configured++
-		}
+// ResolveLimit validates and resolves the policy to an effective limit.
+func (p PipelineConcurrencyPolicy) ResolveLimit() (int, error) {
+	if err := p.Validate(); err != nil {
+		return 0, err
 	}
-	if configured > 1 {
-		return fmt.Errorf("max_concurrency, max_concurrent_pipelines, and legacy concurrency_limit are mutually exclusive")
-	}
-	limit := p.MaxConcurrency
-	field := "max_concurrency"
-	if limit == nil {
-		limit = p.MaxConcurrentPipelines
-		field = "max_concurrent_pipelines"
-	}
-	if limit == nil {
-		limit, field = p.Limit, "concurrency_limit"
-	}
-	if limit == nil {
-		return nil
-	}
-	if err := loomconcurrency.Validate(*limit); err != nil {
-		return fmt.Errorf("%s %d: %w", field, *limit, err)
-	}
-	return nil
+	limit := p.EffectiveLimit()
+	return loomconcurrency.ResolvePolicyLimit(&limit)
+}
+
+// ResolvePipelineConcurrencyLimit validates and resolves the canonical Mills
+// policy field. Keeping this defaulting boundary in the policy package lets
+// hot-path consumers apply reloaded values without duplicating fallback rules.
+func ResolvePipelineConcurrencyLimit(configured *int) (int, error) {
+	return (PipelineConcurrencyPolicy{MaxConcurrentPipelines: configured}).ResolveLimit()
 }
 
 // ExternalIncidentPolicy controls the per-ref external incident auto-merge

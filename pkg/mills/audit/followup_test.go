@@ -244,6 +244,7 @@ type fakeDigestIssuer struct {
 	findErr      error
 	createErr    error
 	commentErr   error
+	closed       []int64
 }
 
 type digestComment struct {
@@ -306,6 +307,48 @@ func (f *fakeDigestIssuer) CommentIssue(_ context.Context, iid int64, body strin
 		return f.commentErr
 	}
 	f.comments = append(f.comments, digestComment{iid: iid, body: body})
+	return nil
+}
+
+// FindPreviousOpenAuditDigest mirrors the production client's newest-first
+// scan: it returns the open digest for the latest period strictly before
+// current, so a fake holding several open prior days supersedes only the
+// newest one — older strays are the operator sweep's job.
+func (f *fakeDigestIssuer) FindPreviousOpenAuditDigest(_ context.Context, current string) (int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var newest string
+	for period := range f.openByPeriod {
+		if period < current && period > newest {
+			newest = period
+		}
+	}
+	if newest == "" {
+		return 0, false, nil
+	}
+	return f.openByPeriod[newest].IID, true, nil
+}
+
+func (f *fakeDigestIssuer) IssueHasComment(_ context.Context, iid int64, body string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.comments {
+		if c.iid == iid && c.body == body {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeDigestIssuer) CloseIssue(_ context.Context, iid int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = append(f.closed, iid)
+	for period, ref := range f.openByPeriod {
+		if ref.IID == iid {
+			delete(f.openByPeriod, period)
+		}
+	}
 	return nil
 }
 
@@ -409,8 +452,8 @@ func TestFollowup_DigestRollsOverByDay(t *testing.T) {
 	if got := dg.createCount(); got != 2 {
 		t.Fatalf("distinct UTC days must open distinct digests; got %d creates", got)
 	}
-	if got := dg.commentCount(); got != 0 {
-		t.Fatalf("no same-day repeat, so no comments; got %d", got)
+	if got := dg.commentCount(); got != 1 {
+		t.Fatalf("day rollover must add only the supersession comment; got %d", got)
 	}
 }
 
@@ -466,3 +509,34 @@ func TestFollowup_DigestCommentErrorSwallowed(t *testing.T) {
 // capability the production GitLab client provides. The operator build carries
 // the real *clients.GitLabClient guard (var _ audit.DigestIssuer ...).
 var _ DigestIssuer = (*fakeDigestIssuer)(nil)
+var _ DigestSupersessionIssuer = (*fakeDigestIssuer)(nil)
+
+// A new day's digest retires the newest still-open prior digest — and only
+// that one. Older open digests (a pile left by a failed close, or from before
+// supersession shipped) are deliberately left for the operator's confirm-gated
+// `loom audit-advisory-sweep`, so an unattended filing never mass-closes.
+func TestFollowup_NewDaySupersedesPriorDigest(t *testing.T) {
+	dg := newFakeDigestIssuer()
+	dg.openByPeriod["2026-07-18"] = pipeline.IssueRef{IID: 498}
+	dg.openByPeriod["2026-07-19"] = pipeline.IssueRef{IID: 499}
+	fu := NewFollowup(dg)
+	fu.Clock = fixedClock(time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC))
+	if err := fu.OnRecorded(context.Background(), newFinding(store.AuditSubjectPipelineMerge, "PIPE-X", .3)); err != nil {
+		t.Fatal(err)
+	}
+	if len(dg.closed) != 1 || dg.closed[0] != 499 {
+		t.Fatalf("closed = %v, want only the newest prior digest [499]", dg.closed)
+	}
+	var got []string
+	for _, c := range dg.comments {
+		if c.iid == 499 {
+			got = append(got, c.body)
+		}
+	}
+	if len(got) != 1 || got[0] != "superseded by #500" {
+		t.Fatalf("comments on #499 = %v, want the single supersession note", got)
+	}
+	if _, stillOpen := dg.openByPeriod["2026-07-18"]; !stillOpen {
+		t.Fatal("older stray digest #498 must be left for the operator sweep")
+	}
+}

@@ -7,92 +7,92 @@ data:
     {
       "mcpServers": {
         "agent-context": {
-          "type": "sse",
-          "url": "http://agent-context.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-agent-context.loom-hub.svc.cluster.local:8080/mcp"
         },
         "alertmanager": {
-          "type": "sse",
-          "url": "http://mcp-alertmanager.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-alertmanager.loom-hub.svc.cluster.local:8080/mcp"
         },
         "cloudflare": {
-          "type": "sse",
-          "url": "http://mcp-cloudflare.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-cloudflare.loom-hub.svc.cluster.local:8080/mcp"
         },
         "codebase-memory": {
-          "type": "sse",
-          "url": "http://mcp-codebase-memory.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-codebase-memory.loom-hub.svc.cluster.local:8080/mcp"
         },
         "context7": {
-          "type": "sse",
-          "url": "http://mcp-context7.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-context7.loom-hub.svc.cluster.local:8080/mcp"
         },
         "flux": {
-          "type": "sse",
-          "url": "http://mcp-flux.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-flux.loom-hub.svc.cluster.local:8080/mcp"
         },
         "github": {
-          "type": "sse",
-          "url": "http://mcp-github.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-github.loom-hub.svc.cluster.local:8080/mcp"
         },
         "gitlab": {
-          "type": "sse",
-          "url": "http://mcp-gitlab.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-gitlab.loom-hub.svc.cluster.local:8080/mcp"
         },
         "grafana": {
-          "type": "sse",
-          "url": "http://mcp-grafana.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-grafana.loom-hub.svc.cluster.local:8080/mcp"
         },
         "helm": {
-          "type": "sse",
-          "url": "http://mcp-helm.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-helm.loom-hub.svc.cluster.local:8080/mcp"
         },
         "k8s-apps-k3s": {
-          "type": "sse",
-          "url": "http://mcp-k8s-apps-k3s.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-k8s-apps-k3s.loom-hub.svc.cluster.local:8080/mcp"
         },
         "loki": {
-          "type": "sse",
-          "url": "http://mcp-loki.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-loki.loom-hub.svc.cluster.local:8080/mcp"
         },
         "longhorn-k3s": {
-          "type": "sse",
-          "url": "http://mcp-longhorn-k3s.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-longhorn-k3s.loom-hub.svc.cluster.local:8080/mcp"
         },
         "morph-fast-apply": {
-          "type": "sse",
-          "url": "http://mcp-morph-fast-apply.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-morph-fast-apply.loom-hub.svc.cluster.local:8080/mcp"
         },
         "postgres": {
-          "type": "sse",
-          "url": "http://mcp-postgres.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-postgres.loom-hub.svc.cluster.local:8080/mcp"
         },
         "prometheus": {
-          "type": "sse",
-          "url": "http://mcp-prometheus.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-prometheus.loom-hub.svc.cluster.local:8080/mcp"
         },
         "qdrant": {
-          "type": "sse",
-          "url": "http://mcp-qdrant.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-qdrant.loom-hub.svc.cluster.local:8080/mcp"
         },
         "sequentialthinking": {
-          "type": "sse",
-          "url": "http://mcp-sequentialthinking.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-sequentialthinking.loom-hub.svc.cluster.local:8080/mcp"
         },
         "tavily": {
-          "type": "sse",
-          "url": "http://mcp-tavily.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-tavily.loom-hub.svc.cluster.local:8080/mcp"
         },
         "time": {
-          "type": "sse",
-          "url": "http://mcp-time.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-time.loom-hub.svc.cluster.local:8080/mcp"
         },
         "youtube": {
-          "type": "sse",
-          "url": "http://mcp-youtube.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-youtube.loom-hub.svc.cluster.local:8080/mcp"
         },
         "zep": {
-          "type": "sse",
-          "url": "http://mcp-zep.loom-hub.svc.cluster.local:8080/sse"
+          "type": "streamable-http",
+          "url": "http://mcp-zep.loom-hub.svc.cluster.local:8080/mcp"
         }
       }
     }

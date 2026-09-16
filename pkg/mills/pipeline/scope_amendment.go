@@ -88,13 +88,17 @@ func (r *Runner) maybeAmendScope(
 		return false, nil
 	}
 	pol := policy.Pipeline.ScopeAmendment
+	// Effective protected globs for THIS item's target repo (global list +
+	// per-repo overlay): an amendment must never admit a path the path_policy
+	// gate would flag, and on cross-repo runs that judgment is target-aware.
+	protected := policy.ProtectedPathsFor(item.TargetProject)
 	if !policy.Pipeline.ScopeAmendmentEnabled() {
 		mills.ScopeAmendmentsTotal.WithLabelValues("disabled").Inc()
-		d := gates.EvaluateScopeAmendment(item, violations, pol, policy.Pipeline.ProtectedPaths)
+		d := gates.EvaluateScopeAmendment(fileScopedItem(item), violations, pol, protected)
 		return false, &d
 	}
 
-	decision, applied := r.applyScopeAmendment(ctx, item, violations, pol, policy.Pipeline.ProtectedPaths)
+	decision, applied := r.applyScopeAmendment(ctx, item, violations, pol, protected)
 	if !applied {
 		if decision.Admitted {
 			// Admissible but the backlog CAS lost twice — a competing writer
@@ -154,7 +158,7 @@ func (r *Runner) applyScopeAmendment(
 ) (gates.AmendmentDecision, bool) {
 	var decision gates.AmendmentDecision
 	for attempt := 0; attempt < 2; attempt++ {
-		decision = gates.EvaluateScopeAmendment(item, violations, pol, protectedPaths)
+		decision = gates.EvaluateScopeAmendment(fileScopedItem(item), violations, pol, protectedPaths)
 		if !decision.Admitted {
 			return decision, false
 		}
@@ -183,6 +187,23 @@ func (r *Runner) applyScopeAmendment(
 	r.logger().Warn("pipeline: scope amendment lost the backlog CAS twice; falling through to retry",
 		"backlog", item.ID)
 	return decision, false
+}
+
+// fileScopedItem presents the amendment evaluator with the path contract the
+// pipeline enforces: only Slices[].files declares scope. Slices[].tests holds
+// shell commands for verification and must never become an ancestor anchor or
+// appear in a rescue MR's declared-directory evidence.
+func fileScopedItem(item *store.BacklogItem) *store.BacklogItem {
+	if item == nil {
+		return nil
+	}
+	copyItem := *item
+	copyItem.Slices = make([]store.Slice, len(item.Slices))
+	for i, slice := range item.Slices {
+		copyItem.Slices[i] = slice
+		copyItem.Slices[i].Tests = nil
+	}
+	return &copyItem
 }
 
 // scopeEscalationReason builds the S2 escalation reason for a scope-cap
@@ -294,6 +315,14 @@ func (r *Runner) openScopeRescueMR(
 	}
 	r.logger().Info("pipeline: scope rescue draft MR opened",
 		"run", run.ID, "mr_iid", resp.MRIID, "branch", branch, "adopted", resp.Adopted)
+	if resp.MRIID > 0 && run != nil {
+		// The caller persists the escalated run after this reason is built. Keep
+		// the rescue MR identity on that same run so the escalation sweep can
+		// reconcile an out-of-band merge by IID instead of waiting for its
+		// branch-lookup backoff.
+		iid := resp.MRIID
+		run.MRIID = &iid
+	}
 	r.event(ctx, "pipeline.gate.scope_rescue_mr", "warn", map[string]any{
 		"run": run.ID, "backlog": item.ID, "mr_iid": resp.MRIID,
 		"branch": branch, "adopted": resp.Adopted,

@@ -1449,3 +1449,154 @@ func TestK8sConfigMapStore_SaveOverflowNeverEvictsItsOwnWrite(t *testing.T) {
 		t.Error("refused terminal save must not be committed")
 	}
 }
+
+func TestStateAuthRoundTrip(t *testing.T) {
+	file, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, store := range map[string]Store{"file": file, "configmap": NewK8sConfigMapStore(fake.NewSimpleClientset(), "devbox", "auth")} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Second)
+			st := &State{SpawnID: "auth", DriverOwnerID: "owner", StartedAt: now, Status: StatusRunning, Request: Request{IdempotencyKey: "auth"}, AuthMode: AuthModeClusterOAuth, AuthAccount: "oauth-token"}
+			if err := store.Save(t.Context(), st); err != nil {
+				t.Fatal(err)
+			}
+			for _, outcome := range []string{"", "oauth_rejected", "oauth_quota", "api_billing", "api_auth", "unknown"} {
+				st.AuthOutcome = outcome
+				if outcome == "unknown" {
+					st.Status = StatusCompleted
+				}
+				if outcome != "" {
+					st.AuthMode, st.AuthAccount = AuthModeClusterAPIKey, "api-key"
+					st.AuthFallbackAt, st.AuthFallbackFrom = &now, "cluster_oauth"
+					st.AuthFailures = []AuthFailure{{Account: "oauth-token", Outcome: outcome, At: now, ResetAt: now.Add(time.Hour)}}
+				}
+				if err := store.Save(t.Context(), st); err != nil {
+					t.Fatal(err)
+				}
+				got, err := store.Load(t.Context(), st.SpawnID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantJSON, _ := json.Marshal(st)
+				gotJSON, _ := json.Marshal(got)
+				if string(gotJSON) != string(wantJSON) {
+					t.Fatalf("round trip: got %s, want %s", gotJSON, wantJSON)
+				}
+			}
+		})
+	}
+}
+
+func authPruneStates(now time.Time) []*State {
+	old := now.Add(-48 * time.Hour)
+	yesterday := now.Add(-24 * time.Hour)
+	return []*State{
+		{SpawnID: "today", Status: StatusCompleted, EndedAt: &old, CleanupAt: &old, AuthFallbackAt: &now},
+		{SpawnID: "excluded", Status: StatusFailed, EndedAt: &old, CleanupAt: &old, AuthFailures: []AuthFailure{{ResetAt: now.Add(time.Hour)}}},
+		{SpawnID: "expired", Status: StatusCompleted, EndedAt: &old, CleanupAt: &old, AuthFallbackAt: &yesterday, AuthFailures: []AuthFailure{{ResetAt: yesterday}}},
+		{SpawnID: "legacy", Status: StatusCompleted, EndedAt: &old, CleanupAt: &old},
+	}
+}
+
+func TestStateAuthRetentionUTC(t *testing.T) {
+	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		keep bool
+	}{
+		{"same UTC day in western zone", now.In(time.FixedZone("west", -7*3600)), true},
+		{"previous UTC day", now.Add(-time.Nanosecond), false},
+		{"next UTC day", now.Add(24 * time.Hour), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retainAuthState(&State{AuthFallbackAt: &tc.at}, now); got != tc.keep {
+				t.Fatalf("retained = %v", got)
+			}
+		})
+	}
+	if retainAuthState(&State{AuthFailures: []AuthFailure{{ResetAt: now}}}, now) {
+		t.Fatal("reset at now must expire")
+	}
+}
+
+func TestStateAuthPrunePaths(t *testing.T) {
+	for _, path := range []string{"file", "controller", "pressure", "overflow"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := t.Context()
+			now := time.Now().UTC()
+			states := authPruneStates(now)
+			var store Store
+			var prune func()
+			if path == "file" || path == "controller" {
+				fs, err := NewFileStore(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				store = fs
+				if path == "file" {
+					prune = func() {
+						if err := fs.PruneCompleted(ctx, time.Hour); err != nil {
+							t.Fatal(err)
+						}
+					}
+				} else {
+					ctrl := NewK8sController(fake.NewSimpleClientset(), "devbox", fs, nil)
+					for _, st := range states {
+						ctrl.spawns[st.SpawnID] = st
+					}
+					prune = func() {
+						if n := ctrl.Prune(ctx, time.Hour); n != 2 {
+							t.Fatalf("pruned %d, want 2", n)
+						}
+					}
+				}
+			} else {
+				client := fake.NewSimpleClientset()
+				cmStore := NewK8sConfigMapStore(client, "devbox", "auth")
+				store = cmStore
+				prune = func() {
+					cm, err := client.CoreV1().ConfigMaps("devbox").Get(ctx, "auth", metav1.GetOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					// Force pressure, but leave ample room for the protected auth ledger.
+					raw, err := json.Marshal(cm)
+					if err != nil {
+						t.Fatal(err)
+					}
+					cmStore.maxSerializedBytes = len(raw) - 1
+					if path == "pressure" {
+						if _, err := cmStore.PruneTerminalToSoftLimit(ctx); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						if err := cmStore.Save(ctx, &State{SpawnID: "incoming", Status: StatusRunning}); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			for _, st := range states {
+				// Make the discardable history dominate the ConfigMap size.
+				if st.SpawnID == "expired" || st.SpawnID == "legacy" {
+					st.Error = strings.Repeat("x", 4000)
+				}
+				if err := store.Save(ctx, st); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prune()
+			for _, id := range []string{"today", "excluded"} {
+				if got, err := store.Load(ctx, id); err != nil || got == nil {
+					t.Fatalf("%s was pruned: %v", id, err)
+				}
+			}
+			if got, err := store.Load(ctx, "expired"); err != nil || got != nil {
+				t.Fatalf("expired auth state retained: %+v, %v", got, err)
+			}
+		})
+	}
+}

@@ -35,11 +35,22 @@ func TestSpawnControllerOwnerLockIsNonBlockingAndReleases(t *testing.T) {
 		"LOOM_TEST_SPAWN_OWNER_LOCK_ID="+controllerID,
 		fmt.Sprintf("LOOM_TEST_SPAWN_OWNER_LOCK_PID=%d", os.Getpid()),
 	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			t.Fatal("second process owner claim blocked instead of failing immediately")
+	type commandResult struct {
+		output []byte
+		err    error
+	}
+	lockAttempted := make(chan commandResult, 1)
+	go func() {
+		output, err := cmd.CombinedOutput()
+		lockAttempted <- commandResult{output: output, err: err}
+	}()
+	select {
+	case result := <-lockAttempted:
+		if result.err != nil {
+			t.Fatalf("second process owner claim: %v\n%s", result.err, result.output)
 		}
-		t.Fatalf("second process owner claim: %v\n%s", err, output)
+	case <-ctx.Done():
+		t.Fatal("second process owner claim blocked instead of reporting lock contention")
 	}
 
 	if err := first.Close(); err != nil {
@@ -56,14 +67,10 @@ func TestSpawnControllerOwnerLockHelperProcess(t *testing.T) {
 	if os.Getenv("LOOM_TEST_SPAWN_OWNER_LOCK_HELPER") != "1" {
 		return
 	}
-	started := time.Now()
 	lock, err := acquireSpawnControllerOwnerLockAt(
 		os.Getenv("LOOM_TEST_SPAWN_OWNER_LOCK_DIR"),
 		os.Getenv("LOOM_TEST_SPAWN_OWNER_LOCK_ID"),
 	)
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("nonblocking owner claim took %s", elapsed)
-	}
 	if lock != nil {
 		_ = lock.Close()
 		t.Fatal("helper process unexpectedly acquired the parent's owner lock")

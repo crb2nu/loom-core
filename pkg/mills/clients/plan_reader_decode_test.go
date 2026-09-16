@@ -2,10 +2,51 @@ package clients
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+
+	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 )
+
+func TestPlanClient_ListSlices_StructuredFilesSurviveLossyTOONFallback(t *testing.T) {
+	const toonWithoutFiles = "ok: true\nslices[1]{id,plan_id,name,phase}:\n  p#1,p,consumer,pending"
+	res, err := json.Marshal(mcp.CallToolResult{
+		Content: []mcp.Content{{Type: "text", Text: toonWithoutFiles}},
+		StructuredContent: map[string]any{
+			"ok": true,
+			"slices": []any{map[string]any{
+				"id": "p#1", "plan_id": "p", "name": "consumer", "phase": "pending",
+				"files": []string{"pkg/mills/clients/mcphub.go", "internal/hud/bridge/tool_result.go"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	ft := &fakeTransport{responses: map[string][]byte{
+		"initialize": []byte(`{}`),
+		"tools/call": res,
+	}}
+	pc := &PlanClient{Hub: newTestHubClient(t, ft)}
+
+	slices, err := pc.ListSlices(context.Background(), "p")
+	if err != nil {
+		t.Fatalf("ListSlices: %v", err)
+	}
+	if len(slices) != 1 || len(slices[0].Files) != 2 || slices[0].Files[1] != "internal/hud/bridge/tool_result.go" {
+		t.Fatalf("slices = %#v", slices)
+	}
+
+	var legacy sliceListEnvelope
+	if err := decodeListBody(toonWithoutFiles, &legacy); err != nil {
+		t.Fatalf("decode legacy TOON: %v", err)
+	}
+	if len(legacy.Slices) != 1 || len(legacy.Slices[0].Files) != 0 {
+		t.Fatalf("legacy TOON unexpectedly preserved files: %#v", legacy.Slices)
+	}
+}
 
 // fakeBodyHub returns one canned (body, err) pair for every tool call —
 // including the tool-ERROR shape where CallTool surfaces BOTH the raw

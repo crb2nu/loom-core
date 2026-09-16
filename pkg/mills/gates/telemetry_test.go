@@ -31,6 +31,91 @@ type errorTelemetryGate struct {
 	name string
 }
 
+type scopeFailureRecorder struct {
+	mu      sync.Mutex
+	classes []telemetry.ScopeFailureClass
+}
+
+func (r *scopeFailureRecorder) RecordScopeFailure(_ context.Context, class telemetry.ScopeFailureClass) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.classes = append(r.classes, class)
+}
+
+func (r *scopeFailureRecorder) snapshot() []telemetry.ScopeFailureClass {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]telemetry.ScopeFailureClass(nil), r.classes...)
+}
+
+func TestRegistryClassifiesEachScopeFailureExactlyOnce(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared string
+		want     telemetry.ScopeFailureClass
+	}{
+		{"missing directory", "not-a-real-scope-directory/file.go", telemetry.ScopeFailureMissingDirectory},
+		{"wrong basename", "pkg/mills/gates/not-the-real-basename.go", telemetry.ScopeFailureWrongBasename},
+		{"genuine detour", "pkg/mills/gates/scope.go", telemetry.ScopeFailureGenuineDetour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &scopeFailureRecorder{}
+			restore := telemetry.SetScopeFailureRecorderForTest(recorder)
+			defer restore()
+			collector := &telemetry.GateDeterminismHarness{}
+			registry := NewRegistry()
+			registry.Register(&Scope{})
+			registry.SetTelemetrySink(collector)
+
+			_, passed, err := registry.EvaluateAll(context.Background(), []string{"scope"}, StageInput{
+				RunID:        "scope-classification",
+				Item:         fixtureItem(store.Slice{Name: "code", Files: []string{tt.declared}}),
+				FilesChanged: []string{"cmd/mcp-git/main.go"},
+			})
+			if err != nil || passed {
+				t.Fatalf("EvaluateAll passed=%v err=%v", passed, err)
+			}
+			classes := recorder.snapshot()
+			if len(classes) != 1 || classes[0] != tt.want {
+				t.Fatalf("counter classes = %v, want exactly [%s]", classes, tt.want)
+			}
+			records := collector.Records()
+			if len(records) != 1 || records[0].ScopeFailureClass != tt.want {
+				t.Fatalf("structured records = %+v, want class %s", records, tt.want)
+			}
+		})
+	}
+}
+
+func TestRegistryDoesNotClassifyScopePassOrSkip(t *testing.T) {
+	recorder := &scopeFailureRecorder{}
+	restore := telemetry.SetScopeFailureRecorderForTest(recorder)
+	defer restore()
+	collector := &telemetry.GateDeterminismHarness{}
+	registry := NewRegistry()
+	registry.Register(&Scope{})
+	registry.SetTelemetrySink(collector)
+
+	inputs := []StageInput{
+		{Item: fixtureItem(store.Slice{Name: "code", Files: []string{"pkg/mills/gates/scope.go"}}), FilesChanged: []string{"pkg/mills/gates/scope.go"}},
+		{Item: fixtureItem(), FilesChanged: []string{"pkg/mills/gates/scope.go"}},
+	}
+	for _, in := range inputs {
+		if _, passed, err := registry.EvaluateAll(context.Background(), []string{"scope"}, in); err != nil || !passed {
+			t.Fatalf("EvaluateAll passed=%v err=%v", passed, err)
+		}
+	}
+	if got := recorder.snapshot(); len(got) != 0 {
+		t.Fatalf("counter classes = %v, want none", got)
+	}
+	for _, record := range collector.Records() {
+		if record.ScopeFailureClass != "" {
+			t.Fatalf("pass/skip record has scope failure class: %+v", record)
+		}
+	}
+}
+
 func (g errorTelemetryGate) Name() string { return g.name }
 func (g errorTelemetryGate) Evaluate(context.Context, StageInput) (Outcome, error) {
 	return Outcome{}, errors.New("evaluation failed")

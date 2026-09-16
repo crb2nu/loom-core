@@ -1,0 +1,1 @@
+- Harden the signature miner stop-phrase guard against generic test commands, timestamp-only shapes, and UUID-like identifiers (`pkg/mills/reconciler_signature_mining.go`, `pkg/mills/reconciler_signature_mining_test.go`).

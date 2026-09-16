@@ -1,0 +1,1 @@
+- Serialize shared Go module cache warm-up with a bounded lock before devbox quality gates, conservatively remove stale per-run checkout index locks, and retain cache-failure diagnostics in `cmd/mcp-devbox/quality_gate.go`, with executable regression coverage in `cmd/mcp-devbox/quality_gate_test.go`.

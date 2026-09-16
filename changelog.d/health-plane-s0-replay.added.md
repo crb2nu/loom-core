@@ -1,0 +1,1 @@
+Added `scripts/mills/health-replay.sh` — Factory Health Plane S0 detector replay. The 30-day kill-test PASSED 2026-08-29 (16/16 true would-page windows, 0 false fires from skipped/canceled pipelines); docs/MILLS_RUNBOOK.md records results and productionizing notes for the S1 health poller.

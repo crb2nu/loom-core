@@ -189,6 +189,40 @@ func TestPatternClient_RecordInstanceCarriesOptionalGrade(t *testing.T) {
 	}
 }
 
+func TestPatternClient_MintVaccineUsesStableCandidateAndRegressionProof(t *testing.T) {
+	ft := &fakeTransport{responses: map[string][]byte{
+		"initialize": []byte(`{"protocolVersion":"2024-11-05","serverInfo":{"name":"x","version":"1"}}`),
+		"tools/call": makeCallToolResult(t, map[string]any{"ok": true, "pattern_id": "pattern-vaccine-run-42"}),
+	}}
+	pc := NewPatternClient(newTestHubClient(t, ft))
+	for i := 0; i < 2; i++ {
+		got, err := pc.MintVaccine(context.Background(), "RUN-42", "BL-42", "deadline rescue", "pkg/mills/regression_test.go:42")
+		if err != nil || got != "pattern-vaccine-run-42" {
+			t.Fatalf("mint %d = %q, %v", i, got, err)
+		}
+	}
+	var calls []string
+	for _, m := range ft.sentMessages() {
+		if strings.Contains(string(m.Params), "agent_pattern_add") {
+			calls = append(calls, string(m.Params))
+		}
+	}
+	if len(calls) != 2 {
+		t.Fatalf("pattern calls = %d", len(calls))
+	}
+	for _, call := range calls {
+		if !strings.Contains(call, `"id":"pattern-vaccine-run-42"`) || !strings.Contains(call, "pkg/mills/regression_test.go:42") {
+			t.Fatalf("candidate lacks stable id/proof: %s", call)
+		}
+	}
+}
+
+func TestPatternClient_MintVaccineRequiresConfiguredClient(t *testing.T) {
+	if _, err := (&PatternClient{}).MintVaccine(context.Background(), "run", "bl", "title", "x_test.go:1"); err == nil {
+		t.Fatal("expected configuration error")
+	}
+}
+
 // fetchApprovedPatterns must swallow lister errors so a council run never
 // blocks on a pattern fetch.
 type erroringLister struct{}

@@ -58,6 +58,7 @@
 
   let overseers = $derived<OverseerAgent[]>(millsOverseersStore.status?.agents ?? []);
   let overseersEnabled = $derived(millsOverseersStore.status?.enabled === true);
+  let soak = $derived(millsOverseersStore.status?.soak ?? null);
   let overseersDisabled = $derived(millsOverseersStore.disabled);
 
   // ---- Recent-actions strip ----
@@ -114,8 +115,9 @@
 
   // slotState collapses a report slot into the one word the tile renders when
   // it has nothing to show. `ok` means render the numbers.
-  function slotState(slot: ReportSlot<unknown>, zero: boolean): 'disabled' | 'error' | 'zero' | 'ok' {
+  function slotState(slot: ReportSlot<unknown>, zero: boolean): 'disabled' | 'unavailable' | 'error' | 'zero' | 'ok' {
     if (slot.disabled) return 'disabled';
+    if (slot.snapshotUnavailable) return 'unavailable';
     if (slot.error && slot.data == null) return 'error';
     if (slot.data == null) return 'zero';
     return zero ? 'zero' : 'ok';
@@ -155,6 +157,11 @@
   }
 </script>
 
+<!--
+  This panel IS the Mill Staff tab: the department tiles (drawing office,
+  drawing-in, the alley) plus the staff evidence reports. The departments
+  are their own tabs beside it; they are not stacked here a second time.
+-->
 <PanelShell
   title="Mill Staff"
   icon="⚑"
@@ -190,6 +197,8 @@
       <p class="dept-blurb">What enters the mill: briefs to proposals to backlog items.</p>
       {#if councilPromotion.disabled}
         <p class="dept-empty">Mills operator not configured.</p>
+      {:else if councilPromotion.snapshotUnavailable}
+        <p class="dept-empty">No snapshot for this window yet.</p>
       {:else if councilPromotion.error && councilPromotion.data == null}
         <p class="dept-empty dept-error">{councilPromotion.error}</p>
       {:else if councilActors.length === 0}
@@ -267,6 +276,26 @@
             </li>
           {/each}
         </ul>
+        {#if soak}
+          <!-- Why the dry-run badges are still there: the S2 promotion
+               verdict over the last seven complete UTC days. -->
+          <div class="alley-soak" class:promotable={soak.promotable} data-testid="alley-soak">
+            <span class="alley-soak-verdict">
+              S2 soak: {soak.promotable ? 'promotable' : 'not promotable'}
+            </span>
+            <span class="alley-soak-stats mono">
+              {soak.mills_overseer_soak_elapsed_days}d · {soak.mills_overseer_soak_dry_run_decisions} decisions ·
+              {soak.mills_overseer_soak_would_have_acted} would act · {soak.mills_overseer_soak_divergences} diverged
+            </span>
+            {#if soak.failure_reasons?.length}
+              <ul class="alley-soak-reasons">
+                {#each soak.failure_reasons as reason (reason)}
+                  <li>{reason}</li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        {/if}
       {/if}
     </article>
   </div>
@@ -307,6 +336,8 @@
       >
         {#if promotionState === 'disabled'}
           <p class="tile-empty">Mills operator not configured.</p>
+        {:else if promotionState === 'unavailable'}
+          <p class="tile-empty">No snapshot for this window yet.</p>
         {:else if promotionState === 'error'}
           <p class="tile-empty tile-error">{promotion.error}</p>
         {:else if promotionState === 'zero'}
@@ -342,6 +373,8 @@
       >
         {#if judgeState === 'disabled'}
           <p class="tile-empty">Mills operator not configured.</p>
+        {:else if judgeState === 'unavailable'}
+          <p class="tile-empty">No snapshot for this window yet.</p>
         {:else if judgeState === 'error'}
           <p class="tile-empty tile-error">{judge.error}</p>
         {:else if judgeState === 'zero' || judgeGates.length === 0}
@@ -385,6 +418,8 @@
       >
         {#if regressionsState === 'disabled'}
           <p class="tile-empty">Mills operator not configured.</p>
+        {:else if regressionsState === 'unavailable'}
+          <p class="tile-empty">No snapshot for this window yet.</p>
         {:else if regressionsState === 'error'}
           <p class="tile-empty tile-error">{regressions.error}</p>
         {:else if regressionsState === 'zero'}
@@ -421,6 +456,8 @@
       >
         {#if configState === 'disabled'}
           <p class="tile-empty">Mills operator not configured.</p>
+        {:else if configState === 'unavailable'}
+          <p class="tile-empty">No snapshot for this window yet.</p>
         {:else if configState === 'error'}
           <p class="tile-empty tile-error">{configOutcomes.error}</p>
         {:else if configState === 'zero'}
@@ -457,6 +494,8 @@
       >
         {#if signaturesState === 'disabled'}
           <p class="tile-empty">Mills operator not configured.</p>
+        {:else if signaturesState === 'unavailable'}
+          <p class="tile-empty">No snapshot for this window yet.</p>
         {:else if signaturesState === 'error'}
           <p class="tile-empty tile-error">{signatures.error}</p>
         {:else if signaturesState === 'zero'}
@@ -646,6 +685,29 @@
   }
   .alley-gate.on {
     color: var(--mills-color-success);
+  }
+  .alley-soak {
+    margin-top: var(--space-3);
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--mills-color-border);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--mills-text-caption);
+    color: var(--mills-color-text-muted);
+  }
+  .alley-soak-verdict {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--mills-color-warning);
+  }
+  .alley-soak.promotable .alley-soak-verdict {
+    color: var(--mills-color-success);
+  }
+  .alley-soak-reasons {
+    margin: 0;
+    padding-left: var(--space-4);
   }
 
   .section-title {

@@ -45,7 +45,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project", "command"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_exec", mgr.handleExec))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_exec", mgr.protectSandbox(mgr.handleExec)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_build",
@@ -76,7 +76,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_build", mgr.handleBuild))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_build", mgr.protectSandbox(mgr.handleBuild)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_status",
@@ -90,7 +90,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 				},
 			},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_status", mgr.handleStatus))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_status", mgr.protectSandbox(mgr.handleStatus)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_stop",
@@ -105,7 +105,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_stop", mgr.handleStop))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_stop", mgr.protectSandbox(mgr.handleStop)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_detect",
@@ -120,7 +120,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_detect", mgr.handleDetect))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_detect", mgr.protectSandbox(mgr.handleDetect)))
 
 	// File read/write tools
 	server.AddTool(mcp.Tool{
@@ -148,7 +148,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project", "path"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_read_file", mgr.handleReadFile))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_read_file", mgr.protectSandbox(mgr.handleReadFile)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_write_file",
@@ -175,7 +175,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project", "path", "content"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_write_file", mgr.handleWriteFile))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_write_file", mgr.protectSandbox(mgr.handleWriteFile)))
 
 	// Async exec tools
 	server.AddTool(mcp.Tool{
@@ -203,7 +203,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project", "command"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_exec_async", mgr.handleExecAsync))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_exec_async", mgr.protectSandbox(mgr.handleExecAsync)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_exec_poll",
@@ -218,7 +218,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"exec_id"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_exec_poll", mgr.handleExecPoll))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_exec_poll", mgr.protectSandbox(mgr.handleExecPoll)))
 
 	// Observability tools
 	server.AddTool(mcp.Tool{
@@ -228,7 +228,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_metrics", mgr.handleMetrics))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_metrics", mgr.protectSandbox(mgr.handleMetrics)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_summary",
@@ -237,7 +237,7 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			Type:       "object",
 			Properties: map[string]any{},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_summary", mgr.handleSummary))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_summary", mgr.protectSandbox(mgr.handleSummary)))
 
 	server.AddTool(mcp.Tool{
 		Name:        "devbox_quality_gate",
@@ -265,5 +265,5 @@ func registerTools(server *mcp.Server, mgr *manager, tracer trace.Tracer) {
 			},
 			Required: []string{"project"},
 		},
-	}, mcpotel.TracedToolHandler(tracer, "devbox_quality_gate", mgr.handleQualityGate))
+	}, mcpotel.TracedToolHandler(tracer, "devbox_quality_gate", mgr.protectSandbox(mgr.handleQualityGate)))
 }

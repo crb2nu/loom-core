@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/crb2nu/loom/pkg/mills"
+	"github.com/crb2nu/loom/pkg/mills/eval"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -61,6 +63,20 @@ func seedSignatureCandidates(t *testing.T, op *operator) {
 
 func getSignatureCandidates(t *testing.T, op *operator, query string) (*httptest.ResponseRecorder, signatureCandidatesResponse) {
 	t.Helper()
+	window := signatureCandidatesDefaultWindow
+	req := httptest.NewRequest(http.MethodGet, "/?"+strings.TrimPrefix(query, "?"), nil)
+	if raw := req.URL.Query().Get("window"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			window = d
+		}
+	}
+	spec := newReportRollupWriter(op).Specs[4]
+	spec.Window = window
+	wri := newReportRollupWriter(op)
+	wri.Specs = []eval.ReportRollupSpec{spec}
+	if err := wri.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	rec := httptest.NewRecorder()
 	op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/signature-candidates"+query, nil))
 	var resp signatureCandidatesResponse

@@ -1,0 +1,1 @@
+- Fail Council reviewer dispatch closed on missing provider keys or wholly empty output, mark partial failures as degraded in the editor brief, and record bounded per-reviewer outcome KPIs (`pkg/mills/council`, `pkg/openairesponses`).

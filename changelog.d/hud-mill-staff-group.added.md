@@ -1,0 +1,1 @@
+- Add a unified, collapsible Mill Staff HUD group for the overseer, shift-report, and squads panels, exported from the mills component barrel and wired into the staff page.

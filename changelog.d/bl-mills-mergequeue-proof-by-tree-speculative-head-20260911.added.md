@@ -1,0 +1,1 @@
+- Add tree-identity pipeline proofs and the bounded `merge_queue.speculation_depth` policy surface across `pkg/mills/mergequeue`, GitLab clients, and the Mills runbook.

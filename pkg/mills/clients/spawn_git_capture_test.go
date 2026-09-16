@@ -231,6 +231,42 @@ func TestGitCapture_EmptyBranchIsDistinctFromSkip(t *testing.T) {
 	}
 }
 
+func TestGitCapture_ShallowBoundaryDegradesWithoutPollutedDiff(t *testing.T) {
+	base, head, boundary := "origin/main", "origin/mills/BL-X/plan_slice", "deadbeef"
+	gr := &spawnTelGitRunner{
+		stdouts: map[string]string{
+			"merge-base " + base + " " + head:         boundary + "\n",
+			"rev-parse --is-shallow-repository":       "true\n",
+			"diff --name-only " + base + "..." + head: "main-only.txt\n",
+			"diff " + base + "..." + head:             "diff --git a/main-only.txt b/main-only.txt\n+polluted\n",
+		},
+		errs:  map[string]error{"rev-parse " + boundary + "^": context.Canceled},
+		exits: map[string]int{"rev-parse " + boundary + "^": 128},
+	}
+	ft := &hudFakeTransport{
+		post: func(*http.Request) (int, any) { return 202, hudSpawnAcceptResponse{SpawnID: "spawn-shallow"} },
+		get: func(*http.Request) (int, any) {
+			return 200, hudSpawnState{SpawnID: "spawn-shallow", Status: "completed", Telemetry: &hudSpawnTelemetry{
+				FileChanges: []hudFileChange{{Path: "branch-only.txt", LinesAdded: 1}},
+			}}
+		},
+	}
+	c := newHUDStub(t, ft)
+	c.cfg.GitRunner = gr
+	req := sampleSpawnReq()
+	req.WorkingDir = "/repo"
+	resp, err := c.Run(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := gitCaptureStatus(t, resp); got != gitCaptureStatusIntegrityFailed {
+		t.Fatalf("status = %q, want %q", got, gitCaptureStatusIntegrityFailed)
+	}
+	if len(resp.FilesChanged) != 1 || resp.FilesChanged[0] != "branch-only.txt" || resp.LinesAdded != 1 || resp.LinesRemoved != 0 || len(resp.DiffPatch) != 0 {
+		t.Fatalf("degraded capture leaked or overwrote evidence: files=%v +%d/-%d patch=%q", resp.FilesChanged, resp.LinesAdded, resp.LinesRemoved, resp.DiffPatch)
+	}
+}
+
 // TestResumeWithContext_RunsGitCapture is the core issue-#224 fix: the
 // operator re-attaches to in-flight spawns on every pod rollout, and the
 // bare Resume entrypoint had no branch/base/checkout in scope, so the

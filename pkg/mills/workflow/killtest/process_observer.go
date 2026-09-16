@@ -39,6 +39,20 @@ type CanaryProcessObserver struct {
 	sampleDeadlineAt time.Time
 }
 
+func (o *CanaryProcessObserver) now() time.Time {
+	if o.h.processObserverNow != nil {
+		return o.h.processObserverNow().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (o *CanaryProcessObserver) after(d time.Duration) <-chan time.Time {
+	if o.h.processObserverAfter != nil {
+		return o.h.processObserverAfter(d)
+	}
+	return time.After(d)
+}
+
 // transientObservationError marks a sample attempt that failed on the
 // observation TRANSPORT — a kubectl call killed or timed out while the cluster
 // absorbed crash churn — rather than on evidence integrity. The run loop
@@ -113,7 +127,7 @@ func (h *Harness) StartPausedCanaryProcessObservation(
 	sample, err := observer.probe(sampleCtx)
 	var deadlineErr error
 	if err == nil {
-		deadlineErr = completedProbeDeadlineError(sampleCtx)
+		deadlineErr = completedProbeDeadlineError(sampleCtx, observer.now())
 	}
 	finishSample()
 	if err != nil {
@@ -124,7 +138,7 @@ func (h *Harness) StartPausedCanaryProcessObservation(
 		return observer, fmt.Errorf("start crash-window process observation: %s", message)
 	}
 	sample.ObservedAt = sampleStartedAt
-	sample.CompletedAt = time.Now().UTC()
+	sample.CompletedAt = observer.now()
 	appendErr := observer.appendSample(sample)
 	if deadlineErr != nil {
 		appendErr = errors.Join(appendErr, fmt.Errorf("crash-window process sampling gap: probe completed after deadline: %w", deadlineErr))
@@ -146,7 +160,7 @@ func (o *CanaryProcessObserver) Activate() error {
 	if o == nil {
 		return errors.New("crash-window process observer is nil")
 	}
-	now := time.Now().UTC()
+	now := o.now()
 	o.mu.Lock()
 	if o.activated {
 		o.mu.Unlock()
@@ -178,7 +192,7 @@ func (o *CanaryProcessObserver) Activate() error {
 // the UID-preconditioned delete. A slow final fence then fails before mutation
 // instead of being discovered only by post-delete activation.
 func (o *CanaryProcessObserver) AssertFreshForDelete() error {
-	_, err := o.AuthorizePausedDelete(time.Now().UTC())
+	_, err := o.AuthorizePausedDelete(o.now())
 	return err
 }
 
@@ -227,7 +241,7 @@ func (o *CanaryProcessObserver) AuthorizePausedDelete(at time.Time) (ProcessDele
 // The observer must already be active from CRASH A and paused between completed
 // samples with both original identities still live.
 func (o *CanaryProcessObserver) AssertActiveFreshForDelete() error {
-	_, err := o.AuthorizeActiveDelete(time.Now().UTC())
+	_, err := o.AuthorizeActiveDelete(o.now())
 	return err
 }
 
@@ -306,14 +320,12 @@ func (o *CanaryProcessObserver) run() {
 		return
 	case <-o.activateCh:
 	}
-	timer := time.NewTimer(o.poll)
-	defer timer.Stop()
 	for {
 		select {
 		case <-o.ctx.Done():
 			o.recordContextEnd()
 			return
-		case <-timer.C:
+		case <-o.after(o.poll):
 			ended, err := o.observeOnce()
 			if err != nil {
 				var transient transientObservationError
@@ -322,7 +334,6 @@ func (o *CanaryProcessObserver) run() {
 					// next beginSample fails closed on the gap
 					// contract if coverage is genuinely broken.
 					o.addTransient(err.Error())
-					timer.Reset(o.poll)
 					continue
 				}
 				o.addError(err.Error())
@@ -331,7 +342,6 @@ func (o *CanaryProcessObserver) run() {
 			if ended {
 				return
 			}
-			timer.Reset(o.poll)
 		}
 	}
 }
@@ -358,7 +368,7 @@ func (o *CanaryProcessObserver) observeOnce() (bool, error) {
 		return false, transientObservationError{fmt.Errorf("observe exact crash-window pod: %w", err)}
 	}
 	if len(names) == 0 {
-		return true, o.finish(time.Now().UTC())
+		return true, o.finish(o.now())
 	}
 
 	probeCtx, cancelProbe := attempt()
@@ -366,7 +376,7 @@ func (o *CanaryProcessObserver) observeOnce() (bool, error) {
 	cancelProbe()
 	var deadlineErr error
 	if err == nil {
-		deadlineErr = completedProbeDeadlineError(sampleCtx)
+		deadlineErr = completedProbeDeadlineError(sampleCtx, o.now())
 	}
 	if err != nil {
 		// The canary pod terminates naturally at its gate during the
@@ -388,7 +398,7 @@ func (o *CanaryProcessObserver) observeOnce() (bool, error) {
 			return false, transientObservationError{fmt.Errorf("probe crash-window processes: %v; confirm exact pod after probe failure: %w", err, recheckErr)}
 		}
 		if len(namesAfter) == 0 {
-			return true, o.finish(time.Now().UTC())
+			return true, o.finish(o.now())
 		}
 		downCtx, cancelDown := attempt()
 		tornDown, downErr := o.h.SpawnPodTornDown(downCtx, o.spawnID)
@@ -397,12 +407,12 @@ func (o *CanaryProcessObserver) observeOnce() (bool, error) {
 			return false, transientObservationError{fmt.Errorf("probe crash-window processes: %v; confirm teardown after probe failure: %w", err, downErr)}
 		}
 		if tornDown {
-			return true, o.finish(time.Now().UTC())
+			return true, o.finish(o.now())
 		}
 		return false, transientObservationError{fmt.Errorf("probe crash-window processes while exact pod still exists: %w", err)}
 	}
 	sample.ObservedAt = sampleStartedAt
-	sample.CompletedAt = time.Now().UTC()
+	sample.CompletedAt = o.now()
 	appendErr := o.appendSample(sample)
 	if deadlineErr != nil {
 		appendErr = errors.Join(appendErr, fmt.Errorf("crash-window process sampling gap: probe completed after deadline: %w", deadlineErr))
@@ -416,12 +426,12 @@ func (o *CanaryProcessObserver) observeOnce() (bool, error) {
 // completedProbeDeadlineError fails closed even when a transport or test double
 // returns a response after ignoring context cancellation. A snapshot received
 // at or after its deadline cannot establish bounded process coverage.
-func completedProbeDeadlineError(ctx context.Context) error {
+func completedProbeDeadlineError(ctx context.Context, now time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	deadline, ok := ctx.Deadline()
-	if ok && !time.Now().UTC().Before(deadline) {
+	if ok && !now.Before(deadline) {
 		return context.DeadlineExceeded
 	}
 	return nil
@@ -449,7 +459,7 @@ func (o *CanaryProcessObserver) probe(ctx context.Context) (CanaryProcessSample,
 }
 
 func (o *CanaryProcessObserver) beginSample() (context.Context, time.Time, context.CancelFunc, error) {
-	now := time.Now().UTC()
+	now := o.now()
 	o.mu.Lock()
 	if !o.endedAt.IsZero() {
 		o.mu.Unlock()
@@ -604,7 +614,7 @@ func (o *CanaryProcessObserver) Record(ev *Evidence) error {
 	o.mu.Lock()
 	overdue := false
 	if len(o.errors) == 0 {
-		if message := o.overdueMessageLocked(time.Now().UTC()); message != "" {
+		if message := o.overdueMessageLocked(o.now()); message != "" {
 			o.errors = append(o.errors, message)
 			overdue = true
 		}

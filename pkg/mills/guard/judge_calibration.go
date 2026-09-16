@@ -78,9 +78,14 @@ type JudgeCalibrationReport struct {
 	ZeroEvidence bool `json:"zero_evidence"`
 }
 
-// JudgeGate is one gate's calibration row.
+// JudgeGate is one (gate, judge role) calibration row. The primary judge's row
+// carries the gate's real grading; a tiebreaker or shadow judge on the same
+// gate gets its own row so two judges' discrimination can be compared instead
+// of averaged together (issue #755).
 type JudgeGate struct {
-	Gate     string `json:"gate"`
+	Gate string `json:"gate"`
+	// Role is the judge role the row aggregates: primary, tiebreaker or shadow.
+	Role     string `json:"role"`
 	Verdicts int    `json:"verdicts"`
 	Passed   int    `json:"passed"`
 	// PassRate is Passed/Verdicts over ALL verdicts, joined or not: how
@@ -123,6 +128,8 @@ type JudgeModel struct {
 
 // judgeGateAgg accumulates one gate's cells before the report is sorted.
 type judgeGateAgg struct {
+	gate                string
+	role                string
 	verdicts            int
 	passed              int
 	corrected           int
@@ -221,10 +228,14 @@ func BuildJudgeCalibrationReport(ctx context.Context, events EventLister, runs R
 			}
 		}
 
-		agg, ok := byGate[v.gate]
+		// One row per (gate, role): a shadow or tiebreaker verdict must not
+		// blend into the primary's calibration signal.
+		gateKey := v.gate + "\x00" + v.role
+		agg, ok := byGate[gateKey]
 		if !ok {
 			agg = newJudgeGateAgg()
-			byGate[v.gate] = agg
+			agg.gate, agg.role = v.gate, v.role
+			byGate[gateKey] = agg
 		}
 		agg.verdicts++
 		if v.pass {
@@ -266,10 +277,11 @@ func BuildJudgeCalibrationReport(ctx context.Context, events EventLister, runs R
 	}
 
 	rep.PerGate = make([]JudgeGate, 0, len(byGate))
-	for _, gate := range sortedKeys(byGate) {
-		agg := byGate[gate]
+	for _, key := range sortedKeys(byGate) {
+		agg := byGate[key]
 		row := JudgeGate{
-			Gate:              gate,
+			Gate:              agg.gate,
+			Role:              agg.role,
 			Verdicts:          agg.verdicts,
 			Passed:            agg.passed,
 			PassRate:          ratio(agg.passed, agg.verdicts),

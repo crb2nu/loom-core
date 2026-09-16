@@ -136,7 +136,7 @@ func (d *Daemon) hubKeepalivePing() {
 	}
 
 	// Backward compat is retained as an explicit, observable downgrade.
-	correlated, downgraded := d.handlePongResponse(resp, &owned.liveness)
+	correlated, downgraded := d.handlePongResponse(serverName, resp, &owned.liveness)
 	if !correlated && !downgraded {
 		span.AddEvent("daemon.hub.keepalive.pong_mismatch")
 		d.logger.Warn("hub keepalive: response did not match outstanding ping",
@@ -168,7 +168,14 @@ func (d *Daemon) buildControlPing(pingID string) *mcp.Message {
 
 // handlePongResponse processes a keepalive response, accepting both
 // envelope-wrapped pongs and raw MCP responses for backward compatibility.
-func (d *Daemon) handlePongResponse(resp *mcp.Message, liveness *loomtransport.Liveness) (correlated, downgraded bool) {
+//
+// The compatibility downgrade is logged at WARN once per hub server and at
+// DEBUG afterwards: a hub that answers every ping raw (the live gateway,
+// 2026-09-09..12: 6,179 identical WARN lines in three days, one per 30s
+// ping) is a standing protocol gap to fix on the hub, not a fresh event on
+// every probe. The first line names the fix; the rest would only bury the
+// daemon log.
+func (d *Daemon) handlePongResponse(serverName string, resp *mcp.Message, liveness *loomtransport.Liveness) (correlated, downgraded bool) {
 	if resp == nil {
 		return false, false
 	}
@@ -193,7 +200,12 @@ func (d *Daemon) handlePongResponse(resp *mcp.Message, liveness *loomtransport.L
 	if liveness != nil {
 		liveness.Reset()
 	}
-	d.logger.Warn("hub keepalive: accepting uncorrelated raw response (compatibility downgrade)")
+	if _, warned := d.hubKeepaliveDowngradeWarned.LoadOrStore(serverName, struct{}{}); !warned {
+		d.logger.Warn("hub keepalive: hub answers pings with raw responses; liveness is uncorrelated (compatibility downgrade) — upgrade the hub gateway to hubproto envelope pongs; further downgrades for this server log at debug",
+			"server", serverName)
+	} else {
+		d.logger.Debug("hub keepalive: accepting uncorrelated raw response (compatibility downgrade)", "server", serverName)
+	}
 	return false, true
 }
 

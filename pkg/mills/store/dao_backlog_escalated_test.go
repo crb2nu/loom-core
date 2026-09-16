@@ -56,9 +56,12 @@ func TestListEscalatedWithMRFiltersUnroutableRowsBeforeLimit(t *testing.T) {
 			putProjectStage("mr", "mr_project", "services/loom-core", failure)
 		case 2:
 			putProjectStage("mr", "mr_project", "services/loom-core", success)
-			// At the same start time, the higher attempt is the most-recent run.
-			// It has neither an MR nor durable project provenance, so the older
-			// eligible-looking run must not make this backlog item a candidate.
+			// At the same start time, the higher attempt is the most-recent
+			// run and it has no MR. The item must STAY a candidate through
+			// its newest MR-BEARING run: a retry that dies before the mr
+			// stage must not hide an earlier MR that later merged (rescue
+			// trains, MWPS races — observed 2026-08-19). Closing still
+			// requires GitLab to report that MR merged.
 			if err := st.Pipeline.PutRun(ctx, &PipelineRun{
 				ID: "PIPE-LEGACY-002-RETRY", BacklogID: backlogID,
 				Template: "mills-default-pipeline", State: PipelineEscalated,
@@ -124,12 +127,28 @@ func TestListEscalatedWithMRFiltersUnroutableRowsBeforeLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list escalated with MR: %v", err)
 	}
-	if len(got) != 1 || got[0].ID != validID {
-		ids := make([]string, 0, len(got))
-		for _, item := range got {
-			ids = append(ids, item.ID)
+	// Oldest updated_at first: LEGACY-002 (reachable via its newest MR-bearing
+	// run despite the MR-less retry on top) drains before the newer valid item.
+	want := []string{"MILLS-LEGACY-002", validID}
+	ids := make([]string, 0, len(got))
+	for _, item := range got {
+		ids = append(ids, item.ID)
+	}
+	if len(ids) != len(want) || ids[0] != want[0] || ids[1] != want[1] {
+		t.Fatalf("candidates = %v, want %v", ids, want)
+	}
+
+	// Disjointness: an item with ANY MR-bearing run belongs to the IID pass
+	// alone; the branch pass's smaller budget is reserved for items where a
+	// branch lookup is the only available evidence.
+	without, err := st.Backlog.ListEscalatedWithoutMR(ctx, limit)
+	if err != nil {
+		t.Fatalf("list escalated without MR: %v", err)
+	}
+	for _, item := range without {
+		if item.ID == "MILLS-LEGACY-002" {
+			t.Fatalf("MILLS-LEGACY-002 leaked into the without-MR candidates")
 		}
-		t.Fatalf("candidates = %v, want only %s", ids, validID)
 	}
 }
 
@@ -186,5 +205,45 @@ func TestListEscalatedWithMRAcceptsEachDurableProjectKey(t *testing.T) {
 	}
 	if len(got) != len(tests) || len(want) != 0 {
 		t.Fatalf("got %d candidates with missing IDs %v", len(got), want)
+	}
+}
+
+func TestAutoRequeueCursorRetainsOrderingAfterStateChange(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
+	for i, priority := range []Priority{P1, P2, P2, P3} {
+		item := &BacklogItem{ID: fmt.Sprintf("cursor-%d", i), Title: "cursor", State: BacklogEscalated, Priority: priority, CreatedBy: "test", CreatedAt: base}
+		if err := st.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cursor, err := st.Backlog.Get(ctx, "cursor-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Backlog.SaveAutoRequeueCursor(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE backlog_items SET state = 'queued', priority = 'P0' WHERE id = ?`, cursor.ID); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := st.Backlog.AutoRequeueCursor(ctx)
+	if err != nil || saved == nil || saved.ID != cursor.ID || saved.Priority != cursor.Priority || !saved.CreatedAt.Equal(cursor.CreatedAt) {
+		t.Fatalf("saved=%+v err=%v", saved, err)
+	}
+	remaining, err := st.Backlog.CountAutoRequeueRemaining(ctx, saved)
+	if err != nil || remaining != 2 {
+		t.Fatalf("remaining=%d err=%v", remaining, err)
+	}
+	page, err := st.Backlog.ListByStatePage(ctx, BacklogEscalated, saved, 64)
+	if err != nil || len(page) != 2 || page[0].ID != "cursor-2" || page[1].ID != "cursor-3" {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if err := st.Backlog.SaveAutoRequeueCursor(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := st.Backlog.AutoRequeueCursor(ctx); err != nil || saved != nil {
+		t.Fatalf("reset=%+v err=%v", saved, err)
 	}
 }

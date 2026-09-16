@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 
@@ -205,6 +206,70 @@ func TestDevboxClient_DecodesTOONGateResult(t *testing.T) {
 	}
 }
 
+func TestDevboxClient_PrefersStructuredVerdictOverLossyText(t *testing.T) {
+	res := mcp.CallToolResult{
+		Content: []mcp.Content{{Type: "text", Text: `{"language":"unknown","passed":false,"checks":[]}`}},
+		StructuredContent: map[string]any{
+			"language": "go", "passed": false, "tested_sha": "deadbeef", "total_duration_ms": 42,
+			"checks": []any{map[string]any{
+				"name": "test", "passed": false, "exit_code": 1, "duration_ms": 42,
+				"output_tail": "structured failure",
+			}},
+		},
+	}
+	resBytes, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	ft := &fakeTransport{responses: map[string][]byte{
+		"initialize": []byte(`{}`),
+		"tools/call": resBytes,
+	}}
+
+	resp, err := NewDevboxClient(newTestHubClient(t, ft)).QualityGate(context.Background(), pipeline.DevboxRequest{Project: "loom-core"})
+	if err != nil {
+		t.Fatalf("QualityGate: %v", err)
+	}
+	if resp.Language != "go" || resp.TestedSHA != "deadbeef" || len(resp.Checks) != 1 {
+		t.Fatalf("response = %#v", resp)
+	}
+	if resp.Checks[0].ExitCode != 1 || resp.Checks[0].Output != "structured failure" {
+		t.Fatalf("check = %#v", resp.Checks[0])
+	}
+}
+
+func TestDevboxClient_MixedRowsSurviveTOONRoundTrip(t *testing.T) {
+	t.Setenv("LOOM_MCP_OUTPUT_FORMAT", "toon")
+	body := devboxQualityGateResult{
+		Language: "go",
+		Passed:   false,
+		Checks: []devboxQualityCheckRow{
+			{Name: "fmt", Passed: true, DurationMs: 12},
+			{Name: "test:0", Passed: false, ExitCode: 1, DurationMs: 34, OutputTail: "go test failed"},
+		},
+		TotalDurationMs: 46,
+	}
+	result, err := mcp.JSONResult(body)
+	if err != nil {
+		t.Fatalf("encode TOON gate result: %v", err)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("TOON gate result has no content")
+	}
+
+	decoded, err := parseDevboxQualityGateResult(result.Content[0].Text)
+	if err != nil {
+		t.Fatalf("decode TOON gate result: %v", err)
+	}
+	if len(decoded.Checks) != 2 {
+		t.Fatalf("checks = %#v", decoded.Checks)
+	}
+	failed := decoded.Checks[1]
+	if failed.ExitCode != 1 || failed.OutputTail != "go test failed" {
+		t.Fatalf("failed check lost TOON columns: %#v", failed)
+	}
+}
+
 // TestDevboxClient_StderrFallbackOutput verifies that when a check
 // reports an empty stdout (typical of `make fmt` errors which write
 // to stderr only), the client surfaces stderr_tail through Output so
@@ -281,8 +346,11 @@ func TestDevboxClient_InfraErrorBodyDoesNotFabricateVerdict(t *testing.T) {
 	if !strings.Contains(err.Error(), "sandbox image still building") {
 		t.Errorf("error should carry the real infra failure text: %v", err)
 	}
-	if got := pipeline.Classify(err); got != pipeline.ClassInfra {
-		t.Errorf("Classify = %s, want %s (so the tests stage doesn't burn attempts as code)", got, pipeline.ClassInfra)
+	// Still-building is a FREE transient since the 2026-09-02 retry-honesty
+	// change (the build keeps running; the next gate call re-attaches), so it
+	// neither burns attempts as code nor as infra.
+	if got := pipeline.Classify(err); got != pipeline.ClassTransient {
+		t.Errorf("Classify = %s, want %s (so the tests stage doesn't burn attempts as code or infra)", got, pipeline.ClassTransient)
 	}
 }
 
@@ -328,5 +396,93 @@ func TestDevboxClient_DecodeFailureSurfacesRawBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not-json") {
 		t.Errorf("error should expose raw body: %v", err)
+	}
+}
+
+func TestDevboxClient_EffectiveGateTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", time.Hour}, {"90m", 90 * time.Minute}, {"0s", 500 * time.Millisecond}, {"-1m", 500 * time.Millisecond},
+	} {
+		t.Run(tc.env, func(t *testing.T) {
+			t.Setenv("LOOM_MILLS_DEVBOX_GATE_TIMEOUT", tc.env)
+			client := NewDevboxClient(newTestHubClient(t, &fakeTransport{}))
+			d := pipeline.NewDispatcher(map[string]pipeline.Worker{"tests": &pipeline.DevboxWorker{Client: client}}, nil)
+			if got := d.SynchronousCallTimeout("tests"); got != tc.want {
+				t.Fatalf("timeout = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// Capture the tools/call deadline to verify watchdog metadata matches the
+// actual transport bound, even when the hub has a different default.
+type gateDeadlineTransport struct {
+	*fakeTransport
+	remaining time.Duration
+}
+
+func (f *gateDeadlineTransport) Send(ctx context.Context, msg *mcp.Message) error {
+	if msg.Method == "tools/call" {
+		deadline, _ := ctx.Deadline()
+		f.remaining = time.Until(deadline)
+	}
+	return f.fakeTransport.Send(ctx, msg)
+}
+
+func TestDevboxClient_GateTimeoutMatchesCallDeadline(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -time.Minute, 90 * time.Minute} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			ft := &gateDeadlineTransport{fakeTransport: &fakeTransport{responses: map[string][]byte{
+				"initialize": []byte(`{}`),
+				"tools/call": devboxStubResult(t, devboxQualityGateResult{Passed: true}),
+			}}}
+			hub := newMCPHubClientWithDefaults(MCPHubConfig{CallTimeout: time.Second}, func(context.Context, string) (mcp.Transport, error) { return ft, nil })
+			client := &DevboxClient{Hub: hub, GateTimeout: timeout}
+			if _, err := client.QualityGate(context.Background(), pipeline.DevboxRequest{Project: "loom-core"}); err != nil {
+				t.Fatal(err)
+			}
+			want := client.EffectiveGateTimeout()
+			if ft.remaining > want || ft.remaining < want-time.Second {
+				t.Fatalf("call bound = %s, watchdog bound = %s", ft.remaining, want)
+			}
+		})
+	}
+}
+
+func TestDevboxClient_ParityDiagnostics(t *testing.T) {
+	body := devboxQualityGateResult{Checks: []devboxQualityCheckRow{
+		{Name: "lint:parity", ExitCode: 1, OutputTail: "handler.go: use CommandContext (noctx)\nstderr diagnostic"},
+		{Name: "lint:parity", ExitCode: 1, Degraded: true, Warning: "infra warning", FailureSignature: "lint_parity_no_output"},
+	}}
+	ft := &fakeTransport{responses: map[string][]byte{
+		"initialize": []byte(`{"protocolVersion":"2024-11-05","serverInfo":{"name":"x","version":"1"}}`),
+		"tools/call": devboxStubResult(t, body),
+	}}
+	resp, err := NewDevboxClient(newTestHubClient(t, ft)).QualityGate(t.Context(), pipeline.DevboxRequest{Project: "loom-core"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Checks[0].Output, "noctx") || !strings.Contains(resp.Checks[0].Output, "stderr diagnostic") || !resp.Checks[1].Degraded || resp.Checks[1].FailureSignature != "lint_parity_no_output" || resp.Checks[1].Warning != "infra warning" {
+		t.Fatalf("checks=%+v", resp.Checks)
+	}
+}
+
+func TestDevboxClient_StopRequiresConfirmation(t *testing.T) {
+	for _, body := range []string{`{"stopped":true}`, `{"stopped":false}`, `{}`, "stopped: true\nproject: loom-core"} {
+		t.Run(body, func(t *testing.T) {
+			envelope, _ := json.Marshal(mcp.CallToolResult{Content: []mcp.Content{{Type: "text", Text: body}}})
+			ft := &fakeTransport{responses: map[string][]byte{
+				"initialize": []byte(`{"protocolVersion":"2024-11-05","serverInfo":{"name":"x","version":"1"}}`),
+				"tools/call": envelope,
+			}}
+			c := NewDevboxClient(newTestHubClient(t, ft))
+			err := c.Stop(context.Background(), "loom-core", "run-agent")
+			if (err == nil) != (body == `{"stopped":true}` || strings.HasPrefix(body, "stopped: true")) {
+				t.Fatalf("Stop(%s) = %v", body, err)
+			}
+		})
 	}
 }

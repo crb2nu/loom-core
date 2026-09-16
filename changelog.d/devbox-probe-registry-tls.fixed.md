@@ -1,0 +1,1 @@
+- Fixed the devbox base-image startup probe in `cmd/mcp-devbox/main.go` and `internal/devbox/baseimage/registry.go` to reuse build-path registry TLS and pull-secret authentication, classify outcomes, and export an alertable gauge.

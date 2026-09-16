@@ -1,0 +1,1 @@
+- Fixed Mills `ci_watch` and merge recovery in `pkg/mills/clients/gitlab.go` to accept exact-head `merge_request_event` pipelines when a project creates no push pipelines, while retaining push-first selection.

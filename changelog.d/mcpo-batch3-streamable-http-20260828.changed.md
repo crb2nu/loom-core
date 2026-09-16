@@ -1,0 +1,1 @@
+- Migrate the `flux`, `k8s-apps-k3s`, `longhorn-k3s`, and `cloudflare` mcpo entries to Streamable HTTP in `k8s/base/servers/mcpo/configmap.yaml`, with the rollout checksum updated in `k8s/base/servers/mcpo/deployment.yaml`.

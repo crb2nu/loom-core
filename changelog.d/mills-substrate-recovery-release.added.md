@@ -1,0 +1,1 @@
+- Release transient and infrastructure escalations when their mapped substrate capability recovers, outside ordinary auto-requeue counters, via `pkg/mills/reconciler_auto_requeue.go` and the default-on policy in `pkg/mills/policy.go`.

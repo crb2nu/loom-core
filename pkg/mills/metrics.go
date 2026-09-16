@@ -24,6 +24,88 @@ package mills
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/crb2nu/loom/pkg/mills/textsim"
+)
+
+// MergedWorkSemanticScoresTotal is registered by textsim, where every
+// SemanticScorer resolution can be observed without creating an import cycle.
+var MergedWorkSemanticScoresTotal = textsim.MergedWorkSemanticScoresTotal
+
+// Factory health-plane metrics. Counter labels are a closed vocabulary and
+// are materialized at init so dashboards never confuse an absent series with
+// a zero count.
+var (
+	FinishingDocsMirrorDriftFiles = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_finishing_docs_mirror_drift_files", Help: "Source documentation files missing or stale in the flexinfer-site mirror."})
+	FinishingDocsMirrorAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_finishing_docs_mirror_age_seconds", Help: "Age in seconds of the newest commit touching the documentation mirror."})
+	MainPipelineGreen             = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_main_pipeline_green", Help: "Whether the latest finished terminal main pipeline succeeded (1) or failed (0)."})
+	MainRedDurationSeconds        = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_main_red_duration_seconds", Help: "Seconds main has continuously remained red according to terminal pipeline finished_at timestamps."})
+	OperatorImageLagSeconds       = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_operator_image_lag_seconds", Help: "Seconds the operator build trails the latest green Mills-touching main commit."})
+	RunsActive                    = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_runs_active", Help: "Current non-terminal Mills pipeline runs."})
+	RunsCapacity                  = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_runs_capacity", Help: "Configured pipeline max_concurrent_runs capacity."})
+	OldestQueuedItemAgeSeconds    = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_oldest_queued_item_age_seconds", Help: "Age in seconds of the oldest queued backlog item."})
+	FinishingBoltsPending         = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_finishing_bolts_pending", Help: "Merged home-project bolts not yet present in the running operator build."})
+	FinishingBoltsUnknown         = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_finishing_bolts_unknown", Help: "Merged home-project bolts whose operator deployment state could not be determined."})
+	FinishingDigestTotal          = promauto.NewCounterVec(prometheus.CounterOpts{Name: "mills_finishing_digest_total", Help: "Daily finished-goods digest runs by outcome."}, []string{"outcome"})
+	WedgedDependencies            = promauto.NewGauge(prometheus.GaugeOpts{Name: "mills_wedged_dependencies", Help: "Queued items blocked by at least one escalated or retired dependency."})
+	DeferralsTotal                = promauto.NewCounterVec(prometheus.CounterOpts{Name: "mills_deferrals_total", Help: "Successful reconciler deferral events by bounded reason."}, []string{"reason"})
+	// EventNoiseSuppressedTotal counts reconciler bookkeeping rows NOT written
+	// because an identical row for the same subject landed inside the cooldown
+	// (reconciler_retention.go). Deferral metrics still count them.
+	EventNoiseSuppressedTotal = promauto.NewCounterVec(prometheus.CounterOpts{Name: "mills_event_noise_suppressed_total", Help: "Reconciler bookkeeping event rows suppressed by the per-subject cooldown, by kind."}, []string{"kind"})
+	// RetentionPrunedTotal counts rows removed by the daily retention sweep.
+	RetentionPrunedTotal = promauto.NewCounterVec(prometheus.CounterOpts{Name: "mills_retention_pruned_total", Help: "Rows removed by the store retention sweep, by table."}, []string{"table"})
+)
+
+var AdmissionDeferredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "mills_admission_deferred_total", Help: "Admission deferrals by normalized reason, including suppressed events.",
+}, []string{"reason"})
+
+func admissionDeferralReason(outcome string) string {
+	switch outcome {
+	case "scope_reservation", "scope_reservation_transaction":
+		return "scope_reserved"
+	case "scope_overlap", "scope_overlap_transaction":
+		return "scope_overlap_active"
+	case "budget", "budget_transaction":
+		return "budget"
+	case "deps", "dependency_undeployed", "bootstrap_error", "base_red":
+		return outcome
+	default:
+		return "other"
+	}
+}
+
+var DeferralReasons = []string{"deps", "scope_reservation", "scope_overlap", "budget", "budget_transaction", "scope_reservation_transaction", "scope_overlap_transaction", "bootstrap_error", "base_red"}
+
+func init() {
+	for _, outcome := range []string{"composed", "skipped", "error"} {
+		FinishingDigestTotal.WithLabelValues(outcome).Add(0)
+	}
+	for _, reason := range DeferralReasons {
+		DeferralsTotal.WithLabelValues(reason).Add(0)
+		AdmissionDeferredTotal.WithLabelValues(admissionDeferralReason(reason)).Add(0)
+	}
+	AdmissionDeferredTotal.WithLabelValues("dependency_undeployed").Add(0)
+	AdmissionDeferredTotal.WithLabelValues("other").Add(0)
+}
+
+// ----- Audit reviewer metrics -----
+
+var (
+	// AuditReviewerFailuresTotal counts configured reviewers that could not
+	// return audit evidence, including unregistered backends and failed calls.
+	AuditReviewerFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_audit_reviewer_failures_total",
+		Help: "Audit reviewer failures by configured backend and model, including unregistered reviewers and failed calls.",
+	}, []string{"backend", "model"})
+
+	// AuditBulkReviewersAvailable is the number of configured bulk reviewers
+	// that returned evidence in the most recently completed bulk dispatch.
+	AuditBulkReviewersAvailable = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mills_audit_bulk_reviewers_available",
+		Help: "Configured bulk audit reviewers that returned evidence in the most recently completed bulk dispatch.",
+	})
 )
 
 // ----- Council metrics -----
@@ -94,11 +176,27 @@ var (
 		Name: "mills_mcphub_transport_retries_total",
 		Help: "Mills MCP hub calls retried after a transport-level failure.",
 	}, []string{"server", "tool"})
+
+	PlanSliceListCallsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_plan_slice_list_calls_total",
+		Help: "Plan slice list reads by outcome (fetched/cached).",
+	}, []string{"outcome"})
 )
+
+func init() {
+	for _, outcome := range []string{"fetched", "cached"} {
+		PlanSliceListCallsTotal.WithLabelValues(outcome).Add(0)
+	}
+}
 
 // ----- Pipeline metrics -----
 
 var (
+	PipelineMintsTotal              = promauto.NewCounterVec(prometheus.CounterOpts{Name: "mills_pipeline_mints_total", Help: "API-created pipelines by bounded mint path."}, []string{"minted_by"})
+	PipelineAdoptionsTotal          = promauto.NewCounterVec(prometheus.CounterOpts{Name: "mills_pipeline_adoptions_total", Help: "Existing exact-head pipelines adopted instead of API creation."}, []string{"minted_by"})
+	PipelineReviewHeadMovedTotal    = promauto.NewCounterVec(prometheus.CounterOpts{Name: "mills_pipeline_review_head_moved_total", Help: "Post-review branch-head checks by outcome (retested or clean)."}, []string{"outcome"})
+	MergeQueuePipelineWallSeconds   = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "mills_merge_queue_pipeline_wall_seconds", Help: "Terminal merge-queue pipeline wall time by bounded lane.", Buckets: []float64{30, 60, 120, 300, 600, 900, 1800, 2700, 3600, 5400, 7200}}, []string{"lane"})
+	MergeQueuePipelineQueuedSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "mills_merge_queue_pipeline_queued_seconds", Help: "Terminal merge-queue pipeline runner queue time by bounded lane.", Buckets: []float64{1, 5, 15, 30, 60, 120, 300, 600, 900, 1800, 2700, 3600}}, []string{"lane"})
 	// PipelineRunsTotal counts every pipeline run that reached a
 	// terminal state, partitioned by terminal state (done/escalated).
 	// Active-runs are tracked by PipelineActiveGauge.
@@ -114,6 +212,12 @@ var (
 		Name: "mills_pipeline_active",
 		Help: "Current pipeline runs in a non-terminal state, by state.",
 	}, []string{"state"})
+
+	// PipelineStageSilentTotal counts runs terminated by the inactivity watchdog.
+	PipelineStageSilentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_pipeline_stage_silent_total",
+		Help: "Pipeline stages terminated after exceeding the inactivity timeout plus grace, partitioned by effective limit in seconds.",
+	}, []string{"stage", "limit_seconds"})
 
 	// PipelineStageAttemptsTotal counts every stage attempt the runner
 	// dispatched, partitioned by stage and outcome. Retry rate per
@@ -133,6 +237,20 @@ var (
 		Name: "mills_pipeline_stage_error_class_total",
 		Help: "Pipeline stage errors, by stage and error_class (transient/transient_quota/infra/code).",
 	}, []string{"stage", "error_class"})
+
+	// PipelineStallConversionsTotal counts stalled or dead spawns converted
+	// from pending into errored attempts so the retry budget can advance.
+	PipelineStallConversionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_pipeline_stall_conversions_total",
+		Help: "Pipeline spawns converted from pending to errored after repeated poll failures, by stage.",
+	}, []string{"stage"})
+
+	// PipelineDriveAbortedTerminalTotal counts Drive loops stopped after an
+	// out-of-band writer persisted a terminal state.
+	PipelineDriveAbortedTerminalTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_pipeline_drive_aborted_terminal_total",
+		Help: "Pipeline drives stopped after an out-of-band terminal state was persisted, by state (escalated/paused/done).",
+	}, []string{"state"})
 
 	// PipelineStageDurationSeconds histograms per-stage wall-clock time.
 	// Stage names go in a label so a dashboard can render heatmaps per
@@ -297,6 +415,33 @@ var (
 		Help: "Escalated ghost-spark backlog items reconciled against GitLab MR state, by outcome (merged/mr_closed).",
 	}, []string{"outcome"})
 
+	// DependencyAncestryUnavailableTotal counts reconcile-tick admissions of a
+	// merged operator-code dependency whose deployment could not be proven:
+	// no_merge_sha — nothing in the store or GitLab names the landed commit;
+	// ancestry_error — git merge-base failed. The gate fails open in both
+	// cases, so this counter (not the rate-limited WARN) is the alarm; one
+	// increment per dependent item per tick while it stays unresolved.
+	DependencyAncestryUnavailableTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_dependency_ancestry_unavailable_total",
+		Help: "Fail-open admissions of merged operator-code dependencies whose deployment ancestry could not be checked, by reason (no_merge_sha/ancestry_error).",
+	}, []string{"reason"})
+
+	// DependencyMergeSHAResolvedTotal counts merge SHAs the dependency gate
+	// recovered outside the run's own merge-stage artifact, by source
+	// (cached_event/merge_queue/gitlab). A steady gitlab rate means the cache
+	// write is failing; a steady cached_event rate is the fallback working.
+	DependencyMergeSHAResolvedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_dependency_merge_sha_resolved_total",
+		Help: "Merged-dependency commit identities recovered from a fallback source (cached_event/merge_queue/gitlab).",
+	}, []string{"source"})
+
+	AutoRequeueUnreached = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mills_auto_requeue_unreached", Help: "Candidates remaining after the latest auto-requeue sweep.",
+	})
+	AutoRequeueSweepsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mills_auto_requeue_sweeps_total", Help: "Auto-requeue sweeps by outcome (ok, timeout, budget_blocked).",
+	}, []string{"outcome"})
+
 	// AutoRequeuesTotal counts escalated backlog items the reconciler's bounded
 	// auto-requeue sweep flipped escalated→queued without a human, labelled by
 	// the retryable fault class that made them eligible ("infra", "transient",
@@ -316,15 +461,46 @@ var (
 	}, []string{"outcome"})
 )
 
+// EscalationReasons and EscalationClasses are the closed label vocabularies
+// used by the established escalation counters. Materialize them at startup so
+// dashboards can distinguish a real zero from a missing series. Reasons mirror
+// exactly what the increment sites emit: pipeline/runner.go's
+// classifyEscalationReason switch plus the literal sites (auto_retried,
+// bootstrap, dispatch_dead_letter) — nothing emits a cap reason other than
+// retry_cap_exceeded, so no other cap label exists here. Classes mirror
+// pipeline/runner.go's escalationClassLabel: the closed ErrorClass taxonomy
+// plus telemetry.EscalationClassExternalDependency and the unclassified
+// fallback.
+var EscalationReasons = []string{
+	"auto_retried", "bootstrap", "cross_repo", "dispatch_dead_letter",
+	"gate_fail", "integrator_alloc_fail", "integrator_conflict", "other", "retry_cap_exceeded", "stage_error",
+}
+
+var EscalationClasses = []string{"transient", "transient_quota", "infra", "code", "config", "external_dependency", "unclassified"}
+
+func init() {
+	for _, reason := range EscalationReasons {
+		EscalationsTotal.WithLabelValues(reason).Add(0)
+	}
+	for _, class := range EscalationClasses {
+		EscalationClassTotal.WithLabelValues(class).Add(0)
+	}
+}
+
 // ----- Reconciler metrics -----
 
 var (
 	// ReconcileTicksTotal counts reconciler ticks, partitioned by the
-	// outcome of the tick (started_one / deferred / skipped / errored
-	// / no_op). Helps spot a stuck loop where every tick is "errored".
+	// outcome of the tick (started_one / deferred / skipped / held_human /
+	// errored / no_op). Helps spot a stuck loop where every tick is
+	// "errored". "skipped" covers the policy-disabled and autonomy-blocked
+	// early returns plus genuine per-item skips (claim conflicts, cross-repo
+	// gate, workflow holds); "held_human" means the only unstarted work was a
+	// queued item whose effective policy requires human review — the queue is
+	// waiting on a person, not on the reconciler.
 	ReconcileTicksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mills_reconciler_ticks_total",
-		Help: "Reconciler ticks, by aggregate outcome.",
+		Help: "Reconciler ticks, by aggregate outcome (started_one/deferred/skipped/held_human/errored/no_op).",
 	}, []string{"outcome"})
 
 	// ReconcileTickDurationSeconds histograms how long each tick takes.
@@ -346,6 +522,9 @@ var (
 	EscalationSweepLookups = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name: "mills_escalation_sweep_lookups", Help: "GitLab lookups performed per escalation sweep pass.",
 		Buckets: []float64{0, 1, 2, 5, 10, 15, 20},
+	})
+	RescuedWithoutVaccine = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mills_rescued_without_vaccine", Help: "Merged backlog items with a terminal escalation and no Pattern Loom vaccine reference.",
 	})
 
 	// PipelineStartClaimsTotal counts transactional admission attempts. The
@@ -908,6 +1087,17 @@ var (
 		Name: "mills_overseer_suppression_active",
 		Help: "1 while the agent holds a live admission-suppression lease (sentinel/foreman), else 0.",
 	}, []string{"agent"})
+
+	SandboxDrillSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "mills_sandbox_drill_seconds",
+		Help:    "Sandbox drill gate duration by bounded outcome (verdict/timeout/error).",
+		Buckets: []float64{1, 5, 15, 30, 60, 120, 300, 600, 900},
+	}, []string{"outcome"})
+
+	SandboxDrillLastSuccessTimestamp = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mills_sandbox_drill_last_success_timestamp",
+		Help: "Unix timestamp of the most recent fully green concurrent sandbox drill.",
+	})
 )
 
 // ----- Learning-signal metrics -----
@@ -924,7 +1114,9 @@ var (
 // closed — gate names and guarded actors are small fixed rosters. Deliberately
 // NOT exported: policy_checksum (one series per policy revision, unbounded over
 // time) and judge model (drifts with every stage pin). Both stay per-row in the
-// JSON reports.
+// JSON reports. The judge ROLE is exported (primary / tiebreaker / shadow — a
+// closed set) so a shadow judge's calibration can be compared with the
+// primary's without a model label; alerts must select role="primary".
 var (
 	// JudgeCalibrationMeanScore is a gate's mean judge score split by what the
 	// graded run finally did. NaN when that outcome recorded no verdicts for
@@ -932,8 +1124,8 @@ var (
 	// alert must not read "no evidence" as "scored 0".
 	JudgeCalibrationMeanScore = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "mills_judge_calibration_mean_score",
-		Help: "Mean judge score for a gate over the learning-signal window, by terminal outcome of the graded run (merged/escalated). NaN when that outcome has no verdicts.",
-	}, []string{"gate", "outcome"})
+		Help: "Mean judge score for a gate over the learning-signal window, by terminal outcome of the graded run (merged/escalated) and judge role (primary/tiebreaker/shadow). NaN when that outcome has no verdicts.",
+	}, []string{"gate", "outcome", "role"})
 
 	// JudgeCalibrationDiscrimination is merged mean − escalated mean: how far
 	// a gate's judge separates work that shipped from work that escalated. It
@@ -942,8 +1134,8 @@ var (
 	// when either side of the difference has no verdicts.
 	JudgeCalibrationDiscrimination = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "mills_judge_calibration_discrimination",
-		Help: "Judge discrimination for a gate over the learning-signal window: mean score of merged runs minus mean score of escalated runs. NaN when either outcome has no verdicts. Decay toward 0 means the judge no longer separates shipped work from escalated work.",
-	}, []string{"gate"})
+		Help: "Judge discrimination for a gate over the learning-signal window, per judge role (primary/tiebreaker/shadow): mean score of merged runs minus mean score of escalated runs. NaN when either outcome has no verdicts. Decay toward 0 means the judge no longer separates shipped work from escalated work.",
+	}, []string{"gate", "role"})
 
 	// JudgeCalibrationGradedRuns is how many of a gate's verdicts reached a
 	// terminal outcome in the window — the denominator behind the two gauges
@@ -951,8 +1143,8 @@ var (
 	// window cannot page anyone.
 	JudgeCalibrationGradedRuns = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "mills_judge_calibration_graded_runs",
-		Help: "Verdicts for a gate whose graded run reached merged or escalated within the learning-signal window — the sample size behind mills_judge_calibration_mean_score and mills_judge_calibration_discrimination.",
-	}, []string{"gate"})
+		Help: "Verdicts for a gate and judge role whose graded run reached merged or escalated within the learning-signal window — the sample size behind mills_judge_calibration_mean_score and mills_judge_calibration_discrimination.",
+	}, []string{"gate", "role"})
 
 	// PromotionEvidenceActions is how many audited actions an actor recorded
 	// in the window, dry-run plus executed. It is the trend behind the
@@ -997,3 +1189,32 @@ var (
 		Help: "Failed learning-signal export passes, by report (judge_calibration/promotion/config_outcomes/sweep). A failed pass publishes no gauges, so the learning-signal families hold their previous values.",
 	}, []string{"report"})
 )
+
+// VendorErrorsTotal counts final vendor failures and locally rejected calls.
+var VendorErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "mills_vendor_errors_total", Help: "Final hosted vendor errors by vendor and kind.",
+}, []string{"vendor", "kind"})
+
+// RegisterVendorBreakerGauge registers a scrape-time view, so a quiet vendor's
+// gauge closes on TTL expiry without requiring another request or a timer.
+func RegisterVendorBreakerGauge(vendor string, open func() bool) {
+	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "mills_vendor_breaker_open", Help: "Whether the hosted vendor circuit is open.",
+		ConstLabels: prometheus.Labels{"vendor": vendor},
+	}, func() float64 {
+		if open() {
+			return 1
+		}
+		return 0
+	})
+}
+
+// AutonomyBreakerHoldsTotal counts hold entries, never individual polls.
+var AutonomyBreakerHoldsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "mills_autonomy_breaker_holds_total", Help: "Transient autonomy hold entries by capability.",
+}, []string{"capability"})
+
+// AutonomyBreakerHeldRuns tracks runs currently waiting for capability recovery.
+var AutonomyBreakerHeldRuns = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "mills_autonomy_breaker_held_runs", Help: "Runs currently held by the autonomy breaker.",
+})

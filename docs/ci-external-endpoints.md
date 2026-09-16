@@ -44,6 +44,34 @@ The variables (except the two registry ones) arrive from
 All Harbor-mirrored tags above were verified to resolve through
 `registry.harbor.lan/dockerhub-cache` before the cutover.
 
+## Audit — 2026-08-15 golangci-lint schema fetch
+
+`golangci-lint config verify` downloads its JSON schema from
+`golangci-lint.run` at runtime unless told otherwise — an invisible
+public-internet dependency inside the blocking `lint` job. Pipeline 23729 job
+235686 failed after 33s on exactly that fetch (`Client.Timeout exceeded`) for
+an MR that touched no Go code and no `.golangci.yml`; a retry passed.
+`golangci-lint run` does not need the schema, and dropping `config verify` is
+not an option: a v1-keyed config under a v2 binary is *silently ignored* by
+`run` (issue #240), so verify is the only step that catches config drift.
+
+| Job / location | External endpoint | Replacement |
+|---|---|---|
+| `lint` (`config verify`) | `golangci-lint.run/jsonschema/…` (implicit) | `--schema ci/golangci.v<MAJ>.<MIN>.jsonschema.json`, vendored in-repo |
+
+The lint job derives the schema filename from `golangci-lint version --short`,
+so bumping the pinned binary without re-vendoring fails with an explicit
+message instead of silently validating against a stale schema. Re-vendor with:
+
+```bash
+curl -sSfo ci/golangci.v<MAJ>.<MIN>.jsonschema.json \
+  https://golangci-lint.run/jsonschema/golangci.v<MAJ>.<MIN>.jsonschema.json
+```
+
+The `--schema` flag is hidden (absent from `config verify --help`) but load-
+bearing upstream; if a future golangci-lint removes it, the job fails loudly
+with an unknown-flag error, not a silent fallback to the network.
+
 ## Known gaps
 
 - **Bare image references** (`image: someorg/someimage:tag`, no host) resolve to
@@ -54,6 +82,11 @@ All Harbor-mirrored tags above were verified to resolve through
   a `platform/gitops` change (`scripts/harbor/setup-proxy-cache.sh`).
 - The lint scans **CI YAML only**, not shell scripts or Dockerfiles. Dockerfile
   base images are covered by the `PUBLIC_BASE_REGISTRY` ARG instead.
+- **Implicit tool fetches** (a binary phoning home for data it needs, with no
+  URL in the YAML) are invisible to a text scan. `golangci-lint config verify`
+  is the one known case and has a dedicated rule that flags the bare
+  invocation; audit any new tool for the same behaviour before adding it to a
+  blocking job.
 
 ## Adding a new image tag
 

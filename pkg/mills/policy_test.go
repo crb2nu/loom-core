@@ -2,6 +2,7 @@ package mills
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/crb2nu/loom/pkg/mills/store"
+	basepolicy "github.com/crb2nu/loom/pkg/policy"
 )
 
 const fixtureV1 = `
@@ -74,6 +81,279 @@ func TestParsePolicy_Valid(t *testing.T) {
 	}
 	if p.Pipeline.Retry.CooldownDuration() != 5*time.Minute {
 		t.Errorf("cooldown: %v", p.Pipeline.Retry.CooldownDuration())
+	}
+}
+
+func TestHealthPolicyDefaultOffAndValidation(t *testing.T) {
+	p := Default()
+	if p.Health.Enabled {
+		t.Fatal("health must default off")
+	}
+	p.Health.Enabled = true
+	if err := p.Validate(); err == nil {
+		t.Fatal("enabled health without project accepted")
+	}
+	p.Health.Project = "services/loom-core"
+	if err := p.Validate(); err != nil {
+		t.Fatalf("valid health policy: %v", err)
+	}
+	if p.Health.RefName() != "main" || p.Health.PollInterval() != time.Minute {
+		t.Fatalf("health defaults = ref %q interval %s", p.Health.RefName(), p.Health.PollInterval())
+	}
+}
+
+func TestBaseRedPolicyDecodeDefaultsValidationAndExemptions(t *testing.T) {
+	p, err := ParsePolicy([]byte("version: 2\nhealth:\n  base_red:\n    enabled: true\n    mode: dry-log\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Health.BaseRed.Enabled || p.Health.BaseRed.Mode != "dry-log" || p.Health.BaseRed.Threshold() != 90*time.Minute {
+		t.Fatalf("decoded base_red = %+v threshold=%s", p.Health.BaseRed, p.Health.BaseRed.Threshold())
+	}
+	for _, label := range []string{"ci-fix", " remediation ", "CI-FIX"} {
+		if !p.Health.BaseRed.Exempt([]string{label}) {
+			t.Errorf("label %q was not exempt", label)
+		}
+	}
+	if p.Health.BaseRed.Exempt([]string{"feature"}) {
+		t.Fatal("feature label was exempt")
+	}
+	p.Health.BaseRed.Mode = "observe-ish"
+	if err := p.Validate(); err == nil {
+		t.Fatal("invalid base_red mode accepted")
+	}
+	p.Health.BaseRed.Mode = "enforce"
+	p.Health.BaseRed.ThresholdMinutes = -1
+	if err := p.Validate(); err == nil {
+		t.Fatal("negative base_red threshold accepted")
+	}
+}
+
+func TestFactoryHealthMetricsRegisteredAndCounterLabelsBorn(t *testing.T) {
+	want := map[string]dto.MetricType{
+		"mills_main_pipeline_green": dto.MetricType_GAUGE, "mills_main_red_duration_seconds": dto.MetricType_GAUGE,
+		"mills_operator_image_lag_seconds": dto.MetricType_GAUGE, "mills_runs_active": dto.MetricType_GAUGE,
+		"mills_runs_capacity": dto.MetricType_GAUGE, "mills_oldest_queued_item_age_seconds": dto.MetricType_GAUGE,
+		"mills_wedged_dependencies": dto.MetricType_GAUGE, "mills_deferrals_total": dto.MetricType_COUNTER,
+		"mills_escalations_total": dto.MetricType_COUNTER,
+	}
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := make(map[string]bool, len(want))
+	for _, family := range families {
+		if metricType, ok := want[family.GetName()]; ok {
+			found[family.GetName()] = true
+			if family.GetType() != metricType {
+				t.Errorf("metric %s type = %s, want %s", family.GetName(), family.GetType(), metricType)
+			}
+		}
+	}
+	for name := range want {
+		if !found[name] {
+			t.Errorf("metric %s not gathered", name)
+		}
+	}
+	for _, reason := range DeferralReasons {
+		if !metricHasLabel(families, "mills_deferrals_total", "reason", reason) {
+			t.Errorf("deferral reason %q absent at zero", reason)
+		}
+	}
+	for _, class := range EscalationClasses {
+		if !metricHasLabel(families, "mills_pipeline_escalation_class_total", "class", class) {
+			t.Errorf("escalation class %q absent at zero", class)
+		}
+	}
+	for _, reason := range EscalationReasons {
+		if !metricHasLabel(families, "mills_escalations_total", "reason", reason) {
+			t.Errorf("escalation reason %q absent at zero", reason)
+		}
+	}
+}
+
+func TestSummarizeFactoryQueueCountsAllItemsOnceAndClears(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	deps := map[string]*store.BacklogItem{
+		"red":     {ID: "red", State: store.BacklogEscalated},
+		"retired": {ID: "retired", State: store.BacklogRetired},
+		"healthy": {ID: "healthy", State: store.BacklogMerged},
+	}
+	lookup := func(id string) (*store.BacklogItem, error) {
+		dep, ok := deps[id]
+		if !ok {
+			return nil, store.ErrNotFound
+		}
+		return dep, nil
+	}
+	queued := []*store.BacklogItem{
+		{ID: "twice-blocked", CreatedAt: now.Add(-3 * time.Hour), Dependencies: []string{"red", "retired"}},
+		{ID: "retired-blocked", CreatedAt: now.Add(-2 * time.Hour), Dependencies: []string{"retired"}},
+		{ID: "healthy", CreatedAt: now.Add(-time.Hour), Dependencies: []string{"healthy", "missing"}},
+	}
+	age, wedged := summarizeFactoryQueue(now, queued, lookup)
+	if age != (3*time.Hour).Seconds() || wedged != 2 {
+		t.Fatalf("summary = age %.0f wedged %d, want %.0f and 2", age, wedged, (3 * time.Hour).Seconds())
+	}
+	age, wedged = summarizeFactoryQueue(now, nil, lookup)
+	if age != 0 || wedged != 0 {
+		t.Fatalf("drained summary = age %.0f wedged %d, want zero", age, wedged)
+	}
+}
+
+func metricHasLabel(families []*dto.MetricFamily, familyName, labelName, labelValue string) bool {
+	for _, family := range families {
+		if family.GetName() != familyName {
+			continue
+		}
+		for _, metric := range family.Metric {
+			for _, label := range metric.Label {
+				if label.GetName() == labelName && label.GetValue() == labelValue {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func TestPolicyPerRepoOverrideResolutionAndBudgetNarrowing(t *testing.T) {
+	no := false
+	yes := true
+	p := &Policy{
+		Budgets: Budgets{Pipeline: BudgetLimits{MaxUSDPerRun: 10, MaxRunsPerDay: 20}},
+		Pipeline: PipelinePolicy{PerRepoOverrides: map[string]RepoExecutionOverride{
+			"services/flexdeck": {AutoMerge: &no, RequireHumanReview: &yes, MaxUSDPerRun: 3, MaxRunsPerDay: 4},
+		}},
+	}
+	ov, ok := p.PerRepoOverrideFor("FLEXDECK", "services/loom-core")
+	if !ok || ov.AutoMerge == nil || *ov.AutoMerge || ov.RequireHumanReview == nil || !*ov.RequireHumanReview {
+		t.Fatalf("override = %+v, %v", ov, ok)
+	}
+	limits := p.PipelineBudgetLimitsFor("services/flexdeck", "services/loom-core")
+	if limits.MaxUSDPerRun != 3 || limits.MaxRunsPerDay != 4 {
+		t.Fatalf("limits = %+v, want repo caps", limits)
+	}
+	global := p.PipelineBudgetLimitsFor("services/other", "services/loom-core")
+	if global.MaxUSDPerRun != 10 || global.MaxRunsPerDay != 20 {
+		t.Fatalf("absent override changed behavior: %+v", global)
+	}
+	if cap, ok := p.PerRepoRunCapFor("services/other", "services/loom-core"); ok || cap != 0 {
+		t.Fatalf("absent override produced per-repo cap: %d, %v", cap, ok)
+	}
+	if cap, ok := p.PerRepoRunCapFor("services/flexdeck", "services/loom-core"); !ok || cap != 4 {
+		t.Fatalf("per-repo run cap = %d, %v; want 4, true", cap, ok)
+	}
+	// Empty TargetProject resolves to the configured home repository.
+	p.Pipeline.PerRepoOverrides["loom-core"] = RepoExecutionOverride{MaxUSDPerRun: 2}
+	if got := p.PipelineBudgetLimitsFor("", "services/loom-core").MaxUSDPerRun; got != 2 {
+		t.Fatalf("home budget = %v, want 2", got)
+	}
+	p.Pipeline.PerLabelOverrides = []LabelOverride{{Label: "safe", AutoMerge: true}}
+	if p.AutoMergeFor("flexdeck", "loom-core", true, nil) || p.AutoMergeFor("flexdeck", "loom-core", false, []string{"safe"}) {
+		t.Fatal("repo auto_merge=false must suppress item and label intent")
+	}
+	if !p.AutoMergeFor("other", "loom-core", true, nil) || !p.AutoMergeFor("other", "loom-core", false, []string{"safe"}) {
+		t.Fatal("absent repo override must preserve item and label intent")
+	}
+	allow := true
+	p.Pipeline.PerRepoOverrides["services/other"] = RepoExecutionOverride{AutoMerge: &allow}
+	if p.AutoMergeFor("other", "loom-core", false, nil) {
+		t.Fatal("repo auto_merge=true must not widen policy")
+	}
+}
+
+func TestThroughputGuardrailThresholdDefaultsOverridesAndValidation(t *testing.T) {
+	if got := Default().Budgets.ThroughputGuardrail.Effective(); got != DefaultThroughputGuardrailThresholds {
+		t.Fatalf("default thresholds = %+v", got)
+	}
+	configured := ThroughputGuardrailThresholds{MaxEscalationRate: .4, MaxCostPerMergedPipelineUSD: 9, MaxScopeQueueAgeSeconds: 99, MaxStarvedQueues: 2}
+	if got := configured.Effective(); got != configured {
+		t.Fatalf("configured thresholds = %+v", got)
+	}
+	for _, tc := range []ThroughputGuardrailThresholds{{MaxEscalationRate: -1}, {MaxEscalationRate: 1.1}, {MaxCostPerMergedPipelineUSD: -1}, {MaxScopeQueueAgeSeconds: -1}, {MaxStarvedQueues: -1}} {
+		p := Default()
+		p.Budgets.ThroughputGuardrail = tc
+		if err := p.Validate(); err == nil {
+			t.Fatalf("Validate(%+v) succeeded", tc)
+		}
+	}
+}
+
+func TestPolicyValidatePerRepoOverrides(t *testing.T) {
+	no := false
+	p := Default()
+	p.Pipeline.PerRepoOverrides = map[string]RepoExecutionOverride{
+		"services/flexdeck": {AutoMerge: &no},
+		"FLEXDECK":          {MaxUSDPerRun: 1},
+	}
+	if err := p.Validate(); err == nil || !strings.Contains(err.Error(), "name the same repo") {
+		t.Fatalf("duplicate validation error = %v", err)
+	}
+	p.Pipeline.PerRepoOverrides = map[string]RepoExecutionOverride{"services": {MaxRunsPerDay: -1}}
+	if err := p.Validate(); err == nil || !strings.Contains(err.Error(), "max_runs_per_day") {
+		t.Fatalf("negative validation error = %v", err)
+	}
+}
+
+func TestParsePolicy_GitLabIntakeProjects(t *testing.T) {
+	p, err := ParsePolicy([]byte("version: 1\nintake:\n  gitlab:\n    projects: [services/loom-core, services/flexdeck]\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := p.Intake.GitLab.Projects; len(got) != 2 || got[0] != "services/loom-core" || got[1] != "services/flexdeck" {
+		t.Fatalf("projects = %v", got)
+	}
+}
+
+func TestPolicy_ValidateGitLabIntakeProjects(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		projects []string
+	}{
+		{name: "empty entry", projects: []string{""}},
+		{name: "whitespace", projects: []string{" services/loom-core"}},
+		{name: "non repository", projects: []string{"services/.."}},
+		{name: "normalized duplicate", projects: []string{"services/loom-core", "loom-core"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParsePolicy([]byte(fixtureV1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.Intake.GitLab.Projects = tc.projects
+			if err := p.Validate(); err == nil || !strings.Contains(err.Error(), "intake.gitlab.projects") {
+				t.Fatalf("Validate() = %v, want intake.gitlab.projects error", err)
+			}
+		})
+	}
+}
+
+func TestParsePolicy_MaxConcurrentPipelines(t *testing.T) {
+	p, err := ParsePolicy([]byte("version: 1\nmax_concurrent_pipelines: 3\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.MaxConcurrentPipelines == nil || *p.MaxConcurrentPipelines != 3 {
+		t.Fatalf("MaxConcurrentPipelines = %v, want 3", p.MaxConcurrentPipelines)
+	}
+
+	for _, value := range []string{"0", "-1", "257"} {
+		_, err := ParsePolicy([]byte("version: 1\nmax_concurrent_pipelines: " + value + "\n"))
+		if err == nil || !strings.Contains(err.Error(), "max_concurrent_pipelines "+value) {
+			t.Fatalf("value %s: error = %v, want field and rejected value", value, err)
+		}
+		var validationErr *basepolicy.ConcurrencyPolicyValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("value %s: error = %T, want *policy.ConcurrencyPolicyValidationError", value, err)
+		}
+		if len(validationErr.Fields) != 1 || validationErr.Fields[0] != "max_concurrent_pipelines" ||
+			validationErr.Min != basepolicy.MinConcurrency || validationErr.Max != basepolicy.MaxConcurrency {
+			t.Fatalf("value %s: validation error = %#v, want canonical field and bounds [%d, %d]", value, validationErr, basepolicy.MinConcurrency, basepolicy.MaxConcurrency)
+		}
+	}
+	if _, err := ParsePolicy([]byte("version: 1\nmax_concurrent_pipelines: many\n")); err == nil {
+		t.Fatal("expected wrong-type max_concurrent_pipelines to fail decoding")
 	}
 }
 
@@ -152,6 +432,91 @@ func TestPolicy_LabelOverrideFor(t *testing.T) {
 	// Mixed-case label still matches.
 	if _, ok := p.LabelOverrideFor([]string{"  Debt  "}); !ok {
 		t.Errorf("normalised lookup failed")
+	}
+}
+
+func TestPolicy_ProtectedPathsFor_PerRepoOverlay(t *testing.T) {
+	p, _ := ParsePolicy([]byte(fixtureV1))
+	p.CrossRepo.DemandProjects = []string{"services/flexdeck", "services/flexinfer"}
+	p.Pipeline.ProtectedPathsPerRepo = map[string][]string{
+		"services/flexdeck": {"internal/rbac/**"},
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	// Overlay hits for the matching target — bucket-qualified, bare, and
+	// mixed-case identifiers all resolve to the same entry.
+	for _, target := range []string{"services/flexdeck", "flexdeck", "FLEXDECK"} {
+		if hits := p.ProtectedPathsHitFor(target, []string{"internal/rbac/store.go"}); len(hits) != 1 {
+			t.Errorf("target %q: hits=%v, want the overlay match", target, hits)
+		}
+	}
+	// The overlay replaces the loom-core-shaped global list.
+	if hits := p.ProtectedPathsHitFor("services/flexdeck", []string{"cmd/loomd/main.go"}); len(hits) != 0 {
+		t.Errorf("global glob must not leak into an overlaid target: %v", hits)
+	}
+	// A known target without an override and the home repo inherit global.
+	if hits := p.ProtectedPathsHitFor("services/flexinfer", []string{"cmd/loomd/main.go"}); len(hits) != 1 {
+		t.Errorf("known target must inherit global paths: %v", hits)
+	}
+	if hits := p.ProtectedPathsHit([]string{"internal/rbac/store.go"}); len(hits) != 0 {
+		t.Errorf("home-repo hit must not consult the overlay: %v", hits)
+	}
+	if hits := p.ProtectedPathsHit([]string{"cmd/loomd/main.go"}); len(hits) != 1 {
+		t.Errorf("home repo must retain the global list: %v", hits)
+	}
+	p.Pipeline.ProtectedPathsPerRepo["services/flexdeck"] = []string{}
+	if got, err := p.ResolveProtectedPaths("flexdeck"); err != nil || len(got) != 0 {
+		t.Errorf("empty replacement = %v, %v; want empty", got, err)
+	}
+	if _, err := p.ResolveProtectedPaths("services/unknown"); err == nil || !strings.Contains(err.Error(), "unknown target repository") {
+		t.Errorf("unknown target error = %v", err)
+	}
+}
+
+func TestPolicy_Validate_ProtectedPathsPerRepoErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		overlay map[string][]string
+		want    string
+	}{
+		{
+			name:    "invalid glob",
+			overlay: map[string][]string{"services/flexdeck": {"["}},
+			want:    "is not a valid glob",
+		},
+		{
+			name: "duplicate keys naming one repo",
+			overlay: map[string][]string{
+				"flexdeck":          {"k8s/**"},
+				"services/flexdeck": {"internal/rbac/**"},
+			},
+			want: "name the same repo",
+		},
+		{
+			name:    "empty key",
+			overlay: map[string][]string{"": {"k8s/**"}},
+			want:    "does not name a repo",
+		},
+		{
+			name:    "traversal key",
+			overlay: map[string][]string{"services/../flexdeck": {"k8s/**"}},
+			want:    "does not name a repo",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParsePolicy([]byte(fixtureV1))
+			if err != nil {
+				t.Fatalf("setup parse: %v", err)
+			}
+			p.Pipeline.ProtectedPathsPerRepo = tc.overlay
+			err = p.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("expected error containing %q, got %v", tc.want, err)
+			}
+		})
 	}
 }
 
@@ -1192,7 +1557,7 @@ pipeline:
 
 // TestValidModelToken pins the vendor-native model-id shape guard directly.
 func TestValidModelToken(t *testing.T) {
-	valid := []string{"gpt-5.6-terra", "gpt-5.6-sol", "openai/gpt-5.6-terra", "claude-opus-4-8", "kimi-k3:0711", "gpt_5.6"}
+	valid := []string{"gpt-5.6-terra", "gpt-5.6-sol", "openai/gpt-5.6-terra", "claude-opus-4-8", "kimi-k3:0711", "gpt_5.6", "claude-fable-5-1", "gpt-6-astra", "oa/gpt-6-astra"}
 	for _, s := range valid {
 		if !validModelToken(s) {
 			t.Errorf("validModelToken(%q) = false, want true", s)
@@ -1349,6 +1714,7 @@ budgets:
 spinning_room:
   enabled: true
   default_priority: P1
+  default_fallback: {backend: openai, model: gpt-5.5}
   frames:
     - name: opus
       model: claude-opus
@@ -1356,10 +1722,14 @@ spinning_room:
     - name: gpt
       model: gpt-5.4
       backend: openai-responses
+      fallback: {backend: none}
 `
 	p, err := ParsePolicy([]byte(body))
 	if err != nil {
 		t.Fatalf("ParsePolicy: %v", err)
+	}
+	if p.SpinningRoom.DefaultFallback == nil || p.SpinningRoom.Frames[1].Fallback == nil {
+		t.Fatal("fallback YAML not decoded")
 	}
 	if !p.SpinningRoomEnabled() {
 		t.Fatal("spinning_room.enabled true must surface via helper")
@@ -1414,5 +1784,317 @@ council:
 	// key still parses on an OLD binary and vice versa. No ordered rollout.
 	if _, err := ParsePolicy([]byte(base + "  some_future_key: 3\n")); err != nil {
 		t.Fatalf("unknown key must not break parsing: %v", err)
+	}
+}
+
+func TestRankerPolicy_DefaultOffRoundTripAndBounds(t *testing.T) {
+	if Default().Pipeline.RankerEnabled {
+		t.Fatal("ranker must default off")
+	}
+	body := []byte(`
+version: 2
+budgets:
+  council: {max_usd_per_run: 1, max_usd_per_day: 1}
+  pipeline: {max_usd_per_run: 1, max_usd_per_day: 1}
+pipeline:
+  ranker_enabled: true
+  ranker_timeout_milliseconds: 75
+  ranker_max_candidates: 12
+  ranker_max_cost: 4.5
+`)
+	p, err := ParsePolicy(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Pipeline.RankerEnabled || p.Pipeline.RankerTimeoutMilliseconds != 75 || p.Pipeline.RankerMaxCandidates != 12 || p.Pipeline.RankerMaxCost != 4.5 {
+		t.Fatalf("ranker policy = %+v", p.Pipeline)
+	}
+	for _, mutate := range []func(*Policy){
+		func(p *Policy) { p.Pipeline.RankerTimeoutMilliseconds = -1 },
+		func(p *Policy) { p.Pipeline.RankerMaxCandidates = -1 },
+		func(p *Policy) { p.Pipeline.RankerMaxCost = -1 },
+	} {
+		bad := Default()
+		mutate(bad)
+		if err := bad.Validate(); err == nil {
+			t.Fatal("negative ranker bound accepted")
+		}
+	}
+}
+
+func TestSubstrateReleasePolicy_DefaultOnYAMLRoundTripAndValidation(t *testing.T) {
+	def := Default().Pipeline.AutoRequeue.Release
+	if !def.IsEnabled() || def.SweepCap() != 10 || len(def.Classes()) != 3 {
+		t.Fatalf("default release=%+v", def)
+	}
+	p, err := ParsePolicy([]byte(`
+version: 2
+budgets:
+  council: {max_usd_per_run: 1, max_usd_per_day: 1}
+  pipeline: {max_usd_per_run: 1, max_usd_per_day: 1}
+pipeline:
+  auto_requeue:
+    release:
+      enabled: false
+      max_per_sweep: 7
+      eligible_classes: [infra]
+      signature_capabilities: {spawn_infra: custom_spawn}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Pipeline.AutoRequeue.Release.IsEnabled() || p.Pipeline.AutoRequeue.Release.SweepCap() != 7 || p.Pipeline.AutoRequeue.Release.SignatureMap()["spawn_infra"] != "custom_spawn" {
+		t.Fatalf("parsed release=%+v", p.Pipeline.AutoRequeue.Release)
+	}
+	for _, mutate := range []func(*Policy){
+		func(p *Policy) { p.Pipeline.AutoRequeue.Release.MaxPerSweep = -1 },
+		func(p *Policy) { p.Pipeline.AutoRequeue.Release.EligibleClasses = []string{"code"} },
+		func(p *Policy) { p.Pipeline.AutoRequeue.Release.SignatureCapabilities = map[string]string{"x": ""} },
+	} {
+		bad := Default()
+		mutate(bad)
+		if err := bad.Validate(); err == nil {
+			t.Fatal("invalid substrate release policy accepted")
+		}
+	}
+}
+
+// TestCouncilEnsemble_EditorCrossVendorFallback pins the resolution rule for
+// the council editor's cross-vendor hop: explicit pin wins, `backend: none`
+// opts out, an anthropic primary defaults to gpt-5.5/openai, every other
+// primary has no default, and a same-vendor pin is never returned.
+func TestCouncilEnsemble_EditorCrossVendorFallback(t *testing.T) {
+	anthropic := CouncilAgent{Model: "claude-fable-5-1", Backend: "anthropic"}
+	openai := CouncilAgent{Model: "gpt-5.5", Backend: "openai"}
+	cases := []struct {
+		name string
+		ens  CouncilEnsemble
+		want CouncilAgent
+		ok   bool
+	}{
+		{name: "anthropic primary defaults to gpt-5.5/openai", ens: CouncilEnsemble{Editor: anthropic}, want: DefaultEditorCrossVendorFallback, ok: true},
+		{name: "claude spelling gets the same default", ens: CouncilEnsemble{Editor: CouncilAgent{Model: "claude-fable-5-1", Backend: "claude"}}, want: DefaultEditorCrossVendorFallback, ok: true},
+		{name: "openai primary has no default hop", ens: CouncilEnsemble{Editor: openai}},
+		{name: "local primary never hops", ens: CouncilEnsemble{Editor: CouncilAgent{Model: "qwen38-27b-autoround-workhorse", Backend: "flexinfer"}}},
+		{name: "backend none opts out", ens: CouncilEnsemble{Editor: anthropic, EditorFallback: CouncilAgent{Backend: "none"}}},
+		{name: "explicit pin wins", ens: CouncilEnsemble{Editor: anthropic, EditorFallback: CouncilAgent{Model: "gpt-5.6-sol", Backend: "openai-responses"}}, want: CouncilAgent{Model: "gpt-5.6-sol", Backend: "openai-responses"}, ok: true},
+		{name: "openai primary with anthropic pin hops", ens: CouncilEnsemble{Editor: openai, EditorFallback: anthropic}, want: anthropic, ok: true},
+		{name: "same-vendor pin is never returned", ens: CouncilEnsemble{Editor: anthropic, EditorFallback: CouncilAgent{Model: "claude-opus-5", Backend: "claude"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tc.ens.EditorCrossVendorFallback()
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("EditorCrossVendorFallback() = (%+v, %t), want (%+v, %t)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestPolicy_Validate_EditorFallback(t *testing.T) {
+	anthropic := CouncilAgent{Model: "claude-fable-5-1", Backend: "anthropic"}
+	cases := []struct {
+		name string
+		fb   CouncilAgent
+		want string // "" = valid
+	}{
+		{name: "cross-vendor openai pin", fb: CouncilAgent{Model: "gpt-5.5", Backend: "openai"}},
+		{name: "opt out", fb: CouncilAgent{Backend: "none"}},
+		{name: "omitted", fb: CouncilAgent{}},
+		{name: "same vendor", fb: CouncilAgent{Model: "claude-opus-5", Backend: "claude"}, want: "same vendor as editor.backend"},
+		{name: "reviewer-only backend", fb: CouncilAgent{Model: "or/kimi-k3", Backend: "litellm"}, want: "must be anthropic, claude, openai, openai-responses, openrouter, or none"},
+		{name: "backend without model", fb: CouncilAgent{Backend: "openai"}, want: "editor_fallback.model is required"},
+		{name: "none with a model", fb: CouncilAgent{Model: "gpt-5.5", Backend: "none"}, want: "backend none takes no model"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParsePolicy([]byte(fixtureV1))
+			if err != nil {
+				t.Fatalf("setup parse: %v", err)
+			}
+			p.Council.Ensemble.Editor = anthropic
+			p.Council.Ensemble.EditorFallback = tc.fb
+			err = p.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestGateTiebreakerPolicy(t *testing.T) {
+	p := Default()
+	h := p.Gates.Tiebreaker.Hops("local")
+	if len(h) != 3 || h[0].Model != "claude-sonnet-5" || h[1].Model != "gpt-5.5" || h[2].Model != "local" {
+		t.Fatal(h)
+	}
+	p.Gates.Tiebreaker.Fallbacks = []GateJudgeHop{}
+	if len(p.Gates.Tiebreaker.Hops("local")) != 1 {
+		t.Fatal("empty fallback list ignored")
+	}
+	for _, backend := range []string{"anthropic", " ANTHROPIC ", "unsupported", ""} {
+		p.Gates.Tiebreaker.Fallbacks = []GateJudgeHop{{Backend: backend, Model: "other"}}
+		if p.Validate() == nil {
+			t.Fatalf("accepted backend %q", backend)
+		}
+	}
+	p.Gates.Tiebreaker.Fallbacks = []GateJudgeHop{{Backend: "openai"}, {Backend: "flexinfer"}}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGateTiebreakerPolicyYAML(t *testing.T) {
+	for _, tc := range []struct {
+		body  string
+		count int
+	}{
+		{"{}", 3},
+		{"gates:\n  tiebreaker:\n    fallbacks: []", 1},
+		{"gates:\n  tiebreaker:\n    backend: openai\n    model: custom\n    fallbacks:\n      - backend: flexinfer\n        model: local", 2},
+	} {
+		p, err := ParsePolicy([]byte(tc.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := p.Gates.Tiebreaker.Hops("local"); len(got) != tc.count {
+			t.Fatal(got)
+		}
+	}
+}
+
+func TestSpinningRoomFallbackPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name, primary string
+		frame, room   *CouncilAgent
+		council       CouncilAgent
+		want          string
+	}{
+		{name: "default anthropic", primary: "claude", want: "gpt-5.5"},
+		{name: "default openai", primary: "openai-responses"},
+		{name: "council", primary: "anthropic", council: CouncilAgent{Backend: "openai", Model: "council"}, want: "council"},
+		{name: "room", primary: "anthropic", room: &CouncilAgent{Backend: "openai", Model: "room"}, council: CouncilAgent{Backend: "openai", Model: "council"}, want: "room"},
+		{name: "frame", primary: "anthropic", frame: &CouncilAgent{Backend: "openai-responses", Model: "frame"}, room: &CouncilAgent{Backend: "openai", Model: "room"}, want: "frame"},
+		{name: "none", primary: "anthropic", frame: &CouncilAgent{Backend: "none"}, room: &CouncilAgent{Backend: "openai", Model: "room"}},
+		{name: "room none", primary: "anthropic", room: &CouncilAgent{Backend: "none"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Default()
+			p.Council.Ensemble.EditorFallback = tc.council
+			p.SpinningRoom.DefaultFallback = tc.room
+			got, ok := p.SpinningRoomFallback(CouncilAgent{Backend: tc.primary, Fallback: tc.frame})
+			if got.Model != tc.want || ok != (tc.want != "") {
+				t.Fatalf("got %+v, %v; want %s", got, ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestSpinningRoomFallbackValidation(t *testing.T) {
+	for _, tc := range []struct {
+		backend, model string
+		valid          bool
+	}{
+		{"claude", "other", false}, {"anthropic", "other", false}, {"openai", "", false}, {"", "gpt", false}, {"spawn", "gpt", false}, {"none", "gpt", false}, {"none", "", true}, {" OPENAI-RESPONSES ", "gpt", true},
+	} {
+		t.Run(tc.backend+tc.model, func(t *testing.T) {
+			for _, room := range []bool{false, true} {
+				p := Default()
+				p.SpinningRoom.Enabled = true
+				fb := &CouncilAgent{Backend: tc.backend, Model: tc.model}
+				p.SpinningRoom.Frames = []CouncilAgent{{Name: "frame", Backend: "anthropic", Model: "claude"}}
+				if room {
+					p.SpinningRoom.DefaultFallback = fb
+				} else {
+					p.SpinningRoom.Frames[0].Fallback = fb
+				}
+				if err := p.Validate(); (err == nil) != tc.valid {
+					t.Fatalf("room=%v: %v", room, err)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenRouterPolicy(t *testing.T) {
+	pin := CouncilAgent{Backend: "openrouter", Model: "anthropic/test"}
+	if editorBackendVendor(" OpenRouter ") != "openrouter" {
+		t.Fatal("vendor")
+	}
+	if err := validateEditorFallback(pin, "anthropic", "fallback"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateEditorFallback(pin, "openrouter", "fallback"); err == nil {
+		t.Fatal("same vendor accepted")
+	}
+	if err := validateEditorFallback(CouncilAgent{Backend: "openrouter"}, "openai", "fallback"); err == nil {
+		t.Fatal("missing model accepted")
+	}
+	e := CouncilEnsemble{Editor: CouncilAgent{Backend: "anthropic"}, EditorFallback: pin}
+	if got, ok := e.EditorCrossVendorFallback(); !ok || got.Backend != "openrouter" {
+		t.Fatal(got, ok)
+	}
+	p := &Policy{}
+	p.Council.Ensemble = e
+	if got, ok := p.SpinningRoomFallback(CouncilAgent{Backend: "openai"}); !ok || got.Backend != "openrouter" {
+		t.Fatal(got, ok)
+	}
+	for _, policy := range []GateTiebreakerPolicy{{Backend: "openrouter", Model: pin.Model}, {Backend: "anthropic", Fallbacks: []GateJudgeHop{{Backend: "openrouter", Model: pin.Model}, {Backend: "flexinfer"}}}} {
+		if err := policy.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := (GateTiebreakerPolicy{Backend: "openrouter"}).Validate(); err == nil {
+		t.Fatal("missing model accepted")
+	}
+}
+
+func TestOpenRouterPolicySlots(t *testing.T) {
+	p, err := ParsePolicy([]byte(fixtureV1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := CouncilAgent{Name: "router", Backend: "openrouter", Model: "moonshotai/kimi-k3"}
+	other := CouncilAgent{Backend: "anthropic", Model: "claude-sonnet-5"}
+	p.Council.Ensemble.Editor = remote
+	p.Council.Ensemble.EditorFallback = other
+	p.SpinningRoom.Enabled = true
+	p.SpinningRoom.Frames = []CouncilAgent{remote}
+	p.SpinningRoom.DefaultFallback = &other
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	p.Council.Ensemble.Editor = other
+	p.Council.Ensemble.EditorFallback = remote
+	p.SpinningRoom.Frames = []CouncilAgent{{Name: "native", Backend: "openai", Model: "gpt-5.5", Fallback: &remote}}
+	p.SpinningRoom.DefaultFallback = &remote
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	p.Council.Ensemble.Editor = CouncilAgent{Backend: "openrouter"}
+	if err := p.Validate(); err == nil {
+		t.Fatal("missing primary model accepted")
+	}
+}
+
+func TestAutonomyHoldPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		minutes, want int
+		invalid       bool
+	}{{0, 30, false}, {1, 1, false}, {1440, 1440, false}, {-1, 30, true}, {1441, 1440, true}} {
+		p := Default()
+		p.Pipeline.AutonomyHoldMinutes = tc.minutes
+		if got := int(p.Pipeline.AutonomyHoldDuration().Minutes()); got != tc.want {
+			t.Fatalf("duration = %d, want %d", got, tc.want)
+		}
+		if err := p.Validate(); (err != nil) != tc.invalid {
+			t.Fatalf("minutes %d: %v", tc.minutes, err)
+		}
 	}
 }

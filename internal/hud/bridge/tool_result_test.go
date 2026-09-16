@@ -35,6 +35,27 @@ func TestParseToolResultMap_DecodesTOONEnvelope(t *testing.T) {
 	}
 }
 
+func TestUnmarshalToolResult_PrefersStructuredContentOverText(t *testing.T) {
+	res := mcp.CallToolResult{
+		Content:           []mcp.Content{{Type: "text", Text: `{"source":"text","files":[]}`}},
+		StructuredContent: map[string]any{"source": "structured", "files": []string{"a.go", "b.go"}},
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got struct {
+		Source string   `json:"source"`
+		Files  []string `json:"files"`
+	}
+	if err := UnmarshalToolResult(raw, &got); err != nil {
+		t.Fatalf("UnmarshalToolResult: %v", err)
+	}
+	if got.Source != "structured" || len(got.Files) != 2 || got.Files[1] != "b.go" {
+		t.Fatalf("result = %#v", got)
+	}
+}
+
 func TestUnmarshalToolResult_PropagatesToolError(t *testing.T) {
 	raw := json.RawMessage(`{"content":[{"type":"text","text":"boom"}],"isError":true}`)
 

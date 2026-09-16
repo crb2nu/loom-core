@@ -30,7 +30,7 @@ spec:
                   key: MINIO_ACCESS_KEY
                   name: loom-secrets
             - name: MINIO_ENDPOINT
-              value: http://192.168.50.246:9000
+              value: http://minio.daemon.svc.cluster.local:9000
             - name: MINIO_PORT_FORWARD
               value: "false"
             - name: MINIO_SECRET_KEY

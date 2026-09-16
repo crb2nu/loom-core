@@ -1,0 +1,1 @@
+- Route merged-work grounding in `pkg/mills/council/merged_work.go` and `pkg/mills/council/backlog_mutator.go` through the configured semantic scorer, retain lexical fallback, and log both scores for every candidate.

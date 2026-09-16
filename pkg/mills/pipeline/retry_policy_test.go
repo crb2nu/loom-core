@@ -7,10 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crb2nu/loom/pkg/mills/store"
-	"github.com/crb2nu/loom/pkg/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/telemetry"
 )
 
 type retryStateStoreStub struct {

@@ -1,0 +1,1 @@
+- Route genuine Devbox lint and test verdicts through `tests_verdict` so Mills rewinds to implementation with actionable findings while substrate failures retain in-place retries (`pkg/mills/pipeline`, `pkg/mills/gates`, and `cmd/loom-mills-operator`).

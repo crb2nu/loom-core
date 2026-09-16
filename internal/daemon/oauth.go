@@ -4,13 +4,16 @@
 package daemon
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -104,6 +107,7 @@ type OAuthServer struct {
 	tokens  map[string]*tokenRecord
 	mu      sync.RWMutex
 	logger  *slog.Logger
+	cimd    *cimdResolver
 }
 
 // NewOAuthServer creates an OAuth 2.1 authorization server.
@@ -123,6 +127,7 @@ func NewOAuthServer(cfg OAuthConfig, issuer string, logger *slog.Logger) *OAuthS
 		codes:   make(map[string]*authCode),
 		tokens:  make(map[string]*tokenRecord),
 		logger:  logger,
+		cimd:    newCIMDResolver(),
 	}
 }
 
@@ -302,17 +307,14 @@ func (s *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate client
-	s.mu.RLock()
-	client, ok := s.clients[clientID]
-	s.mu.RUnlock()
-	if !ok {
+	redirectURIs, err := s.resolveClient(r.Context(), clientID)
+	if err != nil {
 		oauthError(w, "invalid_client", "unknown client_id", http.StatusUnauthorized)
 		return
 	}
 
 	// Validate redirect_uri matches registration
-	if !containsString(client.RedirectURIs, redirectURI) {
+	if !containsString(redirectURIs, redirectURI) {
 		oauthError(w, "invalid_redirect_uri", "redirect_uri not registered", http.StatusBadRequest)
 		return
 	}
@@ -335,15 +337,25 @@ func (s *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		expiresAt:           time.Now().Add(s.cfg.codeTTL()),
 	}
 
+	// Redirect with code (auto-approve)
+	locationURL, err := url.Parse(redirectURI)
+	if err != nil {
+		oauthError(w, "invalid_redirect_uri", "redirect_uri is invalid", http.StatusBadRequest)
+		return
+	}
+	query := locationURL.Query()
+	query.Set("code", code)
+	if state != "" {
+		query.Set("state", state)
+	}
+	query.Set("iss", s.issuer)
+	locationURL.RawQuery = query.Encode()
+	location := locationURL.String()
+
+	// Store the code only after constructing a valid authorization response.
 	s.mu.Lock()
 	s.codes[code] = ac
 	s.mu.Unlock()
-
-	// Redirect with code (auto-approve)
-	location := redirectURI + "?code=" + code
-	if state != "" {
-		location += "&state=" + state
-	}
 
 	s.logger.Info("OAuth authorization code issued",
 		"client_id", clientID,
@@ -411,10 +423,19 @@ func (s *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, "invalid_grant", "client_id mismatch", http.StatusBadRequest)
 		return
 	}
+	redirectURIs, err := s.resolveClient(r.Context(), clientID)
+	if err != nil {
+		oauthError(w, "invalid_grant", "unknown client_id", http.StatusBadRequest)
+		return
+	}
 
 	// Validate redirect_uri matches
 	if redirectURI != "" && ac.redirectURI != redirectURI {
 		oauthError(w, "invalid_grant", "redirect_uri mismatch", http.StatusBadRequest)
+		return
+	}
+	if !containsString(redirectURIs, ac.redirectURI) {
+		oauthError(w, "invalid_grant", "redirect_uri not registered", http.StatusBadRequest)
 		return
 	}
 
@@ -464,6 +485,30 @@ func (s *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *OAuthServer) resolveClient(ctx context.Context, clientID string) ([]string, error) {
+	if isCIMDClientID(clientID) {
+		metadata, err := s.cimd.resolve(ctx, clientID)
+		if err != nil {
+			return nil, err
+		}
+		return metadata.RedirectURIs, nil
+	}
+	s.mu.RLock()
+	client, ok := s.clients[clientID]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, errors.New("unknown client_id")
+	}
+	return client.RedirectURIs, nil
+}
+
+func validateAuthorizationIssuer(expectedIssuer, receivedIssuer string) error {
+	if receivedIssuer == "" || receivedIssuer != expectedIssuer {
+		return errors.New("authorization response issuer mismatch")
+	}
+	return nil
 }
 
 // HandleRevoke handles token revocation (RFC 7009).

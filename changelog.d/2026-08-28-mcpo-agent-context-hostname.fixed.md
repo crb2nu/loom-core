@@ -1,0 +1,1 @@
+- mcpo: fix the agent-context upstream hostname (`agent-context` → `mcp-agent-context`) — the entry has never resolved, so agent-context was dark through mcpo since it was added.

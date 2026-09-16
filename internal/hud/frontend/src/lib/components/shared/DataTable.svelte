@@ -1,5 +1,5 @@
 <script lang="ts" generics="Row">
-  import type { Snippet } from 'svelte';
+  import { tick, type Snippet } from 'svelte';
 
   interface Column {
     key: string;
@@ -109,6 +109,29 @@
 
   let visibleColumns = $derived(columns.filter((c) => !hiddenColumns.has(c.key)));
   let colSpan = $derived((selectable ? 1 : 0) + visibleColumns.length);
+
+  // Stacked-card labels. Consumers render their own <td>s, so the engine
+  // stamps each cell with its column label after render; the ≤800px CSS
+  // shows it as a caption above the value. Runs only in stacked mode and
+  // re-runs when the rows or columns change — cheap (rows × cols) and only
+  // on phones. Cells of unlabelled columns (an actions column) get nothing.
+  $effect(() => {
+    if (!stackedMode || !wrapEl) return;
+    const cols = visibleColumns;
+    const offset = selectable ? 1 : 0;
+    void displayRows;
+    void tick().then(() => {
+      if (!wrapEl) return;
+      for (const tr of wrapEl.querySelectorAll<HTMLTableRowElement>('tbody > tr[data-row-index]')) {
+        const tds = tr.querySelectorAll<HTMLTableCellElement>(':scope > td');
+        tds.forEach((td, i) => {
+          const label = cols[i - offset]?.label ?? '';
+          if (label) td.dataset.label = label;
+          else delete td.dataset.label;
+        });
+      }
+    });
+  });
 
   // Restore persisted sort state on mount (keyed by first column label).
   $effect(() => {
@@ -583,6 +606,22 @@
       white-space: normal;
       overflow: visible;
       text-overflow: clip;
+      /* Column alignment is a table concept; in a card every value sits
+         under its caption. Inline `text-align:center` on a consumer's
+         centered column would otherwise float that one line mid-card. */
+      text-align: left !important;
+    }
+    /* The column label, stamped by the stacked-label effect above, so a
+       card of bare values still says what each value is. */
+    .data-table tbody :global(td[data-label])::before {
+      content: attr(data-label);
+      display: block;
+      margin-bottom: 2px;
+      font-size: var(--text-2xs);
+      font-weight: 600;
+      letter-spacing: var(--tracking-wide);
+      text-transform: uppercase;
+      color: var(--fg-muted);
     }
     .data-table.stable-layout tbody :global(td) {
       white-space: normal;

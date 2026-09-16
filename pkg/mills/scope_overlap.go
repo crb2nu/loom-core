@@ -6,29 +6,18 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
 // Scope-overlap serialization (reconciler dispatch guard).
 //
-// The council decomposes a theme into several backlog items whose slices
-// frequently name files in the SAME package (2026-07-08/09: ten
-// failure-classification items all declared pkg/mills/pipeline files; the
-// reconciler dispatched them concurrently and every resulting MR conflicted
-// with its siblings — seven open MRs, zero merged, ~$12 burned across their
-// escalations #290–#305). Two runs editing one package can only race to a
-// merge conflict, so the reconciler now defers a queued item while another
-// RUNNING item holds an intersecting scope envelope. The deferred item stays
-// queued; the on-merge KickNow dispatches it as soon as the blocker clears.
-//
-// The envelope mirrors pkg/mills/gates/scope.go: council-guessed basenames
-// are systematically near-misses of what the implement agent writes, so the
-// enforceable unit is the parent DIRECTORY of each slice-declared file, and
-// two envelopes intersect when any directory of one equals — or is an
-// ancestor/descendant of — a directory of the other. Serialization compares
-// only items resolved to the same target repo; cross-repo runs cannot
-// produce competing MRs.
+// Literal paths serialize only when they name the same cleaned file. Sibling
+// files can run concurrently; textual conflicts are handled by the merge queue.
+// Globs reserve their static directory against related literal-file and glob
+// directories. This admission rule is separate from the broader scope gate.
+// Comparisons apply only within the same target repository.
 //
 // Escalated items do NOT block: their MRs may be open too, but serializing
 // behind a wedged escalation would starve the queue behind work that needs
@@ -46,19 +35,18 @@ const changelogFragmentDir = "changelog.d"
 
 // scopeEnvelope is the comparable footprint of one backlog item's slices.
 type scopeEnvelope struct {
-	// files holds the cleaned slice-declared paths (exact-match fallback for
-	// repo-root files whose parent directory "." is deliberately excluded).
+	// files holds cleaned literal paths for exact intersection.
 	files map[string]struct{}
-	// dirs holds the parent directory of every declared file plus the static
-	// directory prefix of every glob pattern.
-	dirs map[string]struct{}
+	// Literal directories participate only when compared with a glob.
+	literalDirs map[string]struct{}
+	globDirs    map[string]struct{}
 }
 
 // envelopeForItem builds the scope envelope from every slice's files+tests.
 // Items without slices (canaries, bootstrapped-repo plans) yield an empty
 // envelope, which never blocks and is never blocked.
 func envelopeForItem(item *store.BacklogItem) scopeEnvelope {
-	env := scopeEnvelope{files: map[string]struct{}{}, dirs: map[string]struct{}{}}
+	env := scopeEnvelope{files: map[string]struct{}{}, literalDirs: map[string]struct{}{}, globDirs: map[string]struct{}{}}
 	if item == nil {
 		return env
 	}
@@ -67,7 +55,9 @@ func envelopeForItem(item *store.BacklogItem) scopeEnvelope {
 			env.add(f)
 		}
 		for _, t := range s.Tests {
-			env.add(t)
+			if isPathLike(t) {
+				env.add(t)
+			}
 		}
 	}
 	return env
@@ -85,7 +75,7 @@ func (e scopeEnvelope) add(path string) {
 		// envelope collide with everything, the same allow-anything hazard
 		// the "." exclusion below avoids.
 		if dir := globStaticDir(path); dir != "" && dir != changelogFragmentDir {
-			e.dirs[dir] = struct{}{}
+			e.globDirs[dir] = struct{}{}
 		}
 		return
 	}
@@ -94,37 +84,36 @@ func (e scopeEnvelope) add(path string) {
 	// "." (a repo-root file's parent) would make every pair of items with a
 	// root file "overlap"; root files fall back to exact-file comparison.
 	if dir := filepath.Dir(cleaned); dir != "." && dir != "/" && dir != changelogFragmentDir {
-		e.dirs[dir] = struct{}{}
+		e.literalDirs[dir] = struct{}{}
 	}
 }
 
 func (e scopeEnvelope) empty() bool {
-	return len(e.files) == 0 && len(e.dirs) == 0
+	return len(e.files) == 0 && len(e.literalDirs) == 0 && len(e.globDirs) == 0
 }
 
-// overlaps reports whether the two envelopes intersect, returning a witness
-// path (a shared file or the shallower of the two related directories) for
-// the defer reason. Directory containment counts both ways: a slice pinning
-// pkg/mills/pipeline must serialize against one pinning
-// pkg/mills/pipeline/subdir, because the scope gate's envelope
-// (gates/scope.go isAllowed) lets each run modify the other's files.
+// overlaps returns a shared literal file or an overlapping glob directory.
+// Literal directories alone never reserve sibling or descendant files.
 func (e scopeEnvelope) overlaps(other scopeEnvelope) (bool, string) {
-	for f := range e.files {
+	for _, f := range sortedKeys(e.files) {
 		if _, ok := other.files[f]; ok {
 			return true, f
 		}
 	}
-	// Deterministic witness: scan sorted so repeated ticks log the same path.
-	for _, d := range sortedKeys(e.dirs) {
-		for _, o := range sortedKeys(other.dirs) {
-			if d == o {
-				return true, d
-			}
-			if strings.HasPrefix(o, d+"/") {
-				return true, d
-			}
-			if strings.HasPrefix(d, o+"/") {
-				return true, o
+	for i, pair := range [][2]map[string]struct{}{
+		{e.globDirs, other.globDirs},
+		{e.globDirs, other.literalDirs},
+		{other.globDirs, e.literalDirs},
+	} {
+		for _, glob := range sortedKeys(pair[0]) {
+			for _, dir := range sortedKeys(pair[1]) {
+				if glob == dir || strings.HasPrefix(dir, glob+"/") || strings.HasPrefix(glob, dir+"/") {
+					// For two globs, use their shallower directory.
+					if i == 0 && len(dir) < len(glob) {
+						return true, dir
+					}
+					return true, glob
+				}
 			}
 		}
 	}
@@ -187,12 +176,18 @@ func (r *Reconciler) scopeOverlapBlocker(ctx context.Context, item *store.Backlo
 	return "", "", nil
 }
 
-func (r *Reconciler) scopeReservationBlocker(ctx context.Context, item *store.BacklogItem, hold time.Duration) (string, string, error) {
+func (r *Reconciler) scopeReservationBlocker(ctx context.Context, item *store.BacklogItem, policy *Policy, hold time.Duration) (string, string, error) {
 	reservations, err := r.Store.Backlog.ScopeReservations(ctx)
 	if err != nil {
 		return "", "", err
 	}
 	now := r.now().UTC()
+	type eligibleReservation struct {
+		item       *store.BacklogItem
+		reservedAt time.Time
+		envelope   scopeEnvelope
+	}
+	eligible := make([]eligibleReservation, 0, len(reservations))
 	for _, reservation := range reservations {
 		if reservation.ReservedAt != nil && now.Sub(*reservation.ReservedAt) >= hold {
 			if err := r.Store.Backlog.ResetScopeFairness(ctx, reservation.BacklogID); err != nil {
@@ -202,16 +197,95 @@ func (r *Reconciler) scopeReservationBlocker(ctx context.Context, item *store.Ba
 			r.append(ctx, "reconciler.scope_reservation_cap_released", "released", map[string]any{"item": reservation.BacklogID, "held_seconds": now.Sub(*reservation.ReservedAt).Seconds()})
 			continue
 		}
-		if reservation.BacklogID == item.ID {
-			continue
-		}
 		other, err := r.Store.Backlog.Get(ctx, reservation.BacklogID)
 		if err != nil {
 			return "", "", err
 		}
-		if hit, witness := store.BacklogScopesOverlap(item, other, r.HomeProject); hit {
+		reason, err := r.starvedCandidateExclusion(ctx, other, policy)
+		if err != nil {
+			return "", "", err
+		}
+		if reason != "" {
+			r.appendStarvedCandidateExclusion(ctx, other.ID, reason)
+			continue
+		}
+		blocker, _, err := r.scopeOverlapBlocker(ctx, other)
+		if err != nil {
+			return "", "", err
+		}
+		if blocker != "" {
+			continue
+		}
+		eligible = append(eligible, eligibleReservation{item: other, reservedAt: *reservation.ReservedAt, envelope: envelopeForItem(other)})
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		a, b := eligible[i], eligible[j]
+		return store.ScopeReservationPrecedes(a.item, a.reservedAt, b.item, b.reservedAt)
+	})
+	// Include self in arbitration so lower-ranked reservations cannot block the
+	// winner. A reservation overlapping any earlier eligible reservation yields
+	// its entire envelope for this pass, including scopes the older one lacks.
+	suppressed := make([]bool, len(eligible))
+	for i, reservation := range eligible {
+		for _, earlier := range eligible[:i] {
+			if !sameScopeTarget(reservation.item, earlier.item, r.HomeProject) {
+				continue
+			}
+			if hit, witness := reservation.envelope.overlaps(earlier.envelope); hit {
+				suppressed[i] = true
+				r.append(ctx, "reconciler.scope_reservation_yield", "older_reservation", map[string]any{
+					"item": reservation.item.ID, "yields_to": earlier.item.ID, "shared_scope": witness,
+				})
+				break
+			}
+		}
+	}
+	itemEnv := envelopeForItem(item)
+	for i, reservation := range eligible {
+		other := reservation.item
+		if suppressed[i] || other.ID == item.ID {
+			continue
+		}
+		if !sameScopeTarget(item, other, r.HomeProject) {
+			continue
+		}
+		if hit, witness := itemEnv.overlaps(reservation.envelope); hit {
+			if item.Priority < other.Priority {
+				r.append(ctx, "reconciler.scope_reservation_override", "higher_priority", map[string]any{
+					"item": item.ID, "blocker": other.ID, "shared_scope": witness,
+					"priority": item.Priority, "reserver_priority": other.Priority,
+				})
+				if r.Logger != nil {
+					r.Logger.Info("reconciler: higher priority overrides scope reservation", "item", item.ID, "blocker", other.ID, "shared_scope", witness)
+				}
+				continue
+			}
 			return other.ID, witness, nil
 		}
 	}
 	return "", "", nil
+}
+
+func sameScopeTarget(a, b *store.BacklogItem, homeProject string) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	target := func(item *store.BacklogItem) string {
+		if project := strings.TrimSpace(item.TargetProject); project != "" {
+			return project
+		}
+		return strings.TrimSpace(homeProject)
+	}
+	left, right := target(a), target(b)
+	if left == "" && right == "" {
+		return true
+	}
+	return store.SameRepo(left, right)
+}
+
+// isPathLike distinguishes test paths/globs from commands in Slice.Tests.
+// Files declarations deliberately bypass this filter. Whitespace rejects
+// command prefixes such as "go ", "cd ", "pnpm ", "npm ", and "make ".
+func isPathLike(s string) bool {
+	return s != "" && strings.IndexFunc(s, unicode.IsSpace) < 0 && !strings.ContainsAny(s, "&|;<>()`")
 }

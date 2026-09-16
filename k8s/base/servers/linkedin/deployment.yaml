@@ -24,43 +24,38 @@ spec:
     spec:
       containers:
         - env:
-            - name: LINKEDIN_ACCESS_TOKEN
+            # BrowserKit is deliberately disabled in-cluster: the custom-server
+            # image ships no python/chromium, so session health probes and
+            # recovery cannot run in this pod (the old `auto` mode surfaced as
+            # NotConfigured errors on messaging tools once the cookie went
+            # stale). The pod does cookie-only Voyager HTTP. Cookie refresh runs
+            # on a workstation via linkedin_session_recover, then syncs into
+            # gitops loom-secrets — see docs/LINKEDIN_SESSION_RECOVERY_RUNBOOK.md.
+            # LINKEDIN_ACCESS_TOKEN is intentionally absent: when set it is sent
+            # as an Authorization Bearer header on every Voyager call, and the
+            # stored value was a stale li_at copy, not an official API token.
+            - name: LINKEDIN_BROWSERKIT_MODE
+              value: "off"
+            # Companion device cookies (bcookie/bscookie/lidc/...) harvested at
+            # login. A li_at without them is treated as stolen by LinkedIn's
+            # fraud checks and the session gets revoked on first use. Optional
+            # so the pod still starts before the key exists.
+            - name: LINKEDIN_COOKIE_BUNDLE
               valueFrom:
                 secretKeyRef:
-                  key: LINKEDIN_ACCESS_TOKEN
+                  key: LINKEDIN_COOKIE_BUNDLE
                   name: loom-secrets
-            - name: LINKEDIN_BROWSERKIT_MODE
-              value: auto
-            - name: LINKEDIN_BROWSERKIT_PYTHON
-              value: ${env:BROWSERKIT_PYTHON:-python3}
-            - name: LINKEDIN_BROWSERKIT_SESSION_ID
-              value: primary
-            - name: LINKEDIN_BROWSERKIT_STORAGE_DIR
-              value: /home/mcp/.config/loom/linkedin-browserkit
+                  optional: true
             - name: LINKEDIN_JSESSIONID
               valueFrom:
                 secretKeyRef:
                   key: LINKEDIN_JSESSIONID
-                  name: loom-secrets
-            - name: LINKEDIN_LOGIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  key: LINKEDIN_LOGIN_PASSWORD
-                  name: loom-secrets
-            - name: LINKEDIN_LOGIN_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  key: LINKEDIN_LOGIN_USERNAME
                   name: loom-secrets
             - name: LINKEDIN_SESSION_COOKIE
               valueFrom:
                 secretKeyRef:
                   key: LINKEDIN_SESSION_COOKIE
                   name: loom-secrets
-            - name: LINKEDIN_SESSION_HEALTH_TTL_SECONDS
-              value: "1200"
-            - name: LINKEDIN_SESSION_RECOVERY_COOLDOWN_SECONDS
-              value: "300"
             - name: MCP_WS_PORT
               value: "8080"
             - name: LOG_LEVEL

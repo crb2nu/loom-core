@@ -1,0 +1,1 @@
+- Add OpenRouter as a Mills council/spinning-room editor and gate rubric-judge backend, with independent credentials and circuit breaker, token pricing, API billing, and fallback validation (`pkg/mills/clients/`, `pkg/mills/policy.go`, `pkg/mills/store/billing_test.go`, `cmd/loom-mills-operator/`, and `docs/MILLS.md`).

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +18,197 @@ import (
 	"github.com/crb2nu/loom/internal/devbox/backend"
 	"github.com/crb2nu/loom/internal/spawn"
 )
+
+type recordingLaunchSpecBuilder struct {
+	delegate spawnLaunchSpecBuilder
+	err      error
+	inputs   []SpawnRequest
+	outputs  []SpawnRequest
+}
+
+func (b *recordingLaunchSpecBuilder) Build(ctx context.Context, req SpawnRequest) (SpawnRequest, error) {
+	b.inputs = append(b.inputs, req)
+	if b.err != nil {
+		return SpawnRequest{}, b.err
+	}
+	got, err := b.delegate.Build(ctx, req)
+	if err == nil {
+		b.outputs = append(b.outputs, got)
+	}
+	return got, err
+}
+
+type launchCall struct {
+	spawnID string
+	req     SpawnRequest
+}
+
+type recordingSpawnLauncher struct{ calls chan launchCall }
+
+func (l recordingSpawnLauncher) Launch(spawnID string, req SpawnRequest) {
+	l.calls <- launchCall{spawnID: spawnID, req: req}
+}
+
+func TestSpawnOrchestrator_LaunchSeamsCharacterizeRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		req  SpawnRequest
+		want SpawnRequest
+	}{
+		{
+			name: "applies defaults before launch",
+			req: SpawnRequest{
+				AgentType:       "codex",
+				Project:         "loom-core",
+				TaskDescription: "characterize defaults",
+			},
+			want: SpawnRequest{
+				AgentType:       "codex",
+				Project:         "loom-core",
+				TaskDescription: "characterize defaults",
+				MemoryMB:        4096,
+				CPUs:            2,
+				TimeoutMinutes:  45,
+				BaseBranch:      "main",
+				Namespace:       "loom-core/spawn",
+			},
+		},
+		{
+			name: "preserves explicit launch values",
+			req: SpawnRequest{
+				AgentType:       "claude-code",
+				Project:         "loom-core",
+				TaskDescription: "characterize explicit values",
+				MemoryMB:        8192,
+				CPUs:            3.5,
+				TimeoutMinutes:  90,
+				BaseBranch:      "develop",
+				Namespace:       "custom/namespace",
+			},
+			want: SpawnRequest{
+				AgentType:       "claude-code",
+				Project:         "loom-core",
+				TaskDescription: "characterize explicit values",
+				MemoryMB:        8192,
+				CPUs:            3.5,
+				TimeoutMinutes:  90,
+				BaseBranch:      "develop",
+				Namespace:       "custom/namespace",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := spawn.NewK8sController(nil, "", nil, slog.Default())
+			o := &SpawnOrchestrator{
+				ctrl:           ctrl,
+				logger:         slog.Default(),
+				maxConcurrent:  10,
+				defaultMemory:  4096,
+				defaultCPUs:    2,
+				defaultTimeout: 45 * time.Minute,
+			}
+			builder := &recordingLaunchSpecBuilder{
+				delegate: productionSpawnLaunchSpecBuilder{orchestrator: o},
+			}
+			calls := make(chan launchCall, 1)
+			o.launchSpecBuilder = builder
+			o.launcher = recordingSpawnLauncher{calls: calls}
+
+			spawnID, err := o.Spawn(context.Background(), tc.req)
+			if err != nil {
+				t.Fatalf("Spawn() error = %v", err)
+			}
+			if len(builder.inputs) != 1 || builder.inputs[0].Project != tc.req.Project {
+				t.Fatalf("builder inputs = %#v, want original request", builder.inputs)
+			}
+			if len(builder.outputs) != 1 || !reflect.DeepEqual(builder.outputs[0], tc.want) {
+				t.Fatalf("built request = %#v, want %#v", builder.outputs, tc.want)
+			}
+			select {
+			case call := <-calls:
+				if call.spawnID != spawnID || !reflect.DeepEqual(call.req, tc.want) {
+					t.Fatalf("launcher call = %#v, want id %q request %#v", call, spawnID, tc.want)
+				}
+			default:
+				t.Fatal("launcher was not called before Spawn returned")
+			}
+		})
+	}
+}
+
+func TestSpawnOrchestrator_LaunchSpecErrorPropagates(t *testing.T) {
+	wantErr := errors.New("build launch spec")
+	builder := &recordingLaunchSpecBuilder{err: wantErr}
+	calls := make(chan launchCall, 1)
+	o := &SpawnOrchestrator{
+		ctrl:              spawn.NewK8sController(nil, "", nil, slog.Default()),
+		launchSpecBuilder: builder,
+		launcher:          recordingSpawnLauncher{calls: calls},
+	}
+
+	gotID, err := o.Spawn(context.Background(), SpawnRequest{Project: "loom-core"})
+	if !errors.Is(err, wantErr) || gotID != "" {
+		t.Fatalf("Spawn() = (%q, %v), want empty ID and error %v", gotID, err, wantErr)
+	}
+	if len(builder.inputs) != 1 {
+		t.Fatalf("builder calls = %d, want 1", len(builder.inputs))
+	}
+	select {
+	case call := <-calls:
+		t.Fatalf("launcher called after builder error: %#v", call)
+	default:
+	}
+}
+
+func TestSpawnProjectMetadata(t *testing.T) {
+	ws := t.TempDir()
+	repo := filepath.Join(ws, "libs", "mcp-go")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	abs, rel, err := resolveProjectPath(ws, spawnProjectPath("mcp-go"))
+	if err != nil {
+		t.Fatalf("resolve mcp-go: %v", err)
+	}
+	if abs != repo || rel != "libs/mcp-go" {
+		t.Fatalf("resolved (%q, %q), want (%q, %q)", abs, rel, repo, "libs/mcp-go")
+	}
+	if got := spawnProjectPath("loom-core"); got != "loom-core" {
+		t.Fatalf("existing services project changed to %q", got)
+	}
+	// fi-fhir (admitted 2026-09-01 alongside gitops!647) is the second libs/
+	// project; the bare name must resolve to its libs/ path so the clone URL
+	// and workspace lookup do not fall back to services/fi-fhir.
+	if got := spawnProjectPath("fi-fhir"); got != "libs/fi-fhir" {
+		t.Fatalf("fi-fhir resolved to %q, want libs/fi-fhir", got)
+	}
+	if got := spawnProjectPath("edilint"); got != "libs/edilint" {
+		t.Fatalf("edilint resolved to %q, want libs/edilint", got)
+	}
+}
+
+func TestProjectConfiguredFailsClosed(t *testing.T) {
+	configured := []string{"loom-core", "mcp-go", "fi-fhir", "edilint"}
+	// "services/loom-core" is the shape Mills' home-lane dispatcher sends
+	// (effectiveProject falls back to the worker's bucket-qualified home
+	// project) — regression 2026-08-26: rejecting it broke every home-lane
+	// spawn while cross-repo libs items kept working. Cross-repo items send
+	// the bucket-qualified form ("libs/fi-fhir"); that was the exact string
+	// rejected on 2026-09-01 (loom-core #647) before fi-fhir was listed.
+	for _, project := range []string{"loom-core", "services/loom-core", "mcp-go", "libs/mcp-go", "fi-fhir", "libs/fi-fhir", "edilint", "libs/edilint"} {
+		if !projectConfigured(project, configured) {
+			t.Errorf("configured project %q rejected", project)
+		}
+	}
+	for _, project := range []string{"unknown-repo", "services/unknown-repo", ""} {
+		if projectConfigured(project, configured) {
+			t.Errorf("unconfigured project %q must remain rejected", project)
+		}
+	}
+}
 
 func TestSpawnOrchestrator_SpawnIsIdempotentForActiveMillsStage(t *testing.T) {
 	ctx := context.Background()
@@ -253,9 +445,44 @@ func TestBuildAgentCommand_ClaudePerRequestModel(t *testing.T) {
 		t.Errorf("claude command missing per-request model: %q", withModel)
 	}
 
+	// Without a request override the compiled default is pinned explicitly
+	// (never the CLI's own default), unless SPAWN_CLAUDE_MODEL says otherwise.
+	t.Setenv("SPAWN_CLAUDE_MODEL", "")
 	withoutModel := buildAgentCommand("claude-code", "do work", "spawn-claude-2", "", 0)
-	if strings.Contains(withoutModel, "--model") {
-		t.Errorf("claude command unexpectedly pins a model without a request override: %q", withoutModel)
+	if !strings.Contains(withoutModel, "--model '"+defaultClaudeModel+"'") {
+		t.Errorf("claude command without a request override must pin %s: %q", defaultClaudeModel, withoutModel)
+	}
+	t.Setenv("SPAWN_CLAUDE_MODEL", "claude-sonnet-5")
+	withEnv := buildAgentCommand("claude-code", "do work", "spawn-claude-3", "", 0)
+	if !strings.Contains(withEnv, "--model 'claude-sonnet-5'") {
+		t.Errorf("claude command must honour SPAWN_CLAUDE_MODEL: %q", withEnv)
+	}
+}
+
+func TestResolveClaudeModel(t *testing.T) {
+	t.Setenv("SPAWN_CLAUDE_MODEL", "")
+	if defaultClaudeModel != "claude-opus-5" {
+		t.Fatalf("defaultClaudeModel = %q, want claude-opus-5 (2026-09-13 fleet decision)", defaultClaudeModel)
+	}
+	if got := resolveClaudeModel(""); got != defaultClaudeModel {
+		t.Errorf("resolveClaudeModel() = %q, want %q", got, defaultClaudeModel)
+	}
+	if got := resolveClaudeModel(" claude-fable-5-1 "); got != "claude-fable-5-1" {
+		t.Errorf("request model must win: got %q", got)
+	}
+	t.Setenv("SPAWN_CLAUDE_MODEL", "claude-sonnet-5")
+	if got := resolveClaudeModel(""); got != "claude-sonnet-5" {
+		t.Errorf("env override = %q, want claude-sonnet-5", got)
+	}
+	t.Setenv("SPAWN_CLAUDE_MODEL", "   ")
+	if got := resolveClaudeModel(""); got != defaultClaudeModel {
+		t.Errorf("blank env must fall back to the default, got %q", got)
+	}
+	if got := spawnRequestModel("gemini", ""); got != "" {
+		t.Errorf("gemini has no model knob; spawnRequestModel = %q, want empty", got)
+	}
+	if got := spawnRequestModel("claude-code", ""); got != defaultClaudeModel {
+		t.Errorf("SDK-driver path must apply the same default, got %q", got)
 	}
 }
 
@@ -922,6 +1149,52 @@ func TestAgentSecretEnvVars_CodexOmitsAPIKeyEnv(t *testing.T) {
 			t.Fatalf("codex must NOT receive %q env (overrides auth.json), got %+v",
 				v.Name, vars)
 		}
+	}
+}
+
+// TestClaudeOAuthTokenPool pins the second-account contract: keys listed in
+// SPAWN_CLAUDE_OAUTH_TOKEN_KEYS are dealt round-robin to claude-code spawns,
+// the chosen key is exactly the one wired into CLAUDE_CODE_OAUTH_TOKEN, and
+// an unset/malformed pool degrades to the single default key.
+func TestClaudeOAuthTokenPool(t *testing.T) {
+	t.Setenv(ClaudeOAuthTokenKeysEnv, "")
+	if got := claudeOAuthTokenKeys(); len(got) != 1 || got[0] != "claude-oauth-token" {
+		t.Fatalf("unset pool = %v, want [claude-oauth-token]", got)
+	}
+	if got := nextAuthAccount("claude-code"); got != "claude-oauth-token" {
+		t.Fatalf("single-key account = %q, want claude-oauth-token", got)
+	}
+	if got := nextAuthAccount("codex"); got != "" {
+		t.Fatalf("codex account = %q, want empty (single credential)", got)
+	}
+
+	t.Setenv(ClaudeOAuthTokenKeysEnv, " claude-oauth-token, claude-oauth-token-2 ,bad key,claude-oauth-token-2,")
+	if got := claudeOAuthTokenKeys(); len(got) != 2 || got[0] != "claude-oauth-token" || got[1] != "claude-oauth-token-2" {
+		t.Fatalf("pool = %v, want the two valid keys deduplicated in order", got)
+	}
+	claudeOAuthKeyCursor.Store(0)
+	seen := map[string]int{}
+	for i := 0; i < 4; i++ {
+		account := nextAuthAccount("claude-code")
+		seen[account]++
+		vars := agentSecretEnvVarsFor("claude-code", account)
+		var key string
+		for _, v := range vars {
+			if v.Name == "CLAUDE_CODE_OAUTH_TOKEN" {
+				key = v.SecretKey
+			}
+		}
+		if key != account {
+			t.Fatalf("spawn %d: state account %q but pod key %q", i, account, key)
+		}
+	}
+	if seen["claude-oauth-token"] != 2 || seen["claude-oauth-token-2"] != 2 {
+		t.Fatalf("round-robin over 4 spawns = %v, want 2 each", seen)
+	}
+	// A key that is not in secret-key syntax never reaches the pod spec.
+	vars := agentSecretEnvVarsFor("claude-code", "../etc")
+	if vars[0].SecretKey != "claude-oauth-token" {
+		t.Fatalf("malformed key fell through as %q", vars[0].SecretKey)
 	}
 }
 

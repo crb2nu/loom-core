@@ -1,0 +1,1 @@
+- Added a bounded GitLab webhook bus and operator receiver so `ci_watch` wakes on Pipeline/Merge Request events, with idempotent project-hook registration and polling fallback documented in `docs/MILLS_RUNBOOK.md`.

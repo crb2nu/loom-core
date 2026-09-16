@@ -29,11 +29,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/crb2nu/loom/pkg/telemetry"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // Outcome is the verdict of one gate evaluation. It mirrors the on-disk
@@ -70,6 +71,9 @@ type Outcome struct {
 	// pure-Go gates and for LLM gates that returned without a score
 	// (disabled, canary-skipped, unparseable envelope).
 	Judgements []Judgement
+	// scopeFailureClass is populated only for failed scope evaluations and is
+	// projected into the structured telemetry record, not the persisted outcome.
+	scopeFailureClass telemetry.ScopeFailureClass
 }
 
 // FailureCategory is the bounded taxonomy attached where gate outcomes
@@ -95,7 +99,7 @@ var gitLabUnreachableGateEvaluationsTotal = promauto.NewCounter(prometheus.Count
 // calibration read attributes an overrule to the model that actually made it
 // rather than folding both scores onto the primary.
 type Judgement struct {
-	// Role is JudgeRolePrimary or JudgeRoleTiebreaker.
+	// Role is JudgeRolePrimary, JudgeRoleTiebreaker or JudgeRoleShadow.
 	Role      string
 	Model     string
 	Score     float64
@@ -108,6 +112,11 @@ type Judgement struct {
 const (
 	JudgeRolePrimary    = "primary"
 	JudgeRoleTiebreaker = "tiebreaker"
+	// JudgeRoleShadow marks a calibration-only second opinion (LLMGate.Shadow):
+	// recorded beside the primary on every verdict, never consulted for the
+	// gate's Pass. Calibration reports key on gate+role so a candidate judge
+	// can be compared with the primary without steering a single outcome.
+	JudgeRoleShadow = "shadow"
 )
 
 // StageInput is the bundle of context every gate consumes. Fields are
@@ -121,6 +130,18 @@ type StageInput struct {
 	// Item is the backlog item the pipeline run is materialising. Carries
 	// labels, slice scope, success criteria, budget, and item-level policy.
 	Item *store.BacklogItem
+
+	// MaxDiffLines is the backlog item's explicit diff-size ceiling. Positive
+	// values override the package default; zero and negative values retain it.
+	MaxDiffLines int
+
+	// HomeProject is the operator's own repository (its GITLAB_PROJECT), so
+	// gates can recognise an item that names the home repo explicitly —
+	// "services/loom-core" or the bare "loom-core" — as the home repo rather
+	// than as an unknown foreign target. Items filed from the HUD intake or
+	// by hand carry the bucket-qualified name; the emitter leaves
+	// TargetProject empty. Empty when the runner does not know its home.
+	HomeProject string
 
 	// Policy is the active policy snapshot at the moment the gate runs.
 	// The runtime captures it so a hot-reload mid-stage doesn't change the
@@ -178,6 +199,18 @@ type StageInput struct {
 	// that it failed; a failed tests stage retries/escalates before any
 	// downstream gate fires.
 	TestsPassed bool
+
+	// TestsVerdict carries the structured deterministic test result when the
+	// tests stage emitted one. Nil means a legacy/missing artifact and passes
+	// the tests_verdict gate for backwards compatibility.
+	TestsVerdict *TestsVerdict
+	// TestedSHA is the branch revision the tests stage verified (its
+	// `tested_sha` artifact); empty or "unresolved" when the stage could not
+	// pin one. ReviewHeadSHA is the remote branch head resolved after
+	// pr_self_review finished (`pushed_commits.head_sha`). The tested_head
+	// gate compares the two; an unresolved side is an advisory skip.
+	TestedSHA     string
+	ReviewHeadSHA string
 }
 
 // Gate is the contract every check satisfies. Implementations must be
@@ -233,6 +266,9 @@ func Default() *Registry {
 	r.Register(&SecretScan{})
 	r.Register(&CommitFormat{})
 	r.Register(&DocsGuardrail{})
+	r.Register(&DependencyPreflight{})
+	r.Register(&TestsVerdictGate{})
+	r.Register(&TestedHeadGate{})
 	return r
 }
 
@@ -293,7 +329,7 @@ func (r *Registry) EvaluateAll(ctx context.Context, names []string, in StageInpu
 			o := Outcome{
 				Pass: false, Reasons: []string{err.Error()}, JudgedBy: "go",
 			}
-			r.recordOutcome(n, in, o, FailureCategoryUnknownGate, started)
+			r.recordOutcome(ctx, n, in, o, FailureCategoryUnknownGate, started)
 			out = append(out, NamedOutcome{Name: n, Outcome: o})
 			allPass = false
 			continue
@@ -320,7 +356,7 @@ func (r *Registry) EvaluateAll(ctx context.Context, names []string, in StageInpu
 			return out, false, fmt.Errorf("gate %q: %w", n, err)
 		}
 		recordGateVerdictParse(ctx, n, o, nil)
-		r.recordOutcome(n, in, o, failureCategoryForOutcome(o), started)
+		r.recordOutcome(ctx, n, in, o, failureCategoryForOutcome(o), started)
 		out = append(out, NamedOutcome{Name: n, Outcome: o})
 		if !o.Pass {
 			allPass = false
@@ -387,13 +423,24 @@ func recordGateVerdictParse(ctx context.Context, gate string, out Outcome, err e
 	telemetry.RecordGateVerdictParse(ctx, gate, outcome)
 }
 
-func (r *Registry) recordOutcome(name string, in StageInput, out Outcome, category FailureCategory, started time.Time) {
-	r.recordEvaluation(telemetry.GateEvaluation{
+func (r *Registry) recordOutcome(ctx context.Context, name string, in StageInput, out Outcome, category FailureCategory, started time.Time) {
+	scopeClass := out.scopeFailureClass
+	if name == "scope" && category == FailureCategoryFail && scopeClass == "" {
+		// Preserve the closed contract for alternate scope implementations:
+		// an unclassified successful evaluation must never reach telemetry.
+		scopeClass = telemetry.ScopeFailureGenuineDetour
+	}
+	evaluation := telemetry.GateEvaluation{
 		GateID: name, RunID: in.RunID, InputDigest: inputDigestForGate(name, in),
 		Verdict: telemetryVerdictFor(out), FailureCategory: category,
-		Reason:     strings.Join(out.Reasons, "; "),
-		DurationMS: elapsedMilliseconds(started),
-	})
+		Reason:            strings.Join(out.Reasons, "; "),
+		DurationMS:        elapsedMilliseconds(started),
+		ScopeFailureClass: scopeClass,
+	}
+	r.recordEvaluation(evaluation)
+	if evaluation.GateID == "scope" && category == FailureCategoryFail {
+		telemetry.RecordScopeFailure(ctx, evaluation.ScopeFailureClass)
+	}
 }
 
 func failureCategoryForOutcome(out Outcome) FailureCategory {

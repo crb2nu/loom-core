@@ -78,12 +78,13 @@ type SubRunner interface {
 // Single-slice items skip the fan-out entirely and the parent runner
 // drives the standard DAG.
 type Integrator struct {
-	Store     *store.Store
-	Sub       SubRunner
-	Allocator WorktreeAllocator
-	Merger    BranchMerger
-	Clock     func() time.Time
-	Logger    *slog.Logger
+	Store       *store.Store
+	HomeProject string
+	Sub         SubRunner
+	Allocator   WorktreeAllocator
+	Merger      BranchMerger
+	Clock       func() time.Time
+	Logger      *slog.Logger
 	// MaxParallel caps the number of concurrent sub-runs. 0 means
 	// "no cap"; recommend setting from policy.budgets.pipeline
 	// .max_concurrent_runs at startup.
@@ -351,10 +352,13 @@ func (i *Integrator) escalateWithItem(ctx context.Context, run *store.PipelineRu
 			return fmt.Errorf("integrator: persist backlog escalated: %w", err)
 		}
 		*item = *current
+		if _, err := i.Store.Outcomes.WriteTerminal(ctx, item.ID, mills.OutcomeDispatchScore(item, run.Attempts-1, run.StartedAt)); err != nil {
+			return fmt.Errorf("integrator: persist escalated outcome writeback: %w", err)
+		}
 		// Same escalation-time target binding the runner writes: the ghost-spark
 		// merged-branch sweep needs it to authorize cross-repo lookups.
 		// Best-effort; the escalation stands without it.
-		if _, err := mills.AppendEscalationTargetBinding(ctx, i.Store.Events, "pipeline", run, item); err != nil && i.Logger != nil {
+		if _, err := mills.AppendEscalationTargetBinding(ctx, i.Store.Events, "pipeline", run, item, i.HomeProject); err != nil && i.Logger != nil {
 			i.Logger.Warn("integrator: escalation target binding append failed",
 				"run", run.ID, "backlog", item.ID, "error", err)
 		}

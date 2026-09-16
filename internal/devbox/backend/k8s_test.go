@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -109,6 +111,82 @@ func TestBuildRestConfig_UsesExplicitKubeconfig(t *testing.T) {
 	}
 	if got := cfg.Host; got != "https://127.0.0.1:6443" {
 		t.Fatalf("unexpected kube API host: %q", got)
+	}
+	if cfg.QPS != defaultClientQPS || cfg.Burst != defaultClientBurst {
+		t.Fatalf("rate limits = %v/%d, want controller defaults %v/%d", cfg.QPS, cfg.Burst, defaultClientQPS, defaultClientBurst)
+	}
+}
+
+func TestApplyClientRateLimits_DefaultsEnvAndPreset(t *testing.T) {
+	cfg := &rest.Config{}
+	applyClientRateLimits(cfg)
+	if cfg.QPS != defaultClientQPS || cfg.Burst != defaultClientBurst {
+		t.Fatalf("defaults = %v/%d, want %v/%d", cfg.QPS, cfg.Burst, defaultClientQPS, defaultClientBurst)
+	}
+
+	t.Setenv("DEVBOX_K8S_CLIENT_QPS", "12.5")
+	t.Setenv("DEVBOX_K8S_CLIENT_BURST", "34")
+	cfg = &rest.Config{}
+	applyClientRateLimits(cfg)
+	if cfg.QPS != 12.5 || cfg.Burst != 34 {
+		t.Fatalf("env override = %v/%d, want 12.5/34", cfg.QPS, cfg.Burst)
+	}
+
+	preset := &rest.Config{QPS: 7, Burst: 9}
+	applyClientRateLimits(preset)
+	if preset.QPS != 7 || preset.Burst != 9 {
+		t.Fatalf("preset limits were overwritten: %v/%d", preset.QPS, preset.Burst)
+	}
+
+	applyClientRateLimits(nil) // must not panic
+}
+
+// TestWaitForPodGone_RetriesTransientGetErrors pins the change that ended
+// the "wait to replace non-running pod" family: a Get that fails for a
+// reason other than NotFound (here client-go's rate limiter) keeps the
+// wait alive instead of aborting it, and the wait still resolves when the
+// pod turns out to be gone.
+func TestWaitForPodGone_RetriesTransientGetErrors(t *testing.T) {
+	k := testK8sBackend()
+	cs := k8sfake.NewSimpleClientset()
+	calls := 0
+	cs.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		calls++
+		if calls <= 2 {
+			return true, nil, errors.New("client rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline")
+		}
+		return false, nil, nil // fall through: no pod → NotFound
+	})
+	k.clientset = cs
+
+	if err := k.waitForPodGone(context.Background(), "devbox-loom-core-loom-mills-o", 5*time.Second); err != nil {
+		t.Fatalf("waitForPodGone: %v (get calls=%d)", err, calls)
+	}
+	if calls < 3 {
+		t.Fatalf("get calls = %d, want the wait to keep polling past the transient errors", calls)
+	}
+}
+
+// TestWaitForPodGone_ReportsLastGetErrorOnTimeout pins the diagnostic: when
+// the deadline passes without a NotFound, the error names the pod, the
+// budget, and the last Get error, so a starved limiter is distinguishable
+// from a pod that genuinely would not terminate.
+func TestWaitForPodGone_ReportsLastGetErrorOnTimeout(t *testing.T) {
+	k := testK8sBackend()
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("client rate limiter Wait returned an error: context deadline exceeded")
+	})
+	k.clientset = cs
+
+	err := k.waitForPodGone(context.Background(), "devbox-loom-core-loom-mills-o", 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	for _, want := range []string{"still present after", "rate limiter"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
 	}
 }
 
@@ -326,7 +404,7 @@ func TestBuildPodSpecResourcesAndMounts(t *testing.T) {
 
 func TestBuildBuildahPodSpec(t *testing.T) {
 	k := testK8sBackend()
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false, false)
 
 	if pod.Name != "build-pod" || pod.Namespace != "devbox" {
 		t.Fatalf("unexpected pod metadata: %#v", pod.ObjectMeta)
@@ -406,7 +484,7 @@ func TestBuildBuildahPodSpec_CustomBuildResources(t *testing.T) {
 	k.buildEphemeralStorageRequest = resource.MustParse("4Gi")
 	k.buildEphemeralStorageLimit = resource.MustParse("12Gi")
 
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false, false)
 	res := pod.Spec.Containers[0].Resources
 	if got := res.Requests.Cpu().String(); got != "250m" {
 		t.Fatalf("CPU request = %s, want 250m", got)
@@ -511,7 +589,7 @@ func TestBuildRejectsContextOutsideWorkspaceRoot(t *testing.T) {
 
 func TestBuildBuildahPodSpec_EmptyDirAndRegistryCache(t *testing.T) {
 	k := testK8sBackend()
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false, false)
 
 	// Verify the buildah-storage volume always uses EmptyDir
 	var found bool
@@ -530,18 +608,19 @@ func TestBuildBuildahPodSpec_EmptyDirAndRegistryCache(t *testing.T) {
 		t.Fatal("buildah-storage volume not found")
 	}
 
-	// Verify build command includes --cache-from with bare repo (no tag/digest).
+	// Verify build command reads and writes the registry cache using the bare repo.
 	buildCmd := pod.Spec.Containers[0].Command[2] // sh -c "<cmd>"
 	if !strings.Contains(buildCmd, "--cache-from=registry.harbor.lan/devbox") {
 		t.Fatalf("expected --cache-from with bare repo in build command, got: %s", buildCmd)
 	}
+	if !strings.Contains(buildCmd, "--cache-to=registry.harbor.lan/devbox") {
+		t.Fatalf("expected --cache-to with bare repo in build command, got: %s", buildCmd)
+	}
 	if strings.Contains(buildCmd, "--cache-from=registry.harbor.lan/devbox:") {
 		t.Fatalf("--cache-from must not include a tag (buildah v1.29+ rejects it), got: %s", buildCmd)
 	}
-
-	// Verify build command pushes cache tag
-	if !strings.Contains(buildCmd, "buildah tag") {
-		t.Fatalf("expected cache tag push in build command, got: %s", buildCmd)
+	if strings.Contains(buildCmd, "registry.harbor.lan/devbox:cache") {
+		t.Fatalf("build command must not tag or push a moving :cache image, got: %s", buildCmd)
 	}
 
 	// Verify bumped resources: 1 CPU request, 3 CPU limit
@@ -558,7 +637,7 @@ func TestBuildBuildahPodSpec_EmptyDirAndRegistryCache(t *testing.T) {
 
 func TestBuildBuildahPodSpec_PreferExistingImage(t *testing.T) {
 	k := testK8sBackend()
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", true)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", true, false)
 
 	buildCmd := pod.Spec.Containers[0].Command[2]
 	for _, want := range []string{
@@ -581,7 +660,7 @@ func TestBuildBuildahPodSpec_PreferExistingImage(t *testing.T) {
 func TestBuildBuildahPodSpec_AvoidNodesAffinity(t *testing.T) {
 	k := testK8sBackend()
 	k.buildAvoidNodes = []string{"k3s-w-7", "k3s-w-8"}
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false, false)
 
 	affinity := pod.Spec.Affinity
 	if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
@@ -730,6 +809,21 @@ func TestGitCloneInitContainer(t *testing.T) {
 	}
 	if wantLim := resource.MustParse(defaultGitCloneMemoryLimit); gotMemLim.Cmp(wantLim) != 0 {
 		t.Fatalf("expected git-clone memory limit %s, got %s", wantLim.String(), gotMemLim.String())
+	}
+}
+
+func TestGitCloneInitContainerUsesProjectMetadataPath(t *testing.T) {
+	k := testK8sBackendGitClone()
+	k.gitBaseURL = "https://gitlab.flexinfer.ai"
+	ic := k.gitCloneInitContainer("/workspace/libs/mcp-go", gitCloneOpts{projectPath: "libs/mcp-go"})
+	script := ic.Command[2]
+	if !strings.Contains(script, "gitlab.flexinfer.ai/libs/mcp-go.git") {
+		t.Fatalf("expected libs clone target, got: %s", script)
+	}
+
+	ic = k.gitCloneInitContainer("/workspace/services/loom-core", gitCloneOpts{projectPath: "services/loom-core"})
+	if !strings.Contains(ic.Command[2], "gitlab.flexinfer.ai/services/loom-core.git") {
+		t.Fatalf("expected unchanged services clone target, got: %s", ic.Command[2])
 	}
 }
 
@@ -933,7 +1027,7 @@ func TestBuildPodSpec_TarPipeMode(t *testing.T) {
 
 func TestBuildBuildahPodSpec_GitCloneMode(t *testing.T) {
 	k := testK8sBackendGitClone()
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false, false)
 
 	// Should use emptyDir for workspace, not NFS PVC
 	wsVol := pod.Spec.Volumes[0]
@@ -963,7 +1057,7 @@ func TestBuildBuildahPodSpec_GitCloneMode(t *testing.T) {
 func TestBuildBuildahPodSpec_TarPipeMode(t *testing.T) {
 	k := testK8sBackend()
 	k.syncMode = "tar-pipe"
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false, false)
 
 	wsVol := pod.Spec.Volumes[0]
 	if wsVol.EmptyDir == nil {
@@ -982,7 +1076,7 @@ func TestBuildBuildahPodSpec_TarPipeMode(t *testing.T) {
 
 func TestBuildBuildahPodSpec_NFSMode(t *testing.T) {
 	k := testK8sBackend()
-	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false)
+	pod := k.buildBuildahPodSpec("build-pod", "registry.harbor.lan/devbox:tag", "dockerfile-cm", "/workspace/services/loom-core", false, false)
 
 	wsVol := pod.Spec.Volumes[0]
 	if wsVol.PersistentVolumeClaim == nil {
@@ -1816,6 +1910,91 @@ func TestBuildPodSpecCachePVCs(t *testing.T) {
 	for _, v := range bare.Spec.Volumes {
 		if strings.HasPrefix(v.Name, "cache-pvc-") {
 			t.Errorf("no CachePVCs configured but found volume %s", v.Name)
+		}
+	}
+}
+
+func TestStopWaitsForCapturedPodDeletion(t *testing.T) {
+	k := testK8sBackend()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sandbox", Namespace: k.namespace, UID: types.UID("old")}}
+	client := k8sfake.NewSimpleClientset(pod)
+	k.clientset = client
+	deleted := make(chan struct{})
+	client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		opts := action.(k8stesting.DeleteAction).GetDeleteOptions()
+		if opts.Preconditions == nil || *opts.Preconditions.UID != pod.UID {
+			t.Error("missing UID fence")
+		}
+		close(deleted)
+		return true, nil, nil // API accepted deletion, but pod is still terminating.
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- k.Stop(ctx, pod.Name) }()
+	<-deleted
+	select {
+	case err := <-done:
+		t.Fatalf("returned before termination: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := client.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), k.namespace, pod.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Stop(ctx, pod.Name); err != nil {
+		t.Fatalf("missing sandbox: %v", err)
+	}
+}
+
+func TestStopDoesNotDeleteReplacementOrAcknowledgePendingDeletion(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		t.Run(map[bool]string{false: "still terminating", true: "replacement"}[replacement], func(t *testing.T) {
+			k := testK8sBackend()
+			client := k8sfake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sandbox", Namespace: k.namespace, UID: "old"}})
+			k.clientset = client
+			deletes := 0
+			client.PrependReactor("delete", "pods", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+				deletes++
+				return true, nil, nil
+			})
+			client.PrependReactor("get", "pods", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+				if replacement && deletes > 0 {
+					return true, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sandbox", UID: "new"}}, nil
+				}
+				return false, nil, nil
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			err := k.Stop(ctx, "sandbox")
+			if replacement && err != nil {
+				t.Fatal(err)
+			}
+			if !replacement && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("acknowledged pending deletion: %v", err)
+			}
+			if deletes != 1 {
+				t.Fatalf("deleted replacement: %d deletes", deletes)
+			}
+		})
+	}
+}
+
+func TestK8sBuildTimeoutConfig(t *testing.T) {
+	kubeconfig := writeTestKubeconfig(t)
+	for _, budget := range []time.Duration{0, -time.Minute, 2 * time.Hour} {
+		k, err := NewK8sBackend(K8sBackendConfig{Kubeconfig: kubeconfig, BuildTimeout: budget})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := budget
+		if want <= 0 {
+			want = 30 * time.Minute
+		}
+		if got := k.effectiveBuildTimeout(); got != want {
+			t.Fatalf("got %s, want %s", got, want)
 		}
 	}
 }

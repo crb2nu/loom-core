@@ -85,7 +85,11 @@ func TestVerifyGitLabToken(t *testing.T) {
 		secret string
 		want   bool
 	}{
-		{"empty secret allows all", "anything", "", true},
+		// Empty secret fails CLOSED — regression pin for the fail-open
+		// hole where an unset WEBHOOK_GITLAB_SECRET accepted every
+		// request. Mirrors fi-gitlab-hookify test_empty_expected_token.
+		{"empty secret rejects all", "anything", "", false},
+		{"empty secret rejects empty header", "", "", false},
 		{"matching tokens", "my-secret", "my-secret", true},
 		{"mismatched tokens", "wrong", "my-secret", false},
 		{"empty header with secret", "", "my-secret", false},
@@ -113,7 +117,10 @@ func TestVerifyGitHubSignature(t *testing.T) {
 		want   bool
 	}{
 		{"valid signature", validSig, secret, body, true},
-		{"empty secret allows all", "", "", body, true},
+		// Empty secret fails CLOSED — same regression pin as
+		// TestVerifyGitLabToken, for the HMAC path.
+		{"empty secret rejects all", validSig, "", body, false},
+		{"empty secret rejects empty sig", "", "", body, false},
 		{"wrong signature", "sha256=deadbeef", secret, body, false},
 		{"no prefix", "deadbeef", secret, body, false},
 		{"tampered body", validSig, secret, []byte(`{"test": false}`), false},
@@ -527,5 +534,88 @@ func TestHandleGitLabWebhook_OfflineAgentsAreNotMatches(t *testing.T) {
 
 	if len(spawner.spawnCalls) != 1 {
 		t.Errorf("offline-only match should fall back to spawn, got %d calls", len(spawner.spawnCalls))
+	}
+}
+
+// TestHandleGitLabWebhook_EmptySecretRejects regression-pins the
+// fail-closed contract at the endpoint level: with inbound enabled but
+// no GitLab secret configured, an otherwise well-formed CI-failure
+// payload must be rejected 401 with no spawn and no agent broadcast.
+// Before the fix this exact request drove agent spawning
+// unauthenticated. Mirrors fi-gitlab-hookify test_empty_expected_token.
+func TestHandleGitLabWebhook_EmptySecretRejects(t *testing.T) {
+	spawner := &fakeSpawner{}
+	deps := &fakeDeps{
+		config:  WebhookCfg{InboundEnabled: true, GitLabSecret: ""},
+		spawner: spawner,
+	}
+	d := New(deps)
+
+	payload := GitLabPipelineEvent{}
+	payload.ObjectKind = "pipeline"
+	payload.ObjectAttributes.Status = "failed"
+	payload.ObjectAttributes.ID = 42
+	payload.ObjectAttributes.Ref = "main"
+	payload.Project.PathWithNamespace = "homelab/loom-core"
+	body, _ := json.Marshal(payload)
+
+	for _, token := range []string{"", "anything"} {
+		req := httptest.NewRequest("POST", "/api/webhook/gitlab", bytes.NewReader(body))
+		if token != "" {
+			req.Header.Set("X-Gitlab-Token", token)
+		}
+		w := httptest.NewRecorder()
+
+		d.handleGitLabWebhook(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("token %q: status = %d, want %d", token, w.Code, http.StatusUnauthorized)
+		}
+	}
+	if len(spawner.spawnCalls) != 0 {
+		t.Errorf("expected zero spawn calls with empty secret, got %d", len(spawner.spawnCalls))
+	}
+	if len(deps.broadcasts) != 0 {
+		t.Errorf("expected zero broadcasts with empty secret, got %v", deps.broadcasts)
+	}
+}
+
+// TestHandleGitHubWebhook_EmptySecretRejects mirrors the GitLab test
+// for the GitHub HMAC path — even a signature that would be valid for
+// an empty-string secret must be rejected when no secret is configured.
+func TestHandleGitHubWebhook_EmptySecretRejects(t *testing.T) {
+	spawner := &fakeSpawner{}
+	deps := &fakeDeps{
+		config:  WebhookCfg{InboundEnabled: true, GitHubSecret: ""},
+		spawner: spawner,
+	}
+	d := New(deps)
+
+	payload := GitHubCheckSuiteEvent{Action: "completed"}
+	payload.CheckSuite.ID = 99
+	payload.CheckSuite.Conclusion = "failure"
+	payload.CheckSuite.HeadBranch = "main"
+	payload.Repository.FullName = "user/loom-core"
+	body, _ := json.Marshal(payload)
+
+	for _, sig := range []string{"", computeGitHubSignature("", body)} {
+		req := httptest.NewRequest("POST", "/api/webhook/github", bytes.NewReader(body))
+		if sig != "" {
+			req.Header.Set("X-Hub-Signature-256", sig)
+		}
+		req.Header.Set("X-GitHub-Event", "check_suite")
+		w := httptest.NewRecorder()
+
+		d.handleGitHubWebhook(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("sig %q: status = %d, want %d", sig, w.Code, http.StatusUnauthorized)
+		}
+	}
+	if len(spawner.spawnCalls) != 0 {
+		t.Errorf("expected zero spawn calls with empty secret, got %d", len(spawner.spawnCalls))
+	}
+	if len(deps.broadcasts) != 0 {
+		t.Errorf("expected zero broadcasts with empty secret, got %v", deps.broadcasts)
 	}
 }

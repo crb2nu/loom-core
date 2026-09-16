@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
 
+	"github.com/crb2nu/loom/pkg/env"
 	"github.com/crb2nu/loom/pkg/mills/pipeline"
 )
 
@@ -24,12 +26,37 @@ const DevboxServerName = "devbox"
 type DevboxClient struct {
 	Hub        *MCPHubClient
 	ServerName string // overridable for tests / non-default hub registries
+	// GateTimeout caps one devbox_quality_gate round trip. It must cover the
+	// server-side budgets (300s per check, DEVBOX_QUALITY_GATE_TEST_TIMEOUT_SEC
+	// per test command, 1200s in production) plus checkout, so it is far above
+	// the hub client's 10-minute default. <= 0 uses the hub default.
+	GateTimeout time.Duration
 }
+
+// DefaultDevboxGateTimeout bounds a gate at fmt + lint + two test commands at
+// the production per-command budget with headroom. Override with
+// LOOM_MILLS_DEVBOX_GATE_TIMEOUT.
+const DefaultDevboxGateTimeout = 60 * time.Minute
 
 // NewDevboxClient returns a DevboxClient bound to hub. ServerName falls
 // back to DevboxServerName.
 func NewDevboxClient(hub *MCPHubClient) *DevboxClient {
-	return &DevboxClient{Hub: hub, ServerName: DevboxServerName}
+	return &DevboxClient{
+		Hub:         hub,
+		ServerName:  DevboxServerName,
+		GateTimeout: env.Duration("LOOM_MILLS_DEVBOX_GATE_TIMEOUT", DefaultDevboxGateTimeout),
+	}
+}
+
+// EffectiveGateTimeout is the bound used by both the gate call and watchdog.
+func (c *DevboxClient) EffectiveGateTimeout() time.Duration {
+	if c.GateTimeout > 0 {
+		return c.GateTimeout
+	}
+	if c.Hub != nil {
+		return c.Hub.cfg.CallTimeout
+	}
+	return 0
 }
 
 // devboxQualityGateResult mirrors mcp-devbox's qualityGateResult.
@@ -38,15 +65,19 @@ type devboxQualityGateResult struct {
 	Passed          bool                    `json:"passed"`
 	Checks          []devboxQualityCheckRow `json:"checks"`
 	TotalDurationMs int64                   `json:"total_duration_ms"`
+	TestedSHA       string                  `json:"tested_sha"`
 }
 
 type devboxQualityCheckRow struct {
-	Name       string `json:"name"`
-	Passed     bool   `json:"passed"`
-	ExitCode   int    `json:"exit_code,omitempty"`
-	DurationMs int64  `json:"duration_ms"`
-	OutputTail string `json:"output_tail,omitempty"`
-	StderrTail string `json:"stderr_tail,omitempty"`
+	Degraded         bool   `json:"degraded,omitempty"`
+	Warning          string `json:"warning,omitempty"`
+	FailureSignature string `json:"failure_signature,omitempty"`
+	Name             string `json:"name"`
+	Passed           bool   `json:"passed"`
+	ExitCode         int    `json:"exit_code"`
+	DurationMs       int64  `json:"duration_ms"`
+	OutputTail       string `json:"output_tail"`
+	StderrTail       string `json:"stderr_tail"`
 }
 
 // QualityGate implements pipeline.DevboxClient.
@@ -89,7 +120,7 @@ func (c *DevboxClient) QualityGate(ctx context.Context, req pipeline.DevboxReque
 	if server == "" {
 		server = DevboxServerName
 	}
-	body, err := c.Hub.CallTool(ctx, server, "devbox_quality_gate", args)
+	body, err := c.Hub.CallToolDedicatedWithTimeout(ctx, server, "devbox_quality_gate", args, c.EffectiveGateTimeout())
 	// devbox_quality_gate returns IsError=true with a structured body
 	// when checks fail; we treat that as a real (non-passing) result
 	// rather than a transport error so the runner can surface the
@@ -115,19 +146,23 @@ func (c *DevboxClient) QualityGate(ctx context.Context, req pipeline.DevboxReque
 			output = row.StderrTail
 		}
 		checks = append(checks, pipeline.DevboxCheck{
-			Name:     row.Name,
-			Passed:   row.Passed,
-			ExitCode: row.ExitCode,
-			Duration: float64(row.DurationMs) / 1000.0,
-			Output:   output,
+			Name:             row.Name,
+			Degraded:         row.Degraded,
+			Warning:          row.Warning,
+			FailureSignature: row.FailureSignature,
+			Passed:           row.Passed,
+			ExitCode:         row.ExitCode,
+			Duration:         float64(row.DurationMs) / 1000.0,
+			Output:           output,
 		})
 	}
 	return pipeline.DevboxResponse{
-		Passed:   parsed.Passed,
-		CostUSD:  0, // devbox_quality_gate runs locally; no LLM cost.
-		LogTail:  buildDevboxLogTail(parsed),
-		Checks:   checks,
-		Language: parsed.Language,
+		Passed:    parsed.Passed,
+		CostUSD:   0, // devbox_quality_gate runs locally; no LLM cost.
+		LogTail:   buildDevboxLogTail(parsed),
+		Checks:    checks,
+		Language:  parsed.Language,
+		TestedSHA: parsed.TestedSHA,
 	}, nil
 }
 
@@ -197,3 +232,36 @@ func buildDevboxLogTail(result devboxQualityGateResult) string {
 
 // Compile-time assertion that DevboxClient satisfies the pipeline interface.
 var _ pipeline.DevboxClient = (*DevboxClient)(nil)
+var _ pipeline.DevboxStopClient = (*DevboxClient)(nil)
+
+// Stop waits for sandbox termination before a resumed attempt can reuse its identity.
+func (c *DevboxClient) Stop(ctx context.Context, project, agentID string) error {
+	if c == nil || c.Hub == nil {
+		return errors.New("devbox: client not configured")
+	}
+	server := c.ServerName
+	if server == "" {
+		server = DevboxServerName
+	}
+	body, err := c.Hub.CallToolDedicatedWithTimeout(ctx, server, "devbox_stop", map[string]any{"project": project, "agent_id": agentID}, 55*time.Second)
+	if err != nil {
+		return fmt.Errorf("devbox stop: %w", err)
+	}
+	var result struct {
+		Stopped bool `json:"stopped"`
+	}
+	raw := []byte(body)
+	if !json.Valid(raw) {
+		raw, err = mcp.DecodeTOONToJSON(body)
+		if err != nil {
+			return fmt.Errorf("devbox stop response: %w", err)
+		}
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("devbox stop response: %w", err)
+	}
+	if !result.Stopped {
+		return errors.New("devbox stop did not confirm termination")
+	}
+	return nil
+}

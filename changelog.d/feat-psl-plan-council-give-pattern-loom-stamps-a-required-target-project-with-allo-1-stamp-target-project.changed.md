@@ -1,0 +1,1 @@
+- **Authorize and audit Pattern Loom stamp destinations** (`pkg/mills/crossrepo/stamp.go`, `pkg/policy/policy.go`, `pkg/mills/audit/audit.go`): require normalized targets, fail closed for unallowlisted cross-project writes, emit one structured event per attempt, and idempotently backfill legacy targets from their source repository.

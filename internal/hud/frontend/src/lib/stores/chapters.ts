@@ -3,7 +3,7 @@
 // the conversation they belong to. The daemon emits a `chapter.marked` event
 // (cmd/loom/cmd_agent_event_emit.go) per mark; this module turns the stream of
 // those payloads into per-conversation chapter lists. Rune-free so it is
-// unit-testable via the tsx fixture (chapters.fixture.ts).
+// unit-testable via the vitest suite (chapters.test.ts).
 
 import { conversationId } from '../utils/agents.ts';
 

@@ -1,0 +1,1 @@
+- Make the Mills tests stage run uncached Go tests for every package touched by a change, with bounded parent-pattern fallback and observable artifacts (`pkg/mills/pipeline/dispatcher.go`, `docs/MILLS.md`).

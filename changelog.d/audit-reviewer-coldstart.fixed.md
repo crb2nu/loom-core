@@ -1,0 +1,1 @@
+- Warm FlexInfer audit reviewer models before concurrent dispatch, deduplicating backend/model pairs so scale-to-zero cold starts no longer fail advisory sweeps (`pkg/mills/audit/dispatcher.go`, `pkg/mills/clients/flexinfer_audit.go`).

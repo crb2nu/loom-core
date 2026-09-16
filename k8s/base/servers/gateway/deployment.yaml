@@ -25,31 +25,35 @@ spec:
             - /etc/loom/registry.yaml
             - --listen
             - :8080
+          # The image here is built by libs/fi-mcp-kit (its .gitlab-ci.yml sets
+          # GATEWAY_IMAGE_REPO: mcp/fi-mcp-gateway), and that binary
+          # (cmd/fi-mcp-gateway -> pkg/gateway.Hub) reads exactly three env vars:
+          # PORT, HUB_TOKEN and FI_MCP_HUB_TOKEN. HUB_TOKEN arrives via the
+          # `loom-secrets` envFrom below; PORT is superseded by --listen.
+          #
+          # Ten further vars used to be declared here and none was ever read.
+          # Removed 2026-08-15 — see .loom harvest-wave F1 and
+          # libs/fi-mcp-kit/docs/harvest-fi-mcp-gateway.md:
+          #
+          #   FI_MCP_RATELIMIT_{ENABLED,GLOBAL_RPS,TENANT_RPS,USER_RPS,TOOL_RPS}
+          #     fi-mcp-kit has no rate limiter at all, and the typed-nil panic
+          #     the "workaround" comment referenced was already fixed upstream.
+          #   FI_MCP_BACKEND_IDLE_TIMEOUT
+          #     The 30m intent is real but the mechanism is not: pkg/gateway.Hub
+          #     has no idle reaper. 30m is hardcoded in pkg/proxy/proxy.go's
+          #     localPool, so behaviour is unchanged by the removal.
+          #   FI_MCP_AUTH_MODE, FI_MCP_POLICY_DEFAULT
+          #     Present in fi-mcp-kit only as generated manifest *content*
+          #     (pkg/generator/manifests.go:549,551) — written, never read.
+          #   MCP_HUB_NAMESPACE, FI_MCP_LOG_LEVEL
+          #     No reader anywhere in the module.
           env:
-            - name: FI_MCP_AUTH_MODE
-              value: none
-            - name: FI_MCP_POLICY_DEFAULT
-              value: allow
-            - name: MCP_HUB_NAMESPACE
-              value: loom-hub
-            - name: FI_MCP_LOG_LEVEL
-              value: info
-            # Workaround for typed-nil rate limiter panic path in older gateway binaries.
-            - name: FI_MCP_RATELIMIT_ENABLED
-              value: "true"
-            - name: FI_MCP_RATELIMIT_GLOBAL_RPS
-              value: "20000"
-            - name: FI_MCP_RATELIMIT_TENANT_RPS
-              value: "10000"
-            - name: FI_MCP_RATELIMIT_USER_RPS
-              value: "5000"
-            - name: FI_MCP_RATELIMIT_TOOL_RPS
-              value: "2000"
-            # Allow long-running tool calls (devbox builds ~15min) without
-            # the backend reaper closing the idle connection.
-            - name: FI_MCP_BACKEND_IDLE_TIMEOUT
-              value: "30m"
-            # OpenTelemetry trace export to Langfuse (in-cluster)
+            # NOTE: this does nothing today. pkg/gateway.InitTracer builds a
+            # `stdouttrace` exporter, not an OTLP one, so gateway spans go to
+            # container stdout and never reach Langfuse. Retained rather than
+            # removed because the endpoint is the correct one to use if/when an
+            # OTLP exporter is wired up; the previous comment asserted an export
+            # path that does not exist.
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://langfuse-web.ai.svc.cluster.local:3000/api/public/otel"
           envFrom:

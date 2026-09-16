@@ -1,0 +1,1 @@
+- Fixed `internal/devbox/backend/k8s_build.go` to populate Buildah's registry layer cache and remove the redundant moving `:cache` push; Harbor retention for `mcp/devbox` must preserve the generated per-step cache tags.

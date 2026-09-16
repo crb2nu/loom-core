@@ -84,9 +84,15 @@ func (cs *ContextSvc) Add(ctx context.Context, args map[string]any) (*mcp.CallTo
 	}
 
 	if len(contextEntries) > 0 {
-		if strings.TrimSpace(cs.cfg.EmbedAPIKey) == "" {
-			return mcp.ErrorResult(fmt.Errorf("AGENT_CONTEXT_EMBED_API_KEY (or MORPH_API_KEY / OPENAI_API_KEY) is not set")), nil
-		}
+		// No API-key precondition here. The embedder is enrichment, not a
+		// persistence gate: storeContextEntries already degrades to fallback
+		// vectors when embedding fails, and the default flexinfer provider is
+		// an in-cluster proxy that needs no key at all. The Morph-era guard
+		// that used to sit here rejected EVERY context write the moment the
+		// hub's agent-context ran without MORPH_API_KEY (live 2026-09-06 →
+		// 2026-09-08 after the Morph env was retired: the Mills escalator and
+		// every fleet agent lost decision/finding recording with
+		// "AGENT_CONTEXT_EMBED_API_KEY … is not set").
 		ids, err := cs.storeContextEntries(ctx, contextEntries, embedTexts)
 		if err != nil {
 			return mcp.ErrorResult(err), nil

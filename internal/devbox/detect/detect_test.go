@@ -122,6 +122,104 @@ requires-python = ">=3.11"
 	}
 }
 
+// Regression: py-sprite-kit declares requires-python = ">=3.11,<3.14". The
+// old parser character-trimmed the specifier to "3.11,<3.14", which was then
+// interpolated into "FROM python:3.11,<3.14-slim-bookworm" — an invalid image
+// reference that broke every devbox build for ranged specifiers.
+func TestFingerprint_PythonProject_RangedRequiresPython(t *testing.T) {
+	dir := t.TempDir()
+
+	pyproject := `[project]
+name = "py-sprite-kit"
+requires-python = ">=3.11,<3.14"
+`
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0644); err != nil {
+		t.Fatalf("failed to write pyproject.toml: %v", err)
+	}
+
+	fp, err := Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("Fingerprint() returned error: %v", err)
+	}
+	if len(fp.Languages) != 1 {
+		t.Fatalf("len(Languages) = %d, want 1", len(fp.Languages))
+	}
+	if got := fp.Languages[0].Version; got != "3.11" {
+		t.Errorf("Version = %q, want %q", got, "3.11")
+	}
+}
+
+func TestParsePythonVersion(t *testing.T) {
+	tests := []struct {
+		spec string
+		want string
+	}{
+		{`">=3.11"`, "3.11"},
+		{`">=3.11,<3.14"`, "3.11"},
+		{`">=3.11, <3.14"`, "3.11"},
+		{`"<3.14,>=3.11"`, "3.11"},
+		{`"~=3.11"`, "3.11"},
+		{`"~=3.11.2"`, "3.11"},
+		{`"==3.12.*"`, "3.12"},
+		{`"==3.12"`, "3.12"},
+		{`"==3.12.4"`, "3.12"},
+		{`">=3.11.5"`, "3.11"},
+		{`">3.11"`, "3.11"},
+		{`">=3.11,!=3.11.*"`, "3.12"},
+		{`">=3.10,!=3.11.5"`, "3.10"},
+		{`">=3.9,<=3.10"`, "3.9"},
+		{`">=3"`, "3"},
+		{`">=3.11,<3.0"`, ""}, // unsatisfiable
+		{`"banana"`, ""},
+		{`""`, ""},
+	}
+
+	for _, tt := range tests {
+		content := "[project]\nrequires-python = " + tt.spec + "\n"
+		if got := parsePythonVersion(content); got != tt.want {
+			t.Errorf("parsePythonVersion(requires-python = %s) = %q, want %q", tt.spec, got, tt.want)
+		}
+	}
+}
+
+func TestParsePythonVersion_NoRequiresPython(t *testing.T) {
+	if got := parsePythonVersion("[project]\nname = \"myapp\"\n"); got != "" {
+		t.Errorf("parsePythonVersion() = %q, want empty", got)
+	}
+}
+
+func TestResolveNodeVersion(t *testing.T) {
+	tests := []struct {
+		spec string
+		want string
+	}{
+		{">=20.0.0", "20.0.0"},
+		{">=18 <21", "18"},
+		{">=18, <21", "18"},
+		{"^20.9.0", "20.9.0"},
+		{"~18.2", "18.2"},
+		{"18.x", "18"},
+		{"18", "18"},
+		{">18", "19"},
+		{">=18.17.0 <19 || >=20.3.0", "18.17.0"},
+		{"*", ""},
+		{"", ""},
+		{"latest", ""},
+	}
+
+	for _, tt := range tests {
+		if got := resolveNodeVersion(tt.spec); got != tt.want {
+			t.Errorf("resolveNodeVersion(%q) = %q, want %q", tt.spec, got, tt.want)
+		}
+	}
+}
+
+func TestParseGoVersion_TrailingComment(t *testing.T) {
+	if got := parseGoVersion("module test\n\ngo 1.25 // pinned\n"); got != "1.25" {
+		t.Errorf("parseGoVersion() = %q, want %q", got, "1.25")
+	}
+}
+
 func TestFingerprint_PythonProject_RequirementsTxt(t *testing.T) {
 	dir := t.TempDir()
 

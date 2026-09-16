@@ -25,7 +25,6 @@ afterEach(() => {
   engramsStore.error = null;
   engramsStore.unavailable = false;
   engramsStore.catalogUnavailable = false;
-  engramsStore.engrams = [];
   engramsStore.graph = null;
 });
 
@@ -41,7 +40,7 @@ describe('engramsStore catalog and graph', () => {
 
     await engramsStore.fetchCatalog();
 
-    expect(engramsStore.engrams[0]?.id).toBe('a');
+    expect(engramsStore.graph?.nodes[0]?.id).toBe('b');
     expect(engramsStore.graph?.edges).toEqual([{ from: 'b', to: 'a' }]);
     expect(engramsStore.graph?.degraded).toBe(true);
   });
@@ -84,7 +83,10 @@ describe('engramsStore catalog and graph', () => {
     expect(engramsStore.catalogUnavailable).toBe(false);
   });
 
-  it('polls all three response shapes and stops cleanly', async () => {
+  it('polls exactly summary + graph and stops cleanly', async () => {
+    // The flat /api/engrams list was a third request per cycle that nothing
+    // rendered (and the summary already calls the same MCP tool); the poll
+    // contract is now two requests.
     vi.useFakeTimers();
     globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
@@ -95,9 +97,9 @@ describe('engramsStore catalog and graph', () => {
     }) as typeof globalThis.fetch;
     engramsStore.startPolling(1000);
     await vi.runOnlyPendingTimersAsync();
-    expect(vi.mocked(globalThis.fetch).mock.calls.map(([url]) => String(url))).toEqual(
-      expect.arrayContaining(['/api/engrams/summary', '/api/engrams', '/api/engrams/graph']),
-    );
+    const urls = vi.mocked(globalThis.fetch).mock.calls.map(([url]) => String(url));
+    expect(urls).toEqual(expect.arrayContaining(['/api/engrams/summary', '/api/engrams/graph']));
+    expect(urls).not.toContain('/api/engrams');
     engramsStore.stopPolling();
     const count = vi.mocked(globalThis.fetch).mock.calls.length;
     await vi.advanceTimersByTimeAsync(2000);

@@ -1,8 +1,9 @@
 package gates
 
 import (
-	"github.com/crb2nu/loom/pkg/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/crb2nu/loom/pkg/telemetry"
 )
 
 const (

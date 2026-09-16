@@ -43,6 +43,15 @@ func TestAgentBridge_CallAgentTool_PropagatesToolErrorEnvelope(t *testing.T) {
 	if !strings.Contains(err.Error(), "not registered") {
 		t.Fatalf("expected error to contain registration detail, got: %v", err)
 	}
+	// A server-side failure is the tool's failure, not a decode failure:
+	// the 2026-09-10 outage logged every dead-upstream error as
+	// "unmarshal <tool> result: …".
+	if strings.Contains(err.Error(), "unmarshal") {
+		t.Fatalf("tool error must not be labelled a decode failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "agent tool agent_presence_heartbeat failed") {
+		t.Fatalf("expected the error to name the failing tool, got: %v", err)
+	}
 }
 
 func TestAgentBridge_CallAgentTool_PropagatesToolErrorEnvelopeWithNilTarget(t *testing.T) {

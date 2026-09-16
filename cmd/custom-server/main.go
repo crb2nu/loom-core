@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +18,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	mcp "gitlab.flexinfer.ai/libs/mcp-go"
+
+	"github.com/crb2nu/loom/pkg/lifecycle"
+	"github.com/crb2nu/loom/pkg/transport/muxstdio"
 )
 
 var upgrader = websocket.Upgrader{
@@ -28,17 +29,292 @@ var upgrader = websocket.Upgrader{
 }
 
 // shuttingDown flips to true on SIGTERM. While set, the readiness probe fails
-// (so the Service removes this pod from its endpoints) and new WS/SSE sessions
+// (so the Service removes this pod from its endpoints) and new WS/HTTP sessions
 // are rejected, so the pod stops taking work before it stops serving.
 var shuttingDown atomic.Bool
 
-// drainer tracks every active WS/SSE session so a graceful shutdown can close
-// each one cleanly — a WebSocket close frame or an SSE stream-end — instead of
-// letting process exit reset every socket. Clients then reconnect to the
+// drainer tracks every active WS/Streamable-HTTP session so a graceful
+// shutdown can close each one cleanly — a WebSocket close frame or an HTTP
+// stream end — instead of letting process exit reset every socket. Clients then reconnect to the
 // already-Ready surged-in replacement pod, so a rollout no longer kills
 // in-flight proxied requests (the whole fleet shares one image and rolls on
 // every server-code change; see .gitlab-ci.yml build:image:custom-server).
 var drainer = newDrainRegistry()
+
+// sharedWSChild is installed by main only when MCP_SHARED_CHILD=1. Keeping the
+// default nil preserves the historical one-child-per-WebSocket behavior.
+var sharedWSChild *sharedChildSupervisor
+
+type sharedChild struct {
+	cmd       *exec.Cmd
+	transport *mcp.StdioTransport
+	mux       *muxstdio.Transport
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *sharedChild) close() {
+	c.closeOnce.Do(func() {
+		_ = c.mux.Close()
+		if c.cmd.Process != nil {
+			_ = c.cmd.Process.Kill()
+		}
+		select {
+		case <-c.done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+}
+
+type sharedChildSupervisor struct {
+	serverName string
+	command    string
+	draining   bool
+	deliveries lifecycle.Drain
+
+	mu             sync.Mutex
+	initializeMu   sync.Mutex
+	child          *sharedChild
+	generation     uint64
+	nextRequestID  uint64
+	initializeResp *mcp.Message
+	initialized    bool
+	subscribers    map[string]chan *mcp.Message
+}
+
+func newSharedChildSupervisor(serverName, command string) *sharedChildSupervisor {
+	return &sharedChildSupervisor{serverName: serverName, command: command, subscribers: make(map[string]chan *mcp.Message)}
+}
+
+func (s *sharedChildSupervisor) childForRequest() (*sharedChild, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.child != nil {
+		select {
+		case <-s.child.done:
+			s.child.close()
+			s.child = nil
+			s.initializeResp = nil
+			s.initialized = false
+		default:
+			return s.child, s.generation, nil
+		}
+	}
+	if s.draining {
+		return nil, 0, fmt.Errorf("server draining")
+	}
+	child, err := startSharedChild(s.command)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.generation++
+	s.child = child
+	fmt.Fprintf(os.Stderr, "custom-server shared child started server=%s pid=%d generation=%d\n", s.serverName, child.cmd.Process.Pid, s.generation)
+	go s.forwardNotifications(child, s.generation)
+	return child, s.generation, nil
+}
+
+func startSharedChild(command string) (*sharedChild, error) {
+	cmdName, cmdArgs, err := splitCommand(command)
+	if err != nil {
+		return nil, err
+	}
+	// Deliberately not bound to any request context: the shared child must
+	// outlive every WebSocket session that uses it. Lifetime is owned by
+	// sharedChild.close (Kill + Wait), not by a ctx.
+	cmd := exec.CommandContext(context.Background(), cmdName, cmdArgs...)
+	cmd.Env = append(os.Environ(), "MCP_TRANSPORT=stdio")
+	cmd.Stderr = os.Stderr
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdin pipe error: %w", err)
+	}
+	// Own the read end: exec.Cmd.Wait must not close stdout before the mux
+	// consumes the child's final response on exit.
+	stdout, childOut, err := os.Pipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, fmt.Errorf("stdout pipe error: %w", err)
+	}
+	cmd.Stdout = childOut
+	if err := cmd.Start(); err != nil {
+		_ = childOut.Close()
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, fmt.Errorf("start error: %w", err)
+	}
+	_ = childOut.Close()
+	transport := mcp.NewStdioTransport(stdout, stdin)
+	c := &sharedChild{cmd: cmd, transport: transport, done: make(chan struct{})}
+	c.mux = muxstdio.New(transport)
+	go func() { _ = cmd.Wait(); close(c.done) }()
+	return c, nil
+}
+
+func cloneMessage(msg *mcp.Message) *mcp.Message {
+	if msg == nil {
+		return nil
+	}
+	copy := *msg
+	copy.Params = append(json.RawMessage(nil), msg.Params...)
+	copy.Result = append(json.RawMessage(nil), msg.Result...)
+	return &copy
+}
+
+// beginDrain forwards SIGTERM while keeping the mux and client transports alive.
+// Child exit alone is insufficient: response goroutines must finish writing too.
+func (s *sharedChildSupervisor) beginDrain(ctx context.Context) {
+	s.mu.Lock()
+	s.draining = true
+	child := s.child
+	if child != nil {
+		_ = child.cmd.Process.Signal(syscall.SIGTERM)
+	}
+	s.mu.Unlock()
+	if child != nil {
+		select {
+		case <-child.done:
+		case <-ctx.Done():
+			return
+		}
+	}
+	_, done := s.deliveries.Begin()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+func (s *sharedChildSupervisor) admitDelivery(msg *mcp.Message) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var params struct {
+		Name string `json:"name"`
+	}
+	_ = json.Unmarshal(msg.Params, &params)
+	if s.draining && (msg.Method == "initialize" || (msg.Method == "tools/call" && params.Name != "devbox_exec_poll")) {
+		return false
+	}
+	return s.deliveries.Admit()
+}
+
+func drainingResponse(msg *mcp.Message) *mcp.Message {
+	return &mcp.Message{JSONRPC: mcp.JSONRPCVersion, ID: msg.ID,
+		Error: &mcp.Error{Code: -32000, Message: "devbox is draining; retry on another server", Data: map[string]any{"retryable": true}}}
+}
+
+func (s *sharedChildSupervisor) call(ctx context.Context, msg *mcp.Message) (*mcp.Message, error) {
+	if msg.Method == "initialize" {
+		s.initializeMu.Lock()
+		defer s.initializeMu.Unlock()
+	}
+	s.mu.Lock()
+	if msg.Method == "initialize" && s.initializeResp != nil {
+		resp := cloneMessage(s.initializeResp)
+		resp.ID = msg.ID
+		s.mu.Unlock()
+		return resp, nil
+	}
+	s.mu.Unlock()
+
+	child, generation, err := s.childForRequest()
+	if err != nil {
+		return nil, err
+	}
+	originalID := msg.ID
+	request := cloneMessage(msg)
+	request.ID = fmt.Sprintf("ws-%d-%d", generation, atomic.AddUint64(&s.nextRequestID, 1))
+	resp, err := child.mux.Call(ctx, request)
+	if err != nil {
+		// A WebSocket disconnect cancels only that caller. It must not tear down
+		// the shared process or erase state needed by the reconnecting client.
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			s.discard(child)
+		}
+		return nil, err
+	}
+	resp = cloneMessage(resp)
+	resp.ID = originalID
+	if msg.Method == "initialize" {
+		s.mu.Lock()
+		if s.child == child {
+			s.initializeResp = cloneMessage(resp)
+		}
+		s.mu.Unlock()
+	}
+	return resp, nil
+}
+
+func (s *sharedChildSupervisor) notify(ctx context.Context, msg *mcp.Message) error {
+	// initialized belongs to the single child MCP session; only the first
+	// WebSocket client forwards it.
+	if msg.Method == "notifications/initialized" {
+		s.mu.Lock()
+		if s.initialized {
+			s.mu.Unlock()
+			return nil
+		}
+		s.initialized = true
+		s.mu.Unlock()
+	}
+	child, _, err := s.childForRequest()
+	if err != nil {
+		return err
+	}
+	if err := child.transport.Send(ctx, msg); err != nil {
+		s.discard(child)
+		return err
+	}
+	return nil
+}
+
+func (s *sharedChildSupervisor) discard(child *sharedChild) {
+	s.mu.Lock()
+	if s.child == child {
+		s.child = nil
+		s.initializeResp = nil
+		s.initialized = false
+	}
+	s.mu.Unlock()
+	child.close()
+}
+
+func (s *sharedChildSupervisor) subscribe(id string) (<-chan *mcp.Message, func()) {
+	ch := make(chan *mcp.Message, 16)
+	s.mu.Lock()
+	s.subscribers[id] = ch
+	s.mu.Unlock()
+	return ch, func() { s.mu.Lock(); delete(s.subscribers, id); s.mu.Unlock() }
+}
+
+func (s *sharedChildSupervisor) forwardNotifications(child *sharedChild, generation uint64) {
+	for msg := range child.mux.NotificationCh() {
+		s.mu.Lock()
+		if s.child != child || s.generation != generation {
+			s.mu.Unlock()
+			return
+		}
+		for _, ch := range s.subscribers {
+			select {
+			case ch <- cloneMessage(msg):
+			default:
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+func (s *sharedChildSupervisor) close() {
+	s.mu.Lock()
+	child := s.child
+	s.child = nil
+	s.initializeResp = nil
+	s.initialized = false
+	s.mu.Unlock()
+	if child != nil {
+		child.close()
+	}
+}
 
 type wsMessageWriter interface {
 	WriteMessage(messageType int, data []byte) error
@@ -50,70 +326,18 @@ func writeWS(mu *sync.Mutex, conn wsMessageWriter, messageType int, data []byte)
 	return conn.WriteMessage(messageType, data)
 }
 
-type sseSession struct {
-	id        string
-	createdAt time.Time
-
-	cancel context.CancelFunc
-
-	cmd       *exec.Cmd
-	transport *mcp.StdioTransport
-
-	sendMu sync.Mutex
-
-	closeOnce sync.Once
-	done      chan struct{}
-}
-
-func (s *sseSession) Close() {
-	s.closeOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
-		if s.transport != nil {
-			_ = s.transport.Close()
-		}
-		if s.cmd != nil && s.cmd.Process != nil {
-			_ = s.cmd.Process.Kill()
-		}
-		close(s.done)
-	})
-}
-
-func (s *sseSession) Send(ctx context.Context, msg *mcp.Message) error {
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	if msg.JSONRPC == "" {
-		msg.JSONRPC = mcp.JSONRPCVersion
-	}
-	return s.transport.Send(ctx, msg)
-}
-
-type sessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]*sseSession
-}
-
-func newSessionStore() *sessionStore {
-	return &sessionStore{sessions: make(map[string]*sseSession)}
-}
-
-func (st *sessionStore) Get(id string) *sseSession {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.sessions[id]
-}
-
-func (st *sessionStore) Put(s *sseSession) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.sessions[s.id] = s
-}
-
-func (st *sessionStore) Delete(id string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	delete(st.sessions, id)
+// writeWSWithDeadline is writeWS for the drain path only: a peer that has
+// stopped reading must not hold shutdown open, so this write carries a bounded
+// deadline, cleared again under the same lock so ordinary writes stay
+// deadline-free. Kept off writeWS itself — the per-write type assertion it
+// needs cost the fleet write benchmark 11% (reliability gate, 2026-09-13).
+func writeWSWithDeadline(mu *sync.Mutex, conn *websocket.Conn, messageType int, data []byte, d time.Duration) error {
+	mu.Lock()
+	defer mu.Unlock()
+	_ = conn.SetWriteDeadline(time.Now().Add(d))
+	err := conn.WriteMessage(messageType, data)
+	_ = conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 // drainRegistry holds a close function per active connection so shutdown can
@@ -188,35 +412,22 @@ func newSessionID() (string, error) {
 	return fmt.Sprintf("%x", b[:]), nil
 }
 
-func writeSSE(w http.ResponseWriter, event string, data string) error {
-	if event != "" {
-		if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
-			return err
-		}
-	}
-	// data may contain newlines; each line must be prefixed with "data: "
-	for _, line := range strings.Split(data, "\n") {
-		if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
-			return err
-		}
-	}
-	if _, err := io.WriteString(w, "\n"); err != nil {
-		return err
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	return nil
+// legacyTransportRemovedHandler answers the retired MCP HTTP+SSE transport
+// routes (GET /sse, POST /messages) with a 404 whose body names the
+// replacements, so a straggler configured against the old endpoint sees why
+// it fails instead of a bare not-found. The transport was removed once every
+// mcpo consumer ran Streamable HTTP and a 45h soak showed zero /sse traffic
+// (.loom/197 §4, backlog item bl-mcpo-sse-removal-endgame-20260829).
+func legacyTransportRemovedHandler(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "the MCP HTTP+SSE transport (/sse, /messages) was removed; use Streamable HTTP at POST /mcp or WebSocket at /ws", http.StatusNotFound)
 }
 
-func writeSSEComment(w http.ResponseWriter, comment string) error {
-	if _, err := fmt.Fprintf(w, ": %s\n\n", comment); err != nil {
-		return err
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	return nil
+// registerLegacyTransportRemoved mounts the explanatory 404 on the retired
+// routes. Registered on the same mux as the live transports so the answer is
+// deterministic regardless of the default mux's not-found behaviour.
+func registerLegacyTransportRemoved(mux *http.ServeMux) {
+	mux.HandleFunc("/sse", legacyTransportRemovedHandler)
+	mux.HandleFunc("/messages", legacyTransportRemovedHandler)
 }
 
 func startMCPProcess(ctx context.Context, serverName, command string) (*exec.Cmd, *mcp.StdioTransport, func(), error) {
@@ -291,13 +502,19 @@ func main() {
 	if wsPath == "" {
 		wsPath = "/ws"
 	}
+	httpPath := strings.TrimSpace(os.Getenv("MCP_HTTP_PATH"))
+	if httpPath == "" {
+		httpPath = "/mcp"
+	}
 
 	serverName := strings.TrimSpace(os.Getenv("MCP_SERVER_NAME"))
 	if serverName == "" {
 		serverName = "custom-server"
 	}
-
-	sessions := newSessionStore()
+	if strings.TrimSpace(os.Getenv("MCP_SHARED_CHILD")) == "1" {
+		sharedWSChild = newSharedChildSupervisor(serverName, command)
+		defer sharedWSChild.close()
+	}
 
 	// Liveness stays green throughout drain (so Kubernetes does not kill the pod
 	// mid-drain); readiness fails once shutting down so the Service deregisters
@@ -305,164 +522,19 @@ func main() {
 	http.HandleFunc("/health", okHandler)
 	http.HandleFunc("/ready", readyHandler)
 
-	// SSE transport (MCP SSE spec):
-	// - client connects to GET /sse (text/event-stream)
-	// - server emits an "endpoint" event containing the POST URL to send messages
-	// - client POSTs JSON-RPC messages to /messages?session_id=<hex>
-	http.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if shuttingDown.Load() {
-			http.Error(w, "draining", http.StatusServiceUnavailable)
-			return
-		}
-
-		sessionID, err := newSessionID()
-		if err != nil {
-			http.Error(w, "failed to generate session id", http.StatusInternalServerError)
-			return
-		}
-
-		ctx, cancel := context.WithCancel(r.Context())
-
-		cmd, transport, closeProc, err := startMCPProcess(ctx, serverName, command)
-		if err != nil {
-			cancel()
-			http.Error(w, "failed to start mcp server", http.StatusInternalServerError)
-			return
-		}
-
-		sess := &sseSession{
-			id:        sessionID,
-			createdAt: time.Now().UTC(),
-			cancel:    cancel,
-			cmd:       cmd,
-			transport: transport,
-			done:      make(chan struct{}),
-		}
-
-		sessions.Put(sess)
-		// Register for graceful drain: closing the session cancels its context
-		// and ends the SSE stream, so the client sees a clean EOF and reconnects.
-		drainer.Add(sessionID, sess.Close)
-		defer func() {
-			drainer.Remove(sessionID)
-			sessions.Delete(sessionID)
-			sess.Close()
-			closeProc()
-		}()
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		} else {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-			return
-		}
-
-		// Build a relative endpoint for the client to POST messages.
-		// Keep it consistent with the Python MCP SSE server transport.
-		postPath := "/messages"
-		q := url.Values{}
-		q.Set("session_id", sessionID)
-		postURI := postPath + "?" + q.Encode()
-
-		if err := writeSSE(w, "endpoint", postURI); err != nil {
-			return
-		}
-
-		backendCh := make(chan *mcp.Message, 8)
-		go func() {
-			defer close(backendCh)
-			for {
-				msg, err := transport.Recv(ctx)
-				if err != nil {
-					return
-				}
-				select {
-				case backendCh <- msg:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-
-		keepalive := time.NewTicker(25 * time.Second)
-		defer keepalive.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-sess.done:
-				return
-			case <-keepalive.C:
-				_ = writeSSEComment(w, "ping")
-			case msg, ok := <-backendCh:
-				if !ok {
-					return
-				}
-				b, err := json.Marshal(msg)
-				if err != nil {
-					continue
-				}
-				if err := writeSSE(w, "message", string(b)); err != nil {
-					return
-				}
-			}
-		}
-	})
-
-	http.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		sessionID := r.URL.Query().Get("session_id")
-		if sessionID == "" {
-			http.Error(w, "session_id is required", http.StatusBadRequest)
-			return
-		}
-
-		sess := sessions.Get(sessionID)
-		if sess == nil {
-			http.Error(w, "unknown session_id", http.StatusNotFound)
-			return
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "read error", http.StatusBadRequest)
-			return
-		}
-		_ = r.Body.Close()
-
-		var msg mcp.Message
-		if err := json.Unmarshal(body, &msg); err != nil {
-			http.Error(w, "invalid json", http.StatusBadRequest)
-			return
-		}
-		if msg.JSONRPC == "" {
-			msg.JSONRPC = mcp.JSONRPCVersion
-		}
-
-		if err := sess.Send(r.Context(), &msg); err != nil {
-			http.Error(w, "send failed", http.StatusBadGateway)
-			return
-		}
-
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte("OK"))
-	})
+	// The hub serves exactly two MCP transports: Streamable HTTP at httpPath
+	// (POST /mcp) and WebSocket at wsPath (/ws, the spawn pods' and daemon's
+	// path). The legacy HTTP+SSE transport (GET /sse + POST /messages) was
+	// removed on 2026-09-12 after every mcpo consumer moved to Streamable HTTP
+	// (.loom/197 §4); its routes answer with an explanatory 404.
+	http.Handle(httpPath, newStreamableHTTPHandler(serverName, command, drainer))
+	registerLegacyTransportRemoved(http.DefaultServeMux)
 
 	http.HandleFunc(wsPath, func(w http.ResponseWriter, r *http.Request) {
+		if sharedWSChild != nil {
+			handleSharedWS(w, r, sharedWSChild)
+			return
+		}
 		handleWS(w, r, serverName, command)
 	})
 
@@ -474,7 +546,7 @@ func main() {
 
 	listenErr := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(os.Stderr, "custom-server listening on %s (ws=%s, server=%s)\n", addr, wsPath, serverName)
+		fmt.Fprintf(os.Stderr, "custom-server listening on %s (http=%s, ws=%s, server=%s)\n", addr, httpPath, wsPath, serverName)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			listenErr <- err
 		}
@@ -492,7 +564,7 @@ func main() {
 	// Graceful drain. On SIGTERM: fail readiness (so the Service removes this
 	// pod from its endpoints) and reject new sessions, pause briefly to let the
 	// deregistration propagate to the gateway and in-flight requests settle,
-	// then close every active WS/SSE session cleanly so proxied clients
+	// then close every active WS/HTTP session cleanly so proxied clients
 	// reconnect to the already-Ready surged-in replacement rather than seeing an
 	// abrupt reset. Pairs with the deployment preStop hook and the
 	// maxUnavailable:0/maxSurge:1 rollout strategy. Both waits are env-tunable
@@ -502,7 +574,17 @@ func main() {
 
 	shuttingDown.Store(true)
 	fmt.Fprintf(os.Stderr, "custom-server draining: readiness failing, %d active session(s), settling for %s\n", drainer.Len(), drainDelay)
-	time.Sleep(drainDelay)
+	if sharedWSChild != nil && serverName == "devbox" {
+		timeout := envDuration("DEVBOX_DRAIN_TIMEOUT", 30*time.Minute)
+		if timeout <= 0 {
+			timeout = 30 * time.Minute
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+25*time.Second)
+		sharedWSChild.beginDrain(ctx)
+		cancel()
+	} else {
+		time.Sleep(drainDelay)
+	}
 
 	drainer.DrainAll()
 
@@ -525,6 +607,133 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
+}
+
+func handleSharedWS(w http.ResponseWriter, r *http.Request, supervisor *sharedChildSupervisor) {
+	if shuttingDown.Load() {
+		http.Error(w, "draining", http.StatusServiceUnavailable)
+		return
+	}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	var writeMu sync.Mutex
+	ctx, cancel := context.WithCancel(r.Context())
+	var closeOnce sync.Once
+	closeConn := func() { closeOnce.Do(func() { cancel(); _ = conn.Close() }) }
+	defer closeConn()
+
+	wsID, err := newSessionID()
+	if err != nil {
+		wsID = fmt.Sprintf("ws-%d", time.Now().UnixNano())
+	}
+	notifications, unsubscribe := supervisor.subscribe(wsID)
+	defer unsubscribe()
+	drainer.Add(wsID, func() {
+		_ = writeWS(&writeMu, conn, websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseServiceRestart, "server draining"))
+		closeConn()
+	})
+	defer drainer.Remove(wsID)
+
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(60 * time.Second)); return nil })
+
+	var wg sync.WaitGroup
+	// calls tracks request goroutines dispatched off the read loop.
+	var calls sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if writeWS(&writeMu, conn, websocket.PingMessage, nil) != nil {
+					closeConn()
+					return
+				}
+			case msg := <-notifications:
+				b, err := json.Marshal(msg)
+				if err == nil && writeWS(&writeMu, conn, websocket.TextMessage, b) != nil {
+					closeConn()
+					return
+				}
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			mt, data, err := conn.ReadMessage()
+			if err != nil {
+				closeConn()
+				return
+			}
+			if mt != websocket.TextMessage && mt != websocket.BinaryMessage {
+				continue
+			}
+			var msg mcp.Message
+			if json.Unmarshal(data, &msg) != nil {
+				continue
+			}
+			if msg.JSONRPC == "" {
+				msg.JSONRPC = mcp.JSONRPCVersion
+			}
+			if msg.IsNotification() {
+				if supervisor.notify(ctx, &msg) != nil {
+					closeConn()
+					return
+				}
+				continue
+			}
+			// Dispatch the call off the read loop. A devbox quality-gate call
+			// runs for minutes, and WebSocket control frames — the client's
+			// keepalive pings, our own pongs — are only processed inside
+			// ReadMessage. Calling the supervisor inline here starved them:
+			// every call longer than the client's pong wait died with
+			// "websocket: close 1006 (abnormal closure)" at exactly 60s, and
+			// no Mills tests-stage attempt passed for the six hours the first
+			// shared-child image was live (2026-09-06, 04:14–10:50Z). The
+			// per-session handler never had this problem because it forwards
+			// to the child and reads responses on a separate goroutine.
+			if !supervisor.admitDelivery(&msg) {
+				b, _ := json.Marshal(drainingResponse(&msg))
+				if writeWSWithDeadline(&writeMu, conn, websocket.TextMessage, b, 5*time.Second) != nil {
+					closeConn()
+					return
+				}
+				continue
+			}
+			calls.Add(1)
+			go func(msg mcp.Message) {
+				defer calls.Done()
+				defer supervisor.deliveries.Release()
+				resp, err := supervisor.call(ctx, &msg)
+				if err != nil {
+					// A cancelled ctx means this connection is already closing.
+					if ctx.Err() == nil {
+						closeConn()
+					}
+					return
+				}
+				b, err := json.Marshal(resp)
+				if err == nil && writeWS(&writeMu, conn, websocket.TextMessage, b) != nil {
+					closeConn()
+				}
+			}(msg)
+		}
+	}()
+	wg.Wait()
+	// closeConn cancelled ctx, so in-flight calls return promptly; wait for
+	// them so no goroutine outlives the handler.
+	calls.Wait()
 }
 
 func handleWS(w http.ResponseWriter, r *http.Request, serverName, command string) {

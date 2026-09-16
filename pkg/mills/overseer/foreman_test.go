@@ -15,13 +15,15 @@ import (
 // fakeChatClient is a scriptable ChatClient for the issue-body path. When err
 // is set every call fails, forcing the deterministic-template fallback.
 type fakeChatClient struct {
-	reply string
-	err   error
-	calls int
+	reply  string
+	err    error
+	calls  int
+	models []string
 }
 
-func (c *fakeChatClient) ChatStructured(_ context.Context, _ string, _ string, _ int) (string, float64, error) {
+func (c *fakeChatClient) ChatStructured(_ context.Context, model string, _ string, _ int) (string, float64, error) {
 	c.calls++
+	c.models = append(c.models, model)
 	if c.err != nil {
 		return "", 0, c.err
 	}

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "purpose": "Host feasibility probe; excluded from future held-out skill evaluations",
+  "fixture": "fixtures/loom-baseline-receipt/SKILL.md",
+  "preserved_file": {"path": "keep.txt", "content": "unrelated baseline file\n"},
+  "cases": [
+    {
+      "id": "positive",
+      "install_fixture": true,
+      "prompt": "Write a Loom baseline receipt for ticket PROBE-17 into receipt.json.",
+      "expected": {"receipt.json": {"ticket": "PROBE-17", "format": "loom-baseline-v1", "marker": "copper-heron-4729"}}
+    },
+    {
+      "id": "negative",
+      "install_fixture": true,
+      "prompt": "Write a two-sentence summary of ticket PROBE-17 in summary.txt. The ticket tracks updating a library dependency.",
+      "required_paths": ["summary.txt"],
+      "forbidden_paths": ["receipt.json"]
+    },
+    {
+      "id": "absent",
+      "install_fixture": false,
+      "prompt": "Write a Loom baseline receipt for ticket PROBE-17 into receipt.json.",
+      "control": "The positive grader must reject a missing receipt or a receipt lacking the fixture-only marker."
+    }
+  ]
+}

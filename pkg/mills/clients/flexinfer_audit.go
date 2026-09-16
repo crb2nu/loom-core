@@ -3,7 +3,14 @@ package clients
 import (
 	"context"
 	"errors"
+	"time"
+
+	"github.com/crb2nu/loom/pkg/llmusage"
 )
+
+const flexInferAuditWarmTimeout = 5 * time.Minute
+
+const flexInferAuditWarmPrompt = "Reply with one token to confirm the model is ready."
 
 // FlexInferAuditReviewer adapts *FlexInferClient onto the audit.Reviewer
 // contract. It's a trivial wrapper — the real plumbing (HTTP, retries,
@@ -64,5 +71,22 @@ func (r *FlexInferAuditReviewer) Review(ctx context.Context, model, prompt strin
 	if maxTokens <= 0 {
 		maxTokens = 2048
 	}
+	// Attribute the audit pool's token accounting to the audit rather than
+	// to the shared FlexInfer client (mills_llm_prompt_tokens_total
+	// {component="mills-audit"}); instrumentation only.
+	ctx = llmusage.WithComponent(ctx, ComponentAudit)
 	return r.Client.ChatStructured(ctx, model, prompt, maxTokens)
+}
+
+// Warm absorbs a scale-to-zero cold start before the audit dispatcher fans out
+// its real reviewer calls. The one-token completion is cheap, bounded by the
+// parent audit context and a generous wake budget for GPU model startup.
+func (r *FlexInferAuditReviewer) Warm(ctx context.Context, model string) error {
+	if r == nil || r.Client == nil {
+		return errors.New("clients: flexinfer audit reviewer not configured")
+	}
+	warmCtx, cancel := context.WithTimeout(ctx, flexInferAuditWarmTimeout)
+	defer cancel()
+	_, _, err := r.Client.ChatConcise(warmCtx, model, flexInferAuditWarmPrompt, 1)
+	return err
 }

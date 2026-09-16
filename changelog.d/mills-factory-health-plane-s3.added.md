@@ -1,0 +1,1 @@
+- Added Mills run correlation environment stamping and fail-open Flightdeck lifecycle export in `pkg/mills` and `cmd/loom-mills-operator`.

@@ -1,0 +1,1 @@
+- Pin the bounded label schema for persisted overseer S2 dry-run decision telemetry in `pkg/telemetry/metrics.go`, preserving machine-checkable soak promotion queries.

@@ -1,0 +1,1 @@
+- Add terminal outcome-grade writeback features and a ranked-dispatch calibration API, with a 60% S3 grade-coverage kill gate (`pkg/mills/store`, `pkg/mills`, and `cmd/loom-mills-operator`).

@@ -1,0 +1,1 @@
+- Prevent equal-priority Mills scope reservations from deadlocking the queue by letting the oldest reservation win, with deterministic ties and yield events (`pkg/mills/scope_overlap.go`, `pkg/mills/scope_overlap_test.go`).

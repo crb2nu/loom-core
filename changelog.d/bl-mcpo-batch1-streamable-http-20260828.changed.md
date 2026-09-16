@@ -1,0 +1,1 @@
+- Migrate the mcpo `time`, `sequentialthinking`, `morph-fast-apply`, and `helm` entries to Streamable HTTP in `k8s/base/servers/mcpo/configmap.yaml`, with the rollout checksum updated in `k8s/base/servers/mcpo/deployment.yaml`.

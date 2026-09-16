@@ -33,6 +33,37 @@ func Validate(limit int) error {
 	return nil
 }
 
+// ResolvePolicyLimit returns the compiled default when the policy omits its
+// limit and rejects an explicit value outside the supported range.
+func ResolvePolicyLimit(configured *int) (int, error) {
+	if configured == nil {
+		return DefaultLimit, nil
+	}
+	if err := Validate(*configured); err != nil {
+		return 0, err
+	}
+	return *configured, nil
+}
+
+// SetLimit changes the admission ceiling without losing track of in-flight
+// work. A lower limit takes effect for future admissions; existing holders are
+// allowed to finish. Raising the limit wakes blocked callers immediately.
+func (c *Concurrency) SetLimit(limit int) error {
+	if err := Validate(limit); err != nil {
+		return err
+	}
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	if c.limit != limit {
+		c.limit = limit
+		c.notifyLocked()
+	}
+	c.mu.Unlock()
+	return nil
+}
+
 const (
 	// EnvVar is the environment variable that overrides the default
 	// per-server handler-concurrency limit for every loom MCP binary.

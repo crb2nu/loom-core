@@ -1,0 +1,1 @@
+- Fixed hub-mode devbox git-clone builds to select registered base images after repository hydration, with structured fallback telemetry and warning-only Harbor tag probes (`cmd/mcp-devbox`, `internal/devbox/backend`, and `internal/devbox/baseimage`).

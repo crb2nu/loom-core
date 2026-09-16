@@ -1,0 +1,1 @@
+- Migrate the PostgreSQL mcpo upstream in `k8s/base/servers/mcpo/` from SSE to Streamable HTTP.

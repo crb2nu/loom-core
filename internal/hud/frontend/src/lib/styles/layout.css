@@ -6,6 +6,12 @@
 
 /* ── Panel Container ─────────────────────────────────────────── */
 
+/* Scroll contract: the app shell and ViewShell clip (overflow hidden), so
+   the routed panel is the ONE scroll owner. `.panel` scrolls by default; a
+   panel that overrides overflow-y (or skips this class) must provide an
+   inner overflow-y:auto region covering EVERY part of its content, or
+   anything past the viewport is silently unreachable — the factory
+   (+307px) and patterns (+930px) clipping fixed on 2026-08-15. */
 .panel {
   flex: 1;
   min-width: 0;

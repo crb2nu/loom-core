@@ -1,0 +1,1 @@
+- Prevent Mills implement dispatch from overwriting pre-pushed item branches by adopting their nonempty origin diff for normal gating, with persisted provenance and an outside-agent pickup procedure (`pkg/mills/pipeline`, `docs/MILLS_RUNBOOK.md`).

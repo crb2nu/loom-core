@@ -1,0 +1,1 @@
+- Make declared Go tests in `pkg/mills/pipeline/dispatcher.go` bypass cached results even when prefixed by environment assignments, with regression coverage in `dispatcher_test.go`.

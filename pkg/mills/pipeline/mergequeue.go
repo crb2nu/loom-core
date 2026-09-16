@@ -53,6 +53,39 @@ type MergeQueueStatus struct {
 	// Position is the candidate's 1-based place in its lane (1 = head);
 	// 0 when terminal or unknown.
 	Position int
+
+	// Structural identity of the candidate, populated by the gateway so the
+	// stage can build typed verdicts without re-validating (which would trip
+	// the #374 fence once the queue's own rebase advanced the ledger).
+	Project      string
+	SourceBranch string
+	TargetBranch string
+	// AuthorizedSHA is the head the queue was driving (current_sha — advances
+	// on queue rebases). ObservedSHA is the foreign successor recorded on
+	// head_moved evictions; empty on other verdicts and on rows evicted
+	// before the queue stamped it.
+	AuthorizedSHA string
+	ObservedSHA   string
+}
+
+// MergeQueueEvictedError is the merge stage's typed terminal queue verdict:
+// the candidate settled without merging and the queue — by contract — never
+// retries. Classify maps Reason to an error class so an eviction stops
+// burning code-class attempts on retries that would only re-read the same
+// settled row. head_moved evictions are NOT reported through this type: the
+// stage reconstructs *MergeSourceSHAMismatchError so the runner's existing
+// head-movement rewind (#374) re-gates the successor instead of escalating.
+type MergeQueueEvictedError struct {
+	MRIID  int64
+	Reason string
+	Detail string
+}
+
+func (e *MergeQueueEvictedError) Error() string {
+	if e == nil {
+		return "merge: queue evicted"
+	}
+	return fmt.Sprintf("merge: queue evicted mr %d (%s): %s", e.MRIID, e.Reason, e.Detail)
 }
 
 // MergeQueue is the serial-queue contract the merge stage drives. The
@@ -116,10 +149,18 @@ func (w *GitLabWorker) runMergeViaQueue(ctx context.Context, jc JobContext, mrII
 		return StageOutput{}, fmt.Errorf("merge: queue mode requires a run id for mr %d", mrIID)
 	}
 
-	// Resume path: an existing entry (any state) means this run already
-	// validated + enqueued. Re-validating here would trip the #374 fence once
-	// the queue's own rebase advances the ledger — so re-find first.
-	_, err := w.MergeQueue.Status(ctx, runID)
+	// Resume path: an existing ACTIVE (or merged) entry means this run
+	// already validated + enqueued. Re-validating here would trip the #374
+	// fence once the queue's own rebase advances the ledger — so re-find
+	// first. An EVICTED newest entry is different (A1): the queue never
+	// retries, so the only honest way back in is the full enqueue-time
+	// authorization below — after a head-movement rewind the re-gated
+	// artifacts carry the successor SHA and pass; a stale same-authorization
+	// retry fails the fence closed instead of replaying the old verdict.
+	st, err := w.MergeQueue.Status(ctx, runID)
+	if err == nil && st.Terminal && !st.Merged {
+		err = ErrMergeQueueUnknownRun
+	}
 	switch {
 	case errors.Is(err, ErrMergeQueueUnknownRun):
 		mergeReq, aerr := ciMergeRequestFrom(jc, mrIID)
@@ -177,7 +218,7 @@ func (w *GitLabWorker) awaitMergeQueue(ctx context.Context, jc JobContext, mrIID
 					},
 				}, nil
 			}
-			return StageOutput{}, fmt.Errorf("merge: queue evicted mr %d (%s): %s", mrIID, st.EvictionReason, st.Detail)
+			return StageOutput{}, mergeQueueEvictionError(mrIID, st)
 		}
 		if err == nil && st.Position != logPosition {
 			logPosition = st.Position
@@ -202,6 +243,29 @@ func (w *GitLabWorker) awaitMergeQueue(ctx context.Context, jc JobContext, mrIID
 		case <-time.After(interval):
 		}
 	}
+}
+
+// mergeQueueEvictionError converts a terminal-not-merged queue status into
+// the error the runner acts on. A head_moved eviction with a recorded
+// successor becomes *MergeSourceSHAMismatchError — the ONE shape the runner
+// rewinds on (ledger row + re-gate + CI for the successor) instead of
+// escalating; the historical eviction text is preserved verbatim as Message.
+// Every other reason (and a head_moved too old to carry observed_sha)
+// returns the typed eviction so Classify can assign a per-reason class.
+func mergeQueueEvictionError(mrIID int64, st MergeQueueStatus) error {
+	detail := fmt.Sprintf("merge: queue evicted mr %d (%s): %s", mrIID, st.EvictionReason, st.Detail)
+	if st.EvictionReason == "head_moved" && st.ObservedSHA != "" && st.AuthorizedSHA != "" {
+		return &MergeSourceSHAMismatchError{
+			MRIID:        mrIID,
+			Project:      st.Project,
+			SourceBranch: st.SourceBranch,
+			TargetBranch: st.TargetBranch,
+			ReviewedSHA:  st.AuthorizedSHA,
+			ObservedSHA:  st.ObservedSHA,
+			Message:      detail,
+		}
+	}
+	return &MergeQueueEvictedError{MRIID: mrIID, Reason: st.EvictionReason, Detail: st.Detail}
 }
 
 // jcProjectForLog best-efforts the project for the merged_project artifact on

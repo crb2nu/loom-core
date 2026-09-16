@@ -3,13 +3,14 @@ import {
   diffStagePicks,
   diffTerminalRuns,
   fuelReading,
+  fuelReadings,
   policyTapeSeed,
   seededPattern,
   stageLabel,
   tapeHole,
   warpCountFor,
 } from './factoryHelpers.ts';
-import type { PipelineRun } from '../stores/mills.svelte.ts';
+import type { MillsStatus, PipelineRun } from '../stores/mills.svelte.ts';
 
 function run(id: string, state: string, extra: Partial<PipelineRun> = {}): PipelineRun {
   return { ID: id, BacklogID: `bk-${id}`, Template: 't', State: state, Attempts: 1, ...extra };
@@ -164,5 +165,77 @@ describe('fuelReading', () => {
     expect(r.frac).toBe(0);
     expect(r.tone).toBe('er');
     expect(r.label).toBe('$120 / $100');
+  });
+});
+
+
+describe('fuelReadings', () => {
+  it('splits full pipeline and council status payloads into independent tanks', () => {
+    const status: MillsStatus = { budget: {
+      pipeline: { spent_usd: 2.43, cap_usd: 75, runs: 1, runs_cap: 0,
+        total_spent_usd: 70.92, subscription_spent_usd: 68.48, subscription_cap_usd: 300 },
+      council: { spent_usd: 6, cap_usd: 10, runs: 1, runs_cap: 0,
+        total_spent_usd: 96, subscription_spent_usd: 90, subscription_cap_usd: 100 },
+    } };
+    const [api, sub] = fuelReadings(status.budget?.pipeline);
+    expect(api).toMatchObject({ kind: 'api', label: '$2.43 / $75.00', tone: 'ok', unbounded: false });
+    expect(api.frac).toBeCloseTo(1 - 2.43 / 75);
+    expect(sub).toMatchObject({ kind: 'sub', label: '$68.48 / $300', tone: 'ok', unbounded: false });
+    expect(sub.frac).toBeCloseTo(1 - 68.48 / 300);
+    expect(api.title).toBe('API metered spend: $2.43 / $75.00; total spend: $70.92 (rolling 24h)');
+    expect(sub.title).toBe('Subscription list-price equivalent: $68.48 / $300.00; total spend: $70.92 (rolling 24h)');
+    const council = fuelReadings(status.budget?.council);
+    expect(council.map(t => t.tone)).toEqual(['wr', 'er']);
+    expect(council[0].frac).toBeCloseTo(0.4);
+    expect(council[1].frac).toBeCloseTo(0.1);
+  });
+
+  it('keeps one legacy tank and an em dash for absent metered data', () => {
+    expect(fuelReadings({ spent_usd: 12.5, cap_usd: 75 })).toHaveLength(1);
+    for (const usage of [undefined, null, {}, { cap_usd: 75 }]) {
+      expect(fuelReadings(usage)).toEqual([
+        expect.objectContaining({ kind: 'api', label: '—', frac: null, unbounded: false }),
+      ]);
+    }
+  });
+
+  it.each([0, undefined])('renders an unbounded sub tank for cap %s, including zero spend', cap => {
+    for (const spent of [0, 12.5]) {
+      const sub = fuelReadings({ subscription_spent_usd: spent, subscription_cap_usd: cap })[1];
+      expect(sub).toMatchObject({ unbounded: true, frac: null, tone: 'cy', label: `$${spent.toFixed(2)} · no cap` });
+      expect(sub.title).toContain(`$${spent.toFixed(2)} / no cap`);
+    }
+  });
+
+  it('does not invent missing subscription spend or total', () => {
+    for (const spent of [undefined, NaN, Infinity]) {
+      const sub = fuelReadings({ subscription_spent_usd: spent, subscription_cap_usd: 0 })[1];
+      expect(sub).toMatchObject({ label: '—', frac: null, unbounded: false, tone: 'cy' });
+      expect(sub.title).toContain('—; total spend: —');
+    }
+    expect(fuelReadings({ total_spent_usd: 0 })[1].title).toContain('total spend: $0.00');
+  });
+
+  it('rounds compact labels but preserves cents in tooltips', () => {
+    const sub = fuelReadings({ subscription_spent_usd: 123.456, subscription_cap_usd: 300.12, total_spent_usd: 125.886 })[1];
+    expect(sub.label).toBe('$123 / $300');
+    expect(sub.title).toContain('$123.46 / $300.12; total spend: $125.89');
+  });
+
+  it.each([[-10, 1, 'ok'], [0, 1, 'ok'], [60, 0.4, 'wr'], [120, 0, 'er']] as const)(
+    'clamps and colors subscription spend %s', (spent, frac, tone) => {
+      expect(fuelReadings({ subscription_spent_usd: spent, subscription_cap_usd: 100 })[1])
+        .toMatchObject({ frac, tone, unbounded: false });
+    },
+  );
+
+  it('subscription changes never affect metered readings used by Andon', () => {
+    const usage = { spent_usd: 60, cap_usd: 75, subscription_spent_usd: 0, subscription_cap_usd: 300 };
+    const metered = fuelReading(usage);
+    for (const spend of [0, 150, 600]) {
+      const changed = { ...usage, subscription_spent_usd: spend };
+      expect(fuelReading(changed)).toEqual(metered);
+      expect(fuelReadings(changed)[0]).toMatchObject(metered);
+    }
   });
 });

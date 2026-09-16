@@ -1509,3 +1509,40 @@ func toAnyMap(m map[string]string) map[string]any {
 	}
 	return out
 }
+
+func TestBuildProvisionScriptUsesProjectMetadataPath(t *testing.T) {
+	h := &HarvesterVMBackend{cfg: HarvesterVMBackendConfig{GitBaseURL: "http://192.168.50.218"}}
+
+	script, doClone := h.buildProvisionScript(StartOpts{
+		WorkDir:        "/workspace/libs/mcp-go",
+		GitProjectPath: "libs/mcp-go",
+	}, "token")
+	if !doClone {
+		t.Fatal("expected clone to be requested")
+	}
+	if !strings.Contains(script, "192.168.50.218/libs/mcp-go.git") {
+		t.Fatalf("expected libs clone target, got: %s", script)
+	}
+
+	// Legacy callers without metadata keep the WorkDir-basename behavior.
+	script, doClone = h.buildProvisionScript(StartOpts{
+		WorkDir: "/workspace/services/loom-core",
+	}, "token")
+	if !doClone {
+		t.Fatal("expected clone to be requested")
+	}
+	if !strings.Contains(script, "192.168.50.218/loom-core.git") {
+		t.Fatalf("expected basename fallback clone target, got: %s", script)
+	}
+
+	script, doClone = h.buildProvisionScript(StartOpts{
+		WorkDir:        "/workspace/services/loom-core",
+		GitProjectPath: "services/loom-core",
+	}, "token")
+	if !doClone {
+		t.Fatal("expected clone to be requested")
+	}
+	if !strings.Contains(script, "192.168.50.218/services/loom-core.git") {
+		t.Fatalf("expected services clone target, got: %s", script)
+	}
+}

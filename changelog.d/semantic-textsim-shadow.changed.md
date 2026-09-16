@@ -1,0 +1,1 @@
+- Add embedding-backed merged-work title similarity in shadow mode, logging semantic/Jaccard disagreements and fail-open backend unavailability while retaining lexical gating in `pkg/mills/textsim` and the council merged-work reconciliation path.

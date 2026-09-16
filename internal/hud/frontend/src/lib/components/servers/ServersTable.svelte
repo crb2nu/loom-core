@@ -74,10 +74,13 @@
     >
       {#snippet row({ row: server, hiddenColumns })}
         <td class="server-name-cell">
-          <span class="text-mono server-name" title={sanitizeText(server.name)}>{sanitizeText(server.name)}</span>
-          {#if server.categories?.length > 0}
-            <span class="server-cats">{#each server.categories as cat}<Badge text={cat} variant="info" />{/each}</span>
-          {/if}
+          <!-- Flex on an inner wrapper keeps the td a real table-cell. -->
+          <div class="server-name-stack">
+            <span class="text-mono server-name" title={sanitizeText(server.name)}>{sanitizeText(server.name)}</span>
+            {#if server.categories?.length > 0}
+              <span class="server-cats">{#each server.categories as cat}<Badge text={cat} variant="info" />{/each}</span>
+            {/if}
+          </div>
         </td>
         <td>
           <StatusDot status={server.status ?? 'unknown'} />
@@ -92,16 +95,18 @@
         {/if}
         {#if !hiddenColumns.has('sparkline')}
         <td class="sparkline-cell">
-          {#if server.latencyHistory?.length}
-            <SparkLine
-              data={server.latencyHistory}
-              width={92}
-              height={20}
-              color={server.status === 'healthy' ? 'var(--success)' : server.status === 'degraded' ? 'var(--warning)' : 'var(--error)'}
-            />
-          {:else}
-            <span class="text-muted text-xs">no data</span>
-          {/if}
+          <div class="sparkline-box">
+            {#if server.latencyHistory?.length}
+              <SparkLine
+                data={server.latencyHistory}
+                width={92}
+                height={20}
+                color={server.status === 'healthy' ? 'var(--success)' : server.status === 'degraded' ? 'var(--warning)' : 'var(--error)'}
+              />
+            {:else}
+              <span class="text-muted text-xs">no data</span>
+            {/if}
+          </div>
         </td>
         {/if}
       {/snippet}
@@ -148,17 +153,20 @@
   .sparkline-cell {
     width: 102px;
     padding: 4px 8px;
+  }
+  .sparkline-box {
     display: flex;
     align-items: center;
     justify-content: flex-start;
     min-height: 24px;
   }
 
-  .server-name-cell {
+  .server-name-cell { overflow: hidden; }
+  .server-name-stack {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    overflow: hidden;
+    min-width: 0;
   }
 
   .server-cats {

@@ -19,11 +19,12 @@ import (
 	"syscall"
 	"time"
 
+	"gitlab.flexinfer.ai/libs/mcp-go"
+
 	costpkg "github.com/crb2nu/loom/internal/visibility/contracts/cost"
 	healthpkg "github.com/crb2nu/loom/internal/visibility/contracts/health"
 	statuspkg "github.com/crb2nu/loom/internal/visibility/contracts/status"
 	"github.com/crb2nu/loom/pkg/launchctl"
-	"gitlab.flexinfer.ai/libs/mcp-go"
 )
 
 // Circuit breaker states for downstream server failure detection.

@@ -3,14 +3,39 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
+	"strings"
 	gosync "sync"
+	"syscall"
 
 	"gitlab.flexinfer.ai/libs/mcp-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// isClientGoneErr reports whether a response write failed because the peer
+// had already closed its side of the socket. These are the client's doing
+// (EPIPE, ECONNRESET, a closed net.Conn or io.Pipe), not a daemon fault, and
+// were logged at ERROR ~150 times a day as "write: broken pipe".
+func isClientGoneErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ENOTCONN) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "broken pipe") ||
+		strings.Contains(lower, "connection reset by peer") ||
+		strings.Contains(lower, "use of closed network connection")
+}
 
 func (d *Daemon) acceptLoop(ctx context.Context) {
 	defer d.wg.Done()
@@ -140,6 +165,17 @@ func (d *Daemon) handleConnection(ctx context.Context, conn net.Conn) {
 				sendErr := transport.Send(connCtx, resp)
 				writeMu.Unlock()
 				if sendErr != nil {
+					if isClientGoneErr(sendErr) {
+						// The client hung up before its response was written
+						// (a proxy exiting mid-call, a timed-out HUD poll).
+						// Nothing on the daemon side failed, so this is not
+						// an error worth an operator's attention.
+						d.logger.Debug("client went away before response was written",
+							"method", recv.msg.Method, "error", sendErr)
+						connSpan.AddEvent("client_gone_before_response",
+							trace.WithAttributes(attribute.String("error", sendErr.Error())))
+						return
+					}
 					d.logger.Error("send response error", "error", sendErr)
 					connSpan.RecordError(sendErr)
 					connSpan.SetStatus(codes.Error, sendErr.Error())

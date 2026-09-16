@@ -8,6 +8,13 @@ export interface DriverArgs {
   agentId: string;
   spawnId: string;
   workingDir: string;
+  /**
+   * Routed LLM id forwarded to the SDK (`model` on the Claude Agent SDK
+   * Options, `model` on the Codex ThreadOptions). Empty means the harness
+   * default, matching the legacy CLI path's `--model` semantics. The Go
+   * orchestrator passes the Mills stage_models / agent_routing pin here.
+   */
+  model: string;
   maxTurns: number;
   maxCostUsd: number;
   controlPort: number;
@@ -37,6 +44,7 @@ const DEFAULT_ARGS: DriverArgs = {
   agentId: "",
   spawnId: "",
   workingDir: "",
+  model: "",
   maxTurns: 0,
   maxCostUsd: 0,
   controlPort: 0,
@@ -79,6 +87,9 @@ export function parseArgs(argv: readonly string[]): DriverArgs {
         break;
       case "working-dir":
         args.workingDir = next;
+        break;
+      case "model":
+        args.model = next.trim();
         break;
       case "max-turns":
         args.maxTurns = Number.parseInt(next, 10) || 0;

@@ -173,6 +173,26 @@ The council must not propose repo work whose only action is to restart,
 reconfigure, contact, unblock, grant quota for, rotate credentials for, or wait
 on an outside service.
 
+### Scope of the in-repo follow-up rule
+
+The editor guardrail (`pkg/mills/council/editor_guardrails.go`) applies the
+follow-up contract **per proposal**, not per run. A council run is classified as
+an external dependency incident whenever any part of the editor output says so,
+and the scheduled council's brief almost always carries a workspace error
+cluster (GitLab CI, Longhorn, a provider 5xx) that earns that classification.
+Only proposals that themselves reference the outside system are held to the
+allowed follow-up classes above; a proposal that never mentions an external
+dependency is ordinary repo work and is kept without the
+`external-dependency-incident` label. The run's sidecar note reports the split
+as `N external-only proposals dropped; M proposals labeled; K repo-scoped
+proposals preserved`.
+
+Before this scoping (2026-08-21 → 2026-09-02) every proposal in fifty
+consecutive cron runs was dropped as external-only, including twelve-step plans
+for `pkg/mills/overseer`, `pkg/mills/gates`, and `internal/hud`; `council_yield`
+on `/api/mills/status` reported the dry spell as 50 runs and ~$133 with no
+backlog delta.
+
 ## Operator Follow-Up Allowed Locally
 
 Operators may perform local follow-up that does not pretend the repository can

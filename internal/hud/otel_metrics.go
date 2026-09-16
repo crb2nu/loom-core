@@ -7,11 +7,12 @@ import (
 
 // HUDMetrics holds OTel metric instruments for the HUD server.
 type HUDMetrics struct {
-	AgentSpawnTotal       metric.Int64Counter
-	PushNotificationTotal metric.Int64Counter
-	PushTokenInvalidated  metric.Int64Counter
-	SpawnedAgentActive    metric.Int64UpDownCounter
-	PushDeliveryLatency   metric.Float64Histogram
+	SpawnAuthFallbackTotal metric.Int64Counter
+	AgentSpawnTotal        metric.Int64Counter
+	PushNotificationTotal  metric.Int64Counter
+	PushTokenInvalidated   metric.Int64Counter
+	SpawnedAgentActive     metric.Int64UpDownCounter
+	PushDeliveryLatency    metric.Float64Histogram
 
 	// Spawn telemetry metrics.
 	SpawnTokensTotal      metric.Int64Counter
@@ -26,6 +27,7 @@ type HUDMetrics struct {
 func NewHUDMetrics() *HUDMetrics {
 	meter := otel.Meter("loom-hud")
 
+	authFallback, _ := meter.Int64Counter("hud_spawn_auth_fallback_total", metric.WithDescription("Claude cross-mode auth relaunch reservations"))
 	spawnTotal, _ := meter.Int64Counter("agent_spawn_total",
 		metric.WithDescription("Total agent spawn attempts"),
 		metric.WithUnit("{spawn}"),
@@ -73,11 +75,12 @@ func NewHUDMetrics() *HUDMetrics {
 	)
 
 	return &HUDMetrics{
-		AgentSpawnTotal:       spawnTotal,
-		PushNotificationTotal: pushTotal,
-		PushTokenInvalidated:  pushTokenInvalidated,
-		SpawnedAgentActive:    spawnActive,
-		PushDeliveryLatency:   pushLatency,
+		SpawnAuthFallbackTotal: authFallback,
+		AgentSpawnTotal:        spawnTotal,
+		PushNotificationTotal:  pushTotal,
+		PushTokenInvalidated:   pushTokenInvalidated,
+		SpawnedAgentActive:     spawnActive,
+		PushDeliveryLatency:    pushLatency,
 
 		SpawnTokensTotal:      spawnTokens,
 		SpawnCostTotal:        spawnCost,

@@ -29,6 +29,7 @@ import (
 	"github.com/crb2nu/loom/pkg/mcperror"
 	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/gates"
+	"github.com/crb2nu/loom/pkg/mills/sigfp"
 	"github.com/crb2nu/loom/pkg/mills/store"
 	"github.com/crb2nu/loom/pkg/telemetry"
 )
@@ -75,7 +76,7 @@ var DefaultStages = []Stage{
 		Type:      "auto_gate",
 		State:     store.PipelineTesting,
 		RetryFrom: "implement",
-		Gates:     []string{},
+		Gates:     []string{"tests_verdict"},
 	},
 	{ID: "pr_self_review", Type: "agent_spawn", State: store.PipelineReviewing},
 	{
@@ -83,7 +84,7 @@ var DefaultStages = []Stage{
 		Type:      "auto_gate",
 		State:     store.PipelineReviewing,
 		RetryFrom: "pr_self_review",
-		Gates:     []string{"spec_conformance", "pr_self_review"},
+		Gates:     []string{"tested_head", "spec_conformance", "pr_self_review"},
 	},
 	{ID: "mr", Type: "shell", State: store.PipelineMR},
 	{
@@ -148,10 +149,17 @@ type StageOutput struct {
 	// "unknown".
 	Model   string
 	Backend string
+	// Billing says who pays for CostUSD (store.BillingClass). The spawn
+	// worker sets it from the credential path the HUD reports (cluster OAuth
+	// = subscription, API key = api); empty lets the runner fall back to
+	// store.BillingForBackend.
+	Billing store.BillingClass
 }
 
 type stageAcceptRecorderKey struct{}
 type resumeSpawnIDKey struct{}
+type resumeTestsKey struct{}
+type resumeCleanupRecorderKey struct{}
 type stageAttemptKey struct{}
 type stageRetryContextKey struct{}
 type mergeRecoveryPipelineCreateRecorderKey struct{}
@@ -191,6 +199,15 @@ type StageRetryContext struct {
 	// LastFailure summarizes the most recent failure. Equal to
 	// FirstFailure on the first retry.
 	LastFailure string
+	// Findings are the gate's actionable reasons, preserved verbatim up to a
+	// bounded total so the retry implementer can fix the actual verdict.
+	Findings []string
+	// ExpectedHeadSHA pins the revision a re-dispatched tests stage must
+	// verify. Set only by the post-review re-test (bl-verify-s3b): the review
+	// pushed this head after the previous tests verdict, and the DevboxWorker
+	// would otherwise prefer the implement stage's adopted-head pin and
+	// re-test the stale revision.
+	ExpectedHeadSHA string
 }
 
 var errStagePending = errors.New("pipeline: stage remains pending")
@@ -413,6 +430,9 @@ type WorkerDispatcher interface {
 // caller (the reconciler issues one Start per queued item per tick).
 type Runner struct {
 	Store *store.Store
+	// HomeProject resolves empty TargetProject values when freezing escalation
+	// provenance for home-repository items.
+	HomeProject string
 	// IncidentWriter persists classified external-dependency incidents. New
 	// wires the production store; nil keeps direct test constructors and
 	// store-less integrations backward compatible. Writes are best-effort.
@@ -421,10 +441,15 @@ type Runner struct {
 	}
 	Gates      *gates.Registry
 	Dispatcher WorkerDispatcher
-	Policy     *mills.PolicyManager
-	Stages     []Stage
-	Clock      func() time.Time
-	Logger     *slog.Logger
+	// SpawnStopper must confirm runtime cleanup and driver exit before returning
+	// nil. A missing or failing stopper keeps a stalled accepted spawn pending.
+	SpawnStopper interface {
+		Stop(context.Context, string) error
+	}
+	Policy *mills.PolicyManager
+	Stages []Stage
+	Clock  func() time.Time
+	Logger *slog.Logger
 	// Escalator, when set, is invoked after the runner transitions a
 	// run to PipelineEscalated. Failure-record + issue + handoff
 	// publication is best-effort: an Escalator error is logged but does
@@ -467,6 +492,9 @@ type Runner struct {
 	// run that was already accepted before MR/CI/merge continuation proceeds
 	// under a newly-blocked operator.
 	AutonomyGate AutonomyGateFunc
+
+	// AutonomyWait optionally replaces context-aware waiting for deterministic tests.
+	AutonomyWait func(context.Context, time.Duration) error
 	// RescueMR, when set, opens a Draft merge request over an escalated run's
 	// branch. Wired only for the scope-gate escalation today (S2 of the
 	// 2026-07-26 scope-gate reliability plan): the implement stage pushes a
@@ -495,24 +523,11 @@ type Runner struct {
 	// too). Wait blocks until they all exit — used by tests to avoid
 	// leaking goroutines past the store's teardown, and available to
 	// operators for a clean shutdown.
-	wg sync.WaitGroup
-	// CrossRepoIntegrator, when set, switches the runner into the
-	// cross-repo path for any backlog item that has an open
-	// cross_repo_run row. Unset means single-repo behaviour for every
-	// item; an open cross_repo_run with no integrator wired returns a
-	// clear error rather than silently routing through the single-repo
-	// flow. See slice 4.2/4.3 in
-	// .loom/94-implementation-plan-mills-v2-…2026-05-02.md.
-	CrossRepoIntegrator CrossRepoIntegrator
-}
-
-// CrossRepoIntegrator is the subset of crossrepo.Integrator the pipeline
-// runner depends on. Defined here so the runner stays agnostic to the
-// concrete crossrepo package and tests can supply a fake without pulling
-// in the GitLab/policy wiring.
-type CrossRepoIntegrator interface {
-	WaitForGreen(ctx context.Context, run *store.CrossRepoRun) (store.CrossRepoState, error)
-	AtomicMerge(ctx context.Context, run *store.CrossRepoRun) (store.CrossRepoState, error)
+	wg         sync.WaitGroup
+	activityMu sync.Mutex
+	activity   map[string]*stageActivity
+	// RetryWait replaces context-aware backoff in deterministic tests.
+	RetryWait func(context.Context, time.Duration) error
 }
 
 // New constructs a Runner with sensible defaults. A nil PolicyManager is
@@ -626,22 +641,42 @@ func (r *Runner) Wait() {
 // in r.Stages, execution picks up at that index. New runs (CurrentStage
 // empty) start at index 0.
 //
-// Cross-repo branch (slice 4.2/4.3): when the backlog item has an open
-// cross_repo_run row the Runner hands off to handleCrossRepoRun instead
-// of stepping through r.Stages. The detection is "open run exists" —
-// the planner's caller is responsible for materialising that row before
-// dispatching the pipeline. See .loom/94-…2026-05-02.md slice 4.2.
+// Every item drives through r.Stages against a single repo. An item bound
+// for a non-home repo is routed per-item via BacklogItem.TargetProject
+// (see effectiveProject) rather than through a distinct execution path.
 func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem) error {
 	if r.Store == nil || r.Dispatcher == nil {
 		return errors.New("pipeline: runner not configured")
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	r.activityMu.Lock()
+	if r.activity == nil {
+		r.activity = make(map[string]*stageActivity)
+	}
+	activity := &stageActivity{last: r.now(), cancel: cancel}
+	r.activity[run.ID] = activity
+	r.activityMu.Unlock()
+	defer func() {
+		r.activityMu.Lock()
+		if r.activity[run.ID] == activity {
+			delete(r.activity, run.ID)
+		}
+		r.activityMu.Unlock()
+	}()
+	resuming := run.CurrentStage != ""
+	ctx = context.WithValue(ctx, resumeRecoveryKey{}, resuming)
+	// A resumed Drive may receive a run whose durable head is already terminal
+	// (including invocation preflight failure). Stop before preflight and DAG
+	// resolution so terminal sentinel stages do not need to be part of r.Stages
+	// and repeated reconciliation remains a no-op.
+	if terminal, err := r.runTerminatedExternally(ctx, run); err != nil {
+		return err
+	} else if terminal {
+		return nil
+	}
 	if blocked, err := r.runPreflight(ctx, run, item); blocked || err != nil {
 		return err
-	}
-	if cross, err := r.openCrossRepoRun(ctx, item); err != nil {
-		return err
-	} else if cross != nil {
-		return r.handleCrossRepoRun(ctx, cross, run, item)
 	}
 	startIdx, err := r.resumeIndex(run)
 	if err != nil {
@@ -682,6 +717,7 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 	// re-burning a free retry budget after a restart is acceptable
 	// (Slice 2c trade-off, documented in error_class.go).
 	effectiveAttempts := map[string]int{}
+	lastFailures := map[string]string{}
 
 	// retryCtxs tracks, per RetryFrom stage, why that stage is being
 	// re-dispatched after a gate failure. Seeded from the persisted
@@ -708,8 +744,15 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 	// diff (issue #378).
 	judgeTransportRetries := map[string]int{}
 
+	// reviewRetest is the post-review re-test state (bl-verify-s3b): whether
+	// post_review_gate's tested_head check ordered a tests re-dispatch for a
+	// review-authored head in this Drive, so the pr_self_review stage on the
+	// way back is skipped instead of respawned. See reviewRetestTracker.
+	reviewRetest := reviewRetestTracker{}
+
 	for i := startIdx; i < len(r.Stages); i++ {
 		stage := r.Stages[i]
+		r.touchActivity(run.ID)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -736,6 +779,26 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 		}
 
 		if stage.Type == "auto_gate" {
+			if stage.ID == "post_tests_gate" && prior["tests"].Artifacts["baseline_verdict"] == "environment" {
+				return r.escalateDevboxBaseline(ctx, run, item, "tests", fmt.Sprintf("checks=%v; %s", prior["tests"].Artifacts["checks"], prior["tests"].LogTail))
+			}
+			if stage.ID == postReviewGateStage {
+				// The deterministic tested_head check runs alone BEFORE the LLM
+				// judges: a review-authored commit must not spend two judge
+				// calls on a tree that is about to be re-tested (and judged
+				// again once the re-test passes), and a mismatch rewinds to
+				// tests, not to the gate's RetryFrom (pr_self_review).
+				decision, err := r.reviewHeadRetest(ctx, run, item, stage, prior, policy, retryCtxs, &reviewRetest)
+				if err != nil || decision == reviewHeadTerminated {
+					return err
+				}
+				if decision == reviewHeadRetest {
+					testsIdx, _ := r.indexOf(testsStageID) // presence checked by reviewHeadRetest
+					i = testsIdx - 1                       // -1 so the for-loop ++ lands on tests
+					continue
+				}
+				stage = withoutGate(stage, gates.TestedHeadGateName)
+			}
 			verdict, err := r.runGate(ctx, run, item, stage, prior, policy)
 			if err != nil {
 				rejudge, gerr := r.handleGateError(ctx, run, item, stage, err, judgeTransportRetries)
@@ -747,6 +810,9 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 			}
 			failDetail := verdict.FailDetail
 			if verdict.Pass {
+				if stage.ID == "post_tests_gate" {
+					delete(lastFailures, "tests")
+				}
 				continue
 			}
 			if verdict.JudgeUnparseable {
@@ -808,6 +874,14 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 					continue
 				}
 			}
+			signature := strings.Join(sigfp.NormalizeEvidenceTokens(failDetail), " ")
+			if stage.ID == "post_tests_gate" {
+				var repeated bool
+				signature, repeated = consecutiveFailure(lastFailures, "tests", ClassCode, failDetail)
+				if repeated {
+					return r.escalateWithItem(ctx, run, item, ClassCode, fmt.Sprintf("stage tests: identical failure signature on consecutive attempts [class=%s] signature=%s: %s", ClassCode, signature, failDetail))
+				}
+			}
 			// Gate failure: rewind to RetryFrom and retry, bumping
 			// the upstream stage's attempt counter. Cap at maxAttempts.
 			rewindIdx, ok := r.indexOf(stage.RetryFrom)
@@ -823,6 +897,9 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				retryCtxs[stage.RetryFrom] = rc
 			}
 			rc.LastFailure = failDetail
+			if stage.ID == "post_tests_gate" {
+				rc.Findings = boundedGateFindings(verdict.Failed)
+			}
 			// A non-admissible scope failure gets ONE self-correction respawn,
 			// not the full maxAttempts budget: the amendment evaluator has
 			// already established the reach is NOT a too-narrow envelope, so
@@ -856,19 +933,46 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				}
 				return r.escalateWithItem(ctx, run, item, gateExhaustedClass, reason)
 			}
-			r.logger().Info("pipeline retry", "run", run.ID, "from", stage.RetryFrom, "attempt", attempts[stage.RetryFrom]+1, "gate", stage.ID, "failure", failDetail)
+			r.logger().Info("pipeline retry", "run", run.ID, "from", stage.RetryFrom, "attempt", attempts[stage.RetryFrom]+1, "gate", stage.ID, "failure", failDetail, "signature", signature)
 			i = rewindIdx - 1 // -1 so the for-loop ++ lands on rewindIdx
 			continue
 		}
 
-		// Non-gate stage: dispatch the worker.
+		if stage.ID == prSelfReviewStageID {
+			skip, err := r.skipReviewAfterRetest(ctx, run, prior, &reviewRetest)
+			if err != nil {
+				return err
+			}
+			if skip {
+				continue
+			}
+		}
+		if stage.ID == "implement" {
+			// A fresh implement attempt supersedes the review that ran before
+			// it: the way back must review the new tree, not skip to the gate.
+			reviewRetest.pending = false
+		}
+
+		// Non-gate stage: recover any durable pending attempt before validating a
+		// new implement invocation. A pending attempt already has an accepted
+		// spawn and must be resumed without requiring its original prompt again.
 		attempt := attempts[stage.ID] + 1
 		pending, err := r.pendingStage(ctx, run.ID, stage.ID)
 		if err != nil {
 			return fmt.Errorf("pipeline: load pending stage: %w", err)
 		}
+		if stage.ID == "tests" {
+			pending = nil
+		}
 		if pending != nil {
 			attempt = pending.Attempt
+		} else if blocked, err := r.runImplementPreflight(ctx, run, item, stage, prior); err != nil {
+			return err
+		} else if blocked {
+			return nil
+		}
+		if resuming && i == startIdx && pending == nil {
+			r.logger().Info("pipeline resume: restarting stage attempt", "run", run.ID, "stage", stage.ID, "attempt", attempt)
 		}
 		attempts[stage.ID] = attempt
 		dispatchCtx := ctx
@@ -876,8 +980,17 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 			rc.Attempt = attempt
 			dispatchCtx = withStageRetryContext(ctx, rc)
 		}
+		if resuming && i == startIdx && stage.ID == "tests" {
+			dispatchCtx = context.WithValue(dispatchCtx, resumeTestsKey{}, true)
+		}
 		out, err := r.runStage(dispatchCtx, run, item, stage, prior, attempt, pending)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
+			if stage.ID == "ci_watch" && out.Artifacts != nil {
+				prior[ciWatchStatePriorKey] = StageOutput{Artifacts: out.Artifacts}
+			}
 			if errors.Is(err, errStagePending) {
 				r.logger().Info("pipeline drive stopped; stage remains pending", "run", run.ID, "stage", stage.ID, "attempt", attempt)
 				return nil
@@ -896,6 +1009,10 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				// attempt, rather than creating a second attempt for the same
 				// spawn. Count subsequent retries from that durable attempt.
 				attempts[stage.ID] = deduped.attempt
+			}
+
+			if errors.Is(err, ErrDevboxBaselineAlsoFails) {
+				return r.escalateDevboxBaseline(ctx, run, item, stage.ID, err.Error())
 			}
 
 			// The merge stage's exact-identity MR read found the head moved
@@ -926,6 +1043,9 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 			// failures. Kill-test (2026-05-24) showed ~62% of
 			// failing stage_results were transient.
 			cls := Classify(err)
+			if recoveringResume(ctx) && hubUnavailable(err.Error()) {
+				cls = ClassSubstrate
+			}
 			incident, externalIncident := classifyExternalStageIncident(err, out)
 			if externalIncident {
 				cls = ClassConfig
@@ -968,7 +1088,11 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 			// gets its own guidance — and re-watching only replays "branch
 			// pipeline pending" for another bounded window.
 			if errors.Is(err, ErrBranchPipelineUnavailable) {
-				return r.escalateWithItem(ctx, run, item, cls, fmt.Sprintf("stage %s terminal CI-config error (not retried) [class=%s]: %v — the MR head has no push pipeline; check the project's workflow rules (a repo that only builds merge_request_event pipelines never produces one) and that CI is enabled, or repush the branch, then requeue", stage.ID, cls, err))
+				return r.escalateWithItem(ctx, run, item, cls, fmt.Sprintf("stage %s terminal CI-config error (not retried) [class=%s]: %v — the MR head has neither a push pipeline nor its merge_request_event pipeline; check the project's workflow rules and that CI is enabled, or repush the branch, then requeue", stage.ID, cls, err))
+			}
+
+			if errors.Is(err, ErrBranchContractRefCollision) {
+				return r.escalateWithItem(ctx, run, item, ClassConfig, fmt.Sprintf("stage %s terminal branch-contract ref collision (not retried) [class=%s]: %v — resolve the conflicting origin ref or its open MR, then requeue", stage.ID, ClassConfig, err))
 			}
 
 			// Terminal config errors escalate on first sight — an
@@ -993,6 +1117,15 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				return r.escalateWithItem(ctx, run, item, cls, fmt.Sprintf("stage %s errored deterministically (not retried) [class=%s]: %v — the MR pipeline reached a terminal non-success state; re-watching cannot change it. Fix the branch (or retry the pipeline in GitLab) and requeue", stage.ID, cls, err))
 			}
 
+			// A target branch failing the same jobs/signature is a baseline
+			// incident, not evidence that this item introduced the regression.
+			// Hold immediately and stamp it as a free-retry external dependency;
+			// a requeue after the baseline turns green can proceed normally.
+			var baselineRed *CIWatchBaselineRedError
+			if errors.As(err, &baselineRed) {
+				return r.escalateCIWatchBaselineRed(ctx, run, item, stage.ID, baselineRed)
+			}
+
 			// A ci_watch run whose pipeline was STILL RUNNING at the watch hard
 			// cap is an external CI-dependency stall, not a code failure:
 			// re-watching just re-hits the same cap. Escalate once as a RETRYABLE
@@ -1014,9 +1147,35 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				reasonSuffix = fmt.Sprintf(" [reason=%s]", reason)
 			}
 
+			retryClass := "real"
+			if IsFreeRetry(cls) {
+				retryClass = "transient"
+			} else if cls == ClassInfra || cls == ClassSubstrate {
+				retryClass = "substrate"
+			}
+			// Mirror every cap that escalates below (substrate after a rollout, hard
+			// cap on total attempts, budget cap on real failures) so the final row
+			// on the ledger reads "exhausted" whichever one fired.
+			if (cls == ClassSubstrate && attempts[stage.ID] >= maxAttempts) || attempts[stage.ID] >= maxAttempts+transientRetryCap || effectiveAttempts[stage.ID] >= maxAttempts {
+				retryClass = "exhausted"
+			}
+			if perr := r.persistAttemptClassification(ctx, run.ID, stage.ID, attempts[stage.ID], retryClass, effectiveAttempts[stage.ID]); perr != nil {
+				return perr
+			}
+
+			if cls == ClassSubstrate && attempts[stage.ID] >= maxAttempts {
+				return r.escalateWithItemPolicy(ctx, run, item, cls, fmt.Sprintf("stage %s hub unavailable after operator rollout; exhausted %d attempts [class=substrate]: %v", stage.ID, attempts[stage.ID], err), false)
+			}
+			signature, repeated := consecutiveFailure(lastFailures, stage.ID, cls, err.Error())
+			if repeated {
+				return r.escalateWithItem(ctx, run, item, cls, fmt.Sprintf("stage %s: identical failure signature on consecutive attempts [class=%s] signature=%s: %v", stage.ID, cls, signature, err))
+			}
 			// Hard cap on total attempts (free + budgeted) so a
-			// permanent transient can't loop forever.
-			if attempts[stage.ID] >= maxAttempts+transientRetryCap {
+			// permanent transient can't loop forever. A ci_watch poll-session
+			// cap is exempt: the watch is bounded by its own wall-clock ceiling
+			// (CIWatchStalledError) rather than the generic transient cap.
+			freeCIWatchReattach := stage.ID == "ci_watch" && errors.Is(err, ErrCIWatchPollTimeout)
+			if !freeCIWatchReattach && attempts[stage.ID] >= maxAttempts+transientRetryCap {
 				return r.escalateWithItem(ctx, run, item, cls, fmt.Sprintf("stage %s errored after %d total attempts (cap %d) [class=%s]%s: %v", stage.ID, attempts[stage.ID], maxAttempts+transientRetryCap, cls, reasonSuffix, err))
 			}
 			// Budget cap on real (Code + Infra) failures.
@@ -1028,19 +1187,21 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 			// re-hit the rate limit (seconds scale) or the saturated
 			// spawn pool (minutes scale — see saturationBackoff).
 			if backoff := retryBackoff(cls, err, attempts[stage.ID]); backoff > 0 {
-				r.logger().Info("pipeline retry backoff", "run", run.ID, "stage", stage.ID, "class", cls, "backoff", backoff)
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
-					return ctx.Err()
+				r.logger().Info("pipeline retry backoff", "run", run.ID, "stage", stage.ID, "class", cls, "backoff", backoff, "signature", signature)
+				if err := r.waitRetry(ctx, backoff); err != nil {
+					return err
 				}
 			} else {
-				r.logger().Info("pipeline retry", "run", run.ID, "stage", stage.ID, "class", cls, "attempt", attempts[stage.ID], "effective_attempts", effectiveAttempts[stage.ID])
+				r.logger().Info("pipeline retry", "run", run.ID, "stage", stage.ID, "class", cls, "attempt", attempts[stage.ID], "effective_attempts", effectiveAttempts[stage.ID], "signature", signature)
 			}
 
 			// Retry the same stage by stepping back one (loop will ++).
 			i--
 			continue
+		}
+		// Tests transport success is not a verdict; its gate resolves the streak.
+		if stage.ID != "tests" {
+			delete(lastFailures, stage.ID)
 		}
 		if prev, ok := prior[stage.ID]; ok {
 			var carried bool
@@ -1052,7 +1213,16 @@ func (r *Runner) Drive(ctx context.Context, run *store.PipelineRun, item *store.
 				})
 			}
 		}
+		if stage.ID == "mr" {
+			// Reauthorization after a head-change rewind starts a new watch.
+			delete(prior, ciWatchStatePriorKey)
+		}
 		prior[stage.ID] = out
+		if stage.ID == testsStageID {
+			// A post-review re-test pin is single-use: the next tests dispatch
+			// (after an implement rewind) must verify the live head again.
+			delete(retryCtxs, testsStageID)
+		}
 		if stage.ID == "plan_slice" {
 			// The decomposition the plan_slice stage just authored lives in
 			// the plan store; a slice-less item picks its file scope up here
@@ -1137,8 +1307,16 @@ func (r *Runner) loadPriorOutputs(ctx context.Context, runID string) (map[string
 	}
 	out := make(map[string]StageOutput, len(rows))
 	for _, sr := range rows {
+		if sr.Stage == "ci_watch" && sr.Artifacts != nil {
+			if id, ok := ciWatchArtifactInt64(sr.Artifacts[ciWatchPipelineIDArtifact]); ok && id != 0 {
+				out[ciWatchStatePriorKey] = StageOutput{Artifacts: sr.Artifacts}
+			}
+		}
 		if sr.Outcome == nil || *sr.Outcome != store.StageOutcomeSuccess {
 			continue
+		}
+		if sr.Stage == "mr" {
+			delete(out, ciWatchStatePriorKey)
 		}
 		so := StageOutput{
 			CostUSD:   sr.CostUSD,
@@ -1194,9 +1372,6 @@ func (r *Runner) seedAttempts(ctx context.Context, runID string) (map[string]int
 		return nil, err
 	}
 	for _, sr := range rows {
-		if sr.Outcome == nil {
-			continue
-		}
 		if sr.Attempt > out[sr.Stage] {
 			out[sr.Stage] = sr.Attempt
 		}
@@ -1476,6 +1651,14 @@ func (r *Runner) runStage(
 	if err := r.Store.Pipeline.PutRun(ctx, run); err != nil {
 		return StageOutput{}, fmt.Errorf("persist run head: %w", err)
 	}
+	// Persist synchronous hub attempts before dispatch. Spawn-backed stages
+	// retain their acceptance recorder and poll-timeout deduplication path.
+	if pending == nil && stage.Type != "llm" && stage.Type != "agent_spawn" {
+		if err := r.Store.Pipeline.PutStage(ctx, &store.StageResult{PipelineRunID: run.ID, Stage: stage.ID, Attempt: attempt, StartedAt: now}); err != nil {
+			return StageOutput{}, err
+		}
+	}
+	r.touchActivity(run.ID)
 	r.event(ctx, "pipeline.stage.start", "ok", map[string]any{
 		"run": run.ID, "stage": stage.ID, "attempt": attempt,
 	})
@@ -1483,6 +1666,15 @@ func (r *Runner) runStage(
 	acceptedSpawnID := resumeSpawnID
 	stageCtx := withResumeSpawnID(ctx, resumeSpawnID)
 	stageCtx = withStageAttempt(stageCtx, attempt)
+	if resume, _ := ctx.Value(resumeTestsKey{}).(bool); resume {
+		stageCtx = context.WithValue(stageCtx, resumeCleanupRecorderKey{}, func(evidence []string) error {
+			return r.Store.Pipeline.PutStage(ctx, &store.StageResult{
+				PipelineRunID: run.ID, Stage: stage.ID, Attempt: attempt, StartedAt: now,
+				Artifacts: map[string]any{"resume_sandbox_cleanup": append([]string(nil), evidence...)},
+			})
+		})
+	}
+
 	// The MR head-movement fence (#374) is read fresh for both halves of the
 	// authorization: ci_watch STAMPS the value it authorized under, merge
 	// COMPARES against it. Threaded through context exactly like the
@@ -1558,7 +1750,31 @@ func (r *Runner) runStage(
 			Artifacts:     map[string]any{"stage_id": stage.ID},
 		})
 	})
-	out, derr := r.Dispatcher.Dispatch(stageCtx, run, item, stage, prior)
+	stageCtx = context.WithValue(stageCtx, stageHeartbeatKey{}, func() { r.touchActivity(run.ID) })
+	var out StageOutput
+	var derr error
+	if pending != nil && pending.Artifacts[spawnStopPendingArtifact] == true {
+		// Stop intent survives rollouts and ambiguous HTTP failures. Retry the
+		// fence directly, without another long poll or trusting a terminal
+		// status observed before runtime cleanup has been acknowledged.
+		out = StageOutput{SpawnID: pending.SpawnID, Model: pending.Model,
+			Backend: pending.Backend, Billing: pending.Billing, LogTail: pending.LogTail}
+		derr = fmt.Errorf("resume stalled spawn stop: %w", ErrSpawnPollTimeout)
+	} else {
+		derr = r.resumeHubReadiness(stageCtx, run, item, stage)
+		if derr == nil {
+			out, derr = r.Dispatcher.Dispatch(stageCtx, run, item, stage, prior)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+	r.touchActivity(run.ID)
+	if detail, ok := out.Artifacts[AdoptionProbeUnresolvedArtifact]; ok {
+		r.event(ctx, "pipeline.adoption_probe_unresolved", "warn", map[string]any{
+			"run": run.ID, "stage": stage.ID, "attempt": attempt, "detail": detail,
+		})
+	}
 	if ciWatchRescued {
 		if out.Artifacts == nil {
 			out.Artifacts = map[string]any{}
@@ -1599,21 +1815,53 @@ func (r *Runner) runStage(
 		// on a hung pod) and again 2026-07-01 (a resumed run logged "run
 		// already active" every minute and never escalated). We therefore
 		// count consecutive non-terminal poll failures — timeout OR error —
-		// on this attempt; once they reach the stall tolerance we fall through
-		// to the error path so the attempt is recorded errored and Drive's
-		// retry/escalation logic re-dispatches a fresh spawn and ultimately
-		// escalates. A single failure still parks: a genuine operator restart
-		// mid-poll must stay resume-safe.
+		// on this attempt. At the stall tolerance, confirm the old worker has
+		// stopped before recording an error that permits a replacement. A
+		// single failure still parks for resume-safe interrupted polling.
 		failures := pendingPollFailures(pending) + 1
 		if failures < maxConsecutiveSpawnPollFailures {
 			// Still within tolerance: a legitimately slow-but-progressing
 			// spawn (or a one-off interruption) gets another tick.
 			return r.parkPendingSpawn(ctx, run, stage, attempt, now, out, derr, failures)
 		}
+		if out.Artifacts == nil {
+			out.Artifacts = map[string]any{}
+		}
+		out.Artifacts[spawnStopPendingArtifact] = true
+		// Persist intent before the remote call. A crash after successful stop
+		// but before error persistence must retry the same idempotent fence.
+		if _, err := r.parkPendingSpawn(ctx, run, stage, attempt, now, out, derr, failures); !errors.Is(err, errStagePending) {
+			return out, err
+		}
+		stopErr := errors.New("spawn stopper unavailable")
+		if r.SpawnStopper != nil {
+			stopCtx, cancel := context.WithTimeout(ctx, stalledSpawnStopTimeout)
+			stopErr = r.SpawnStopper.Stop(stopCtx, out.SpawnID)
+			stopErr = errors.Join(stopErr, stopCtx.Err())
+			cancel()
+		}
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		if terminal, err := r.runTerminatedExternally(ctx, run); err != nil {
+			return out, err
+		} else if terminal {
+			return out, errRunTerminated
+		}
+		if stopErr != nil {
+			r.event(ctx, "pipeline.spawn.stop_pending", "warn", map[string]any{
+				"run": run.ID, "stage": stage.ID, "spawn_id": out.SpawnID, "error": stopErr.Error(),
+			})
+			return r.parkPendingSpawn(ctx, run, stage, attempt, now, out,
+				errors.Join(derr, fmt.Errorf("confirm stalled spawn stopped: %w", stopErr)), failures)
+		}
+		out.Artifacts[spawnStopPendingArtifact] = false
+		out.Artifacts["spawn_stop_confirmed"] = true
 		r.logger().Warn("pipeline spawn stalled; converting pending to errored attempt",
 			"run", run.ID, "stage", stage.ID, "attempt", attempt,
 			"spawn_id", out.SpawnID, "consecutive_poll_failures", failures,
 			"poll_timeout", errors.Is(derr, ErrSpawnPollTimeout))
+		mills.PipelineStallConversionsTotal.WithLabelValues(stage.ID).Inc()
 		// fall through to the error-path persistence below.
 	}
 	// HUD can first report a poll timeout, then later report that the same
@@ -1661,6 +1909,10 @@ func (r *Runner) runStage(
 			attributedCost = 0
 		}
 	}
+	billing := out.Billing
+	if billing == "" {
+		billing = store.BillingForBackend(out.Backend)
+	}
 	sr := &store.StageResult{
 		PipelineRunID: run.ID,
 		Stage:         stage.ID,
@@ -1672,6 +1924,7 @@ func (r *Runner) runStage(
 		CostUSD:       attributedCost,
 		Model:         out.Model,
 		Backend:       out.Backend,
+		Billing:       billing,
 		Artifacts:     mergeArtifacts(stage.ID, out),
 		LogTail:       logTail,
 	}
@@ -1687,6 +1940,7 @@ func (r *Runner) runStage(
 	if derr != nil {
 		r.event(ctx, "pipeline.stage.error", "error", map[string]any{
 			"run": run.ID, "stage": stage.ID, "attempt": attempt, "error": derr.Error(),
+			"error_class": string(Classify(derr)), "log_tail": logTail,
 		})
 		if dedupedPollTimeout {
 			return out, &dedupedStageAttemptError{err: derr, attempt: attempt}
@@ -1696,6 +1950,9 @@ func (r *Runner) runStage(
 
 	// Roll up side effects onto the run row.
 	run.CostUSD += attributedCost
+	if billing == store.BillingSubscription {
+		run.SubscriptionCostUSD += attributedCost
+	}
 	if out.MRIID != 0 {
 		v := out.MRIID
 		run.MRIID = &v
@@ -1724,14 +1981,28 @@ func (r *Runner) runStage(
 //
 // Precedence:
 //  1. Existing log_tail from the worker (most informative — telemetry
-//     from the spawn poll, devbox check tail, etc.).
+//     from the spawn poll, devbox check tail, etc.), with err.Error()
+//     appended as a trailing "error: …" line when the tail does not
+//     already carry it. Without that line a ci_watch poll timeout
+//     persisted only the poller's "status=running" lines and the
+//     telemetry classifier could not tell a timeout from a red pipeline
+//     (live 2026-09-01: 3/3 ci_watch errors bucketed as "other").
 //  2. err.Error() — what the dispatcher returned upstream.
 //  3. A synthetic "<stage> attempt <n> spawn <id>: no error text returned
 //     by worker" fallback so the row is still searchable.
 func buildFailureLogTail(existing string, err error, stageID string, attempt int, spawnID string) string {
 	tail := strings.TrimSpace(existing)
-	if tail == "" && err != nil {
-		tail = strings.TrimSpace(err.Error())
+	errText := ""
+	if err != nil {
+		errText = strings.TrimSpace(err.Error())
+	}
+	switch {
+	case tail == "":
+		tail = errText
+	case errText != "" && !strings.Contains(tail, errText):
+		// Appended (not prepended) so a consumer that keeps only the last N
+		// lines of a long tail still sees the verdict.
+		tail += "\nerror: " + truncate(errText, failureLogTailErrorMaxLen)
 	}
 	if tail == "" {
 		tail = "no error text returned by worker"
@@ -1747,6 +2018,11 @@ func buildFailureLogTail(existing string, err error, stageID string, attempt int
 	}
 	return prefix + ": " + tail
 }
+
+// failureLogTailErrorMaxLen bounds the error line buildFailureLogTail appends
+// to a worker tail. Dispatcher errors occasionally embed a raw response body
+// (devbox gate errors carry `raw="…"`), and the tail must stay a tail.
+const failureLogTailErrorMaxLen = 2000
 
 // spawnPollTimeoutsArtifactKey records, on a pending stage_results row, how
 // many consecutive non-terminal poll failures a single spawn attempt has
@@ -1771,6 +2047,11 @@ const spawnPollTimeoutsArtifactKey = "spawn_poll_timeouts"
 // the stall converts so the run re-spawns and escalates instead of wedging
 // active-but-idle forever.
 const maxConsecutiveSpawnPollFailures = 2
+
+const (
+	stalledSpawnStopTimeout  = 45 * time.Second
+	spawnStopPendingArtifact = "spawn_stop_pending"
+)
 
 // pendingPollFailures reads the consecutive non-terminal poll-failure counter
 // off a pending stage_results row. Returns 0 when absent. Artifacts round-trip
@@ -1821,6 +2102,10 @@ func (r *Runner) runTerminatedExternally(ctx context.Context, run *store.Pipelin
 		r.event(ctx, "pipeline.drive.aborted_terminal", "ok", map[string]any{
 			"run": run.ID, "state": string(persisted.State), "stage": run.CurrentStage,
 		})
+		switch persisted.State {
+		case store.PipelineEscalated, store.PipelinePaused, store.PipelineDone:
+			mills.PipelineDriveAbortedTerminalTotal.WithLabelValues(string(persisted.State)).Inc()
+		}
 		return true, nil
 	}
 	return false, nil
@@ -1866,6 +2151,9 @@ func (r *Runner) parkPendingSpawn(
 ) (StageOutput, error) {
 	pendingTail := buildFailureLogTail(out.LogTail, derr, stage.ID, attempt, out.SpawnID)
 	art := map[string]any{"stage_id": stage.ID}
+	if out.Artifacts[spawnStopPendingArtifact] == true {
+		art[spawnStopPendingArtifact] = true
+	}
 	if pollFailures > 0 {
 		art[spawnPollTimeoutsArtifactKey] = pollFailures
 	}
@@ -1877,6 +2165,7 @@ func (r *Runner) parkPendingSpawn(
 		SpawnID:       out.SpawnID,
 		Model:         out.Model,
 		Backend:       out.Backend,
+		Billing:       out.Billing,
 		Artifacts:     art,
 		LogTail:       pendingTail,
 	}); perr != nil {
@@ -2014,6 +2303,7 @@ func (r *Runner) runGate(
 		FailDetail:       failDetail,
 		Terminal:         terminal,
 		JudgeUnparseable: judgeUnparseable,
+		Outcomes:         outcomes,
 		Failed:           failed,
 		Input:            in,
 	}, nil
@@ -2031,6 +2321,8 @@ type gateVerdict struct {
 	FailDetail       string
 	Terminal         bool
 	JudgeUnparseable bool
+	// Outcomes is every gate evaluated, in gate order (pass, skip, and fail).
+	Outcomes []gates.NamedOutcome
 	// Failed is every non-passing outcome of this evaluation, in gate order.
 	Failed []gates.NamedOutcome
 	// Input is the StageInput the gates were evaluated against.
@@ -2043,6 +2335,239 @@ func (v gateVerdict) scopeOnlyFailure() bool {
 	return len(v.Failed) == 1 && v.Failed[0].Name == scopeGateName
 }
 
+// outcome returns the evaluation of gate name in this verdict.
+func (v gateVerdict) outcome(name string) (gates.Outcome, bool) {
+	for _, no := range v.Outcomes {
+		if no.Name == name {
+			return no.Outcome, true
+		}
+	}
+	return gates.Outcome{}, false
+}
+
+// Stage ids the post-review re-test (bl-verify-s3b) keys on. Constants so a
+// DAG rename fails to compile here instead of silently disabling the re-test.
+const (
+	testsStageID        = "tests"
+	prSelfReviewStageID = "pr_self_review"
+	postReviewGateStage = "post_review_gate"
+)
+
+// maxReviewHeadRetests bounds how many times one Drive re-dispatches tests
+// because tested_head still mismatched. One re-test settles the normal case
+// (review pushed once); a second absorbs a head that moved again while the
+// re-test ran. Beyond that the tests stage keeps verifying a revision other
+// than the branch head — a pin or a push race, not something another sandbox
+// run can fix — so the run escalates instead of looping.
+const maxReviewHeadRetests = 2
+
+// reviewRetestTracker is Drive-local state for the post-review re-test.
+type reviewRetestTracker struct {
+	// evaluated is set once post_review_gate's tested_head check has run in
+	// this Drive. Until then a pr_self_review visit consults the persisted
+	// gate ledger instead (an operator restart mid-re-test loses the flag).
+	evaluated bool
+	// pending is set when a re-test was ordered and the review has not yet
+	// been skipped on the way back. It is what stops the review respawn; a
+	// fresh implement dispatch clears it, because the review that ran
+	// before implement moved the head again is stale by construction.
+	pending bool
+	// ordered counts the re-tests ordered in this Drive (loop guard).
+	ordered int
+	// cleanHead is the last review head the check found already tested, so
+	// a judge-transport re-judge of the same gate stage does not count the
+	// same clean head twice.
+	cleanHead string
+}
+
+// reviewHeadDecision is what Drive does after the tested_head check.
+type reviewHeadDecision int
+
+const (
+	// reviewHeadProceed: the head is the tested one (or unknown) — run the
+	// judge gates as usual.
+	reviewHeadProceed reviewHeadDecision = iota
+	// reviewHeadRetest: the review moved the head — re-dispatch tests.
+	reviewHeadRetest
+	// reviewHeadTerminated: the run was escalated — stop driving.
+	reviewHeadTerminated
+)
+
+// reviewHeadRetest evaluates only the tested_head gate of post_review_gate and
+// decides whether the review's resulting head must be re-tested before the
+// judges (and mr/ci_watch) see it. A re-test pins the tests dispatch to the
+// review head through the stage retry context and consumes no implement
+// attempt; the review itself is not respawned (see skipReviewAfterRetest).
+func (r *Runner) reviewHeadRetest(
+	ctx context.Context,
+	run *store.PipelineRun,
+	item *store.BacklogItem,
+	stage Stage,
+	prior map[string]StageOutput,
+	policy *mills.Policy,
+	retryCtxs map[string]*StageRetryContext,
+	rt *reviewRetestTracker,
+) (reviewHeadDecision, error) {
+	if !r.gateRegistered(gates.TestedHeadGateName) || !containsGate(stage, gates.TestedHeadGateName) {
+		return reviewHeadProceed, nil
+	}
+	headStage := stage
+	headStage.Gates = []string{gates.TestedHeadGateName}
+	verdict, err := r.runGate(ctx, run, item, headStage, prior, policy)
+	if err != nil {
+		return reviewHeadProceed, err
+	}
+	rt.evaluated = true
+	outcome, ran := verdict.outcome(gates.TestedHeadGateName)
+	tested, head := verdict.Input.TestedSHA, verdict.Input.ReviewHeadSHA
+	if !ran || outcome.Pass {
+		rt.pending = false
+		if ran && !outcome.Skip && rt.cleanHead != head {
+			rt.cleanHead = head
+			mills.PipelineReviewHeadMovedTotal.WithLabelValues("clean").Inc()
+		}
+		return reviewHeadProceed, nil
+	}
+	if _, ok := r.indexOf(testsStageID); !ok {
+		return reviewHeadTerminated, r.escalateWithItem(ctx, run, item, ClassConfig, fmt.Sprintf(
+			"gate %s failed (%s) [class=%s] and the pipeline has no %s stage to re-run", stage.ID, verdict.FailDetail, ClassConfig, testsStageID))
+	}
+	if rt.ordered >= maxReviewHeadRetests {
+		return reviewHeadTerminated, r.escalateWithItem(ctx, run, item, ClassInfra, fmt.Sprintf(
+			"gate %s failed (%s) after %d post-review re-tests [class=%s]: the tests stage keeps verifying a revision other than the branch head — check the branch for pushes racing the pipeline, then requeue",
+			stage.ID, verdict.FailDetail, rt.ordered, ClassInfra))
+	}
+	rt.ordered++
+	rt.pending = true
+	mills.PipelineReviewHeadMovedTotal.WithLabelValues("retested").Inc()
+	// Pin the re-test to the review head. The DevboxWorker otherwise prefers
+	// the implement stage's adopted-head pin, which is exactly the stale
+	// revision this re-test exists to replace.
+	retryCtxs[testsStageID] = &StageRetryContext{
+		GateStage:       stage.ID,
+		FirstFailure:    verdict.FailDetail,
+		LastFailure:     verdict.FailDetail,
+		ExpectedHeadSHA: head,
+	}
+	r.logger().Info("pipeline: review moved the branch head; re-testing the review head without respawning review",
+		"run", run.ID, "tested_sha", tested, "review_head_sha", head, "retest", rt.ordered)
+	r.event(ctx, "pipeline.review_head.retest", "warn", map[string]any{
+		"run": run.ID, "gate": stage.ID, "tested_sha": tested, "review_head_sha": head, "retest": rt.ordered,
+	})
+	return reviewHeadRetest, nil
+}
+
+// skipReviewAfterRetest reports whether this pr_self_review visit is the way
+// back from a post-review re-test — the review already ran for the head the
+// re-test verified — and must not respawn. A visit after a judge-gate rewind
+// (RetryFrom) is a real retry and runs; so is a visit after implement moved
+// the head again (Drive clears pending on every implement dispatch), because
+// that review output is stale by construction.
+func (r *Runner) skipReviewAfterRetest(ctx context.Context, run *store.PipelineRun, prior map[string]StageOutput, rt *reviewRetestTracker) (bool, error) {
+	pending := rt.pending
+	if !rt.evaluated {
+		// Resumed Drive: the in-memory verdict is gone. The gate ledger says
+		// whether the last post_review_gate visit ordered a re-test, but not
+		// whether implement ran again since, so the resumed path also
+		// requires the tests verdict to describe exactly the review head. A
+		// resumed re-test that verified another revision (an adopted-head
+		// pin survives the restart, the re-test pin does not) respawns the
+		// review once; the head check then orders a pinned re-test, which
+		// converges.
+		ordered, err := r.retestOrderedInLedger(ctx, run.ID)
+		if err != nil {
+			return false, err
+		}
+		pending = ordered && reviewHeadCoveredByTests(prior)
+	}
+	if !pending {
+		return false, nil
+	}
+	rt.evaluated = true
+	rt.pending = false
+	r.logger().Info("pipeline: review head already re-tested; skipping review respawn", "run", run.ID)
+	r.event(ctx, "pipeline.review_head.review_skipped", "ok", map[string]any{"run": run.ID, "stage": prSelfReviewStageID})
+	return true, nil
+}
+
+// retestOrderedInLedger reports whether the run's most recent persisted
+// tested_head verdict is a failure: the last post_review_gate visit ordered a
+// re-test that no later visit has superseded.
+func (r *Runner) retestOrderedInLedger(ctx context.Context, runID string) (bool, error) {
+	if r.Store == nil || runID == "" {
+		return false, nil
+	}
+	rows, err := r.Store.Pipeline.ListGates(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("pipeline: list gate outcomes: %w", err)
+	}
+	ordered := false
+	for _, g := range rows {
+		if g.GateName == gates.TestedHeadGateName {
+			ordered = g.Outcome == store.GateOutcomeFail
+		}
+	}
+	return ordered, nil
+}
+
+// reviewHeadCoveredByTests reports whether the latest tests verdict describes
+// exactly the head the latest review left behind.
+func reviewHeadCoveredByTests(prior map[string]StageOutput) bool {
+	testedSHA := resolvedSHA(prior[testsStageID].Artifacts["tested_sha"])
+	headSHA := resolvedSHA(reviewPushedCommits(prior)["head_sha"])
+	return testedSHA != "" && headSHA != "" && testedSHA == headSHA
+}
+
+// reviewPushedCommits returns the pr_self_review stage's pushed_commits
+// artifact ({count, head_sha}), or nil when the review recorded none.
+func reviewPushedCommits(prior map[string]StageOutput) map[string]any {
+	pushed, _ := prior[prSelfReviewStageID].Artifacts[reviewPushedCommitsArtifactKey].(map[string]any)
+	return pushed
+}
+
+// resolvedSHA lower-cases an artifact SHA and maps the tests stage's
+// "unresolved" sentinel to "" (the tested_head gate normalizes the same way).
+func resolvedSHA(v any) string {
+	s, _ := v.(string)
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "unresolved" {
+		return ""
+	}
+	return s
+}
+
+// withoutGate returns a copy of stage whose Gates omit name. The copy owns
+// its slice so the shared DefaultStages entry is never mutated.
+func withoutGate(stage Stage, name string) Stage {
+	kept := make([]string, 0, len(stage.Gates))
+	for _, g := range stage.Gates {
+		if g != name {
+			kept = append(kept, g)
+		}
+	}
+	stage.Gates = kept
+	return stage
+}
+
+func containsGate(stage Stage, name string) bool {
+	for _, g := range stage.Gates {
+		if g == name {
+			return true
+		}
+	}
+	return false
+}
+
+// gateRegistered reports whether the registry knows name. runGate skips an
+// unregistered gate, so callers that would do extra work for it can skip too.
+func (r *Runner) gateRegistered(name string) bool {
+	if r.Gates == nil {
+		return false
+	}
+	_, err := r.Gates.Get(name)
+	return err == nil
+}
+
 // scopeGateName is the registry name of the scope gate (gates.Scope.Name()).
 // Kept as a constant here so the amendment's entry condition can't silently
 // stop matching if the gate is ever renamed without a compile error somewhere.
@@ -2053,6 +2578,25 @@ const scopeGateName = "scope"
 // the summary is for triage, not for replaying the full outcome (the
 // gate_outcomes table keeps that).
 const gateFailureDetailMaxLen = 500
+const gateFindingsMaxLen = 4 * 1024
+
+func boundedGateFindings(failed []gates.NamedOutcome) []string {
+	var findings []string
+	remaining := gateFindingsMaxLen
+	for _, no := range failed {
+		for _, reason := range no.Outcome.Reasons {
+			if remaining <= 0 {
+				return findings
+			}
+			if len(reason) > remaining {
+				reason = reason[:remaining]
+			}
+			findings = append(findings, reason)
+			remaining -= len(reason)
+		}
+	}
+	return findings
+}
 
 // maxJudgeUnparseableRetries bounds the FREE gate re-judges spent recovering an
 // ungradeable LLM-judge score envelope (raw="") before the run escalates as an
@@ -2239,6 +2783,12 @@ func (r *Runner) seedRetryContexts(ctx context.Context, runID string) (map[strin
 		if g.Outcome != store.GateOutcomeFail {
 			continue
 		}
+		if g.GateName == gates.TestedHeadGateName {
+			// A tested_head failure re-dispatches tests, not the gate's
+			// RetryFrom (pr_self_review): it is not a review retry and must
+			// not tell a later review respawn it is fixing a head mismatch.
+			continue
+		}
 		retryFrom := retryFromByGateStage[g.AfterStage]
 		if retryFrom == "" {
 			continue
@@ -2256,6 +2806,9 @@ func (r *Runner) seedRetryContexts(ctx context.Context, runID string) (map[strin
 			out[retryFrom] = rc
 		}
 		rc.LastFailure = detail
+		if g.AfterStage == "post_tests_gate" {
+			rc.Findings = appendBoundedFindings(rc.Findings, g.Reasons...)
+		}
 	}
 	return out, nil
 }
@@ -2264,7 +2817,10 @@ func (r *Runner) seedRetryContexts(ctx context.Context, runID string) (map[strin
 // for the most recent diff/file/test artifact regardless of which stage
 // produced it.
 func (r *Runner) gateInputFor(ctx context.Context, stage Stage, item *store.BacklogItem, policy *mills.Policy, prior map[string]StageOutput) gates.StageInput {
-	in := gates.StageInput{Item: item, Policy: policy}
+	in := gates.StageInput{Item: item, Policy: policy, HomeProject: r.HomeProject}
+	if item != nil {
+		in.MaxDiffLines = item.Policy.MaxDiffLines
+	}
 	if impl, ok := prior["implement"]; ok {
 		in.FilesChanged = impl.FilesChanged
 		in.LinesAdded = impl.LinesAdded
@@ -2273,15 +2829,90 @@ func (r *Runner) gateInputFor(ctx context.Context, stage Stage, item *store.Back
 		in.CommitMessages = impl.CommitMessages
 		in.GitCaptureStatus, in.GitCaptureReason = gitCaptureFromArtifacts(impl.Artifacts)
 	}
-	// prior[stage.ID] is only written after a stage completes without error
-	// (the retry/escalate paths run first), so the presence of a "tests"
-	// output means the devbox quality gate genuinely passed. The LLM judges
-	// use this to ground out compile-health hallucinations (#304).
-	if _, ok := prior["tests"]; ok {
-		in.TestsPassed = true
+	if tests, ok := prior["tests"]; ok {
+		in.TestsPassed = true // legacy rows without a passed artifact
+		if passed, exists := tests.Artifacts["passed"].(bool); exists {
+			in.TestsPassed = passed
+			in.TestsVerdict = &gates.TestsVerdict{Passed: passed, FailedChecks: decodeFailedChecks(tests.Artifacts["checks"])}
+		}
+		in.TestedSHA, _ = tests.Artifacts["tested_sha"].(string)
 	}
+	in.ReviewHeadSHA, _ = reviewPushedCommits(prior)["head_sha"].(string)
 	in.ProjectBootstrapped = r.projectBootstrapped(ctx, item)
 	return in
+}
+
+func appendBoundedFindings(existing []string, reasons ...string) []string {
+	used := 0
+	for _, finding := range existing {
+		used += len(finding)
+	}
+	for _, reason := range reasons {
+		if used >= gateFindingsMaxLen {
+			break
+		}
+		if len(reason) > gateFindingsMaxLen-used {
+			reason = reason[:gateFindingsMaxLen-used]
+		}
+		existing = append(existing, reason)
+		used += len(reason)
+	}
+	return existing
+}
+
+func decodeFailedChecks(raw any) []gates.FailedCheck {
+	var out []gates.FailedCheck
+	appendCheck := func(name string, passed bool, exitCode int, output string) {
+		if !passed {
+			out = append(out, gates.FailedCheck{Name: name, ExitCode: exitCode, Output: output})
+		}
+	}
+	switch checks := raw.(type) {
+	case []DevboxCheck:
+		for _, check := range checks {
+			appendCheck(check.Name, check.Passed, check.ExitCode, check.Output)
+		}
+	case []any:
+		for _, value := range checks {
+			m, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := stringMapValue(m, "name", "Name")
+			passed, _ := boolMapValue(m, "passed", "Passed")
+			output, _ := stringMapValue(m, "output", "Output")
+			exit, _ := numberMapValue(m, "exit_code", "ExitCode")
+			appendCheck(name, passed, int(exit), output)
+		}
+	}
+	return out
+}
+
+func stringMapValue(m map[string]any, keys ...string) (string, bool) {
+	for _, key := range keys {
+		if value, ok := m[key].(string); ok {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func boolMapValue(m map[string]any, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		if value, ok := m[key].(bool); ok {
+			return value, true
+		}
+	}
+	return false, false
+}
+
+func numberMapValue(m map[string]any, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		if value, ok := m[key].(float64); ok {
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 // gitCaptureFromArtifacts reads the cumulative-git-capture provenance the
@@ -2354,6 +2985,9 @@ func (r *Runner) markDone(ctx context.Context, run *store.PipelineRun, item *sto
 			return fmt.Errorf("persist backlog merged: %w", err)
 		}
 		*item = *current
+		if _, err := r.Store.Outcomes.WriteTerminal(ctx, item.ID, mills.OutcomeDispatchScore(item, run.Attempts-1, run.StartedAt)); err != nil {
+			return fmt.Errorf("persist merged outcome writeback: %w", err)
+		}
 	}
 	mills.PipelineRunsTotal.WithLabelValues(string(store.PipelineDone)).Inc()
 	mills.PipelineCostUSDTotal.WithLabelValues(string(store.PipelineDone)).Add(run.CostUSD)
@@ -2391,7 +3025,11 @@ func (r *Runner) markDone(ctx context.Context, run *store.PipelineRun, item *sto
 // queued so the reconciler spins up a fresh pipeline_run on the next
 // tick (kicked immediately via OnAutoRetry).
 func (r *Runner) escalateWithItem(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, cls ErrorClass, reason string) error {
-	if r.maybeAutoRetry(ctx, run, item, cls, reason) {
+	return r.escalateWithItemPolicy(ctx, run, item, cls, reason, true)
+}
+
+func (r *Runner) escalateWithItemPolicy(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, cls ErrorClass, reason string, allowAutoRetry bool) error {
+	if allowAutoRetry && r.maybeAutoRetry(ctx, run, item, cls, reason) {
 		return nil
 	}
 	if isTransientEscalationClass(cls) && r.transientRetryBudgetExhausted(ctx, item) {
@@ -2422,13 +3060,16 @@ func (r *Runner) escalateWithItem(ctx context.Context, run *store.PipelineRun, i
 			return fmt.Errorf("persist backlog escalated: %w", err)
 		}
 		*item = *current
-		// Freeze the item's TargetProject onto the run's event subject,
+		if _, err := r.Store.Outcomes.WriteTerminal(ctx, item.ID, mills.OutcomeDispatchScore(item, run.Attempts-1, run.StartedAt)); err != nil {
+			return fmt.Errorf("persist escalated outcome writeback: %w", err)
+		}
+		// Freeze the item's resolved target project onto the run's event subject,
 		// first-writer: the ghost-spark merged-branch sweep authorizes a
 		// cross-repo branch lookup against this immutable binding, never the
 		// mutable backlog field. Best-effort — the escalation stands without it
 		// (the item then just stays a human's to close).
 		if r.Store != nil {
-			if _, err := mills.AppendEscalationTargetBinding(ctx, r.Store.Events, "pipeline", run, item); err != nil {
+			if _, err := mills.AppendEscalationTargetBinding(ctx, r.Store.Events, "pipeline", run, item, r.HomeProject); err != nil {
 				r.logger().Warn("pipeline: escalation target binding append failed",
 					"run", run.ID, "backlog", item.ID, "error", err)
 			}
@@ -2484,6 +3125,38 @@ func (r *Runner) escalateCIWatchStall(ctx context.Context, run *store.PipelineRu
 	if err := r.Store.Pipeline.SetEscalationMetadata(ctx, run.ID, md); err != nil {
 		r.logger().Warn("pipeline: stamp ci_watch stall metadata failed", "run", run.ID, "error", err)
 	}
+	return nil
+}
+
+func (r *Runner) escalateCIWatchBaselineRed(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, stageID string, baseline *CIWatchBaselineRedError) error {
+	reason := fmt.Sprintf("stage %s held for target-branch baseline-red CI [class=%s]: %v — wait for the target branch to return green, then requeue for free", stageID, ClassTransient, baseline)
+	retryable := true
+	// Seed the dynamic dependency before escalation so the persisted row and
+	// the handler's FailureRecord carry the same external-incident identity.
+	// Baseline red is a hold, so bypass the generic transient auto-requeue;
+	// the retry remains free when a green-baseline reconciler requeues it.
+	run.ExternalDependencyID = "gitlab_ci_baseline_red"
+	run.ExternalDependency = "gitlab_ci_baseline_red"
+	run.FailureClass = string(FailureTransient)
+	run.EscalationRetryable = &retryable
+	if err := r.escalateWithItemPolicy(ctx, run, item, ClassTransient, reason, false); err != nil {
+		return err
+	}
+	// Escalation records use the telemetry vocabulary "external_dependency";
+	// the pipeline verdict stores the more specific resolved classification.
+	md := store.EscalationMetadata{
+		EscalationClass:      string(ClassificationExternalDependencyIncident),
+		FailureClass:         string(FailureTransient),
+		ExternalDependencyID: run.ExternalDependencyID,
+		ExternalDependency:   run.ExternalDependency,
+		Retryable:            &retryable,
+	}
+	if r.Store != nil && r.Store.Pipeline != nil {
+		if err := r.Store.Pipeline.SetEscalationMetadata(ctx, run.ID, md); err != nil {
+			r.logger().Warn("pipeline: stamp baseline-red classification failed", "run", run.ID, "error", err)
+		}
+	}
+	applyEscalationMetadata(run, md)
 	return nil
 }
 
@@ -2751,91 +3424,6 @@ func boolStr(b bool, t, f string) string {
 	return f
 }
 
-// openCrossRepoRun returns the most-recent cross_repo_runs row for the
-// backlog item if it sits in a non-terminal state the runner should
-// drive. Returns (nil, nil) for the common single-repo case.
-//
-// "Non-terminal" today is open + gates_green + merging — anything before
-// the integrator finishes its job. Merged/reverted/failed rows are
-// historical artifacts and should not re-enter the pipeline.
-func (r *Runner) openCrossRepoRun(ctx context.Context, item *store.BacklogItem) (*store.CrossRepoRun, error) {
-	if r.Store == nil || r.Store.CrossRepo == nil || item == nil {
-		return nil, nil
-	}
-	rows, err := r.Store.CrossRepo.ListByBacklog(ctx, item.ID)
-	if err != nil {
-		return nil, fmt.Errorf("pipeline: lookup cross_repo for %s: %w", item.ID, err)
-	}
-	for _, row := range rows {
-		if isCrossRepoActive(row.State) {
-			return row, nil
-		}
-	}
-	return nil, nil
-}
-
-func isCrossRepoActive(s store.CrossRepoState) bool {
-	switch s {
-	case store.CrossRepoOpen, store.CrossRepoGatesGreen, store.CrossRepoMerging:
-		return true
-	default:
-		return false
-	}
-}
-
-// handleCrossRepoRun drives a cross-repo run through WaitForGreen +
-// AtomicMerge, persisting state transitions on cross_repo_runs and
-// closing out the *store.PipelineRun envelope when the integrator
-// reaches a terminal state. Per-repo MR creation is intentionally
-// out-of-band today (see TODO below).
-func (r *Runner) handleCrossRepoRun(
-	ctx context.Context,
-	cross *store.CrossRepoRun,
-	run *store.PipelineRun,
-	item *store.BacklogItem,
-) error {
-	if r.CrossRepoIntegrator == nil {
-		return r.escalateWithItem(ctx, run, item, ClassConfig, fmt.Sprintf(
-			"cross-repo run %s present but integrator not configured", cross.ID))
-	}
-	// TODO(slice 4.2 followup): fan out per-repo plan stages; for now
-	// assume MRs are created out-of-band by the planner caller.
-	greenState, err := r.CrossRepoIntegrator.WaitForGreen(ctx, cross)
-	if perr := r.persistCrossState(ctx, cross, greenState); perr != nil {
-		r.logger().Warn("crossrepo persist gates_green failed",
-			"cross_repo_run", cross.ID, "error", perr)
-	}
-	if err != nil {
-		return r.escalateWithItem(ctx, run, item, Classify(err), fmt.Sprintf(
-			"cross-repo wait_for_green: %v", err))
-	}
-	mergeState, err := r.CrossRepoIntegrator.AtomicMerge(ctx, cross)
-	if perr := r.persistCrossState(ctx, cross, mergeState); perr != nil {
-		r.logger().Warn("crossrepo persist merge state failed",
-			"cross_repo_run", cross.ID, "state", mergeState, "error", perr)
-	}
-	if err != nil {
-		return r.escalateWithItem(ctx, run, item, Classify(err), fmt.Sprintf(
-			"cross-repo atomic_merge: %v", err))
-	}
-	if mergeState != store.CrossRepoMerged {
-		return r.escalateWithItem(ctx, run, item, ClassConfig, fmt.Sprintf(
-			"cross-repo terminal state %s", mergeState))
-	}
-	return r.markDone(ctx, run, item)
-}
-
-// persistCrossState pushes a state transition onto cross_repo_runs.
-// Wraps the DAO so the runner doesn't grow conditional nil checks at
-// every call site.
-func (r *Runner) persistCrossState(ctx context.Context, cross *store.CrossRepoRun, state store.CrossRepoState) error {
-	if r.Store == nil || r.Store.CrossRepo == nil || cross == nil || state == "" {
-		return nil
-	}
-	cross.State = state
-	return r.Store.CrossRepo.SetState(ctx, cross.ID, state)
-}
-
 // stampEscalationMetadata records the terminal classification metadata on a
 // just-escalated run. The historical escalation_class is parsed from the
 // reason's "[class=…]" marker so budget accounting keeps its existing
@@ -2944,6 +3532,27 @@ func escalationMetadataFromEvidence(cls ErrorClass, reason, lastLogTail string) 
 		md.ExternalDependencyID = incident.ID
 		md.ExternalDependency = incident.Dependency
 	}
+	// A devbox ResourceQuota refusal is attributed to devbox_quota (kept class
+	// infra by routeExternalDependencyEscalation, like devbox_baseline).
+	if md.ExternalDependencyID == "" && devboxQuotaRefusalText(reason) {
+		md.ExternalDependencyID = DevboxQuotaDependency
+		md.ExternalDependency = DevboxQuotaDependency
+	}
+	// Failure-shape fingerprint (shepherd B2): stamp the normalized identity
+	// of the evidence tail so the shepherd's environment-delta predicate can
+	// join this escalation against its cohort. Prefer the log tail — the
+	// richer text — and fall back to the reason; an empty fingerprint means
+	// the evidence was too short to name a failure and stamps nothing.
+	if md.FailureSignature = sigfp.Fingerprint(lastLogTail); md.FailureSignature == "" {
+		md.FailureSignature = sigfp.Fingerprint(reason)
+	}
+	if md.FailureSignature == "" {
+		// bl-honest-verdicts-s1: evidence below the miner's shape floor still
+		// gets a coarse synthetic identity keyed on the verdict, so classified
+		// escalations never land unstamped. Verdict-less empty evidence stays
+		// unstamped (the safety pin above the classification fallback).
+		md.FailureSignature = sigfp.SyntheticFingerprint(md.EscalationClass, reason+"\n"+lastLogTail)
+	}
 	return md
 }
 
@@ -3036,4 +3645,192 @@ func classifyEscalationReason(reason string) string {
 	default:
 		return "other"
 	}
+}
+
+// A heartbeat represents observed worker activity, never a periodic timer
+// keeping an otherwise silent remote call alive. Synchronous hub calls without
+// progress notifications are bounded by their last dispatch time.
+type stageActivity struct {
+	last   time.Time
+	cancel context.CancelFunc
+}
+type stageHeartbeatKey struct{}
+
+// RecordStageHeartbeat lets a dispatcher report observed remote progress.
+func RecordStageHeartbeat(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	if fn, ok := ctx.Value(stageHeartbeatKey{}).(func()); ok {
+		fn()
+	}
+}
+
+func (r *Runner) touchActivity(runID string) {
+	r.activityMu.Lock()
+	defer r.activityMu.Unlock()
+	if a := r.activity[runID]; a != nil {
+		a.last = r.now()
+	}
+}
+
+func (r *Runner) waitRetry(ctx context.Context, delay time.Duration) error {
+	if r.RetryWait != nil {
+		return r.RetryWait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// stageSilenceLimit preserves the policy budget and allows every declared
+// synchronous call its own full timeout plus the same five-minute grace.
+func (r *Runner) stageSilenceLimit(stage string) time.Duration {
+	minutes := r.policy().CrossRepo.PerRepoTimeoutMinutes
+	if minutes <= 0 {
+		minutes = 60
+	}
+	limit := time.Duration(minutes)*time.Minute + 5*time.Minute
+	if provider, ok := r.Dispatcher.(interface{ SynchronousCallTimeout(string) time.Duration }); ok {
+		limit = max(limit, provider.SynchronousCallTimeout(stage)+5*time.Minute)
+	}
+	return limit
+}
+
+// SweepSilentRuns bounds stalls even when readiness or a worker ignores its
+// context. Store revision/terminal fences reject all late worker writes. The
+// startup Drive supplies one fresh recovery window; repeated Start deliveries
+// cannot refresh it because the existing active guard deduplicates them.
+func (r *Runner) SweepSilentRuns(ctx context.Context) error {
+	runs, err := r.Store.Pipeline.ListInFlight(ctx)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range runs {
+		limit := r.stageSilenceLimit(candidate.CurrentStage)
+		r.activityMu.Lock()
+		last := candidate.StartedAt
+		activity := r.activity[candidate.ID]
+		if activity != nil {
+			last = activity.last
+		} else {
+			rows, e := r.Store.Pipeline.ListStages(ctx, candidate.ID)
+			if e != nil {
+				r.activityMu.Unlock()
+				return e
+			}
+			for _, row := range rows {
+				if row.StartedAt.After(last) {
+					last = row.StartedAt
+				}
+				if row.EndedAt != nil && row.EndedAt.After(last) {
+					last = *row.EndedAt
+				}
+			}
+		}
+		if r.now().Sub(last) <= limit {
+			r.activityMu.Unlock()
+			continue
+		}
+		// Re-read for a fresh revision, and serialize heartbeat refresh against
+		// this terminal claim. Never mutate the Drive goroutine's run pointer.
+		run, e := r.Store.Pipeline.GetRun(ctx, candidate.ID)
+		if e != nil {
+			r.activityMu.Unlock()
+			return e
+		}
+		limit = r.stageSilenceLimit(run.CurrentStage)
+		if store.IsPipelineTerminalState(run.State) || run.CurrentStage != candidate.CurrentStage || r.now().Sub(last) <= limit {
+			r.activityMu.Unlock()
+			continue
+		}
+		now := r.now()
+		run.State, run.EndedAt = store.PipelineEscalated, &now
+		retryable := true
+		run.EscalationClass = string(ClassSubstrate)
+		run.FailureClass = string(FailureInfrastructure)
+		run.EscalationRetryable = &retryable
+		e = r.Store.Pipeline.PutRun(ctx, run)
+		if e == nil && activity != nil {
+			activity.cancel()
+		}
+		r.activityMu.Unlock()
+		if e != nil {
+			return e
+		}
+		reason := fmt.Sprintf("stage %s silent after operator rollout: no attempt heartbeat for %s (timeout plus grace %s) [class=substrate]", run.CurrentStage, now.Sub(last), limit)
+		mills.PipelineStageSilentTotal.WithLabelValues(run.CurrentStage, strconv.FormatFloat(limit.Seconds(), 'f', -1, 64)).Inc()
+		r.logger().Error("pipeline stage silent watchdog", "run", run.ID, "stage", run.CurrentStage, "class", ClassSubstrate, "reason", reason)
+		r.event(ctx, "pipeline.run.escalated", "error", map[string]any{"run": run.ID, "stage": run.CurrentStage, "reason": reason})
+		rows, err := r.Store.Pipeline.ListStages(ctx, run.ID)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if row.Stage == run.CurrentStage && row.Outcome == nil {
+				outcome := store.StageOutcomeError
+				row.Outcome, row.EndedAt, row.LogTail = &outcome, &now, reason
+				if err := r.Store.Pipeline.PutStage(ctx, row); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// persistAttemptClassification updates the durable attempt (including a deduped
+// spawn's original attempt), preserving its output and attribution. The counter
+// is stage-local and intentionally resets when Drive resumes.
+func (r *Runner) persistAttemptClassification(ctx context.Context, runID, stageID string, attempt int, retryClass string, effective int) error {
+	rows, err := r.Store.Pipeline.ListStages(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("load retry attempt: %w", err)
+	}
+	for _, row := range rows {
+		if row.Stage != stageID || row.Attempt != attempt {
+			continue
+		}
+		if row.Artifacts == nil {
+			row.Artifacts = map[string]any{}
+		}
+		row.Artifacts["retry_class"] = retryClass
+		row.Artifacts["effective_attempts"] = effective
+		if err := r.Store.Pipeline.PutStage(ctx, row); err != nil {
+			return fmt.Errorf("persist retry attempt: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("retry attempt missing: %s/%s/%d", runID, stageID, attempt)
+}
+
+// consecutiveFailure tracks completed failures independently per stage, including
+// tests verdicts across implement rewinds. A transient breaks the streak.
+func consecutiveFailure(last map[string]string, stage string, cls ErrorClass, evidence string) (string, bool) {
+	signature := strings.Join(sigfp.NormalizeEvidenceTokens(evidence), " ")
+	// Substrate is main's bounded hub-outage retry (own attempt cap and
+	// backoff): an outage repeats its signature by nature, so it breaks the
+	// streak like a transient instead of tripping the two-attempt stop. So does
+	// a devbox quota refusal: it repeats verbatim while the quota drains and has
+	// its own minutes-scale backoff (devboxQuotaBackoff).
+	if IsFreeRetry(cls) || cls == ClassSubstrate || signature == "" || devboxQuotaRefusalText(evidence) {
+		delete(last, stage)
+		return signature, false
+	}
+	key := string(cls) + ":" + signature
+	repeated := last[stage] == key
+	last[stage] = key
+	return signature, repeated
+}
+
+func (r *Runner) escalateDevboxBaseline(ctx context.Context, run *store.PipelineRun, item *store.BacklogItem, stage, detail string) error {
+	run.ExternalDependencyID = "devbox_baseline"
+	run.ExternalDependency = "devbox_baseline"
+	reason := fmt.Sprintf("stage %s [class=%s]: substrate: the same checks fail on bare main: %s — requeue for free once the substrate is fixed", stage, ClassInfra, detail)
+	return r.escalateWithItemPolicy(ctx, run, item, ClassInfra, reason, false)
 }

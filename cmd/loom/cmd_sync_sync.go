@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/spf13/cobra"
 
@@ -40,6 +41,22 @@ func runSyncCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	mgr.SkipSkills = skipSkills
+
+	// --dry-run must not touch the repo or home. SyncToHome/SyncAll have no
+	// dry-run mode (and --regen writes generated files into the repo before
+	// syncing), so we report the pending drift and stop here rather than
+	// calling them. Previously the flag was parsed but only ever reached the
+	// --all-projects propagation, so `loom sync <profile> --dry-run` silently
+	// wrote to home — the opposite of what the flag advertises.
+	if dryRun {
+		if err := reportSyncDryRun(mgr, profile); err != nil {
+			return err
+		}
+		if allProjects {
+			return propagateSyncAllProjects(mgr, profile, cwd, wsRoot, skipWorktrees, dryRun)
+		}
+		return nil
+	}
 
 	if profile == "all" {
 		// For "all", pass nil/explicit resolveSecrets and loomMode flag status
@@ -83,5 +100,45 @@ func runSyncCmd(cmd *cobra.Command, args []string) error {
 	if allProjects {
 		return propagateSyncAllProjects(mgr, profile, cwd, wsRoot, skipWorktrees, dryRun)
 	}
+	return nil
+}
+
+// reportSyncDryRun prints the files that a real sync would rewrite, without
+// writing anything. It reads the same drift machinery `loom sync status` uses,
+// so the two commands can never disagree about what is out of sync.
+func reportSyncDryRun(mgr *sync.Manager, profile string) error {
+	names := []string{profile}
+	if profile == "all" {
+		names = mgr.List()
+		sort.Strings(names)
+	}
+
+	for _, name := range names {
+		status, err := mgr.GetSyncStatus(name)
+		if err != nil {
+			return err
+		}
+		if status == nil {
+			return fmt.Errorf("unknown profile %q", name)
+		}
+
+		fmt.Printf("[dry-run] %s: %s -> %s\n", name, status.RepoPath, status.HomePath)
+		if status.InSync {
+			fmt.Println("[dry-run]   already in sync")
+			continue
+		}
+		for _, item := range status.DriftDetails {
+			if item.Status == sync.DriftInSync {
+				continue
+			}
+			file := item.File
+			if file == "" {
+				file = "(profile)"
+			}
+			fmt.Printf("[dry-run]   %s: %s\n", file, item.Status)
+		}
+	}
+
+	fmt.Println("[dry-run] no files written")
 	return nil
 }

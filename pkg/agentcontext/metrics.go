@@ -40,6 +40,7 @@ type Metrics struct {
 	EmbedWriteAttempts      atomic.Int64
 	EmbedFallbackWrites     atomic.Int64
 	EmbedDegradedRejections atomic.Int64
+	PatternEmbedFailclosed  atomic.Int64
 
 	// Recall quality
 	RecallRequests  atomic.Int64
@@ -279,6 +280,7 @@ type MetricsSnapshot struct {
 	EmbedWriteAttempts      int64   `json:"embed_write_attempts"`
 	EmbedFallbackWrites     int64   `json:"embed_fallback_writes"`
 	EmbedDegradedRejections int64   `json:"embed_degraded_rejections"`
+	PatternEmbedFailclosed  int64   `json:"pattern_embed_failclosed"`
 	EmbedFallbackRatio      float64 `json:"embed_fallback_ratio"`
 
 	// Recall
@@ -380,6 +382,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		EmbedWriteAttempts:       embedWriteAttempts,
 		EmbedFallbackWrites:      embedFallbackWrites,
 		EmbedDegradedRejections:  m.EmbedDegradedRejections.Load(),
+		PatternEmbedFailclosed:   m.PatternEmbedFailclosed.Load(),
 		EmbedFallbackRatio:       embedFallbackRatio,
 		RecallRequests:           recallReqs,
 		RecallHits:               recallHits,
@@ -439,6 +442,7 @@ func (m *Metrics) Reset() {
 	m.EmbedWriteAttempts.Store(0)
 	m.EmbedFallbackWrites.Store(0)
 	m.EmbedDegradedRejections.Store(0)
+	m.PatternEmbedFailclosed.Store(0)
 
 	m.RecallRequests.Store(0)
 	m.RecallHits.Store(0)
@@ -530,6 +534,10 @@ agent_context_embed_fallback_writes_total ` + formatInt64(snap.EmbedFallbackWrit
 # HELP agent_context_embed_degraded_rejections_total Writes rejected fail-closed while the embedder was degraded
 # TYPE agent_context_embed_degraded_rejections_total counter
 agent_context_embed_degraded_rejections_total ` + formatInt64(snap.EmbedDegradedRejections) + `
+
+# HELP pattern_embed_failclosed_total Pattern writes rejected while the embedder circuit breaker is open
+# TYPE pattern_embed_failclosed_total counter
+pattern_embed_failclosed_total ` + formatInt64(snap.PatternEmbedFailclosed) + `
 
 # HELP agent_context_embed_fallback_ratio Ratio of write-path embed attempts that used fallback vectors
 # TYPE agent_context_embed_fallback_ratio gauge

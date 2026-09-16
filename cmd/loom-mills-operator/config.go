@@ -76,12 +76,30 @@ type Config struct {
 	// as research, so the lane that is already sized and paid for is the right
 	// default. Env: FLEXINFER_MEMORY_MODEL.
 	FlexInferMemoryModel string
+	// FlexInferEmbedModel is the model id the merged-work semantic
+	// grounding scorer embeds titles with. Empty falls through to the
+	// embed client's default (BAAI/bge-large-en-v1.5) — which the
+	// FlexInfer proxy resolves only when a Model of that exact serving
+	// name is deployed; a mismatch degrades scoring to lexical-only via
+	// the scorer's total fallback. Env: FLEXINFER_EMBED_MODEL.
+	FlexInferEmbedModel string
 	// FlexInferTimeout caps any single proxy HTTP call. Zero falls
 	// through to the client default (5min). Operators tune this via
 	// FLEXINFER_TIMEOUT (Go duration; e.g. "180s", "3m") when the
 	// backing model is slow enough that the default would clip the
 	// research stage prematurely.
 	FlexInferTimeout time.Duration
+	// FlexInferShadowJudgeModel names a FlexInfer-proxy serving model that
+	// grades every LLM-judged gate verdict in the shadow of the primary judge
+	// (gates.LLMGate.Shadow, issue #755): its score is persisted under
+	// role=shadow for calibration and never affects a verdict. Empty (the
+	// default) disables it. Gateway ids (oa/, or/) are refused: the shadow
+	// exists to grade a LOCAL candidate against the frontier primary. Env:
+	// FLEXINFER_SHADOW_JUDGE_MODEL.
+	FlexInferShadowJudgeModel string
+	// FlexInferShadowJudgeTimeout bounds one shadow call. Zero falls through
+	// to gates.DefaultShadowTimeout. Env: FLEXINFER_SHADOW_JUDGE_TIMEOUT.
+	FlexInferShadowJudgeTimeout time.Duration
 
 	// LiteLLMProxyURL is the cluster LiteLLM gateway (OpenAI-compatible)
 	// that fronts remote providers via OpenRouter — the route council
@@ -108,6 +126,23 @@ type Config struct {
 	// default vs "litellm" (model follows FlexInferWeaverModel). Env:
 	// MILLS_WEAVER_BACKEND.
 	WeaverBackend string
+	// TriageBackend selects the LLM client behind the overseer triage
+	// (backlog groomer dedup/zombie verdicts, foreman issue bodies).
+	// "" (default) inherits the resolved judge client + model, exactly as
+	// before. "flexinfer" pins the FlexInfer proxy client on
+	// FlexInferTriageModel so the 512-token JSON verdicts run on a warm
+	// local lane instead of the frontier judge; "litellm" binds the gateway
+	// on that model. Either non-default selection without an explicit
+	// FLEXINFER_TRIAGE_MODEL (or without its client) fails loud at startup
+	// and falls back to the judge wiring. Env: MILLS_TRIAGE_BACKEND.
+	TriageBackend string
+	// FlexInferTriageModel is the model id the overseer triage dials when
+	// TriageBackend is set. It must be a serving name the selected backend
+	// routes (flexinfer-proxy labels 404 in this client). An ad-hoc id gets
+	// no fallback chain (clients.FlexInferClient.fallbacksFor): a triage
+	// outage degrades the overseers to deterministic-only, never to the
+	// judge. Env: FLEXINFER_TRIAGE_MODEL.
+	FlexInferTriageModel string
 
 	// GitLabAPIURL is the GitLab REST API base, e.g.
 	// "https://gitlab.flexinfer.ai/api/v4". Empty disables the GitLab
@@ -119,7 +154,12 @@ type Config struct {
 	GitLabToken string
 	// GitLabProject is the URL-encoded slug or numeric id of the
 	// project the operator manages MRs against.
-	GitLabProject string
+	GitLabProject     string
+	DocsMirrorProject string
+	DocsMirrorRef     string
+	DocsMirrorPath    string
+	// DigestAt is the UTC time-of-day for the finished-goods digest.
+	DigestAt string
 	// GitLabHeadSHADeadline overrides how long ci_watch waits for an MR to
 	// report any head SHA before failing with ErrMRHeadSHAUnavailable. Env:
 	// LOOM_MILLS_GITLAB_HEAD_SHA_DEADLINE. Zero keeps the client default (5m).
@@ -191,6 +231,10 @@ type Config struct {
 	// GitOpsDefaultBranch is the branch the kill-switch MR targets and
 	// branches off. Defaults to "main".
 	GitOpsDefaultBranch string
+	// GitOpsDeploymentPath is the in-repo path to the operator Deployment
+	// whose policy-checksum annotation onboarding MRs bump. Defaults to
+	// "k3s/mills/deployment.yaml".
+	GitOpsDeploymentPath string
 
 	// HUDBaseURL is the loom HUD's HTTP base, e.g.
 	// "http://hud.loom-system.svc.cluster.local:8090". Empty disables
@@ -237,13 +281,17 @@ type Config struct {
 // DefaultConfig returns the values used when neither flag nor env supplies one.
 func DefaultConfig() Config {
 	return Config{
-		DBPath:      "/var/lib/loom-mills/state.db",
-		PolicyPath:  "/etc/loom-mills/policy.yaml",
-		SquadsPath:  "/etc/loom-mills/squads",
-		HTTPAddr:    ":8090",
-		MetricsAddr: ":9090",
-		RepoRoot:    "/workspace/loom-core",
-		LokiURL:     "http://loki.logging.svc.cluster.local:3100",
+		DBPath:            "/var/lib/loom-mills/state.db",
+		PolicyPath:        "/etc/loom-mills/policy.yaml",
+		SquadsPath:        "/etc/loom-mills/squads",
+		HTTPAddr:          ":8090",
+		MetricsAddr:       ":9090",
+		RepoRoot:          "/workspace/loom-core",
+		LokiURL:           "http://loki.logging.svc.cluster.local:3100",
+		DocsMirrorProject: "services/flexinfer-site",
+		DocsMirrorRef:     "main",
+		DocsMirrorPath:    "content/loom-core-docs",
+		DigestAt:          "06:00",
 
 		CouncilStages:           runner.DefaultStageBudgets(),
 		CouncilAsyncConcurrency: defaultCouncilAsyncConcurrency,
@@ -310,9 +358,20 @@ func (c *Config) ApplyEnv() {
 	if v := strings.TrimSpace(os.Getenv("FLEXINFER_MEMORY_MODEL")); v != "" {
 		c.FlexInferMemoryModel = v
 	}
+	if v := strings.TrimSpace(os.Getenv("FLEXINFER_EMBED_MODEL")); v != "" {
+		c.FlexInferEmbedModel = v
+	}
 	if v := strings.TrimSpace(os.Getenv("FLEXINFER_TIMEOUT")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			c.FlexInferTimeout = d
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("FLEXINFER_SHADOW_JUDGE_MODEL")); v != "" {
+		c.FlexInferShadowJudgeModel = v
+	}
+	if v := strings.TrimSpace(os.Getenv("FLEXINFER_SHADOW_JUDGE_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.FlexInferShadowJudgeTimeout = d
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("LITELLM_PROXY_URL")); v != "" {
@@ -327,6 +386,12 @@ func (c *Config) ApplyEnv() {
 	if v := strings.TrimSpace(os.Getenv("MILLS_WEAVER_BACKEND")); v != "" {
 		c.WeaverBackend = v
 	}
+	if v := strings.TrimSpace(os.Getenv("MILLS_TRIAGE_BACKEND")); v != "" {
+		c.TriageBackend = v
+	}
+	if v := strings.TrimSpace(os.Getenv("FLEXINFER_TRIAGE_MODEL")); v != "" {
+		c.FlexInferTriageModel = v
+	}
 	if v := strings.TrimSpace(os.Getenv("GITLAB_API_URL")); v != "" {
 		c.GitLabAPIURL = v
 	}
@@ -335,6 +400,18 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := strings.TrimSpace(os.Getenv("GITLAB_PROJECT")); v != "" {
 		c.GitLabProject = v
+	}
+	if v := strings.TrimSpace(os.Getenv("LOOM_MILLS_DOCS_MIRROR_PROJECT")); v != "" {
+		c.DocsMirrorProject = v
+	}
+	if v := strings.TrimSpace(os.Getenv("LOOM_MILLS_DOCS_MIRROR_REF")); v != "" {
+		c.DocsMirrorRef = v
+	}
+	if v := strings.TrimSpace(os.Getenv("LOOM_MILLS_DOCS_MIRROR_PATH")); v != "" {
+		c.DocsMirrorPath = v
+	}
+	if v := strings.TrimSpace(os.Getenv("LOOM_MILLS_DIGEST_AT")); v != "" && validDigestAt(v) {
+		c.DigestAt = v
 	}
 	// ci_watch bounds. durationEnv honours a negative value as "no bound" for
 	// council stages, which is meaningless here — a negative deadline would
@@ -389,6 +466,9 @@ func (c *Config) ApplyEnv() {
 	}
 	if v := strings.TrimSpace(os.Getenv("GITOPS_DEFAULT_BRANCH")); v != "" {
 		c.GitOpsDefaultBranch = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GITOPS_DEPLOYMENT_PATH")); v != "" {
+		c.GitOpsDeploymentPath = v
 	}
 	if v := strings.TrimSpace(os.Getenv("LOOM_HUD_URL")); v != "" {
 		c.HUDBaseURL = v

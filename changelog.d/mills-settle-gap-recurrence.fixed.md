@@ -1,0 +1,1 @@
+- Settle externally rebased, merged Mills MRs from the run-stamped project and MR IID instead of later head or actor provenance; add first-sweep regression coverage and document structured ghost-spark skip diagnostics (`pkg/mills/reconciler.go`, `pkg/mills/reconciler_ghost_spark_test.go`, `docs/MILLS_RUNBOOK.md`).

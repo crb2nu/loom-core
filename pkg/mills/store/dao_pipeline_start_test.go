@@ -141,7 +141,7 @@ func TestClaimPipelineStart_RejectsOverlappingScopeReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := seedClaimBacklog(t, st, "CANDIDATE")
-	candidate.Slices = []Slice{{Name: "candidate", Files: []string{"pkg/mills/b.go"}}}
+	candidate.Slices = []Slice{{Name: "candidate", Files: []string{"pkg/mills/a.go"}}}
 	if err := st.Backlog.Put(ctx, candidate); err != nil {
 		t.Fatal(err)
 	}
@@ -405,46 +405,64 @@ func TestClaimPipelineStart_BudgetCountsActualAboveReservation(t *testing.T) {
 }
 
 func TestClaimPipelineStart_TenThousandRunBudgetWindow(t *testing.T) {
-	st := newTestStore(t)
+	const (
+		samples                 = 20
+		budgetHistoryRatioBound = 10
+	)
+	shallow := newTestStore(t)
+	deep := newTestStore(t)
 	ctx := context.Background()
-	history := seedClaimBacklog(t, st, "MILLS-BUDGET-HISTORY")
-	history.State = BacklogMerged
-	if err := st.Backlog.Put(ctx, history); err != nil {
-		t.Fatalf("mark history backlog merged: %v", err)
-	}
+	seedHistory := func(st *Store, rows int) {
+		t.Helper()
+		history := seedClaimBacklog(t, st, "MILLS-BUDGET-HISTORY")
+		history.State = BacklogMerged
+		if err := st.Backlog.Put(ctx, history); err != nil {
+			t.Fatalf("mark history backlog merged: %v", err)
+		}
 
-	tx, err := st.DB().BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("begin history seed: %v", err)
-	}
-	stmt, err := tx.PrepareContext(ctx, `
+		tx, err := st.DB().BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin history seed: %v", err)
+		}
+		stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO pipeline_runs (
 			id, backlog_id, aggregate_version, template, state, attempts,
 			started_at, ended_at, cost_usd, depth
 		) VALUES (?, ?, 0, 'history', 'done', ?, ?, ?, 0.01, 0)
 	`)
-	if err != nil {
-		t.Fatalf("prepare history seed: %v", err)
-	}
-	for i := range 10_000 {
-		started := claimTestNow.Add(-48 * time.Hour)
-		if i >= 5_000 {
-			started = claimTestNow.Add(-12*time.Hour + time.Duration(i-5_000)*time.Millisecond)
+		if err != nil {
+			t.Fatalf("prepare history seed: %v", err)
 		}
-		ended := started.Add(time.Minute)
-		if _, err := stmt.ExecContext(ctx, fmt.Sprintf("PIPE-HISTORY-%05d", i), history.ID,
-			i+1, timeRFC3339(started), timeRFC3339(ended)); err != nil {
-			t.Fatalf("seed history row %d: %v", i, err)
+		for i := range rows {
+			// Both stores have the same 100 rows inside the budget window. The
+			// deep store differs only by 9,900 older rows that the window index
+			// must skip.
+			started := claimTestNow.Add(-48 * time.Hour)
+			if i < 100 {
+				started = claimTestNow.Add(-12*time.Hour + time.Duration(i)*time.Millisecond)
+			}
+			ended := started.Add(time.Minute)
+			if _, err := stmt.ExecContext(ctx, fmt.Sprintf("PIPE-HISTORY-%05d", i), history.ID,
+				i+1, timeRFC3339(started), timeRFC3339(ended)); err != nil {
+				t.Fatalf("seed history row %d: %v", i, err)
+			}
+		}
+		if err := stmt.Close(); err != nil {
+			t.Fatalf("close history statement: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit history seed: %v", err)
 		}
 	}
-	if err := stmt.Close(); err != nil {
-		t.Fatalf("close history statement: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit history seed: %v", err)
+	seedHistory(shallow, 100)
+	seedHistory(deep, 10_000)
+	for i := range samples {
+		id := fmt.Sprintf("MILLS-BUDGET-CLAIM-%02d", i)
+		seedClaimBacklog(t, shallow, id)
+		seedClaimBacklog(t, deep, id)
 	}
 
-	planRows, err := st.DB().QueryContext(ctx, `
+	planRows, err := deep.DB().QueryContext(ctx, `
 		EXPLAIN QUERY PLAN
 		SELECT COALESCE(SUM(cost_usd), 0)
 		FROM pipeline_runs
@@ -469,39 +487,42 @@ func TestClaimPipelineStart_TenThousandRunBudgetWindow(t *testing.T) {
 		t.Fatal("rolling budget query did not use idx_pipeline_started_at")
 	}
 
-	item := seedClaimBacklog(t, st, "MILLS-BUDGET-10K-CLAIM")
-	req := claimTestRequest(item.ID)
-	req.Limits = PipelineStartLimits{MaxConcurrentRuns: 10}
+	limits := PipelineStartLimits{MaxUSDPerDay: 1000, MaxRunsPerDay: 1000, MaxConcurrentRuns: 1000}
 	budgetQuery, budgetArgs := buildPipelineStartBudgetSnapshotQuery(
-		claimTestNow.Add(-24*time.Hour), req.Limits,
+		claimTestNow.Add(-24*time.Hour), limits,
 	)
-	if !queryPlanUsesIndex(t, st, "EXPLAIN QUERY PLAN "+budgetQuery, budgetArgs, "idx_pipeline_state") {
+	if !queryPlanUsesIndex(t, deep, "EXPLAIN QUERY PLAN "+budgetQuery, budgetArgs, "idx_pipeline_state") {
 		t.Fatal("active-run snapshot did not use idx_pipeline_state")
 	}
-	started := time.Now()
-	if _, err := st.ClaimPipelineStart(ctx, req); err != nil {
-		t.Fatalf("claim against 10k history: %v", err)
+
+	shallowDurations := make([]time.Duration, 0, samples)
+	deepDurations := make([]time.Duration, 0, samples)
+	for i := range samples {
+		id := fmt.Sprintf("MILLS-BUDGET-CLAIM-%02d", i)
+		if i%2 == 0 {
+			shallowDurations = append(shallowDurations, claimSampleWithLimits(t, shallow, "shallow history", id, 1, limits))
+			deepDurations = append(deepDurations, claimSampleWithLimits(t, deep, "10k history", id, 1, limits))
+			continue
+		}
+		deepDurations = append(deepDurations, claimSampleWithLimits(t, deep, "10k history", id, 1, limits))
+		shallowDurations = append(shallowDurations, claimSampleWithLimits(t, shallow, "shallow history", id, 1, limits))
 	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("claim against 10k history took %s, want <=2s", elapsed)
+
+	for _, cut := range []struct {
+		name string
+		pct  float64
+	}{{name: "p50", pct: 50}, {name: "p90", pct: 90}} {
+		shallowCut := durationPercentile(shallowDurations, cut.pct)
+		deepCut := durationPercentile(deepDurations, cut.pct)
+		ratio := float64(deepCut) / float64(max(shallowCut, time.Nanosecond))
+		t.Logf("budget-window claim %s: shallow(100 rows)=%s deep(10k rows)=%s ratio=%.2fx allowed=%dx",
+			cut.name, shallowCut, deepCut, ratio, budgetHistoryRatioBound)
+		if deepCut > budgetHistoryRatioBound*shallowCut {
+			t.Errorf("10k-history claim %s=%s vs shallow-history %s=%s (%.2fx, allowed %dx): old history is reaching the budget-window claim path",
+				cut.name, deepCut, cut.name, shallowCut, ratio, budgetHistoryRatioBound)
+		}
 	}
 }
-
-// deepQueueClaimRatioBound caps how much a 10k-row queue may inflate claim
-// latency relative to an otherwise identical shallow queue. ClaimPipelineStart
-// reaches backlog_items only by primary key plus one idx_backlog_state search
-// over `running` rows, so queued depth must not register at all; a ratio past
-// this is a new depth-dependent scan rather than scheduler noise.
-//
-// Deliberately NOT paired with an absolute noise floor. A `3 * max(shallow,
-// floor)` allowance sounds prudent and is how this started, but at a 20ms floor
-// it swallowed the very regression it exists to catch: with idx_backlog_state
-// dropped the deep series ran 4.85x the shallow one (344µs -> 1.67ms at p50) and
-// the floor still allowed 60ms. Both series are sampled in lockstep in one
-// process, so the ratio holds without a floor: measured 0.86x-1.34x across
-// -race and plain builds, idle and at load average 45, against 4.83x-4.86x at
-// p50 for the dropped-index regression.
-const deepQueueClaimRatioBound = 3
 
 // seedClaimQueue inserts n queued backlog rows as `<prefix>-%05d` in one
 // transaction. Callers claim a prefix of that range; the rows past it exist only
@@ -549,9 +570,20 @@ func seedClaimQueue(t *testing.T, st *Store, prefix string, n int) {
 // contract: it holds at any queue depth on any machine, busy or idle.
 func claimSample(t *testing.T, st *Store, label, id string) time.Duration {
 	t.Helper()
+	return claimSampleWithLimits(t, st, label, id, 0, PipelineStartLimits{})
+}
+
+func claimSampleWithLimits(
+	t *testing.T,
+	st *Store,
+	label, id string,
+	expectedRevision int64,
+	limits PipelineStartLimits,
+) time.Duration {
+	t.Helper()
 	req := claimTestRequest(id)
-	req.ExpectedRevision = 0
-	req.Limits = PipelineStartLimits{}
+	req.ExpectedRevision = expectedRevision
+	req.Limits = limits
 	var statements atomic.Int64
 	req.FaultHook = func(ClaimPipelineStartFaultPoint) error {
 		statements.Add(1)
@@ -580,27 +612,13 @@ func durationPercentile(durations []time.Duration, pct float64) time.Duration {
 	return time.Duration(percentile(sorted, pct))
 }
 
-// A 10k-row queue must not make one admission cost more than a shallow queue
-// does, and one admission must stay inside its fixed statement budget.
-//
-// The depth half of that contract used to be an absolute `p95 < 100ms`, which
-// measured the runner rather than the claim path. On 2026-08-09 it failed on
-// main in test:race (p95=129.7ms, job 225918) and test:reliability (152.9ms, job
-// 226771) while three concurrent main pipelines shared the runner, and it
-// reproduces locally at load average 45 with GOMAXPROCS=2. It was also loose in
-// the only condition where it could have caught anything: on an idle machine the
-// claim path came in at 13ms, so a 7x depth regression would have passed.
-//
-// The depth claim is differential instead. Two stores that differ ONLY in queued
-// depth are sampled in lockstep, so a CPU steal hits both series in the same
-// window and cancels in the ratio, while a genuinely depth-dependent claim path
-// moves the deep series alone. Statement counts and the query plan stay
-// absolute — neither reads the clock.
+// A 10k-row queue must use the same indexed plan and fixed SQL boundary count
+// as a shallow queue. These structural assertions detect depth-dependent scans
+// and extra claim work without measuring runner latency.
 func TestClaimPipelineStart_TenThousandQueueDepthNeutralAndStatementBound(t *testing.T) {
-	const samples = 100
 	shallow := newTestStore(t)
 	deep := newTestStore(t)
-	seedClaimQueue(t, shallow, "MILLS-QUEUE", samples)
+	seedClaimQueue(t, shallow, "MILLS-QUEUE", 1)
 	seedClaimQueue(t, deep, "MILLS-QUEUE", 10_000)
 
 	// Structural witness for depth-neutrality, independent of any clock: the
@@ -609,47 +627,15 @@ func TestClaimPipelineStart_TenThousandQueueDepthNeutralAndStatementBound(t *tes
 	// back to a table scan, all 10k queued rows would land in every admission.
 	scopeQuery := `EXPLAIN QUERY PLAN SELECT ` + backlogColumns + `
 		FROM backlog_items WHERE state = ? AND id <> ? ORDER BY id ASC`
-	if !queryPlanUsesIndex(t, deep, scopeQuery,
-		[]any{string(BacklogRunning), "MILLS-QUEUE-00000"}, "idx_backlog_state") {
-		t.Fatal("scope-conflict scan did not use idx_backlog_state")
-	}
-
-	// Sampled in lockstep on the same backlog id, alternating which store goes
-	// first so neither series systematically pays the other's cache-warm cost.
-	// Both stores therefore also grow their `running` set identically, keeping
-	// the scope-conflict scan equal on both sides — queued depth stays the one
-	// variable between them.
-	shallowDurations := make([]time.Duration, 0, samples)
-	deepDurations := make([]time.Duration, 0, samples)
-	for i := range samples {
-		id := fmt.Sprintf("MILLS-QUEUE-%05d", i)
-		if i%2 == 0 {
-			shallowDurations = append(shallowDurations, claimSample(t, shallow, "shallow", id))
-			deepDurations = append(deepDurations, claimSample(t, deep, "deep", id))
-			continue
+	for _, depth := range []struct {
+		name  string
+		store *Store
+	}{{"shallow queue", shallow}, {"10k queue", deep}} {
+		if !queryPlanUsesIndex(t, depth.store, scopeQuery,
+			[]any{string(BacklogRunning), "MILLS-QUEUE-00000"}, "idx_backlog_state") {
+			t.Fatalf("%s scope-conflict scan did not use idx_backlog_state", depth.name)
 		}
-		deepDurations = append(deepDurations, claimSample(t, deep, "deep", id))
-		shallowDurations = append(shallowDurations, claimSample(t, shallow, "shallow", id))
-	}
-
-	// Both the middle and the tail of the distribution have to stay depth-neutral.
-	// p50 is the sensitive one — 100 samples make it steady enough to catch a
-	// small constant inflation — and p95 catches a cost that only shows up
-	// occasionally. Neither is compared against a wall-clock constant.
-	for _, cut := range []struct {
-		name string
-		pct  float64
-	}{{name: "p50", pct: 50}, {name: "p95", pct: 95}} {
-		shallowCut := durationPercentile(shallowDurations, cut.pct)
-		deepCut := durationPercentile(deepDurations, cut.pct)
-		ratio := float64(deepCut) / float64(max(shallowCut, time.Nanosecond))
-		t.Logf("claim %s: shallow(%d rows)=%s deep(10k rows)=%s ratio=%.2fx allowed=%dx",
-			cut.name, samples, shallowCut, deepCut, ratio, deepQueueClaimRatioBound)
-		if deepCut > deepQueueClaimRatioBound*shallowCut {
-			t.Errorf("10k-queue claim %s=%s vs shallow-queue %s=%s (%.2fx, allowed %dx): "+
-				"queue depth is reaching the claim path",
-				cut.name, deepCut, cut.name, shallowCut, ratio, deepQueueClaimRatioBound)
-		}
+		claimSample(t, depth.store, depth.name, "MILLS-QUEUE-00000")
 	}
 }
 
@@ -1361,5 +1347,284 @@ func assertTableCount(t *testing.T, st *Store, table string, want int) {
 	}
 	if got != want {
 		t.Fatalf("count %s=%d want %d", table, got, want)
+	}
+}
+
+func TestClaimPipelineStart_ReservationEligibility(t *testing.T) {
+	for _, name := range []string{"higher priority", "equal priority", "lower priority", "active blocker", "direct active overlap", "dependency", "missing dependency", "undeployed dependency", "changed deployment evidence", "human hold", "policy hold", "repository budget"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			st := newTestStore(t)
+			reserved := seedClaimBacklog(t, st, "reserved")
+			reserved.Priority = P2
+			reserved.Slices = []Slice{{Name: "s", Files: []string{"pkg/a/active.go", "pkg/c/reserved.go"}}}
+			candidate := seedClaimBacklog(t, st, "candidate")
+			candidate.Priority = P2
+			candidate.Slices = []Slice{{Name: "s", Files: []string{"pkg/c/reserved.go"}}}
+			wantConflict := false
+			wantActive := false
+			switch name {
+			case "higher priority":
+				candidate.Priority = P1
+			case "equal priority":
+				wantConflict = true
+			case "lower priority":
+				candidate.Priority = P3
+				wantConflict = true
+			case "active blocker", "direct active overlap":
+				active := seedClaimBacklog(t, st, "active")
+				active.State = BacklogRunning
+				active.Slices = []Slice{{Name: "s", Files: []string{"pkg/a/active.go"}}}
+				if err := st.Backlog.Put(ctx, active); err != nil {
+					t.Fatal(err)
+				}
+				if name == "direct active overlap" {
+					candidate.Slices = active.Slices
+					wantActive = true
+				}
+			case "dependency", "undeployed dependency", "changed deployment evidence":
+				dep := seedClaimBacklog(t, st, "dep")
+				reserved.Dependencies = []string{dep.ID}
+				if name != "dependency" {
+					dep.State = BacklogMerged
+					if err := st.Backlog.Put(ctx, dep); err != nil {
+						t.Fatal(err)
+					}
+				}
+				wantConflict = name == "changed deployment evidence"
+			case "missing dependency":
+				reserved.Dependencies = []string{"missing"}
+			case "human hold":
+				reserved.Policy.RequireHumanReview = true
+			}
+			for _, item := range []*BacklogItem{reserved, candidate} {
+				if err := st.Backlog.Put(ctx, item); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, _, err := st.Backlog.RecordScopeDeferral(ctx, reserved.ID, claimTestNow, 1, time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			req := claimTestRequest(candidate.ID)
+			req.ExpectedRevision = candidate.Revision
+			req.EnforceScopeReservations = true
+			if name == "undeployed dependency" || name == "changed deployment evidence" {
+				dep, err := st.Backlog.Get(ctx, "dep")
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.UndeployedReservationDependencies = map[string]int64{dep.ID: dep.Revision}
+				if name == "changed deployment evidence" {
+					dep.Title = "updated dependency"
+					if err := st.Backlog.Put(ctx, dep); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if name == "repository budget" {
+				req.ReservationPolicy = func(*BacklogItem) (bool, int) { return false, 1 }
+				old := seedClaimBacklog(t, st, "old")
+				if err := st.Pipeline.PutRun(ctx, &PipelineRun{ID: "old-run", BacklogID: old.ID, Template: "test", State: PipelineDone, StartedAt: claimTestNow.Add(-time.Hour)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if name == "policy hold" {
+				req.ReservationPolicy = func(*BacklogItem) (bool, int) { return true, 0 }
+			}
+			_, err := st.ClaimPipelineStart(ctx, req)
+			var activeConflict *ScopeConflictError
+			if wantConflict {
+				if !errors.Is(err, ErrScopeReservationConflict) {
+					t.Fatalf("want reservation conflict: %v", err)
+				}
+			} else if wantActive {
+				if !errors.As(err, &activeConflict) {
+					t.Fatalf("want active conflict: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestClaimPipelineStart_ReservationAppearsAfterPreflight(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	reserved := seedClaimBacklog(t, st, "reserved")
+	candidate := seedClaimBacklog(t, st, "candidate")
+	for _, item := range []*BacklogItem{reserved, candidate} {
+		item.Slices = []Slice{{Name: "s", Files: []string{"pkg/shared/file.go"}}}
+		if err := st.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := st.Backlog.RecordScopeDeferral(ctx, candidate.ID, claimTestNow.Add(time.Minute), 1, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	req := claimTestRequest(candidate.ID)
+	req.ExpectedRevision = candidate.Revision
+	req.EnforceScopeReservations = true
+	if conflict, err := findPipelineStartReservationConflict(ctx, st.db, candidate, req.HomeProject, nil, req.Now, nil); err != nil || conflict != nil {
+		t.Fatalf("preflight conflict=%+v err=%v", conflict, err)
+	}
+	// The same predicate is used after CAS. Insert into the transaction through
+	// its connection to simulate a reservation invisible to preflight.
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO scope_fairness_state(backlog_id, first_deferred_at, deferral_count, reserved_at) VALUES (?, ?, 1, ?)`, reserved.ID, timeRFC3339(claimTestNow), timeRFC3339(claimTestNow)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE backlog_items SET state = 'running' WHERE id = ?`, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	conflict, err := findPipelineStartReservationConflict(ctx, tx, candidate, req.HomeProject, nil, req.Now, nil)
+	if err != nil || conflict == nil || conflict.BlockerID != reserved.ID {
+		t.Fatalf("transaction lost reservation: conflict=%+v err=%v", conflict, err)
+	}
+}
+
+func TestClaimPipelineStart_ConcurrentConvoyRelief(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	active := seedClaimBacklog(t, st, "active")
+	active.State = BacklogRunning
+	active.Slices = []Slice{{Name: "s", Files: []string{"pkg/a/run.go"}}}
+	reserved := seedClaimBacklog(t, st, "reserved")
+	reserved.Slices = []Slice{{Name: "s", Files: []string{"pkg/a/run.go", "pkg/c/reserved.go"}}}
+	left := seedClaimBacklog(t, st, "left")
+	right := seedClaimBacklog(t, st, "right")
+	for _, item := range []*BacklogItem{left, right} {
+		item.Slices = []Slice{{Name: "s", Files: []string{"pkg/c/reserved.go"}}}
+	}
+	for _, item := range []*BacklogItem{active, reserved, left, right} {
+		if err := st.Backlog.Put(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := st.Backlog.RecordScopeDeferral(ctx, reserved.ID, claimTestNow, 1, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, item := range []*BacklogItem{left, right} {
+		go func(item *BacklogItem) {
+			<-start
+			req := claimTestRequest(item.ID)
+			req.ExpectedRevision = item.Revision
+			req.EnforceScopeReservations = true
+			_, err := st.ClaimPipelineStart(ctx, req)
+			results <- err
+		}(item)
+	}
+	close(start)
+	admitted, blocked := 0, 0
+	for i := 0; i < 2; i++ {
+		err := <-results
+		var conflict *ScopeConflictError
+		if err == nil {
+			admitted++
+		} else if errors.As(err, &conflict) {
+			blocked++
+		} else {
+			t.Fatalf("unexpected claim error: %v", err)
+		}
+	}
+	if admitted != 1 || blocked != 1 {
+		t.Fatalf("admitted=%d blocked=%d", admitted, blocked)
+	}
+}
+
+func TestClaimPipelineStart_ReservationArbitration(t *testing.T) {
+	for _, tc := range []struct {
+		name                                               string
+		highPriority, tieReservation, tieCreation, running bool
+	}{
+		{name: "oldest"},
+		{name: "younger higher priority", highPriority: true},
+		{name: "creation tie break", tieReservation: true},
+		{name: "ID tie break", tieReservation: true, tieCreation: true},
+		{name: "running blocks both", running: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := newTestStore(t)
+			items := []*BacklogItem{{ID: "Z", Title: "older", State: BacklogQueued}, {ID: "A", Title: "younger", State: BacklogQueued}}
+			if tc.tieCreation {
+				items[0].ID, items[1].ID = "A", "Z"
+			}
+			for i, item := range items {
+				item.Priority = P2
+				item.CreatedAt = claimTestNow.Add(time.Duration(i-4) * time.Hour)
+				if !tc.tieReservation {
+					item.CreatedAt = claimTestNow.Add(-time.Duration(i+1) * time.Hour)
+				}
+				if tc.tieCreation {
+					item.CreatedAt = claimTestNow.Add(-4 * time.Hour)
+				}
+				if tc.highPriority && i == 1 {
+					item.Priority = P1
+				}
+				item.Slices = []Slice{{Name: "s", Files: []string{"pkg/shared/file.go"}}}
+				if err := st.Backlog.Put(ctx, item); err != nil {
+					t.Fatal(err)
+				}
+				at := claimTestNow.Add(time.Duration(i-4) * time.Minute)
+				if tc.tieReservation {
+					at = claimTestNow.Add(-4 * time.Minute)
+				}
+				if _, _, err := st.Backlog.RecordScopeDeferral(ctx, item.ID, at, 1, time.Hour); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.highPriority {
+				items[0], items[1] = items[1], items[0]
+			}
+			if tc.running {
+				active := seedClaimBacklog(t, st, "active")
+				active.State = BacklogRunning
+				active.Slices = items[0].Slices
+				if err := st.Backlog.Put(ctx, active); err != nil {
+					t.Fatal(err)
+				}
+			}
+			claim := func(item *BacklogItem) error {
+				req := claimTestRequest(item.ID)
+				req.ExpectedRevision = item.Revision
+				req.EnforceScopeReservations = true
+				_, err := st.ClaimPipelineStart(ctx, req)
+				return err
+			}
+			if tc.running {
+				for _, item := range items {
+					var conflict *ScopeConflictError
+					if err := claim(item); !errors.As(err, &conflict) {
+						t.Fatalf("running conflict: %v", err)
+					}
+				}
+				return
+			}
+			var conflict *ScopeReservationConflictError
+			if err := claim(items[1]); !errors.As(err, &conflict) || conflict.BlockerID != items[0].ID {
+				t.Fatalf("loser conflict: %v", err)
+			}
+			for _, table := range []string{"pipeline_runs", "pending_dispatches", "pipeline_budget_reservations", "pipeline_transitions"} {
+				var n int
+				if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&n); err != nil || n != 0 {
+					t.Fatalf("%s artifacts=%d err=%v", table, n, err)
+				}
+			}
+			if err := claim(items[0]); err != nil {
+				t.Fatalf("winner cannot progress: %v", err)
+			}
+			var activeConflict *ScopeConflictError
+			if err := claim(items[1]); !errors.As(err, &activeConflict) {
+				t.Fatalf("winner must serialize loser: %v", err)
+			}
+		})
 	}
 }

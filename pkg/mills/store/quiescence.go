@@ -16,7 +16,6 @@ type QuiescenceCounts struct {
 	ActiveWorkflowRuns     int `json:"active_workflow_runs"`
 	ActiveSpinningRoomRuns int `json:"active_spinning_room_runs"`
 	ActiveCouncilRuns      int `json:"active_council_runs"`
-	ActiveCrossRepoRuns    int `json:"active_cross_repo_runs"`
 	PendingDispatches      int `json:"pending_dispatches"`
 }
 
@@ -27,7 +26,6 @@ func (c QuiescenceCounts) Quiescent() bool {
 		c.ActiveWorkflowRuns == 0 &&
 		c.ActiveSpinningRoomRuns == 0 &&
 		c.ActiveCouncilRuns == 0 &&
-		c.ActiveCrossRepoRuns == 0 &&
 		c.PendingDispatches == 0
 }
 
@@ -52,14 +50,12 @@ func (s *Store) ReadQuiescence(ctx context.Context) (QuiescenceCounts, error) {
 		SELECT
 			(SELECT COUNT(*) FROM backlog_items WHERE state = 'queued'),
 			(SELECT COUNT(*) FROM pipeline_runs
-				WHERE state NOT IN ('done', 'escalated', 'paused')),
+				WHERE state NOT IN ('done', 'escalated', 'preflight_failed', 'paused')),
 			(SELECT COUNT(*) FROM workflow_runs
 				WHERE state NOT IN ('done', 'escalated', 'error', 'quarantined')),
 			(SELECT COUNT(*) FROM spin_runs
 				WHERE status NOT IN ('succeeded', 'failed', 'timeout')),
 			(SELECT COUNT(*) FROM council_runs WHERE ended_at IS NULL),
-			(SELECT COUNT(*) FROM cross_repo_runs
-				WHERE state NOT IN ('merged', 'reverted', 'failed')),
 			(SELECT COUNT(*) FROM pending_dispatches
 				WHERE status NOT IN ('delivered', 'dead_letter'))
 	`).Scan(
@@ -68,7 +64,6 @@ func (s *Store) ReadQuiescence(ctx context.Context) (QuiescenceCounts, error) {
 		&counts.ActiveWorkflowRuns,
 		&counts.ActiveSpinningRoomRuns,
 		&counts.ActiveCouncilRuns,
-		&counts.ActiveCrossRepoRuns,
 		&counts.PendingDispatches,
 	)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"github.com/crb2nu/loom/internal/devbox/backend"
 	"github.com/crb2nu/loom/internal/spawn"
@@ -37,9 +38,65 @@ func resolveAuthMode(agentType string) spawn.AuthMode {
 }
 
 // agentSecretEnvVars returns K8s secret env vars for the given agent type.
+// ClaudeOAuthTokenKeysEnv lists, comma-separated, the cluster-agent-auth keys
+// that each hold a `claude setup-token` for a DIFFERENT Claude subscription.
+// claude-code spawns are dealt across them round-robin, so two Max accounts
+// give twice the harness capacity (each plan carries its own 5-hour and weekly
+// limits). Unset or empty = the single default key. Every listed key must
+// exist in the secret: the k8s backend drops a missing key silently and the
+// pod would then start without CLAUDE_CODE_OAUTH_TOKEN — mint the token
+// (platform/gitops/bin/sync-agent-tokens --mint-claude-token --key <key>)
+// BEFORE adding it here.
+const ClaudeOAuthTokenKeysEnv = "SPAWN_CLAUDE_OAUTH_TOKEN_KEYS"
+
+// defaultClaudeOAuthTokenKey is the key the single-account contract used
+// before pooling; it stays the default so existing clusters are unchanged.
+const defaultClaudeOAuthTokenKey = "claude-oauth-token"
+
+// secretKeyPattern bounds ClaudeOAuthTokenKeysEnv entries to Kubernetes
+// secret-key syntax so a typo cannot become a jsonpath or shell fragment.
+var secretKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// claudeOAuthKeyCursor deals claude-code spawns across the configured token
+// keys. Process-local: a HUD restart simply starts the round again.
+var claudeOAuthKeyCursor atomic.Uint64
+
+// claudeOAuthTokenKeys returns the configured Claude OAuth token pool, in
+// order, deduplicated, with malformed entries dropped; never empty. Reset
+// annotations (`key=fri@17`, see claudeAccount) are stripped here.
+func claudeOAuthTokenKeys() []string {
+	accounts := claudeAccounts()
+	out := make([]string, 0, len(accounts))
+	for _, a := range accounts {
+		out = append(out, a.Key)
+	}
+	return out
+}
+
+// nextAuthAccount picks the credential a new spawn of agentType runs under.
+// Only claude-code has a pool today (the next key round-robin); every other
+// vendor has one credential and returns "" (spawn.State.AuthAccount empty).
+func nextAuthAccount(agentType string) string {
+	if agentType != "claude-code" {
+		return ""
+	}
+	keys := claudeOAuthTokenKeys()
+	if len(keys) == 1 {
+		return keys[0]
+	}
+	n := claudeOAuthKeyCursor.Add(1) - 1
+	return keys[n%uint64(len(keys))]
+}
+
 // Sources credentials from the cluster-scoped secret (ClusterAgentAPIKeysSecret)
 // so pods never read the developer's Mac Keychain state.
 func agentSecretEnvVars(agentType string) []backend.SecretEnvVar {
+	return agentSecretEnvVarsFor(agentType, "")
+}
+
+// agentSecretEnvVarsFor is agentSecretEnvVars with an explicit Claude OAuth
+// token key from the pool (see nextAuthAccount); empty selects the default.
+func agentSecretEnvVarsFor(agentType, claudeOAuthKey string) []backend.SecretEnvVar {
 	secretName := ClusterAgentAPIKeysSecret
 	switch agentType {
 	case "claude-code":
@@ -47,11 +104,16 @@ func agentSecretEnvVars(agentType string) []backend.SecretEnvVar {
 		// (https://code.claude.com/docs/en/authentication, "Long-Lived Authentication
 		// Token" section). Operators generate a 1-year token via `claude setup-token`
 		// on a machine with an active Pro/Max/Team subscription, then set it on the
-		// cluster-agent-auth secret under the claude-oauth-token key. API-key
-		// fallback is opt-in only: without a valid setup token the CLI must fail
-		// visibly, rather than silently charging the API-billing credential.
+		// cluster-agent-auth secret under the claude-oauth-token key (or one of the
+		// pooled keys, see ClaudeOAuthTokenKeysEnv). API-key fallback is opt-in
+		// only: without a valid setup token the CLI must fail visibly, rather than
+		// silently charging the API-billing credential.
+		key := strings.TrimSpace(claudeOAuthKey)
+		if key == "" || !secretKeyPattern.MatchString(key) {
+			key = defaultClaudeOAuthTokenKey
+		}
 		vars := []backend.SecretEnvVar{
-			{Name: "CLAUDE_CODE_OAUTH_TOKEN", SecretName: ClusterAgentAuthSecret, SecretKey: "claude-oauth-token"},
+			{Name: "CLAUDE_CODE_OAUTH_TOKEN", SecretName: ClusterAgentAuthSecret, SecretKey: key},
 		}
 		if os.Getenv("LOOM_SPAWN_CLAUDE_API_KEY_FALLBACK") == "1" {
 			vars = append(vars, backend.SecretEnvVar{Name: "ANTHROPIC_API_KEY", SecretName: secretName, SecretKey: "ANTHROPIC_API_KEY"})
@@ -229,4 +291,16 @@ func agentCLIInstallShell(agentType string) string {
 	default:
 		return ""
 	}
+}
+
+// Select exactly one credential path; implicit CLI fallback would bypass the cap.
+func agentSecretEnvVarsForMode(agentType, account string, mode spawn.AuthMode) []backend.SecretEnvVar {
+	if agentType != "claude-code" {
+		return agentSecretEnvVarsFor(agentType, account)
+	}
+	if mode == spawn.AuthModeClusterAPIKey {
+		return []backend.SecretEnvVar{{Name: "ANTHROPIC_API_KEY", SecretName: ClusterAgentAPIKeysSecret, SecretKey: "ANTHROPIC_API_KEY"}}
+	}
+	vars := agentSecretEnvVarsFor(agentType, account)
+	return vars[:1]
 }

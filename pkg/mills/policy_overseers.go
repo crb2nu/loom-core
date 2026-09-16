@@ -52,11 +52,25 @@ const (
 	overseerSentinelMaxTripsToOpen              = 20
 	overseerSentinelDefaultSuppressionTTLMin    = 30
 	overseerSentinelMaxSuppressionTTLMin        = 24 * 60
+	overseerSandboxDrillDefaultIntervalMinutes  = 6 * 60
+	overseerSandboxDrillDefaultBudgetSeconds    = 900
+	overseerSandboxDrillMaxBudgetSeconds        = 3600
+	overseerSandboxDrillDefaultConcurrency      = 2
+	overseerSandboxDrillMaxConcurrency          = 8
+	overseerSandboxDrillDefaultThrottlePercent  = 25
 	overseerForemanDefaultStuckRunHours         = 4
 	overseerForemanDefaultZeroMergeHours        = 24
 	overseerForemanDefaultEscalationStorm24h    = 10
 	overseerForemanDefaultBudgetBurnRatio       = 0.9
 	overseerForemanDefaultSuppressionTTLMinutes = 60
+
+	overseerShepherdDefaultIntervalMinutes = 30
+	overseerShepherdDefaultTickCap         = 3
+	overseerShepherdMaxTickCap             = 10
+	overseerShepherdDefaultDayCap          = 6
+	overseerShepherdMaxDayCap              = 24
+	overseerShepherdDefaultMinShelfHours   = 24
+	overseerShepherdDefaultOrphanMRDays    = 3
 )
 
 // OverseersPolicy gates the three supervisory agents. Zero value = fully off.
@@ -64,10 +78,22 @@ type OverseersPolicy struct {
 	// Enabled is the master gate for every overseer. Plain bool (not *bool):
 	// an omitted `overseers:` block must disable the section, matching the
 	// Workflows/SpinningRoom optional-section pattern.
-	Enabled  bool           `yaml:"enabled,omitempty"`
-	Groomer  GroomerPolicy  `yaml:"groomer,omitempty"`
-	Sentinel SentinelPolicy `yaml:"sentinel,omitempty"`
-	Foreman  ForemanPolicy  `yaml:"foreman,omitempty"`
+	Enabled      bool               `yaml:"enabled,omitempty"`
+	Groomer      GroomerPolicy      `yaml:"groomer,omitempty"`
+	Sentinel     SentinelPolicy     `yaml:"sentinel,omitempty"`
+	Foreman      ForemanPolicy      `yaml:"foreman,omitempty"`
+	Shepherd     ShepherdPolicy     `yaml:"shepherd,omitempty"`
+	SandboxDrill SandboxDrillPolicy `yaml:"sandbox_drill,omitempty"`
+}
+
+// SandboxDrillPolicy configures the scheduled concurrent devbox sentinel.
+type SandboxDrillPolicy struct {
+	Enabled                     bool   `yaml:"enabled,omitempty"`
+	IntervalMinutes             int    `yaml:"interval_minutes,omitempty"`
+	BudgetSeconds               int    `yaml:"budget_seconds,omitempty"`
+	Concurrency                 int    `yaml:"concurrency,omitempty"`
+	Project                     string `yaml:"project,omitempty"`
+	CPUThrottlingCeilingPercent int    `yaml:"cpu_throttling_ceiling_percent,omitempty"`
 }
 
 // GroomerPolicy configures the backlog groomer: duplicate retire, obsolete
@@ -163,6 +189,45 @@ type ForemanAllowPolicy struct {
 	Alert bool `yaml:"alert,omitempty"`
 }
 
+// ShepherdPolicy configures the escalated-shelf shepherd: bounded relaunch of
+// escalated items the auto-requeue sweep structurally cannot reach, and
+// attention flags for closed-MR orphans. Fail-safe posture matches its
+// siblings: default-OFF section, dry-run default ON, every action audited.
+type ShepherdPolicy struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+	// DryRun is *bool so an OMITTED key means dry-run ON — the fail-safe
+	// default. In dry-run every would-be relaunch is recorded as an
+	// `overseer.shepherd.relaunch.dryrun` event and nothing mutates.
+	DryRun          *bool `yaml:"dry_run,omitempty"`
+	IntervalMinutes int   `yaml:"interval_minutes,omitempty"`
+	// MaxActionsPerTick / MaxActionsPerDay cap committed relaunches. The day
+	// cap is read from durable events so it survives a restart.
+	MaxActionsPerTick int `yaml:"max_actions_per_tick,omitempty"`
+	MaxActionsPerDay  int `yaml:"max_actions_per_day,omitempty"`
+	// MinShelfHours: an escalated item whose latest run ended more recently
+	// than this is never touched — the auto-requeue sweep and fresh triage
+	// own the young shelf.
+	MinShelfHours int `yaml:"min_shelf_hours,omitempty"`
+	// OrphanMRDays: an item whose MR was closed (not merged) at least this
+	// long ago earns an attention flag (event-only, never a state change).
+	OrphanMRDays int                 `yaml:"orphan_mr_days,omitempty"`
+	Allow        ShepherdAllowPolicy `yaml:"allow,omitempty"`
+}
+
+// ShepherdAllowPolicy is the shepherd's per-action-class opt-in. Default
+// false: an enabled, non-dry-run shepherd with an empty allow block still
+// only flags.
+type ShepherdAllowPolicy struct {
+	// Relaunch permits the guarded escalated→queued transition.
+	Relaunch bool `yaml:"relaunch,omitempty"`
+	// ScopeWiden permits CAS-widening a scope-escalated item's slices when
+	// every recorded violation is admissible under CURRENT policy, then
+	// requeueing it. The run adopts its existing rescue branch and the
+	// merge-stage recoverable states un-draft the rescue MR — the shepherd
+	// only owns the decision the draft template asks a human for.
+	ScopeWiden bool `yaml:"scope_widen,omitempty"`
+}
+
 // GroomerEnabled reports whether the groomer loop should act: master gate AND
 // per-agent enable. Nil-safe like the other Policy accessors.
 func (p *Policy) GroomerEnabled() bool {
@@ -177,6 +242,39 @@ func (p *Policy) SentinelEnabled() bool {
 // ForemanEnabled reports whether the foreman loop should act.
 func (p *Policy) ForemanEnabled() bool {
 	return p != nil && p.Overseers.Enabled && p.Overseers.Foreman.Enabled
+}
+
+// ShepherdEnabled reports whether the shepherd loop should act.
+func (p *Policy) ShepherdEnabled() bool {
+	return p != nil && p.Overseers.Enabled && p.Overseers.Shepherd.Enabled
+}
+
+// SandboxDrillEnabled reports whether the master and drill gates are enabled.
+func (p *Policy) SandboxDrillEnabled() bool {
+	return p != nil && p.Overseers.Enabled && p.Overseers.SandboxDrill.Enabled
+}
+
+func (s SandboxDrillPolicy) Interval() time.Duration {
+	return overseerInterval(s.IntervalMinutes, overseerSandboxDrillDefaultIntervalMinutes)
+}
+
+func (s SandboxDrillPolicy) Budget() time.Duration {
+	return time.Duration(capWithDefault(s.BudgetSeconds, overseerSandboxDrillDefaultBudgetSeconds, overseerSandboxDrillMaxBudgetSeconds)) * time.Second
+}
+
+func (s SandboxDrillPolicy) GateConcurrency() int {
+	return capWithDefault(s.Concurrency, overseerSandboxDrillDefaultConcurrency, overseerSandboxDrillMaxConcurrency)
+}
+
+func (s SandboxDrillPolicy) DrillProject() string {
+	if s.Project == "" {
+		return "loom-core"
+	}
+	return s.Project
+}
+
+func (s SandboxDrillPolicy) ThrottlingCeiling() int {
+	return capWithDefault(s.CPUThrottlingCeilingPercent, overseerSandboxDrillDefaultThrottlePercent, 100)
 }
 
 // DryRunOn resolves a *bool dry-run flag with its default-ON semantics: nil
@@ -323,6 +421,41 @@ func (f ForemanPolicy) SuppressionTTL() time.Duration {
 	return time.Duration(overseerForemanDefaultSuppressionTTLMinutes) * time.Minute
 }
 
+// Interval returns the shepherd's tick cadence (default 30m, clamped).
+func (s ShepherdPolicy) Interval() time.Duration {
+	return overseerInterval(s.IntervalMinutes, overseerShepherdDefaultIntervalMinutes)
+}
+
+// TickCap returns the shepherd's per-tick committed-relaunch cap (default 3).
+func (s ShepherdPolicy) TickCap() int {
+	return capWithDefault(s.MaxActionsPerTick, overseerShepherdDefaultTickCap, overseerShepherdMaxTickCap)
+}
+
+// DayCap returns the shepherd's rolling-24h committed-relaunch cap (default 6).
+func (s ShepherdPolicy) DayCap() int {
+	return capWithDefault(s.MaxActionsPerDay, overseerShepherdDefaultDayCap, overseerShepherdMaxDayCap)
+}
+
+// MinShelfAge returns how old an escalation must be before the shepherd may
+// touch it (default 24h).
+func (s ShepherdPolicy) MinShelfAge() time.Duration {
+	h := s.MinShelfHours
+	if h <= 0 {
+		h = overseerShepherdDefaultMinShelfHours
+	}
+	return time.Duration(h) * time.Hour
+}
+
+// OrphanAge returns how stale a closed-MR orphan must be to earn an attention
+// flag (default 3 days).
+func (s ShepherdPolicy) OrphanAge() time.Duration {
+	d := s.OrphanMRDays
+	if d <= 0 {
+		d = overseerShepherdDefaultOrphanMRDays
+	}
+	return time.Duration(d) * 24 * time.Hour
+}
+
 // capWithDefault resolves a positive-int cap field: <=0 means the default,
 // anything above the ceiling clamps down to it.
 func capWithDefault(v, def, ceiling int) int {
@@ -346,20 +479,29 @@ func validateOverseers(o OverseersPolicy) error {
 			o.Groomer.DedupAutoThreshold, textsim.GrayBandFloor)
 	}
 	for name, v := range map[string]int{
-		"overseers.groomer.interval_minutes":         o.Groomer.IntervalMinutes,
-		"overseers.groomer.max_actions_per_tick":     o.Groomer.MaxActionsPerTick,
-		"overseers.groomer.max_actions_per_day":      o.Groomer.MaxActionsPerDay,
-		"overseers.groomer.max_llm_calls_per_tick":   o.Groomer.MaxLLMCallsPerTick,
-		"overseers.groomer.zombie_queued_days":       o.Groomer.ZombieQueuedDays,
-		"overseers.groomer.stale_priority_days":      o.Groomer.StalePriorityDays,
-		"overseers.sentinel.interval_minutes":        o.Sentinel.IntervalMinutes,
-		"overseers.sentinel.probe_timeout_seconds":   o.Sentinel.ProbeTimeoutSeconds,
-		"overseers.sentinel.trips_to_open":           o.Sentinel.TripsToOpen,
-		"overseers.sentinel.suppression_ttl_minutes": o.Sentinel.SuppressionTTLMinutes,
-		"overseers.foreman.interval_minutes":         o.Foreman.IntervalMinutes,
-		"overseers.foreman.stuck_run_hours":          o.Foreman.StuckRunHours,
-		"overseers.foreman.zero_merge_hours":         o.Foreman.ZeroMergeHours,
-		"overseers.foreman.escalation_storm_24h":     o.Foreman.EscalationStorm24h,
+		"overseers.groomer.interval_minutes":                     o.Groomer.IntervalMinutes,
+		"overseers.groomer.max_actions_per_tick":                 o.Groomer.MaxActionsPerTick,
+		"overseers.groomer.max_actions_per_day":                  o.Groomer.MaxActionsPerDay,
+		"overseers.groomer.max_llm_calls_per_tick":               o.Groomer.MaxLLMCallsPerTick,
+		"overseers.groomer.zombie_queued_days":                   o.Groomer.ZombieQueuedDays,
+		"overseers.groomer.stale_priority_days":                  o.Groomer.StalePriorityDays,
+		"overseers.sentinel.interval_minutes":                    o.Sentinel.IntervalMinutes,
+		"overseers.sentinel.probe_timeout_seconds":               o.Sentinel.ProbeTimeoutSeconds,
+		"overseers.sentinel.trips_to_open":                       o.Sentinel.TripsToOpen,
+		"overseers.sentinel.suppression_ttl_minutes":             o.Sentinel.SuppressionTTLMinutes,
+		"overseers.sandbox_drill.interval_minutes":               o.SandboxDrill.IntervalMinutes,
+		"overseers.sandbox_drill.budget_seconds":                 o.SandboxDrill.BudgetSeconds,
+		"overseers.sandbox_drill.concurrency":                    o.SandboxDrill.Concurrency,
+		"overseers.sandbox_drill.cpu_throttling_ceiling_percent": o.SandboxDrill.CPUThrottlingCeilingPercent,
+		"overseers.foreman.interval_minutes":                     o.Foreman.IntervalMinutes,
+		"overseers.foreman.stuck_run_hours":                      o.Foreman.StuckRunHours,
+		"overseers.foreman.zero_merge_hours":                     o.Foreman.ZeroMergeHours,
+		"overseers.foreman.escalation_storm_24h":                 o.Foreman.EscalationStorm24h,
+		"overseers.shepherd.interval_minutes":                    o.Shepherd.IntervalMinutes,
+		"overseers.shepherd.max_actions_per_tick":                o.Shepherd.MaxActionsPerTick,
+		"overseers.shepherd.max_actions_per_day":                 o.Shepherd.MaxActionsPerDay,
+		"overseers.shepherd.min_shelf_hours":                     o.Shepherd.MinShelfHours,
+		"overseers.shepherd.orphan_mr_days":                      o.Shepherd.OrphanMRDays,
 	} {
 		if v < 0 {
 			return errors.New(name + " must be >= 0")

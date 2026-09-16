@@ -323,10 +323,9 @@ pipeline:
 		if stages["implement"].Agent != mills.AgentDefault || stages["implement"].Source != "default" {
 			t.Errorf("implement agent = %+v, want %s/default", stages["implement"], mills.AgentDefault)
 		}
-		// implement has a stage_models override; model resolves even though the
-		// agent stays the default.
-		if stages["implement"].Model != "gpt-5.6-terra" {
-			t.Errorf("implement model = %q, want gpt-5.6-terra", stages["implement"].Model)
+		// An unpaired stage model must not reach the default harness.
+		if stages["implement"].Model != "" {
+			t.Errorf("implement model = %q, want vendor default", stages["implement"].Model)
 		}
 		if stages["plan_slice"].Source != "default" {
 			t.Errorf("plan_slice source = %q, want default", stages["plan_slice"].Source)
@@ -392,4 +391,77 @@ func loadPolicyFromBody(t *testing.T, body string) *mills.Policy {
 	}
 	t.Cleanup(func() { _ = pm.Close() })
 	return pm.Current()
+}
+
+func TestWiringVendorBreakerLiveStatus(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	op.withWiringSnapshot(buildWiringSnapshot(wiringInputs{policy: op.policy.Current(), now: time.Unix(100, 0)}))
+	now := time.Unix(200, 0)
+	original := clients.DefaultVendorBreaker
+	b := clients.NewVendorBreaker(func() time.Time { return now })
+	clients.DefaultVendorBreaker = b
+	defer func() { clients.DefaultVendorBreaker = original }()
+	check := func(want string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/wiring", nil))
+		if rec.Code != 200 {
+			t.Fatalf("wiring: %s", rec.Body.String())
+		}
+		var snap WiringSnapshot
+		if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+			t.Fatal(err)
+		}
+		s := snap.Vendors["anthropic"]
+		if s.Breaker != want || snap.Vendors["openai"].Breaker != "closed" {
+			t.Fatalf("vendors: %+v", snap.Vendors)
+		}
+		if want == "open" && (s.Kind != clients.VendorAuth || s.Since == nil || !s.Since.Equal(time.Unix(200, 0))) {
+			t.Fatalf("trip changed: %+v", s)
+		}
+		rec = httptest.NewRecorder()
+		op.httpMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/mills/status", nil))
+		if rec.Code != 200 {
+			t.Fatalf("status: %s", rec.Body.String())
+		}
+		var report capabilityReport
+		if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, row := range report.Capabilities {
+			if row.ID == "anthropic_api" {
+				found = true
+				if row.Message != "auth" || row.Status != "yellow" || row.RequiredForAutonomy {
+					t.Fatalf("capability: %+v", row)
+				}
+			}
+		}
+		if found != (want == "open") {
+			t.Fatalf("degraded=%v want=%s", found, want)
+		}
+	}
+	check("closed")
+	b.Trip("anthropic", clients.VendorAuth, time.Minute)
+	check("open")
+	now = now.Add(30 * time.Second)
+	b.Trip("anthropic", clients.VendorBilling, time.Hour)
+	check("open")
+	now = now.Add(30 * time.Second)
+	check("closed")
+	b.Trip("anthropic", clients.VendorAuth, time.Minute)
+	b.Reset("anthropic")
+	check("closed")
+	if op.wiring.Vendors != nil {
+		t.Fatal("live overlay mutated startup snapshot")
+	}
+}
+
+func TestWiringTiebreakerChain(t *testing.T) {
+	const chain = "anthropic/claude-sonnet-5 → openai/gpt-5.5 → flexinfer/local"
+	snapshot := buildWiringSnapshot(wiringInputs{policy: mills.Default(), gateTiebreaker: chain})
+	if snapshot.Gates.Tiebreaker != chain {
+		t.Fatal(snapshot.Gates.Tiebreaker)
+	}
 }

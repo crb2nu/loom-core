@@ -3,6 +3,7 @@ package openairesponses
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -162,8 +163,10 @@ func TestAPIClientCreate_EncodesToolOutputsAndRetries(t *testing.T) {
 }
 
 func TestNewAPIClient_RequiresAPIKey(t *testing.T) {
-	if _, err := NewAPIClient(APIClientConfig{}); err == nil {
-		t.Fatal("expected api key error")
+	for _, key := range []string{"", " ", "\n\t"} {
+		if _, err := NewAPIClient(APIClientConfig{APIKey: key}); err == nil {
+			t.Fatalf("expected api key error for %q", key)
+		}
 	}
 }
 
@@ -237,5 +240,31 @@ func TestResponsesUsage_ChatCompletionsFallbackShape(t *testing.T) {
 	var nilU *responsesAPIUsage
 	if nilU.prompt() != 0 || nilU.completion() != 0 || nilU.cached() != 0 {
 		t.Error("nil usage must coalesce to zeros")
+	}
+}
+
+func TestAPIClientStructuredVendorErrors(t *testing.T) {
+	for _, tc := range []struct{ body, code, message string }{
+		{`{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"quota exhausted"}}`, "insufficient_quota", "quota exhausted"},
+		{`not json`, "", "not json"},
+		{``, "", "Too Many Requests"},
+	} {
+		t.Run(tc.message, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("x-request-id", "req-42")
+				w.WriteHeader(429)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			c, err := NewAPIClient(APIClientConfig{APIKey: "test", BaseURL: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = c.Create(context.Background(), TurnRequest{Model: "test", Input: "hello"})
+			var e *APIError
+			if !errors.As(err, &e) || e.Status != 429 || e.Code != tc.code || e.Message != tc.message || e.RequestID != "req-42" {
+				t.Fatalf("error: %#v (%v)", e, err)
+			}
+		})
 	}
 }

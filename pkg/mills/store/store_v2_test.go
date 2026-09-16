@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -15,9 +17,8 @@ func TestMigrate_v2_TablesExist(t *testing.T) {
 	want := []string{
 		"squads", "squad_memory", "squad_outcomes",
 		"audit_findings",
-		"cross_repo_runs",
 		"council_debate_rounds",
-		"policy_proposals",
+		"policy_proposals", "default_branch_pipeline_observations", "main_red_external_holds",
 	}
 	for _, table := range want {
 		var name string
@@ -109,8 +110,26 @@ func TestMigrate_v2_Idempotent(t *testing.T) {
 	// 020 pipeline retry-exhausted ledger,
 	// 021 target-bound cross-repository stamps,
 	// 022 external-incident dwell ledger, 023 escalation sweep state,
-	// 024 serial merge queue, 025 Bolt grade columns, 026 scope fairness aging.
-	want := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26}
+	// 024 serial merge queue, 025 Bolt grade columns, 026 scope fairness aging,
+	// 027 bounded event/pipeline/gate hot-read indexes,
+	// 028 drop the retired cross_repo_runs atomic-merge table,
+	// 030 KPI window-snapshot hot-read index,
+	// 031 merge-queue re-admission (one active row per run),
+	// 032 durable operator watches (renumbered from 028 at rescue),
+	// 033 terminal outcome/grade writeback (renumbered from 029 at rescue),
+	// 034 durable materialized report rollups (renumbered from 029 at rescue),
+	// 035 escalation failure-shape fingerprint (shepherd B2),
+	// 036 vaccine obligations (renumbered from 030 at rescue),
+	// 037 preflight-failed quiescence index (renumbered from 020 at rescue),
+	// 038 target-project + pattern-ID composite stamp identity,
+	// 039 billing class (who pays) on stage_results + run subscription roll-up,
+	// 040 one-time writeback grade backfill (renumbered from 038 at rescue),
+	// 041 auto-requeue sweep cursor,
+	// 042 one-time rewrite of trimmed RFC3339Nano timestamps to fixed width,
+	// 043 external main CI hold (renumbered from 042 at rescue),
+	// 044 covering actor metadata index for payload-free report reads.
+	want := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44}
+
 	if len(versions) != len(want) {
 		t.Errorf("schema_migrations versions: got %v want %v", versions, want)
 	} else {
@@ -372,73 +391,6 @@ func TestAudit_RecordAndRecall(t *testing.T) {
 		Severity: AuditSeverityInfo, RubricID: "audit_v1", SurvivalScore: 1.5,
 	}); err == nil {
 		t.Error("expected validation error for SurvivalScore > 1")
-	}
-}
-
-func TestCrossRepo_Lifecycle(t *testing.T) {
-	st := newTestStore(t)
-	ctx := context.Background()
-
-	council := "COUNCIL-2026-05-02"
-	if err := st.Council.Put(ctx, &CouncilRun{
-		ID: council, Trigger: CouncilTriggerCron,
-		StartedAt: time.Now().UTC(), Outcome: CouncilOutcomeSuccess,
-	}); err != nil {
-		t.Fatalf("seed council: %v", err)
-	}
-	if err := st.Backlog.Put(ctx, &BacklogItem{
-		ID: "MILLS-2026-05-02-001", Title: "Cross-repo test", State: BacklogQueued,
-		Priority: P2, CreatedBy: "council", CouncilRunID: &council,
-	}); err != nil {
-		t.Fatalf("seed backlog: %v", err)
-	}
-
-	mr1, mr2 := int64(101), int64(202)
-	r := &CrossRepoRun{
-		ID:            "XR-2026-05-02-001",
-		BacklogItemID: "MILLS-2026-05-02-001",
-		Repos: []CrossRepoRepoEntry{
-			{ProjectID: 47, RepoName: "loom-core", Branch: "feat/x-loom-core", MRIID: &mr1, CIStatus: "success", GateStatus: "pass"},
-			{ProjectID: 51, RepoName: "loom", Branch: "feat/x-loom-vscode", MRIID: &mr2, CIStatus: "running"},
-		},
-		State: CrossRepoOpen,
-	}
-	if err := st.CrossRepo.PutRun(ctx, r); err != nil {
-		t.Fatalf("put: %v", err)
-	}
-
-	got, err := st.CrossRepo.GetRun(ctx, r.ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got.AtomicityStrategy != "all_or_revert" {
-		t.Errorf("atomicity default: %q", got.AtomicityStrategy)
-	}
-	if len(got.Repos) != 2 || got.Repos[1].RepoName != "loom" {
-		t.Errorf("repos round-trip: %+v", got.Repos)
-	}
-	if got.Repos[0].MRIID == nil || *got.Repos[0].MRIID != 101 {
-		t.Errorf("mr_iid round-trip: %+v", got.Repos[0])
-	}
-
-	// Lifecycle transitions.
-	for _, st2 := range []CrossRepoState{CrossRepoGatesGreen, CrossRepoMerging, CrossRepoMerged} {
-		if err := st.CrossRepo.SetState(ctx, r.ID, st2); err != nil {
-			t.Fatalf("set %s: %v", st2, err)
-		}
-	}
-	final, _ := st.CrossRepo.GetRun(ctx, r.ID)
-	if final.State != CrossRepoMerged {
-		t.Errorf("final state: %v", final.State)
-	}
-
-	// ListByBacklog.
-	byBacklog, err := st.CrossRepo.ListByBacklog(ctx, "MILLS-2026-05-02-001")
-	if err != nil {
-		t.Fatalf("list-backlog: %v", err)
-	}
-	if len(byBacklog) != 1 {
-		t.Errorf("list-backlog len: %d", len(byBacklog))
 	}
 }
 
@@ -710,4 +662,81 @@ func seedPipelineRun(ctx context.Context, st *Store, runID, backlogID string, at
 		Attempts:  attempt,
 		StartedAt: time.Now().UTC(),
 	})
+}
+
+// Exercise the real upgrade from 042, and preserve data on subsequent opens.
+func TestMigrate_MainRedExternalHoldUpgrade(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "upgrade.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int]bool{}
+	for _, m := range migrations {
+		if seen[m.version] {
+			t.Fatalf("duplicate migration version %d", m.version)
+		}
+		seen[m.version] = true
+		if m.version < 43 {
+			if err := applyOne(ctx, db, m); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	if err := db.QueryRowContext(ctx, `SELECT name FROM schema_migrations WHERE version=38`).Scan(&name); err != nil || name != "cross_repo_stamp_composite_identity" {
+		t.Fatalf("migration 038 = %q: %v", name, err)
+	}
+	st := &Store{db: db}
+	at := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	for _, id := range []string{"1", "2"} {
+		if _, err := st.RecordDefaultBranchPipeline(ctx, "p", "main", id, ExternalDependencyIncident, at, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	h, err := st.MainRedExternalHold(ctx, "p", "main")
+	if err != nil || h == nil || !h.Active(at) {
+		t.Fatalf("hold lost after repeat migration: %+v, %v", h, err)
+	}
+}
+
+func TestMainRedExternalEscalationRollback(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	for _, id := range []string{"1", "2"} {
+		if _, err := st.RecordDefaultBranchPipeline(ctx, "p", "main", id, ExternalDependencyIncident, now, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.DB().ExecContext(ctx, `CREATE TRIGGER reject_hold_event BEFORE INSERT ON events WHEN NEW.kind='mergequeue.main_red_external.expired' BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimMainRedExternalEscalation(ctx, "p", "main", now.Add(time.Minute)); err == nil {
+		t.Fatal("expected failed event write")
+	}
+	h, err := st.MainRedExternalHold(ctx, "p", "main")
+	if err != nil || h.EscalationSentAt != nil {
+		t.Fatalf("failed event consumed escalation: %+v %v", h, err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `DROP TRIGGER reject_hold_event`); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := st.ClaimMainRedExternalEscalation(ctx, "p", "main", now.Add(time.Minute)); err != nil || !won {
+		t.Fatalf("retry won=%v err=%v", won, err)
+	}
 }

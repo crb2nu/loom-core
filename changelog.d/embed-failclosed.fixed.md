@@ -1,0 +1,1 @@
+- Fail pattern persistence closed on an open embedder circuit breaker in `pkg/agentcontext/svc_patterns.go`, with regression coverage in `pkg/agentcontext/svc_patterns_test.go` and the `pattern_embed_failclosed_total` counter in `pkg/agentcontext/metrics.go`.

@@ -2,11 +2,67 @@
 package skills
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
+
+// PruneManifest removes stale files only when their bytes still match the
+// previous delivery. Legacy manifests remain readable, but missing hashes
+// cannot establish safe deletion: preserve those files and report a conflict.
+// All candidates are checked before deleting any, so a known conflict leaves
+// the stale set intact. Filesystem failures are returned to the caller, which
+// must retain the previous manifest for a later retry.
+func PruneManifest(dir string, previous *Manifest, newFiles []string) ([]string, error) {
+	if previous == nil {
+		return nil, nil
+	}
+	keep := make(map[string]bool, len(newFiles))
+	for _, rel := range newFiles {
+		keep[rel] = true
+	}
+	var stale []string
+	for _, rel := range previous.Generated {
+		if keep[rel] {
+			continue
+		}
+		path, err := managedFilePath(dir, rel)
+		if err != nil {
+			return nil, err
+		}
+		actual, err := hashRegularFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect stale skill file %s: %w", rel, err)
+		}
+		expected := previous.Hashes[rel]
+		if expected == "" {
+			return nil, fmt.Errorf("preserving stale skill file %s: legacy manifest has no ownership hash", rel)
+		}
+		if actual != expected {
+			return nil, fmt.Errorf("preserving modified stale skill file %s", rel)
+		}
+		stale = append(stale, rel)
+	}
+	var removed []string
+	parents := make(map[string]struct{})
+	for _, rel := range stale {
+		if err := os.Remove(filepath.Join(dir, rel)); err != nil && !os.IsNotExist(err) {
+			return removed, fmt.Errorf("remove stale skill file %s: %w", rel, err)
+		} else if err == nil {
+			removed = append(removed, rel)
+		}
+		for parent := filepath.Dir(rel); parent != "."; parent = filepath.Dir(parent) {
+			parents[parent] = struct{}{}
+		}
+	}
+	pruneEmptyParents(dir, parents)
+	return removed, nil
+}
 
 // PruneStaleGenerated removes files under dir that are listed in oldFiles but
 // absent from newFiles, then removes any directories left empty by the
@@ -46,6 +102,11 @@ func PruneStaleGenerated(dir string, oldFiles, newFiles []string) []string {
 		}
 	}
 
+	pruneEmptyParents(dir, parents)
+	return removed
+}
+
+func pruneEmptyParents(dir string, parents map[string]struct{}) {
 	// Sweep parent directories of pruned files, deepest first, removing any
 	// that no longer contain files (generation pre-creates empty scaffolding
 	// dirs like scripts/ and references/ that the manifest never lists).
@@ -59,8 +120,6 @@ func PruneStaleGenerated(dir string, oldFiles, newFiles []string) []string {
 	for _, d := range dirs {
 		removeDirIfNoFiles(filepath.Join(dir, d))
 	}
-
-	return removed
 }
 
 // removeDirIfNoFiles removes dir when it contains no regular files, first

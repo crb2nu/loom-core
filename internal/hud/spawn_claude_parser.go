@@ -26,7 +26,8 @@ type ClaudeJSONLParser struct {
 	lastRetryNote string
 	// sawResult records the terminal `result` event: the CLI finished its
 	// stream, so any earlier retry is something the run recovered from.
-	sawResult bool
+	sawResult  bool
+	authResult claudeParseResult
 }
 
 // NewClaudeJSONLParser creates a parser that writes structured events to sink.
@@ -347,6 +348,7 @@ func (p *ClaudeJSONLParser) handleResult(line []byte) {
 	}
 
 	p.sawResult = true
+	p.authResult = claudeParseResult{sawResult: true, isError: ev.IsError || isClaudeErrorSubtype(ev.Subtype), result: ev.Result}
 
 	stopReason := mapClaudeSubtype(ev.Subtype)
 	// Flag SDK-level errors (is_error=true on a success-subtype result) so

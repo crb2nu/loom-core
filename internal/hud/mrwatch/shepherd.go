@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/clients"
+	"github.com/crb2nu/loom/pkg/mills/mergequeue"
 )
 
 // The shepherd (slice M4) is the bounded-autonomy reconciler for the mrwatch
@@ -125,12 +127,14 @@ const (
 	// may the shepherd arm that head. Consumes budget so a fast-moving branch
 	// cannot make the shepherd loop on rejected arms.
 	OutcomeHeadMoved Outcome = "head_moved"
+	OutcomeAdopted   Outcome = "adopted"
 )
 
 // Actor is the bounded write surface the shepherd needs. The GitLab-backed
 // implementation scopes each call to its project; tests supply a fake so no
 // network or token is required.
 type Actor interface {
+	FindActivePipeline(ctx context.Context, repo, ref, sha string) (mergequeue.PipelineStatus, error)
 	// RetryPipeline retries the pipeline by id in repo.
 	RetryPipeline(ctx context.Context, repo string, pipelineID int64) error
 	// CreatePipeline creates a fresh branch pipeline for ref in repo.
@@ -173,6 +177,7 @@ type Shepherd struct {
 	mu      sync.Mutex
 	spent   map[string]daySpend // per-MR budget consumed today
 	refused map[string]string   // per-MR UTC day a SHA-less arm refusal was audited
+	minted  map[string]bool     // repo, MR, SHA heads minted in this process
 	ring    []ActionRecord      // bounded audit log, chronological
 }
 
@@ -226,6 +231,7 @@ func NewShepherd(actor Actor, opts ShepherdOptions) *Shepherd {
 		logger:        logger,
 		spent:         make(map[string]daySpend),
 		refused:       make(map[string]string),
+		minted:        make(map[string]bool),
 		ring:          make([]ActionRecord, 0, ring),
 	}
 }
@@ -328,6 +334,9 @@ func (s *Shepherd) Reconcile(ctx context.Context, snap Snapshot) {
 			continue
 		}
 		key := budgetKey(mr.Repo, mr.IID)
+		if plan.kind == ActionCreatePipeline && s.mintedHead(plan) {
+			continue
+		}
 
 		// Fail closed: an arm we cannot pin to an observed head SHA is refused
 		// outright. Without the sha precondition GitLab would arm whatever the
@@ -354,7 +363,7 @@ func (s *Shepherd) Reconcile(ctx context.Context, snap Snapshot) {
 		// other outcome — including a 409 head-moved rejection — does, which is
 		// what stops a branch being pushed every poll from looping the shepherd
 		// on rejected arms.
-		if outcome != OutcomeDeferred && outcome != OutcomeSkipped {
+		if outcome != OutcomeDeferred && outcome != OutcomeSkipped && outcome != OutcomeAdopted {
 			s.consume(key, now)
 		}
 		s.record(ActionRecord{
@@ -395,7 +404,7 @@ func (s *Shepherd) plan(mr MergeRequest, now time.Time) (actionPlan, bool) {
 		base.kind = ActionRetryPipeline
 		return base, true
 	case StatePipelineSkipped:
-		if mr.SourceBranch == "" || mrAge(mr, now) < pipelineMinAge {
+		if mr.SourceBranch == "" || base.sha == "" || mrAge(mr, now) < pipelineMinAge {
 			return actionPlan{}, false
 		}
 		base.kind = ActionCreatePipeline
@@ -404,7 +413,7 @@ func (s *Shepherd) plan(mr MergeRequest, now time.Time) (actionPlan, bool) {
 		// Only when there is genuinely no head pipeline (id 0). A non-zero id
 		// here means an unknown-status pipeline exists; leave it to poll again
 		// rather than spawn a duplicate.
-		if mr.PipelineID != 0 || mr.SourceBranch == "" || mrAge(mr, now) < pipelineMinAge {
+		if mr.PipelineID != 0 || mr.SourceBranch == "" || base.sha == "" || mrAge(mr, now) < pipelineMinAge {
 			return actionPlan{}, false
 		}
 		base.kind = ActionCreatePipeline
@@ -436,10 +445,22 @@ func (s *Shepherd) act(ctx context.Context, plan actionPlan) (Outcome, string) {
 		}
 		return OutcomeOK, "retried pipeline " + strconv.FormatInt(plan.pipelineID, 10)
 	case ActionCreatePipeline:
+		found, err := s.actor.FindActivePipeline(actx, plan.repo, plan.branch, plan.sha)
+		if err != nil {
+			return OutcomeError, errDetail(err)
+		}
+		if found.Found {
+			s.logger.Info("mrwatch shepherd: adopted pipeline", "adopted_pipeline_id", found.ID, "ref", plan.branch, "sha", plan.sha, "minted_by", "mrwatch.shepherd")
+			mills.PipelineAdoptionsTotal.WithLabelValues("mrwatch.shepherd").Inc()
+			return OutcomeAdopted, "adopted pipeline " + strconv.FormatInt(found.ID, 10) + " on " + plan.branch
+		}
 		id, err := s.actor.CreatePipeline(actx, plan.repo, plan.branch)
 		if err != nil {
 			return OutcomeError, errDetail(err)
 		}
+		s.rememberMintedHead(plan)
+		s.logger.Info("mrwatch shepherd: minted pipeline", "pipeline_id", id, "ref", plan.branch, "sha", plan.sha, "minted_by", "mrwatch.shepherd")
+		mills.PipelineMintsTotal.WithLabelValues("mrwatch.shepherd").Inc()
 		return OutcomeOK, "created pipeline " + strconv.FormatInt(id, 10) + " on " + plan.branch
 	case ActionArmAutoMerge:
 		// Defence in depth: Reconcile already refuses a sha-less arm before it
@@ -469,6 +490,20 @@ func (s *Shepherd) act(ctx context.Context, plan actionPlan) (Outcome, string) {
 	default:
 		return OutcomeError, "unknown action"
 	}
+}
+
+func mintedHeadKey(plan actionPlan) string {
+	return fmt.Sprintf("%s\x00%d\x00%s", plan.repo, plan.iid, plan.sha)
+}
+func (s *Shepherd) mintedHead(plan actionPlan) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.minted[mintedHeadKey(plan)]
+}
+func (s *Shepherd) rememberMintedHead(plan actionPlan) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.minted[mintedHeadKey(plan)] = true
 }
 
 // detailNoHeadSHA is the audit detail for a refused arm. It names the reason
@@ -624,6 +659,10 @@ func NewGitLabActor(base *clients.GitLabClient) Actor {
 
 func (a gitlabActor) RetryPipeline(ctx context.Context, repo string, pipelineID int64) error {
 	return a.base.ForProject(repo).RetryPipeline(ctx, pipelineID)
+}
+
+func (a gitlabActor) FindActivePipeline(ctx context.Context, repo, ref, sha string) (mergequeue.PipelineStatus, error) {
+	return a.base.ForProject(repo).FindActivePipeline(ctx, ref, sha)
 }
 
 func (a gitlabActor) CreatePipeline(ctx context.Context, repo, ref string) (int64, error) {

@@ -237,13 +237,75 @@ func TestTick_SkipsNonOpenedIssues(t *testing.T) {
 	}
 }
 
-func TestTick_PropagatesListError(t *testing.T) {
+func TestTick_IsolatesListError(t *testing.T) {
 	client := &stubClient{err: errors.New("boom")}
 	im := NewGitLabImporter(client, newStubStore(), GitLabImporterConfig{}, nil)
 
-	_, err := im.Tick(context.Background())
-	if err == nil {
-		t.Fatal("expected error from failed list")
+	got, err := im.Tick(context.Background())
+	if err != nil || got != 0 {
+		t.Fatalf("Tick() = %d, %v; want 0, nil", got, err)
+	}
+}
+
+func TestTick_MultiProjectTagsRemoteAndDeduplicates(t *testing.T) {
+	home := &stubClient{issues: []clients.IssueListItem{{IID: 1, ProjectID: 47, Title: "Home", State: "opened"}}}
+	remote := &stubClient{issues: []clients.IssueListItem{{IID: 2, ProjectID: 88, Title: "Remote", State: "opened"}}}
+	clientsByProject := map[string]GitLabIssuesClient{
+		"services/loom-core": home,
+		"services/flexdeck":  remote,
+	}
+	st := newStubStore()
+	im := NewGitLabImporter(home, st, GitLabImporterConfig{
+		HomeProject: "services/loom-core",
+		Projects:    []string{"services/loom-core", "services/flexdeck"},
+		IssuesClientForProject: func(project string) GitLabIssuesClient {
+			return clientsByProject[project]
+		},
+	}, nil)
+
+	if got, err := im.Tick(context.Background()); err != nil || got != 2 {
+		t.Fatalf("first Tick() = %d, %v; want 2, nil", got, err)
+	}
+	gotHome, _ := st.Get(context.Background(), "gl-47-1")
+	gotRemote, _ := st.Get(context.Background(), "gl-88-2")
+	if gotHome.TargetProject != "" {
+		t.Errorf("home TargetProject = %q, want empty", gotHome.TargetProject)
+	}
+	if gotRemote.TargetProject != "services/flexdeck" {
+		t.Errorf("remote TargetProject = %q", gotRemote.TargetProject)
+	}
+	if got, err := im.Tick(context.Background()); err != nil || got != 0 {
+		t.Fatalf("second Tick() = %d, %v; want 0, nil", got, err)
+	}
+}
+
+func TestTick_EmptyProjectsUsesLegacyHomeClient(t *testing.T) {
+	home := &stubClient{issues: []clients.IssueListItem{{IID: 3, ProjectID: 47, State: "opened"}}}
+	st := newStubStore()
+	im := NewGitLabImporter(home, st, GitLabImporterConfig{HomeProject: "services/loom-core"}, nil)
+	if got, err := im.Tick(context.Background()); err != nil || got != 1 || home.calls != 1 {
+		t.Fatalf("Tick() = %d, calls=%d, err=%v", got, home.calls, err)
+	}
+	item, _ := st.Get(context.Background(), "gl-47-3")
+	if item.TargetProject != "" {
+		t.Errorf("TargetProject = %q, want legacy empty value", item.TargetProject)
+	}
+}
+
+func TestTick_ProjectListFailureDoesNotBlockOthers(t *testing.T) {
+	home := &stubClient{err: errors.New("home unavailable")}
+	remote := &stubClient{issues: []clients.IssueListItem{{IID: 4, ProjectID: 88, State: "opened"}}}
+	im := NewGitLabImporter(home, newStubStore(), GitLabImporterConfig{
+		HomeProject: "services/loom-core", Projects: []string{"services/flexdeck"},
+		IssuesClientForProject: func(project string) GitLabIssuesClient {
+			if project == "services/flexdeck" {
+				return remote
+			}
+			return home
+		},
+	}, nil)
+	if got, err := im.Tick(context.Background()); err != nil || got != 1 {
+		t.Fatalf("Tick() = %d, %v; want 1, nil", got, err)
 	}
 }
 

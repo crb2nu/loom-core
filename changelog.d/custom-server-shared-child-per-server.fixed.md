@@ -1,0 +1,1 @@
+- Keep the devbox MCP child alive across WebSocket reconnects by adding opt-in request multiplexing in `cmd/custom-server` and enabling it in the devbox deployment; align the agent-context base memory limit with the 1Gi incident stopgap.

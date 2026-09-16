@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/crb2nu/loom/pkg/mills"
 	"github.com/crb2nu/loom/pkg/mills/store"
 )
 
@@ -33,6 +37,59 @@ type fakeReviewer struct {
 	rawByModel map[string]string
 
 	calls atomic.Int64
+}
+
+type warmableFakeReviewer struct {
+	mu          sync.Mutex
+	backend     string
+	warmed      map[string]bool
+	warmCalls   map[string]int
+	reviewCalls int
+	warmErr     error
+	reviewErr   error
+	blockWarm   bool
+	warmStarted chan struct{}
+}
+
+func (f *warmableFakeReviewer) Backend() string { return f.backend }
+
+func (f *warmableFakeReviewer) Warm(ctx context.Context, model string) error {
+	if f.blockWarm {
+		if f.warmStarted != nil {
+			close(f.warmStarted)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.warmCalls == nil {
+		f.warmCalls = make(map[string]int)
+	}
+	if f.warmed == nil {
+		f.warmed = make(map[string]bool)
+	}
+	f.warmCalls[model]++
+	if f.warmErr == nil {
+		f.warmed[model] = true
+	}
+	return f.warmErr
+}
+
+func (f *warmableFakeReviewer) Review(ctx context.Context, model, _ string, _ float64) (string, float64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reviewCalls++
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	if f.reviewErr != nil {
+		return "", 0, f.reviewErr
+	}
+	if !f.warmed[model] {
+		return "", 0, errors.New("review started before model was warm")
+	}
+	return synthRubricResponse(0.9, nil), 0.01, nil
 }
 
 func (f *fakeReviewer) Backend() string { return f.backend }
@@ -92,6 +149,106 @@ func makeRequest(pool []PoolMember, escalation []PoolMember) *Request {
 		Artifact:       "## Plan\nA slice mods foo.go",
 		Pool:           pool,
 		EscalationPool: escalation,
+	}
+}
+
+func TestDispatcher_WarmsUniqueBackendModelBeforeReview(t *testing.T) {
+	rev := &warmableFakeReviewer{backend: "flexinfer"}
+	d := New(map[string]Reviewer{"flexinfer": rev}, MustLoadRubric())
+	pool := []PoolMember{
+		{Backend: "flexinfer", Model: "cold-model"},
+		{Backend: "flexinfer", Model: "cold-model"},
+		{Backend: "flexinfer", Model: "other-model"},
+	}
+
+	res, err := d.Run(context.Background(), makeRequest(pool, nil))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.SkippedMembers != 0 {
+		t.Fatalf("skipped members = %d, want 0", res.SkippedMembers)
+	}
+	rev.mu.Lock()
+	defer rev.mu.Unlock()
+	if got := rev.warmCalls["cold-model"]; got != 1 {
+		t.Errorf("cold-model warm calls = %d, want 1", got)
+	}
+	if got := rev.warmCalls["other-model"]; got != 1 {
+		t.Errorf("other-model warm calls = %d, want 1", got)
+	}
+	if rev.reviewCalls != len(pool) {
+		t.Errorf("review calls = %d, want %d", rev.reviewCalls, len(pool))
+	}
+}
+
+func TestDispatcher_NonWarmableReviewerRunsUnchanged(t *testing.T) {
+	rev := &fakeReviewer{backend: "spawn", defaultScore: 0.9}
+	d := newDispatcher(t, rev)
+
+	if _, err := d.Run(context.Background(), makeRequest([]PoolMember{{Backend: "spawn", Model: "agent"}}, nil)); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := rev.calls.Load(); got != 1 {
+		t.Fatalf("review calls = %d, want 1", got)
+	}
+}
+
+func TestDispatcher_WarmFailureStillAttemptsReview(t *testing.T) {
+	rev := &warmableFakeReviewer{backend: "flexinfer", warmErr: errors.New("wake timeout"), reviewErr: errors.New("still cold")}
+	d := New(map[string]Reviewer{"flexinfer": rev}, MustLoadRubric())
+	before := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("flexinfer", "cold-model"))
+
+	_, err := d.Run(context.Background(), makeRequest([]PoolMember{{Backend: "flexinfer", Model: "cold-model"}}, nil))
+	if !errors.Is(err, ErrNoAuditReviewersAvailable) {
+		t.Fatalf("run error = %v, want ErrNoAuditReviewersAvailable", err)
+	}
+	rev.mu.Lock()
+	if rev.reviewCalls != 1 {
+		t.Errorf("review calls = %d, want 1", rev.reviewCalls)
+	}
+	rev.mu.Unlock()
+	if got := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("flexinfer", "cold-model")) - before; got != 1 {
+		t.Errorf("failure metric delta = %v, want 1", got)
+	}
+}
+
+func TestDispatcher_WarmFailureIsAdvisoryWhenReviewRecovers(t *testing.T) {
+	rev := &warmableFakeReviewer{
+		backend: "flexinfer",
+		warmErr: errors.New("wake response lost"),
+		warmed:  map[string]bool{"cold-model": true},
+	}
+	d := New(map[string]Reviewer{"flexinfer": rev}, MustLoadRubric())
+	before := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("flexinfer", "cold-model"))
+
+	res, err := d.Run(context.Background(), makeRequest([]PoolMember{{Backend: "flexinfer", Model: "cold-model"}}, nil))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.SkippedMembers != 0 {
+		t.Errorf("skipped members = %d, want 0", res.SkippedMembers)
+	}
+	if got := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("flexinfer", "cold-model")) - before; got != 0 {
+		t.Errorf("failure metric delta = %v, want 0", got)
+	}
+}
+
+func TestDispatcher_ParentCancellationStopsWarmup(t *testing.T) {
+	started := make(chan struct{})
+	rev := &warmableFakeReviewer{backend: "flexinfer", blockWarm: true, warmStarted: started}
+	d := New(map[string]Reviewer{"flexinfer": rev}, MustLoadRubric())
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := d.Run(ctx, makeRequest([]PoolMember{{Backend: "flexinfer", Model: "cold-model"}}, nil))
+		errCh <- err
+	}()
+	<-started
+	cancel()
+
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want context.Canceled", err)
 	}
 }
 
@@ -215,6 +372,7 @@ func TestDispatcher_HighBulkSkipsEscalation(t *testing.T) {
 func TestDispatcher_UnregisteredBackendIsSkipped(t *testing.T) {
 	rev := &fakeReviewer{backend: "flexinfer", defaultScore: 0.88, defaultCost: 0.04}
 	d := newDispatcher(t, rev)
+	failuresBefore := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("spawn", "claude-opus"))
 
 	req := makeRequest(
 		[]PoolMember{
@@ -229,6 +387,12 @@ func TestDispatcher_UnregisteredBackendIsSkipped(t *testing.T) {
 	}
 	if res.SkippedMembers != 1 {
 		t.Errorf("expected 1 skipped member; got %d", res.SkippedMembers)
+	}
+	if got := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("spawn", "claude-opus")) - failuresBefore; got != 1 {
+		t.Errorf("unregistered reviewer failure counter delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(mills.AuditBulkReviewersAvailable); got != 1 {
+		t.Errorf("available bulk reviewers = %v, want 1", got)
 	}
 	// Audit still produces a row using the surviving member's score.
 	if got := res.Finding.SurvivalScore; got != 0.88 {
@@ -246,6 +410,7 @@ func TestDispatcher_ReviewerErrorFoldsIntoMember(t *testing.T) {
 		},
 	}
 	d := newDispatcher(t, rev)
+	failuresBefore := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("flexinfer", "llama-4-70b"))
 
 	req := makeRequest(
 		[]PoolMember{
@@ -264,6 +429,12 @@ func TestDispatcher_ReviewerErrorFoldsIntoMember(t *testing.T) {
 	}
 	if res.SkippedMembers != 1 {
 		t.Errorf("skipped members = %d, want 1", res.SkippedMembers)
+	}
+	if got := testutil.ToFloat64(mills.AuditReviewerFailuresTotal.WithLabelValues("flexinfer", "llama-4-70b")) - failuresBefore; got != 1 {
+		t.Errorf("reviewer call failure counter delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(mills.AuditBulkReviewersAvailable); got != 1 {
+		t.Errorf("available bulk reviewers = %v, want 1", got)
 	}
 	// The errored member appears in res.Members with ParseErr set.
 	var sawErr bool
@@ -304,6 +475,9 @@ func TestDispatcher_AllReviewerCallsFailReturnsUnavailable(t *testing.T) {
 	}
 	if got := rev.calls.Load(); got != 2 {
 		t.Fatalf("reviewer calls = %d, want 2", got)
+	}
+	if got := testutil.ToFloat64(mills.AuditBulkReviewersAvailable); got != 0 {
+		t.Fatalf("available bulk reviewers = %v, want 0", got)
 	}
 }
 

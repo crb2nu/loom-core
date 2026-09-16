@@ -32,6 +32,9 @@ func (g *Generator) generateBundleSkill(skill *Skill, target string) error {
 		fmt.Printf("[dry-run] Would create %s skill: %s\n", target, skillDir)
 		return nil
 	}
+	if err := validateBundleDestination(baseDir, skillDir, skill); err != nil {
+		return err
+	}
 
 	for _, subdir := range []string{"scripts", "references", "assets/templates"} {
 		if err := os.MkdirAll(filepath.Join(skillDir, subdir), 0755); err != nil {
@@ -54,40 +57,58 @@ func (g *Generator) generateBundleSkill(skill *Skill, target string) error {
 // the registry source tree into a generated SKILL.md bundle directory.
 func (g *Generator) copyBundleResources(skill *Skill, skillDir string) error {
 	sourceSkillDir := filepath.Join(g.SourceDir, skill.Name)
+	for _, resource := range bundleResources(skill) {
+		srcPath, err := managedFilePath(sourceSkillDir, resource.path)
+		if err != nil {
+			return fmt.Errorf("source %s %s: %w", resource.kind, resource.path, err)
+		}
+		dstPath, err := managedFilePath(skillDir, resource.path)
+		if err != nil {
+			return fmt.Errorf("destination %s %s: %w", resource.kind, resource.path, err)
+		}
+		if err := copyDeliveredFile(srcPath, dstPath); err != nil {
+			return fmt.Errorf("copy %s %s: %w", resource.kind, resource.path, err)
+		}
+	}
+	return nil
+}
+
+type bundleResource struct{ kind, path string }
+
+func bundleResources(skill *Skill) []bundleResource {
 	if skill.Common == nil {
 		return nil
 	}
+	var resources []bundleResource
 	for _, script := range skill.Common.Scripts {
-		if script == nil || script.Path == "" {
-			continue
-		}
-		srcPath := filepath.Join(sourceSkillDir, script.Path)
-		dstPath := filepath.Join(skillDir, script.Path)
-		if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-			return err
-		}
-		if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
-			fmt.Printf("Warning: could not copy script %s: %v\n", script.Path, err)
+		if script != nil && script.Path != "" {
+			resources = append(resources, bundleResource{"script", script.Path})
 		}
 	}
 	for _, ref := range skill.Common.References {
-		srcPath := filepath.Join(sourceSkillDir, "references", ref)
-		dstPath := filepath.Join(skillDir, "references", ref)
-		if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-			return err
-		}
-		if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
-			fmt.Printf("Warning: could not copy reference %s: %v\n", ref, err)
-		}
+		resources = append(resources, bundleResource{"reference", filepath.Join("references", ref)})
 	}
 	for _, asset := range skill.Common.Assets {
-		srcPath := filepath.Join(sourceSkillDir, "assets", asset)
-		dstPath := filepath.Join(skillDir, "assets", asset)
-		if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-			return err
-		}
-		if err := copyFile(srcPath, dstPath); err != nil && g.Verbose {
-			fmt.Printf("Warning: could not copy asset %s: %v\n", asset, err)
+		resources = append(resources, bundleResource{"asset", filepath.Join("assets", asset)})
+	}
+	return resources
+}
+
+// Validate every destination before creating scaffolding or writing SKILL.md.
+// The anchor is the configured platform root, so symlinks at the bundle itself
+// and in resource directories cannot redirect writes outside that root.
+func validateBundleDestination(root, skillDir string, skill *Skill) error {
+	rel, err := filepath.Rel(root, skillDir)
+	if err != nil || !filepath.IsLocal(rel) {
+		return fmt.Errorf("skill bundle %s must be within output root %s", skillDir, root)
+	}
+	paths := []string{"SKILL.md", "scripts", "references", "assets/templates"}
+	for _, resource := range bundleResources(skill) {
+		paths = append(paths, resource.path)
+	}
+	for _, path := range paths {
+		if _, err := managedFilePath(root, filepath.Join(rel, path)); err != nil {
+			return fmt.Errorf("validate bundle destination: %w", err)
 		}
 	}
 	return nil

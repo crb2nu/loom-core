@@ -1,0 +1,1 @@
+- Capture stderr from the Mills golangci-lint parity command and degrade exit-7 zero-finding runs and exit-137 process kills instead of misclassifying no-verdict infrastructure failures as code failures (`pkg/mills/gates/lint_parity.go`, parity and dispatcher tests).

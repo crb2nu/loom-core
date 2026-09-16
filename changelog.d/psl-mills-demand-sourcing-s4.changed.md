@@ -1,0 +1,1 @@
+- Add per-repository Mills execution overrides, admission and auto-merge safety rails, budget caps, and merged-run KPI visibility in `pkg/mills`, with operator wiring and rollout documentation.

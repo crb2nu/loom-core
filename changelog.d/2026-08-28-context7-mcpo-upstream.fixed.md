@@ -1,0 +1,1 @@
+- Restore the Context7 mcpo upstream by packaging its pinned Node MCP server in the custom-server image, serving it over Streamable HTTP, and rolling mcpo onto the corrected `/mcp` configuration.

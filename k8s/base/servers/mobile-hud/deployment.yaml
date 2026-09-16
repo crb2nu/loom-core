@@ -7,11 +7,22 @@ metadata:
   name: mobile-hud
 spec:
   replicas: 1
-  # Recreate (not RollingUpdate): the workspace volume below is a
-  # ReadWriteOnce Longhorn volume, so the old pod must release it before
-  # the new one attaches — a surge pod would deadlock on the RWO mount.
+  # RollingUpdate with zero unavailability: every merged loom-core MR rolls
+  # this deployment (shared-tag fleet rollout), and under Recreate each roll
+  # was a full outage — ~40s image pull + boot + tunnel rebind, surfacing as
+  # 503s on hud.flexinfer.ai (observed 2026-08-15). The surge pod pulls and
+  # boots while the old pod keeps serving; traffic swaps on readiness.
+  #
+  # The workspace volume below is ReadWriteOnce Longhorn, which is NODE-
+  # scoped: a surge pod deadlocks on the attach unless it lands on the same
+  # node as the incumbent. The required self-affinity under `affinity:`
+  # co-schedules the surge pod beside the old one so the RWO mount is shared
+  # via the existing node attachment. Do not remove one without the other.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: mobile-hud
@@ -23,8 +34,8 @@ spec:
     spec:
       serviceAccountName: loom-hub
       # loomd exits promptly on SIGTERM; the default 30s grace period just
-      # extends the Recreate outage window (old pod must fully terminate
-      # before the new one schedules). 10s covers in-flight request drain.
+      # stretches the RollingUpdate handoff overlap (see the
+      # SPAWN_CONTROLLER_ID note below). 10s covers in-flight request drain.
       terminationGracePeriodSeconds: 10
       nodeSelector:
         kubernetes.io/arch: amd64
@@ -37,6 +48,19 @@ spec:
                     operator: NotIn
                     values:
                       - k3s-w-7
+        # Same-node self-affinity: REQUIRED by the RollingUpdate strategy
+        # above — the RWO workspace volume only attaches to one node, so the
+        # surge pod must co-schedule beside the incumbent to share the mount.
+        # Bootstrap/node-loss are safe: when no mobile-hud pod exists the
+        # self-match carve-out lets the scheduler place the pod anywhere the
+        # node affinity allows. If a roll wedges Pending, check the incumbent
+        # node's free capacity first (surge briefly doubles requests).
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mobile-hud
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: loomd
           # Concrete SHA tag is set via the platform/gitops Kustomization
@@ -92,15 +116,10 @@ spec:
                 secretKeyRef:
                   name: loom-secrets
                   key: QDRANT_API_KEY
-            - name: MORPH_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: loom-secrets
-                  key: MORPH_API_KEY
-            - name: MORPH_BASE_URL
-              value: https://api.morphllm.com/v1
-            - name: MORPH_EMBED_MODEL
-              value: morph-embedding-v3
+            # Embeddings: intentionally unset so the embedded agent-context and
+            # pm stores fall through to the FlexInfer defaults
+            # (flexinfer-proxy, embeddings-1536). The retired MORPH_* trio used
+            # to sit here and produced a 404 on every embed.
             # HUD configuration (previously in separate hud container)
             - name: HUD_BIND_ADDRESS
               value: 0.0.0.0
@@ -147,10 +166,16 @@ spec:
               value: memory
             - name: SPAWN_ENABLED
               value: "true"
-            # Stable logical owner for shared loom-spawn-state recovery. The
-            # Deployment is replicas=1 + Recreate, so only one live process may
-            # use this ID. A future multi-replica HUD must add leader election
-            # or a fencing epoch before sharing the same recovery domain.
+            # Stable logical owner for shared loom-spawn-state recovery.
+            # Steady state is one live process per ID; the RollingUpdate
+            # handoff briefly (~boot + 10s grace) runs old and new pods with
+            # the same ID. That bounded overlap is tolerated by design: the
+            # store's per-entry owner fence rejects conflicting saves
+            # (ErrSpawnStateConflict, controller.go RecoverFromStore), the
+            # shepherd's merge-queue enqueues are idempotency-keyed, and the
+            # S4 supervisor re-attach is idempotent. A future STEADY-STATE
+            # multi-replica HUD still needs leader election or a fencing
+            # epoch — a permanent dual-writer is NOT covered by this fence.
             - name: SPAWN_CONTROLLER_ID
               value: loom-hub/mobile-hud
             # Sole authority for migrating pre-owner ConfigMap rows and
@@ -165,11 +190,15 @@ spec:
             - name: SPAWN_SYNC_MODE
               value: git-clone
             - name: SPAWN_GIT_BASE_URL
-              value: http://192.168.50.218/services
+              # Group-neutral root; per-project metadata supplies services/
+              # or libs/ when constructing the clone URL.
+              value: http://192.168.50.218
             - name: SPAWN_GIT_SECRET
               value: gitlab-creds
             - name: SPAWN_PROJECTS
-              value: "loom-core,flexdeck,flexinfer,homelab-homepage,storyboard-generator,jobsearch-app"
+              # mcp-go, fi-fhir and edilint are the explicitly admitted libs/ projects
+              # (paths resolved via spawnProjectPaths in internal/hud/spawn_config.go).
+              value: "loom-core,flexdeck,flexinfer,homelab-homepage,storyboard-generator,jobsearch-app,mcp-go,fi-fhir,edilint"
             - name: SPAWN_DEFAULT_CPU
               value: "0.5"
             - name: SPAWN_DEFAULT_MEMORY_MB
@@ -255,13 +284,38 @@ spec:
             # Codex"), which wedged every stage_models codex spawn from
             # 2026-07-18. Set here so the FLUX APPLY takes effect immediately
             # on the currently deployed image — the env changes the runtime
-            # Dockerfile hash, so the next spawn rebuilds at 0.144.6 without
-            # waiting for a loom-core image rollout. Matches the in-code
-            # default (internal/hud/spawn.go codexVersion) as of this commit;
-            # keep the two in sync or drop this env once the code default
-            # image is everywhere.
+            # Dockerfile hash, so the next spawn rebuilds at the pinned version
+            # without waiting for a loom-core image rollout. Matches the
+            # in-code default (internal/hud/spawn_config.go codexVersion) as
+            # of this commit; keep the two in sync or drop this env once the
+            # code default image is everywhere. 0.154.0 (2026-09-13) is the
+            # first pin that runs the gpt-6 family (gpt-6-astra verified with
+            # the pinned CLI).
             - name: SPAWN_CODEX_VERSION
-              value: "0.144.6"
+              value: "0.154.0"
+            # SPAWN_CLAUDE_MODEL: the model every claude-code spawn runs unless the
+            # request (Mills agent_routing / stage_models) names one. Matches the
+            # in-code default (internal/hud/spawn_config.go defaultClaudeModel);
+            # set explicitly so the fleet tier is visible here, next to codex.
+            - name: SPAWN_CLAUDE_MODEL
+              value: claude-opus-5
+            # SPAWN_CLAUDE_OAUTH_TOKEN_KEYS: pool of cluster-agent-auth keys, one
+            # `claude setup-token` per Claude subscription. Syntax per entry is
+            # `key[=weekday[@HH]]` with the weekday/hour (UTC) the account's
+            # weekly usage window resets; annotated accounts are paced — each
+            # claude-code spawn goes to the account furthest behind its own
+            # weekly pace (HUD log "claude account selected by weekly pace"),
+            # so the pool evens out across accounts that reset on different
+            # days. Unannotated keys pace on a rolling 7 days; a pool with no
+            # annotations round-robins. Add a key here ONLY after minting it:
+            #   platform/gitops/bin/sync-agent-tokens --mint-claude-token --key=claude-oauth-token-2
+            # (a listed-but-missing key starts pods without a token). Unset =
+            # the single claude-oauth-token key. Original account resets on
+            # Tuesday, the second on Friday; both tokens minted and verified
+            # 2026-09-13 (claude-oauth-token-2 authenticates with the new,
+            # shorter setup-token format).
+            - name: SPAWN_CLAUDE_OAUTH_TOKEN_KEYS
+              value: "claude-oauth-token=tue,claude-oauth-token-2=fri"
             # SPAWN_PLAN_STORE_WS_URL: agent-context Plan Store, plain MCP over
             # WebSocket at /ws (the mcp-agent-context Deployment sets
             # MCP_TRANSPORT=websocket on :8080). This equals the in-code default
@@ -339,7 +393,23 @@ spec:
                   name: loom-secrets
                   key: LOOM_MILLS_OPERATOR_TOKEN
                   optional: true
-            # mrwatch shepherd: ENABLED 2026-08-09 as the serial merge queue's
+            # mrwatch shepherd: OFF 2026-09-10 (incident). The shepherd creates a
+            # branch pipeline whenever GitLab reports no MR head pipeline, but
+            # GitLab reports none for MRs whose only pipelines were minted via
+            # the API (the merge queue's recovery pipelines), so it re-minted
+            # ~150 job-minute pipelines for eight Mills MRs on EVERY poll (16 in
+            # six minutes at 20:22Z) and doubled the CI queue. Its arm action
+            # also enqueued duplicate external candidates for MRs the queue
+            # already held. Re-enable only after backlog item
+            # bl-mills-pipeline-adopt-before-mint-20260910 ships (adopt an
+            # existing pipeline for the head SHA before creating one).
+            # 2026-09-12: back ON — !1906 shipped adopt-before-mint (shepherd,
+            # merge queue and ci_watch all reuse an existing pipeline for the
+            # head SHA, API-minted ones included) and the mobile-hud image from
+            # that merge (20260911-234444) is rolled. If API-minted duplicate
+            # pipelines reappear, set "off" again and requeue the item.
+            #
+            # Original note — ENABLED 2026-08-09 as the serial merge queue's
             # standing feeder. Post-!1548 the arm action no longer arms GitLab
             # MWPS — it submits a SHA-pinned external candidate to the merge
             # queue (fail-closed on disabled/full/unreachable), so the burst

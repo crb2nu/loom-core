@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -25,18 +26,21 @@ import (
 	"github.com/crb2nu/loom/pkg/mills/spin"
 	"github.com/crb2nu/loom/pkg/mills/squads"
 	"github.com/crb2nu/loom/pkg/mills/store"
+	"github.com/crb2nu/loom/pkg/mills/webhookbus"
 )
 
 // operator owns the state shared between HTTP handlers — the canonical
 // store, the policy manager, the budget enforcer, and (slice 3.7+) the
 // council runner that orchestrates an end-to-end planning pass.
 type operator struct {
-	store       *store.Store
-	policy      *mills.PolicyManager
-	budget      *mills.Budget
-	runner      *runner.Runner    // optional; nil disables /api/mills/council/{run,dryrun}
-	reconciler  *mills.Reconciler // optional; nil disables manual pipeline starts
-	spawnClient interface {
+	webhookBus    *webhookbus.Bus
+	webhookSecret string
+	store         *store.Store
+	policy        *mills.PolicyManager
+	budget        *mills.Budget
+	runner        *runner.Runner    // optional; nil disables /api/mills/council/{run,dryrun}
+	reconciler    *mills.Reconciler // optional; nil disables manual pipeline starts
+	spawnClient   interface {
 		Stop(context.Context, string) error
 	} // optional; stops live HUD spawns on pipeline pause
 	regressionGate *gates.RegressionGate // optional; nil makes the alerts webhook return 503
@@ -69,6 +73,10 @@ type operator struct {
 	gitopsClient        gitopsCommitter
 	gitopsPolicyPath    string
 	gitopsDefaultBranch string
+	// gitopsDeploymentPath is the operator Deployment manifest whose
+	// policy-checksum annotation the onboarding MR bumps. Defaults to
+	// k3s/mills/deployment.yaml (see handlers_projects.go).
+	gitopsDeploymentPath string
 
 	// gitlabBaseURL is the GitLab instance web base (scheme+host, e.g.
 	// "https://gitlab.flexinfer.ai"), derived from the configured API URL. It
@@ -79,6 +87,16 @@ type operator struct {
 	// across repos (the per-item TargetProject supplies the path). Empty when
 	// no GitLab API URL is configured — the HUD then degrades to an iid chip.
 	gitlabBaseURL string
+	boltMRStats   func(context.Context, string, int64) (boltGitLabStats, error)
+	shiftNow      func() time.Time
+	docsMirror    *docsMirrorCache
+	digestAt      string
+
+	// repoRoot is the operator-local loom-core checkout (cfg.RepoRoot), the
+	// same tree ensureRepoRoot hard-aligns to origin/main on every boot. Read
+	// by GET /api/mills/fleet-gate/waivers to serve the committed fleet
+	// reliability manifest. Empty leaves that endpoint returning 503.
+	repoRoot string
 
 	// verdictMRStateForProject verifies operator verdict overrides against the
 	// project that owns the run's MR. The durable resolver is preferred; the
@@ -216,11 +234,13 @@ const defaultSpinConcurrency = 2
 
 func newOperator(st *store.Store, pm *mills.PolicyManager, b *mills.Budget, logger *slog.Logger) *operator {
 	o := &operator{
-		store:        st,
-		policy:       pm,
-		budget:       b,
-		logger:       logger,
-		capabilities: newCapabilityWiring(Config{}),
+		webhookBus:    webhookbus.Default,
+		webhookSecret: strings.TrimSpace(os.Getenv("LOOM_MILLS_GITLAB_WEBHOOK_SECRET")),
+		store:         st,
+		policy:        pm,
+		budget:        b,
+		logger:        logger,
+		capabilities:  newCapabilityWiring(Config{}),
 		// Async-spin concurrency gate. Seeded here so handler tests (which call
 		// newOperator directly) get a working semaphore; main.go may replace it
 		// with a policy/env-sized channel before the listener starts.
@@ -241,6 +261,9 @@ func newOperator(st *store.Store, pm *mills.PolicyManager, b *mills.Budget, logg
 		authority:       operatorAuthorityIdentityFromEnv(),
 		// Short-TTL memo for the telemetry stages roll-up (see handler).
 		telemetryCache: newTelemetryStageCache(telemetryCacheTTLFromEnv(logger)),
+		shiftNow:       func() time.Time { return time.Now().UTC() },
+		docsMirror:     newDocsMirrorCache(),
+		digestAt:       "06:00",
 	}
 	// Unit/embedded callers have no late-bound background wiring. Production
 	// explicitly clears this before building its source set and marks it ready
@@ -280,6 +303,19 @@ func (o *operator) withHealthGates(w *healthGateWiring) *operator {
 // the base empty and the endpoint simply omits it (the HUD degrades to a chip).
 func (o *operator) withGitLabBaseURL(apiURL string) *operator {
 	o.gitlabBaseURL = gitlabWebBaseURL(apiURL)
+	return o
+}
+
+func (o *operator) withBoltMRStats(fn func(context.Context, string, int64) (boltGitLabStats, error)) *operator {
+	o.boltMRStats = fn
+	return o
+}
+
+// withRepoRoot stores the operator-local checkout path so the fleet-gate
+// waiver endpoint can read the committed reliability manifest. Blank input
+// leaves the endpoint serving its 503 "manifest unavailable" branch.
+func (o *operator) withRepoRoot(root string) *operator {
+	o.repoRoot = strings.TrimSpace(root)
 	return o
 }
 
@@ -570,6 +606,10 @@ func (o *operator) httpMux() http.Handler {
 		}
 	}
 
+	// GitLab cannot attach the operator admin bearer. This endpoint therefore
+	// sits outside requireAdmin and authenticates only its shared hook token.
+	mux.HandleFunc("POST /api/mills/hooks/gitlab", o.handleGitLabWebhook)
+
 	// Status / policy / KPIs (read-only).
 	mux.HandleFunc("GET /api/mills/status", o.handleStatusFull)
 	mux.HandleFunc("GET /api/mills/capabilities", o.handleCapabilities)
@@ -601,6 +641,8 @@ func (o *operator) httpMux() http.Handler {
 	// Judge calibration: the LLM gates' own scores joined to what the runs
 	// they graded actually did over ?window=. Open read like the report above.
 	mux.HandleFunc("GET /api/mills/judge-calibration", o.handleJudgeCalibration)
+	// Ranked-dispatch score versus terminal outcome and optional taste grade.
+	mux.HandleFunc("GET /api/mills/taste/calibration", o.handleTasteCalibration)
 	// Config outcomes: run.provenance stamps joined to what the runs they
 	// describe merged, escalated, cost and regressed over ?window=. Open read
 	// like the reports above.
@@ -652,6 +694,14 @@ func (o *operator) httpMux() http.Handler {
 	// /spin; the registry list is an open read like /spin/runs.
 	mux.HandleFunc("POST /api/mills/projects/bootstrap", admit(o.handleProjectBootstrap))
 	mux.HandleFunc("GET /api/mills/projects/bootstrapped", o.handleBootstrappedList)
+	// Mills intake (HUD Projects panel): the project registry with a
+	// readiness verdict per repo, runtime onboarding of an existing repo
+	// (registry insert, work-admission gated like bootstrap), and the gitops
+	// MR that writes the Git-policy half (admin gated like the kill-switch —
+	// it only opens an MR, so work admission is not required).
+	mux.HandleFunc("GET /api/mills/projects", o.handleProjectsList)
+	mux.HandleFunc("POST /api/mills/projects/onboard", admit(o.handleProjectOnboard))
+	mux.HandleFunc("POST /api/mills/projects/policy-mr", requireAdmin(o.handleProjectPolicyMR))
 
 	// Pipeline.
 	mux.HandleFunc("GET /api/mills/merge-queue", o.handleMergeQueueList)
@@ -689,10 +739,22 @@ func (o *operator) httpMux() http.Handler {
 	mux.HandleFunc("POST /api/mills/workflow/runs/{id}/fail", operate(o.handleWorkflowRunFail))
 
 	// Backlog.
+	mux.HandleFunc("GET /api/mills/watches", o.handleWatchesList)
+	mux.HandleFunc("POST /api/mills/watches", requireAdmin(o.handleWatchRegister))
+	mux.HandleFunc("POST /api/mills/watches/{id}/resolve", requireAdmin(o.handleWatchResolve))
+	mux.HandleFunc("POST /api/mills/watches/{id}/cancel", requireAdmin(o.handleWatchCancel))
 	mux.HandleFunc("GET /api/mills/backlog", o.handleBacklogList)
+	mux.HandleFunc("GET /api/mills/bolts", o.handleBolts)
+	mux.HandleFunc("GET /api/mills/shift-report", o.handleShiftReport)
+	mux.HandleFunc("GET /api/mills/finishing/docs-mirror", o.handleDocsMirror)
+	mux.HandleFunc("GET /api/mills/finishing/digest", o.handleFinishingDigest)
+	mux.HandleFunc("POST /api/mills/finishing/digest/run", requireAdmin(o.handleFinishingDigestRun))
 	mux.HandleFunc("GET /api/mills/taste/aggregates", o.handleTasteAggregates)
 	mux.HandleFunc("GET /api/mills/backlog/{id}", o.handleBacklogGet)
+	mux.HandleFunc("GET /api/mills/backlog/{id}/events", o.handleBacklogItemEvents)
+	mux.HandleFunc("GET /api/mills/fleet-gate/waivers", o.handleFleetGateWaivers)
 	mux.HandleFunc("POST /api/mills/backlog", admit(o.handleBacklogCreate))
+	mux.HandleFunc("POST /api/mills/backlog/{id}/grade", grade(o.handleBacklogGrade))
 	mux.HandleFunc("POST /api/mills/backlog/sync", admit(o.handleBacklogSync))
 	mux.HandleFunc("GET /api/mills/cost-preview", o.handleCostPreview)
 
@@ -720,12 +782,6 @@ func (o *operator) httpMux() http.Handler {
 	mux.HandleFunc("GET /api/mills/audit/findings", o.handleAuditFindings)
 	mux.HandleFunc("GET /api/mills/audit/findings/{id}", o.handleAuditFindingDetails)
 	mux.HandleFunc("POST /api/mills/audit/run", admit(o.handleAuditRun))
-
-	// Cross-repo (Phase 4 slice 4.4). Read endpoints serve canonical-store
-	// rows; abort is admin-gated like other mutating endpoints.
-	mux.HandleFunc("GET /api/mills/cross-repo/runs", o.handleCrossRepoList)
-	mux.HandleFunc("GET /api/mills/cross-repo/runs/{id}", o.handleCrossRepoGet)
-	mux.HandleFunc("POST /api/mills/cross-repo/runs/{id}/abort", operate(o.handleCrossRepoAbort))
 
 	// Regression gate (slice 6.3): Alertmanager telemetry webhook. Keep it
 	// authenticated but outside the workload-admission barrier: returning 503

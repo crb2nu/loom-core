@@ -1,0 +1,1 @@
+- Validate Mills pipeline concurrency policy against hard bounds and reject invalid startup configuration before runner work begins (`pkg/policy`, `pkg/mills/runner`, and `docs/mills-policy.md`).

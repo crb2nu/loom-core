@@ -1,0 +1,1 @@
+- Extract HUD pod start, stop, and late-start cleanup lifecycle helpers into `internal/hud/spawn_pod.go`, retaining deterministic late-pod cleanup coverage.

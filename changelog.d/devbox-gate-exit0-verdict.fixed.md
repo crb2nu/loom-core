@@ -1,0 +1,1 @@
+- Harden `cmd/mcp-devbox/quality_gate.go` against contradictory exit-0 failures and surface bounded failed-check output in `pkg/mills/pipeline/dispatcher.go` stage logs.

@@ -32,6 +32,7 @@ var DEFAULT_ARGS = {
   agentId: "",
   spawnId: "",
   workingDir: "",
+  model: "",
   maxTurns: 0,
   maxCostUsd: 0,
   controlPort: 0,
@@ -73,6 +74,9 @@ function parseArgs(argv) {
         break;
       case "working-dir":
         args.workingDir = next;
+        break;
+      case "model":
+        args.model = next.trim();
         break;
       case "max-turns":
         args.maxTurns = Number.parseInt(next, 10) || 0;
@@ -20093,6 +20097,9 @@ async function runClaudeDriver(args) {
   if (claudeCli) {
     options.pathToClaudeCodeExecutable = claudeCli;
   }
+  if (args.model) {
+    options.model = args.model;
+  }
   if (args.maxTurns > 0) {
     options.maxTurns = args.maxTurns;
   }
@@ -20818,6 +20825,9 @@ async function runCodexDriver(args) {
   };
   if (args.workingDir) {
     threadOptions.workingDirectory = args.workingDir;
+  }
+  if (args.model) {
+    threadOptions.model = args.model;
   }
   if (args.multiTurn) {
     return runMultiTurn2(args, threadOptions);

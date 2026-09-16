@@ -179,6 +179,9 @@ type MutationOptions struct {
 // distinct slices stay well under. Tunable via MutationOptions.
 const defaultDedupThreshold = 0.7
 
+// mutatorAuditWriteBudget bounds one detached audit append (see auditSubject).
+const mutatorAuditWriteBudget = 5 * time.Second
+
 // MutationResult is the audit footprint of one Apply call.
 type MutationResult struct {
 	TotalProposed     int
@@ -283,6 +286,9 @@ type BacklogMutator struct {
 	// operator after the GitLab client exists, the same late-injection the
 	// PlanAuthor above uses.
 	MergedWork MergedWorkSource
+	// MergedWorkSemantic augments merged-work Jaccard with embedding-backed
+	// similarity. Nil or an unavailable backend preserves lexical-only gating.
+	MergedWorkSemantic textsim.Scorer
 	// Logger is used for best-effort plan-authoring diagnostics. Nil falls
 	// back to slog.Default().
 	Logger *slog.Logger
@@ -303,6 +309,15 @@ func (m *BacklogMutator) auditSubject(ctx context.Context, record bool, action, 
 	if m == nil || m.Recorder == nil {
 		return
 	}
+	// The audit row is the only durable record of WHY a proposal was skipped
+	// (dedup_skip / merged_work_skip): council_yield reads run rows, the run
+	// Notes carry counts, and the operator log line is ephemeral. Write it
+	// under its own short budget, detached from the mutator stage context —
+	// on 2026-09-02 18:26Z the stage budget was nearly spent after slow
+	// merged-work scans and every audit append died "context deadline
+	// exceeded", leaving five skips unexplained.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutatorAuditWriteBudget)
+	defer cancel()
 	var err error
 	if record {
 		err = m.Recorder.Record(ctx, action, subjectKind, subjectID, payload)
@@ -537,7 +552,13 @@ func (m *BacklogMutator) Apply(ctx context.Context, runID string, out *EditorOut
 		// dedup threshold). Runs after both backlog bands so an item the
 		// council itself authored still reports as dedup_skip, and before the
 		// plan lane so it covers sliced and flat proposals alike.
-		if hit := findMergedWork(p.Title, mergedWork, threshold, now); hit != nil {
+		observeScore := func(score mergedWorkScore) {
+			m.logger().Info("council scored merged-work grounding candidate",
+				"run_id", runID, "proposal_title", p.Title, "merged_ref", score.work.Ref(),
+				"lexical_score", score.lexicalScore, "semantic_score", score.semanticScore,
+				"semantic_available", score.semanticAvailable, "configured_score", score.configuredScore)
+		}
+		if hit := findMergedWorkGroundedObserved(ctx, m.MergedWorkSemantic, p.Title, mergedWork, threshold, now, observeScore); hit != nil {
 			res.MergedWorkSkipped = append(res.MergedWorkSkipped, MergedWorkSkipped{
 				ProposalIndex: i,
 				ProposalTitle: p.Title,
