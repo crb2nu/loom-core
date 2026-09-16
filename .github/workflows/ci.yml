@@ -5,6 +5,14 @@ on:
     branches: ["main"]
   pull_request:
 
+env:
+  # go.work describes the developer's sibling checkouts, not this runner layout.
+  GOWORK: "off"
+  # Match GitLab's portable Go lane; fi-accel native libraries are not built here.
+  CGO_ENABLED: "0"
+  # Keep the security-patched toolchain aligned with .gitlab-ci.yml.
+  GO_VERSION: "1.26.6"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -12,34 +20,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # loom-core uses local `replace` directives for these libs. In GitHub Actions we
-      # check them out and repoint the replaces so builds/tests are hermetic.
+      # Public mirror commits corresponding to the versions required by go.mod.
+      # Repoint the modules to these checkouts without loading local go.work paths.
       - uses: actions/checkout@v4
         with:
           repository: crb2nu/mcp-go
           path: _deps/mcp-go
-          ref: main
-          # Use a PAT/fine-grained token with access to the private dependency repos.
-          # Deploy-key based checkouts were flaky on runners ("error in libcrypto").
-          token: ${{ secrets.LOOM_DEPS_TOKEN }}
+          ref: 3af51e6cdf8c26d1fbf90fb0b859c33d9ec9627d
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: crb2nu/fi-mcp-kit
           path: _deps/fi-mcp-kit
-          ref: main
-          token: ${{ secrets.LOOM_DEPS_TOKEN }}
+          ref: f42344ef2b596261786bc801f4437894df823f80
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: crb2nu/fi-accel
           path: _deps/fi-accel
-          ref: main
-          token: ${{ secrets.LOOM_DEPS_TOKEN }}
+          ref: 7a20206d342597488207c7e282c3607351d8c006
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Wire local module replacements
         run: |
@@ -66,26 +69,23 @@ jobs:
         with:
           repository: crb2nu/mcp-go
           path: _deps/mcp-go
-          ref: main
-          token: ${{ secrets.LOOM_DEPS_TOKEN }}
+          ref: 3af51e6cdf8c26d1fbf90fb0b859c33d9ec9627d
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: crb2nu/fi-mcp-kit
           path: _deps/fi-mcp-kit
-          ref: main
-          token: ${{ secrets.LOOM_DEPS_TOKEN }}
+          ref: f42344ef2b596261786bc801f4437894df823f80
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: crb2nu/fi-accel
           path: _deps/fi-accel
-          ref: main
-          token: ${{ secrets.LOOM_DEPS_TOKEN }}
+          ref: 7a20206d342597488207c7e282c3607351d8c006
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Wire local module replacements
         run: |
@@ -97,8 +97,21 @@ jobs:
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
           go install golang.org/x/vuln/cmd/govulncheck@latest
-      - name: Security checks
-        run: make ci-security
+      # Match the application scope and documented rule policy in GitLab's
+      # security:gosec job; do not scan the downloaded dependency checkouts.
+      - name: Static security checks
+        run: >-
+          gosec -concurrency=2
+          -exclude=G101,G104,G106,G115,G117,G118,G120,G122,G204,G301,G302,G304,G306,G401,G402,G501,G505,G702,G703,G704,G705
+          -exclude-dir=_deps -exclude-dir=vendor
+          -fmt json -out gosec-report.json ./cmd/... ./internal/... ./pkg/...
+      # GitLab also gates on imported packages. Whole-repo symbol analysis
+      # exceeds hosted-runner memory; package mode is the stricter check.
+      - name: Dependency vulnerability checks
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          govulncheck -scan=package ./... | tee govulncheck-report.txt
       - name: Upload security reports
         if: always()
         uses: actions/upload-artifact@v7

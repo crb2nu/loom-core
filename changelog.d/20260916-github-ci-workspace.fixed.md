@@ -1,0 +1,1 @@
+- Repair GitHub CI module resolution by disabling the developer workspace and pinning public dependency checkouts to the versions in `go.mod`; align the Go toolchain and security checks with GitLab.
