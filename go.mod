@@ -40,7 +40,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
-	github.com/xuri/excelize/v2 v2.11.0
+	github.com/xuri/excelize/v2 v2.11.1-0.20260728235842-f98df08a8f6a
 	gitlab.flexinfer.ai/libs/fi-accel/go/fiaccel v0.0.0-20260702142837-7a20206d3425
 	gitlab.flexinfer.ai/libs/fi-mcp-kit v0.2.1-0.20260714193933-f42344ef2b59
 	gitlab.flexinfer.ai/libs/mcp-go v0.2.2-0.20260826050850-3af51e6cdf8c

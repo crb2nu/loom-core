@@ -789,12 +789,13 @@ security:govulncheck:
     #
     # Restore symbol mode only alongside a platform/gitops runner-chart bump
     # to memory_limit_overwrite_max_allowed.
-    - $(go env GOPATH)/bin/govulncheck -scan=package ./... > govulncheck-report.txt
-    - cat govulncheck-report.txt
+    - bash scripts/ci/check_go_vulnerabilities.sh
   artifacts:
     when: always
     paths:
       - govulncheck-report.txt
+      - govulncheck-report.raw.json
+      - govulncheck-report.filtered.json
     expire_in: 1 week
 
 lint:mcp-godot:

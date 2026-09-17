@@ -110,8 +110,7 @@ jobs:
       - name: Dependency vulnerability checks
         if: success() || failure()
         run: |
-          set -o pipefail
-          govulncheck -scan=package ./... | tee govulncheck-report.txt
+          bash scripts/ci/check_go_vulnerabilities.sh
       - name: Upload security reports
         if: always()
         uses: actions/upload-artifact@v7
@@ -120,3 +119,5 @@ jobs:
           path: |
             gosec-report.json
             govulncheck-report.txt
+            govulncheck-report.raw.json
+            govulncheck-report.filtered.json
