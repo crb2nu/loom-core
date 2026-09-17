@@ -706,6 +706,9 @@ func run(cfg Config) error {
 	// disabled independently; the escalator runs whichever it has.
 	gitlabClient := buildGitLabClient(cfg, logger)
 	if gitlabClient != nil {
+		op.mergeQueuePermission = func(ctx context.Context, project string, iid int64) (bool, error) {
+			return gitlabClient.ForProject(project).CheckMergePermission(ctx, iid)
+		}
 		op.docsMirror.check = func(ctx context.Context, now time.Time) finishing.DocsMirrorDrift {
 			return finishing.CheckDocsMirror(ctx, finishing.GitSourceLister(cfg.RepoRoot, version), gitlabClient, gitlabClient, cfg.DocsMirrorProject, cfg.DocsMirrorRef, cfg.DocsMirrorPath, now)
 		}
@@ -1355,9 +1358,10 @@ func run(cfg Config) error {
 		// flag is on. External candidates only merge on a terminal
 		// successful pipeline for the head, so the hop never bypasses proof.
 		External: &mergequeue.ExternalEnqueuer{
-			Store:    st,
-			Enabled:  mergeQueueEnabled,
-			MaxDepth: func() int { return pm.Current().MergeQueueMaxDepth() },
+			Store:           st,
+			Enabled:         mergeQueueEnabled,
+			MaxDepth:        func() int { return pm.Current().MergeQueueMaxDepth() },
+			CheckPermission: op.mergeQueuePermission,
 		},
 		RequeueEvictions: func() bool { return pm.Current().MergeQueueRequeueEvictions() },
 		AwaitPipelineFn:  func() time.Duration { return pm.Current().MergeQueueAwaitPipeline() },

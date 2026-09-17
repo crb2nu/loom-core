@@ -87,10 +87,12 @@ type operator struct {
 	// across repos (the per-item TargetProject supplies the path). Empty when
 	// no GitLab API URL is configured — the HUD then degrades to an iid chip.
 	gitlabBaseURL string
-	boltMRStats   func(context.Context, string, int64) (boltGitLabStats, error)
-	shiftNow      func() time.Time
-	docsMirror    *docsMirrorCache
-	digestAt      string
+	// Same GitLab identity as the queue processor; nil fails admission closed.
+	mergeQueuePermission func(context.Context, string, int64) (bool, error)
+	boltMRStats          func(context.Context, string, int64) (boltGitLabStats, error)
+	shiftNow             func() time.Time
+	docsMirror           *docsMirrorCache
+	digestAt             string
 
 	// repoRoot is the operator-local loom-core checkout (cfg.RepoRoot), the
 	// same tree ensureRepoRoot hard-aligns to origin/main on every boot. Read

@@ -865,7 +865,7 @@ func TestProcessor_EvictionRequeueHop(t *testing.T) {
 	ctx := context.Background()
 	enabled := true
 	p := newProcessor(st, &fakeForge{})
-	p.External = &ExternalEnqueuer{Store: st}
+	p.External = &ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st}
 	p.RequeueEvictions = func() bool { return enabled }
 
 	runID := seedRun(t, st, "hop")

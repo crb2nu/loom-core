@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -65,9 +66,19 @@ func (o *operator) handleMergeQueueEnqueue(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	enq := &mergequeue.ExternalEnqueuer{Store: o.store, Enabled: func() bool { return o.policy != nil && o.policy.Current().MergeQueueEnabled() }, MaxDepth: func() int { return o.policy.Current().MergeQueueMaxDepth() }}
+	enq := &mergequeue.ExternalEnqueuer{Store: o.store, Enabled: func() bool { return o.policy != nil && o.policy.Current().MergeQueueEnabled() }, MaxDepth: func() int { return o.policy.Current().MergeQueueMaxDepth() }, CheckPermission: o.mergeQueuePermission}
 	result, err := enq.Enqueue(r.Context(), mergequeue.ExternalCandidate{Producer: req.Producer, IdempotencyKey: req.IdempotencyKey, Project: req.Project, MRIID: req.MRIID, SourceBranch: req.SourceBranch, TargetBranch: req.TargetBranch, ObservedSHA: req.ObservedSHA})
 	if err != nil {
+		// JSON outcomes let fleet producers surface denial/unavailability without
+		// treating either as the policy-disabled direct-merge fallback.
+		if errors.Is(err, mergequeue.ErrMergePermissionDenied) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"outcome": "forbidden", "reason": mergequeue.ErrMergePermissionDenied.Error()})
+			return
+		}
+		if errors.Is(err, mergequeue.ErrMergePermissionUnavailable) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"outcome": "unavailable", "reason": mergequeue.ErrMergePermissionUnavailable.Error() + "; retry later"})
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

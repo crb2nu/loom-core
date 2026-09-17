@@ -1,0 +1,1 @@
+- Reject external Mills merge candidates before durable enqueue when the operator GitLab identity lacks merge permission; report uncertain permission checks as retryable errors without falling back to a direct merge.

@@ -387,3 +387,39 @@ func TestHandleMergeMergeRequest_FleetFullLaneStaysAnError(t *testing.T) {
 		t.Fatalf("mergePUTs=%d, want 0", mergePUTs)
 	}
 }
+
+// A permission rejection or an uncertain check must never bypass the queue
+// using the MCP server's potentially more privileged GitLab identity.
+func TestHandleMergeMergeRequest_FleetPermissionRejectionNeverFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		outcome string
+	}{{403, "forbidden"}, {503, "unavailable"}} {
+		t.Run(tc.outcome, func(t *testing.T) {
+			var enqueues, mergePUTs int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.Method {
+				case http.MethodGet:
+					fmt.Fprint(w, `{"iid":718,"sha":"head","source_branch":"fix/test","target_branch":"main"}`)
+				case http.MethodPost:
+					enqueues++
+					w.WriteHeader(tc.status)
+					fmt.Fprintf(w, `{"outcome":%q,"reason":"operator permission"}`, tc.outcome)
+				case http.MethodPut:
+					mergePUTs++
+					fmt.Fprint(w, `{"state":"merged"}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer ts.Close()
+			gl := newTestServer(ts)
+			gl.mergeQueueURL = ts.URL
+			result, err := gl.handleMergeMergeRequest(context.Background(), map[string]any{"project": "platform/gitops", "merge_request_iid": 718, "sha": "head"})
+			if err != nil || result == nil || !result.IsError || enqueues != 1 || mergePUTs != 0 {
+				t.Fatalf("result=%+v err=%v enqueues=%d merges=%d", result, err, enqueues, mergePUTs)
+			}
+		})
+	}
+}

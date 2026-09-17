@@ -517,6 +517,22 @@ and merges land in bursts that stack uncancelable main pipelines. The serial
 queue (`pkg/mills/mergequeue`) guarantees every MR is CI-tested on the exact
 main it lands on, one candidate at a time per `(project, target_branch)` lane.
 
+### External candidate permission checks
+
+External candidates (including eviction requeues) require a fresh GitLab MR
+`user.can_merge` result using the same credential as the queue processor.
+The check runs before queue, backlog or compatibility-run rows are written,
+with a ten-second bound. Public project visibility is not merge permission.
+An explicit denial or GitLab 401/403 produces HTTP 403 (`forbidden`); a missing
+permission field, failed lookup or unwired client produces HTTP 503
+(`unavailable`), which can be retried. Neither response permits a direct-merge
+fallback. Policy-disabled behavior remains unchanged.
+
+This is a point-in-time admission check, not a replacement for CI/head proof
+or GitLab's authorization on the eventual merge. It does not broaden token
+roles or use the separate GitOps auto-PR credential. See the
+[GitLab MR API permission field](https://docs.gitlab.com/api/merge_requests/#get-single-mr).
+
 ### Semantics
 
 When `merge_queue.enabled` is true, the pipeline's `merge` stage validates the

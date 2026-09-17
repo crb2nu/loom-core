@@ -26,11 +26,19 @@ type ExternalResult struct {
 	Entry    *store.MergeQueueEntry `json:"entry,omitempty"`
 }
 
+var (
+	ErrMergePermissionDenied      = errors.New("operator GitLab identity cannot merge this merge request")
+	ErrMergePermissionUnavailable = errors.New("operator GitLab merge permission could not be verified")
+)
+
 // ExternalEnqueuer durably adapts fleet producers to the canonical serial queue.
 type ExternalEnqueuer struct {
 	Store    *store.Store
 	Enabled  func() bool
 	MaxDepth func() int
+	// CheckPermission must use the same identity as the processor. Nil or an
+	// uncertain lookup rejects admission before any durable provenance rows.
+	CheckPermission func(context.Context, string, int64) (bool, error)
 }
 
 func (e *ExternalEnqueuer) Enqueue(ctx context.Context, c ExternalCandidate) (ExternalResult, error) {
@@ -47,6 +55,18 @@ func (e *ExternalEnqueuer) Enqueue(ctx context.Context, c ExternalCandidate) (Ex
 	}
 	if e.Enabled != nil && !e.Enabled() {
 		return ExternalResult{Outcome: "disabled"}, nil
+	}
+	if e.CheckPermission == nil {
+		return ExternalResult{}, ErrMergePermissionUnavailable
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	allowed, err := e.CheckPermission(checkCtx, c.Project, c.MRIID)
+	cancel()
+	if err != nil {
+		return ExternalResult{}, fmt.Errorf("%w: %w", ErrMergePermissionUnavailable, err)
+	}
+	if !allowed {
+		return ExternalResult{}, ErrMergePermissionDenied
 	}
 	if prior := e.conflictedAtHead(ctx, c); prior != nil {
 		// The queue already rebased this exact head and GitLab reported a

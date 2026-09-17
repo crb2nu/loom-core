@@ -17,7 +17,7 @@ func TestExternalEnqueuer_DurableIdempotencyAndProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := ExternalCandidate{Producer: "mcp_gitlab", IdempotencyKey: "ship-1", Project: "services/loom", MRIID: 42, SourceBranch: "feat/x", TargetBranch: "main", ObservedSHA: "abc"}
-	e := &ExternalEnqueuer{Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 10 }}
+	e := &ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 10 }}
 	first, err := e.Enqueue(ctx, c)
 	if err != nil || first.Outcome != "enqueued" {
 		t.Fatalf("first = %+v, %v", first, err)
@@ -52,7 +52,7 @@ func TestExternalEnqueuer_RefusesHeadEvictedForRebaseConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	e := &ExternalEnqueuer{Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 10 }}
+	e := &ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 10 }}
 	c := ExternalCandidate{Producer: "mrwatch_shepherd", IdempotencyKey: "loom!1789:aead08f4", Project: "services/loom-core", MRIID: 1789, SourceBranch: "feat/canary", TargetBranch: "main", ObservedSHA: "aead08f4"}
 
 	first, err := e.Enqueue(ctx, c)
@@ -112,11 +112,11 @@ func TestExternalEnqueuer_Outcomes(t *testing.T) {
 	}
 	defer st.Close()
 	c := ExternalCandidate{Producer: "mrwatch_shepherd", IdempotencyKey: "one", Project: "p", MRIID: 1, SourceBranch: "x", TargetBranch: "main", ObservedSHA: "sha"}
-	disabled, err := (&ExternalEnqueuer{Store: st, Enabled: func() bool { return false }}).Enqueue(ctx, c)
+	disabled, err := (&ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st, Enabled: func() bool { return false }}).Enqueue(ctx, c)
 	if err != nil || disabled.Outcome != "disabled" {
 		t.Fatalf("disabled = %+v, %v", disabled, err)
 	}
-	e := &ExternalEnqueuer{Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 1 }}
+	e := &ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 1 }}
 	if _, err := e.Enqueue(ctx, c); err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestExternalEnqueuer_ValidatesCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	_, err = (&ExternalEnqueuer{Store: st, Enabled: func() bool { return true }}).Enqueue(ctx, ExternalCandidate{})
+	_, err = (&ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st, Enabled: func() bool { return true }}).Enqueue(ctx, ExternalCandidate{})
 	if err == nil {
 		t.Fatal("expected validation error")
 	}
@@ -151,7 +151,7 @@ func TestExternalEnqueuer_RefusesSecondCandidateForActiveMR(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	e := &ExternalEnqueuer{Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 10 }}
+	e := &ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st, Enabled: func() bool { return true }, MaxDepth: func() int { return 10 }}
 	c := ExternalCandidate{Producer: "mrwatch_shepherd", IdempotencyKey: "loom!1918:a73991d7", Project: "services/loom-core", MRIID: 1918, SourceBranch: "feat/canary", TargetBranch: "main", ObservedSHA: "a73991d7"}
 	first, err := e.Enqueue(ctx, c)
 	if err != nil || first.Outcome != "enqueued" {
@@ -235,7 +235,7 @@ func TestExternalAdoptionBranchOwner(t *testing.T) {
 			if _, err := st.Backlog.DeferEscalationRecheck(ctx, item.ID, 0, time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			result, err := (&ExternalEnqueuer{Store: st}).Enqueue(ctx, ExternalCandidate{Producer: "mrwatch_shepherd", IdempotencyKey: "branch", Project: "services/flexinfer", MRIID: 1004, SourceBranch: tc.branch, TargetBranch: "main", ObservedSHA: "head"})
+			result, err := (&ExternalEnqueuer{CheckPermission: allowExternalMerge, Store: st}).Enqueue(ctx, ExternalCandidate{Producer: "mrwatch_shepherd", IdempotencyKey: "branch", Project: "services/flexinfer", MRIID: 1004, SourceBranch: tc.branch, TargetBranch: "main", ObservedSHA: "head"})
 			if err != nil {
 				t.Fatal(err)
 			}
