@@ -110,6 +110,17 @@ const transientRequeueEventKind = "pipeline.transient_requeue.claimed"
 
 const overseerSoakTelemetryEventKind = "overseer.soak.daily"
 
+// Migration 045 covers the small decision payloads. Pin this range scan so the
+// planner cannot fall back to fetching a table page per decision via the generic
+// subject index. Literal predicates prove eligibility for the partial index.
+const overseerSoakTelemetryQuery = `
+	SELECT subject_id, payload_json
+	FROM events INDEXED BY idx_events_soak_daily
+	WHERE kind = 'overseer.soak.daily' AND subject_kind = 'utc_day'
+	  AND subject_id >= ? AND subject_id < ?
+	ORDER BY subject_id, id
+`
+
 // OverseerSoakDailyCounters is one durable UTC-day bucket of dry-run evidence.
 // Day is always returned at UTC midnight. Decisions is the denominator for the
 // other counters, so either derived count exceeding it is corrupt evidence.
@@ -168,13 +179,8 @@ func (s *Store) OverseerSoakTelemetry(ctx context.Context, windowEnd time.Time) 
 	}
 	end := windowEnd.UTC().Truncate(24 * time.Hour)
 	start := end.AddDate(0, 0, -7)
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT subject_id, payload_json
-		FROM events
-		WHERE kind = ? AND subject_kind = 'utc_day'
-		  AND subject_id >= ? AND subject_id < ?
-		ORDER BY subject_id, id
-	`, overseerSoakTelemetryEventKind, start.Format("2006-01-02"), end.Format("2006-01-02"))
+	rows, err := s.db.QueryContext(ctx, overseerSoakTelemetryQuery,
+		start.Format("2006-01-02"), end.Format("2006-01-02"))
 	if err != nil {
 		return nil, fmt.Errorf("overseer soak telemetry read: %w", err)
 	}

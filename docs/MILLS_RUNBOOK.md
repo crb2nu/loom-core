@@ -631,6 +631,24 @@ or GitOps reconciliation should be inspected. `unknown` means the local git
 ancestry check failed and does not prevent the report from being served.
 The pending and unknown gauges update when a shift report is composed.
 
+## Slow overseer report refreshes
+
+The overseer rollup reads seven complete UTC days of `overseer.soak.daily`
+evidence before recent actions. Each stored row is one decision; limiting the
+read to the latest row per day would lose evidence. Migration 045 adds the
+partial covering index `idx_events_soak_daily`, and the evidence query pins
+that index to avoid fetching an event-table page for every decision. The
+existing Go counter validation and fail-closed promotion verdict are unchanged.
+
+The index is built transactionally during store startup. Its first build scans
+existing history and can delay readiness on a large or cold Longhorn volume;
+monitor store-open progress and the rollout's startup budget. After rollout,
+verify schema 45, a covering range query plan, successful `overseers` refresh
+durations and an advancing `X-Loom-Report-Snapshot-At` header. A deadline spent
+reading soak evidence is reported as `overseer soak telemetry`, rather than
+being attributed to the subsequent recent-action query. The refresh deadline
+and promotion thresholds are unchanged.
+
 ## Recover from a corrupted DB
 
 The canonical SQLite DB lives on a Longhorn RWO PVC. WAL replay handles most operator restarts; nothing should be needed for a clean kill. The procedures below are for the rare cases where the DB is unrecoverable.

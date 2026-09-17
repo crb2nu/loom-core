@@ -86,3 +86,47 @@ func TestReportRollupWriterWiresAllSurfaces(t *testing.T) {
 		t.Fatalf("specs=%v want=%v", got, want)
 	}
 }
+
+func TestOverseerRollupLabelsSoakCancellation(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	now := time.Now().UTC()
+	_, err := op.buildOverseersRollup(ctx, now.Add(-24*time.Hour), now)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "overseer soak telemetry") {
+		t.Fatalf("soak cancellation must identify the exhausted phase: %v", err)
+	}
+}
+
+func TestOverseerRollupRetainsFailClosedEvidence(t *testing.T) {
+	op, cleanup := newTestOperator(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	check := func(promotable bool) {
+		t.Helper()
+		result, err := op.buildOverseersRollup(ctx, now.Add(-24*time.Hour), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := result.(overseersStatusResponse).Soak
+		if got == nil || got.Promotable != promotable || got.FailClosed == promotable {
+			t.Fatalf("promotable=%v, got %+v", promotable, got)
+		}
+	}
+	check(false) // Missing days must not count as zero-disagreement evidence.
+	for day := 1; day <= 7; day++ {
+		if err := op.store.RecordOverseerSoakDecision(ctx, now.AddDate(0, 0, -day), true, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(true)
+	if err := op.store.Events.Append(ctx, &store.Event{
+		Actor: "overseer", Kind: "overseer.soak.daily", SubjectKind: "utc_day",
+		SubjectID: "2026-09-12", Payload: map[string]any{"decisions": 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	check(false) // Malformed appended evidence must still close the gate.
+}

@@ -1,0 +1,1 @@
+- Keep Mills overseer soak reads on a covering index of the seven-day decision evidence, preserving all counter validation while avoiding per-decision event-table reads; identify soak deadline exhaustion separately from recent-action failures.

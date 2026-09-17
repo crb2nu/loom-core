@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"time"
@@ -110,6 +111,9 @@ func (o *operator) buildOverseersRollup(ctx context.Context, since, now time.Tim
 		now = time.Now().UTC()
 	}
 	soak := overseer.EvaluatePersistedS2Soak(ctx, o.store, now)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("overseer soak telemetry: %w", err)
+	}
 	resp.Soak = &soak
 	if pol := o.policy.Current(); pol != nil {
 		resp.Enabled = pol.Overseers.Enabled
