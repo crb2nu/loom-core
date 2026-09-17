@@ -675,19 +675,36 @@ func countMergedRunsByRepoSince(ctx context.Context, st *store.Store, since time
 	return out, rows.Err()
 }
 
+// These aggregate reads are covered by migration 046, keeping large gate
+// reasons and stage logs out of the KPI refresh working set.
+const kpiGateOutcomesQuery = `
+		SELECT
+			COALESCE(SUM(CASE WHEN outcome = 'pass' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN outcome != 'skip' THEN 1 ELSE 0 END), 0)
+		FROM gate_outcomes
+		WHERE evaluated_at >= ?
+	`
+
+const kpiRetryCostQuery = `
+		SELECT COALESCE(SUM(sr.cost_usd), 0)
+		FROM stage_results sr
+		JOIN pipeline_runs pr ON pr.id = sr.pipeline_run_id
+		WHERE pr.started_at >= ? AND sr.attempt > 1
+	`
+
+const kpiUnparseableGatesQuery = `
+		SELECT COUNT(*)
+		FROM gate_outcomes
+		WHERE evaluated_at >= ? AND judged_by = ?
+	`
+
 func countGateOutcomesSince(ctx context.Context, st *store.Store, since time.Time) (passes, total int, err error) {
 	// total counts pass + fail only; 'skip' outcomes (advisory/not-applicable
 	// gates, e.g. a slice-less item's scope) are excluded from BOTH numerator
 	// and denominator so a skip neither raises nor lowers gate_pass_rate —
 	// matching adaptive.gateFailRate. Without this a skip would drag the rate
 	// down exactly like a fail.
-	row := st.DB().QueryRowContext(ctx, `
-		SELECT
-			COALESCE(SUM(CASE WHEN outcome = 'pass' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN outcome != 'skip' THEN 1 ELSE 0 END), 0)
-		FROM gate_outcomes
-		WHERE evaluated_at >= ?
-	`, kpiTime(since))
+	row := st.DB().QueryRowContext(ctx, kpiGateOutcomesQuery, kpiTime(since))
 	if err := row.Scan(&passes, &total); err != nil {
 		return 0, 0, fmt.Errorf("kpi gate outcome count: %w", err)
 	}
@@ -699,12 +716,7 @@ func countGateOutcomesSince(ctx context.Context, st *store.Store, since time.Tim
 // started_at so the window matches the run-level cost metrics rather than each
 // stage's own timestamp — the retry burn is attributed to the run's window.
 func retryStageCostSince(ctx context.Context, st *store.Store, since time.Time) (float64, error) {
-	row := st.DB().QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(sr.cost_usd), 0)
-		FROM stage_results sr
-		JOIN pipeline_runs pr ON pr.id = sr.pipeline_run_id
-		WHERE pr.started_at >= ? AND sr.attempt > 1
-	`, kpiTime(since))
+	row := st.DB().QueryRowContext(ctx, kpiRetryCostQuery, kpiTime(since))
 	var cost float64
 	if err := row.Scan(&cost); err != nil {
 		return 0, fmt.Errorf("kpi retry-cost: %w", err)
@@ -717,11 +729,7 @@ func retryStageCostSince(ctx context.Context, st *store.Store, since time.Time) 
 // window as countGateOutcomesSince so it forms a valid ratio with the gate
 // total.
 func countUnparseableGatesSince(ctx context.Context, st *store.Store, since time.Time) (int, error) {
-	row := st.DB().QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM gate_outcomes
-		WHERE evaluated_at >= ? AND judged_by = ?
-	`, kpiTime(since), store.JudgedByUnparseable)
+	row := st.DB().QueryRowContext(ctx, kpiUnparseableGatesQuery, kpiTime(since), store.JudgedByUnparseable)
 	var n int
 	if err := row.Scan(&n); err != nil {
 		return 0, fmt.Errorf("kpi unparseable-gate: %w", err)

@@ -128,8 +128,9 @@ func TestMigrate_v2_Idempotent(t *testing.T) {
 	// 042 one-time rewrite of trimmed RFC3339Nano timestamps to fixed width,
 	// 043 external main CI hold (renumbered from 042 at rescue),
 	// 044 covering actor metadata index for payload-free report reads,
-	// 045 partial covering index for daily overseer soak evidence.
-	want := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45}
+	// 045 partial covering index for daily overseer soak evidence,
+	// 046 covering gate and retry-cost KPI history indexes.
+	want := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46}
 
 	if len(versions) != len(want) {
 		t.Errorf("schema_migrations versions: got %v want %v", versions, want)

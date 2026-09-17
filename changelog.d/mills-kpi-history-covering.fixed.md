@@ -1,0 +1,1 @@
+- Keep Mills gate and retry-cost KPI aggregates on covering indexes so refreshes avoid reading large historical logs and artifacts without changing cost attribution, time windows, or deadlines.

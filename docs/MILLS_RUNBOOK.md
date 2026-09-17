@@ -649,6 +649,29 @@ reading soak evidence is reported as `overseer soak telemetry`, rather than
 being attributed to the subsequent recent-action query. The refresh deadline
 and promotion thresholds are unchanged.
 
+## Slow KPI snapshots
+
+The scheduler gives the combined 1-day, 7-day, and 30-day KPI refresh a
+10-second budget. A `kpi retry-cost` deadline identifies the query where the
+budget expired; earlier reads or connection contention may have consumed it.
+Check all three snapshot timestamps and correlate failures with replica
+rebuilds, disk latency, and database lock warnings before attributing a timeout
+to one query. A fast warm-cache probe does not rule out intermittent I/O stalls.
+
+Migration 046 covers gate counts with `idx_gate_outcomes_evaluated`
+(`evaluated_at`, `outcome`, `judged_by`) and retry costs with the partial
+`idx_stage_retry_cost` index. These aggregates no longer fetch gate reason or
+stage log/artifact pages. Retry costs still include every attempt greater than
+one for runs starting within the requested window; the stage timestamp does
+not determine membership. Gate skip and unparseable accounting is unchanged.
+The refresh budget and retention policy are unchanged.
+
+Both indexes build transactionally at store startup. After rollout, verify
+schema 46, covering plans for gate and retry aggregates, and advancing KPI
+snapshots for all three windows over several scheduler cycles. The indexes
+reduce avoidable I/O; ongoing storage or writer contention still needs its own
+investigation.
+
 ## Recover from a corrupted DB
 
 The canonical SQLite DB lives on a Longhorn RWO PVC. WAL replay handles most operator restarts; nothing should be needed for a clean kill. The procedures below are for the rare cases where the DB is unrecoverable.
