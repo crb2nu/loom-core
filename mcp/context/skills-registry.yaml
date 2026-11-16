@@ -8757,7 +8757,7 @@ skills:
         - **`confirmed_phi` is a one-way door** — once tagged, the
           artifact body is gated from briefings, drafts, and external
           send paths. Use it when content unambiguously contains
-          Devoted patient data.
+          real patient data.
         - **No real data in git.** If a `confirmed_phi` artifact is
           discovered to have been committed (e.g. in a `.loom/`
           plan), STOP and surface it — that's an incident, not a

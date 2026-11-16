@@ -54,7 +54,7 @@ spec:
             # + no contention with news-analyzer / other writers).
             #
             # The old collection on the Harvester instance is still around;
-            # re-indexing devoted-core writes a fresh codebase_memory_v1
+            # re-indexing a repository writes a fresh codebase_memory_v1
             # collection on qdrant-fast.
             - name: QDRANT_URL
               value: http://qdrant-fast.loom-hub.svc.cluster.local:6333
